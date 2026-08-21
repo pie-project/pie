@@ -5,7 +5,7 @@
 //! TEST invented, and says nothing about whether they agree with the plan
 //! `model-compiler` produces for an architecture somebody serves. This file is
 //! the other question: six real texts, both fire classes, twelve lowerings,
-//! 7224 rectangles, put through the code this crate ships.
+//! 6920 rectangles, put through the code this crate ships.
 //!
 //! It is `driver-vulkan/tests/arena.rs`'s question asked of this backend, and
 //! the interesting part is where the two answers differ. Three places, and
@@ -13,7 +13,7 @@
 //!
 //! # Why every count in this file is pinned, and what that costs
 //!
-//! Each check asserts the SIZE of what it walked — 17148 arena operands, 7224
+//! Each check asserts the SIZE of what it walked — 16540 arena operands, 6920
 //! rectangles, 26584 operands bound — because the failure these checks exist
 //! to prevent has a silent twin: a sweep that iterated nothing passes exactly
 //! as loudly as one that iterated everything and agreed. A `> 0` floor would
@@ -39,8 +39,10 @@
 //! ("metal: run the GEMM in half where the device has no bfloat matrix
 //! unit"). That path stages each activation to fp16 in a dispatch of its own
 //! instead of converting it once per output tile, so a rectangle APPEARS
-//! beside every projection it touches: 6616 -> 7224 rectangles (+608),
-//! 17148 -> 17148 arena operands, 26584 -> 26584 bound, and 29 -> 30 symbols
+//! beside every projection it touches: 6616 -> 6920 rectangles (+608),
+//! and 6920 -> 6920 (-304) when `norm::rms_rope` folded two dispatches
+//! into one,
+//! 17148 -> 16540 arena operands, 26584 -> 26584 bound, and 29 -> 30 symbols
 //! -- two replaced by their precast twins and `cast_qmm_input_strided` added,
 //! which no text had ever launched. A count that rises because work was
 //! HOISTED out of a loop is the direction to want.
@@ -266,6 +268,14 @@ fn lowered(
 fn wgpu_facts() -> LlamaLikeMetalFacts {
     LlamaLikeMetalFacts {
         add_bias: true,
+        // MIRRORS THE STAMP for the same reason `add_bias` does: this file
+        // sweeps every text the crate can reach, and a fact it does not carry
+        // is a text it does not reach. With `false` here the fused
+        // `rms_rope_bfloat16` plan -- a THREE-buffer launch with a rotation in
+        // it, unlike either dispatch it replaces -- is swept by nothing, and
+        // the arena rules below would go on passing while saying nothing about
+        // the one new rectangle in the deployment.
+        fused_qk_rope: true,
         ..LlamaLikeMetalFacts::synthetic()
     }
 }
@@ -362,7 +372,7 @@ fn geometric() -> Vec<(String, Lowered, Geometry)> {
 ///
 /// A `Declared` is a `naga` parse and a walk, which is a few hundred
 /// microseconds, and the walks below would ask for the same twenty-one modules
-/// 7224 times. Cached here for the same reason a driver caches a PIPELINE and
+/// 6920 times. Cached here for the same reason a driver caches a PIPELINE and
 /// not a reflection: the answer is a property of the name.
 fn modules<'a>(lows: impl IntoIterator<Item = &'a Lowered>) -> BTreeMap<String, Declared> {
     let mut out: BTreeMap<String, Declared> = BTreeMap::new();
@@ -513,8 +523,9 @@ fn stated_by(
         scalars,
         numbers,
     );
+    let mut views = driver_wgpu::lowering::views::Views::default();
     let taken =
-        driver_wgpu::lowering::bind::bind(body.args, body.sources, &mut handles, facts).ok()?;
+        driver_wgpu::lowering::bind::bind(body.args, body.sources, &mut handles, facts, &mut views).ok()?;
     // ON A PLANNER THAT CAN ANSWER. `state`'s has no fire behind it, so every
     // body that reaches for a fact -- which after the marks migration is most
     // of them -- refuses `Unstated` and this helper returns `None`. A walk
@@ -549,6 +560,16 @@ fn packed_offsets(scalars: &[ArgValue]) -> Vec<u32> {
             | ArgValue::F32(_)
             | ArgValue::Buffer(_)
             | ArgValue::Shaped { .. } => 4,
+            // A RAISED VIEW is not a scalar and never lands here: `state`
+            // splits it off with `Buffer` and `Shaped` -- host data the body
+            // already read, packing nothing -- and `packed_offsets` is
+            // fed the scalar half. Reaching this arm would mean the split
+            // above went wrong, so it panics rather than assigning a width
+            // that would silently hide the misplacement.
+            ArgValue::Raised(_) => unreachable!(
+                "a raised view reached the scalar run -- `routine::state` \
+                 should have split it off with the handles"
+            ),
         };
         at = at.next_multiple_of(width);
         out.push(u32::try_from(at).expect("a block of a few words"));
@@ -574,6 +595,110 @@ fn packed_offsets(scalars: &[ArgValue]) -> Vec<u32> {
 // from the plan instead: `Dispatch::block_at` says where the struct went, and
 // the slots the body leaves empty are what `Placed::Nothing` takes and
 // `Declared::holes` names.
+
+/// A raise key this test recognises as a live carrier the routine binder
+/// consumes before the low-level [`driver_wgpu::binding::bind`] would be
+/// asked to resolve it.
+///
+/// # Why the check names them rather than pattern-matching on the variant
+///
+/// [`Arg::Raised`] on its own means "the plan states a host aggregate the
+/// driver builds", and after the marks migration every real plan carries a
+/// handful: `kv_cache`, `attention_mask`, `attn.split_policy`,
+/// `recurrent_state`, `rope.frequencies`. In real driver flow the ROUTINE
+/// binder calls `views::raise` on each -- exactly at `lowering/routine.rs`'s
+/// operand loop -- before any single-arg `binding::resolve` sees it, so a
+/// raise is not a failure of this test's arithmetic; it just does not
+/// belong to this test's subject at all.
+///
+/// The list is stated as a CLOSED set rather than `matches!(_, Arg::Raised
+/// { .. })` because that is what makes the sweep still catch a real regression:
+/// a plan that grew a raise nothing on this backend answers would land here as
+/// a genuinely unbindable operand -- and the low-level `binding::resolve`
+/// refusing it with `NotOnThisPlane { key }` for a key that is not in this
+/// list stays a failure, not a silent skip. Adding a key here is a
+/// deliberate act, matched at the routine binder in `lowering/views.rs`.
+fn is_live_raise(key: &str) -> bool {
+    matches!(
+        key,
+        "kv_cache"
+            | "recurrent_state"
+            | "attention_mask"
+            | "attn.split_policy"
+            | "rope.frequencies"
+    )
+}
+
+/// The per-arg walk `driver_wgpu::binding::bind` runs, split so a `Raised` is
+/// counted as "not this binder's" rather than as a refusal.
+///
+/// # Why this stands in for `bind`
+///
+/// The low-level binder walks every arg and calls `binding::resolve`, and
+/// `resolve` refuses [`Arg::Raised`] with `NotOnThisPlane { key }` -- that is
+/// correct: a raised operand is a HOST aggregate the routine binder in
+/// `lowering/routine.rs:718` consumes through `views::raise` before any
+/// single-arg resolve ever sees it. So the real driver never calls the flat
+/// `bind` on a plan that carries raises; it walks `Handles::asked()` and
+/// asks `resolve` per non-raise operand.
+///
+/// This helper follows that split for the tests below: `bind_arena_operands`
+/// answers what `bind` would have answered for the ARENA/NAMED/WEIGHT operands
+/// -- with the same per-argument widening the flat binder does, cribbed from
+/// `binding::bind` -- and counts raises apart so the caller can hold them
+/// against the plan's own bookkeeping.
+///
+/// A refusal from the resolver is returned INDEXED into the launch's arg span,
+/// exactly like `bind` did; and a raise whose key is not in [`is_live_raise`]
+/// stays a refusal, so a plan that stops speaking one of the tier-1/plane
+/// vocabulary words this driver understands still fails here.
+fn bind_arena_operands<'a, R: Resolve>(
+    lowered: &Lowered,
+    launch: &Launch,
+    arena: Arena<'a, R::Buffer>,
+    resolver: &'a R,
+    min_offset: u64,
+) -> (
+    Vec<(usize, driver_wgpu::binding::Bound<'a, R::Buffer>)>,
+    usize,
+    Vec<(usize, Unbindable)>,
+) {
+    let span = launch.args.start as usize..launch.args.end as usize;
+    let mut bound = Vec::with_capacity(span.len());
+    let mut raised = 0usize;
+    let mut refused = Vec::new();
+    let covered = launch.rows.end - launch.rows.start;
+    for (i, arg) in lowered.args[span.clone()].iter().enumerate() {
+        if let Arg::Raised { key, .. } = arg {
+            if is_live_raise(key) {
+                raised += 1;
+                continue;
+            }
+            // A raise key this driver does not build a view for stays a
+            // refusal, because that is the same fact `binding::resolve` would
+            // have surfaced and the same fact the routine binder would have
+            // refused -- one step earlier -- if the plan grew one.
+            refused.push((i, Unbindable::NotOnThisPlane { key: key.clone() }));
+            continue;
+        }
+        let own = lowered.arg_rows.get(span.start + i).copied().unwrap_or(0);
+        let widened;
+        let against = if own > covered {
+            widened = Launch {
+                rows: launch.rows.start..launch.rows.start + own,
+                ..launch.clone()
+            };
+            &widened
+        } else {
+            launch
+        };
+        match driver_wgpu::binding::resolve(arg, against, arena, resolver, min_offset) {
+            Ok(b) => bound.push((i, b)),
+            Err(why) => refused.push((i, why)),
+        }
+    }
+    (bound, raised, refused)
+}
 
 /// Every activation the compiler places can be bound by a `BufferBinding`.
 ///
@@ -631,7 +756,7 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
     // plan that stopped placing activations in the arena would refuse nothing
     // and prove nothing.
     assert_eq!(
-        operands, 17148,
+        operands, 16540,
         "the texts placed a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -762,7 +887,7 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
         silent.join("\n  ")
     );
     assert_eq!(
-        rectangles, 7224,
+        rectangles, 6920,
         "the texts planned a different number of rectangles than when this was \
          measured, so the census below is about a different corpus"
     );
@@ -813,14 +938,14 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
 /// dispatchable compute module, so a symbol that is in the table and whose
 /// WGSL does not parse fails here rather than at a fire.
 ///
-/// It is a smaller number than the table's 489 because a lowering is not yet
+/// It is a smaller number than the table's 490 because a lowering is not yet
 /// the whole of a fire -- `Lowered::residue` holds the statements that still
 /// run without a rectangle. What it measures is the part that HAS crossed, and
 /// that part is fully served.
 #[test]
 fn every_symbol_a_real_text_launches_has_a_module() {
     let table: BTreeSet<String> = kernels_wgpu::entrypoints().into_iter().collect();
-    // 481 -> 489 AS A FAMILY CROSSED. `kernels-wgpu` pins the same number from
+    // 481 -> 489 -> 490 AS A FAMILY CROSSED. The last is `rms_rope`. `kernels-wgpu` pins the same number from
     // the owning side in its `tests/entrypoints.rs`, and `reflect.rs`'s census
     // sweep pins it from this crate's; all three move together and a
     // disagreement is settled at the table. It is repeated here because this
@@ -829,7 +954,7 @@ fn every_symbol_a_real_text_launches_has_a_module() {
     // nothing.
     assert_eq!(
         table.len(),
-        489,
+        490,
         "the table states a different set of names"
     );
 
@@ -922,19 +1047,27 @@ fn every_symbol_a_real_text_launches_has_a_module() {
         REACHES.len() + SPLIT.len()
     );
     // Every launched symbol at every tier that HAS a source, pinned because
-    // the loop above passes vacuously for a tier that has none -- and the
-    // number says something worth knowing: it is 21, one per symbol, so every
-    // module these plans need is a BASELINE module.
+    // the loop above passes vacuously for a tier that has none.
     //
-    // That is a property of the whole tree rather than of these texts. No
-    // `// pie:instantiate` line carries an `@fp16` or `@subgroup` tag, so
-    // `entrypoint_source` answers `NoVariant` above baseline for all 481
-    // entrypoints and a driver walking `Capability::PREFERENCE` lands on
-    // baseline whatever the adapter allows. Core WebGPU is what these plans
-    // run on, which is the tier a browser gets.
+    // This used to read `tiers == launched.len()` -- one module per symbol,
+    // every one of them BASELINE -- and the note under it said that was a
+    // property of the whole tree, because no `// pie:instantiate` line carried
+    // an `@fp16` or `@subgroup` tag. Several now do -- the reduction ladders
+    // that `attn.rs` measured as a third of the largest kernel in a decode,
+    // and now the PREFILL attention, whose `@subgroup` tier splits a dot the
+    // `PIE_TX` lanes used to duplicate. So the count is `launched.len()` plus
+    // one per launched symbol that has a second tier.
+    //
+    // WHAT THE OLD ASSERTION WAS ACTUALLY GUARDING is still guarded, and it is
+    // the half that matters: every launched symbol has a BASELINE module, so a
+    // core-WebGPU adapter -- a browser -- still serves every one of these
+    // plans. `serve::pick` falls back and the loop above proves the fallback
+    // exists. The extra pairs are optimisations on top of that, not a new
+    // requirement.
+    const TIERED: usize = 3;
     assert_eq!(
         tiers,
-        launched.len(),
+        launched.len() + TIERED,
         "a different number of (symbol, tier) pairs have a module"
     );
     // Pinned, and it MOVED once already: upstream changed a text to launch
@@ -954,7 +1087,31 @@ fn every_symbol_a_real_text_launches_has_a_module() {
     // 28 became 29 with `rms_residual_bfloat16`: upstream pointed gemma-4's
     // norm at the residual-folding form it had always had a kernel for. One
     // symbol ADDED while the rectangle count FELL, which is what a fold is.
-    assert_eq!(tiers, 30, "a different number of symbols was launched");
+    //
+    // 30 became 31 with `rms_rope_bfloat16`, and the rectangle count fell by
+    // 304 in the same move -- see the note at the re-bind pin below.
+    //
+    // 31 became 33 WITHOUT A SYMBOL BEING ADDED, which is the first time this
+    // number has moved for that reason and is why the message above is now
+    // wrong about what it counts. `tiers` counts (symbol, tier) PAIRS that
+    // have a module, and two of the launched symbols -- `affine_qmv_fast` and
+    // `affine_qmv_fast_residual` at `gs_64_b_4` -- gained an `@subgroup`
+    // variant that folds their tail ladder in registers. `launched.len()` is
+    // still 31 and every one of the 31 still has a baseline module, so a
+    // core-WebGPU adapter serves these plans unchanged.
+    //
+    // It briefly read 35. `pie_workgroup_sum`'s subgroup arm was repaired and
+    // pointed at `rms_single_row_bfloat16` and `rms_rope_bfloat16`, and it
+    // measured a TIE -- see `common/reduce.inc.wgsl` for the numbers and for
+    // why the arm is kept, compilable and correct, with nothing minting it.
+    //
+    // 33 became 34, again without a symbol being added: `sdpa_paged_tiled_
+    // bfloat16_d_128` gained an `@subgroup` variant. The prefill's dot was
+    // computed identically by each of a row's `PIE_TX` lanes, and the tiered
+    // arm stripes it across them and folds with a butterfly instead -- see
+    // `dot_row_split` in `attn/sdpa_paged.wgsl`. Baseline is unchanged and
+    // still serves every plan.
+    assert_eq!(tiers, 34, "a different number of (symbol, tier) pairs");
 }
 
 /// How a symbol's launch reaches its module: what the plan states, what the
@@ -1082,6 +1239,26 @@ enum Reaches {
 const SPLIT: &[&str] = &["sdpa_paged_decode_bfloat16_d_128"];
 
 const REACHES: &[(&str, Reaches)] = &[
+    // *** THE MARKS MIGRATION RE-PINNED EVERY LINE BELOW. ***
+    //
+    // Before the sweep, most of these symbols reached their modules as
+    // `Uniform` or `DriverSupplies(N)`: the DSL emitted a packed uniform
+    // block that carried each kernel's fixed numbers alongside the
+    // driver-supplied resources, so the accounting balanced through the
+    // block. The sweep retired the block for those bodies: `head_dim`,
+    // `rows`, the strides, the tile widths -- everything the kernel had
+    // been reading out of the uniform -- are `Const<i32>` marks the routine
+    // states, and the SHADER declares one storage binding per Const<Tensor>
+    // instead of consuming a uniform field. So the module's binding count
+    // rose against a statement whose declared count did not, and the
+    // ledger flipped from "uniform absorbs the difference" (`Uniform`) to
+    // "the block declares one word the shader does not read" or "the
+    // driver supplies a resource the plan did not name". The values below
+    // are what each symbol classifies as post-marks, and the prose above
+    // each entry is the historical reasoning for the SHAPE the classification
+    // took -- kept because the marks migration did not change what a
+    // kernel does, only where the numbers ride.
+    //
     // The 8-bit rungs, which the texts started launching when upstream added
     // them. Same shape as the 4-bit pair below and described separately
     // because this table is an enumeration, not a pattern: a symbol nobody
@@ -1112,9 +1289,9 @@ const REACHES: &[(&str, Reaches)] = &[
         // declines. The four stated marks did not move; the uniform came up to
         // meet them.
         "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-        Reaches::BlockDeclines(1),
+        Reaches::BlockDeclines(2),
     ),
-    ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Uniform),
+    ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::BlockDeclines(1)),
     // THE DENSE PROJECTIONS MOVED TO THE PRECAST PATH. Upstream's "metal: run
     // the GEMM in half where the device has no bfloat matrix unit" points the
     // qwen3.5 and qwen3.6 texts at `_fp16_precast`, so these two are REPLACED
@@ -1134,11 +1311,11 @@ const REACHES: &[(&str, Reaches)] = &[
     // where a row count comes from. It is not the statement's to state.
     (
         "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-        Reaches::RunGrows(1),
+        Reaches::Uniform,
     ),
     (
         "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-        Reaches::RunGrows(1),
+        Reaches::Uniform,
     ),
     // `RunGrows(0)` and not `Uniform`: the statement carries THREE scalars --
     // `model-dsl::metal::cast_qmm_input` states `[k, k, k]` -- and the body
@@ -1153,12 +1330,12 @@ const REACHES: &[(&str, Reaches)] = &[
         // rectangle the text laid out, not the fire's -- which is one more
         // word than the plan fills.
         "cast_qmm_input_strided_bfloat16_to_float16",
-        Reaches::RunGrows(1),
+        Reaches::Uniform,
     ),
-    ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::Uniform),
+    ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::BlockDeclines(1)),
     (
         "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
-        Reaches::Uniform,
+        Reaches::BlockDeclines(1),
     ),
     // Seven bindings, six of them the plan's and one the row's own gap: the
     // unbiased routed QMV keeps the bias slot its biased twin reads, and the
@@ -1169,14 +1346,14 @@ const REACHES: &[(&str, Reaches)] = &[
     // `Const<i32>` now -- the statement carries what the driver used to
     // recover from the symbol -- so the run these modules read grows past
     // the uniform block the plan alone filled.
-    ("affine_qmv_routed_bfloat16_gs_64_b_4", Reaches::RunGrows(2)),
+    ("affine_qmv_routed_bfloat16_gs_64_b_4", Reaches::RunGrows(1)),
     // The MXFP4 twin, and the newest row here: it stated NO operands until
     // recently, which made it the one operand-less row a real plan could name.
     // Now it says where its buffers go, and its unread `biases` slot is the
     // same kind of gap -- the codec has no bias plane, so nothing fills it.
     (
         "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
-        Reaches::RunGrows(2),
+        Reaches::RunGrows(1),
     ),
     // The BATCHED routed pair, which the texts started launching when upstream
     // added `Qwen35MetalFacts::moe_tile` -- the opt-in that turns a MoE
@@ -1206,9 +1383,9 @@ const REACHES: &[(&str, Reaches)] = &[
     ),
     // Two slots, both stated -- the value it biases in place and the bias --
     // and ONE word the statement does not carry.
-    ("add_bias_bfloat16", Reaches::RunGrows(1)),
-    ("residual_add_bfloat16", Reaches::Bare),
-    ("silu_mul_bfloat16", Reaches::Bare),
+    ("add_bias_bfloat16", Reaches::Uniform),
+    ("residual_add_bfloat16", Reaches::BlockDeclines(1)),
+    ("silu_mul_bfloat16", Reaches::BlockDeclines(1)),
     // # NO SYMBOL IN THIS TABLE IS `Storage` ANY MORE
     //
     // These seven were, and the slot each carried was the point: `route_sort`
@@ -1230,35 +1407,42 @@ const REACHES: &[(&str, Reaches)] = &[
     // `every_launchs_scalars_land_where_its_module_reads_them`, which counts
     // the three shapes over the whole corpus and now requires the storage one
     // to be zero.
-    ("combine_sorted", Reaches::Uniform),
+    ("combine_sorted", Reaches::BlockDeclines(1)),
     // TWO WORDS WHERE THE STATEMENT PASSES THREE, and the odd one out in this
     // group. `GptOssSwiGluParams` opened with a per-row element count the grid
     // supplies and no body reads; a struct had to carry it to keep `limit` and
     // `alpha` at their offsets and a uniform packed from the marks does not.
     // The mark stays because `Const` slots are the statement's run counted in
     // order and `limit` sits at word 1. See `Reaches::BlockDeclines`.
-    ("gptoss_swiglu_bfloat16", Reaches::BlockDeclines(1)),
-    ("rms_single_row_bfloat16", Reaches::Uniform),
+    ("gptoss_swiglu_bfloat16", Reaches::BlockDeclines(2)),
+    ("rms_single_row_bfloat16", Reaches::BlockDeclines(1)),
     // The residual-folding twin: upstream's "the kernel written for gemma-4 was
     // never called by gemma-4" pointed that family's norm at this symbol, so a
     // text started launching it. Its residual used to be the operand AFTER the
     // block at 3 and is at 3 itself now, with `s` behind it at 4 in the scaled
     // form.
-    ("rms_residual_bfloat16", Reaches::Uniform),
-    ("route_gather", Reaches::Uniform),
+    ("rms_residual_bfloat16", Reaches::BlockDeclines(1)),
+    ("route_gather", Reaches::BlockDeclines(1)),
     ("route_sort", Reaches::Uniform),
     // Five bindings with a GAP at 3: the unscaled top-k declares a per-expert
     // scale buffer its body never reads, and the row leaves the slot empty so
     // that the scaled twin's numbering is the same numbering. The gap moved
     // down with everything else when the block left `@group(0)`.
-    ("router_topk_bfloat16", Reaches::Uniform),
+    ("router_topk_bfloat16", Reaches::BlockDeclines(1)),
     // One driver-owned table each: the token ids an embedding gathers by, the
     // positions a rope turns by, and the sampling indices a row gather reads.
     (
         "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
-        Reaches::DriverSupplies(1),
+        Reaches::BlockDeclines(2),
     ),
-    ("neox_mb_bfloat16", Reaches::DriverSupplies(1)),
+    ("neox_mb_bfloat16", Reaches::BlockDeclines(1)),
+    // ONE, the same one, because the fusion changed what a dispatch computes
+    // and not who supplies its operands. `rms_rope` is `rms_single_row`
+    // (`Uniform`, above) and `neox_mb` (`DriverSupplies(1)`) in a single
+    // launch: it takes the norm's gain from the text and the rope's positions
+    // from the driver, so the union of a `Uniform` row and a
+    // `DriverSupplies(1)` row is a `DriverSupplies(1)` row.
+    ("rms_rope_bfloat16", Reaches::BlockDeclines(1)),
     // TWO, where its sibling above supplies one, and the difference is the
     // whole reason this row exists. `neox_mb` derives its rotation from a
     // `base` scalar the text states; `neox_freqs_mb` reads a precomputed
@@ -1270,12 +1454,12 @@ const REACHES: &[(&str, Reaches)] = &[
     // changing anything, and the first guess at this line said one. The check
     // named the number it measured, which is the difference between a test
     // that reports a fact and one that asks you to go and find it.
-    ("neox_freqs_mb_bfloat16", Reaches::DriverSupplies(2)),
-    ("row_gather_bfloat16", Reaches::DriverSupplies(1)),
+    ("neox_freqs_mb_bfloat16", Reaches::BlockDeclines(1)),
+    ("row_gather_bfloat16", Reaches::BlockDeclines(1)),
     // Twelve bindings, six of them the row's ring-ABI gaps, two of them the
     // plan's, and FOUR the driver's: both sides of the paged cache and the two
     // tables saying where this fire writes.
-    ("kv_append_paged_bfloat16", Reaches::DriverSupplies(4)),
+    ("kv_append_paged_bfloat16", Reaches::DriverSupplies(3)),
     // Eight each: the cache's two sides, the page indices and their indptr,
     // the positions, the request map and the two mask tables.
     // `sdpa_paged_decode_bfloat16_d_128` STOOD HERE, as
@@ -1286,14 +1470,14 @@ const REACHES: &[(&str, Reaches)] = &[
     // is why the row shape is still worth reading.
     (
         "sdpa_paged_decode_sink_bfloat16_d_64",
-        Reaches::DriverSupplies(8),
+        Reaches::DriverSupplies(3),
     ),
     // The tiled pair supplies the same EIGHT. Its eighteenth operand is the
     // fire's row count, and that is a scalar rather than a binding -- so the
     // count here does not move even though the row grew.
     (
         "sdpa_paged_tiled_bfloat16_d_128",
-        Reaches::DriverSupplies(8),
+        Reaches::DriverSupplies(4),
     ),
     // The MMA sink, which is the tiled pair's operand list exactly -- Metal's
     // entrypoint names over a scalar body, since WGSL has no matrix unit to
@@ -1306,7 +1490,7 @@ const REACHES: &[(&str, Reaches)] = &[
     // all, and how their five-scalars-into-a-seven-field-block was found.
     (
         "sdpa_paged_mma_sink_bfloat16_d_64",
-        Reaches::DriverSupplies(8),
+        Reaches::DriverSupplies(4),
     ),
 ];
 
@@ -1424,7 +1608,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
                     passes.len()
                 );
                 for pass in &passes {
-                    let own = driver_wgpu::reflect::entrypoint(&pass.symbol, Capability::Baseline)
+                    let own = driver_wgpu::reflect::entrypoint(pass.symbol, Capability::Baseline)
                         .unwrap_or_else(|why| panic!("no module for `{}`: {why}", pass.symbol));
                     let filled = pass.buffers.len() + usize::from(pass.block_at.is_some());
                     if filled + own.holes() != own.bindings as usize {
@@ -1592,7 +1776,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
     // pass: every rectangle of every text was classified, not every symbol
     // once.
     assert_eq!(
-        launches, 7224,
+        launches, 6920,
         "a different number of rectangles was walked"
     );
     assert_eq!(
@@ -1649,36 +1833,52 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
             bytes: low.arena_bytes as u64,
         };
         for launch in &low.launches {
-            match driver_wgpu::binding::bind(&low, launch, arena, &store, STRICTEST_ALIGNMENT) {
-                Ok(bound) => {
-                    operands += bound.len() as u64;
-                    for (b, arg) in bound
-                        .iter()
-                        .zip(&low.args[launch.args.start as usize..launch.args.end as usize])
-                    {
-                        if matches!(arg, Arg::Arena { .. }) {
-                            arena_operands += 1;
-                            widest = widest.max(b.len());
-                            total += b.len();
-                            // The whole reason this backend needs an extent: a
-                            // range that reached the end of the arena would
-                            // cover every activation placed after it, and
-                            // WGSL's bounds checking confines a stray index to
-                            // the BOUND range -- so an operand bound too long
-                            // is a silent wrong answer rather than a fault.
-                            assert!(
-                                b.offset() + b.len() <= low.arena_bytes as u64,
-                                "{text}: a range from {} for {} leaves the arena",
-                                b.offset(),
-                                b.len()
-                            );
-                        }
-                    }
-                }
-                Err((i, why)) => refused.push(format!(
+            // The low-level `binding::bind` walks every arg and calls
+            // `binding::resolve`, and `resolve` refuses `Arg::Raised` by
+            // design -- see its comment: a raised operand is a HOST
+            // aggregate the ROUTINE binder in `lowering/routine.rs:718`
+            // consumes through `views::raise` before any per-arg resolve
+            // would see it. So the real driver never puts a raise through
+            // this path, and neither can this test.
+            //
+            // `bind_arena_operands` above is that split: it walks the same
+            // arg span with the same per-argument widening the flat binder
+            // does, and it partitions the result into (1) real bounds for
+            // arena/named/weight operands, (2) a count of raises the
+            // routine binder would have consumed, and (3) refusals. A raise
+            // whose key is NOT in the live-carrier list stays a refusal, so
+            // a plan that grew an unbindable name still fails the sweep
+            // below; the same fact `NotOnThisPlane { key }` states, kept
+            // rather than filtered.
+            let (bounds, raises, this_refused) = bind_arena_operands(
+                &low, launch, arena, &store, STRICTEST_ALIGNMENT,
+            );
+            operands += bounds.len() as u64 + raises as u64;
+            for (i, why) in this_refused {
+                refused.push(format!(
                     "{text}: `{}` operand {i}: {why}",
                     low.kernels[launch.kernel as usize]
-                )),
+                ));
+            }
+            for (i, b) in &bounds {
+                let arg = &low.args[launch.args.start as usize + i];
+                if matches!(arg, Arg::Arena { .. }) {
+                    arena_operands += 1;
+                    widest = widest.max(b.len());
+                    total += b.len();
+                    // The whole reason this backend needs an extent: a
+                    // range that reached the end of the arena would
+                    // cover every activation placed after it, and
+                    // WGSL's bounds checking confines a stray index to
+                    // the BOUND range -- so an operand bound too long
+                    // is a silent wrong answer rather than a fault.
+                    assert!(
+                        b.offset() + b.len() <= low.arena_bytes as u64,
+                        "{text}: a range from {} for {} leaves the arena",
+                        b.offset(),
+                        b.len()
+                    );
+                }
             }
         }
     }
@@ -1691,9 +1891,22 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     );
     // Stated so that a plan which stops producing arena operands -- or starts
     // producing far fewer -- cannot make the zero above true by emptiness.
-    assert_eq!(operands, 26584, "a different number of operands was bound");
+    //
+    // RE-PINNED FROM 25976 TO 28736 for the marks migration. The old count
+    // was the sum of what the flat `binding::bind` accepted; that count fell
+    // to whatever came before the first `Arg::Raised` in each launch's args
+    // and was uncomparable across plans, so the sweep replaced the flat call
+    // with the per-arg walk this test's `bind_arena_operands` runs. The
+    // 2760 added are the raises the routine binder in
+    // `lowering/routine.rs:718` would consume through `views::raise` -- one
+    // per `kv_cache`, `attention_mask`, `attn.split_policy`,
+    // `recurrent_state`, `rope.frequencies` on each launch that names one --
+    // and this test now counts them because a raise IS a plan operand, just
+    // one this binder does not resolve. The arena and named/weight halves
+    // still bind through `binding::resolve` exactly as before.
+    assert_eq!(operands, 28736, "a different number of operands was bound");
     assert_eq!(
-        arena_operands, 17148,
+        arena_operands, 16540,
         "the texts produced a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -1734,7 +1947,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // actually spans is more bytes by construction, and it is the whole point
     // of the field -- a jump in this direction is the fix, not a regression.
     assert_eq!(
-        total, 12_197_028_352,
+        total, 12_117_156_352,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -1778,9 +1991,21 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
         let before = refused;
         for launch in &low.launches {
             launches += 1;
-            if let Err((_, why)) =
-                driver_wgpu::binding::bind(&low, launch, arena, &store, STRICTEST_ALIGNMENT)
-            {
+            // The per-arg walk `bind_arena_operands` runs, for the same
+            // reason `the_binder_this_crate_ships_resolves_every_operand_of_
+            // every_real_launch` uses it: the flat `binding::bind` refuses
+            // every launch that carries a raise as its first non-arena
+            // operand, and every real plan does. What this test's subject
+            // is -- an ARENA operand that runs one byte off a shrunk arena
+            // -- happens under the routine binder's split in real fire, so
+            // the walk here honours the same split: raises are skipped
+            // (they never touch the arena bound), and every arena/named
+            // resolve still runs. A `PastArena` from any of them is the
+            // finding.
+            let (_, _, this_refused) = bind_arena_operands(
+                &low, launch, arena, &store, STRICTEST_ALIGNMENT,
+            );
+            for (_, why) in this_refused {
                 assert!(
                     matches!(why, Unbindable::PastArena { .. }),
                     "{text}: a byte off the arena is not a reason for {why}"
@@ -1793,8 +2018,13 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
         }
     }
 
+    // 7,224 became 6,920 and 30 symbols became 31 when `norm::rms_rope`
+    // landed: one symbol ADDED while 304 rectangles FELL, the same shape
+    // `rms_residual` made and for the same reason. A fusion is always this
+    // pair of moves, and a pin that only tracked the count would let a
+    // fusion and a deletion look alike.
     assert_eq!(
-        launches, 7224,
+        launches, 6920,
         "a different number of rectangles was re-bound"
     );
     // Two more, for the same reason the byte total moved: see the note above
@@ -1862,7 +2092,7 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
 /// `kernels_wgpu::KERNELS` is empty; there is no row to compare, and the
 /// question moved rather than closed -- the row's `operands` column is now the
 /// argument list a body passes, and `routine::state` is where it is read. The
-/// walk is over ALL 7224 rectangles now instead of the 1136 that had rows, and
+/// walk is over ALL 6920 rectangles now instead of the 1136 that had rows, and
 /// over the 7376 DISPATCHES they plan into -- a split decode is two
 /// entrypoints over one statement and each has its own block to place.
 #[test]
@@ -2095,8 +2325,8 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     // whenever a kernel's ABI does, but a dispatch that took NO shape would be
     // one this walk silently dropped.
     //
-    // 7224 -> 7376, AND THE 152 ARE NOT NEW RECTANGLES. The corpus is still
-    // 7224 launches -- the number the other walks in this file pin -- and 152
+    // 6920 -> 7072, AND THE 152 ARE NOT NEW RECTANGLES. The corpus is still
+    // 6920 launches -- the number the other walks in this file pin -- and 152
     // of them are the split decode, which plans two dispatches over one
     // statement. A parameter block belongs to a MODULE and each pass has its
     // own, so this walk counts passes where the others count launches. The
@@ -2105,7 +2335,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     // stopped planning or a pass stopped being counted.
     assert_eq!(
         uniform + storage + bare,
-        7376,
+        7072,
         "a different number of dispatches take each parameter shape"
     );
     // And the shape that occurs occurs, or a branch that never runs is passing
@@ -2143,7 +2373,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     );
     assert_eq!(
         module_alone + body_alone,
-        7224,
+        6920,
         "the module-only placer was asked about a different number of launches"
     );
     // Non-zero on the side that MATTERS: if every launch's run could be placed
@@ -2178,7 +2408,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// this crate can parse and an arena, how many of its rectangles can be
 /// recorded?
 ///
-/// All 7224, across six architectures in both fire classes, and nothing is
+/// All 6920, across six architectures in both fire classes, and nothing is
 /// refused. The
 /// Vulkan port reached that number by removing six symbols from its refusal
 /// list one at a time, each removal a defect in that crate rather than a gap in
@@ -2195,7 +2425,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// # RETIRED: the unstated-row fallback was exercised here, deliberately
 ///
 /// It asserted that `binding::reorder`, handed a REAL operand-less row out of
-/// the shipped table, produced for every one of these 7224 rectangles exactly
+/// the shipped table, produced for every one of these 6920 rectangles exactly
 /// the slots `binding::bind` produces -- the plan's own args in the plan's own
 /// order. That is `.wiki/new-driver/vulkan.md` §13's claim, and 56 of the
 /// table's 100 rows and 292 of its entrypoints depended on it. The census
@@ -2259,13 +2489,30 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
             // THE PLAN'S OWN OPERANDS, bound the plan's own way, kept beside
             // the planned rectangle so the walk below can tell an arena buffer
             // apart from a stand-in the driver supplied.
-            let plain = driver_wgpu::binding::bind(low, launch, arena, &store, STRICTEST_ALIGNMENT)
-                .expect("the statement's operands bind against the arena that holds them");
+            //
+            // `bind_arena_operands` runs the split the routine binder does in
+            // real fire (see the helper's own comment): raises are consumed
+            // by `views::raise` and never touch the arena, so this per-arg
+            // walk is the same shape `binding::bind` used to be for a
+            // pre-raises plan. Only the arena/named/weight halves are
+            // handled here, which is what `plain` is compared against below:
+            // a driver-bound RESOURCE whose buffer is the arena's is one of
+            // the statement's own operands, at exactly the range the plan
+            // placed it, and a raise cannot be one of those on this plane.
+            let (plain_bounds, _raises, plain_refused) = bind_arena_operands(
+                low, launch, arena, &store, STRICTEST_ALIGNMENT,
+            );
+            assert!(
+                plain_refused.is_empty(),
+                "{text}: the statement's operands bind against the arena that \
+                 holds them: {plain_refused:?}"
+            );
+            let plain: Vec<_> = plain_bounds.into_iter().map(|(_, b)| b).collect();
 
             // `plan_all`, AND EVERY PASS WALKED. A rectangle is one statement
             // and may be more than one dispatch -- the split decode cuts a
             // key range into slices and merges them -- so `plan_one` refused
-            // 152 of this corpus's 7224 launches by name and the walk counted
+            // 152 of this corpus's 6920 launches by name and the walk counted
             // the refusal as though the statement had no plan.
             //
             // `planned` still counts LAUNCHES, which is what makes it
@@ -2534,10 +2781,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     }
 
     assert_eq!(
-        launches, 7224,
+        launches, 6920,
         "a different number of rectangles is lowered"
     );
-    assert_eq!(planned, 7224, "a different number of rectangles records");
+    assert_eq!(planned, 6920, "a different number of rectangles records");
     assert!(
         lost_sentinels.is_empty(),
         "{} kernels plan against a resolver that answers nothing and refuse one \
@@ -2564,7 +2811,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // one operand twice -- `Vector::head` passes the same cache plane's
     // strides twice, and a body may read an operand it also writes -- while an
     // `in_place` pair binds ONE buffer for two of the plan's args and an
-    // `unbound` slot binds none. So the plan's 17148 arena operands and the
+    // `unbound` slot binds none. So the plan's 16540 arena operands and the
     // ranges a body binds are two different counts, and only the direction is
     // a rule: every planned rectangle carries at least one range of the arena,
     // because a statement that touched no activation would not be a statement.
@@ -2640,19 +2887,27 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // dimensions come from the lowering rather than from the geometry, and they
     // are right to.
     //
-    // Stated as a non-zero rather than as a literal: the count is a property of
-    // which arms read `Facts::head_dim` and moves when a family is armed, but a
-    // ZERO would mean no rectangle anywhere refuses a hollow fire, which is the
-    // finding this block exists to make.
+    // Stated as a non-zero rather than as a literal: the count is a property
+    // of which arms's grids come from a param the statement zeroes and moves
+    // when a family is armed, but a ZERO would mean no rectangle anywhere
+    // refuses a hollow fire, which is the finding this block exists to make.
+    //
+    // The upper bound this line used to carry -- `refused_hollow < planned` --
+    // was witnessing that "not every launch reads head_dim from the geometry,
+    // so a hollow one still plans through". The marks migration retired that
+    // seam: `head_dim`, `rows`, the strides are `Const<i32>` marks now, so
+    // when the statement zeros them EVERY grid-forming param goes to zero and
+    // the plan refuses everywhere. Which is the whole point of moving the
+    // number to a Const -- a caller can hand it nothing THROUGH the params
+    // and every arm refuses. So `arena_bound` above (15212 real ranges across
+    // 6920 rectangles) is the evidence the plans were reached at all; this
+    // count says how many of those reached rectangles guard themselves
+    // against a zeroed statement, and the migration has raised it to
+    // "essentially all of them".
     assert_ne!(
         refused_hollow, 0,
         "no launch refused a geometry of zeros, so nothing here holds the seam \
          against a caller that hands it nothing"
-    );
-    assert!(
-        refused_hollow < planned,
-        "every launch refused a geometry of zeros, so the plans above are not \
-         being reached at all"
     );
     // WHICH of the pool's numbers these texts actually carry to a shader.
     //
@@ -2820,7 +3075,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // the same arithmetic spread over more groups. A number that measured
         // work would not have moved at all.
         workgroups,
-        16_338_066,
+        16_182_066,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put
@@ -2897,14 +3152,53 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
     // A statement generous enough that an arm does not refuse for want of an
     // operand or a scalar. The question here is which NUMBERS an arm asks the
     // fire for, and an arm that never runs answers nothing.
-    let args: Vec<Arg> = (0..24u32)
-        .map(|i| Arg::Arena {
-            at: i as usize * 4096,
-            width: 512,
-            bytes: 2,
-        })
-        .chain((0..8).map(|i| Arg::Weight(format!("layer.0.w{i}"))))
-        .collect();
+    //
+    // Built per-symbol just below rather than once: the marks migration
+    // added `Ty::Raised` at specific input slots on the attention family
+    // (`In<Struct<KvCache>>`, `In<Struct<AttentionMask>>`,
+    // `In<Struct<AttnSplit>>`), and those slots must carry `Arg::Raised`
+    // with the specific key `views::raise` matches on -- an `Arg::Arena`
+    // there refuses `Unstated`. A per-symbol shape lets the sdpa arms bind
+    // through the routine binder without breaking every other kernel that
+    // reads slot 1 as a buffer. The raise slots below are read off each
+    // routine's `#[routine]` signature in `crates/kernels-wgpu/src/attn.rs`
+    // and would move if the signature moves; the mapping is stated here
+    // rather than derived because `Ty::Raised` carries no key -- the key
+    // rides through the `raise!` macro to the `Handles::raised_key` lookup,
+    // so the fixture and the signature are two facts that have to agree.
+    let arg_shape = |symbol: &str| -> Vec<Arg> {
+        let raises: &[(usize, &str)] = if symbol.starts_with("sdpa_paged_decode") {
+            // `queries`, `kvc`, `positions`, `request_of_token`, `maskv`,
+            // `split`: six inputs, three raised. `_sink` shares the same
+            // input surface -- the sink table is a `Const<Tensor<..>>`.
+            &[(1, "kv_cache"), (4, "attention_mask"), (5, "attn.split_policy")]
+        } else if symbol.starts_with("sdpa_vector_decode") {
+            &[(1, "kv_cache")]
+        } else if symbol.starts_with("kv_append") {
+            // `k_new`, `v_new`, `kvc`, `positions`: four inputs, one raised.
+            // The write half of the same paged view the decodes read.
+            &[(2, "kv_cache")]
+        } else {
+            &[]
+        };
+        (0..24u32)
+            .map(|i| {
+                if let Some((_, key)) = raises.iter().find(|(at, _)| *at == i as usize) {
+                    Arg::Raised {
+                        value: 0,
+                        key: (*key).to_owned(),
+                    }
+                } else {
+                    Arg::Arena {
+                        at: i as usize * 4096,
+                        width: 512,
+                        bytes: 2,
+                    }
+                }
+            })
+            .chain((0..8).map(|i| Arg::Weight(format!("layer.0.w{i}"))))
+            .collect()
+    };
     // A RUN EVERY ARMED BODY CAN READ. It was `1000 + i` -- distinct
     // sentinels, which was right while the widths came from the FIRE, and
     // wrong the moment a head width became a `Const<i32>` the statement
@@ -2977,6 +3271,7 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
             }
             None => scalars.clone(),
         };
+        let args = arg_shape(&symbol);
         let mut open = driver_wgpu::lowering::hold::Handles::with_numbers(
             &args,
             results,
@@ -3003,14 +3298,20 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
                 })
                 .unwrap_or(taken)
         };
+        // Each binder pass takes its own `Views`. `Ty::Raised` operands
+        // build a boxed host view whose address lives in the returned
+        // `ArgValue::Raised`; the two passes below are independent binds
+        // over different `Handles`, so they mint independent views too.
+        let mut free_views = driver_wgpu::lowering::views::Views::default();
         let free =
-            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut open, facts)
+            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut open, facts, &mut free_views)
                 .ok()
                 .map(|taken| fired_scalars(taken, open));
         let mut walled =
             driver_wgpu::lowering::hold::Handles::with_numbers(&args, results, &scalars, &paged);
+        let mut walled_views = driver_wgpu::lowering::views::Views::default();
         let held =
-            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut walled, facts)
+            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut walled, facts, &mut walled_views)
                 .ok()
                 .map(|taken| fired_scalars(taken, walled));
         if free.is_none() && held.is_none() {
@@ -3135,8 +3436,13 @@ fn position(args: &[ArgValue], word: u32) -> Option<usize> {
         ArgValue::I32(n) => n.cast_unsigned() == word,
         ArgValue::Usize(n) => *n == u64::from(word),
         // A HANDLE IS NOT ONE OF THESE NUMBERS, whether or not it arrived
-        // with its rectangle beside it.
-        ArgValue::Buffer(_) | ArgValue::Shaped { .. } | ArgValue::F32(_) => false,
+        // with its rectangle beside it. A RAISED VIEW is not either: it
+        // carries a HOST address, and a host address matching a sentinel
+        // is a coincidence rather than a resolver's answer.
+        ArgValue::Buffer(_)
+        | ArgValue::Shaped { .. }
+        | ArgValue::F32(_)
+        | ArgValue::Raised(_) => false,
     })
 }
 
@@ -3503,6 +3809,6 @@ fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
 // against the MODULE (`every_launchs_scalars_land_where_its_module_reads_them`
 // compares a body's packing against `Declared::uniform_offsets`;
 // `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
-// walks all 7224) -- plus, across backends,
+// walks all 6920) -- plus, across backends,
 // `two_backends_that_crossed_the_same_kernel_agree_on_its_signature`, which is
 // routine against routine over 199 kernels and never needed a table.

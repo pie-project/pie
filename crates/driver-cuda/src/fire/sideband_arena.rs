@@ -114,7 +114,11 @@ struct Slot {
 
 impl Default for Slot {
     fn default() -> Self {
-        Self { base: std::ptr::null_mut(), capacity: 0, busy: false }
+        Self {
+            base: std::ptr::null_mut(),
+            capacity: 0,
+            busy: false,
+        }
     }
 }
 
@@ -290,7 +294,10 @@ mod tests {
 
     impl FakeMemory {
         fn new() -> Self {
-            Self { next: 0x1000, ..Self::default() }
+            Self {
+                next: 0x1000,
+                ..Self::default()
+            }
         }
     }
 
@@ -343,7 +350,10 @@ mod tests {
         let mut mem = FakeMemory::new();
         let mut arena = SidebandArena::new();
         arena.acquire(&mut mem, Region::Score, 1024).unwrap();
-        assert_eq!(arena.acquire(&mut mem, Region::Score, 1 << 30), Err(Refusal::Busy));
+        assert_eq!(
+            arena.acquire(&mut mem, Region::Score, 1 << 30),
+            Err(Refusal::Busy)
+        );
         assert_eq!(mem.handed_out, 1, "the refused caller paid for no growth");
         assert_eq!(arena.capacity(Region::Score), 64 * 1024);
     }
@@ -352,7 +362,10 @@ mod tests {
     fn a_zero_byte_request_is_refused_without_marking_the_slot_busy() {
         let mut mem = FakeMemory::new();
         let mut arena = SidebandArena::new();
-        assert_eq!(arena.acquire(&mut mem, Region::Score, 0), Err(Refusal::ZeroBytes));
+        assert_eq!(
+            arena.acquire(&mut mem, Region::Score, 0),
+            Err(Refusal::ZeroBytes)
+        );
         assert!(!arena.is_held(Region::Score));
         assert!(arena.acquire(&mut mem, Region::Score, 1024).is_ok());
     }
@@ -364,7 +377,10 @@ mod tests {
         let first = arena.acquire(&mut mem, Region::Score, 1024).unwrap();
         arena.release(Region::Score);
         mem.fail_syncs = 1;
-        assert_eq!(arena.acquire(&mut mem, Region::Score, 1 << 20), Err(Refusal::SyncFailed));
+        assert_eq!(
+            arena.acquire(&mut mem, Region::Score, 1 << 20),
+            Err(Refusal::SyncFailed)
+        );
         assert!(mem.freed.is_empty(), "nothing may be freed before the sync");
         arena.release(Region::Score);
         assert_eq!(arena.acquire(&mut mem, Region::Score, 1024).unwrap(), first);
@@ -379,7 +395,10 @@ mod tests {
         arena.release(Region::Score);
         let before = arena.generation();
         mem.fail_allocs = 1;
-        assert_eq!(arena.acquire(&mut mem, Region::Score, 1 << 20), Err(Refusal::AllocFailed));
+        assert_eq!(
+            arena.acquire(&mut mem, Region::Score, 1 << 20),
+            Err(Refusal::AllocFailed)
+        );
         assert_eq!(mem.freed.len(), 1, "the old block was freed first");
         assert_eq!(arena.capacity(Region::Score), 0);
         assert_eq!(

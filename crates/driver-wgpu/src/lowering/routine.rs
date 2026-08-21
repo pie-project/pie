@@ -32,8 +32,8 @@ use kernels_wgpu::routine::{ArgValue, Encode, Fire, Wgpu};
 use model_compiler::lower::Launch;
 
 use crate::binding::{Bound, ParamSlot, Params};
-use crate::lowering::hold::Facts;
 use crate::dispatch::Dispatch;
+use crate::lowering::hold::Facts;
 use crate::reflect::Declared;
 
 /// Why a body's dispatch could not become one.
@@ -168,7 +168,10 @@ impl std::fmt::Display for Unplanned {
                 if *values { "values" } else { "keys" }
             ),
             Self::NoPoint { point, why } => {
-                write!(f, "the body fired `{point}`, whose module is unreadable: {why}")
+                write!(
+                    f,
+                    "the body fired `{point}`, whose module is unreadable: {why}"
+                )
             }
             Self::Absent { at, what } => write!(
                 f,
@@ -233,7 +236,10 @@ impl<'a, 'h> Planner<'a, 'h> {
     /// A planner with nothing recorded, and nothing to answer with.
     #[must_use]
     pub fn new() -> Self {
-        Self { out: RefCell::new(Vec::new()), answers: None }
+        Self {
+            out: RefCell::new(Vec::new()),
+            answers: None,
+        }
     }
 
     /// The same planner, able to ANSWER a body that asks.
@@ -262,11 +268,7 @@ impl Encode for Planner<'_, '_> {
     //
     // `RefCell` because answering MINTS -- a staged fact takes a handle, which
     // is a mutation of the handle vector -- and the body holds only a `&self`.
-    fn resolve(
-        &self,
-        ty: kernels::Ty,
-        source: kernels::Source,
-    ) -> Result<ArgValue, Refusal> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
             what: "a fact, on a planner with no fire behind it",
         })?;
@@ -653,7 +655,13 @@ pub fn plan<'a, R: crate::binding::Resolve>(
         // for before stopping. The scratch `Views` is dropped with the probe:
         // nothing reads a counting pass's addresses.
         let mut scratch = super::views::Views::default();
-        let _ = super::bind::bind(routine.args, routine.sources, &mut probe, facts, &mut scratch);
+        let _ = super::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut probe,
+            facts,
+            &mut scratch,
+        );
         probe.asked_results()
     };
     let mut handles = super::hold::Handles::with_numbers(args, asked, scalars, &numbers);
@@ -662,9 +670,14 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     // `stating` below, so the holder sits on this frame until then. Dropping
     // it earlier would hand the body a dangling address that still binds.
     let mut views = super::views::Views::default();
-    let taken_args =
-        super::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
-            .map_err(Unplanned::Refused)?;
+    let taken_args = super::bind::bind(
+        routine.args,
+        routine.sources,
+        &mut handles,
+        facts,
+        &mut views,
+    )
+    .map_err(Unplanned::Refused)?;
     // THE BODY ANSWERS THROUGH THE SAME HANDLES IT BOUND FROM. Answering
     // mints, and the walk below reads the minted list back, so the cell hands
     // the planner a borrow and gives the `Handles` back after.
@@ -752,17 +765,23 @@ pub fn plan<'a, R: crate::binding::Resolve>(
         let point = if one.point == symbol {
             None
         } else {
-            Some(crate::reflect::point(one.point).map_err(|why| Unplanned::NoPoint {
-                point: one.point,
-                why: why.to_string(),
-            })?)
+            Some(
+                crate::reflect::point(one.point).map_err(|why| Unplanned::NoPoint {
+                    point: one.point,
+                    why: why.to_string(),
+                })?,
+            )
         };
         let named = point.as_ref().unwrap_or(declared);
         // The dispatch is named by what the BODY fired, not by what the plan
         // was keyed on. They agree everywhere but the second pass, and the
         // day they do not, the shell builds a pipeline for the point that was
         // planned rather than for the one whose bindings were checked.
-        let at = if one.point == symbol { symbol } else { one.point };
+        let at = if one.point == symbol {
+            symbol
+        } else {
+            one.point
+        };
         out.push(bind(one, &bounds, scalars, named, at, launch)?);
     }
     Ok(out)
@@ -784,7 +803,9 @@ pub fn armed(symbol: &str) -> Option<&'static Routine<Wgpu>> {
     // a kernel, and it is the only thing that can, because this fork answers
     // before any row is looked up.
     let stem = super::hold::crossed(symbol)?;
-    kernels_wgpu::routines().into_iter().find(|r| r.name == stem)
+    kernels_wgpu::routines()
+        .into_iter()
+        .find(|r| r.name == stem)
 }
 
 /// How many of a statement's widthed operands are RESULTS.
@@ -1113,24 +1134,58 @@ mod tests {
                 .into_iter()
                 .find(|r| r.name == stem)
                 .unwrap_or_else(|| panic!("`{stem}` names no routine"));
-            let args: Vec<model_compiler::lower::Arg> = (0..8)
-                .map(|n| model_compiler::lower::Arg::Arena {
-                    at: n * 256,
-                    width: 256,
-                    bytes: 256,
+            // WHICH INPUT SLOT HOLDS THE RECURRENT VIEW, per stem. All seven
+            // gdn arms take `rsv: In<Struct<RecurrentState>>`, but the arms
+            // that carry `pre_q/pre_k/pre_gate` as inputs (the `_recurrent`
+            // forms) list rsv one slot later than the arms that produce them
+            // (`_prep_*`) or ignore them (`_core*`).
+            //
+            // The mapping is stated here rather than inferred from
+            // `routine.args` because the raise KEY is not on the type at
+            // runtime -- `resident!(RecurrentState = "recurrent_state" => ..)`
+            // writes it on a trait -- so the fixture and the signature both
+            // spell it, and a shape change on one that misses the other lands
+            // as a refusal at bind and not as a silent skip.
+            let rsv_at = if stem.contains("_recurrent") { 4 } else { 3 };
+            let mut args: Vec<model_compiler::lower::Arg> = (0..8)
+                .map(|n| {
+                    if n == rsv_at {
+                        // A raised view carries no rectangle; the `value` is
+                        // written zero because `Handles::raised_key` reads
+                        // the KEY off the variant, not the value id.
+                        model_compiler::lower::Arg::Raised {
+                            value: 0,
+                            key: "recurrent_state".to_owned(),
+                        }
+                    } else {
+                        model_compiler::lower::Arg::Arena {
+                            at: n * 256,
+                            width: 256,
+                            bytes: 256,
+                        }
+                    }
                 })
                 .collect();
+            // Four weights, matching every gdn arm's `conv_w`, `conv_b`,
+            // `a_log`, `dt_bias`. Weights land after the outputs the arm
+            // states, and a routine that takes more of either falls out of
+            // `bind` on a NAMED slot rather than on a shape this fixture
+            // does not spell.
+            args.extend((0..4).map(|n| model_compiler::lower::Arg::Weight(format!("w.{n}"))));
             // A WHOLE `GdnCoreParams` and the scan's tile after it, because
-            // that is what the statements carry and the arms read: `Dv` at 1
-            // and `Hv` at 3 size the grid, and the prefill scan's `(lanes,
-            // vrows)` at 11 and 12 pick which compiled shape fires. Four ones
-            // left every arm refusing, and the guard below is what said so
-            // rather than the suite going quietly green over nothing.
+            // that is what the statements carry and the arms read: `v_dim`
+            // at 1 and `v_heads` at 3 size the grid, the prefill scan's
+            // `(row_pitch, n_scan)` at 11 and 12 pick which compiled shape
+            // fires, and `rows` at 11 on every non-prefill form gives the
+            // arm a rectangle so it does not refuse `Empty { what: "rows" }`
+            // before it can name its slab. Four ones left every arm refusing,
+            // and the guard below is what said so rather than the suite
+            // going quietly green over nothing.
             let mut o = super::super::hold::Handles::with_scalars(
                 &args,
                 3,
-                // Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off, eps,
-                // inv_sqrt_dk, then lanes and vrows.
+                // k_dim, v_dim, k_heads, v_heads, conv_dim, conv_k,
+                // q_off, k_off, v_off, eps, inv_sqrt_dk, rows/n_scan, row_pitch
                 &[128, 128, 4, 4, 1024, 4, 0, 512, 1024, 0, 0, 32, 4],
             );
             let facts = super::super::hold::facts(
@@ -1151,8 +1206,9 @@ mod tests {
             );
             // The arm may refuse for its own reasons; what matters is that
             // when it SUCCEEDS it recorded a slab ask, so `plan` will refuse.
+            let mut views = super::super::views::Views::default();
             if let Ok(bound) =
-                crate::lowering::bind::bind(routine.args, routine.sources, &mut o, facts)
+                crate::lowering::bind::bind(routine.args, routine.sources, &mut o, facts, &mut views)
             {
                 let asked = o.asked();
                 let slab = asked
@@ -1296,9 +1352,11 @@ mod tests {
             depth_prefix_plan: false,
             derived: &[],
             internal: false,
-            asked: &[],
             no_join: false,
             driver: false,
+            canon: None,
+            point: &[],
+            out_rule: &[],
         };
         assert_eq!(state(&QUIET, &[]), Err(Unplanned::Silent));
     }
@@ -1432,7 +1490,17 @@ mod tests {
             epilogue_norm: 0,
             structural: Vec::new(),
             residue: Vec::new(),
-            params: Vec::new(),
+            // ONE SCALAR, standing in for the mark the arm asks for.
+            //
+            // After the marks migration, `argmax_logits`' arm reads `rows`
+            // as a `Const<u32>` from the statement's scalar run rather than
+            // from the fire, so a fixture with no scalars refuses inside the
+            // body's `param(0)` call and never reaches the resolver -- which
+            // is the WRONG refusal for this test, whose subject is what
+            // happens when the resolver has nothing to hand back. The value
+            // matches the rows in `facts` below so the arm reads a coherent
+            // rectangle before the resolver is asked.
+            params: vec![7],
             n_requests: 1,
             conds: Vec::new(),
             // A fixture states no attention schedule to raise.
@@ -1441,6 +1509,9 @@ mod tests {
         };
         let launch = Launch {
             args: 0..4,
+            // The one scalar above, so the arm reads its `rows` mark before
+            // it starts asking the resolver for handles.
+            params: 0..1,
             ..sample_launch()
         };
         let out = plan(

@@ -48,6 +48,8 @@ use model::catalog::{MetalBinding, Variant};
 use model_compiler::lower::{Arg, Fire, Row, lower};
 use model_ir::trace::FireClass;
 
+use driver_metal::skip::{inapplicable, skipped};
+
 fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
 }
@@ -116,7 +118,7 @@ fn served(
         // finds neither `model.safetensors` nor its index -- the only refusal
         // that means "there was nothing here to read in the first place".
         Err(e) if format!("{e:?}").contains("no model.safetensors") => {
-            eprintln!("SKIP: {}: no weights, not a checkpoint", dir.display());
+            inapplicable(&format!("{}: no weights, not a checkpoint", dir.display()));
             return None;
         }
         Err(e) => panic!("{} did not read as a checkpoint: {e:?}", dir.display()),
@@ -124,7 +126,7 @@ fn served(
     let row = match model::catalog::identify(&meta, &model::catalog::Override::None) {
         Ok(row) => row,
         Err(why) => {
-            eprintln!("SKIP: {}: {why}", dir.display());
+            inapplicable(&format!("{}: {why}", dir.display()));
             return None;
         }
     };
@@ -230,11 +232,11 @@ fn names_the_text_states(row: &dyn Variant, binding: &MetalBinding) -> BTreeSet<
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_checkpoint_answers_the_names_the_text_states() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let Some((row, encoding)) = served(&snapshot) else {
@@ -311,7 +313,7 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     ) {
         Ok(g) => g,
         Err(why) => {
-            eprintln!("SKIP: the geometry refuses `{}` -- {}", row.id(), why.0);
+            inapplicable(&format!("the geometry refuses `{}` -- {}", row.id(), why.0));
             return;
         }
     };
@@ -364,11 +366,11 @@ fn the_checkpoint_answers_the_names_the_text_states() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn what_this_checkpoint_published() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let Some((row, encoding)) = served(&snapshot) else {

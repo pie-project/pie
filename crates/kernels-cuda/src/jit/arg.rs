@@ -1,4 +1,3 @@
-
 #[macro_export]
 macro_rules! arg_via_abi {
     ($($rust:ty),* $(,)?) => {

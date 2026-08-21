@@ -1,16 +1,15 @@
-
-use kernels::{Bind, Fire};
-use kernels_macros::routine;
 use crate::by_value;
 use core::ffi::c_void;
+use kernels::{Bind, Fire};
+use kernels_macros::routine;
 
-use crate::jit::{Ctx, Launch, Root};
 use crate::jit::abi::MaybeConst;
 use crate::jit::abi::Tensor;
+use crate::jit::{Ctx, Launch, Root};
+use crate::views::KvCache;
 use kernels::Refusal;
 use kernels::raises::Struct;
 use kernels::routine::{Const, In, Out};
-use crate::views::KvCache;
 
 pub use crate::jit::abi::DevicePtr;
 use kernels::Ty;
@@ -18,7 +17,6 @@ use kernels::Ty;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct KvCacheList {
-
     pub k_cache: DevicePtr,
     pub v_cache: DevicePtr,
     pub page_list: DevicePtr,
@@ -41,7 +39,6 @@ by_value! {
 }
 
 impl KvCacheList {
-
     #[must_use]
     pub const fn paged(
         k_cache: DevicePtr,
@@ -50,7 +47,13 @@ impl KvCacheList {
         seq_len_list: DevicePtr,
         max_pages_per_seq: u32,
     ) -> Self {
-        Self { k_cache, v_cache, page_list, seq_len_list, max_pages_per_seq }
+        Self {
+            k_cache,
+            v_cache,
+            page_list,
+            seq_len_list,
+            max_pages_per_seq,
+        }
     }
 }
 
@@ -73,18 +76,35 @@ impl crate::jit::Abi for *const XqaIoHead {
 }
 
 impl kernels::Elem for XqaIoHead {
-
     type Read = *const XqaIoHead;
     type Write = *mut XqaIoHead;
 
-    unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
-
-        unsafe { read.add(elems) }
+    /// The pointer, unchanged, and that is the whole of it.
+    ///
+    /// `XqaIoHead` is an empty enum standing for a C++ `IOHead` this side
+    /// never lays out, so Rust sizes it at zero and `add(elems)` is an
+    /// offset that cannot move -- `clippy::zst_offset` denies it outright,
+    /// and it is right to: an expression that reads as arithmetic and does
+    /// nothing is worse than one that says it does nothing. `raises.rs`
+    /// writes the same degenerate case for the same reason.
+    ///
+    /// A head is not an array. Nothing splits one by rows, so `elems` is
+    /// only ever zero here.
+    ///
+    /// # Safety
+    ///
+    /// Trivially upheld: the result is the argument.
+    unsafe fn advance_read(read: Self::Read, _elems: usize) -> Self::Read {
+        read
     }
 
-    unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
-
-        unsafe { write.add(elems) }
+    /// [`Self::advance_read`]'s counterpart, and the same degenerate case.
+    ///
+    /// # Safety
+    ///
+    /// [`Self::advance_read`]'s.
+    unsafe fn advance_write(write: Self::Write, _elems: usize) -> Self::Write {
+        write
     }
 
     const CPP_CONST: &'static str = "const IOHead*";
@@ -104,7 +124,10 @@ impl crate::jit::Abi for *mut XqaIoHead {
     fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
         match value {
             crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<XqaIoHead>()),
-            _ => Err(kernels::Refusal::Kind { at, want: Ty::BufMut }),
+            _ => Err(kernels::Refusal::Kind {
+                at,
+                want: Ty::BufMut,
+            }),
         }
     }
 }
@@ -112,7 +135,6 @@ impl crate::jit::Abi for *mut XqaIoHead {
 crate::arg_via_abi!(*mut XqaIoHead);
 
 pub struct XqaVariant {
-
     pub unit: &'static str,
     pub options: &'static [&'static str],
     pub entry: &'static str,
@@ -265,8 +287,13 @@ const OPTIONS_GQA4_P32: [&str; 18] = options_of(2);
 const OPTIONS_GQA5_P32: [&str; 18] = options_of(3);
 const OPTIONS_GQA8_P32: [&str; 18] = options_of(4);
 
-const OPTION_SETS: [&[&str]; 5] =
-    [&OPTIONS_GQA2_P32, &OPTIONS_GQA2_P16, &OPTIONS_GQA4_P32, &OPTIONS_GQA5_P32, &OPTIONS_GQA8_P32];
+const OPTION_SETS: [&[&str]; 5] = [
+    &OPTIONS_GQA2_P32,
+    &OPTIONS_GQA2_P16,
+    &OPTIONS_GQA4_P32,
+    &OPTIONS_GQA5_P32,
+    &OPTIONS_GQA8_P32,
+];
 
 pub static OPTIONS: [&[&str]; 5] = OPTION_SETS;
 
@@ -286,8 +313,13 @@ pub static ROOT_GQA5_P32: Root = mha_root(3);
 
 pub static ROOT_GQA8_P32: Root = mha_root(4);
 
-pub static ROOTS: [&Root; 5] =
-    [&ROOT_GQA2_P32, &ROOT_GQA2_P16, &ROOT_GQA4_P32, &ROOT_GQA5_P32, &ROOT_GQA8_P32];
+pub static ROOTS: [&Root; 5] = [
+    &ROOT_GQA2_P32,
+    &ROOT_GQA2_P16,
+    &ROOT_GQA4_P32,
+    &ROOT_GQA5_P32,
+    &ROOT_GQA8_P32,
+];
 
 pub mod inst {
 
@@ -311,7 +343,11 @@ const MAX_PAGE_BUCKET: i32 = 4096;
 #[must_use]
 pub const fn page_bucket(max_pages_per_seq: i32) -> i32 {
     let mut bucket = 1i32;
-    let pages = if max_pages_per_seq > 1 { max_pages_per_seq } else { 1 };
+    let pages = if max_pages_per_seq > 1 {
+        max_pages_per_seq
+    } else {
+        1
+    };
     while bucket < pages && bucket < MAX_PAGE_BUCKET {
         bucket <<= 1;
     }
@@ -325,7 +361,6 @@ pub const fn gqa2_page16_enabled() -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XqaMember {
-
     Gqa2Page32,
     Gqa2Page16,
     Gqa4Page32,
@@ -335,7 +370,6 @@ pub enum XqaMember {
 }
 
 impl XqaMember {
-
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
@@ -418,7 +452,6 @@ const SCRATCH_ALIGN: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 struct Carve {
-
     page_table: *mut i32,
     seq_lens: *mut u32,
     scratch: *mut c_void,
@@ -432,7 +465,9 @@ fn carve(
     max_pages_per_seq: i32,
 ) -> Result<Carve, Refusal> {
     if float_buffer.is_null() {
-        return Err(Refusal::Null { what: "the attention workspace's float buffer" });
+        return Err(Refusal::Null {
+            what: "the attention workspace's float buffer",
+        });
     }
     let bucket = page_bucket(max_pages_per_seq);
     let requests = num_requests.unsigned_abs() as usize;
@@ -447,7 +482,9 @@ fn carve(
         return Err(Refusal::Wide {
             what: "the XQA workspace carve's scratch offset",
             at: i64::try_from(p_scratch - base).unwrap_or(i64::MAX),
-            max: i64::try_from(float_bytes).unwrap_or(i64::MAX).saturating_sub(1),
+            max: i64::try_from(float_bytes)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(1),
         });
     }
 
@@ -467,13 +504,17 @@ unsafe fn zero_on_stream(ctx: &Ctx<'_>, at: *mut c_void, bytes: usize) -> Result
     if code == cudaError::cudaSuccess {
         Ok(())
     } else {
-        Err(Refusal::Device { why: "the XQA semaphore bank could not be zeroed" })
+        Err(Refusal::Device {
+            why: "the XQA semaphore bank could not be zeroed",
+        })
     }
 }
 
 #[cfg(not(feature = "_cuda"))]
 unsafe fn zero_on_stream(_ctx: &Ctx<'_>, _at: *mut c_void, _bytes: usize) -> Result<(), Refusal> {
-    Err(Refusal::Device { why: "this build selected no CUDA runtime" })
+    Err(Refusal::Device {
+        why: "this build selected no CUDA runtime",
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -486,22 +527,26 @@ pub fn build_xqa_metadata(
     seq_lens: *mut u32,
     num_requests: i32,
     max_pages_per_seq: i32,
-    page_size: i32) -> Result<(), Refusal> {
-
+    page_size: i32,
+) -> Result<(), Refusal> {
     const METADATA_BLOCK: u32 = 128;
 
     let bucket = page_bucket(max_pages_per_seq);
 
-    ctx.fire(Fire::at("attn/attention_xqa.cuh", "::pie::attn::build_xqa_metadata").apply(Launch::per_row(num_requests.unsigned_abs(), METADATA_BLOCK)), &[
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                kv_last_page_lens.arg(),
-                page_table.arg(),
-                seq_lens.arg(),
-                num_requests.arg(),
-                bucket.arg(),
-                page_size.arg(),
-            ])
+    ctx.fire(
+        Fire::at("attn/attention_xqa.cuh", "::pie::attn::build_xqa_metadata")
+            .apply(Launch::per_row(num_requests.unsigned_abs(), METADATA_BLOCK)),
+        &[
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            kv_last_page_lens.arg(),
+            page_table.arg(),
+            seq_lens.arg(),
+            num_requests.arg(),
+            bucket.arg(),
+            page_size.arg(),
+        ],
+    )
 }
 
 #[routine(whole)]
@@ -514,9 +559,12 @@ pub fn attention_xqa_decode_bf16_prepared(
     head_dim: Const<i32>,
     kvc: In<Struct<KvCache>>,
     sm_scale: Const<f32>,
-    num_requests: Const<i32>) -> Result<(), Refusal> {
+    num_requests: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
 
@@ -552,7 +600,9 @@ pub fn attention_xqa_decode_bf16_prepared(
     const XQA_CTA_TILE_X: u32 = 256;
 
     let Some(major) = ctx.compute_capability_major() else {
-        return Err(Refusal::Device { why: "the device would not say its compute capability" });
+        return Err(Refusal::Device {
+            why: "the device would not say its compute capability",
+        });
     };
     let major = i32::try_from(major).unwrap_or(0);
 
@@ -566,18 +616,26 @@ pub fn attention_xqa_decode_bf16_prepared(
         sm_scale,
         major,
     ) {
-        return Err(Refusal::Device { why: "XQA serves neither this shape nor this device" });
+        return Err(Refusal::Device {
+            why: "XQA serves neither this shape nor this device",
+        });
     }
     let ratio = num_q_heads / num_kv_heads;
     let Some(member) = XqaMember::dispatch(ratio, page_size, major) else {
-        return Err(Refusal::Device { why: "XQA serves neither this shape nor this device" });
+        return Err(Refusal::Device {
+            why: "XQA serves neither this shape nor this device",
+        });
     };
     let Some(root_at) = member.enrolled_at() else {
-        return Err(Refusal::Absent { what: "a root for the Hopper XQA body" });
+        return Err(Refusal::Absent {
+            what: "a root for the Hopper XQA body",
+        });
     };
 
     if kv_page_indices.is_null() || kv_page_indptr.is_null() || kv_last_page_lens.is_null() {
-        return Err(Refusal::Null { what: "the fire's paged-KV CSR" });
+        return Err(Refusal::Null {
+            what: "the fire's paged-KV CSR",
+        });
     }
 
     let batch = num_requests.unsigned_abs();
@@ -588,7 +646,9 @@ pub fn attention_xqa_decode_bf16_prepared(
     let max_seq_len = bucket.unsigned_abs() * page_size.unsigned_abs();
 
     if int_buffer.is_null() {
-        return Err(Refusal::Null { what: "the attention workspace's int buffer" });
+        return Err(Refusal::Null {
+            what: "the attention workspace's int buffer",
+        });
     }
     let semaphores: *mut u32 = int_buffer.cast();
     let semaphore_bytes = batch as usize * kv_heads as usize * core::mem::size_of::<u32>();
@@ -641,21 +701,21 @@ pub fn attention_xqa_decode_bf16_prepared(
             .unit(ROOTS[root_at].name)
             .apply(Launch::grid([sub_seqs, kv_heads, batch], XQA_BLOCK).smem(XQA_SMEM_BYTES)),
         &[
-                kv_heads.arg(),
-                1.0f32.arg(),
-                MaybeConst::<f32>::none().arg(),
-                o.arg(),
-                q.arg(),
-                MaybeConst::<f32>::none().arg(),
-                cache.arg(),
-                batch.arg(),
-                1.0f32.arg(),
-                MaybeConst::<f32>::none().arg(),
-                stride_page.arg(),
-                stride_token.arg(),
-                stride_head.arg(),
-                semaphores.arg(),
-                regions.scratch.arg(),
+            kv_heads.arg(),
+            1.0f32.arg(),
+            MaybeConst::<f32>::none().arg(),
+            o.arg(),
+            q.arg(),
+            MaybeConst::<f32>::none().arg(),
+            cache.arg(),
+            batch.arg(),
+            1.0f32.arg(),
+            MaybeConst::<f32>::none().arg(),
+            stride_page.arg(),
+            stride_token.arg(),
+            stride_head.arg(),
+            semaphores.arg(),
+            regions.scratch.arg(),
         ],
     )
 }

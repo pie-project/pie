@@ -1,6 +1,5 @@
-
-use kernels::routine::Fire;
 use core::ffi::c_void;
+use kernels::routine::Fire;
 
 use kernels::routine::{Backend, Extent, Refusal};
 
@@ -25,11 +24,7 @@ impl Backend for Cuda {
 }
 
 impl kernels::routine::Answers<Cuda> for Ctx<'_> {
-    fn resolve(
-        &self,
-        ty: kernels::Ty,
-        source: kernels::Source,
-    ) -> Result<ArgValue, Refusal> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         self.env
             .ok_or(Refusal::Unstated {
                 what: "a fact, on a context built for a hand-written call: \
@@ -41,7 +36,6 @@ impl kernels::routine::Answers<Cuda> for Ctx<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Launch {
-
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub smem: u32,
@@ -55,21 +49,35 @@ impl kernels::routine::Geometry for Launch {
 }
 
 impl Launch {
-
     #[must_use]
     pub const fn flat(n: u32, block: u32) -> Self {
         let grid = if block == 0 { 0 } else { n.div_ceil(block) };
-        Self { grid: [grid, 1, 1], block: [block, 1, 1], smem: 0, cooperative: false }
+        Self {
+            grid: [grid, 1, 1],
+            block: [block, 1, 1],
+            smem: 0,
+            cooperative: false,
+        }
     }
 
     #[must_use]
     pub const fn per_row(rows: u32, block: u32) -> Self {
-        Self { grid: [rows, 1, 1], block: [block, 1, 1], smem: 0, cooperative: false }
+        Self {
+            grid: [rows, 1, 1],
+            block: [block, 1, 1],
+            smem: 0,
+            cooperative: false,
+        }
     }
 
     #[must_use]
     pub const fn grid(grid: [u32; 3], block: [u32; 3]) -> Self {
-        Self { grid, block, smem: 0, cooperative: false }
+        Self {
+            grid,
+            block,
+            smem: 0,
+            cooperative: false,
+        }
     }
 
     #[must_use]
@@ -136,7 +144,12 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-
+    /// A context on a stream, answering nothing else.
+    ///
+    /// # Safety
+    ///
+    /// `stream` must be a live CUDA stream in the current context, and must
+    /// stay live for as long as the returned `Ctx` is used to fire.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
@@ -148,12 +161,26 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// The same context, carrying a cuBLAS handle for the routines that want one.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live `cublasHandle_t` in the current context, and
+    /// its stream must be this context's -- a handle set to another stream
+    /// orders its work against the wrong queue.
     #[must_use]
     pub const unsafe fn with_cublas(mut self, handle: *mut c_void) -> Self {
         self.cublas = handle;
         self
     }
 
+    /// The same context, carrying the communicator a collective fires on.
+    ///
+    /// # Safety
+    ///
+    /// `plane` must name a communicator that is live and whose every rank is
+    /// making the same call in the same order; a collective that one rank
+    /// skips hangs the rest.
     #[must_use]
     pub const unsafe fn with_comm(mut self, plane: Plane) -> Self {
         self.comm = Some(plane);
@@ -173,14 +200,18 @@ impl<'a> Ctx<'a> {
 
     pub fn cublas(&self) -> Result<*mut c_void, Refusal> {
         if self.cublas.is_null() {
-            return Err(Refusal::Absent { what: "a cuBLAS handle" });
+            return Err(Refusal::Absent {
+                what: "a cuBLAS handle",
+            });
         }
         Ok(self.cublas)
     }
 
     pub fn comm(&self) -> Result<Plane, Refusal> {
         let Some(plane) = self.comm else {
-            return Err(Refusal::Absent { what: "a tensor-parallel plane" });
+            return Err(Refusal::Absent {
+                what: "a tensor-parallel plane",
+            });
         };
         Ok(plane)
     }
@@ -194,7 +225,9 @@ impl<'a> Ctx<'a> {
         #[cfg(not(feature = "_cuda"))]
         {
             let _ = (name, bytes);
-            Err(Refusal::Device { why: "this build selected no CUDA runtime" })
+            Err(Refusal::Device {
+                why: "this build selected no CUDA runtime",
+            })
         }
     }
 
@@ -219,12 +252,13 @@ impl<'a> Ctx<'a> {
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            Err(Refusal::Device { why: "this build selected no CUDA runtime" })
+            Err(Refusal::Device {
+                why: "this build selected no CUDA runtime",
+            })
         }
     }
 
     pub fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-
         let root = if fire.unit.is_empty() {
             match Root::of(fire.file) {
                 Some(root) => root,
@@ -290,7 +324,9 @@ impl<'a> Ctx<'a> {
         _launch: Launch,
         _args: &[ArgValue],
     ) -> Result<(), Refusal> {
-        Err(Refusal::Device { why: "this build selected no CUDA runtime" })
+        Err(Refusal::Device {
+            why: "this build selected no CUDA runtime",
+        })
     }
 }
 
@@ -304,7 +340,14 @@ fn said(root: &str, instantiation: &str, why: &str) -> Refusal {
     if let Ok(mut said) = said.lock()
         && said.insert(instantiation.to_owned())
     {
-        tracing::error!(root, instantiation, why, "a device instantiation will not fire");
+        tracing::error!(
+            root,
+            instantiation,
+            why,
+            "a device instantiation will not fire"
+        );
     }
-    Refusal::Device { why: "the compile, the load or the launch refused; see the log" }
+    Refusal::Device {
+        why: "the compile, the load or the launch refused; see the log",
+    }
 }

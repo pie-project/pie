@@ -71,8 +71,18 @@ use tensor_compiler::codegen::program::{Backend, emit_program};
 // the versions below are restatements of constants that already describe their
 // output, not a judgement about whether a cache should be discarded; the
 // judgement was made and is recorded in the dumps.
+// Re-pinned a third time, again without a bump, and again on the reasoning the
+// paragraph above records rather than on convenience. `EmitError::
+// GeneratedRegionHasBoundary` now carries the offending library op's own name,
+// so the refusal reads `... (top_k)` instead of leaving the reader to add a
+// print to find out which op the partitioner lifted. The fingerprint hashes
+// `kernel.error` alongside `kernel.source`, deliberately, so it moved -- but
+// not one byte of any emitted SOURCE did, and the regions whose text changed
+// are exactly the ones that emit nothing at all. A cache keyed on version 22
+// therefore cannot hand back a cubin built from anything: there is no cubin.
+// Bumping would discard both drivers' caches to re-emit identical sources.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 22, 0xfb7e_ee65_ae13_ee7b),
+    ("cuda", 22, 0x5d98_7c38_15e8_2c41),
     ("metal", 36, 0x0f81_7250_caff_2a71),
 ];
 

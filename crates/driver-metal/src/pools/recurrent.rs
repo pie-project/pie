@@ -67,7 +67,11 @@ impl Pool {
                 new_conv.zero(0, new_conv.len())?;
                 state.zero(0, state.len())?;
             }
-            layers.push(Layer { conv, new_conv, state });
+            layers.push(Layer {
+                conv,
+                new_conv,
+                state,
+            });
         }
         Ok(Self { shape, layers })
     }

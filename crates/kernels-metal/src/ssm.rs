@@ -1,11 +1,11 @@
-use kernels::Grid;
 use kernels::BindMut;
-use kernels_macros::routine;
+use kernels::Grid;
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
-use kernels::raises::Struct;
 use crate::views::RecurrentState;
+use kernels::raises::Struct;
 
 fn head_rows(rows: i32, v_heads: i32) -> Result<u32, Refusal> {
     if rows <= 0 {
@@ -111,9 +111,12 @@ pub fn gdn_core(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -173,9 +176,12 @@ pub fn gdn_core_slotted(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -185,7 +191,8 @@ pub fn gdn_core_slotted(
     let rows = *rows;
     let grid = core_grid(rows, *v_heads, *v_dim)?;
     ctx.fire(
-        Fire::at("ssm/gdn_core.metal", "gdn_core_slotted_bfloat16").apply(Grid::of(grid, core_group(grid))),
+        Fire::at("ssm/gdn_core.metal", "gdn_core_slotted_bfloat16")
+            .apply(Grid::of(grid, core_group(grid))),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -239,9 +246,12 @@ pub fn gdn_prep(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -303,9 +313,12 @@ pub fn gdn_prep_slotted(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -314,7 +327,8 @@ pub fn gdn_prep_slotted(
     let rows = *rows;
     let grid = prep_grid(rows, *v_heads)?;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_prep_slotted_bfloat16").apply(Grid::of(grid, simd_group(grid))),
+        Fire::at("ssm/gdn_prep.metal", "gdn_prep_slotted_bfloat16")
+            .apply(Grid::of(grid, simd_group(grid))),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -366,9 +380,12 @@ pub fn gdn_core_recurrent(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -377,7 +394,8 @@ pub fn gdn_core_recurrent(
     let rows = *rows;
     let grid = core_grid(rows, *v_heads, *v_dim)?;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_core_recurrent_bfloat16").apply(Grid::of(grid, core_group(grid))),
+        Fire::at("ssm/gdn_prep.metal", "gdn_core_recurrent_bfloat16")
+            .apply(Grid::of(grid, core_group(grid))),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -426,9 +444,12 @@ pub fn gdn_core_recurrent_slotted(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -438,7 +459,8 @@ pub fn gdn_core_recurrent_slotted(
     let rows = *rows;
     let grid = core_grid(rows, *v_heads, *v_dim)?;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_core_recurrent_slotted_bfloat16").apply(Grid::of(grid, core_group(grid))),
+        Fire::at("ssm/gdn_prep.metal", "gdn_core_recurrent_slotted_bfloat16")
+            .apply(Grid::of(grid, core_group(grid))),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -491,9 +513,12 @@ pub fn gdn_prep_prefill(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    n_scan: Const<i32>) -> Result<(), Refusal> {
+    n_scan: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -509,7 +534,8 @@ pub fn gdn_prep_prefill(
     }
     let grid = prep_grid(n_scan, *v_heads)?;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_prep_prefill_bfloat16").apply(Grid::of(grid, simd_group(grid))),
+        Fire::at("ssm/gdn_prep.metal", "gdn_prep_prefill_bfloat16")
+            .apply(Grid::of(grid, simd_group(grid))),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -563,9 +589,12 @@ pub fn gdn_core_recurrent_prefill(
     lanes: Const<i32>,
     vrows: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
-    n_scan: Const<i32>) -> Result<(), Refusal> {
+    n_scan: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let rstate = rsv.state;
@@ -596,7 +625,8 @@ pub fn gdn_core_recurrent_prefill(
                 "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
                 "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
             ][point],
-        ).apply(Grid::of(grid, simd_group(grid))),
+        )
+        .apply(Grid::of(grid, simd_group(grid))),
         &[
             pad.arg(),
             pad.arg(),

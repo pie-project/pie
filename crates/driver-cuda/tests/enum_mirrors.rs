@@ -146,7 +146,10 @@ const DEVICE: &str = "crates/kernels-cuda/kernels/attn/attention_naive_paged.cuh
 /// thing that claim was standing in for.
 #[test]
 fn the_kv_cache_scheme_mirrors_the_device() {
-    let rust = enumerators(&read("crates/driver-cuda/src/bind/abi.rs"), "pub enum KvCacheScheme");
+    let rust = enumerators(
+        &read("crates/driver-cuda/src/bind/abi.rs"),
+        "pub enum KvCacheScheme",
+    );
     let device = enumerators(&read(DEVICE), "enum class KvScheme");
     mirrors("KvCacheScheme", &rust, &device);
 }

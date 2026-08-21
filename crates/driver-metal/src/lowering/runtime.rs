@@ -73,7 +73,10 @@ fn table_of(name: &str) -> Option<FireTable> {
         "sampling_indices" => FireTable::SamplingIndices,
         // Tier-2 on the vocabulary, tier-1 on this driver: the rope table is
         // staged every fire and the rope routines take it as an operand.
-        "rope_frequencies" => FireTable::RopeFrequencies,
+        // The name is dotted because the load-time signature check refuses
+        // an undotted runtime name outside the tier-1 floor — the plane owns
+        // the spelling, not the vocabulary.
+        "rope.frequencies" => FireTable::RopeFrequencies,
         _ => return None,
     })
 }

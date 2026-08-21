@@ -4,7 +4,7 @@
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 320
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: nucleus_sample#0 fused#1 flips ok:false -> ok:true, which is the whole change: the CUDA emitter refused every RegionKind::Library for being one, but it implements no library kernels, so that refusal reached the driver as Slot::Refused, the driver skipped the region, and the sampler's 13-node chain never ran -- every nonzero temperature published token 0. Emittability is now decided per node, so a 13-node lift over ordinary ops emits and the single-op lifts (library_op 1/2/4/5, nodes=1) are still refused, by the check that names what they wrap.
+#   reason: EmitError::GeneratedRegionHasBoundary now carries the offending library op's own name, so the refusal reads 'generated region contains a non-generated boundary (top_k)' rather than leaving the reader to add a print to find out which op the partitioner lifted. Text only: no runtime/cuda source changed, no verdict changed, and every previously refused region is still refused for the same reason.
 === beam_epilogue#0 singleton#0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
@@ -78,7 +78,7 @@ error:
 === beam_epilogue#0 singleton#14
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 === end
 === beam_epilogue#0 singleton#15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
@@ -423,7 +423,7 @@ error:
 === beam_epilogue#0 fused#1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 === end
 === beam_epilogue#0 fused#2
 region: library=0 library_op=0 schedule=1 nodes=67 inputs=2 outputs=0 sinks=15
@@ -608,7 +608,7 @@ error:
 === lora_prologue#0 singleton#3
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === lora_prologue#0 fused#0
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
@@ -618,7 +618,7 @@ error:
 === lora_prologue#0 fused#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === matrix_mask_apply_packed#0 singleton#0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
@@ -758,7 +758,7 @@ error:
 === mtp_verify_tail#0 singleton#13
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (scan)
 === end
 === mtp_verify_tail#0 singleton#14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
@@ -823,7 +823,7 @@ error:
 === mtp_verify_tail#0 fused#1
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (scan)
 === end
 === mtp_verify_tail#0 fused#2
 region: library=0 library_op=0 schedule=1 nodes=11 inputs=3 outputs=0 sinks=3
@@ -938,7 +938,7 @@ error:
 === pentathlon_iter#0 singleton#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === pentathlon_iter#0 singleton#2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -958,7 +958,7 @@ error:
 === pentathlon_iter#0 singleton#5
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === pentathlon_iter#0 fused#0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
@@ -968,7 +968,7 @@ error:
 === pentathlon_iter#0 fused#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === pentathlon_iter#0 fused#2
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=1 outputs=1 sinks=0
@@ -978,7 +978,7 @@ error:
 === pentathlon_iter#0 fused#3
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === pentathlon_iter#1 singleton#0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
@@ -1138,7 +1138,7 @@ error:
 === pentathlon_iter#1 singleton#31
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 === end
 === pentathlon_iter#1 singleton#32
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
@@ -1178,7 +1178,7 @@ error:
 === pentathlon_iter#1 fused#1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 === end
 === pentathlon_iter#1 fused#2
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
@@ -1518,7 +1518,7 @@ error:
 === synthetic_sort_desc#0 singleton#1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (sort)
 === end
 === synthetic_sort_desc#0 singleton#2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
@@ -1538,7 +1538,7 @@ error:
 === synthetic_sort_desc#0 fused#1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (sort)
 === end
 === synthetic_sort_desc#0 fused#2
 region: library=0 library_op=0 schedule=0 nodes=2 inputs=2 outputs=0 sinks=2
@@ -1558,7 +1558,7 @@ error:
 === synthetic_matmul#0 singleton#2
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (matmul)
 === end
 === synthetic_matmul#0 singleton#3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
@@ -1573,7 +1573,7 @@ error:
 === synthetic_matmul#0 fused#1
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (matmul)
 === end
 === synthetic_matmul#0 fused#2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
@@ -1623,7 +1623,7 @@ error:
 === synthetic_sink_call#0 singleton#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end
 === synthetic_sink_call#0 fused#0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -1633,5 +1633,5 @@ error:
 === synthetic_sink_call#0 fused#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 === end

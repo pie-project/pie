@@ -86,7 +86,8 @@ pub struct Shell {
     pub(crate) channels: std::collections::BTreeMap<u64, ChannelState>,
     /// The host-pinned KV swap pool where `copy_kv`'s host domain lands:
     /// page-granular, per layer, both planes. Grown by highest page id touched.
-    pub(crate) swap: Option<SwapPool>,    /// The adapter staging's bump arena, driver-lifetime: reset each fire, grown
+    pub(crate) swap: Option<SwapPool>,
+    /// The adapter staging's bump arena, driver-lifetime: reset each fire, grown
     /// on demand. Must never retire a block an in-flight fire may still read.
     pub(crate) lora_arena: crate::fire::lora::LoraStageArena,
     /// The fire scratch held per driver: the attention workspace and both
@@ -428,7 +429,6 @@ impl KvState {
             .map(|l| self.cache.layer_view(i32::try_from(l).unwrap_or(0)))
             .collect()
     }
-
 }
 
 /// The hybrid's driver-owned GDN state via the ported [`RecurrentStateCache`]: one
@@ -808,4 +808,3 @@ pub(crate) fn instance_ring_shapes(
 pub(crate) fn channel_dtype(byte: u8) -> driver::tensor_ir::DType {
     driver::tensor_ir::DType::from_wire(byte).unwrap_or(driver::tensor_ir::DType::F32)
 }
-

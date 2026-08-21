@@ -95,6 +95,355 @@ struct Params {
 // the arithmetic is dead there and the allocation is not. `quant::qmv_fast`
 // row, which is also exactly when `Rule::Qmv`'s quartered x extent differs
 // from the row count.
+// Row-groups of four per workgroup. `kernels_wgpu::quant::QMV_ROWREP` divides
+// the grid by this, so the total work is fixed and only the DISPATCH SIZE
+// moves -- which is the one thing the GB/s table above says this kernel is
+// sensitive to. One is the shipped value; two and four exist to measure the
+// slope from the wrong side, since making the grid bigger needs a model-crate
+// join and making it smaller needs only this.
+//
+// # AND THE SLOPE IS STEEP. THIS IS THE MEASUREMENT THE TABLE ABOVE PREDICTED
+//
+// Three interleaved rounds, 200 samples, `what_a_decode_costs_at_length`,
+// p50 ms of a 512-key qwen3-0.6b decode:
+//
+// | PIE_ROWREP | grid | round 1 | round 2 | round 3 | mean | cost |
+// | --- | --- | --- | --- | --- | --- | --- |
+// | 1 | rows/4 | 9.598 | 9.644 | 9.568 | 9.603 | |
+// | 2 | rows/8 | 10.213 | 10.293 | 10.326 | 10.277 | **+7.0%** |
+// | 4 | rows/16 | 12.116 | 12.651 | 12.577 | 12.448 | **+29.6%** |
+//
+// Non-overlapping at every round, and the three configurations do the
+// IDENTICAL work: same codes unpacked, same bytes read, same reduction depth,
+// same stores. The only thing that changed is how many workgroups the grid
+// asks for. Against the 3.20 ms qmv spends in a decode that is +21% for one
+// halving and +89% for two -- superlinear, so the curve is still climbing at
+// the shipped grid and a DOUBLING should still pay.
+//
+// It took a knob that goes the wrong way to get, because the right way needs a
+// quantization-aware join in the model crate.
+//
+// # AND THE WRONG WAY WAS THE ONLY WAY IT WORKS. SEE `PIE_ROWW`
+//
+// Every sentence in the paragraph above about a DOUBLING is wrong, and the
+// measurement that killed it is under `PIE_ROWW`. This table is the falling
+// edge of a knee that the shipped grid already sits on top of: halving the
+// grid costs 7% and 30%, and doubling it, measured directly, buys nothing
+// within a percent. The curve is not superlinear through the operating point;
+// it is flat above it and steep below it, and reading a slope on one side as
+// a prediction for the other is the mistake this file made twice in one
+// afternoon -- once with the GB/s table and once with this one.
+//
+// It also retires a suspicion. Six probes have now said this kernel's inner
+// loop is free -- ALU 2.4%, load issue 0.7%, wider workgroups worse twice --
+// and this is the first one that moved the number. The kernel is fine. The
+// dispatch is too small.
+//
+// # THE CHANGE THIS ASKS FOR, WHICH IS TWO ROWS A WORKGROUP AND NOT A KNOB
+//
+// `PIE_ROWREP` can only go the wrong way, because a workgroup already covers
+// the smallest number of rows the code can express: four, the width of the
+// `vec4<u32>` that `block_dot1` loads and the `vec4<f32>` it accumulates. Cut
+// that to two and the grid DOUBLES at fixed work -- each row is still read by
+// exactly one workgroup's thirty-two lanes, so the weight traffic is
+// unchanged; only the activation is re-read, and it is a kilobyte the cache
+// already holds.
+//
+// The slope above says that is worth roughly what `PIE_ROWREP = 2` costs, ~7%
+// of a decode, and unlike the join in `turns.rs` it applies to EVERY fire --
+// including `o_proj` and `down_proj`, which are 56 `affine_qmv_fast_residual`
+// launches that no join can ever reach because they have no sibling to be
+// joined to. It needs no model crate, no contract change and no new launch.
+// It is the largest self-contained win left in this file and the two changes
+// compose: a joined q||k||v at two rows a workgroup is a 2048-workgroup
+// dispatch where today there are three of 512, 256 and 256.
+//
+// What it costs to write, honestly: `block_dot1`, `block_dot2` and `block_dot`
+// all carry rows in a `vec4`, `reduce_store`'s tree and store both walk `r` to
+// four, and `qmv_partials` is sized `4 * PIE_MT * 32`. Every one of those is
+// mechanical and none of it is subtle -- except the slot arithmetic, which has
+// already cost one afternoon and three gpu tests (see the `mt > 1u` note
+// below) and which must be re-derived rather than pattern-matched.
+//
+// And one thing to MEASURE rather than assume: the prefill. A prefill fire has
+// many activation rows and is already a large dispatch, so it sits at the flat
+// end of the curve where doubling the grid buys nothing and doubling the
+// reduction-tree count costs something. If it regresses, the row width wants
+// to be a compile-time variant selected by the launcher on `vecs`, which the
+// `PIE_MT` arms already show how to do.
+const PIE_ROWREP = 1u;
+
+// Output rows a workgroup covers, and THE KNOB THAT PROVED THE GRID IS DONE.
+//
+// Four is what `block_dot1`'s `vec4` naturally holds. Two halves it and doubles
+// the grid at fixed weight traffic -- each row is still read by exactly one
+// workgroup's thirty-two lanes -- which is the direction `PIE_ROWREP`'s slope
+// appeared to be asking for. At two, the `vec4` still loads four rows and the
+// upper pair REPEATS the lower, so the loop does twice the arithmetic and half
+// of the loads are a second read of a line just touched. Both wastes are
+// separately measured cheap here (ALU 2.4%, duplicate load 0.7%), which is what
+// made a six-line probe worth more than the vec2 rewrite it stands in for.
+//
+// Three interleaved rounds, 200 samples, p50 ms:
+//
+// | | round 1 | round 2 | round 3 | mean |
+// | --- | --- | --- | --- | --- |
+// | four rows, grid rows/4 | 10.057 | 10.048 | 10.041 | 10.049 |
+// | two rows, grid rows/2 | 9.894 | 9.987 | 10.015 | 9.965 |
+//
+// **+0.84%, and the rounds overlap.** Against a predicted 7%.
+//
+// The obvious objection is the probe's own doubled arithmetic, so it was
+// removed: the same sweep with the cheap-unpack stub in `block_dot1` on BOTH
+// arms, which shrinks the duplicated work to a mask and a convert.
+//
+// | | round 1 | round 2 | round 3 | mean |
+// | --- | --- | --- | --- | --- |
+// | four rows | 9.731 | 9.727 | 9.841 | 9.766 |
+// | two rows | 9.824 | 9.797 | 9.886 | 9.836 |
+//
+// **-0.7%, worse in every round.** Taking the contamination out did not
+// uncover a win, it reversed the sign -- so the two experiments straddle zero
+// and the honest reading is that doubling this grid does NOTHING, +-1%.
+//
+// # WHAT THAT COSTS, WHICH IS THREE COMMITS' WORTH OF CONCLUSIONS
+//
+// The GB/s table above and the `PIE_ROWREP` table below both measure the grid
+// getting SMALLER, and both were read as slopes through the operating point.
+// They are not. There is a knee, the shipped grid sits on it, and below it the
+// cost is steep while above it the curve is flat. That is the ordinary shape
+// of a saturation curve and it is exactly the shape that punishes
+// extrapolation.
+//
+// So: the vec2 rewrite this knob was written to justify is DEAD, and so is the
+// "rate term" it lent the fusion rows in `driver-wgpu`'s `turns.rs`. Joining
+// q||k||v is worth its launch floor and nothing more.
+//
+// # THE 68 GB/s HAS A NAME NOW, AND HALF OF IT IS A FIXED COST
+//
+// The line above used to end "still unexplained". `PIE_WGPU_STAMP` times each
+// dispatch with the GPU's own clock, and a decode fires this kernel at three
+// shapes whose weight banks are all a clean multiple of each other. Weights
+// are 4-bit with bf16 scales AND biases every 64, so a bank is
+// `out * in / 2 + out * in / 64 * 4` bytes:
+//
+// ```text
+//   fire        out    in    bank        stamped
+//   k, v       1024  1024   0.5625 MiB    16.1 us
+//   q          2048  1024   1.1250 MiB    23.2 us
+//   gate, up   3072  1024   1.6875 MiB    31.0 us
+// ```
+//
+// Three points, and they are a straight line: **8.65 us + 13.24 us a MiB**.
+// The middle point, which the fit does not use, lands at 23.55 against 23.2 --
+// 1.5%, inside this machine's repeatability.
+//
+// So the marginal rate is **79.2 GB/s**, and the reason the whole-kernel figure
+// reads 68 is the intercept. A qmv fire costs **8.65 us before it reads a
+// byte**, which is 54% of the k projection and 12x the 0.71 us of dispatch
+// turnaround `device.rs` measured -- so it is not the launch, it is inside the
+// kernel. Every probe in this file changed the SLOPE and the slope was never
+// the problem.
+//
+// AND IT RE-ARGUES THE JOIN THIS KNOB JUST FINISHED DEMOTING. Above, `q||k||v`
+// is "worth its launch floor and nothing more", which at 0.71 us a launch is
+// 0.04 ms a token. On the fit it is worth the two intercepts it deletes:
+//
+// ```text
+//   q + k + v       23.2 + 16.1 + 16.1 = 55.4 us    joined 2.25 MiB -> 38.5
+//   gate + up              31.0 + 31.0 = 62.0 us    joined 3.375   -> 53.3
+// ```
+//
+// 16.9 and 8.7 us a layer, **0.72 ms a token between them, 7.4%**. Ten times
+// the launch-floor story, and for a reason that has nothing to do with
+// dispatch count. `turns.rs` carries the same arithmetic.
+//
+// # AND THEN A FOURTH POINT BROKE THE FIT, WHICH IS THE SIXTH RULE AGAIN
+//
+// The lm head is a qmv too -- 151936 rows over 1024, a **83.4 MiB** bank in
+// one 37984-group fire -- and it had never appeared in the stamp table because
+// Metal loses the last two encoders' counters. `device.rs` now spends two
+// sacrificial one-workgroup dispatches to buy its number back. It reads
+// **666 us**. The line above predicts 1113.
+//
+// ```text
+//    0.5625 MiB    16.1 us     36.6 GB/s
+//    1.1250 MiB    23.2 us     50.8 GB/s
+//    1.6875 MiB    31.0 us     57.1 GB/s
+//   83.4000 MiB   666.0 us    131.3 GB/s
+// ```
+//
+// So there is no intercept, or not a constant one: **the rate rises with the
+// bytes in the fire**, 37 GB/s to 131 across this range, and a straight line
+// through three points 3x apart cannot be walked out to 50x. That is rule six
+// -- never extrapolate a curve past its measured direction -- caught for the
+// second time in this file, this time inside a fit rather than across one.
+//
+// It is BYTES and not workgroups, which is what makes it consistent with
+// `PIE_ROWW` above rather than a contradiction of it. `PIE_ROWW = 2` doubles
+// the grid at IDENTICAL bytes -- 256 groups to 512 -- and measured zero twice.
+// If the driver were the grid it would have read the 36.6 -> 50.8 step, 39%.
+// It did not. Something is amortised over the SIZE OF A FIRE, and a fire's
+// grid is not its size.
+//
+// WHAT SURVIVES FOR THE JOIN, stated as a bound rather than a fit. A joined
+// q||k||v is 2.25 MiB, which is bigger than every point in the fitted range,
+// and the rate is monotone in bytes -- so it runs at AT LEAST the 57.1 GB/s
+// the 1.6875 MiB fire gets:
+//
+// ```text
+//   q + k + v   55.4 us today   joined <= 41.3 us   saves >= 14.1 us a layer
+//   gate + up   62.0 us today   joined <= 62.0 us   saves >= 0
+// ```
+//
+// **q||k||v is worth at least 0.39 ms a token and the bound is a real one.**
+// `gate||up` is not proven at all: at 3.375 MiB its pessimistic bound is
+// exactly break-even, and only the rate's rise decides it. Measure that one,
+// do not assume it.
+//
+// # AND THEN THE TABLE LEARNED TO COUNT BYTES, AND THE CURVE BECAME A PLANE
+//
+// Every table above is keyed by entrypoint and grid, which silently averaged
+// qwen3's `o` and `down` -- both `affine_qmv_fast_residual` at [1,256,1], over
+// 1.125 and 1.6875 MiB -- into a single 21.9 us number that is neither.
+// `device.rs::charge` now sums the launch's bound buffer lengths into the key,
+// and the two came apart. So did the reason the "rate" was rising.
+//
+// Five points, per launch, windows 2 and 3 of a 512-key decode averaged (the
+// ordering below repeats identically in all three windows; window 1 is ~10%
+// faster across the board because its context is shorter):
+//
+// ```text
+//   entrypoint    out     in     MiB      measured
+//   k, v         1024   1024   0.566      15.85 us
+//   q            2048   1024   1.131      22.90 us
+//   gate, up     3072   1024   1.695      30.45 us
+//   o    (res)   1024   2048   1.133      20.35 us
+//   down (res)   1024   3072   1.697      23.15 us
+// ```
+//
+// **Read the last two against the first three.** `down` binds the same bytes
+// as `gate`/`up` -- 1.697 against 1.695 -- with a THIRD of the grid, and it is
+// 24% FASTER. `o` binds q's bytes with half the grid and is 11% faster. Both
+// gaps repeat in every window. So the cost is not the bytes either. What
+// distinguishes the pairs is the number of OUTPUT ROWS, and fewer is cheaper
+// at equal traffic.
+//
+// Fit `t = a + b*rows + c*MiB (+ d if residual)` on the three non-residual
+// points and the residual pair's slope, and every point lands:
+//
+// ```text
+//   a = 7.8 us      per fire
+//   b = 4.64 ns     per output row
+//   c = 4.96 us     per MiB   =  209 GB/s, against a 273 GB/s machine
+//   d = 2.2 us      for the residual variant's extra read and write
+//
+//   k, v    15.35 predicted   15.85 measured   +3%
+//   q       22.90             22.90             fitted
+//   gate    30.45             30.45             fitted
+//   o       20.36             20.35            +0.0%
+//   down    23.16             23.15            +0.0%
+// ```
+//
+// The residual pair is not fitted for `b` or `a` and lands within 0.01 us.
+// That is the whole "rate rises with bytes" story dissolved: there was never a
+// rate curve, there was a per-ROW term that grew alongside the bytes because
+// every one of the first three points holds `in` at 1024 and varies `out`.
+// Rule six, a third time, and this time the fix is a variable rather than a
+// caveat.
+//
+// **THE DECODE'S QMV IS LATENCY-BOUND, NOT BANDWIDTH-BOUND.** 209 GB/s of the
+// machine's 273 is already being had on the marginal byte; what is left is
+// 7.8 us a fire plus 4.6 ns a row, and at 768 workgroups an M4 Pro's 20 cores
+// are nowhere near occupied, so a row's latency is exposed instead of hidden.
+// Which is also why the lm head still misses: 151936 rows predicts 1128 us and
+// it reads ~800. At 37984 groups the machine IS occupied and the row term goes
+// under the bandwidth. The model above is a LOW-OCCUPANCY model and must not
+// be walked past the point where the GPU fills up -- rule six once more, now
+// stated in advance instead of after.
+//
+// # WHAT THIS SAYS ABOUT THE JOIN, WHICH IS NOW A PREDICTION
+//
+// A join does not delete rows, only fires. So the saving is `a` per fire
+// deleted, plus whatever the row term's non-linearity gives back -- and the
+// model says that is nothing, so this is a floor and a ceiling at once:
+//
+// ```text
+//   q + k + v   54.60 us today   joined 4096 rows, 2.263 MiB   38.0 us
+//               saves 16.6 us a layer  =  0.46 ms a token  (4.8%)
+//   gate + up   60.90 us today   joined 6144 rows, 3.390 MiB   53.1 us
+//               saves  7.8 us a layer  =  0.22 ms a token  (2.3%)
+// ```
+//
+// **0.68 ms a token, 7%, for both joins.** The bound-based estimate two
+// sections up said ">= 0.39 ms" for q||k||v from a different and worse model;
+// the two agree, which is the first time an estimate in this file has been
+// reproduced by an independent route. `gate||up` is no longer break-even --
+// under the row model it is a clear 0.22 ms, because the join deletes a whole
+// 7.8 us fixed cost and the bytes were never the problem.
+//
+// # `b` WAS THE TAIL LADDER, AND THE @subgroup TIER TAKES MOST OF IT
+//
+// The paragraph this replaces guessed: "per output row, then: the tail tree,
+// the scale and bias fetch, or the store." It was the tail tree, and the way
+// to find out was not to reason about it.
+//
+// `attn.rs` had just established the mechanism on a different kernel -- on
+// Metal a reduction LEVEL costs, not the adds in it, because a level is a
+// barrier and a workgroup-memory round trip and a level with four live lanes
+// costs what a level with thirty-two costs. `reduce_store` ends every
+// workgroup with five such levels over 32 lanes. This workgroup is
+// `@workgroup_size(32, 1, 1)`, which on any adapter whose subgroup is at least
+// 32 wide is EXACTLY ONE SUBGROUP, so all five fold into register exchanges
+// with no barrier at all. See `reduce_store` for the butterfly and why
+// `lim = min(32, subgroup_size)` makes it correct at any width.
+//
+// Same window of the same bench, `PIE_WGPU_TIER` switching tiers inside one
+// binary, per launch:
+//
+// ```text
+//                   baseline   subgroup
+//   q       2048 rows  21.0 us   17.2 us   -18%
+//   gate/up 3072 rows  28.2 us   22.9 us   -19%
+// ```
+//
+// **The saving scales with the ROWS, which is what identifies it.** q sheds
+// 3.8 us over 2048 rows and gate/up 5.3 over 3072 -- 1.86 and 1.73 ns a row,
+// the same number twice -- so what came out is 40% of `b` and nothing of `a`
+// or `c`. Refitting, `b` falls from 4.64 ns a row to about 2.8, and the rest
+// of it is still the scale and bias fetch or the store.
+//
+// End to end, three interleaved rounds with BOTH subgroup arms in (this one
+// and the attention ladder `attn.rs` describes):
+//
+// ```text
+//   round        1       2       3
+//   subgroup   7.671   7.772   7.747   ms a token
+//   baseline   9.667   9.575   9.574
+// ```
+//
+// **1.88 ms a token, 19.5%**, of which the attention ladder measured 0.54 on
+// its own, so this one is worth about 1.3.
+//
+// WHAT IT DOES TO THE JOIN, which is the other thing `b` was load-bearing for:
+// nothing. A join deletes FIRES, so it collects `a`, and `a` did not move --
+// q||k||v is still ~16 us a layer. It is a larger fraction of a smaller token
+// now, which is the only change.
+//
+// `a` is still "pipeline state or a cold bank", still 7.8 us, and is now the
+// biggest unexplained term in the smallest fire.
+const PIE_ROWW = 4u;
+
+// How many workgroups of row-groups ride the y axis before the rest go to z.
+//
+// `maxComputeWorkgroupsPerDimension` is 65535 and WebGPU guarantees it, so a
+// grid of rows/2 stops being expressible at 131072 rows -- which the lm head
+// passes on the model this file is tuned against, 151936 rows asking for
+// 75968. At four rows a workgroup it fit by a factor of two and nobody had to
+// know. It does not fit at two, so the row index is a two-digit number in base
+// `PIE_YTILE` and `kernels_wgpu::quant::qmv_grid` writes the digits.
+const PIE_YTILE = 65535u;
+
 const PIE_MT = 2u;
 
 // 4 output columns x `PIE_MT` activation rows x the 32 local-x lanes each
@@ -263,6 +612,144 @@ fn block_dot1(rows: vec4<u32>, vec_: u32, k0: u32) -> vec4<f32> {
         // ALU-bound: with the unpack stubbed out the kernel reads its weights
         // at 113 GB/s against this machine's ~120 GB/s roofline, so every
         // instruction removed here is time.
+        //
+        // # THAT ROOFLINE IS AN M4. THIS IS AN M4 PRO, AND IT IS NOT TRUE HERE
+        //
+        // 120 GB/s is the base M4: ten GPU cores, LPDDR5-7500 on a 128-bit
+        // bus. The part this file is now tuned against is an M4 Pro -- twenty
+        // cores, 273 GB/s -- so the sentence above is about a machine with 44%
+        // of this one's bandwidth, and "113 against 120" is a saturation claim
+        // that does not survive the move.
+        //
+        // Re-measured here, interleaved, `what_a_decode_costs_at_length`:
+        //
+        // | probe | p50 ms | worth |
+        // | --- | --- | --- |
+        // | (baseline) | 9.514 | |
+        // | the eight `unpack4x8unorm` and their eight multiplies replaced by a
+        //   mask and a convert | 9.285 | **2.4%** |
+        // | every weight word loaded TWICE (unfoldable runtime index) | 9.587 |
+        //   **-0.7%** |
+        //
+        // So on this part the unpack is 2.4% and the load ISSUE is nothing.
+        // Neither binds. What the kernel actually reads is 218 MB of weights
+        // across its 141 decode fires in 3.20 ms, which is **68 GB/s, a
+        // quarter of what the part will do** -- and the shortfall is not in
+        // this loop.
+        //
+        // # AND THE 68 GB/s IS AN ARTEFACT. THE BYTES ARE AT THE WALL.
+        //
+        // Everything below this heading divides the WHOLE kernel's time by the
+        // bytes it reads and calls the quotient a bandwidth. That is only a
+        // bandwidth if fetching the bytes is what the time is, and it is not.
+        //
+        // The `k0 = lid * PIE_QMV_VPT` above gives adjacent lanes a 16-byte
+        // stride at a 4-byte load, so a 32-lane instruction spans 512 bytes and
+        // uses 128, and 273/4 is 68 -- the measured number, exactly. That is a
+        // coalescing defect with a matching fingerprint, and the "every weight
+        // word loaded TWICE costs 0.7%" probe below CANNOT rule it out: a
+        // repeated load is answered by the cache and says nothing about the
+        // footprint the first one pulled in.
+        //
+        // So cut the footprint instead. `w[at.x]` four times in place of
+        // `w[at.{x,y,z,w}]` -- the four rows of the block all read the first
+        // row's words -- is a FOUR-fold cut in distinct weight bytes at an
+        // identical issue count, identical arithmetic and identical bindings.
+        // Wrong answers, so it is a probe. Two rounds against baselines of
+        // 7.440 and 7.451 ms:
+        //
+        // | probe | p50 ms | p50 ms | saved |
+        // | --- | --- | --- | --- |
+        // | one row's words for all four | 6.490 | 6.527 | **0.94 ms** |
+        //
+        // Linear in the footprint, a 4x cut that saves 0.94 ms means the whole
+        // fetch is 1.25 ms of qmv's measured 3.91. And the weight banks are
+        // 0.352 GB a token -- 252 MiB of layers plus an 83.8 MiB lm head -- so
+        //
+        //     0.352 GB / 1.25 ms  =  282 GB/s
+        //
+        // against this part's 273. **qmv reads its weights at the machine's
+        // wall.** There is no coalescing defect, the 16-byte stride costs
+        // nothing because the four words a lane wants are consecutive and the
+        // second, third and fourth `jw` trips hit lines the first pulled in,
+        // and the 68 GB/s never was a rate the memory system achieved.
+        //
+        // What it leaves is sharper than what it removes: **2.66 ms of qmv is
+        // not traffic at all**, 13.6 us across its 196 fires, in a kernel
+        // whose bytes are already saturated. Every remaining idea about this
+        // loop's LOADS is dead -- issue, coalescing, and now footprint -- and
+        // the whole of the gap is in what a fire costs before and around them.
+        //
+        // # WHAT THE 3.91 ms IS, LINE BY LINE, AND 61% OF IT IS STILL OPEN
+        //
+        // `turns.rs` measures this kernel family at 3.91 ms of a 7.45 ms token
+        // by deleting its fires. Every stream in a fire has now been priced by
+        // a probe that changes ONE of them and leaves issue count, bindings
+        // and grid alone. Two rounds each, against baselines of 7.440/7.451:
+        //
+        // | what the probe cuts | p50 ms | worth |
+        // | --- | --- | --- |
+        // | weight footprint 4x (one row's words for four) | 6.490 6.527 | **1.25 ms** |
+        // | 6 of 8 scale/bias loads, footprint 4x | 7.290 7.302 | **0.15 ms** |
+        // | activation footprint 32x (`x[(i>>1) & 3]`) | 7.461 7.449 | **tie** |
+        // | 124 of 128 dead `qmv_partials` stores | 7.494 | **tie** |
+        //
+        // ```text
+        //   weight traffic, at 282 GB/s          1.25 ms   32%
+        //   scales and biases                    0.15 ms    4%
+        //   the 4-bit unpack (2.4%, above)       0.09 ms    2%
+        //   activation loads                     0
+        //   the workgroup-memory tail            0
+        //                                      ---------  ----
+        //   unaccounted                          2.42 ms   61%
+        // ```
+        //
+        // THE ACTIVATION IS FREE and that is worth stating, because each of a
+        // fire's 256 workgroups reads the whole 2 KiB slice, so a fire touches
+        // as many activation bytes as weight bytes. Cutting the footprint 32x
+        // moved nothing: the same 2 KiB read by every workgroup is a cache hit
+        // and always was.
+        //
+        // THE DEAD STORES ARE FREE, WHICH IS THE SURPRISING ONE. Under the
+        // subgroup tier the butterfly leaves every lane of a block holding the
+        // block's sum, and the final read walks one lane a block -- so 31 of
+        // every 32 stores write a value nothing reads. Guarding them with
+        // `lid % lim == 0` is correct at both tiers (300 tests pass, baseline
+        // and subgroup) and strictly less work, and three interleaved rounds
+        // read 7.554/7.458/7.471 against 7.520/7.457/7.471. A tie, so it was
+        // reverted rather than shipped for tidiness. Same lesson the split
+        // attention's merge learned from the other side: **rearranging what
+        // touches workgroup memory buys nothing here, because the touching was
+        // never the price.**
+        //
+        // So six probes into the loop and two into the tail have found 38% of
+        // this kernel, and none of the remaining 2.42 ms -- 12.3 us across 196
+        // fires -- is a load, an unpack, a store or the grid. `PIE_ROWW` and
+        // `PIE_ROWREP` below say the grid is on a knee, flat above and steep
+        // below. What is left is what a fire costs to BE, and the only lever
+        // this file has on that is having fewer of them.
+        //
+        // It is in how little each fire is. Take the lm head out and 140 fires
+        // move 140 MB, 513 us of data at the part's rate, in 2.9 ms: 20.8 us a
+        // fire where the bytes are 1.8 us for a k/v plane and the launch floor
+        // is 6. The small projections are LATENCY-bound, not bandwidth-bound,
+        // and a k/v fire is 256 workgroups of 32 invocations -- 8192 threads
+        // for a twenty-core GPU, each doing one 32-code block and then a
+        // five-level tree.
+        //
+        // That reprices `fuse-qkv-quant` in `turns.rs`. Joining q, k and v is
+        // not worth two launch floors (0.34 ms); it makes ONE dispatch of 1024
+        // workgroups where there were three of 512, 256 and 256, and the
+        // measurement above says the dispatch size is what this kernel is
+        // short of. Same for gate and up.
+        //
+        // What is NOT worth trying, because it is measured: anything that makes
+        // this loop's arithmetic cheaper, and anything that merges its loads.
+        // The second is the surprise -- a lane reads four words per row four
+        // bytes at a time, sixteen-byte strided across the group, which looks
+        // exactly like a coalescing defect -- and issuing every one of them
+        // twice costs 0.7%, so folding them into one `vec4<u32>` load can buy
+        // at most that.
         //
         // `unpack4x8unorm` is Metal's `unpack_unorm4x8_to_float` and SPIR-V's
         // `UnpackUnorm4x8`: one instruction for four bytes. Masking the word
@@ -434,6 +921,52 @@ fn block_dot1(rows: vec4<u32>, vec_: u32, k0: u32) -> vec4<f32> {
 // adapter the second is dearer. The first attempt at this is recorded in the
 // list above; it is repeated here with numbers so the third attempt does not
 // happen.
+//
+// # THE LEFT COLUMN OF THAT TABLE IS THE ANSWER TO THE WHOLE KERNEL
+//
+// It was written to dismiss occupancy and it was read that way for a year.
+// Read the BASELINE column instead, against its dispatch size -- a workgroup
+// covers four output rows, so the grid is rows/4:
+//
+// | plane | workgroups | GB/s |
+// | --- | --- | --- |
+// | 512x2048 | 128 | 45 |
+// | 2048x2048 | 512 | 96 |
+// | 8192x2048 | 2048 | 149 |
+// | 128256x2048 | 32064 | 186 |
+//
+// **Monotone in the grid, over 4x from end to end, and nowhere near flat by
+// the last row.** That is not a property of the arithmetic -- every row runs
+// the identical loop -- it is the kernel saying it cannot fill a twenty-core
+// GPU until it is given tens of thousands of workgroups.
+//
+// READ THE `PIE_ROWW` NOTE BEFORE BELIEVING THE PARAGRAPH BELOW. Every row of
+// this table has a different amount of WORK as well as a different grid, so
+// "nowhere near flat" is a statement about two variables at once. Holding the
+// work fixed and doubling the grid -- which `PIE_ROWW` does -- moves nothing.
+// The plans drawn from this table survive as descriptions and not as levers.
+//
+// Now place the decode's real fires on that curve. qwen3-0.6b, hidden 1024:
+//
+// | fire | rows | workgroups | expected |
+// | --- | --- | --- | --- |
+// | k, v | 1024 | 256 | between 45 and 96 |
+// | q | 2048 | 512 | ~96 |
+// | gate, up | 3072 | 768 | ~100 |
+// | lm head | 151936 | 37984 | ~186 |
+//
+// The measured whole-kernel figure, 218 MB in 3.20 ms, is **68 GB/s** -- and
+// the fires are weighted toward the top of that table. The curve predicted the
+// number. qmv is not slow; it is being asked in pieces too small to be fast,
+// and the two probes in `block_dot1`'s note (ALU 2.4%, load issue free) are
+// what that looks like from inside the loop.
+//
+// So the lever is the GRID, and there are only two ways to grow it. Fewer
+// output rows per workgroup keeps the invocation count and doubles the groups
+// -- untried, and the only remaining intra-kernel move, since the two attempts
+// above prove wider is worse. Or JOIN THE FIRES, which is `turns.rs`'s fusion
+// table: q||k||v turns 512 + 256 + 256 into 1024 and gate||up turns 768 + 768
+// into 1536, both a step up this curve on top of the launches they delete.
 
 // One lane's block, for four output columns AND `PIE_MT` activation rows.
 //
@@ -745,8 +1278,7 @@ fn block_dot(rows: vec4<u32>, vecs: vec4<u32>, k0: u32) -> BlockM {
 }
 
 //#if !defined(PIE_WIDE_STRIDED)
-fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
-    let out0 = wg.y * 4u;
+fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>, out0: u32, sg: u32) {
     let vec0 = wg.x * PIE_MT;
 
     // How many activation rows the fire actually bound.
@@ -767,10 +1299,18 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
     // -- it keeps the lanes on the same trip count and the values are dropped
     // at the store, which already asks.
     let last = max(u32(params.out_vec_size), 1u) - 1u;
-    let rows = min(
-        vec4<u32>(out0, out0 + 1u, out0 + 2u, out0 + 3u),
-        vec4<u32>(last),
-    );
+    // At `PIE_ROWW == 2` the upper pair REPEATS the lower one rather than
+    // running off into the next workgroup's rows: `wbase` and `g` are the only
+    // things `block_dot1` derives from this, so a repeat costs two redundant
+    // word loads of an address the first pair just read and two redundant
+    // unpacks, and produces lanes `.z`/`.w` that the tree below never walks.
+    // Clamping to `last` instead would be wrong, not slow -- it would add row
+    // `last`'s products into a partial the store then attributes to `out0`.
+    var want = vec4<u32>(out0, out0 + 1u, out0 + 2u, out0 + 3u);
+    if PIE_ROWW == 2u {
+        want = vec4<u32>(out0, out0 + 1u, out0, out0 + 1u);
+    }
+    let rows = min(want, vec4<u32>(last));
     let vecs = min(
         vec4<u32>(vec0, vec0 + 1u, vec0 + 2u, vec0 + 3u),
         vec4<u32>(m - 1u),
@@ -822,6 +1362,33 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
     // spare ones hold the zeros they were accumulated from, and the tree and
     // the store below walk only `mt` of them.
     let slot0 = 0u;
+//#if defined(PIE_SUBGROUP)
+    // FOLD THE THIRTY-TWO LANES HERE, IN REGISTERS, so the ladder below never
+    // runs. The workgroup is `@workgroup_size(32, 1, 1)`, which on any adapter
+    // whose subgroup is at least 32 wide is ONE subgroup, so a butterfly over
+    // `off < lim` reaches every lane that holds a partial and no lane that
+    // does not -- `lane ^ off` cannot leave the aligned `lim`-lane block.
+    //
+    // Why bother, when the ladder is five levels run once per workgroup rather
+    // than once per key: because a LEVEL is what costs, not the adds in it.
+    // `attn.rs` and `sdpa_paged.wgsl` establish that on this machine by
+    // deleting three levels of a 63-add tree and getting a third of a kernel
+    // back. Five levels here are five barriers and five workgroup-memory round
+    // trips for every one of a fire's hundreds of workgroups, and this is the
+    // per-output-row cost `PIE_ROWW`'s table could name but not explain.
+    //
+    // Every lane of a block leaves holding that block's sum, so the stores
+    // below stay unconditional -- each lane writes its own slot and the
+    // block's first slot is the one the final read walks, at stride `lim`. At
+    // `lim == 32` that is one slot, one barrier, and no tree at all.
+    let lim = min(32u, sg);
+    for (var off = 1u; off < lim; off = off << 1u) {
+        t0 = t0 + subgroupShuffleXor(t0, off);
+        t1 = t1 + subgroupShuffleXor(t1, off);
+        t2 = t2 + subgroupShuffleXor(t2, off);
+        t3 = t3 + subgroupShuffleXor(t3, off);
+    }
+//#endif
     qmv_partials[(slot0 + 0u * PIE_MT + 0u) * 32u + lid] = t0.x;
     qmv_partials[(slot0 + 1u * PIE_MT + 0u) * 32u + lid] = t0.y;
     qmv_partials[(slot0 + 2u * PIE_MT + 0u) * 32u + lid] = t0.z;
@@ -864,9 +1431,10 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
     // The barrier is OUTSIDE the `if`, which is not a style choice: WGSL
     // requires `workgroupBarrier` in uniform control flow, and a barrier
     // reached by half a workgroup is undefined rather than slow.
+//#if !defined(PIE_SUBGROUP)
     for (var half = 16u; half > 0u; half = half >> 1u) {
         if lid < half {
-            for (var r = 0u; r < 4u; r = r + 1u) {
+            for (var r = 0u; r < PIE_ROWW; r = r + 1u) {
                 for (var mi = 0u; mi < mt; mi = mi + 1u) {
                     let at = (slot0 + r * PIE_MT + mi) * 32u + lid;
                     qmv_partials[at] = qmv_partials[at] + qmv_partials[at + half];
@@ -875,16 +1443,24 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
         }
         workgroupBarrier();
     }
+//#endif
 
     if lid == 0u {
-        for (var r = 0u; r < 4u; r = r + 1u) {
+        for (var r = 0u; r < PIE_ROWW; r = r + 1u) {
             let row = out0 + r;
             if row >= u32(params.out_vec_size) {
                 continue;
             }
             for (var mi = 0u; mi < mt; mi = mi + 1u) {
                 let vec_ = vec0 + mi;
+//#if defined(PIE_SUBGROUP)
+                var sum0 = 0.0;
+                for (var g = 0u; g < 32u; g = g + lim) {
+                    sum0 = sum0 + qmv_partials[(slot0 + r * PIE_MT + mi) * 32u + g];
+                }
+//#else
                 let sum0 = qmv_partials[(slot0 + r * PIE_MT + mi) * 32u];
+//#endif
                 var sum = sum0;
 //#if defined(PIE_BIAS)
                 // Unconditional, where the GLSL asked `if (tail)`: every
@@ -942,11 +1518,26 @@ fn wide_strided(lid: vec3<u32>, wg: vec3<u32>) {
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wg: vec3<u32>,
+//#if defined(PIE_SUBGROUP)
+    @builtin(subgroup_size) sg: u32,
+//#endif
 ) {
+//#if !defined(PIE_SUBGROUP)
+    let sg = 32u;
+//#endif
 //#if defined(PIE_WIDE_STRIDED)
     wide_strided(lid, wg);
 //#else
-    reduce_store(lid.x, lid.y, wg);
+    // PIE_ROWREP row-groups per workgroup, so the grid is 1/PIE_ROWREP of the
+    // rows/4 it would otherwise be. A probe knob: see `PIE_ROWREP`.
+    for (var rep = 0u; rep < PIE_ROWREP; rep = rep + 1u) {
+        // The partials are reused between reps and the previous one's tree
+        // read them, so the rewrite below has to wait. Uniform: the loop bound
+        // is a constant.
+        workgroupBarrier();
+        let yg = wg.y + wg.z * PIE_YTILE;
+        reduce_store(lid.x, lid.y, wg, (yg * PIE_ROWREP + rep) * PIE_ROWW, sg);
+    }
 //#endif
 }
 
@@ -962,6 +1553,15 @@ fn main(
 // pie:instantiate affine_qmv_fast_residual_bfloat16_gs_32_b_8 PIE_GROUP=32 PIE_BITS=8 PIE_RESIDUAL=1
 // pie:instantiate affine_qmv_fast_residual_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_RESIDUAL=1
 // pie:instantiate affine_qmv_fast_residual_bfloat16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_RESIDUAL=1
+// THE SAME TWO WITH THE TAIL LADDER TAKEN OUT, at the one quantization these
+// checkpoints use. `serve::pick` takes these when the adapter has `SUBGROUP`
+// and falls back to the lines above when it does not.
+//
+// `gs_64_b_4` only: it is what every MLX 4-bit checkpoint in the bench binds,
+// it is 52% of a decode on its own, and a tier variant costs a pipeline. Mint
+// the others the day a bench measures one.
+// pie:instantiate affine_qmv_fast_bfloat16_gs_64_b_4 @subgroup PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_64_b_4 @subgroup PIE_GROUP=64 PIE_BITS=4 PIE_RESIDUAL=1
 // pie:instantiate affine_qmv_tail_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_TAIL=1
 // pie:instantiate affine_qmv_tail_bfloat16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_TAIL=1
 // pie:instantiate affine_qmv_tail_bias_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_BIAS=1 PIE_TAIL=1

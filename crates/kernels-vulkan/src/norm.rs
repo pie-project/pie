@@ -43,7 +43,7 @@ fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     Ok([256, heads.unsigned_abs(), rows.unsigned_abs()])
 }
 
-#[routine(canon = rmsnorm)]
+#[routine(canon = rmsnorm, out(out = like(x)))]
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -221,7 +221,7 @@ pub fn rms_rope(
     )
 }
 
-#[routine]
+#[routine(out(out = like(x)))]
 pub fn rms_residual(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -259,7 +259,7 @@ pub fn rms_residual(
     )
 }
 
-#[routine]
+#[routine(out(out = like(x)))]
 pub fn rms_residual_scaled(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -299,7 +299,7 @@ pub fn rms_residual_scaled(
     )
 }
 
-#[routine]
+#[routine(out(out = like(x)))]
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -379,7 +379,7 @@ pub fn gated_rms_strided(
     )
 }
 
-#[routine]
+#[routine(out(out = like(x)))]
 pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -399,7 +399,7 @@ pub fn layer_scalar_mul(
     )
 }
 
-#[routine(canon = residual_add)]
+#[routine(canon = residual_add, out(out = like(x)))]
 pub fn residual_add(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -440,7 +440,7 @@ pub fn residual_add_strided(
     )
 }
 
-#[routine(canon = add_bias)]
+#[routine(canon = add_bias, out(out = like(out)))]
 pub fn add_bias(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<bf16>>,
@@ -458,4 +458,3 @@ pub fn add_bias(
         &[out.arg(), bias.arg(), width.arg()],
     )
 }
-

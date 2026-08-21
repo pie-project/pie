@@ -137,13 +137,14 @@ EXCLUSIONS = {
         # release tarball, since `slangc` is in no distribution -- and runs
         # clippy over both crates with `-D warnings`.
         "driver-vulkan": "needs slangc on the runner; zero warnings otherwise",
-        # 52 sites, and the crate is where the CUDA rewrite landed. The
-        # ahead-of-time archive crate stood here under this same key with
-        # the reason "needs nvcc"; it was deleted at `85c6c674b` and this
-        # crate took its name, and nothing on this side needs nvcc -- a
-        # kernel is text NVRTC compiles at run time. The entry to remove is
-        # the last warning, not this line.
-        "kernels-cuda": "52 warnings, and the rewrite is landing in it",
+        # `kernels-cuda` STOOD HERE reading "52 warnings, and the rewrite is
+        # landing in it". Both halves expired. The crate is named by the
+        # clippy step in `ci.yml` AND was excluded here, which is the one
+        # combination this audit calls out by itself -- an exclusion that
+        # excludes nothing still reads as a crate nobody lints. And the 52
+        # warnings are gone: the crate passes this gate's exact flags at
+        # zero, verified by running the step. The rewrite landed, and the
+        # exclusion outlived it.
         # `kernels-metal` and `kernels-vulkan` STOOD HERE, reading "needs a
         # Mac" and "needs slangc on the runner". Neither claim survives:
         # this gate names both crates, and neither toolchain is needed to

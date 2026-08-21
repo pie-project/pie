@@ -1,28 +1,3 @@
-//! gemma-2's forward, declared.
-//!
-//! Transcribed from `gemma/gemma2.cpp`. The last family that existed only
-//! as hand-written C++, and the simplest — which makes the three things
-//! that ARE gemma's easy to see:
-//!
-//! * **A norm PAIR around each block.** Every other declared family
-//!   norms before its block and folds the residual after. gemma norms
-//!   before AND after, then adds — so `post_attn_norm` and
-//!   `post_mlp_norm` are statements, and the residual add is its own
-//!   launch rather than a `beta=1` fold.
-//!
-//! * **An alternating window.** Layers take turns attending the whole
-//!   context and a 4096-token suffix. It is a per-layer LIST, not an
-//!   interval, because that is what the driver reads.
-//!
-//! * **Two softcaps, and only one is a launch.** The attention logit cap
-//!   is a DISPATCH parameter — the kernel takes it — so nothing states
-//!   it. The final one is `launch_logit_softcap_bf16`, at the end. A
-//!   text that stated both as launches would claim a kernel the fire
-//!   never runs.
-//!
-//! The embedding is scaled once, before the layers: `sqrt(hidden)` folded
-//! into a `scalar_mul`, which is a launch and says so.
-
 pub mod facts;
 
 use self::facts::Gemma2Facts;
@@ -76,53 +51,28 @@ impl G2LayerW {
     }
 }
 
-/// gemma-2's CUDA text for one fire class.
 pub fn gemma2_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &Gemma2Facts,
     class: FireClass,
     norm_eps: f32,
     rope_theta: f32,
 ) -> ForwardPlan {
-    // The activation axis is DECLARED but pinned until the launch wrappers
-    // take a dtype: every statement below states BF16 outs, so a point
-    // instantiated at another A would lie. The pin is a compile refusal,
-    // not a comment. Same for K: `write_kv_to_pages` states native bf16
-    // pages and nothing here forks on the scheme yet.
+
     const {
         assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
         assert!(K::NATIVE_BF16);
     }
-    // DECODE AND PREFILL, and the difference is one call.
-    //
-    // This family served Decode only and PANICKED on anything else — not
-    // refused, panicked, on the first prefill a serving deployment sends.
-    // The reason was never that the two bodies diverge: counting the
-    // class-dependent sites in this text finds exactly ONE, the attention
-    // op, which is what `dsl::cuda::attention_for` now holds. Everything
-    // else below is class-independent and always was.
-    //
-    // The MTP passes stay unstated, because those genuinely are different
-    // passes and not this one under another name.
-    // The SKU joins the family's FIRST segment ('.'-separated segment two
-    // stays the backend, which `Backend::of_family` parses).
-    let family = format!(
-        "gemma_2-{}-{}.cuda.{}",
-        W1::NAME,
-        K::NAME,
-        class.suffix()
-    );
+
+    let family = format!("gemma_2-{}-{}.cuda.{}", W1::NAME, K::NAME, class.suffix());
     dsl::trace_named(&family, |t| {
         let embedded = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
-        // `sqrt(hidden)` on the embedding — a launch, not a fold.
+
         let mut y =
             dsl::cuda::scalar_mul(&embedded, "embed_scale", Some((facts.hidden as f32).sqrt()));
 
+        let rt = dsl::rt(t);
         for l in 0..facts.layers {
-            // THIS LAYER's sliding window, `-1` for none — a
-            // load-time fact the dispatch statements carry, where four
-            // executors used to re-derive it per launch. The shape
-            // answers from the alternation RULE now; it used to index a
-            // per-layer vector that spelled the same rule out.
+
             let window_left = facts.window_left_at(l);
             let w = G2LayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
@@ -130,38 +80,32 @@ pub fn gemma2_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             let q = matmul(&x, &w.q_proj);
             let k = matmul(&x, &w.k_proj);
             let v = matmul(&x, &w.v_proj);
-            // No q/k norm here: gemma-2 does not ship one, and the
-            // manifest says so as an absence. A later gemma that does is
-            // its own generation with its own trace.
-            //
-            // The pre-attention query scale is its OWN launch, and every
-            // gemma-2 applies it.
+
             let q = dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"), None);
-            // The row's base; gemma-2 states no pairing, and stating
-            // nothing means NeoX (`interleaved: false`).
-            let (q, k) = dsl::cuda::rope(
+
+            let (q, k) = dsl::cuda::generated::rope_bf16(
                 &q,
                 &k,
-                facts.attn.heads,
-                facts.attn.kv_heads,
-                facts.attn.head_dim,
+                facts.attn.heads as i32,
+                facts.attn.kv_heads as i32,
+                facts.attn.head_dim as i32,
                 rope_theta,
                 false,
+                &rt.positions(),
+                q.layer(),
+                None,
             );
             let kv = dsl::Kv::at(t, l);
-            dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+            dsl::cuda::write_kv_to_pages(&k, &v, &kv, facts.attn.kv_heads, facts.attn.head_dim);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            // The attention logit softcap rides HERE, as a dispatch
-            // parameter — see the module doc on why it is not a
-            // statement of its own.
+
             let o = dsl::cuda::attention_for(
                 class,
                 &q,
                 &kv,
                 window_left,
                 facts.attn.head_dim,
-                // The cap the row states, or none — the deployment's own
-                // conditional (project.rs's `attn_logit_softcap`).
+
                 if facts.attn.attn_logit_softcap {
                     crate::gemma_2::project::ATTN_LOGIT_SOFTCAP
                 } else {
@@ -172,17 +116,17 @@ pub fn gemma2_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             )
             .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
-            // The POST norm, then an explicit add — gemma's pair.
+
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
-            y = dsl::cuda::residual_add(&y, &o, facts.hidden);
+            y = dsl::cuda::generated::residual_add(&y, &o, y.layer(), None);
 
             let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             let gate = matmul(&m, &w.gate_proj);
             let up = matmul(&m, &w.up_proj);
-            let act = dsl::cuda::geglu_tanh_pair(&gate, &up, facts.intermediate);
+            let act = dsl::cuda::generated::geglu_tanh(&gate, &up, gate.layer(), None);
             let mlp = matmul(&act, &w.down_proj);
             let mlp = dsl::cuda::rmsnorm(&mlp, &w.post_mlp_norm);
-            y = dsl::cuda::residual_add(&y, &mlp, facts.hidden);
+            y = dsl::cuda::generated::residual_add(&y, &mlp, y.layer(), None);
         }
 
         dsl::logits_epilogue(
@@ -199,23 +143,15 @@ pub fn gemma2_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     })
 }
 
-/// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Gemma2Facts, FireClass, f32, f32) -> ForwardPlan;
 
-/// The shipped SKU's axes — the family's ONE spelling of its point.
-/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claim
-/// all derive from these; a second SKU adds a row, not a respelling.
 pub type ShippedW1 = Bf16Ax;
-/// The activation axis of the shipped point (pinned BF16 in the text).
+
 pub type ShippedA = Bf16Ax;
-/// The KV axis of the shipped point.
+
 pub type ShippedKv = NativeKv;
 
-/// The family's catalogue — every SKU this build ships, enumerated. The
-/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
-/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
-/// row whose statements reach a routine point that does not exist, which
-/// is how the demand set closes: checked, never hoped.
-pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    ("gemma_2-bf16-kv-bf16", gemma2_cuda::<ShippedW1, ShippedA, ShippedKv>),
-];
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![(
+    "gemma_2-bf16-kv-bf16",
+    gemma2_cuda::<ShippedW1, ShippedA, ShippedKv>
+),];

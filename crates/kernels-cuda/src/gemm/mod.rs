@@ -1,12 +1,11 @@
-
-use kernels_macros::routine;
 use crate::jit::Ctx;
-use crate::jit::abi::bf16;
 use crate::jit::abi::Tensor;
+use crate::jit::abi::bf16;
+use crate::views::GemmGroups;
 use kernels::Refusal;
 use kernels::raises::Struct;
 use kernels::routine::{Const, In, InOut, Out};
-use crate::views::GemmGroups;
+use kernels_macros::routine;
 
 use core::ffi::c_void;
 
@@ -22,13 +21,13 @@ pub mod lora;
 #[cfg(feature = "_cuda")]
 pub mod quant;
 
-#[routine(canon = matmul)]
+#[routine(canon = matmul, out(y = rows(act) x weight(w)))]
 pub fn act_x_wt_bf16(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
     w: Const<Tensor<c_void>>,
-    y: Out<Tensor<c_void>>) -> Result<(), Refusal> {
-
+    y: Out<Tensor<c_void>>,
+) -> Result<(), Refusal> {
     let beta = 0.0f32;
     act_x_wt_bf16_beta(ctx, act, w, y, beta)
 }
@@ -40,7 +39,6 @@ fn act_x_wt_bf16_beta(
     y: Out<Tensor<c_void>>,
     beta: f32,
 ) -> Result<(), Refusal> {
-
     let dst = crate::layout::stated(y.all("n or k"))?;
     let src = crate::layout::stated(act.all("n or k"))?;
     let m = dst.rows;
@@ -56,25 +54,31 @@ fn act_x_wt_bf16_beta(
     Ok(())
 }
 
-#[routine]
+#[routine(out(y = rows(act) x weight(w)))]
 pub fn act_x_w(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
     w: Const<Tensor<c_void>>,
-    y: Out<Tensor<c_void>>) -> Result<(), Refusal> {
+    y: Out<Tensor<c_void>>,
+) -> Result<(), Refusal> {
     let beta = 0.0f32;
     act_x_wt_bf16_beta(ctx, act, w, y, beta)
 }
 
-#[routine(canon = "matmul.acc")]
+#[routine(canon = "matmul.acc", out(y = like(y)))]
 pub fn act_x_w_acc(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
     w: Const<Tensor<c_void>>,
-    y: InOut<Tensor<c_void>>) -> Result<(), Refusal> {
+    y: InOut<Tensor<c_void>>,
+) -> Result<(), Refusal> {
     let beta = 1.0f32;
 
-    let dst = Out { ptr: y.ptr, rows: y.rows, width: y.width };
+    let dst = Out {
+        ptr: y.ptr,
+        rows: y.rows,
+        width: y.width,
+    };
     act_x_wt_bf16_beta(ctx, act, w, dst, beta)
 }
 
@@ -83,8 +87,8 @@ pub fn act_x_wt_bf16_out_fp32(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
     w: Const<Tensor<c_void>>,
-    y: Out<Tensor<f32>>) -> Result<(), Refusal> {
-
+    y: Out<Tensor<f32>>,
+) -> Result<(), Refusal> {
     let dst = crate::layout::stated(y.all("n or k"))?;
     let src = crate::layout::stated(act.all("n or k"))?;
     let m = dst.rows;
@@ -107,9 +111,12 @@ pub fn grouped_act_x_wt_bf16(
     beta: Const<f32>,
     n: Const<i32>,
     k: Const<i32>,
-    groups: In<Struct<GemmGroups>>) -> Result<(), Refusal> {
+    groups: In<Struct<GemmGroups>>,
+) -> Result<(), Refusal> {
     if groups.ptr.is_null() {
-        return Err(Refusal::Null { what: "the grouped-GEMM view this statement names" });
+        return Err(Refusal::Null {
+            what: "the grouped-GEMM view this statement names",
+        });
     }
     let groups = unsafe { &*groups.ptr };
     let group_count = *group_count;
@@ -137,19 +144,28 @@ pub fn grouped_act_x_wt_bf16(
         );
     }
     #[cfg(not(feature = "_cuda"))]
-    let _ =
-        (handle, act_ptrs_dev, w_ptrs_dev, y_ptrs_dev, m_array_host, group_count, n, k, beta);
+    let _ = (
+        handle,
+        act_ptrs_dev,
+        w_ptrs_dev,
+        y_ptrs_dev,
+        m_array_host,
+        group_count,
+        n,
+        k,
+        beta,
+    );
     Ok(())
 }
 
-#[routine]
+#[routine(out(y = rows(act) x weight(w)))]
 pub fn act_x_wt_bias_bf16(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
     w: Const<Tensor<c_void>>,
     bias: Const<Tensor<c_void>>,
-    y: Out<Tensor<c_void>>) -> Result<(), Refusal> {
-
+    y: Out<Tensor<c_void>>,
+) -> Result<(), Refusal> {
     let beta = 0.0f32;
 
     let dst = crate::layout::stated(y.all("n or k"))?;
@@ -174,8 +190,14 @@ pub fn act_x_wt_bias_bf16(
 
     crate::norm::add_bias::<bf16>(
         ctx,
-        InOut { ptr: dst.ptr.cast::<bf16>(), rows: dst.rows, width: dst.width },
-        Const { v: bias.v.cast::<bf16>() },
+        InOut {
+            ptr: dst.ptr.cast::<bf16>(),
+            rows: dst.rows,
+            width: dst.width,
+        },
+        Const {
+            v: bias.v.cast::<bf16>(),
+        },
     )
 }
 
@@ -195,21 +217,48 @@ pub fn act_x_wt_channel_scaled(
     m: i32,
     n: i32,
     k: i32,
-    beta: f32) -> Result<(), Refusal> {
+    beta: f32,
+) -> Result<(), Refusal> {
     let handle = ctx.cublas()?;
     let (act, w, scale, zero_point, y) = (act.ptr, w.v, scale.v, zero_point.v, y.ptr);
 
     #[cfg(feature = "_cuda")]
     unsafe {
         quant::act_x_wt_channel_scaled(
-            handle, act, w, w_dtype, w_nbytes, scale, scale_dtype, scale_numel, zero_point,
-            channel_axis, y, m, n, k, beta,
+            handle,
+            act,
+            w,
+            w_dtype,
+            w_nbytes,
+            scale,
+            scale_dtype,
+            scale_numel,
+            zero_point,
+            channel_axis,
+            y,
+            m,
+            n,
+            k,
+            beta,
         );
     }
     #[cfg(not(feature = "_cuda"))]
     let _ = (
-        handle, act, w, w_dtype, w_nbytes, scale, scale_dtype, scale_numel, zero_point,
-        channel_axis, y, m, n, k, beta,
+        handle,
+        act,
+        w,
+        w_dtype,
+        w_nbytes,
+        scale,
+        scale_dtype,
+        scale_numel,
+        zero_point,
+        channel_axis,
+        y,
+        m,
+        n,
+        k,
+        beta,
     );
     Ok(())
 }
@@ -230,21 +279,48 @@ pub fn act_x_wt_grouped_scaled(
     m: i32,
     n: i32,
     k: i32,
-    beta: f32) -> Result<(), Refusal> {
+    beta: f32,
+) -> Result<(), Refusal> {
     let handle = ctx.cublas()?;
     let (act, w, scale, zero_point, y) = (act.ptr, w.v, scale.v, zero_point.v, y.ptr);
 
     #[cfg(feature = "_cuda")]
     unsafe {
         quant::act_x_wt_grouped_scaled(
-            handle, act, w, w_dtype, w_nbytes, scale, scale_dtype, scale_numel, zero_point,
-            group_size, y, m, n, k, beta,
+            handle,
+            act,
+            w,
+            w_dtype,
+            w_nbytes,
+            scale,
+            scale_dtype,
+            scale_numel,
+            zero_point,
+            group_size,
+            y,
+            m,
+            n,
+            k,
+            beta,
         );
     }
     #[cfg(not(feature = "_cuda"))]
     let _ = (
-        handle, act, w, w_dtype, w_nbytes, scale, scale_dtype, scale_numel, zero_point, group_size,
-        y, m, n, k, beta,
+        handle,
+        act,
+        w,
+        w_dtype,
+        w_nbytes,
+        scale,
+        scale_dtype,
+        scale_numel,
+        zero_point,
+        group_size,
+        y,
+        m,
+        n,
+        k,
+        beta,
     );
     Ok(())
 }
@@ -261,18 +337,41 @@ pub fn act_x_wt_mxfp4_marlin(
     m: i32,
     n: i32,
     k: i32,
-    beta: f32) -> Result<(), Refusal> {
+    beta: f32,
+) -> Result<(), Refusal> {
     let handle = ctx.cublas()?;
     let (act, w, scale, y) = (act.ptr, w.v, scale.v, y.ptr);
 
     #[cfg(feature = "_cuda")]
     unsafe {
         quant::act_x_wt_mxfp4_marlin(
-            handle, act, w, w_nbytes, scale, scale_numel, y, m, n, k, beta,
+            handle,
+            act,
+            w,
+            w_nbytes,
+            scale,
+            scale_numel,
+            y,
+            m,
+            n,
+            k,
+            beta,
         );
     }
     #[cfg(not(feature = "_cuda"))]
-    let _ = (handle, act, w, w_nbytes, scale, scale_numel, y, m, n, k, beta);
+    let _ = (
+        handle,
+        act,
+        w,
+        w_nbytes,
+        scale,
+        scale_numel,
+        y,
+        m,
+        n,
+        k,
+        beta,
+    );
     Ok(())
 }
 

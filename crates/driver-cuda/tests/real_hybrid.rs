@@ -73,12 +73,15 @@ impl Checkpoint {
         let home = std::env::var_os("HOME")?;
         let snaps =
             PathBuf::from(home).join(format!(".cache/huggingface/hub/{cache_dir}/snapshots"));
-        let snap = std::fs::read_dir(&snaps).ok()?.filter_map(Result::ok).find_map(|e| {
-            let d = e.path();
-            (d.join("model.safetensors").is_file()
-                || d.join("model.safetensors.index.json").is_file())
-            .then_some(d)
-        })?;
+        let snap = std::fs::read_dir(&snaps)
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|e| {
+                let d = e.path();
+                (d.join("model.safetensors").is_file()
+                    || d.join("model.safetensors.index.json").is_file())
+                .then_some(d)
+            })?;
         let files: Vec<PathBuf> = if snap.join("model.safetensors").is_file() {
             vec![snap.join("model.safetensors")]
         } else {
@@ -127,7 +130,10 @@ impl Checkpoint {
     }
 
     fn bytes(&self, name: &str) -> &[u8] {
-        let (f, b, e) = *self.index.get(name).unwrap_or_else(|| panic!("checkpoint lacks {name}"));
+        let (f, b, e) = *self
+            .index
+            .get(name)
+            .unwrap_or_else(|| panic!("checkpoint lacks {name}"));
         &self.raws[f][b..e]
     }
 }
@@ -136,8 +142,14 @@ impl Checkpoint {
 /// — the qwen3_5 binder, `bind_qwen3_5_weight`'s vocabulary as data.
 fn bind(ckpt: &Checkpoint, sink: &mut dyn FnMut(String, Vec<u8>)) {
     let p = "model.language_model";
-    sink("embed".into(), ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec());
-    sink("final_norm".into(), ckpt.bytes(&format!("{p}.norm.weight")).to_vec());
+    sink(
+        "embed".into(),
+        ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec(),
+    );
+    sink(
+        "final_norm".into(),
+        ckpt.bytes(&format!("{p}.norm.weight")).to_vec(),
+    );
     for n in 0..24u32 {
         let lp = format!("{p}.layers.{n}");
         let mut w =
@@ -169,6 +181,22 @@ fn bind(ckpt: &Checkpoint, sink: &mut dyn FnMut(String, Vec<u8>)) {
 struct Live<'a> {
     weights: &'a BTreeMap<String, DeviceBuffer>,
     named: &'a BTreeMap<ValueId, DeviceBuffer>,
+    /// The prefill schedule this fixture staged, for the statement that NAMES
+    /// it.
+    ///
+    /// `Resolver::raised` defaults to `None` and that default is right for a
+    /// resolver holding no raises -- but this one holds one, and hands the
+    /// same pointer it puts in `AttnCtx::prefill_plan`. The driver used to
+    /// recover the plan from the ctx by guessing from a family string; the
+    /// statement says which object it wants now, and a fixture that answers
+    /// only weights and names refuses at `RaisedUnbound { key: "fa2.prefill" }`
+    /// the moment the prefill launcher binds its first argument.
+    ///
+    /// One pointer and not a map, because this fixture stages one schedule.
+    /// The live path keys on the VALUE for the reason `fire::launch`'s
+    /// `LiveResolver` states: two prefills of different head dim both spell
+    /// `fa2.prefill`. That cannot arise here.
+    prefill_plan: *const std::ffi::c_void,
 }
 impl Resolver for Live<'_> {
     fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -176,6 +204,12 @@ impl Resolver for Live<'_> {
     }
     fn named(&mut self, value: ValueId) -> Option<*mut std::ffi::c_void> {
         self.named.get(&value).map(|b| b.as_ptr())
+    }
+    fn raised(&mut self, _value: ValueId, key: &str) -> Option<*const std::ffi::c_void> {
+        // BY THE KEY, because this fixture holds exactly one -- which is the
+        // case the trait's doc names as the key's own. An unrecognised key is
+        // `None` and therefore a refusal, not this plan under another name.
+        (key == "fa2.prefill").then_some(self.prefill_plan)
     }
 }
 
@@ -248,12 +282,42 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let plan = qwen3_5_hybrid_cuda(&hybrid, &cuda, FireClass::Prefill);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
-    let rows: Vec<Row> = vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
-    let dplan = DispatchPlan::new(&plan, &l);
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            multi_token: true,
+            ..Row::default()
+        };
+        TOKENS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
+    // WITH THE BOOT'S ANSWER, not `Boot::default()`, for the reason
+    // `real_gemma4.rs` states it: `attn::write_kv_to_pages` is an `untraced!`
+    // declaration standing for a CHOICE, and `Boot::route` is what resolves
+    // it to `_bf16` or `_quantised`. A plan that states no KV dtype resolves
+    // it to neither, and this walk refused at launch 51 with `NoArm`. The
+    // caches built below are all `native_bf16: true`, so the fact is
+    // `Some(true)` and stating it here is what makes the two agree.
+    let dplan = DispatchPlan::with_boot(
+        &plan,
+        &l,
+        driver_cuda::bind::Boot {
+            kv_native_bf16: Some(true),
+        },
+    );
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
@@ -308,8 +372,9 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         .iter()
         .enumerate()
         .map(|(i, kv)| {
-            let (k, v) =
-                kv.as_ref().map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
+            let (k, v) = kv
+                .as_ref()
+                .map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
                     (k.as_ptr(), v.as_ptr())
                 });
             KvCacheLayerView {
@@ -390,7 +455,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let csr_lens = up(&u32s(&last_lens_h));
     let qo_indptr = up(&u32s(&qo_indptr_h));
     let row_valid = up(&[1u8; TOKENS]);
-    let ids = up(&prompt.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&prompt
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
     let positions = up(&(0i32..7).flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
     let lse = alloc.alloc(TOKENS * Q_HEADS as usize * 4).expect("lse");
 
@@ -519,10 +587,21 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         }
     }
 
-    let mut resolver = Live { weights: &weights, named: &named_bufs };
-    let ran =
-        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
-            .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
+    let mut resolver = Live {
+        weights: &weights,
+        named: &named_bufs,
+        prefill_plan: pplan.as_ptr().cast_const(),
+    };
+    let ran = run(
+        &l,
+        &dplan,
+        frame,
+        &mut resolver,
+        &ctx,
+        AttnRegions::whole(Some(&attn)),
+        Some(&gdn),
+    )
+    .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");
 
@@ -550,7 +629,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
             f32::from_bits(u32::from(bits) << 16)
         };
         let head: Vec<f32> = (0..8).map(|c| h(TOKENS - 1, c)).collect();
-        let norm: f32 = (0..1024).map(|c| h(TOKENS - 1, c).powi(2)).sum::<f32>().sqrt();
+        let norm: f32 = (0..1024)
+            .map(|c| h(TOKENS - 1, c).powi(2))
+            .sum::<f32>()
+            .sqrt();
         eprintln!("ours residual last row head: {head:?} norm={norm:.4}");
     }
 
@@ -558,7 +640,9 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let lv = logits_value.expect("the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let last = TOKENS - 1;
     let logit = |t: usize| {
@@ -602,11 +686,17 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     );
     let our_top8: Vec<usize> = all[..8].iter().map(|(t, _)| *t).collect();
     for t in &ids5 {
-        assert!(our_top8.contains(t), "HF top-5 token {t} missing from our top-8 {our_top8:?}");
+        assert!(
+            our_top8.contains(t),
+            "HF top-5 token {t} missing from our top-8 {our_top8:?}"
+        );
     }
     for (t, hf) in ids5.iter().zip(&vals5) {
         let ours = logit(*t);
-        assert!((ours - hf).abs() < 1.25, "top-5 token {t}: ours {ours} vs HF {hf}");
+        assert!(
+            (ours - hf).abs() < 1.25,
+            "top-5 token {t}: ours {ours} vs HF {hf}"
+        );
     }
     let probes: Vec<usize> = reference["probe_ids"]
         .as_array()
@@ -628,7 +718,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         .collect();
     for (t, hf) in probes.iter().zip(&probe_vals) {
         let ours = logit(*t);
-        assert!((ours - hf).abs() < 0.6, "probe token {t}: ours {ours} vs HF {hf}");
+        assert!(
+            (ours - hf).abs() < 0.6,
+            "probe token {t}: ours {ours} vs HF {hf}"
+        );
     }
 
     ws.release(&mut sops);

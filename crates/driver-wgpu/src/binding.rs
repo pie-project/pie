@@ -1613,8 +1613,7 @@ mod tests {
             value: 0,
             key: "gdn_core".to_string(),
         };
-        let err =
-            resolve(&arg, &launch(1, 1), arena, &Store::default(), 256).expect_err("a raise");
+        let err = resolve(&arg, &launch(1, 1), arena, &Store::default(), 256).expect_err("a raise");
         assert_eq!(
             err,
             Unbindable::NotOnThisPlane {

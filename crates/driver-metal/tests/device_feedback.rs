@@ -41,7 +41,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no feedback buffer came back");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -97,7 +100,7 @@ fn timed_step(rounds: u32, threads: usize) -> Option<Duration> {
 #[test]
 fn a_step_is_reported_on_with_a_time_that_is_not_zero() {
     let Some(gpu) = timed_step(4096, 1 << 16) else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     assert!(
@@ -114,7 +117,7 @@ fn a_step_is_reported_on_with_a_time_that_is_not_zero() {
 #[test]
 fn slow_and_fast_steps_are_told_apart() {
     let Some(fast) = timed_step(1, 1 << 14) else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let slow = timed_step(1 << 15, 1 << 16).expect("device");
@@ -129,7 +132,7 @@ fn slow_and_fast_steps_are_told_apart() {
 #[test]
 fn feedback_has_not_landed_before_anything_has_run() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let stepper = Stepper::new(&f.context).expect("stepper");
@@ -150,7 +153,7 @@ fn feedback_has_not_landed_before_anything_has_run() {
 #[test]
 fn later_steps_replace_the_report_of_earlier_ones() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;

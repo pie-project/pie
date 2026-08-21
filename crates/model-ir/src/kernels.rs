@@ -300,16 +300,13 @@ pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
             .find(|k| k.canon == Some(claim))
             .map(|k| k.symbol),
         Backend::Metal => {
-            static CLAIMS: std::sync::OnceLock<
-                std::collections::BTreeMap<String, &'static str>,
-            > = std::sync::OnceLock::new();
+            static CLAIMS: std::sync::OnceLock<std::collections::BTreeMap<String, &'static str>> =
+                std::sync::OnceLock::new();
             CLAIMS
                 .get_or_init(|| {
                     kernels_metal::declared()
                         .into_iter()
-                        .filter_map(|d| {
-                            d.canon.map(|c| (c.to_string(), d.name))
-                        })
+                        .filter_map(|d| d.canon.map(|c| (c.to_string(), d.name)))
                         .collect()
                 })
                 .get(claim)
@@ -393,14 +390,20 @@ pub fn sig(symbol: &str) -> Option<&'static KernelSig> {
 /// operation in its operand count, and was fixed by splitting the symbol.
 pub const ARITY_EXCEPTIONS: &[&str] = &[];
 
-
-/// Is `symbol`'s params run one the DSL has not finished stating?
-///
-/// A metal statement names an INSTANTIATED POINT, and a routine is stamped
-/// over a product of axes; [`kernels_metal::kernel_of`] is the same map
-/// [`stated_in`] uses to find the signature, so the allowlist is read through
-/// it and one entry covers one routine however many points it has.
-#[must_use]
+// AN ALLOWLIST FOR HALF-STATED PARAMS RUNS STOOD HERE, and its doc and its
+// `#[must_use]` outlived it: the predicate went, the six lines above it did
+// not, and an attribute with nothing between it and the next item applies to
+// THAT item. So `arity_problem` was carrying a `#[must_use]` it never asked
+// for and a rustdoc summary line describing a function that is not there --
+// "Is `symbol`'s params run one the DSL has not finished stating? A metal
+// statement names an INSTANTIATED POINT, and a routine is stamped over a
+// product of axes; `kernels_metal::kernel_of` is the same map `stated_in`
+// uses to find the signature, so the allowlist is read through it and one
+// entry covers one routine however many points it has."
+//
+// The allowlist is empty for the same reason `ARITY_EXCEPTIONS` above it is:
+// `Const<i32>` gave the params run its mark back, so a statement short of
+// what the signature claims is refused rather than excused.
 
 /// For one statement: does it place what the routine reads and writes?
 ///
@@ -551,8 +554,7 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                 peeled = peeled.max(*prefix_ops as usize + *tail_ops as usize);
             }
             OpKind::Guard { arms, else_ops } if !op.outputs.is_empty() => {
-                let span = arms.iter().map(|a| a.ops as usize).sum::<usize>()
-                    + *else_ops as usize;
+                let span = arms.iter().map(|a| a.ops as usize).sum::<usize>() + *else_ops as usize;
                 regioned = regioned.max(span);
             }
             OpKind::Launch {
@@ -581,9 +583,7 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                     // `DispatchCtx::scales`, so counting it as an operand
                     // would make `norm::scalar_mul` look one short.
                     let bound = weights.iter().filter(|w| !w.starts_with("scale.")).count();
-                    if let Some(why) =
-                        arity_problem(&k, kernel, bound, op, inside_value_region)
-                    {
+                    if let Some(why) = arity_problem(&k, kernel, bound, op, inside_value_region) {
                         problems.push(format!("{}: {why}", plan.family));
                     }
                     // THE PARAMS RUN, CHECKED THE WAY THE OPERANDS ALREADY

@@ -1,6 +1,6 @@
 use kernels::Grid;
-use kernels_macros::routine;
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, InOut, Tensor, bf16};
 
@@ -37,7 +37,7 @@ const fn rope_group(lanes: [u32; 3]) -> [u32; 3] {
     [lanes[0], 1, 1]
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_decode(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -45,17 +45,25 @@ pub fn neox_decode(
     base: Const<f32>,
     head_dim: Const<i32>,
     rotary: Const<i32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let position = positions.ptr;
     let width = x.width;
     let lanes = rope_grid(*rotary, width, *head_dim, 1)?;
     ctx.fire(
-        Fire::at("rope/neox.metal", "neox_decode_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at("rope/neox.metal", "neox_decode_bfloat16")
+            .apply(Grid::of(lanes, rope_group(lanes))),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
-#[routine(canon = rope)]
+#[routine(canon = rope, out(x = like(x)))]
 pub fn neox_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -64,18 +72,25 @@ pub fn neox_mb(
     head_dim: Const<i32>,
     rotary: Const<i32>,
     positions: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let position = positions.ptr;
     let width = x.width;
     let rows = *rows;
     let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
     ctx.fire(
         Fire::at("rope/neox.metal", "neox_mb_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_freqs_decode(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -84,14 +99,16 @@ pub fn neox_freqs_decode(
     mscale: Const<f32>,
     rotary: Const<i32>,
     rope_freqs: In<Tensor<f32>>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let inv_freq = rope_freqs.ptr;
 
     let position = positions.ptr;
     let width = x.width;
     let lanes = rope_grid(*rotary, width, *head_dim, 1)?;
     ctx.fire(
-        Fire::at("rope/neox.metal", "neox_freqs_decode_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        Fire::at("rope/neox.metal", "neox_freqs_decode_bfloat16")
+            .apply(Grid::of(lanes, rope_group(lanes))),
         &[
             x.arg(),
             position.arg(),
@@ -103,7 +120,7 @@ pub fn neox_freqs_decode(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_freqs_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -113,7 +130,8 @@ pub fn neox_freqs_mb(
     rotary: Const<i32>,
     rope_freqs: In<Tensor<f32>>,
     positions: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let inv_freq = rope_freqs.ptr;
 
     let position = positions.ptr;
@@ -121,7 +139,8 @@ pub fn neox_freqs_mb(
     let rows = *rows;
     let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
     ctx.fire(
-        Fire::at("rope/neox.metal", "neox_freqs_mb_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        Fire::at("rope/neox.metal", "neox_freqs_mb_bfloat16")
+            .apply(Grid::of(lanes, rope_group(lanes))),
         &[
             x.arg(),
             position.arg(),
@@ -133,7 +152,7 @@ pub fn neox_freqs_mb(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_prop_decode(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -141,17 +160,25 @@ pub fn neox_prop_decode(
     base: Const<f32>,
     head_dim: Const<i32>,
     rotary: Const<i32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let position = positions.ptr;
     let width = x.width;
     let lanes = rope_grid(*rotary, width, *head_dim, 1)?;
     ctx.fire(
-        Fire::at("rope/neox.metal", "neox_prop_decode_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at("rope/neox.metal", "neox_prop_decode_bfloat16")
+            .apply(Grid::of(lanes, rope_group(lanes))),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_prop_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -160,18 +187,26 @@ pub fn neox_prop_mb(
     head_dim: Const<i32>,
     rotary: Const<i32>,
     positions: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let position = positions.ptr;
     let width = x.width;
     let rows = *rows;
     let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
     ctx.fire(
-        Fire::at("rope/neox.metal", "neox_prop_mb_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at("rope/neox.metal", "neox_prop_mb_bfloat16")
+            .apply(Grid::of(lanes, rope_group(lanes))),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_strided(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -181,7 +216,8 @@ pub fn neox_strided(
     rotary: Const<i32>,
     row_pitch: Const<i32>,
     positions: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let position = positions.ptr;
     let width = x.width;
     let rows = *rows;
@@ -193,7 +229,8 @@ pub fn neox_strided(
     }
     let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
     ctx.fire(
-        Fire::at("rope/neox.metal", "neox_strided_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        Fire::at("rope/neox.metal", "neox_strided_bfloat16")
+            .apply(Grid::of(lanes, rope_group(lanes))),
         &[
             x.arg(),
             position.arg(),

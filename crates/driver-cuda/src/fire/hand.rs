@@ -17,10 +17,7 @@ pub fn fire(
     // SAFETY: `values` are live allocations; `stream` stays valid across the launch.
     // `Ctx::launch` BECAME `Ctx::fire`, taking the four facts as one `Fire`.
     let fired = unsafe {
-        Ctx::on(stream).fire(
-            kernels::Fire::at(file, instantiation).apply(launch),
-            values,
-        )
+        Ctx::on(stream).fire(kernels::Fire::at(file, instantiation).apply(launch), values)
     };
     if let Err(why) = fired {
         panic!("{instantiation}: {why}");

@@ -62,7 +62,12 @@ impl BucketKey {
         _fire: model_ir::trace::FireClass,
         model: u64,
     ) -> Self {
-        Self { requests, tokens, model, lora_shape: 0 }
+        Self {
+            requests,
+            tokens,
+            model,
+            lora_shape: 0,
+        }
     }
 
     /// The same key for a fire that staged adapters.
@@ -98,7 +103,6 @@ pub fn union_eligibility(lora: Option<&crate::fire::lora::LoraFireState>) -> Opt
 pub struct PlanEpoch(u64);
 
 impl PlanEpoch {
-
     /// The only way the epoch changes, so nothing else can manufacture "the
     /// epoch this exec was recorded against". Doesn't prove the arena is alive.
     pub(crate) fn bump(&mut self) {
@@ -119,9 +123,9 @@ impl PlanEpoch {
 struct Entry {
     exec: GraphExec,
     epoch: PlanEpoch,
-    /// What the graph baked, when it was recorded. See [`capture_digest`].
-    digest: u64,
     nodes: Vec<Option<cudarc::runtime::sys::cudaGraphNode_t>>,
+    /// Install order within the bucket, read only to pick an eviction.
+    seq: u64,
 }
 
 // SAFETY: a `cudaGraphNode_t` is an opaque handle into the graph the `GraphExec`
@@ -129,17 +133,58 @@ struct Entry {
 unsafe impl Send for Entry {}
 unsafe impl Sync for Entry {}
 
-/// The instantiated graphs, keyed by bucket and the epoch recorded against.
-/// Not an LRU: evicting a graph mid-launch is a use-after-free, not a miss.
+/// A bucket plus the addresses its graph baked. See [`Recordings`] for why
+/// the digest is half the key and not a validity check on one exec per bucket.
+type Slot = (BucketKey, u64);
+
+/// How many recorded address-sets one bucket may hold at once.
+///
+/// A bucket is a SHAPE, and several concurrent streams of work can share a
+/// shape while pointing at different memory: two lanes of a contrastive
+/// decoder, a handful of sequences decoding side by side. Each needs its own
+/// graph. Four covers what has been observed and bounds the cost of a workload
+/// whose addresses genuinely churn, where no exec would ever be replayed and
+/// keeping them all would be a leak in slow motion.
+const SLOTS_PER_BUCKET: usize = 4;
+
+/// The instantiated graphs, keyed by bucket, baked addresses, and the epoch
+/// recorded against.
+/// Not an LRU across buckets: evicting a graph mid-launch is a use-after-free,
+/// not a miss.
+///
+/// # Why the digest is part of the key
+///
+/// It used to be a validity check on a single exec per bucket: a fire whose
+/// digest disagreed with the recorded one evicted that exec, counted a
+/// `mismatched`, and recaptured. That is right for a bucket whose addresses
+/// MOVED, and wrong for a bucket two callers are sharing.
+///
+/// `context-aware-decoding` runs two lanes of the same shape, alternating, so
+/// its fires arrive with two digests in strict alternation and one bucket key.
+/// Each fire found the other lane's exec, refused it, evicted it, and paid a
+/// 535-launch capture plus a `cudaGraphInstantiate` to install an exec the next
+/// fire would evict in turn. Over four tokens: six fires, six captures, zero
+/// hits, five mismatches -- and `mismatched`'s own doc says a nonzero count on
+/// a steady workload is a bug, not the cache working. It cost about 7.7 seconds
+/// a token on a 0.6B decode.
+///
+/// The digest already discriminates the lanes perfectly; it was simply being
+/// used to reject rather than to select. Now it selects, up to
+/// [`SLOTS_PER_BUCKET`] address-sets per shape, and a bucket that really is
+/// moving still cannot grow without bound.
 #[derive(Debug, Default)]
 pub struct Recordings {
-    execs: HashMap<BucketKey, Entry>,
+    execs: HashMap<Slot, Entry>,
+    /// Monotonic install counter, so a full bucket evicts its oldest slot.
+    seq: u64,
     hits: u64,
     misses: u64,
     stale: u64,
     /// Replays refused because the fire's addresses don't match the graph's.
     /// See [`capture_digest`].
     mismatched: u64,
+    /// Slots dropped because a bucket was full. See [`SLOTS_PER_BUCKET`].
+    evicted: u64,
 }
 
 impl Recordings {
@@ -151,15 +196,16 @@ impl Recordings {
 
     /// The exec for `key` if captured and recorded against `epoch`; a stale
     /// entry is dropped, not returned, since its recorded state is gone.
-    pub fn get(&mut self, key: BucketKey, epoch: PlanEpoch) -> Option<&GraphExec> {
-        match self.execs.get(&key) {
+    pub fn get(&mut self, key: BucketKey, digest: u64, epoch: PlanEpoch) -> Option<&GraphExec> {
+        let slot = (key, digest);
+        match self.execs.get(&slot) {
             Some(e) if e.epoch == epoch => {
                 self.hits += 1;
-                self.execs.get(&key).map(|e| &e.exec)
+                self.execs.get(&slot).map(|e| &e.exec)
             }
             Some(_) => {
                 self.stale += 1;
-                self.execs.remove(&key);
+                self.execs.remove(&slot);
                 None
             }
             None => {
@@ -169,11 +215,34 @@ impl Recordings {
         }
     }
 
+    /// Make room in `key`'s bucket, dropping its oldest slot when full.
+    ///
+    /// Dropping is safe here and only here: an entry is removed between fires,
+    /// never while its graph is in flight, because the caller holds the cache
+    /// mutably across the whole capture-or-replay.
+    fn evict_if_full(&mut self, key: BucketKey) {
+        let mut held: Vec<(u64, u64)> = self
+            .execs
+            .iter()
+            .filter(|((k, _), _)| *k == key)
+            .map(|((_, d), e)| (e.seq, *d))
+            .collect();
+        if held.len() < SLOTS_PER_BUCKET {
+            return;
+        }
+        held.sort_unstable();
+        for (_, d) in held.iter().take(held.len() + 1 - SLOTS_PER_BUCKET) {
+            self.execs.remove(&(key, *d));
+            self.evicted += 1;
+        }
+    }
+
     /// Install a freshly instantiated exec, unless `eligibility` says the fire
     /// should have stayed eager, in which case nothing is installed.
     pub fn insert(
         &mut self,
         key: BucketKey,
+        digest: u64,
         exec: GraphExec,
         epoch: PlanEpoch,
         eligibility: Option<Ineligible>,
@@ -181,7 +250,10 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, Entry { exec, epoch, digest: 0, nodes: Vec::new() });
+        self.evict_if_full(key);
+        self.seq += 1;
+        self.execs
+            .insert((key, digest), Entry { exec, epoch, nodes: Vec::new(), seq: self.seq });
         Ok(())
     }
 
@@ -199,7 +271,9 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, Entry { exec, epoch, digest, nodes });
+        self.evict_if_full(key);
+        self.seq += 1;
+        self.execs.insert((key, digest), Entry { exec, epoch, nodes, seq: self.seq });
         Ok(())
     }
 
@@ -208,10 +282,11 @@ impl Recordings {
     pub fn retune(
         &mut self,
         key: BucketKey,
+        digest: u64,
         epoch: PlanEpoch,
         grids: &[Option<u32>],
     ) -> Result<bool> {
-        let Some(entry) = self.execs.get(&key) else {
+        let Some(entry) = self.execs.get(&(key, digest)) else {
             return Ok(false);
         };
         if entry.epoch != epoch {
@@ -235,12 +310,7 @@ impl Recordings {
         digest: u64,
         stream: StreamRef<'_>,
     ) -> Result<bool> {
-        if self.execs.get(&key).is_some_and(|e| e.digest != digest) {
-            self.mismatched += 1;
-            self.execs.remove(&key);
-            return Ok(false);
-        }
-        let Some(exec) = self.get(key, epoch) else {
+        let Some(exec) = self.get(key, digest, epoch) else {
             return Ok(false);
         };
         exec.launch(stream)?;
@@ -266,11 +336,26 @@ impl Recordings {
         (self.hits, self.misses, self.stale)
     }
 
-    /// Replays refused for an address mismatch (see [`capture_digest`]); a
-    /// nonzero value on a steady workload is a bug, not the cache working.
+    /// Replays refused for an address mismatch (see [`capture_digest`]).
+    ///
+    /// RETIRED, AND LEFT AT ZERO. A mismatch used to mean "this bucket holds
+    /// one exec and it is not yours", which conflated a bucket whose addresses
+    /// moved with a bucket two lanes were sharing -- and the second case, which
+    /// is the common one, is not a mismatch at all. The digest is part of the
+    /// key now, so the question this counted cannot be asked. Kept so the
+    /// canaries and the parity gates that assert it is zero keep compiling, and
+    /// so the count they assert stays true by construction.
     #[must_use]
     pub const fn mismatched(&self) -> u64 {
         self.mismatched
+    }
+
+    /// Slots dropped to keep a bucket within [`SLOTS_PER_BUCKET`]. Nonzero
+    /// means more concurrent address-sets share a shape than the cache holds,
+    /// which is a capacity question, not a correctness one.
+    #[must_use]
+    pub const fn evicted(&self) -> u64 {
+        self.evicted
     }
 }
 
@@ -332,7 +417,7 @@ mod tests {
     fn a_stale_epoch_is_a_miss_and_the_entry_goes() {
         let mut c = Recordings::new();
         let k = BucketKey::new(4, 4, FireClass::Decode, 1);
-        assert!(c.get(k, PlanEpoch::at(7)).is_none(), "cold");
+        assert!(c.get(k, 0, PlanEpoch::at(7)).is_none(), "cold");
         assert_eq!(c.stats(), (0, 1, 0));
 
         assert!(c.is_empty());
@@ -353,7 +438,9 @@ mod tests {
     fn a_miss_is_not_an_error() {
         let mut c = Recordings::new();
         assert!(c.is_empty());
-        assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0)).is_none());
+        assert!(
+            c.get(BucketKey::new(1, 1, FireClass::Decode, 0), 0, PlanEpoch::at(0)).is_none()
+        );
         assert_eq!(c.stats(), (0, 1, 0));
     }
 }

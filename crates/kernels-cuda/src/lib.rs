@@ -66,7 +66,6 @@ pub struct Registered(pub ::kernels::routine::Routine<Plane>);
 #[cfg(target_family = "wasm")]
 ::inventory::collect!(Registered);
 
-#[must_use]
 pub fn rows() -> impl Iterator<Item = &'static ::kernels::routine::Routine<Plane>> {
     #[cfg(not(target_family = "wasm"))]
     {
@@ -148,6 +147,11 @@ pub fn routine_at(symbol: &str, point: &str) -> Option<&'static jit::Routine> {
         .or_else(|| routine(symbol))
 }
 
+/// Fire a symbol on a stream, with no cuBLAS handle and no environment.
+///
+/// # Safety
+///
+/// [`call_answering`]'s, with both of the pointers it names left null.
 pub unsafe fn call(
     symbol: &str,
     args: &[ArgValue],
@@ -156,6 +160,11 @@ pub unsafe fn call(
     unsafe { call_with_cublas(symbol, args, stream, core::ptr::null_mut()) }
 }
 
+/// [`call`], carrying a cuBLAS handle for the routines that want one.
+///
+/// # Safety
+///
+/// [`call_answering`]'s.
 pub unsafe fn call_with_cublas(
     symbol: &str,
     args: &[ArgValue],
@@ -165,6 +174,16 @@ pub unsafe fn call_with_cublas(
     unsafe { call_answering(symbol, args, stream, cublas, None) }
 }
 
+/// Fire a symbol, answering its asks out of `env`.
+///
+/// # Safety
+///
+/// Every pointer in `args` must address device memory of the extent the
+/// symbol reads, and the kinds must match the signature the symbol was
+/// compiled from -- `ArgValue` carries a kind but not a length, so an
+/// argument of the right kind and the wrong size passes every check here
+/// and faults on device. `stream` must be a live stream in the current
+/// context, and `cublas`, if not null, a live handle set to that stream.
 pub unsafe fn call_answering(
     symbol: &str,
     args: &[ArgValue],
@@ -207,7 +226,10 @@ pub(crate) fn stage_peel_window(
         // Pageable host memory: `cudaMemcpyAsync` stages it before
         // returning, so the stack pair may die after this call.
         let bytes = unsafe {
-            core::slice::from_raw_parts(bounds.as_ptr().cast::<u8>(), core::mem::size_of_val(&bounds))
+            core::slice::from_raw_parts(
+                bounds.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(&bounds),
+            )
         };
         unsafe { jit::device::upload(win, bytes, ctx.stream())? };
     }

@@ -32,7 +32,6 @@ pub struct RuntimeExtents {
     pub key_len: u32,
 }
 
-
 /// Stable grouped-dispatch header. Lane-record address fields are device virtual addresses, `u64` on both backends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

@@ -341,7 +341,14 @@ impl Book {
         // holds there -- which is the same gap `copy_kv` fills for the pages
         // and which no caller has asked for yet.
         let slot = self.free_slot(to);
-        self.seats.insert(to, Seat { pages, tokens, slot });
+        self.seats.insert(
+            to,
+            Seat {
+                pages,
+                tokens,
+                slot,
+            },
+        );
         Ok(moves)
     }
 

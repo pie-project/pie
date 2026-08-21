@@ -1,38 +1,10 @@
-//! glm5's forward, declared.
-//!
-//! Transcribed from `driver-cuda/csrc/src/model/glm5/glm5_forward.cpp`,
-//! which is the only description of this family that has ever run. Three
-//! things about the reading are worth stating before the body, because
-//! each is a place a transcription could go wrong quietly:
-//!
-//! * **The MLA prepare is FUSED.** `kernels::attn::mla_prepare_bf16` does what
-//!   the four launches beside it do (`kimi_split_kv_a_norm`,
-//!   `kimi_split_q_b`, `rope`, `write_mla_to_pages`), and the driver
-//!   takes it whenever `mla_prepare_supported(q_rope)` holds. This text
-//!   states the fused form. The four-launch arm is not a guard's other
-//!   half: it is a different rectangle count for a rope width the fused
-//!   kernel refuses, which makes it a different declaration.
-//!
-//! * **The DSA indexer produces no activation the layer reads.** Its
-//!   output is a page mask the attention dispatch takes as a sideband.
-//!   It is stated anyway: a reader following the dataflow has to see
-//!   where the mask comes from, and its three projections are real
-//!   weights a binding must resolve.
-//!
-//! * **The decode MoE leg is the GEMV one.** `kGlm5MoeGemvMaxTokens` is
-//!   1, so a decode fire takes `launch_moe_{gate_up,down}_decode_gemv_bf16`
-//!   and never the aligned or CUTLASS legs. Stating the leg a decode fire
-//!   ACTUALLY takes is the same rule qwen3_5's text follows.
-
 pub mod facts;
 
 use self::facts::Glm5Facts;
 use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
-use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
+use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, Shape};
 
-/// One glm5 layer's weight handles, under the tree-wide
-/// `layer.{l}.{field}` convention every executor's `parse_name` reads.
 struct Glm5LayerW {
     attn_norm: NormW,
     mlp_norm: NormW,
@@ -44,11 +16,7 @@ struct Glm5LayerW {
     idx_wq_b: MatW,
     idx_wk: MatW,
     idx_weights: MatW,
-    /// The indexer's own LayerNorm, and it is a PAIR because the kernel
-    /// subtracts the row mean before scaling and adds a bias after -- see
-    /// `dsl::cuda::dsa_index_knorm_rope`. Trace names like the three
-    /// projections above, for the reason `project.rs` gives about all of
-    /// them at once.
+
     idx_k_norm_weight: String,
     idx_k_norm_bias: String,
     dense_gate: MatW,
@@ -101,29 +69,18 @@ impl Glm5LayerW {
     }
 }
 
-/// glm5's CUDA text for one fire class.
-///
-/// **Both shaped classes, one body.** The MLA attention is one planned
-/// dispatch over a `qo_indptr` (see `kimi_k2`), and the DSA indexer scores
-/// whatever query rows the fire brought. Nothing here reads the class except
-/// the trace's name.
 pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &Glm5Facts,
     class: FireClass,
     norm_eps: f32,
     rope_theta: f32,
 ) -> ForwardPlan {
-    // The activation axis is DECLARED but pinned until the launch wrappers
-    // take a dtype: every statement below states BF16 outs, so a point
-    // instantiated at another A would lie. The pin is a compile refusal,
-    // not a comment. Same for K: MLA's latent cache is stated bf16 and
-    // nothing here forks on the scheme yet.
+
     const {
         assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
         assert!(K::NATIVE_BF16);
     }
-    // The SKU joins the family's FIRST segment ('.'-separated segment two
-    // stays the backend, which `Backend::of_family` parses).
+
     let family = format!(
         "glm5-{}-{}-{}.cuda.{}",
         W1::NAME,
@@ -135,13 +92,11 @@ pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
 
+        let rt = dsl::rt(t);
         for l in 0..facts.layers {
             let w = Glm5LayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
-            // The query's own latent, normed, then expanded. `hidden`
-            // appears nowhere between here and `o_proj` — that is what
-            // makes this MLA rather than a wide attention.
             let (q_b, kv_a, q_a_n) = dsl::mla_latents(
                 &x,
                 None,
@@ -152,53 +107,74 @@ pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                 a.q_lora_rank,
             );
 
-            // ── DSA lightning indexer ────────────────────────────────
-            // A second, smaller attention whose only product is a top-k
-            // page mask. `gemm_xwt` rather than `matmul`: these three
-            // weights are named directly rather than through a layer
-            // field the binder resolves by role.
-            let idx_q = dsl::cuda::gemm_xwt(
+            let idx_q = dsl::cuda::generated::act_x_wt_bf16(
                 &q_a_n,
                 &w.idx_wq_b.name,
-                facts.dsa.index_n_heads * facts.dsa.index_head_dim,
+                (
+                    Shape(vec![
+                        Dim::Tokens,
+                        Dim::Const(facts.dsa.index_n_heads * facts.dsa.index_head_dim),
+                    ]),
+                    DType::BF16,
+                ),
+                q_a_n.layer(),
+                None,
             );
-            let idx_k = dsl::cuda::gemm_xwt(&x, &w.idx_wk.name, facts.dsa.index_head_dim);
-            let idx_w = dsl::cuda::gemm_xwt(&q_a_n, &w.idx_weights.name, facts.dsa.index_n_heads);
-            // The indexer rotates the MLA's rope width (the head's own
-            // rotary slice, `qk_rope_head_dim`), on the row's base, at
-            // the row's epsilon.
-            let idx_k = dsl::cuda::dsa_index_knorm_rope(
+            let idx_k = dsl::cuda::generated::act_x_wt_bf16(
+                &x,
+                &w.idx_wk.name,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.dsa.index_head_dim)]),
+                    DType::BF16,
+                ),
+                x.layer(),
+                None,
+            );
+            let idx_w = dsl::cuda::generated::act_x_wt_bf16(
+                &q_a_n,
+                &w.idx_weights.name,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.dsa.index_n_heads)]),
+                    DType::BF16,
+                ),
+                q_a_n.layer(),
+                None,
+            );
+
+            let idx_k = dsl::cuda::generated::dsa_index_knorm_rope(
                 &idx_k,
                 &w.idx_k_norm_weight,
                 &w.idx_k_norm_bias,
-                facts.dsa.index_head_dim,
-                a.qk_rope_head_dim,
+                a.qk_rope_head_dim as i32,
                 rope_theta,
                 norm_eps,
+                &rt.positions(),
+                idx_k.layer(),
+                None,
             );
-            let idx_q = dsl::cuda::dsa_index_q_rope(
+            let idx_q = dsl::cuda::generated::dsa_index_q_rope(
                 &idx_q,
-                facts.dsa.index_n_heads,
-                facts.dsa.index_head_dim,
-                a.qk_rope_head_dim,
+                facts.dsa.index_n_heads as i32,
+                facts.dsa.index_head_dim as i32,
+                a.qk_rope_head_dim as i32,
                 rope_theta,
+                &rt.positions(),
+                idx_q.layer(),
+                None,
             );
-            // The mask is STATED, not threaded: `mla_absorbed_attention`
-            // below takes no operand for it, and the binding is what
-            // says the drop is deliberate. `builder!` marks every
-            // statement it generates `#[must_use]`, and
-            // `model-dsl/src/cuda/mla.rs` folded this one into the block
-            // its two index ropes were already in.
-            let _index_mask = dsl::cuda::dsa_index_topk_mask(
+
+            let _index_mask = dsl::cuda::generated::dsa_index_topk_mask(
                 &idx_q,
                 &idx_k,
                 &idx_w,
-                facts.dsa.index_n_heads,
-                facts.dsa.index_head_dim,
-                facts.dsa.index_topk,
+                (Shape(vec![Dim::Tokens, Dim::Tokens]), DType::I32),
+                facts.dsa.index_n_heads as i32,
+                facts.dsa.index_head_dim as i32,
+                facts.dsa.index_topk as i32,
+                idx_q.layer(),
+                None,
             );
 
-            // ── MLA ──────────────────────────────────────────────────
             let (_kv_c, _k_pe, q_nope, q_pe) = dsl::cuda::mla_prepare(
                 &kv_a,
                 &q_b,
@@ -219,12 +195,9 @@ pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                     v_head_dim: a.v_head_dim,
                 },
             );
-            // The OnAttn site: after the core, before `o_proj` — the
-            // hand-written invoke's position.
-            // `+=` of a fresh matmul IS the beta=1 fold the T==1 arm makes.
+
             y += dsl::attention_landing(&attn_v, &w.o_proj, l);
 
-            // ── MLP / MoE ────────────────────────────────────────────
             let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             if !facts.is_moe_layer(l) {
                 y += dsl::dense_gated_mlp(
@@ -239,53 +212,66 @@ pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             }
 
             let logits = matmul(&m, &w.router);
-            let (experts, weights) = dsl::cuda::topk_sigmoid(
+            let (experts, weights) = dsl::cuda::generated::topk_sigmoid(
                 &logits,
-                facts.moe.top_k,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.top_k)]),
+                    DType::I32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.top_k)]),
+                    DType::F32,
+                ),
+                None,
                 facts.moe.norm_topk_prob,
                 facts.moe.routed_scaling,
+                logits.layer(),
+                None,
             );
 
-            // The decode leg: one warp per output row, because at M == 1
-            // the routed GEMMs are streaming reads with no weight reuse.
-            let gate_up = dsl::cuda::moe_gate_up_gemv(
+            let gate_up = dsl::cuda::generated::moe_gate_up_decode_gemv(
+                &experts,
                 &m,
-                &MatW {
-                    name: format!("layer.{l}.expert.{{e}}.gate_up"),
-                    width: 2 * facts.moe.moe_intermediate,
-                    layer: Some(l),
-                    repr: W2::REPR,
-                },
-                &experts,
-                facts.moe.top_k,
+                &format!("layer.{l}.expert.{{e}}.gate_up"),
+                (
+                    Shape(vec![
+                        Dim::Tokens,
+                        Dim::Const(facts.moe.top_k),
+                        Dim::Const(2 * facts.moe.moe_intermediate),
+                    ]),
+                    DType::BF16,
+                ),
+                Some(l),
+                None,
             );
-            let act = dsl::cuda::swiglu(&gate_up, facts.moe.moe_intermediate);
-            let route_out = dsl::cuda::moe_down_gemv(
-                &act,
-                &MatW {
-                    name: format!("layer.{l}.expert.{{e}}.down"),
-                    width: facts.hidden,
-                    layer: Some(l),
-                    repr: W2::REPR,
-                },
+            let act = dsl::cuda::generated::chunked_swiglu(&gate_up, gate_up.layer(), None);
+            let route_out = dsl::cuda::generated::moe_down_decode_gemv(
                 &experts,
-                facts.moe.top_k,
+                &act,
+                &format!("layer.{l}.expert.{{e}}.down"),
+                (
+                    Shape(vec![
+                        Dim::Tokens,
+                        Dim::Const(facts.moe.top_k),
+                        Dim::Const(facts.hidden),
+                    ]),
+                    DType::BF16,
+                ),
+                Some(l),
+                None,
             );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
-            // The shared expert lands on the routed sum, and the SUM
-            // lands on the residual — two explicit adds, because glm5's
-            // `moe_out` is scratch and nothing folded into it.
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sgate = matmul(&m, &w.shared_gate);
                 let sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::swiglu_pair(&sgate, &sup, facts.moe.shared_intermediate);
+                let sact = dsl::cuda::generated::swiglu(&sgate, &sup, sgate.layer(), None);
                 let shared = matmul(&sact, &w.shared_down);
-                dsl::cuda::residual_add(&routed, &shared, facts.hidden)
+                dsl::cuda::generated::residual_add(&routed, &shared, routed.layer(), None)
             } else {
                 routed
             };
-            y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
+            y = dsl::cuda::generated::residual_add(&y, &moe_out, y.layer(), None);
         }
 
         dsl::logits_epilogue(
@@ -300,28 +286,17 @@ pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     })
 }
 
-/// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Glm5Facts, FireClass, f32, f32) -> ForwardPlan;
 
-/// The shipped SKU's axes — the family's ONE spelling of its point.
-/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claims
-/// all derive from these; a second SKU adds a row, not a respelling.
 pub type ShippedW1 = Bf16Ax;
-/// The routed expert banks' axis of the shipped point.
+
 pub type ShippedW2 = Bf16Ax;
-/// The activation axis of the shipped point (pinned BF16 in the text).
+
 pub type ShippedA = Bf16Ax;
-/// The KV axis of the shipped point.
+
 pub type ShippedKv = NativeKv;
 
-/// The family's catalogue — every SKU this build ships, enumerated. The
-/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
-/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
-/// row whose statements reach a routine point that does not exist, which
-/// is how the demand set closes: checked, never hoped.
-pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    (
-        "glm5-bf16-bf16-kv-bf16",
-        glm5_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
-    ),
-];
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![(
+    "glm5-bf16-bf16-kv-bf16",
+    glm5_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
+),];

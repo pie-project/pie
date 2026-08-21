@@ -357,4 +357,3 @@ fn term_truth(
 
     Err(uncondition())
 }
-

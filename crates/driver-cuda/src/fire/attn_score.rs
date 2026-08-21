@@ -5,7 +5,6 @@
 // stderr is the C++'s refusal channel for these messages.
 #![allow(clippy::print_stderr)]
 
-
 use crate::fire::sideband_arena::{DeviceMemory, Region, SidebandArena};
 
 /// One layer's attention scores — the read side of `AttnScore`. `values` is
@@ -374,14 +373,34 @@ impl ScoreOps for LiveScoreOps {
             "attn_score_fold_heads_dev",
             attn_score_fold_heads(
                 &ctx_on(self.stream),
-                kernels::routine::In { ptr: raw, rows: 0, width: 0 },
-                kernels::routine::In { ptr: score_indptr_d, rows: 0, width: 0 },
-                kernels::routine::In { ptr: kv_page_indptr_d, rows: 0, width: 0 },
-                kernels::routine::In { ptr: kv_last_page_lens_d, rows: 0, width: 0 },
+                kernels::routine::In {
+                    ptr: raw,
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::In {
+                    ptr: score_indptr_d,
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::In {
+                    ptr: kv_page_indptr_d,
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::In {
+                    ptr: kv_last_page_lens_d,
+                    rows: 0,
+                    width: 0,
+                },
                 page_size,
                 num_requests,
                 num_q_heads,
-                kernels::routine::Out { ptr: folded, rows: 0, width: 0 },
+                kernels::routine::Out {
+                    ptr: folded,
+                    rows: 0,
+                    width: 0,
+                },
             ),
         );
     }
@@ -514,7 +533,10 @@ fn compute_decode_score_csr(
     scratch.raw_offsets.resize(requests + 1, 0);
     scratch.folded_offsets.clear();
     scratch.folded_offsets.resize(requests + 1, 0);
-    let mut totals = DecodeScoreCsrTotals { raw_total: 0, folded_total: 0 };
+    let mut totals = DecodeScoreCsrTotals {
+        raw_total: 0,
+        folded_total: 0,
+    };
     for r in 0..requests {
         let pages = kvpp[r + 1] - kvpp[r];
         let kv_len = if pages == 0 {
@@ -606,7 +628,9 @@ pub fn default_attn_score_window_from(value: Option<&std::ffi::OsStr>) -> u32 {
     }
     let mut parsed: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        parsed = parsed.saturating_mul(10).saturating_add(i64::from(bytes[i] - b'0'));
+        parsed = parsed
+            .saturating_mul(10)
+            .saturating_add(i64::from(bytes[i] - b'0'));
         i += 1;
     }
     let parsed = sign * parsed;
@@ -673,7 +697,9 @@ pub fn prepare_decode_score_capture<M: DeviceMemory>(
         return DecodeScoreCapturePlan::refused();
     }
     scratch.raw_offsets_i32.clear();
-    scratch.raw_offsets_i32.extend(scratch.raw_offsets.iter().map(|&v| v as i32));
+    scratch
+        .raw_offsets_i32
+        .extend(scratch.raw_offsets.iter().map(|&v| v as i32));
 
     let raw_bytes = usize::try_from(totals.raw_total).unwrap_or(usize::MAX) * 4;
     let folded_bytes = usize::try_from(totals.folded_total).unwrap_or(usize::MAX) * 4;
@@ -763,7 +789,9 @@ impl LayerScoreCapture {
             return me;
         }
         scratch.raw_offsets_i32.clear();
-        scratch.raw_offsets_i32.extend(scratch.raw_offsets.iter().map(|&v| v as i32));
+        scratch
+            .raw_offsets_i32
+            .extend(scratch.raw_offsets.iter().map(|&v| v as i32));
         let Some(arena) = arena else {
             eprintln!(
                 "[pie-driver-cuda] score capture has no hook sideband arena; \
@@ -773,8 +801,14 @@ impl LayerScoreCapture {
         };
         let requests = u32::try_from(obs.num_requests).unwrap_or(0);
         let indptr = std::mem::take(&mut scratch.raw_offsets_i32);
-        let acquired =
-            me.buf.acquire(ops, arena, totals.raw_total, totals.folded_total, &indptr, requests);
+        let acquired = me.buf.acquire(
+            ops,
+            arena,
+            totals.raw_total,
+            totals.folded_total,
+            &indptr,
+            requests,
+        );
         scratch.raw_offsets_i32 = indptr;
         if !acquired {
             return me;
@@ -859,7 +893,11 @@ impl LayerScoreCapture {
     /// until [`Self::publish`] ran.
     #[must_use]
     pub const fn scores(&self) -> Option<&AttentionScores> {
-        if self.published { self.payload.as_ref() } else { None }
+        if self.published {
+            self.payload.as_ref()
+        } else {
+            None
+        }
     }
 
     /// The C++ destructor: hand the slot back and drop the depth.
@@ -875,7 +913,10 @@ impl LayerScoreCapture {
 
 impl Drop for LayerScoreCapture {
     fn drop(&mut self) {
-        debug_assert!(!self.buf.held, "LayerScoreCapture dropped without release()");
+        debug_assert!(
+            !self.buf.held,
+            "LayerScoreCapture dropped without release()"
+        );
     }
 }
 
@@ -1089,7 +1130,11 @@ impl LayerPrefillScoreCapture {
     /// The published payload; `None` until [`Self::publish`] ran.
     #[must_use]
     pub const fn scores(&self) -> Option<&AttentionScores> {
-        if self.published { self.payload.as_ref() } else { None }
+        if self.published {
+            self.payload.as_ref()
+        } else {
+            None
+        }
     }
 
     /// The C++ destructor.
@@ -1105,6 +1150,9 @@ impl LayerPrefillScoreCapture {
 
 impl Drop for LayerPrefillScoreCapture {
     fn drop(&mut self) {
-        debug_assert!(!self.buf.held, "LayerPrefillScoreCapture dropped without release()");
+        debug_assert!(
+            !self.buf.held,
+            "LayerPrefillScoreCapture dropped without release()"
+        );
     }
 }

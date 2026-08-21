@@ -32,7 +32,11 @@ fn attention_landing(
     use model_compiler::lower::Arg;
     match dplan.spec(fi).outs.first() {
         Some(Arg::Arena { at, .. }) => Some(*at),
-        _ => match lowered.launches.get(fi + 1).map(|n| &lowered.args[n.args.start as usize]) {
+        _ => match lowered
+            .launches
+            .get(fi + 1)
+            .map(|n| &lowered.args[n.args.start as usize])
+        {
             Some(Arg::Arena { at, .. }) => Some(*at),
             _ => None,
         },
@@ -56,7 +60,72 @@ pub fn fire_class_of(
     requests: usize,
 ) -> Result<model_ir::trace::FireClass, i32> {
     use model_ir::trace::FireClass;
-    Ok(if rows == requests { FireClass::Decode } else { FireClass::Prefill })
+    Ok(if rows == requests {
+        FireClass::Decode
+    } else {
+        FireClass::Prefill
+    })
+}
+
+/// Run this fire eagerly, on a lowering whose guards are already resolved.
+///
+/// # What this replaces
+///
+/// Every path out of `capture_or_replay` that gives up — a predicate upload
+/// that failed, a warm-up that would not lower, a capture that would not open,
+/// a graph that would not instantiate, an exec that would not launch — used to
+/// hand the fire's own `lowered` to `run`. That was wrong, and silently so.
+///
+/// `run` walks every launch and never reads `launch.cond`: it has no predicate
+/// word to read it against, because resolving a guard on the host is the whole
+/// point of not capturing. Under `GuardMode::Resolve` that is exactly right —
+/// the lowering contains only the arms this fire's rows selected. Under
+/// `GuardMode::Union` it is exactly wrong — the lowering contains BOTH arms of
+/// every guard, and `run` fires both.
+///
+/// # What that cost
+///
+/// On `lora-probe` at `adapter_scale: 8.0` the union-eager walk answered
+/// `" Navigation llii"` where the resolved walk answers
+/// `" Navigationervicesii Instructions"`. Reproducibly, on every fire — so a
+/// single failed `begin_capture` (an out-of-memory moment, a driver hiccup, a
+/// second capture already open on the stream) would not degrade the fire to a
+/// slower correct path. It would degrade it to a fast wrong one, with nothing
+/// in the log to say so.
+///
+/// So this lowers the fire's OWN rows a second time under `Resolve` and runs
+/// that. The cost is one lowering, paid only on a path that was already about
+/// to walk 535 launches by hand. If even that lowering refuses there is
+/// nothing better left than the old behaviour, and the fire takes it.
+#[allow(clippy::too_many_arguments)]
+fn run_resolved<R: crate::bind::Resolver>(
+    plan: &model_ir::trace::ForwardPlan,
+    rows_desc: &[model_compiler::lower::Row],
+    lowered: &model_compiler::lower::Lowered,
+    dplan: &crate::bind::DispatchPlan,
+    frame: crate::bind::Frame,
+    resolver: &mut R,
+    ctx: &crate::bind::DispatchCtx,
+    regions: crate::bind::AttnRegions<'_>,
+    gdn: Option<&crate::bind::GdnCtx>,
+) -> Result<usize, crate::bind::RunRefusal> {
+    let resolved = model_compiler::lower::lower_with(
+        plan,
+        rows_desc,
+        // A resolved walk states no `rows_device` early-out, so the host's
+        // counts are the truth and this fire's split is the one that runs.
+        model_compiler::lower::Fire {
+            captures_across_splits: false,
+        },
+        model_compiler::lower::GuardMode::Resolve,
+    );
+    match resolved {
+        Ok(r) => {
+            let rdplan = crate::bind::DispatchPlan::with_boot(plan, &r, dplan.boot());
+            crate::bind::run(&r, &rdplan, frame, resolver, ctx, regions, gdn)
+        }
+        Err(_) => crate::bind::run(lowered, dplan, frame, resolver, ctx, regions, gdn),
+    }
 }
 
 /// Replay this fire's bucket if it is captured, and capture it if not.
@@ -95,6 +164,21 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     // past `capture_or_replay`.
     let lora = ctx.lora.map(|(s, _)| unsafe { &*s });
     let eligibility = union_eligibility(lora);
+    // A fire the cache will not keep must not pay to be captured.
+    //
+    // `Recordings::insert` refuses an ineligible exec and installs nothing, so
+    // a fire that lands here every time used to walk two warm passes, a
+    // 535-launch capture, a `cudaGraphInstantiate` and a launch, and then have
+    // the exec dropped on the floor. `Ineligible`'s own doc says such a fire
+    // "stays eager"; until now it did not. On `lora-probe` that was 17s per
+    // four tokens against 4.2s for the same fire run eagerly — four times the
+    // cost, for a graph nobody would ever replay.
+    if let Some(why) = eligibility {
+        sg_trace(|| format!("eager: {why:?}"));
+        return run_resolved(
+            plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+        );
+    }
     let key = BucketKey::new(
         u32::try_from(requests).unwrap_or(0),
         u32::try_from(rows).unwrap_or(0),
@@ -110,7 +194,9 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     // one exec. Not synchronized after: upload and replay are ordered on the
     // same stream.
     if fire_predicates(rows_desc, &lowered.conds, preds).is_err() || preds.upload(stream).is_err() {
-        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+        return run_resolved(
+            plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+        );
     }
 
     // What this fire would hand the graph, against what the graph recorded.
@@ -119,23 +205,58 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         sg_trace(|| format!("replay {key:?}"));
         return Ok(lowered.launches.len());
     }
-    sg_trace(|| format!("miss {key:?} launches={}", lowered.launches.len()));
+    // The digest and the stats are on this line because the two questions a
+    // miss raises cannot be answered without them: whether this fire's
+    // addresses moved, and whether the bucket is being shared. Six misses on
+    // one key with two digests strictly alternating is what a shared bucket
+    // looks like, and it is unreadable without printing the digest.
+    sg_trace(|| {
+        format!(
+            "miss {key:?} launches={} epoch={epoch:?} digest={digest:#x} \
+             (hits,misses,stale)={:?} evicted={}",
+            lowered.launches.len(),
+            cache.stats(),
+            cache.evicted()
+        )
+    });
 
     // One warm fire per variant, each a resolved program — only variants this
     // fire can prepare: a `wants_scores` warm-up would lower the score-
     // capturing dispatch, which refuses without a score sink.
+    // The warm fire must resolve the SAME guards the capture will, or it warms
+    // a different program. The adapter bit is the one that matters: it decides
+    // whether the correction launch exists, and -- since the correction's
+    // projection input is pinned out of the arena only for a fire that carries
+    // an adapter -- it decides the arena layout and which named buffers the
+    // resolver has been asked for. A warm-up that dropped the bit left the
+    // capture to ask for a buffer nobody had allocated yet, inside an open
+    // capture, which is the one allocation CUDA will not do.
+    let lora = rows_desc.iter().any(|r| r.lora);
     for marks in [
-        model_compiler::lower::Row { samples: true, ..Default::default() },
-        model_compiler::lower::Row { samples: true, write_desc: true, ..Default::default() },
+        model_compiler::lower::Row {
+            samples: true,
+            lora,
+            ..Default::default()
+        },
+        model_compiler::lower::Row {
+            samples: true,
+            lora,
+            write_desc: true,
+            ..Default::default()
+        },
     ] {
         let warm_rows = vec![marks; rows];
         let Ok(warm) = model_compiler::lower::lower_with(
             plan,
             &warm_rows,
-            model_compiler::lower::Fire { captures_across_splits: false },
+            model_compiler::lower::Fire {
+                captures_across_splits: false,
+            },
             model_compiler::lower::GuardMode::Resolve,
         ) else {
-            return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+            return run_resolved(
+                plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+            );
         };
         // Resolve against the fire's own boot, not a default: a
         // `Boot::default()` states no KV dtype, so the warm-up would exercise
@@ -151,7 +272,9 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         // immediately inside the open capture and the graph would fault on
         // destroy.
         let Ok(scope) = alloc.begin_capture(stream) else {
-            return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+            return run_resolved(
+                plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+            );
         };
         let mut b = crate::device::SupergraphBuilder::new(scope.stream(), preds);
         let ran =
@@ -180,13 +303,19 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         }
     };
     let Some((ran, graph, nodes)) = captured else {
-        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+        return run_resolved(
+            plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+        );
     };
     let Ok(exec) = graph.instantiate() else {
-        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+        return run_resolved(
+            plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+        );
     };
     if exec.launch(stream).is_err() {
-        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+        return run_resolved(
+            plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
+        );
     }
     let _ = cache.insert_with_nodes(key, exec, epoch, nodes, digest, eligibility);
     Ok(ran)
@@ -236,7 +365,9 @@ fn build_lowering(
     use crate::bind::DispatchPlan;
     use model_compiler::lower::{Fire, GuardMode, lower_with};
 
-    let plan = row.trace(class, deployed).map_err(|e| i32::from(crate::Error::from(e)))?;
+    let plan = row
+        .trace(class, deployed)
+        .map_err(|e| i32::from(crate::Error::from(e)))?;
     // `captures_across_splits` must follow the guard mode: with it clear the
     // host's counts are the truth, so a capture would bake this fire's split
     // into the graph — wrong only on replay. Under `Union` both regions lower
@@ -244,7 +375,15 @@ fn build_lowering(
     // one exec serves every split and the split need not be a `BucketKey` axis.
     let lower_as = |g: GuardMode| {
         let captures_across_splits = g == GuardMode::Union;
-        lower_with(&plan, fire_rows, Fire { captures_across_splits }, g).map_err(|e| {
+        lower_with(
+            &plan,
+            fire_rows,
+            Fire {
+                captures_across_splits,
+            },
+            g,
+        )
+        .map_err(|e| {
             eprintln!("[driver-cuda] launch: uncovered: {e:?}");
             PIE_STATUS_UNSUPPORTED
         })
@@ -253,7 +392,11 @@ fn build_lowering(
     if !union {
         sg_trace(|| "union off at the gate".into());
     }
-    let lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
+    let lowered = lower_as(if union {
+        GuardMode::Union
+    } else {
+        GuardMode::Resolve
+    })?;
 
     let dplan = DispatchPlan::with_boot(&plan, &lowered, boot);
     // The load-time refusal: unfireable symbols refuse here, before any
@@ -271,7 +414,11 @@ fn build_lowering(
             format!(
                 "refused at load: {} unfireable symbol(s): {}",
                 unfireable.len(),
-                unfireable.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+                unfireable
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             )
         });
         return Err(PIE_STATUS_UNSUPPORTED);
@@ -280,7 +427,12 @@ fn build_lowering(
     let (rows_left, total) = dplan.sweep_progress();
     sg_trace(|| format!("routes: {rows_left}/{total} still row-world"));
     sg_trace(|| format!("built: launches={} union={union}", lowered.launches.len()));
-    Ok(LoweredFire { plan, lowered, dplan, union })
+    Ok(LoweredFire {
+        plan,
+        lowered,
+        dplan,
+        union,
+    })
 }
 
 /// The admit phase's result.
@@ -358,7 +510,10 @@ fn admit(
         .map(|&wire_row| {
             // Out of range must not be clamped — a clamp would describe the
             // wrong rows; pass it through so `rows_from_regions` refuses it.
-            qo_indptr.get(wire_row as usize).copied().unwrap_or(u32::MAX)
+            qo_indptr
+                .get(wire_row as usize)
+                .copied()
+                .unwrap_or(u32::MAX)
         })
         .collect();
     let mut fire_rows = model_compiler::lower::rows_from_regions(
@@ -419,7 +574,15 @@ fn admit(
         );
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    Ok((Admitted { class, rows, requests, fire_rows }, row))
+    Ok((
+        Admitted {
+            class,
+            rows,
+            requests,
+            fire_rows,
+        },
+        row,
+    ))
 }
 
 /// Run the instance's registered program over the fire's logits — the
@@ -498,14 +661,19 @@ fn run_program(
     let Some(compiled) = programs.get(instance.program_id) else {
         return Ok(false);
     };
-    // The epilogue's plan, not the first: `plans.first()` is the epilogue only
-    // by accident, and a package carrying an adapter puts its sink in a
-    // prologue, so first would fire the adapter and never sample. Fall back to
-    // the first stage for a package that states no kinds.
-    let stage = compiled.stage_of_kind(crate::program::runtime::stage_kind::EPILOGUE).unwrap_or(0);
-    let Some(plan) = compiled.plans.get(stage).cloned() else {
+    // A PROGRAM has no single plan to pick. It used to: the fire prepared one
+    // stage, so this had to choose which, and the choice had to be by KIND
+    // rather than by position -- `plans.first()` is the epilogue only by
+    // accident, and a package carrying an adapter puts its sink in a prologue,
+    // so first would have fired the adapter and never sampled. `Session::fire`
+    // now prepares every launching stage from its own plan, which is both the
+    // reason that choice is gone and the reason an adapter program runs at all.
+    //
+    // The refusal that STOOD HERE -- a program with no plan at index `stage` --
+    // is `stages_and_plans_agree`'s now, and states which index and why.
+    if compiled.plans.is_empty() {
         return Ok(false);
-    };
+    }
     let Some(shapes) = instance_ring_shapes(instance, channels) else {
         eprintln!(
             "[driver-cuda] launch: instance {instance_id} names a channel this \
@@ -569,7 +737,6 @@ fn run_program(
     match session.fire(
         rings,
         &compiled,
-        &plan,
         control,
         &mut host,
         logits,
@@ -618,7 +785,10 @@ fn logits_row_of(span_end: usize, rows: usize, sampled_rows: &[u32]) -> usize {
     if sampled_rows.len() == rows {
         return row;
     }
-    sampled_rows.iter().position(|&s| s as usize == row).unwrap_or(row)
+    sampled_rows
+        .iter()
+        .position(|&s| s as usize == row)
+        .unwrap_or(row)
 }
 
 fn deliver_logits(
@@ -633,10 +803,7 @@ fn deliver_logits(
     model: &LoadedModel,
     lowered: &model_compiler::lower::Lowered,
     dplan: &crate::bind::DispatchPlan,
-    named_bufs: &std::collections::BTreeMap<
-        model_ir::trace::ValueId,
-        crate::device::DeviceBuffer,
-    >,
+    named_bufs: &std::collections::BTreeMap<model_ir::trace::ValueId, crate::device::DeviceBuffer>,
     stream: crate::device::StreamRef<'_>,
     rows: usize,
     // Where each request's token span ends, so its answer row can be
@@ -755,7 +922,11 @@ fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
     if state.fire_alloc.is_none() {
         state.fire_alloc = Some(crate::device::Allocator::new());
     }
-    while state.in_flight.front().is_some_and(|f| f.done.is_complete().unwrap_or(true)) {
+    while state
+        .in_flight
+        .front()
+        .is_some_and(|f| f.done.is_complete().unwrap_or(true))
+    {
         let done = state.in_flight.pop_front().expect("just checked");
         retire(done);
     }
@@ -795,7 +966,13 @@ fn gdn_context(
     requests: usize,
     alloc: &crate::device::Allocator,
     stream: &crate::device::OwnedStream,
-) -> Result<(Option<crate::bind::GdnCtx>, Option<crate::device::DeviceBuffer>), i32> {
+) -> Result<
+    (
+        Option<crate::bind::GdnCtx>,
+        Option<crate::device::DeviceBuffer>,
+    ),
+    i32,
+> {
     use crate::bind::GdnCtx;
 
     let mut gdn_ctx: Option<GdnCtx> = None;
@@ -806,8 +983,9 @@ fn gdn_context(
         if (*gdn).is_none() {
             // The ported cache owns the layout: it pools the `(conv,
             // recurrent)` pairs and answers both strides.
-            let is_linear: Vec<bool> =
-                (0..dep.layers).map(|l| shape.linear_layers.contains(&l)).collect();
+            let is_linear: Vec<bool> = (0..dep.layers)
+                .map(|l| shape.linear_layers.contains(&l))
+                .collect();
             let cache =
                 crate::pools::recurrent_state_cache::RecurrentStateCache::allocate_bf16_recurrent(
                     &is_linear,
@@ -818,10 +996,15 @@ fn gdn_context(
                     u32::try_from(shape.v_d).unwrap_or(0),
                     i32::try_from(GDN_SLOTS).unwrap_or(0),
                 );
-            let mut conv = alloc
-                .alloc(usize::try_from(cache.layout().conv_total_bytes()).unwrap_or(0).max(1))?;
+            let mut conv = alloc.alloc(
+                usize::try_from(cache.layout().conv_total_bytes())
+                    .unwrap_or(0)
+                    .max(1),
+            )?;
             let mut recurrent = alloc.alloc(
-                usize::try_from(cache.layout().recurrent_total_bytes()).unwrap_or(0).max(1),
+                usize::try_from(cache.layout().recurrent_total_bytes())
+                    .unwrap_or(0)
+                    .max(1),
             )?;
             conv.memset(0, stream.as_ref())?;
             recurrent.memset(0, stream.as_ref())?;
@@ -860,7 +1043,10 @@ fn gdn_context(
             if rs_flags.get(r).copied().unwrap_or(0) & driver_api::local::PIE_RS_FLAG_RESET == 0 {
                 continue;
             }
-            let Ok(ops) = gdn_state.cache.reset_slot(i32::try_from(slot).unwrap_or(-1)) else {
+            let Ok(ops) = gdn_state
+                .cache
+                .reset_slot(i32::try_from(slot).unwrap_or(-1))
+            else {
                 eprintln!("[driver-cuda] launch: rs_slot_ids names a slot the cache lacks");
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
@@ -887,7 +1073,11 @@ fn gdn_context(
             })
             .collect();
         // Every slot the fire names has to exist, buffer slots included.
-        let need_buffer = rs_buffer_slot_ids.iter().copied().max().map_or(0, |m| m + 1);
+        let need_buffer = rs_buffer_slot_ids
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m + 1);
         gdn_state.ensure_slots(need_buffer.max(need_slots), epoch, &alloc, &stream)?;
         // The fold, recorded on the fire's stream so it lands after the pass
         // that filled the buffer: copy the accepted prefix's last state into
@@ -946,7 +1136,9 @@ fn gdn_context(
             n_groups: shape.n_groups,
             // Still one base per model layer: pooling changed where a base
             // comes from, not what a launch is handed.
-            conv_state: (0..gdn_state.is_linear.len()).map(|l| gdn_state.conv_base(l)).collect(),
+            conv_state: (0..gdn_state.is_linear.len())
+                .map(|l| gdn_state.conv_base(l))
+                .collect(),
             conv_stride_elems: gdn_state.conv_stride_elems,
             recurrent_state: (0..gdn_state.is_linear.len())
                 .map(|l| gdn_state.recurrent_base(l))
@@ -1040,7 +1232,11 @@ fn kv_pools_for(
         crate::serve::state::install_kv(
             kv,
             epoch,
-            KvState { cache, _held: held, num_pages: need_pages },
+            KvState {
+                cache,
+                _held: held,
+                num_pages: need_pages,
+            },
         );
     }
     Ok((*kv).as_ref().expect("just ensured").views())
@@ -1258,7 +1454,14 @@ fn raise_attn_plans(
     use crate::bind::{DecodePlan, PrefillPlan};
     use crate::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 
-    let PlanGeometry { kv_indptr, kv_lens, qo_indptr, kv_heads, head_dim, page_size } = geom;
+    let PlanGeometry {
+        kv_indptr,
+        kv_lens,
+        qo_indptr,
+        kv_heads,
+        head_dim,
+        page_size,
+    } = geom;
     let mut sops = LiveStagingOps;
     if scratch_slot.is_none() {
         let ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
@@ -1293,7 +1496,10 @@ fn raise_attn_plans(
     let mut prefill_head_dim: Option<u32> = None;
     for p in &lowered.preps {
         match p.kind {
-            PrepKind::DecodeAttention { head_dim, full_attention } => {
+            PrepKind::DecodeAttention {
+                head_dim,
+                full_attention,
+            } => {
                 if !decode_wanted.contains(&(head_dim, full_attention)) {
                     decode_wanted.push((head_dim, full_attention));
                 }
@@ -1350,12 +1556,28 @@ fn raise_attn_plans(
         // one schedule: the width is what the plan is.
         (Some((d_win, _)), Some((d_full, _))) if d_win != d_full => {
             decode_plan.plan_decode_variant(
-                kv_indptr, q_heads_i, kv_heads, d_win as i32, page_size,
-                ws.view(), raw_stream, true, false, -1,
+                kv_indptr,
+                q_heads_i,
+                kv_heads,
+                d_win as i32,
+                page_size,
+                ws.view(),
+                raw_stream,
+                true,
+                false,
+                -1,
             );
             decode_plan_full.plan_decode_variant(
-                kv_indptr, q_heads_i, kv_heads, d_full as i32, page_size,
-                ws.view(), raw_stream, true, true, -1,
+                kv_indptr,
+                q_heads_i,
+                kv_heads,
+                d_full as i32,
+                page_size,
+                ws.view(),
+                raw_stream,
+                true,
+                true,
+                -1,
             );
             decode_plan_full.as_ptr()
         }
@@ -1379,8 +1601,16 @@ fn raise_attn_plans(
             let stated = windowed.or(full);
             let d = stated.map_or(head_dim, |(d, _)| d as i32);
             decode_plan.plan_decode_variant(
-                kv_indptr, q_heads_i, kv_heads, d, page_size,
-                ws.view(), raw_stream, true, stated.is_some_and(|(_, f)| f), -1,
+                kv_indptr,
+                q_heads_i,
+                kv_heads,
+                d,
+                page_size,
+                ws.view(),
+                raw_stream,
+                true,
+                stated.is_some_and(|(_, f)| f),
+                -1,
             );
             core::ptr::null_mut()
         }
@@ -1390,8 +1620,17 @@ fn raise_attn_plans(
     if let Some(d) = prefill_head_dim {
         prefill_ws.begin_plan_update(&mut sops)?;
         prefill_plan.plan_prefill(
-            qo_indptr, kv_indptr, kv_lens, q_heads_i, kv_heads, d as i32, page_size,
-            prefill_ws.view(), raw_stream, true, -1,
+            qo_indptr,
+            kv_indptr,
+            kv_lens,
+            q_heads_i,
+            kv_heads,
+            d as i32,
+            page_size,
+            prefill_ws.view(),
+            raw_stream,
+            true,
+            -1,
         );
         // The fence is the point: `end_plan_update` records the event that
         // says the schedule upload landed, so a launch cannot read a schedule
@@ -1415,7 +1654,11 @@ fn raise_attn_plans(
         decode_raised_at,
         prefill_plan: prefill_plan.as_ptr(),
         workspace: ws.view(),
-        prefill_workspace: if planless_prefill { ws.view() } else { prefill_ws.view() },
+        prefill_workspace: if planless_prefill {
+            ws.view()
+        } else {
+            prefill_ws.view()
+        },
         states_decode_dispatch,
         planless_prefill,
         two_decode_kinds: !decode_plan_full_ptr.is_null(),
@@ -1456,7 +1699,13 @@ fn publish_seam_pins(
     // the knob reaches here.
     attn_score_window: u32,
 ) -> Result<SeamPins, i32> {
-    let PlanGeometry { kv_indptr, kv_lens, qo_indptr, page_size, .. } = geom;
+    let PlanGeometry {
+        kv_indptr,
+        kv_lens,
+        qo_indptr,
+        page_size,
+        ..
+    } = geom;
     for (&v, &w) in named_widths {
         // fp32-wide: the GDN seam pins are f32; llama-like's are bf16 and
         // simply leave half the pin unread.
@@ -1465,7 +1714,11 @@ fn publish_seam_pins(
     // The score sink is published unconditionally: `WantsAttnScore` is a folded
     // predicate, so the capturing arm must be recordable whether this fire
     // wants scores or not.
-    let score_window = if states_decode_dispatch { 1 } else { attn_score_window };
+    let score_window = if states_decode_dispatch {
+        1
+    } else {
+        attn_score_window
+    };
     let sink = crate::fire::attn_score::plan_score_sink(
         kv_indptr,
         kv_lens,
@@ -1476,13 +1729,19 @@ fn publish_seam_pins(
     let (d_scores, d_folded, d_score_indptr) = match sink {
         // A sink too large to publish (the prefill window grows with context)
         // keeps the old answer: null, and the capturing arm declines.
-        None => (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null()),
+        None => (
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        ),
         Some(p) => {
             let base = fire_arrays.score(alloc, &p, stream.as_ref())?;
             (
                 base,
                 unsafe { base.cast::<u8>().add(p.folded_offset) }.cast::<std::ffi::c_void>(),
-                unsafe { base.cast::<u8>().add(p.indptr_offset) }.cast::<i32>().cast_const(),
+                unsafe { base.cast::<u8>().add(p.indptr_offset) }
+                    .cast::<i32>()
+                    .cast_const(),
             )
         }
     };
@@ -1525,7 +1784,9 @@ fn publish_seam_pins(
             let base = fire_arrays.mask(alloc, &p, stream.as_ref())?;
             (
                 base.cast::<u8>().cast_const(),
-                unsafe { base.cast::<u8>().add(p.indptr_offset) }.cast::<i32>().cast_const(),
+                unsafe { base.cast::<u8>().add(p.indptr_offset) }
+                    .cast::<i32>()
+                    .cast_const(),
             )
         }
     };
@@ -1545,7 +1806,14 @@ fn publish_seam_pins(
         core::ptr::null_mut()
     };
 
-    Ok(SeamPins { d_scores, d_folded, d_score_indptr, d_mask, d_mask_indptr, d_attn_out })
+    Ok(SeamPins {
+        d_scores,
+        d_folded,
+        d_score_indptr,
+        d_mask,
+        d_mask_indptr,
+        d_attn_out,
+    })
 }
 
 /// Which SSA value holds the attention query, and where its output lands.
@@ -1555,38 +1823,116 @@ fn publish_seam_pins(
 ///
 /// Which SSA values the adapter correction reads and writes. `(q, v, x)`: the
 /// two projection outputs the correction adds into (bound as `args[0]`/`[1]`)
-/// and the projection input it reads — a foreign aux operand (`aux[0]`, bound
-/// as `aux_slot(0)`), which is what makes it resolvable. `None` when the
-/// lowering states no correction.
+/// and the projection input it reads (`aux[0]`, bound as `aux_slot(0)`).
+/// `None` when the lowering states no correction.
+///
+/// # Two ways to name the same rows
+///
+/// A lowered operand is EITHER a named SSA value, which the fire resolves out
+/// of `scratch.named`, OR an arena slot, which is a byte offset into the one
+/// activation arena the fire allocates per launch. Which one a given operand
+/// gets is the lowering's choice and it is made per family: a value that no
+/// later launch reads by name is folded into the arena, and one that crosses a
+/// guard arm keeps its name.
+///
+/// # What that cost
+///
+/// This read named SSA values only, and refused a correction whose operands
+/// were arena-resident by returning `None` -- which is the shape a model that
+/// states no correction at all also returns, so the refusal was invisible.
+/// `lora-probe` on qwen3-0.6b took that path: the lowering DOES state
+/// `gemm::lora_qkv_correction`, at launch 4, with `args[0]`/`args[1]` named
+/// (the q and v projection outputs) and `aux[0]` an `Arena { at: 10240 }` --
+/// the normed projection input, which nothing downstream reads by name.
+///
+/// So one operand of three was unresolvable, `lora_pins` said `None`, the
+/// adapter phase staged nothing, and the fire ran the base model. The lane
+/// resolved, the channels were seeded, the sink was read: everything up to the
+/// last step worked. The only symptom was that `adapter_scale: 0.5` answered
+/// exactly what `adapter_scale: 0.0` answered, which is precisely the claim
+/// the fixture exists to falsify, silently inverted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoraPin {
+    /// A named SSA value, resolved through the fire's `scratch.named` map.
+    Named(model_ir::trace::ValueId),
+    /// A byte offset into the fire's activation arena.
+    Arena(usize),
+}
+
+/// Where the adapter correction's three operands live, and how wide two of
+/// them are.
+///
+/// # Why the widths are read and not computed
+///
+/// `q_width`/`v_width` are the ROW STRIDES of the two projection buffers the
+/// correction adds into, and the staging uses them to step from one token's
+/// row to the next. They are stated by the lowering, on the operand itself,
+/// which is the only place they are stated ONCE: recomputing them means
+/// picking `q_heads * head_dim` versus `q_heads * head_dim_kernel` and being
+/// right about padding for every family, forever.
+///
+/// # What that cost
+///
+/// The call passed `shape.q_heads` and `shape.kv_heads` -- head COUNTS -- into
+/// the two width parameters. On qwen3-0.6b that offered 16 and 8 where the
+/// buffers are 2048 and 1024 wide, so the staging refused with *lora adapter
+/// d_out 2048 != q projection width 16*, which is a correct refusal of a
+/// wrong question. The refusal was swallowed by an `.ok()?`, so the fire ran
+/// the base model and the adapter simply did not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LoraPins {
     /// The q-site output rows.
-    q: model_ir::trace::ValueId,
+    q: LoraPin,
     /// The v-site output rows.
-    v: model_ir::trace::ValueId,
-    /// The projection input — normed value under `Pre`, residual stream under
+    v: LoraPin,
+    /// The projection input -- normed value under `Pre`, residual stream under
     /// `Post`; the lowering knows which.
-    x: model_ir::trace::ValueId,
+    x: LoraPin,
+    /// Elements per token row in the q buffer.
+    q_width: i32,
+    /// Elements per token row in the v buffer.
+    v_width: i32,
+}
+
+/// Read an operand's home off the lowering. `Weight` and `Raised` are neither:
+/// a weight is not per-fire rows and a raise is a plan object, and the
+/// correction reads neither, so a correction that named one is malformed and
+/// refuses here rather than being bound to something plausible.
+fn lora_pin(arg: &model_compiler::lower::Arg) -> Option<(LoraPin, i32)> {
+    use model_compiler::lower::Arg;
+    match arg {
+        Arg::Named { value, width, .. } => {
+            Some((LoraPin::Named(*value), i32::try_from(*width).unwrap_or(0)))
+        }
+        Arg::Arena { at, width, .. } => {
+            Some((LoraPin::Arena(*at), i32::try_from(*width).unwrap_or(0)))
+        }
+        Arg::Weight(_) | Arg::Raised { .. } => None,
+    }
 }
 
 fn lora_pins(
     lowered: &model_compiler::lower::Lowered,
     dplan: &crate::bind::DispatchPlan,
 ) -> Option<LoraPins> {
-    use model_compiler::lower::Arg;
     let at = lowered
         .launches
         .iter()
         .position(|x| lowered.kernels[x.kernel as usize] == "gemm::lora_qkv_correction")?;
-    let named = |a: &Arg| match a {
-        Arg::Named { value, .. } => Some(*value),
-        Arg::Arena { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
-    };
-    let mut args =
-        lowered.launches[at].args.clone().filter_map(|ai| named(&lowered.args[ai as usize]));
-    let q = args.next()?;
-    let v = args.next()?;
-    let x = dplan.spec(at).aux.first().and_then(named)?;
-    Some(LoraPins { q, v, x })
+    let mut args = lowered.launches[at]
+        .args
+        .clone()
+        .filter_map(|ai| lora_pin(&lowered.args[ai as usize]));
+    let (q, q_width) = args.next()?;
+    let (v, v_width) = args.next()?;
+    let (x, _) = dplan.spec(at).aux.first().and_then(lora_pin)?;
+    Some(LoraPins {
+        q,
+        v,
+        x,
+        q_width,
+        v_width,
+    })
 }
 
 fn attention_pins(
@@ -1634,13 +1980,19 @@ fn attention_pins(
         .iter()
         .position(|x| dispatch_names.contains(&lowered.kernels[x.kernel as usize].as_str()))
     else {
-        eprintln!("[driver-cuda] launch: the lowering states no {}", dispatch_names[0]);
+        eprintln!(
+            "[driver-cuda] launch: the lowering states no {}",
+            dispatch_names[0]
+        );
         return Err(PIE_STATUS_UNSUPPORTED);
     };
-    let q_pin = lowered.launches[fi].args.clone().find_map(|ai| match &lowered.args[ai as usize] {
-        Arg::Named { value, .. } => Some(*value),
-        _ => None,
-    });
+    let q_pin = lowered.launches[fi]
+        .args
+        .clone()
+        .find_map(|ai| match &lowered.args[ai as usize] {
+            Arg::Named { value, .. } => Some(*value),
+            _ => None,
+        });
     // The dispatch's output, read off its op join — the stated read: the
     // attention statement carries its output placement, the slot the o_proj
     // reads. Preferred over the neighbour launch (the old positional read)
@@ -1706,7 +2058,9 @@ fn run_sampling_programs(
             Arg::Arena { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
         })
     });
-    let logits_base = readout.and_then(|v| named_bufs.get(&v)).map_or(0, |b| b.as_ptr() as u64);
+    let logits_base = readout
+        .and_then(|v| named_bufs.get(&v))
+        .map_or(0, |b| b.as_ptr() as u64);
     // A ZERO BASE IS A SAMPLER READING ADDRESS ZERO, and it fails silently:
     // every request draws from whatever is there, which is why a forward pass
     // whose logits are provably right can still emit token 0 forever.
@@ -1840,7 +2194,11 @@ fn compose_step(
     match composed {
         Ok(Composed::Wire) => Ok(None),
         Ok(Composed::Ready(step)) => Ok(Some(step)),
-        Ok(Composed::Early { instance, channel, port }) => {
+        Ok(Composed::Early {
+            instance,
+            channel,
+            port,
+        }) => {
             eprintln!(
                 "[driver-cuda] launch: instance {instance}'s {port:?} port names channel \
                  {channel}, whose ring holds no value — and every earlier slot of this \
@@ -1849,7 +2207,10 @@ fn compose_step(
             Err(PIE_STATUS_INVALID_ARGUMENT)
         }
         Err(why) => {
-            eprintln!("[driver-cuda] launch: this step's geometry cannot be composed: {}", why.0);
+            eprintln!(
+                "[driver-cuda] launch: this step's geometry cannot be composed: {}",
+                why.0
+            );
             Err(PIE_STATUS_INVALID_ARGUMENT)
         }
     }
@@ -1903,9 +2264,7 @@ fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
                     // channel a previous instance registered keeps its cells
                     // (the `continue` above), so re-seeding would overwrite
                     // what that instance published.
-                    if let Some((_, wire)) =
-                        instance.seeds.iter().find(|(id, _)| id == channel)
-                    {
+                    if let Some((_, wire)) = instance.seeds.iter().find(|(id, _)| id == channel) {
                         let shape = shapes[dense];
                         match crate::program::channel::wire_to_native(
                             shape.dtype,
@@ -1918,6 +2277,53 @@ fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
                                 {
                                     refused = Some(error);
                                     break;
+                                }
+                                // And into the MIRROR, which the seed
+                                // otherwise skips entirely.
+                                //
+                                // A seed rides the bind as a `ChannelValue`,
+                                // out of band, so the cell above never travels
+                                // through the engine-shared plane and neither
+                                // cursor word moves. The engine counts it all
+                                // the same -- `pipeline::channel::bind` sets
+                                // `writer_tail = max(1)` for a seeded writer,
+                                // because from the guest's side one cell HAS
+                                // been put -- and then two things it owns are
+                                // wrong at once, with no fault from either
+                                // side:
+                                //
+                                // * The guest's next `put` asks
+                                //   `writer_tail - head >= capacity`, reads the
+                                //   head word at zero, and gets `1 - 0 >= 1` at
+                                //   the default capacity of one. `Full`, and
+                                //   forever: the only thing that moves `head`
+                                //   is a `pull_channels` take out of a mirror
+                                //   that is empty. The guest waits on a cell it
+                                //   cannot stage, the driver waits on a fire
+                                //   that is never submitted, and nothing logs.
+                                // * `Channel::set` -- which is how a
+                                //   latest-value port like `KvLen` is advanced,
+                                //   since nothing consumes it -- refuses with
+                                //   `Empty` unless the cell it replaces is
+                                //   still committed (`committed_tail <= head`).
+                                //   With an empty mirror there is no front to
+                                //   replace and every `set` after the seed is
+                                //   an error.
+                                //
+                                // Publishing it here fixes both, because it is
+                                // the truth: the cell was produced by the guest
+                                // and has not been consumed by anything. Tail
+                                // moves, head does not. `tart-masked` is the
+                                // gate -- it seeds `token_in` AND `set`s
+                                // `klen`, so it needed both halves.
+                                if let Some(entry) = state.channels.get(channel) {
+                                    let mut plane = entry.host_plane();
+                                    if plane.engine_writes() && !plane.publish(wire) {
+                                        eprintln!(
+                                            "[driver-cuda] launch: instance {id}'s seed for \
+                                             channel {channel} did not fit the host mirror"
+                                        );
+                                    }
                                 }
                             }
                             Err(why) => {
@@ -1965,6 +2371,11 @@ fn lora_phase(
     instances: &std::collections::BTreeMap<u64, crate::serve::state::InstanceEntry>,
     scratch: &mut crate::fire::scratch::Scratch,
     lora_arena: &mut crate::fire::lora::LoraStageArena,
+    // The fire's activation arena, already grown -- the correction's operands
+    // are as likely to be arena slots as named values, and an arena slot is
+    // only an address once it is added to this base.
+    arena: *mut core::ffi::c_void,
+    arena_bytes: usize,
     tp_size: u32,
     frame: &FrameSubmission,
     qo_indptr: &[u32],
@@ -2007,14 +2418,26 @@ fn lora_phase(
         core::ptr::null_mut()
     } else {
         scratch
-            .attn_out(alloc, rows * model.deployment.shape.intermediate.max(1) as usize * 2)
+            .lora_gate(
+                alloc,
+                rows * model.deployment.shape.intermediate.max(1) as usize * 2,
+            )
             .unwrap_or(core::ptr::null_mut())
     };
     let named_bufs = &scratch.named;
-    let lora_state =
-        (!lora_lanes.is_empty()).then(|| lora_pins(lowered, dplan)).flatten().and_then(|pins| {
-            let ptr = |v: model_ir::trace::ValueId| {
-                named_bufs.get(&v).map(crate::device::DeviceBuffer::as_ptr)
+    let lora_state = (!lora_lanes.is_empty())
+        .then(|| lora_pins(lowered, dplan))
+        .flatten()
+        .and_then(|pins| {
+            // Both homes, because the lowering uses both. The arena arm bounds
+            // its offset for the reason `resolve_arg_windowed` does: an offset
+            // past the arena is a lowering that disagrees with the arena the
+            // fire grew, and pointing at the memory after it would corrupt
+            // whatever the allocator handed out next rather than refuse.
+            let ptr = |pin: LoraPin| match pin {
+                LoraPin::Named(v) => named_bufs.get(&v).map(crate::device::DeviceBuffer::as_ptr),
+                LoraPin::Arena(at) => (!arena.is_null() && at < arena_bytes)
+                    .then(|| unsafe { arena.cast::<u8>().add(at) }.cast()),
             };
             let (q, v, x) = (ptr(pins.q)?, ptr(pins.v)?, ptr(pins.x)?);
             // The xAᵀ scratch, from the driver's own pool: it is not a value
@@ -2045,8 +2468,10 @@ fn lora_phase(
                 i32::try_from(model.deployment.layers).unwrap_or(0),
                 i32::try_from(rows).unwrap_or(0),
                 i32::try_from(model.deployment.shape.hidden).unwrap_or(0),
-                i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
-                i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+                // The lowering's own row strides, not `q_heads`/`kv_heads`:
+                // see [`LoraPins`] for what that mistake cost.
+                pins.q_width,
+                pins.v_width,
                 i32::try_from(model.deployment.shape.intermediate).unwrap_or(0),
                 i32::try_from(tp_size).unwrap_or(1),
                 post,
@@ -2161,7 +2586,10 @@ fn fire_experts_per_token(lowered: &model_compiler::lower::Lowered) -> i32 {
             .iter()
             .find_map(|&(s, i)| (s == sym.as_str()).then_some(i))
             .or_else(|| {
-                ROUTED_QMV_STEMS.iter().any(|s| sym.starts_with(s)).then_some(ROUTED_QMV_FANOUT_AT)
+                ROUTED_QMV_STEMS
+                    .iter()
+                    .any(|s| sym.starts_with(s))
+                    .then_some(ROUTED_QMV_FANOUT_AT)
             });
         let Some(at) = at else { continue };
         // The run this launch's `params` names, then the slot inside it. A
@@ -2200,7 +2628,12 @@ fn tail_csrs(kv_indptr: &[u32], qo_indptr: &[u32], split: usize) -> TailCsrs {
             .iter()
             .map(|p| p.saturating_sub(page0))
             .collect(),
-        qo: qo_indptr.get(split..).unwrap_or(&[]).iter().map(|p| p.saturating_sub(tok0)).collect(),
+        qo: qo_indptr
+            .get(split..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| p.saturating_sub(tok0))
+            .collect(),
     }
 }
 
@@ -2252,8 +2685,11 @@ fn peel_tail_ctx(
     if two_kind {
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    let TailCsrs { base, indptr: tail_indptr, qo: tail_qo } =
-        tail_csrs(kv_indptr, qo_indptr, split);
+    let TailCsrs {
+        base,
+        indptr: tail_indptr,
+        qo: tail_qo,
+    } = tail_csrs(kv_indptr, qo_indptr, split);
 
     let d_indptr = scratch.upload_u32(alloc, slot::TAIL_INDPTR, &tail_indptr, stream)?;
     let d_lens = scratch.upload_u32(alloc, slot::TAIL_LENS, &kv_lens[split..], stream)?;
@@ -2368,7 +2804,15 @@ pub(crate) fn step_impl(
     // them and translates each member's working-set pages to physical ones.
     let composed = compose_step(state, frame, step)?;
     let step = composed.as_deref().unwrap_or(step);
-    let (Admitted { class, rows, requests, fire_rows }, row) = admit(state, step)?;
+    let (
+        Admitted {
+            class,
+            rows,
+            requests,
+            fire_rows,
+        },
+        row,
+    ) = admit(state, step)?;
     let model = state.model.as_ref().ok_or(PIE_STATUS_INVALID_ARGUMENT)?;
     // Derived at load, read here. See `LoadedModel::deployment`.
     let dep = &model.deployment;
@@ -2406,12 +2850,18 @@ pub(crate) fn step_impl(
             key.union_asked,
             // The boot's KV scheme, read once here rather than branched on at
             // every append — the same value the layer view is built from.
-            crate::bind::Boot { kv_native_bf16: Some(state.kv_format.is_native_bf16()) },
+            crate::bind::Boot {
+                kv_native_bf16: Some(state.kv_format.is_native_bf16()),
+            },
         )?;
         state.lowerings.insert(key, built);
     }
-    let LoweredFire { plan, lowered, dplan, union } =
-        state.lowerings.get(&key).expect("just built");
+    let LoweredFire {
+        plan,
+        lowered,
+        dplan,
+        union,
+    } = state.lowerings.get(&key).expect("just built");
     let union = *union;
     sg_trace(|| format!("  lowering {:?}", t_low.elapsed()));
     let mut phase = std::time::Instant::now();
@@ -2491,7 +2941,10 @@ pub(crate) fn step_impl(
 
     let arena_bytes = lowered.arena_bytes.max(64);
     let arena_ptr = state.fire_arrays.arena(&alloc, arena_bytes)?;
-    let exec_frame = Frame { arena: arena_ptr, arena_bytes };
+    let exec_frame = Frame {
+        arena: arena_ptr,
+        arena_bytes,
+    };
 
     // The plan's RUNTIME values: streams and objects the driver answers
     // itself (`bind::views`). Excluded from the seam-pin walk below — a
@@ -2540,27 +2993,33 @@ pub(crate) fn step_impl(
     } else {
         core::ptr::null()
     };
-    let SeamPins { d_scores, d_folded, d_score_indptr, d_mask, d_mask_indptr, d_attn_out } =
-        publish_seam_pins(
-            &mut state.fire_arrays,
-            alloc,
-            stream,
-            dep,
-            model,
-            step,
-            &named_widths,
-            PlanGeometry {
-                kv_indptr,
-                kv_lens,
-                qo_indptr,
-                kv_heads: kv_heads_i,
-                head_dim: head_dim_i,
-                page_size,
-            },
-            rows,
-            states_decode_dispatch,
-            state.boot.attn_score_window,
-        )?;
+    let SeamPins {
+        d_scores,
+        d_folded,
+        d_score_indptr,
+        d_mask,
+        d_mask_indptr,
+        d_attn_out,
+    } = publish_seam_pins(
+        &mut state.fire_arrays,
+        alloc,
+        stream,
+        dep,
+        model,
+        step,
+        &named_widths,
+        PlanGeometry {
+            kv_indptr,
+            kv_lens,
+            qo_indptr,
+            kv_heads: kv_heads_i,
+            head_dim: head_dim_i,
+            page_size,
+        },
+        rows,
+        states_decode_dispatch,
+        state.boot.attn_score_window,
+    )?;
 
     lap("attn-plan");
     // The hybrid's GDN context: driver-owned slabs, instance slots.
@@ -2575,7 +3034,9 @@ pub(crate) fn step_impl(
     )?;
 
     // Pooled, because a capture bakes `lse_out_d`.
-    let lse = state.fire_arrays.lse(alloc, rows * model.deployment.shape.q_heads as usize * 4)?;
+    let lse = state
+        .fire_arrays
+        .lse(alloc, rows * model.deployment.shape.q_heads as usize * 4)?;
 
     // The guard-owned attention values, discovered from the lowering.
     let (q_pin, o_off) = attention_pins(dep, lowered, dplan, states_decode_dispatch)?;
@@ -2692,12 +3153,24 @@ pub(crate) fn step_impl(
         kv_page_indptr_d: d_kv_indptr.cast(),
         kv_last_page_lens_d: d_kv_lens.cast(),
         qo_indptr_d: d_qo.cast(),
-        qo_indptr_h: if planless_prefill { qo_indptr.as_ptr() } else { core::ptr::null() },
-        kv_page_indptr_h: if planless_prefill { kv_indptr.as_ptr() } else { core::ptr::null() },
+        qo_indptr_h: if planless_prefill {
+            qo_indptr.as_ptr()
+        } else {
+            core::ptr::null()
+        },
+        kv_page_indptr_h: if planless_prefill {
+            kv_indptr.as_ptr()
+        } else {
+            core::ptr::null()
+        },
         num_requests: requests as i32,
         num_pages_in_batch: kv_indices.len() as i32,
         max_pages_per_request: i32::try_from(
-            kv_indptr.windows(2).map(|w| w[1].saturating_sub(w[0])).max().unwrap_or(0),
+            kv_indptr
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .max()
+                .unwrap_or(0),
         )
         .unwrap_or(0),
         first_token: 0,
@@ -2724,6 +3197,8 @@ pub(crate) fn step_impl(
         &state.instances,
         &mut state.fire_arrays,
         &mut state.lora_arena,
+        arena_ptr,
+        arena_bytes,
         state.tp_size,
         frame,
         &qo_indptr,
@@ -2741,8 +3216,10 @@ pub(crate) fn step_impl(
     // destroying one per fire cost 3.2 ms.
     let mut cublas_ops = crate::device::cublas::LiveCublas;
     if state.cublas.is_none() {
-        state.cublas =
-            Some(crate::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)?);
+        state.cublas = Some(crate::device::cublas::CublasHandle::create(
+            &mut cublas_ops,
+            raw_stream,
+        )?);
     }
     let cublas = state.cublas.as_mut().expect("just ensured");
     cublas.set_stream(&mut cublas_ops, raw_stream)?;
@@ -2785,7 +3262,11 @@ pub(crate) fn step_impl(
         // The first layer's base, which is what a single `rope_theta` meant;
         // the per-layer values are read from `rope_theta_by_layer`. Zero for a
         // deployment with no attention layers.
-        rope_theta: model.deployment.attention.first().map_or(0.0, |a| a.rope_theta),
+        rope_theta: model
+            .deployment
+            .attention
+            .first()
+            .map_or(0.0, |a| a.rope_theta),
         rope_theta_by_layer: theta_by_layer,
         rotary_by_layer,
         head_dim: i32::try_from(model.deployment.shape.head_dim).unwrap_or(0),
@@ -2822,9 +3303,10 @@ pub(crate) fn step_impl(
             _ => [0.0; 4],
         },
         yarn_original_max: match model.deployment.rope_scaling {
-            Some(model::deployment::RopeScaling::Yarn { original_max_position, .. }) => {
-                i32::try_from(original_max_position).unwrap_or(0)
-            }
+            Some(model::deployment::RopeScaling::Yarn {
+                original_max_position,
+                ..
+            }) => i32::try_from(original_max_position).unwrap_or(0),
             _ => 0,
         },
         // gpt-oss's clamped GLU, off the statement not left at zero: `alpha`
@@ -2846,7 +3328,11 @@ pub(crate) fn step_impl(
         // `fire_experts_per_token` stays below it as the fallback.
         experts_per_token: {
             let stated = i32::try_from(model.deployment.shape.experts_per_token).unwrap_or(0);
-            if stated > 0 { stated } else { fire_experts_per_token(lowered) }
+            if stated > 0 {
+                stated
+            } else {
+                fire_experts_per_token(lowered)
+            }
         },
         altup_streams: 0,
         altup_active: 0,
@@ -2855,7 +3341,9 @@ pub(crate) fn step_impl(
         // not a refusal: the executor's arm returns `Ok(())`, load-bearing for
         // union captures — every arm lowers and the predicate decides at
         // replay, so the arm must be issuable with nothing to correct.
-        lora: lora_state.as_ref().map(|(s, scratch)| (std::ptr::from_ref(s), *scratch)),
+        lora: lora_state
+            .as_ref()
+            .map(|(s, scratch)| (std::ptr::from_ref(s), *scratch)),
         // The fire's peel window, published so a `_devwin` tail statement can
         // early-out per lane: the prefix is the rows that do not carry the
         // axis's mark, so with no marked rows the word says the whole fire.
@@ -2933,8 +3421,11 @@ pub(crate) fn step_impl(
         tv.fill_expert_weights(lowered, dplan, |name| model.weight(name));
         tv
     });
-    let runtime_of: std::collections::BTreeMap<ValueId, (&str, Option<u32>)> =
-        plan.runtime.iter().map(|b| (b.value, (b.name.as_str(), b.layer))).collect();
+    let runtime_of: std::collections::BTreeMap<ValueId, (&str, Option<u32>)> = plan
+        .runtime
+        .iter()
+        .map(|b| (b.value, (b.name.as_str(), b.layer)))
+        .collect();
 
     let named_bufs = &state.fire_arrays.named;
     // EVERY PREFILL PREP'S VALUE, AT THE SCHEDULE THIS FIRE RAISED. Decode is
@@ -2969,9 +3460,10 @@ pub(crate) fn step_impl(
                     PrepKind::PrefillAttention { .. } => {
                         (!prefill_plan.is_null()).then_some(prefill_plan)
                     }
-                    PrepKind::DecodeAttention { head_dim, full_attention } => {
-                        decode_for((head_dim, full_attention))
-                    }
+                    PrepKind::DecodeAttention {
+                        head_dim,
+                        full_attention,
+                    } => decode_for((head_dim, full_attention)),
                 }?;
                 Some((p.value, ptr))
             })
@@ -2996,7 +3488,10 @@ pub(crate) fn step_impl(
     // the allocator that owns what the fire frees, or the frees are not deferred.
     if state.preds.is_none() {
         state.preds = crate::device::PredicateWord::new(
-            state.fire_alloc.as_ref().expect("the fire allocator exists"),
+            state
+                .fire_alloc
+                .as_ref()
+                .expect("the fire allocator exists"),
         )
         .ok();
     }
@@ -3028,14 +3523,25 @@ pub(crate) fn step_impl(
             class,
         )
     } else {
-        run(&lowered, &dplan, exec_frame, &mut resolver, &ctx, regions, gdn_ctx.as_ref())
+        run(
+            &lowered,
+            &dplan,
+            exec_frame,
+            &mut resolver,
+            &ctx,
+            regions,
+            gdn_ctx.as_ref(),
+        )
     };
     lap("run");
     // A step that owes nothing synchronizes, because the next step reads what
     // this one wrote. A step that owes the completion does not: its debt rides
     // a stream-ordered callback and this call returns with the work queued.
-    let sync =
-        if owes.is_some() && state.runahead { Ok(()) } else { stream.as_ref().synchronize() };
+    let sync = if owes.is_some() && state.runahead {
+        Ok(())
+    } else {
+        stream.as_ref().synchronize()
+    };
     lap("sync");
     match (result, sync) {
         (Ok(_), Ok(())) => {}
@@ -3069,7 +3575,10 @@ pub(crate) fn step_impl(
     // A fresh borrow of the allocator: the capture above takes
     // `&mut state.fire_alloc`, so reusing the earlier binding here would extend
     // a shared borrow across it.
-    let alloc = state.fire_alloc.as_ref().expect("the fire allocator exists");
+    let alloc = state
+        .fire_alloc
+        .as_ref()
+        .expect("the fire allocator exists");
     // One instance per wire request, off the step's own roster.
     let request_instances = request_instances(frame, step, requests);
     // No registry means no instance this shell ringed, so every request falls
@@ -3077,26 +3586,26 @@ pub(crate) fn step_impl(
     let unsampled = match state.ptir_rings.as_mut() {
         None => (0..qo_indptr.len().saturating_sub(1)).collect(),
         Some(rings) => run_sampling_programs(
-        SamplingSites {
-            instances: &state.instances,
-            channels: &state.channels,
-            programs: &state.ptir_programs,
-            control: &mut state.ptir_control,
-            sessions: &mut state.ptir_sessions,
-            rings,
-            disk: state.ptir.disk(),
-            device_ordinal: state.device_ordinal,
-            named_bufs: &state.fire_arrays.named,
-        },
-        model,
-        lowered,
-        dplan,
-        &request_instances,
-        alloc,
-        stream,
-        qo_indptr,
-        &sampled_rows,
-        rows,
+            SamplingSites {
+                instances: &state.instances,
+                channels: &state.channels,
+                programs: &state.ptir_programs,
+                control: &mut state.ptir_control,
+                sessions: &mut state.ptir_sessions,
+                rings,
+                disk: state.ptir.disk(),
+                device_ordinal: state.device_ordinal,
+                named_bufs: &state.fire_arrays.named,
+            },
+            model,
+            lowered,
+            dplan,
+            &request_instances,
+            alloc,
+            stream,
+            qo_indptr,
+            &sampled_rows,
+            rows,
         )?,
     };
     lap("sample");
@@ -3183,7 +3692,13 @@ mod peel_tests {
     use model_ir::trace::PeelWindow;
 
     fn rows(hooked: &[bool]) -> Vec<Row> {
-        hooked.iter().map(|&h| Row { hooked: h, ..Row::default() }).collect()
+        hooked
+            .iter()
+            .map(|&h| Row {
+                hooked: h,
+                ..Row::default()
+            })
+            .collect()
     }
 
     /// The three cases the two kernel forms must agree on: the prefix form runs
@@ -3206,12 +3721,19 @@ mod peel_tests {
 
         // A contiguous marked suffix: prefix [0,2), tail [2,4).
         assert_eq!(
-            peel_word(&rows(&[false, false, true, true]), Some(PeelWindow::HookFreePrefix), 4),
+            peel_word(
+                &rows(&[false, false, true, true]),
+                Some(PeelWindow::HookFreePrefix),
+                4
+            ),
             (2, 2)
         );
 
         // Every row marked: no prefix, the tail is the fire.
-        assert_eq!(peel_word(&rows(&[true; 4]), Some(PeelWindow::HookFreePrefix), 4), (0, 4));
+        assert_eq!(
+            peel_word(&rows(&[true; 4]), Some(PeelWindow::HookFreePrefix), 4),
+            (0, 4)
+        );
     }
 
     /// The axis picks the predicate, and the two axes are different marks.
@@ -3236,7 +3758,11 @@ mod peel_tests {
         let got = tail_csrs(&kv_indptr, &qo_indptr, 2);
         assert_eq!(
             got,
-            TailCsrs { base: 3, indptr: vec![0, 3, 4], qo: vec![0, 1, 2] },
+            TailCsrs {
+                base: 3,
+                indptr: vec![0, 3, 4],
+                qo: vec![0, 1, 2]
+            },
             "requests 2..4 hold 3 then 1 pages, and their pages begin at \
              index 3 — the value `kv_indptr[2]` holds"
         );
@@ -3263,6 +3789,72 @@ mod peel_tests {
     #[test]
     fn a_split_past_the_end_is_empty_not_a_panic() {
         let got = tail_csrs(&[0, 2], &[0, 1], 9);
-        assert_eq!(got, TailCsrs { base: 0, indptr: Vec::new(), qo: Vec::new() });
+        assert_eq!(
+            got,
+            TailCsrs {
+                base: 0,
+                indptr: Vec::new(),
+                qo: Vec::new()
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod lora_pin_tests {
+    use super::{LoraPin, lora_pin};
+    use model_compiler::lower::Arg;
+
+    /// Both homes, because the lowering uses both: the q and v projection
+    /// outputs come back as named SSA values and the projection input as an
+    /// arena slot, and reading only the first is what made the adapter
+    /// silently not exist on qwen3.
+    #[test]
+    fn a_named_value_and_an_arena_slot_are_both_homes() {
+        assert_eq!(
+            lora_pin(&Arg::Named {
+                value: 7,
+                width: 2048,
+                bytes: 2
+            }),
+            Some((LoraPin::Named(7), 2048))
+        );
+        assert_eq!(
+            lora_pin(&Arg::Arena {
+                at: 10240,
+                width: 1024,
+                bytes: 2
+            }),
+            Some((LoraPin::Arena(10240), 1024))
+        );
+    }
+
+    /// A weight is not per-fire rows and a raise is a plan object; a
+    /// correction that named either is malformed and says so by declining,
+    /// rather than being bound to something the right size.
+    #[test]
+    fn a_weight_and_a_raise_are_neither() {
+        assert_eq!(lora_pin(&Arg::Weight("layer.0.q_proj".into())), None);
+        assert_eq!(
+            lora_pin(&Arg::Raised {
+                value: 1,
+                key: "attn.plan".into()
+            }),
+            None
+        );
+    }
+
+    /// The width comes off the operand, and it is the ROW STRIDE the staging
+    /// steps by -- not a head count, which is what the call used to pass and
+    /// what made the staging refuse `d_out 2048 != q projection width 16`.
+    #[test]
+    fn the_width_is_the_operands_own_and_not_a_head_count() {
+        let (_, width) = lora_pin(&Arg::Named {
+            value: 0,
+            width: 2048,
+            bytes: 2,
+        })
+        .expect("a named operand has a home");
+        assert_eq!(width, 2048, "16 heads of 128 is 2048 elements, not 16");
     }
 }

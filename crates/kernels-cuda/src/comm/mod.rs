@@ -2,8 +2,8 @@ use core::ffi::c_void;
 use std::fmt;
 
 use crate::jit::{ArgValue, Ctx, Launch};
-use kernels::Refusal;
 use kernels::Fire;
+use kernels::Refusal;
 
 pub const CAN_LAUNCH: bool = true;
 
@@ -306,7 +306,9 @@ pub fn resolve(
         return Err(Decline::WorldSizeUnsupported { nranks });
     }
     if !INSTANTIATED.contains(&pattern) {
-        return Err(Decline::PatternNotInstantiated { code: pattern.code() });
+        return Err(Decline::PatternNotInstantiated {
+            code: pattern.code(),
+        });
     }
     Ok(Instantiation {
         nranks,
@@ -405,9 +407,16 @@ impl fmt::Display for Decline {
             ),
             Self::CaptureUnknown => write!(f, "`cudaStreamIsCapturing` failed on this stream"),
             Self::Unregistered => {
-                write!(f, "the input's base allocation was never passed to `register_buffer`")
+                write!(
+                    f,
+                    "the input's base allocation was never passed to `register_buffer`"
+                )
             }
-            Self::AboveCrossover { bytes, crossover, world_size } => write!(
+            Self::AboveCrossover {
+                bytes,
+                crossover,
+                world_size,
+            } => write!(
                 f,
                 "{bytes} bytes is at or above the {crossover}-byte crossover for world size \
                  {world_size}; NCCL wins on bandwidth here"
@@ -418,18 +427,31 @@ impl fmt::Display for Decline {
                  and `fusion_hidden` is what builds one)"
             ),
             Self::FusionTokens { tokens, max_tokens } => {
-                write!(f, "{tokens} tokens against a workspace sized for {max_tokens}")
+                write!(
+                    f,
+                    "{tokens} tokens against a workspace sized for {max_tokens}"
+                )
             }
             Self::FusionHidden { hidden, want } => {
-                write!(f, "hidden {hidden} against a workspace sized for exactly {want}")
+                write!(
+                    f,
+                    "hidden {hidden} against a workspace sized for exactly {want}"
+                )
             }
             Self::FusionWorldSize { world_size } => {
-                write!(f, "the fused landing is world size 2 only; this group is {world_size}")
+                write!(
+                    f,
+                    "the fused landing is world size 2 only; this group is {world_size}"
+                )
             }
             Self::FusionHiddenNotOctet { hidden } => {
                 write!(f, "hidden {hidden} is not a multiple of 8")
             }
-            Self::FusionBlockWidth { hidden, threads, max } => write!(
+            Self::FusionBlockWidth {
+                hidden,
+                threads,
+                max,
+            } => write!(
                 f,
                 "hidden {hidden} needs {threads} threads in one block and a block holds {max}; \
                  upstream would have spread this token over a cluster, and \
@@ -500,10 +522,7 @@ pub struct FusionParams {
 }
 
 impl FusionParams {
-    pub fn instantiation(
-        &self,
-        use_fp32_acc: bool,
-    ) -> std::result::Result<Instantiation, Decline> {
+    pub fn instantiation(&self, use_fp32_acc: bool) -> std::result::Result<Instantiation, Decline> {
         resolve(
             self.nranks,
             self.pattern,
@@ -535,7 +554,10 @@ pub fn fusion_geometry(
     multiprocessors: u32,
 ) -> std::result::Result<Geometry, Decline> {
     if tokens <= 0 {
-        return Err(Decline::FusionTokens { tokens, max_tokens: 0 });
+        return Err(Decline::FusionTokens {
+            tokens,
+            max_tokens: 0,
+        });
     }
     if hidden <= 0 || hidden % VEC_SIZE != 0 {
         return Err(Decline::FusionHiddenNotOctet { hidden });
@@ -552,7 +574,10 @@ pub fn fusion_geometry(
     }
 
     if !leaf.oneshot() && threads_per_block < nranks {
-        return Err(Decline::FusionBlockNarrow { threads: threads_per_block, nranks });
+        return Err(Decline::FusionBlockNarrow {
+            threads: threads_per_block,
+            nranks,
+        });
     }
 
     let cluster_num = if leaf.oneshot() {
@@ -595,7 +620,10 @@ pub fn plain_geometry(
 
     let width = usize::try_from(VEC_SIZE).unwrap_or(8);
     if count == 0 || !count.is_multiple_of(width) {
-        return Err(Decline::Vector { count, width: VEC_SIZE });
+        return Err(Decline::Vector {
+            count,
+            width: VEC_SIZE,
+        });
     }
     if !PLAIN_NRANKS.contains(&world_size) {
         return Err(Decline::WorldSizeUnsupported { nranks: world_size });
@@ -616,7 +644,9 @@ pub fn plain_geometry(
     };
 
     let threads = ALL_REDUCE_THREADS;
-    let blocks = MAX_BLOCKS.min(size.div_euclid(threads) + i32::from(size % threads != 0)).max(1);
+    let blocks = MAX_BLOCKS
+        .min(size.div_euclid(threads) + i32::from(size % threads != 0))
+        .max(1);
     Ok((
         Geometry {
             grid: u32::try_from(blocks).unwrap_or(1),
@@ -676,15 +706,23 @@ impl Plane {
         };
 
         if tokens <= 0 || tokens > fusion.max_tokens {
-            return Err(Decline::FusionTokens { tokens, max_tokens: fusion.max_tokens });
+            return Err(Decline::FusionTokens {
+                tokens,
+                max_tokens: fusion.max_tokens,
+            });
         }
 
         if hidden != fusion.hidden {
-            return Err(Decline::FusionHidden { hidden, want: fusion.hidden });
+            return Err(Decline::FusionHidden {
+                hidden,
+                want: fusion.hidden,
+            });
         }
 
         if self.world_size != 2 {
-            return Err(Decline::FusionWorldSize { world_size: self.world_size });
+            return Err(Decline::FusionWorldSize {
+                world_size: self.world_size,
+            });
         }
 
         if hidden % VEC_SIZE != 0 {
@@ -694,25 +732,25 @@ impl Plane {
     }
 }
 
-#[must_use]
 pub fn all_reduce_bf16(
     ctx: &Ctx<'_>,
     input: *const c_void,
     output: *mut c_void,
-    count: usize) -> AllReduce {
+    count: usize,
+) -> AllReduce {
     match plain_all_reduce_bf16(ctx, input, output, count) {
         AllReduce::Launched => AllReduce::Launched,
         AllReduce::Declined(why) => fall_back_out_of_place(ctx, input, output, count, why),
     }
 }
 
-#[must_use]
 pub fn fall_back_out_of_place(
     ctx: &Ctx<'_>,
     input: *const c_void,
     output: *mut c_void,
     count: usize,
-    why: Decline) -> AllReduce {
+    why: Decline,
+) -> AllReduce {
     let elems = i64::try_from(count).unwrap_or(i64::MAX);
     match crate::dist::all_reduce_out_of_place(ctx, input, output, elems) {
         Ok(()) => AllReduce::Launched,
@@ -725,12 +763,12 @@ pub fn fall_back_out_of_place(
     }
 }
 
-#[must_use]
 fn plain_all_reduce_bf16(
     ctx: &Ctx<'_>,
     input: *const c_void,
     output: *mut c_void,
-    count: usize) -> AllReduce {
+    count: usize,
+) -> AllReduce {
     if input.is_null() {
         return AllReduce::Declined(Decline::NullInput);
     }
@@ -753,7 +791,9 @@ fn plain_all_reduce_bf16(
             Err(decline) => return AllReduce::Declined(decline),
         };
     let Some(instantiation) = plain_name_expression(plane.world_size, stage) else {
-        return AllReduce::Declined(Decline::NoTemplateId { nranks: plane.world_size });
+        return AllReduce::Declined(Decline::NoTemplateId {
+            nranks: plane.world_size,
+        });
     };
 
     let signals = plane.peers.signals;
@@ -762,21 +802,24 @@ fn plain_all_reduce_bf16(
         len: core::mem::size_of::<[*mut c_void; 8]>(),
     };
 
-    let fired = ctx.fire(Fire::at("comm/all_reduce.cuh", instantiation).apply(Launch::grid([geometry.grid, 1, 1], [geometry.block, 1, 1])), &[
-                ArgValue::Ptr(plane.peers.rank_data),
-                signals_arg,
-                ArgValue::Ptr(plane.peers.self_signal),
-                ArgValue::Ptr(output),
-                ArgValue::I32(plane.rank),
-                ArgValue::I32(size),
-            ]);
+    let fired = ctx.fire(
+        Fire::at("comm/all_reduce.cuh", instantiation)
+            .apply(Launch::grid([geometry.grid, 1, 1], [geometry.block, 1, 1])),
+        &[
+            ArgValue::Ptr(plane.peers.rank_data),
+            signals_arg,
+            ArgValue::Ptr(plane.peers.self_signal),
+            ArgValue::Ptr(output),
+            ArgValue::I32(plane.rank),
+            ArgValue::I32(size),
+        ],
+    );
     match fired {
         Ok(()) => AllReduce::Launched,
         Err(why) => AllReduce::Declined(Decline::Launch(why)),
     }
 }
 
-#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn all_reduce_residual_rmsnorm_bf16(
     ctx: &Ctx<'_>,
@@ -786,7 +829,8 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     norm_out: *mut c_void,
     tokens: i32,
     hidden: i32,
-    eps: f32) -> AllReduce {
+    eps: f32,
+) -> AllReduce {
     let Ok(plane) = ctx.comm() else {
         return AllReduce::Declined(Decline::NoInstance);
     };
@@ -829,7 +873,9 @@ pub fn all_reduce_residual_rmsnorm_bf16(
         Err(decline) => return AllReduce::Declined(decline),
     };
     let Some(instantiation) = point.name_expression() else {
-        return AllReduce::Declined(Decline::NoTemplateId { nranks: point.nranks });
+        return AllReduce::Declined(Decline::NoTemplateId {
+            nranks: point.nranks,
+        });
     };
     let multiprocessors = match ctx.multiprocessors() {
         Ok(count) => count,
@@ -847,16 +893,28 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     let launch = Launch::grid([geometry.grid, 1, 1], [geometry.block, 1, 1]);
 
     let fired = if point.leaf.oneshot() {
-        ctx.fire(Fire::at("comm/all_reduce.cuh", instantiation).apply(launch), &[params.arg()])
+        ctx.fire(
+            Fire::at("comm/all_reduce.cuh", instantiation).apply(launch),
+            &[params.arg()],
+        )
     } else {
         let (begin, per_rank) = twoshot_split(tokens, point.nranks);
         let bytes = core::mem::size_of::<i32>()
             * usize::try_from(point.nranks).unwrap_or(0).min(begin.len());
-        ctx.fire(Fire::at("comm/all_reduce.cuh", instantiation).apply(launch), &[
-                    params.arg(),
-                    ArgValue::Bytes { ptr: begin.as_ptr().cast::<u8>(), len: bytes },
-                    ArgValue::Bytes { ptr: per_rank.as_ptr().cast::<u8>(), len: bytes },
-                ])
+        ctx.fire(
+            Fire::at("comm/all_reduce.cuh", instantiation).apply(launch),
+            &[
+                params.arg(),
+                ArgValue::Bytes {
+                    ptr: begin.as_ptr().cast::<u8>(),
+                    len: bytes,
+                },
+                ArgValue::Bytes {
+                    ptr: per_rank.as_ptr().cast::<u8>(),
+                    len: bytes,
+                },
+            ],
+        )
     };
     match fired {
         Ok(()) => AllReduce::Launched,
@@ -864,15 +922,14 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     }
 }
 
-const ALL_REDUCE_BF16_ROW: ::kernels::routine::Routine<crate::Plane> =
-    ::kernels::untraced!(
-        crate::Plane,
-        "all_reduce_bf16",
-        all_reduce_bf16,
-        namespace = "comm",
-        whole,
-        driver
-    );
+const ALL_REDUCE_BF16_ROW: ::kernels::routine::Routine<crate::Plane> = ::kernels::untraced!(
+    crate::Plane,
+    "all_reduce_bf16",
+    all_reduce_bf16,
+    namespace = "comm",
+    whole,
+    driver
+);
 
 #[cfg(not(target_family = "wasm"))]
 #[::linkme::distributed_slice(crate::ROUTINES)]
@@ -894,7 +951,8 @@ const ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW: ::kernels::routine::Routine<crate::P
 
 #[cfg(not(target_family = "wasm"))]
 #[::linkme::distributed_slice(crate::ROUTINES)]
-static ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> = ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW;
+static ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
+    ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW;
 
 #[cfg(target_family = "wasm")]
 ::inventory::submit! { crate::Registered(ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW) }

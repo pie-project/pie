@@ -1,8 +1,6 @@
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodePlanInfo {
-
     pub padded_batch_size: i64,
     pub v_offset: i64,
     pub s_offset: i64,
@@ -16,7 +14,6 @@ pub struct DecodePlanInfo {
 }
 
 impl DecodePlanInfo {
-
     #[must_use]
     pub const fn to_vector(&self) -> [i64; 10] {
         [
@@ -37,7 +34,6 @@ impl DecodePlanInfo {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanInfo {
-
     pub padded_batch_size: i64,
     pub total_num_rows: i64,
     pub total_num_rows_offset: i64,
@@ -56,7 +52,6 @@ pub struct PrefillPlanInfo {
 }
 
 impl PrefillPlanInfo {
-
     #[must_use]
     pub const fn to_vector(&self) -> [i64; 15] {
         [
@@ -82,7 +77,6 @@ impl PrefillPlanInfo {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanSm90Info {
-
     pub qo_tile_indices_offset: i64,
     pub qo_indptr_offset: i64,
     pub kv_indptr_offset: i64,
@@ -95,7 +89,6 @@ pub struct PrefillPlanSm90Info {
 }
 
 impl PrefillPlanSm90Info {
-
     #[must_use]
     pub const fn to_vector(&self) -> [i64; 9] {
         [
@@ -115,7 +108,6 @@ impl PrefillPlanSm90Info {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MlaPlanInfo {
-
     pub num_blks_x: i64,
     pub num_blks_y: i64,
     pub q_indptr_offset: i64,
@@ -137,7 +129,6 @@ pub struct MlaPlanInfo {
 }
 
 impl MlaPlanInfo {
-
     #[must_use]
     pub const fn to_vector(&self) -> [i64; 18] {
         [

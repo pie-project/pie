@@ -120,6 +120,8 @@ use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
 use driver_metal::lowering::executor::{BoundArg, Slice};
 
 /// One key head's width, and `32 * n_per_t` with `n_per_t = Dk / 32`.
+use driver_metal::skip::skipped;
+
 const DK: usize = 128;
 /// Value channels a head owns. A multiple of the threadgroup's four
 /// simdgroups, because the tile is `tg = {32, 4, 1}` over this axis.
@@ -321,8 +323,20 @@ fn gdn_scalar_slots(base: usize) -> Vec<ParamSlot> {
 /// which follow the eleven at words 11 and 12 of the same run.
 fn gdn_prefill_slots(base: usize) -> Vec<ParamSlot> {
     let mut slots = gdn_scalar_slots(base);
-    slots.push(ParamSlot { slot: base + 11, at: 44, bytes: 4, packed: false, value: Some(11) });
-    slots.push(ParamSlot { slot: base + 12, at: 48, bytes: 4, packed: false, value: Some(12) });
+    slots.push(ParamSlot {
+        slot: base + 11,
+        at: 44,
+        bytes: 4,
+        packed: false,
+        value: Some(11),
+    });
+    slots.push(ParamSlot {
+        slot: base + 12,
+        at: 48,
+        bytes: 4,
+        packed: false,
+        value: Some(12),
+    });
     slots
 }
 
@@ -359,7 +373,11 @@ fn fire(
     // `gdn_core` sealed: eleven buffers then eleven scalars, ending at 21.
     // Slotted puts `slot_ids` at 11 -- where the struct used to sit -- and
     // pushes the scalars to 12..22.
-    let (wide, scalar_base) = if slot_ids.is_some() { (23, 12) } else { (22, 11) };
+    let (wide, scalar_base) = if slot_ids.is_some() {
+        (23, 12)
+    } else {
+        (22, 11)
+    };
     let mut args = vec![
         BoundArg {
             slice: Slice {
@@ -667,7 +685,7 @@ fn fire_pair(
 #[ignore = "needs a Metal 4 device"]
 fn the_gdn_core_answers_its_own_arithmetic() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");
@@ -952,7 +970,7 @@ fn tolerance_holds(worst: f32, what: &str) {
 #[ignore = "needs a Metal 4 device"]
 fn the_split_gdn_pair_is_the_fused_kernel_to_the_bit() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");
@@ -1497,7 +1515,7 @@ const TILINGS: [(u32, u32); 9] = [
 #[ignore = "needs a Metal 4 device"]
 fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");

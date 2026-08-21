@@ -255,7 +255,10 @@ const NOTHING_DELIVERS_IT: &[(&str, &str)] = &[
          neither beta, so the arm that gets written will need the model \
          side to carry them first.",
     ),
-    ("situ_linear_beta", "as `situ_beta` — the linear half of the same unwritten binding."),
+    (
+        "situ_linear_beta",
+        "as `situ_beta` — the linear half of the same unwritten binding.",
+    ),
     (
         "wna16_group_size",
         "the AWQ/GPTQ group width, and the ONE name here that is asked \
@@ -339,7 +342,9 @@ fn bodies<'a>(src: &'a str, header: &str) -> Vec<&'a str> {
     let mut at = 0;
     while let Some(i) = src[at..].find(header) {
         let start = at + i + header.len();
-        let Some(body) = balanced(src, start) else { break };
+        let Some(body) = balanced(src, start) else {
+            break;
+        };
         at = start + body.len();
         out.push(body);
     }
@@ -364,9 +369,14 @@ fn fields(body: &str) -> Vec<(String, String)> {
         if e.is_empty() || e.starts_with("..") {
             return;
         }
-        let (name, rhs) = e.split_once(':').map_or((e, e), |(n, r)| (n.trim(), r.trim()));
+        let (name, rhs) = e
+            .split_once(':')
+            .map_or((e, e), |(n, r)| (n.trim(), r.trim()));
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            out.push((name.to_string(), rhs.split_whitespace().collect::<Vec<_>>().join(" ")));
+            out.push((
+                name.to_string(),
+                rhs.split_whitespace().collect::<Vec<_>>().join(" "),
+            ));
         }
     };
     for c in body.chars() {
@@ -403,7 +413,9 @@ fn one_hop(launch: &str, ident: &str) -> Option<String> {
         at = s;
         let rest = &launch[s..];
         let rest = rest.strip_prefix("mut ").unwrap_or(rest);
-        let Some(tail) = rest.strip_prefix(ident) else { continue };
+        let Some(tail) = rest.strip_prefix(ident) else {
+            continue;
+        };
         if tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
@@ -465,7 +477,11 @@ fn context_fills(launch: &str) -> Vec<Fill> {
                 } else {
                     rhs
                 };
-                out.push(Fill { owner, name, rhs: resolved });
+                out.push(Fill {
+                    owner,
+                    name,
+                    rhs: resolved,
+                });
             }
         }
     }
@@ -488,8 +504,12 @@ fn idents(src: &str) -> BTreeSet<String> {
 /// fact, every time, and never reaches the context.
 fn answers_a_constant_none(facts: &str, name: &str) -> bool {
     let needle = format!("fn {name}(");
-    let Some(i) = facts.find(&needle) else { return false };
-    let Some(open) = facts[i..].find('{').map(|j| i + j + 1) else { return false };
+    let Some(i) = facts.find(&needle) else {
+        return false;
+    };
+    let Some(open) = facts[i..].find('{').map(|j| i + j + 1) else {
+        return false;
+    };
     balanced(facts, open).is_some_and(|body| body.trim() == "None")
 }
 
@@ -503,22 +523,34 @@ fn answers_a_constant_none(facts: &str, name: &str) -> bool {
 /// excusing them.
 fn accessor_fields(binds: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut out = BTreeMap::new();
-    let Some(i) = binds.find("impl DispatchCtx {") else { return out };
-    let Some(block) = balanced(binds, i + "impl DispatchCtx {".len()) else { return out };
+    let Some(i) = binds.find("impl DispatchCtx {") else {
+        return out;
+    };
+    let Some(block) = balanced(binds, i + "impl DispatchCtx {".len()) else {
+        return out;
+    };
     let mut at = 0;
     while let Some(j) = block[at..].find("fn ") {
         let s = at + j + 3;
-        let name: String =
-            block[s..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-        let Some(open) = block[s..].find('{').map(|k| s + k + 1) else { break };
-        let Some(body) = balanced(block, open) else { break };
+        let name: String = block[s..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let Some(open) = block[s..].find('{').map(|k| s + k + 1) else {
+            break;
+        };
+        let Some(body) = balanced(block, open) else {
+            break;
+        };
         at = open + body.len();
         let mut reads = BTreeSet::new();
         let mut rest = body;
         while let Some(k) = rest.find("self.") {
             rest = &rest[k + 5..];
-            let f: String =
-                rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            let f: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
             if !f.is_empty() {
                 reads.insert(f);
             }
@@ -592,7 +624,10 @@ fn every_context_scalar_is_read_off_the_model_or_argued_for() {
 
     let named = deliverable_names(&facts, &binds);
     let argued: BTreeSet<&str> = CONSTANT_BY_ARGUMENT.iter().map(|(n, _)| *n).collect();
-    let deferred: BTreeSet<&str> = VARIED_BY_A_ROW_WITH_NO_TEXT.iter().map(|(n, ..)| *n).collect();
+    let deferred: BTreeSet<&str> = VARIED_BY_A_ROW_WITH_NO_TEXT
+        .iter()
+        .map(|(n, ..)| *n)
+        .collect();
     let inert: BTreeSet<&str> = NOTHING_DELIVERS_IT.iter().map(|(n, _)| *n).collect();
 
     let mut unstated = BTreeSet::new();
@@ -677,9 +712,15 @@ fn nothing_is_argued_for_that_the_launch_no_longer_invents() {
     // the failure the three lists exist to prevent, spelled as a typo.
     let mut once = BTreeSet::new();
     let twice: Vec<&&str> = listed.iter().filter(|n| !once.insert(**n)).collect();
-    assert!(twice.is_empty(), "these are excused by more than one list: {twice:?}");
+    assert!(
+        twice.is_empty(),
+        "these are excused by more than one list: {twice:?}"
+    );
 
-    let stale: Vec<&str> = listed.into_iter().filter(|n| !literal.contains(*n)).collect();
+    let stale: Vec<&str> = listed
+        .into_iter()
+        .filter(|n| !literal.contains(*n))
+        .collect();
     assert!(
         stale.is_empty(),
         "the launch does not invent these any more: {stale:?}. Delete the \
@@ -727,4 +768,3 @@ fn the_deferred_names_are_still_out_of_reach() {
         );
     }
 }
-

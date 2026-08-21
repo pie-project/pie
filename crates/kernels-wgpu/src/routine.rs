@@ -105,10 +105,18 @@ impl ShaderValue for ArgValue {
         }
     }
     fn buffer_at(handle: u32, rows: i32, width: i32) -> Self {
-        Self::Shaped { handle, rows, width }
+        Self::Shaped {
+            handle,
+            rows,
+            width,
+        }
     }
     fn buffer_mut_at(handle: u32, rows: i32, width: i32) -> Self {
-        Self::Shaped { handle, rows, width }
+        Self::Shaped {
+            handle,
+            rows,
+            width,
+        }
     }
     fn buffer(handle: u32) -> Self {
         Self::Buffer(handle)
@@ -160,7 +168,6 @@ impl kernels::routine::Answers<Wgpu> for Ctx<'_> {
 }
 
 pub type Routine = kernels::routine::Routine<Wgpu>;
-
 
 pub use kernels::routine::{Const, Fire, In, InOut, Out};
 

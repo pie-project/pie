@@ -59,7 +59,10 @@ pub enum Arg {
     /// Carries the KEY and not just the value id, so the driver's arm matches
     /// on the same string `kernels-cuda`'s `raise!` wrote rather than
     /// re-deriving it from the op that produced the value.
-    Raised { value: ValueId, key: String },
+    Raised {
+        value: ValueId,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +114,10 @@ pub struct PeelRegion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Uncovered {
-    Rows { at_op: usize, rows: Range<u32> },
+    Rows {
+        at_op: usize,
+        rows: Range<u32>,
+    },
     /// `whole` kernels may only cover the full fire.
     WholeKernelSplit {
         at_op: usize,
@@ -119,7 +125,10 @@ pub enum Uncovered {
         rows: Range<u32>,
     },
     /// Non-contiguous partitions mean the row order and trace disagree.
-    Discontiguous { at_op: usize, axis: &'static str },
+    Discontiguous {
+        at_op: usize,
+        axis: &'static str,
+    },
     UnknownBackend(String),
 }
 

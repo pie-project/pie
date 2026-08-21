@@ -51,6 +51,19 @@ pub struct Frame<'a> {
     /// [`crate::lowering::frame::sampled_rows`] is the translation, and the
     /// only one; nothing else may fill this.
     pub sampling_indices: &'a [u32],
+    /// How many KV rows one page holds.
+    ///
+    /// Not a table, and the only scalar here, because without it the tables
+    /// above cannot be CHECKED. `kv_page_indices` is a run of physical pages
+    /// per request and `position_ids` says how far into that run the fire
+    /// reaches, but the two are in different units until something states
+    /// the divisor. [`stage`] states the refusal that needs it.
+    ///
+    /// Zero means "not stated", and then the refusal does not run. That is
+    /// not an escape hatch for a caller who finds the check inconvenient --
+    /// it is for the fires that state no pages at all, where there is no run
+    /// to fall short of.
+    pub page_size: u32,
     /// Per ROW: which recurrent-state slot its request occupies.
     ///
     /// One entry per token, not per request: `gdn_prep_slotted` and
@@ -158,6 +171,91 @@ pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<S
             ),
         });
     }
+    // THE PAGE RUN MUST REACH THE LAST POSITION, and this refusal exists
+    // because a rig spent three commits blaming the driver for its absence.
+    //
+    // `kv_page_indices` is a per-request run of physical pages and the paged
+    // attention kernels index it as `kv_page_indices[indptr[r] + p /
+    // page_size]` for every KEY position `p` a query row may look back at.
+    // A run one page long is right for a sequence that fits in one page and
+    // is a read past the end of the list for anything longer. What it reads
+    // then is a PAGE NUMBER, so the fire goes on to address a real page
+    // belonging to nobody: nothing faults, nothing is uninitialised, and the
+    // answer is simply drawn from the wrong keys.
+    //
+    // Measured, on `Qwen3-0.6B-4bit` with a 16-row page and a rig staging
+    // `kv_page_indices: &[0]`: prefills of 16 tokens or fewer returned
+    // bit-identical logits on every run, and 17 or more returned a different
+    // answer in most processes -- five isolated runs of one 20-token prompt
+    // gave `1124, 1124, 11, 220, 431`. The boundary was exactly the page
+    // size, which is what named the defect after a kernel reading had
+    // produced a plausible wrong answer instead.
+    //
+    // Nothing caught it for as long as it did because every reference prompt
+    // in that rig was five to seven tokens. A rig-wide invariant can be
+    // invisible simply because no fixture ever crossed it, which is why this
+    // is checked where the tables are BUILT and not where they are used.
+    //
+    // `driver_api::Plan::validate` already refuses this on the serving path.
+    // This is the same refusal for the path that does not build a `Plan` --
+    // `serve::launch` and every hand-built test frame -- and it is stated
+    // here because this is the one place all five tables are side by side.
+    if frame.page_size > 0 && !frame.kv_page_indptr.is_empty() {
+        let requests = frame.kv_page_indptr.len() - 1;
+        for (t, (&r, &pos)) in frame
+            .req_of_token
+            .iter()
+            .zip(frame.position_ids)
+            .enumerate()
+        {
+            let r = r as usize;
+            if r >= requests {
+                return Err(crate::error::Error::Create {
+                    what: "fire tables",
+                    message: format!(
+                        "token {t} says request {r}, but kv_page_indptr \
+                         describes {requests} of them"
+                    ),
+                });
+            }
+            let (from, to) = (
+                frame.kv_page_indptr[r] as usize,
+                frame.kv_page_indptr[r + 1] as usize,
+            );
+            let run = to.saturating_sub(from);
+            // The LAST position and not the token count, because a decode is
+            // one token whose history is many pages: a fire of one row at
+            // position 40 needs three 16-row pages staged, not one.
+            let wanted = pos as usize / frame.page_size as usize + 1;
+            if wanted > run {
+                return Err(crate::error::Error::Create {
+                    what: "fire tables",
+                    message: format!(
+                        "token {t} of request {r} sits at position {pos}, which a \
+                         {}-row page puts in page {} of that request; the \
+                         request states {run} page(s). The paged attention \
+                         kernels read one page index per {} key positions, \
+                         so a run this short is a read past kv_page_indices \
+                         and an answer drawn from whichever page the number \
+                         beyond it happened to be",
+                        frame.page_size,
+                        wanted - 1,
+                        frame.page_size,
+                    ),
+                });
+            }
+            if to > frame.kv_page_indices.len() {
+                return Err(crate::error::Error::Create {
+                    what: "fire tables",
+                    message: format!(
+                        "request {r}'s page run ends at {to}, past the {} \
+                         entries kv_page_indices holds",
+                        frame.kv_page_indices.len()
+                    ),
+                });
+            }
+        }
+    }
     let mut blob: Vec<u32> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     // The ORDER is the contract, and it is this list — `Staged::at` indexes
@@ -224,7 +322,7 @@ mod tests {
     #[test]
     fn a_table_this_fire_has_none_of_answers_nothing() {
         let Ok(context) = Context::new() else {
-            eprintln!("SKIP: no Metal 4 device");
+            crate::skip::skipped("no Metal 4 device");
             return;
         };
         let ids = [7u32, 8, 9];
@@ -281,7 +379,7 @@ mod tests {
     #[test]
     fn every_table_starts_where_the_one_before_it_ended() {
         let Ok(context) = Context::new() else {
-            eprintln!("SKIP: no Metal 4 device");
+            crate::skip::skipped("no Metal 4 device");
             return;
         };
         let (a, b) = ([1u32, 2], [3u32, 4, 5]);
@@ -300,10 +398,75 @@ mod tests {
         assert_eq!(p.address, t.address + t.bytes, "packed, in order");
     }
 
+    /// A page run that does not reach the last position is refused, and a
+    /// `page_size` of zero disarms nothing that was armed.
+    ///
+    /// The bug this is the gate for: `kv_page_indices: &[0]`,
+    /// `kv_page_indptr: &[0, 1]` — one page for a whole sequence — staged by
+    /// a rig whose every fixture was five to seven tokens long. With a 16-row
+    /// page it is exactly right up to sixteen tokens and a read past the end
+    /// of the list at seventeen, and what lies past the end is a number the
+    /// kernel spends as a PAGE. So the fire addresses a real page belonging
+    /// to nobody: no fault, no uninitialised memory, just keys from somewhere
+    /// else. Five isolated runs of one 20-token prompt answered `1124, 1124,
+    /// 11, 220, 431`.
+    ///
+    /// Sixteen and seventeen are the two lengths here for that reason. One
+    /// page is a correct staging at the first and a defect at the second, and
+    /// a check that only refuses the obviously-too-short would have passed
+    /// the fire that started this.
+    #[test]
+    fn a_page_run_short_of_the_last_position_is_refused() {
+        let Ok(context) = Context::new() else {
+            crate::skip::skipped("no Metal 4 device");
+            return;
+        };
+        let one_page = [0u32];
+        let ends = [0u32, 1];
+        let frame = |positions: &'static [u32]| Frame {
+            token_ids: positions,
+            position_ids: positions,
+            req_of_token: &[0; 17],
+            kv_page_indices: &one_page,
+            kv_page_indptr: &ends,
+            page_size: 16,
+            ..Frame::default()
+        };
+
+        // Sixteen rows fill the page exactly, and one page is the truth.
+        let fits: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        stage(&context, &Scratch::new(), frame(fits)).expect("sixteen rows fit one 16-row page");
+
+        // Seventeen do not, and this is the position the whole story turns on.
+        let over: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let why = stage(&context, &Scratch::new(), frame(over))
+            .expect_err("position 16 is the second page of a 16-row run")
+            .to_string();
+        assert!(
+            why.contains("16") && why.contains("kv_page_indices"),
+            "the refusal has to name the position and the table it would have \
+             read past, or a reader cannot act on it: {why}"
+        );
+
+        // UNSTATED page size, and the check does not run. This is the arm
+        // that makes the refusal adoptable by a caller that has no pages at
+        // all, and it is asserted because a default of zero that silently
+        // refused every fire would be the worse failure of the two.
+        stage(
+            &context,
+            &Scratch::new(),
+            Frame {
+                page_size: 0,
+                ..frame(over)
+            },
+        )
+        .expect("no page size stated is no claim about pages to check");
+    }
+
     #[test]
     fn a_seat_table_short_of_the_rows_is_refused_rather_than_read_past() {
         let Ok(context) = Context::new() else {
-            eprintln!("SKIP: no Metal 4 device");
+            crate::skip::skipped("no Metal 4 device");
             return;
         };
         let tokens = [1u32, 2, 3, 4];

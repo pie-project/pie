@@ -246,7 +246,6 @@ pub fn rows_from_regions(
         .collect()
 }
 
-
 mod buffers;
 mod semantics;
 mod shapes;

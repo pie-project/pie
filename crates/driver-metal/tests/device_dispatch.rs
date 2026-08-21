@@ -51,7 +51,12 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped(
+                "no Metal 4 device, so no dispatch wrote bytes to read back",
+            );
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let compiler = Compiler::new(&context).expect("compiler");

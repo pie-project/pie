@@ -866,7 +866,6 @@ impl Ty {
     }
 }
 
-
 /// What the SIGNATURE knows and a type cannot say.
 ///
 /// # What is not here any more
@@ -905,7 +904,6 @@ pub trait Derivation {
     /// disagreeing; reaching both from the same marker is what lets a pin name
     /// an index and a key in one place.
     const SOURCES: &'static [Option<Source>];
-
 }
 
 /// The routine's call surface, on the marker `#[routine]` emits.
@@ -1162,7 +1160,6 @@ impl KernelSig {
 // does `sig_in`: `kernels-cuda` synthesises rows at run time from its routine
 // registry, because `model-compiler` asks a backend two questions about every
 // symbol it lowers. That is a lookup, not a table.
-
 
 /// The contract for one symbol, in `table`.
 ///

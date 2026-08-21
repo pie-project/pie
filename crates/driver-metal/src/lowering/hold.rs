@@ -347,7 +347,10 @@ impl<'a> Handles<'a> {
     ///
     /// [`Refusal::Absent`] when the statement carries no such input.
     pub fn in_width(&self, i: usize) -> Result<i32, Refusal> {
-        self.width_at(self.ins.get(i).copied(), "an input the statement does not carry")
+        self.width_at(
+            self.ins.get(i).copied(),
+            "an input the statement does not carry",
+        )
     }
 
     /// Elements per row of the statement's `i`-th RESULT. See [`Self::in_width`].
@@ -356,7 +359,10 @@ impl<'a> Handles<'a> {
     ///
     /// [`Refusal::Absent`] when the statement declares no such result.
     pub fn out_width(&self, i: usize) -> Result<i32, Refusal> {
-        self.width_at(self.outs.get(i).copied(), "a result the statement does not declare")
+        self.width_at(
+            self.outs.get(i).copied(),
+            "a result the statement does not declare",
+        )
     }
 
     /// The `i`-th result's width, read off the argument the launch bound.

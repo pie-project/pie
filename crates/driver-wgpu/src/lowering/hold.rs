@@ -393,7 +393,10 @@ impl<'a> Handles<'a> {
     ///
     /// [`Refusal::Empty`] when the statement carries no such input.
     pub fn in_width(&self, n: usize) -> Result<i32, Refusal> {
-        self.width_at(self.ins.get(n).copied(), "an input operand the arm asked for")
+        self.width_at(
+            self.ins.get(n).copied(),
+            "an input operand the arm asked for",
+        )
     }
 
     /// Elements per row of the statement's `n`th RESULT. See [`Self::in_width`].
@@ -760,6 +763,10 @@ pub(crate) static LIVE: &[Crossed] = &[
     },
     Crossed {
         stem: "vnorm_single_row",
+        routine: None,
+    },
+    Crossed {
+        stem: "rms_rope",
         routine: None,
     },
     Crossed {
@@ -1335,16 +1342,13 @@ mod tests {
     /// they checked is the signature's; what they check about `Handles` --
     /// that a handle is minted per ask, and that a short statement refuses
     /// rather than indexing past -- is unchanged and worth keeping.
-    fn bound(
-        name: &str,
-        o: &mut Handles<'_>,
-        f: Facts,
-    ) -> Result<Vec<ArgValue>, Refusal> {
+    fn bound(name: &str, o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
         let routine = kernels_wgpu::routines()
             .into_iter()
             .find(|r| r.name == name)
             .expect("a routine by that name");
-        crate::lowering::bind::bind(routine.args, routine.sources, o, f)
+        let mut views = crate::lowering::views::Views::default();
+        crate::lowering::bind::bind(routine.args, routine.sources, o, f, &mut views)
     }
 
     /// must be 0, 1, 2, 3 in the order ASKED and not in the order the trace
@@ -1359,7 +1363,14 @@ mod tests {
                 bytes: 2,
             })
             .collect();
-        let mut o = Handles::over(&args, 2);
+        // ONE SCALAR, standing in for the statement's `rows` mark: after the
+        // marks migration, `argmax_logits` reads `rows` as a `Const<u32>` from
+        // the statement's params run rather than from the fire, so an empty
+        // run refuses inside the body's `param(0)` call and the four handles
+        // this test is about are never minted. The value matches the rows in
+        // `facts` below so the shape the arm carries is consistent.
+        let scalars = [7u32];
+        let mut o = Handles::with_scalars(&args, 2, &scalars);
         let f = facts("x", 7, Geometry::default(), 1, 1024, 1024);
         let args = bound("argmax_logits", &mut o, f).expect("four operands");
         // The handle SEQUENCE is 0, 1, 2, 3 by construction -- they are
@@ -1368,15 +1379,35 @@ mod tests {
         // distinct slots.
         // BOUND AS `Shaped`, AND THE ROW COUNT IS NOT HERE. Each operand now
         // carries the rectangle the statement gave it -- that is what a mark
-        // binds on this plane -- and the `U32(7)` that used to close the run
-        // was the row count, which the body asks the fire for.
+        // binds on this plane -- and the `U32(7)` that closes the run is the
+        // `rows` mark the body reads from the statement: after the marks
+        // migration `argmax_logits` takes `rows: Const<u32>`, so binding it
+        // stops asking the fire for that count and starts unpacking it as
+        // the fifth positional argument.
         assert_eq!(
             args,
             vec![
-                ArgValue::Shaped { handle: 0, rows: 7, width: 1 },
-                ArgValue::Shaped { handle: 1, rows: 7, width: 1 },
-                ArgValue::Shaped { handle: 2, rows: 7, width: 1 },
-                ArgValue::Shaped { handle: 3, rows: 7, width: 1 },
+                ArgValue::Shaped {
+                    handle: 0,
+                    rows: 7,
+                    width: 1
+                },
+                ArgValue::Shaped {
+                    handle: 1,
+                    rows: 7,
+                    width: 1
+                },
+                ArgValue::Shaped {
+                    handle: 2,
+                    rows: 7,
+                    width: 1
+                },
+                ArgValue::Shaped {
+                    handle: 3,
+                    rows: 7,
+                    width: 1
+                },
+                ArgValue::U32(7),
             ]
         );
 

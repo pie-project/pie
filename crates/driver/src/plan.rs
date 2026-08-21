@@ -335,25 +335,109 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
     }
 }
 
-/// Adopt a launch package into an [`ExecPlan`], or reject it structurally.
+/// The semantic library boundaries one backend implements.
 ///
-/// The only structural failures are an empty stage list and a plan/stage count
-/// mismatch — everything else the host already validated. Returns `Err(reason)`
-/// for those, mirroring the C++ `bool` + out-param but without the sentinel.
+/// A `kernel_call` or `sink_call` is the emitter's way of saying "this region
+/// is not generated code, it is a NAME the backend has a kernel for". Which
+/// names those are is a fact about the backend and about nothing else, and it
+/// is the whole reason this type exists: the check used to be written inline
+/// against Metal's two names, in this crate, applied to every caller.
 ///
-/// Two boundary ops are recognised specially: this backend implements
-/// `kernel_call`/`sink_call` only as the identity/discard reshape named
-/// `metal.identity`/`metal.discard`; any other named or wrongly-shaped boundary
-/// is not something it can launch, so the plan is adopted but marked non-
-/// executable. A non-executable plan is still a valid, inspectable value — the
-/// caller reads `executable`/`reject_reason` to route it — which is why this is
-/// not an `Err`.
+/// # What that cost
+///
+/// `driver-cuda` implements three boundaries -- `lora` and `attn_page_mask` as
+/// sinks, `envelope_dot` as a kernel -- and states all three in its own
+/// emitter gate (`tensor-compiler/src/codegen/cuda/validate.rs`). Every one of
+/// them was adopted here and then marked non-executable for not being called
+/// `metal.discard`. Nothing downstream could recover: the program never
+/// reached the PTIR compile, so the fire found no compiled program, so the
+/// epilogue never ran, so the sampled token was never put on the channel the
+/// guest was awaiting. `lora-probe` did not fail -- it hung, forever, at one
+/// token, with the forward pass itself running to completion and the GPU at
+/// 0%. The refusal was printed once at registration, in a line that named
+/// METAL on an NVIDIA card, and was true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boundaries {
+    /// `kernel_call` names this backend launches. A kernel call also has to be
+    /// unary -- it lowers to a reshape of its single operand -- and that is a
+    /// property of the op form rather than of the backend, so it is checked
+    /// for every vocabulary rather than spelled in one.
+    pub kernel_calls: &'static [&'static str],
+    /// `sink_call` names this backend launches. A sink has no result.
+    pub sink_calls: &'static [&'static str],
+}
+
+impl Boundaries {
+    /// What the step interpreter in this crate can run, which is the identity
+    /// reshape and the discard. Metal and Vulkan both execute through it.
+    pub const METAL: Self = Self {
+        kernel_calls: &["metal.identity"],
+        sink_calls: &["metal.discard"],
+    };
+
+    /// What `driver-cuda` launches. `lora` is the adapter configuration sink
+    /// (`fire::lora::read_lora_sink`), `attn_page_mask` the per-page mask sink,
+    /// and `envelope_dot` the quest-attention page score. These are the same
+    /// three the CUDA emitter gate admits, and the two lists have to agree or
+    /// a program emits and then will not adopt.
+    pub const CUDA: Self = Self {
+        kernel_calls: &["envelope_dot"],
+        sink_calls: &["lora", "attn_page_mask"],
+    };
+
+    /// Whether this vocabulary admits `name` at `code`.
+    fn admits(self, code: u8, name: &str) -> bool {
+        let vocabulary = if code == tags::KERNEL_CALL {
+            self.kernel_calls
+        } else {
+            self.sink_calls
+        };
+        vocabulary.contains(&name)
+    }
+
+    /// Every name, for a refusal that says what WAS on offer. A refusal naming
+    /// only the rejected op leaves the reader guessing at the alternative, and
+    /// this one was misread for exactly as long as it existed.
+    fn describe(self) -> String {
+        let mut all: Vec<&str> = self.kernel_calls.to_vec();
+        all.extend_from_slice(self.sink_calls);
+        all.join(", ")
+    }
+}
+
+/// Adopt a launch package into an [`ExecPlan`] for the step interpreter this
+/// crate owns; see [`adopt_launch_package_with`] for a backend with its own.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Program`] if the package has no stages or its
 /// `plans` and `stages` arrays disagree in length.
 pub fn adopt_launch_package(package: LaunchPackage) -> Result<ExecPlan> {
+    adopt_launch_package_with(package, Boundaries::METAL)
+}
+
+/// Adopt a launch package into an [`ExecPlan`], or reject it structurally.
+///
+/// The only structural failures are an empty stage list and a plan/stage count
+/// mismatch — everything else the host already validated. Returns `Err(reason)`
+/// for those, mirroring the C++ `bool` + out-param but without the sentinel.
+///
+/// Boundary ops are recognised against `boundaries`: a `kernel_call` or
+/// `sink_call` whose name that backend does not implement -- or a kernel call
+/// that is not unary, since it lowers to a reshape of its single operand -- is
+/// not something the backend can launch, so the plan is adopted but marked
+/// non-executable. A non-executable plan is still a valid, inspectable value —
+/// the caller reads `executable`/`reject_reason` to route it — which is why
+/// this is not an `Err`.
+///
+/// # Errors
+///
+/// Returns [`Error::Program`] if the package has no stages or its
+/// `plans` and `stages` arrays disagree in length.
+pub fn adopt_launch_package_with(
+    package: LaunchPackage,
+    boundaries: Boundaries,
+) -> Result<ExecPlan> {
     if package.stages.is_empty() {
         return Err(Error::Program {
             message: "launch package has no stages".to_owned(),
@@ -394,23 +478,27 @@ pub fn adopt_launch_package(package: LaunchPackage) -> Result<ExecPlan> {
             if !boundary {
                 continue;
             }
-            let want = if code == tags::KERNEL_CALL {
-                "metal.identity"
-            } else {
-                "metal.discard"
-            };
-            let named = (op.name_index as usize) < plan.package.names.len()
-                && plan.package.names[op.name_index as usize] == want;
+            let name = plan
+                .package
+                .names
+                .get(op.name_index as usize)
+                .map_or("<unnamed>", String::as_str);
+            let named = boundaries.admits(code, name);
             // `kernel_call` lowers to a reshape of its single operand; any
-            // other arity is not the boundary this backend implements.
+            // other arity is not the boundary any backend implements.
             let shaped = code != tags::KERNEL_CALL || op.args.len() == 1;
             if !(named && shaped) {
                 plan.executable = false;
                 plan.needs_logits = false;
                 plan.needs_mtp_logits = false;
-                plan.reject_reason = Some(
-                    "program requests an unsupported Metal semantic library boundary".to_string(),
-                );
+                // Naming BOTH sides: which boundary was asked for and which
+                // ones this backend has. The old message named neither, and
+                // said "Metal" on every backend that called this.
+                plan.reject_reason = Some(format!(
+                    "program requests the semantic library boundary `{name}`, \
+                     which this backend does not implement (it has: {})",
+                    boundaries.describe()
+                ));
             }
         }
     }
@@ -606,5 +694,79 @@ mod tests {
             vec![0, 1],
             "operand v0 must be listed before its consumer v1 for ascending evaluation"
         );
+    }
+
+    /// A boundary package: one `sink_call` named `name`, in a prologue.
+    fn sink_package(name: &str) -> LaunchPackage {
+        let mut package = package_with(
+            vec![],
+            vec![LaunchStage {
+                kind: Stage::Prologue as u8,
+                ops: vec![LaunchOp {
+                    code: u16::from(tags::SINK_CALL),
+                    result_count: 0,
+                    args: vec![],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        );
+        package.names = vec![name.to_string()];
+        package
+    }
+
+    /// THE DEFECT: the boundary vocabulary is the BACKEND's, and this crate
+    /// used to apply Metal's to every caller. `lora` is a sink `driver-cuda`
+    /// launches and Metal does not, so the two vocabularies have to disagree
+    /// about it -- and when this check was inline against `metal.discard`, they
+    /// could not.
+    #[test]
+    fn a_backend_admits_its_own_boundaries_and_not_another_backends() {
+        let cuda =
+            adopt_launch_package_with(sink_package("lora"), Boundaries::CUDA).expect("well-formed");
+        assert!(
+            cuda.executable,
+            "`lora` is a sink driver-cuda launches: {:?}",
+            cuda.reject_reason
+        );
+
+        let metal = adopt_launch_package_with(sink_package("lora"), Boundaries::METAL)
+            .expect("well-formed");
+        assert!(!metal.executable, "the step interpreter has no `lora`");
+
+        let discard = adopt_launch_package_with(sink_package("metal.discard"), Boundaries::METAL)
+            .expect("well-formed");
+        assert!(discard.executable, "and it does have `metal.discard`");
+        let on_cuda = adopt_launch_package_with(sink_package("metal.discard"), Boundaries::CUDA)
+            .expect("well-formed");
+        assert!(!on_cuda.executable, "which driver-cuda in turn does not");
+    }
+
+    /// A refusal has to name the boundary that was asked for AND the ones on
+    /// offer. The message it replaces said "unsupported Metal semantic library
+    /// boundary" on an NVIDIA card, named neither, and was read for months as
+    /// a mis-tagged log line rather than as the reason nothing ran.
+    #[test]
+    fn a_refused_boundary_names_itself_and_the_alternatives() {
+        let plan = adopt_launch_package_with(sink_package("no_such_sink"), Boundaries::CUDA)
+            .expect("well-formed");
+        let reason = plan.reject_reason.expect("refused");
+        assert!(reason.contains("no_such_sink"), "names the ask: {reason}");
+        assert!(reason.contains("lora"), "and what was on offer: {reason}");
+        assert!(
+            !reason.contains("Metal") && !reason.contains("metal"),
+            "and does not name a backend it is not: {reason}"
+        );
+    }
+
+    /// A non-executable plan needs nothing from the logits, and saying
+    /// otherwise would have a caller allocate a readout for a fire that will
+    /// not happen.
+    #[test]
+    fn a_refused_boundary_clears_what_the_plan_would_have_needed() {
+        let plan = adopt_launch_package_with(sink_package("no_such_sink"), Boundaries::CUDA)
+            .expect("well-formed");
+        assert!(!plan.needs_logits);
+        assert!(!plan.needs_mtp_logits);
     }
 }

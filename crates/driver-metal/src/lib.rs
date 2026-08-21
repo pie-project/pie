@@ -23,12 +23,13 @@
 
 pub mod batch;
 pub mod channel;
-mod error;
 pub mod envelope;
+mod error;
 pub mod layout;
 pub mod loader;
 pub mod lowering;
 pub mod model;
+pub mod skip;
 
 pub use error::{Error, Result};
 pub use layout::{Batch, Region, Request};

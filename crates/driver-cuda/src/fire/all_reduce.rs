@@ -324,7 +324,10 @@ impl CustomAllReduce {
         // SAFETY: a live out-parameter.
         check_rt(unsafe { cudaGetDevice(&mut dev) }, "cudaGetDevice")?;
         if cfg.group_devices.is_empty() {
-            return Err(Error::invalid("custom_all_reduce", "group device ordinals are required"));
+            return Err(Error::invalid(
+                "custom_all_reduce",
+                "group device ordinals are required",
+            ));
         }
         if cfg.group_devices.len() != self.world_size as usize {
             return Err(Error::invalid(
@@ -346,9 +349,15 @@ impl CustomAllReduce {
         // needs; TP=2 takes the 1-stage path but the layout is matched anyway.
         let signal_bytes = SIGNAL_BYTES + self.max_bytes;
         // SAFETY: a live out-parameter and a positive size.
-        check_rt(unsafe { cudaMalloc(&mut self.signal_self, signal_bytes) }, "cudaMalloc(signal)")?;
+        check_rt(
+            unsafe { cudaMalloc(&mut self.signal_self, signal_bytes) },
+            "cudaMalloc(signal)",
+        )?;
         // SAFETY: `signal_self` now addresses `signal_bytes` writable bytes.
-        check_rt(unsafe { cudaMemset(self.signal_self, 0, signal_bytes) }, "cudaMemset(signal)")?;
+        check_rt(
+            unsafe { cudaMemset(self.signal_self, 0, signal_bytes) },
+            "cudaMemset(signal)",
+        )?;
 
         self.signal_peers = self.exchange_pointers(self.signal_self)?;
 
@@ -369,7 +378,11 @@ impl CustomAllReduce {
             "[custom_all_reduce] initialised (world={}, rank={}, mode={}, fully_connected={})",
             self.world_size,
             self.rank,
-            if self.same_process { "same-process" } else { "ipc" },
+            if self.same_process {
+                "same-process"
+            } else {
+                "ipc"
+            },
             if self.fully_connected { "yes" } else { "no" }
         );
         Ok(())
@@ -393,7 +406,10 @@ impl CustomAllReduce {
 
         let mut self_handle = cudaIpcMemHandle_t { reserved: [0; 64] };
         // SAFETY: `local` is a base allocation of this process.
-        check_rt(unsafe { cudaIpcGetMemHandle(&mut self_handle, local) }, "cudaIpcGetMemHandle")?;
+        check_rt(
+            unsafe { cudaIpcGetMemHandle(&mut self_handle, local) },
+            "cudaIpcGetMemHandle",
+        )?;
         let gathered = self.allgather(&from_handle(&self_handle));
 
         let mut out = Vec::with_capacity(world);
@@ -458,14 +474,20 @@ impl CustomAllReduce {
         let lamport_bytes = align_up(lamport_comm_bytes * 3, FUSION_ALIGN);
 
         let mut buffers = [std::ptr::null_mut::<c_void>(); 3];
-        for (slot, bytes) in buffers.iter_mut().zip([buffer_bytes, flag_bytes, lamport_bytes]) {
+        for (slot, bytes) in buffers
+            .iter_mut()
+            .zip([buffer_bytes, flag_bytes, lamport_bytes])
+        {
             // SAFETY: a live out-parameter and a positive size.
             check_rt(unsafe { cudaMalloc(slot, bytes) }, "cudaMalloc(fusion)")?;
         }
 
         let mut flag_dev: *mut c_void = std::ptr::null_mut();
         // SAFETY: a live out-parameter.
-        check_rt(unsafe { cudaMalloc(&mut flag_dev, 5 * 4) }, "cudaMalloc(fusion flags)")?;
+        check_rt(
+            unsafe { cudaMalloc(&mut flag_dev, 5 * 4) },
+            "cudaMalloc(fusion flags)",
+        )?;
 
         // Park it on `self` now so `Drop` owns it before anything else fails.
         self.fusion = Some(Fusion {
@@ -519,7 +541,10 @@ impl CustomAllReduce {
         // SAFETY: a live out-parameter and a positive size.
         check_rt(
             unsafe {
-                cudaMalloc(&mut workspace_dev, workspace.len() * std::mem::size_of::<*mut c_void>())
+                cudaMalloc(
+                    &mut workspace_dev,
+                    workspace.len() * std::mem::size_of::<*mut c_void>(),
+                )
             },
             "cudaMalloc(fusion workspace)",
         )?;
@@ -736,10 +761,15 @@ impl CustomAllReduce {
         }
         // the 16-byte multiple is the kernel's vector width.
         if bytes == 0 || bytes > self.max_bytes || bytes % 16 != 0 {
-            return Err(Decline::Bytes { bytes, max_bytes: self.max_bytes });
+            return Err(Decline::Bytes {
+                bytes,
+                max_bytes: self.max_bytes,
+            });
         }
         if self.world_size > 2 && !self.fully_connected {
-            return Err(Decline::NotFullyConnected { world_size: self.world_size });
+            return Err(Decline::NotFullyConnected {
+                world_size: self.world_size,
+            });
         }
         // Under capture the address is replayed, not dereferenced now, so the
         // registration check is deferred to `register_graph_buffers` and
@@ -775,7 +805,11 @@ impl CustomAllReduce {
         if bytes < crossover {
             Ok(())
         } else {
-            Err(Decline::AboveCrossover { bytes, crossover, world_size: self.world_size })
+            Err(Decline::AboveCrossover {
+                bytes,
+                crossover,
+                world_size: self.world_size,
+            })
         }
     }
 
@@ -910,7 +944,6 @@ pub fn admitted(input: *const c_void, bytes: usize, stream: *mut c_void) -> Resu
     Ok(car.plane())
 }
 
-
 /// This thread's `car`, as the opaque handle the ABI forms take.
 ///
 /// Null when no rank published one, which every form below reads as
@@ -932,10 +965,12 @@ pub fn resident_car() -> *mut c_void {
 /// numbers survive only into a variant with integer fields.
 pub fn refusal_for(decline: &Decline) -> Refusal {
     match decline {
-        Decline::NoInstance | Decline::NotInitialised => {
-            Refusal::Absent { what: "a constructed custom all-reduce for this rank" }
-        }
-        Decline::NullInput => Refusal::Null { what: "the all-reduce's input" },
+        Decline::NoInstance | Decline::NotInitialised => Refusal::Absent {
+            what: "a constructed custom all-reduce for this rank",
+        },
+        Decline::NullInput => Refusal::Null {
+            what: "the all-reduce's input",
+        },
         Decline::Bytes { bytes, max_bytes } => Refusal::Wide {
             what: "the P2P all-reduce's message (or it is not a multiple of 16 bytes)",
             at: i64::try_from(*bytes).unwrap_or(i64::MAX),
@@ -944,13 +979,15 @@ pub fn refusal_for(decline: &Decline) -> Refusal {
         Decline::NotFullyConnected { .. } => Refusal::Absent {
             what: "peer access between every ordered pair of a group wider than two",
         },
-        Decline::CaptureUnknown => {
-            Refusal::Device { why: "`cudaStreamIsCapturing` failed on the fire's stream" }
-        }
-        Decline::Unregistered => {
-            Refusal::Absent { what: "a `register_buffer` for the all-reduce's input" }
-        }
-        Decline::AboveCrossover { bytes, crossover, .. } => Refusal::Wide {
+        Decline::CaptureUnknown => Refusal::Device {
+            why: "`cudaStreamIsCapturing` failed on the fire's stream",
+        },
+        Decline::Unregistered => Refusal::Absent {
+            what: "a `register_buffer` for the all-reduce's input",
+        },
+        Decline::AboveCrossover {
+            bytes, crossover, ..
+        } => Refusal::Wide {
             what: "the P2P all-reduce's message, above the crossover where NCCL wins",
             at: i64::try_from(*bytes).unwrap_or(i64::MAX),
             max: i64::try_from(*crossover).unwrap_or(i64::MAX),
@@ -966,9 +1003,9 @@ pub fn refusal_for(decline: &Decline) -> Refusal {
         Decline::FusionHidden { .. } => Refusal::Unstated {
             what: "a hidden size equal to the one the fusion workspace was sized for",
         },
-        Decline::FusionWorldSize { .. } => {
-            Refusal::Unstated { what: "a world size of two, which is all the fused landing takes" }
-        }
+        Decline::FusionWorldSize { .. } => Refusal::Unstated {
+            what: "a world size of two, which is all the fused landing takes",
+        },
         Decline::FusionHiddenNotOctet { .. } => Refusal::Unstated {
             what: "a hidden size that is a multiple of 8, the kernel's vector width in bf16",
         },

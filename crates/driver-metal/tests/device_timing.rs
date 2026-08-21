@@ -46,7 +46,10 @@ fn source(iters: u32) -> String {
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so nothing was timed");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -58,7 +61,7 @@ fn ms(d: Duration) -> f64 {
 #[test]
 fn encoding_and_execution_are_measured_separately() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -182,7 +185,7 @@ fn encoding_and_execution_are_measured_separately() {
 #[test]
 fn the_gpus_own_report_excludes_the_host_wake_up() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -246,7 +249,7 @@ fn the_gpus_own_report_excludes_the_host_wake_up() {
 #[test]
 fn segments_accumulate_both_host_halves() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -322,7 +325,7 @@ fn segments_accumulate_both_host_halves() {
 #[test]
 fn a_run_that_encodes_nothing_is_zero_rather_than_a_refusal() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut stepper = Stepper::new(&context).expect("stepper");

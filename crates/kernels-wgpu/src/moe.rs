@@ -32,13 +32,10 @@ fn routed_qmv_grid(rows: i32, out_vec_size: i32, slots: i32) -> Result<[u32; 3],
     if slots <= 0 {
         return Err(Refusal::Empty { what: "slots" });
     }
-    let x = rows
-        .unsigned_abs()
-        .checked_mul(32)
-        .ok_or(Refusal::Grid {
-            what: "rows * the matvec's lane count",
-            at: i64::from(rows) * 32,
-        })?;
+    let x = rows.unsigned_abs().checked_mul(32).ok_or(Refusal::Grid {
+        what: "rows * the matvec's lane count",
+        at: i64::from(rows) * 32,
+    })?;
     Ok([x, out_vec_size.unsigned_abs(), slots.unsigned_abs()])
 }
 
@@ -110,7 +107,7 @@ fn affine_qmm_point(group: i32, bits: i32, tile_m: i32, tile_n: i32) -> Result<u
     Ok((g * 2 + b) * 9 + tile_point(tile_m, tile_n)?)
 }
 
-#[routine(canon = topk)]
+#[routine(canon = topk, out(expert_weights = rows(logits) x const(experts_per_token)))]
 pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
@@ -120,7 +117,8 @@ pub fn router_topk(
     experts_per_token: Const<u32>,
     softmax_over_all: Const<u32>,
     logits_pitch: Const<u32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let per_expert_scale = ctx.absent()?;
     let rows = *rows;
     ctx.fire(
@@ -138,7 +136,7 @@ pub fn router_topk(
     )
 }
 
-#[routine]
+#[routine(out(expert_weights = rows(logits) x const(experts_per_token)))]
 pub fn router_topk_scaled(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
@@ -149,7 +147,8 @@ pub fn router_topk_scaled(
     experts_per_token: Const<u32>,
     softmax_over_all: Const<u32>,
     logits_pitch: Const<u32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let rows = *rows;
     ctx.fire(
         Fire::at("moe/route.wgsl", "router_topk_scaled_bfloat16").apply(router_grid(rows)?),
@@ -180,7 +179,8 @@ pub fn route_sort(
     tile_rows: Const<u32>,
     padded: Const<u32>,
     width: Const<u32>,
-    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    x_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     ctx.fire(
         Fire::at("moe/route.wgsl", "route_sort").apply([256, 1, 1]),
         &[
@@ -213,7 +213,8 @@ pub fn route_gather(
     padded: Const<u32>,
     width: Const<u32>,
     x_pitch: Const<u32>,
-    padded_rows: Const<i32>) -> Result<(), Refusal> {
+    padded_rows: Const<i32>,
+) -> Result<(), Refusal> {
     let x_width = x.width;
     let padded_rows = *padded_rows;
     ctx.fire(
@@ -233,7 +234,7 @@ pub fn route_gather(
     )
 }
 
-#[routine(canon = weighted_sum)]
+#[routine(canon = weighted_sum, out(out = rows(expert_weights) x const(width)))]
 pub fn combine_sorted(
     ctx: &Ctx<'_>,
     y: In<Tensor<bf16>>,
@@ -243,7 +244,8 @@ pub fn combine_sorted(
     width: Const<u32>,
     experts_per_token: Const<u32>,
     out_pitch: Const<u32>,
-    tokens: Const<i32>) -> Result<(), Refusal> {
+    tokens: Const<i32>,
+) -> Result<(), Refusal> {
     let y_width = y.width;
     let tokens = *tokens;
     ctx.fire(
@@ -260,23 +262,26 @@ pub fn combine_sorted(
     )
 }
 
-#[routine(canon = sigmoid_gate_add)]
+#[routine(canon = sigmoid_gate_add, out(out = like(routed)))]
 pub fn shared_expert_combine(
     ctx: &Ctx<'_>,
     routed: In<Tensor<bf16>>,
     shared: In<Tensor<bf16>>,
     gate: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = routed.width;
     let rows = *rows;
-    let w = i32::try_from(width).map_err(|_| Refusal::Grid {
-        what: "the shared expert's row width",
-        at: i64::from(width),
-    })?;
     ctx.fire(
-        Fire::at("moe/route.wgsl", "shared_expert_combine").apply(rows_by_width(w, rows)?),
-        &[routed.arg(), shared.arg(), gate.arg(), out.arg(), width.arg()],
+        Fire::at("moe/route.wgsl", "shared_expert_combine").apply(rows_by_width(width, rows)?),
+        &[
+            routed.arg(),
+            shared.arg(),
+            gate.arg(),
+            out.arg(),
+            width.arg(),
+        ],
     )
 }
 
@@ -287,17 +292,15 @@ pub fn shared_expert_combine_strided(
     shared: In<Tensor<bf16>>,
     gate: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = routed.width;
 
     let row_pitch = ctx.param(1)?;
     let rows = *rows;
-    let w = i32::try_from(width).map_err(|_| Refusal::Grid {
-        what: "the shared expert's row width",
-        at: i64::from(width),
-    })?;
     ctx.fire(
-        Fire::at("moe/route.wgsl", "shared_expert_combine_strided").apply(rows_by_width(w, rows)?),
+        Fire::at("moe/route.wgsl", "shared_expert_combine_strided")
+            .apply(rows_by_width(width, rows)?),
         &[
             routed.arg(),
             shared.arg(),
@@ -321,13 +324,18 @@ pub fn qmv_routed(
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
     expert_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let bias = ctx.absent()?;
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("moe/qmv_routed.wgsl", "affine_qmv_routed_bfloat16_gs_64_b_4").apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
+        Fire::at(
+            "moe/qmv_routed.wgsl",
+            "affine_qmv_routed_bfloat16_gs_64_b_4",
+        )
+        .apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
         &[
             w.arg(),
             scales.arg(),
@@ -358,12 +366,17 @@ pub fn qmv_routed_bias(
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
     expert_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("moe/qmv_routed.wgsl", "affine_qmv_routed_bias_bfloat16_gs_64_b_4").apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
+        Fire::at(
+            "moe/qmv_routed.wgsl",
+            "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
+        )
+        .apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
         &[
             w.arg(),
             scales.arg(),
@@ -393,12 +406,17 @@ pub fn mxfp4_qmv_routed_bias(
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
     expert_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("moe/qmv_routed.wgsl", "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4").apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
+        Fire::at(
+            "moe/qmv_routed.wgsl",
+            "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+        )
+        .apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
         &[
             w.arg(),
             scales.arg(),
@@ -423,14 +441,14 @@ pub fn qmm_t_routed(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     tile_expert: In<Tensor<i32>>,
     group: Const<i32>,
     bits: Const<i32>,
     tile_m: Const<i32>,
     tile_n: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let rows = *rows;
@@ -493,7 +511,8 @@ pub fn qmm_t_routed(
                 "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_32",
                 "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_64",
             ][affine_qmm_point(*group, *bits, *tile_m, *tile_n)?],
-        ).apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
+        )
+        .apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
         &[
             w.arg(),
             scales.arg(),
@@ -515,12 +534,12 @@ pub fn qmm_t_routed_fp16(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     tile_expert: In<Tensor<i32>>,
     tile_m: Const<i32>,
     tile_n: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let rows = *rows;
@@ -538,7 +557,8 @@ pub fn qmm_t_routed_fp16(
                 "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_32",
                 "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_64",
             ][tile_point(*tile_m, *tile_n)?],
-        ).apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
+        )
+        .apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
         &[
             w.arg(),
             scales.arg(),
@@ -560,12 +580,12 @@ pub fn mxfp4_qmm_t_routed_bias(
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
     bias: Const<Tensor<bf16>>,
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     tile_expert: In<Tensor<i32>>,
     tile_m: Const<i32>,
     tile_n: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let rows = *rows;
@@ -583,7 +603,8 @@ pub fn mxfp4_qmm_t_routed_bias(
                 "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_32",
                 "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_64",
             ][tile_point(*tile_m, *tile_n)?],
-        ).apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
+        )
+        .apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
         &[
             w.arg(),
             exponents.arg(),

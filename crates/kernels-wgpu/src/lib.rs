@@ -9,7 +9,6 @@ pub use crate::preproc::{Directive, Malformed, Variant, expand, instantiations};
 pub mod source;
 pub use crate::source::{Missing, SOURCES, entrypoint_source, source};
 
-
 pub mod routine;
 pub mod views;
 
@@ -40,7 +39,6 @@ pub struct Registered(pub ::kernels::routine::Routine<Plane>);
 #[cfg(target_family = "wasm")]
 ::inventory::collect!(Registered);
 
-#[must_use]
 pub fn rows() -> impl Iterator<Item = &'static ::kernels::routine::Routine<Plane>> {
     #[cfg(not(target_family = "wasm"))]
     {

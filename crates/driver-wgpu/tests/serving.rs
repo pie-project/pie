@@ -266,6 +266,34 @@ fn opened() -> Result<Device, driver_wgpu::device::Unavailable> {
     }
 }
 
+/// The chip every recorded table in this file was measured on.
+///
+/// Four tables here carry milliseconds, and all four say "Apple M4 Pro" in
+/// their prose and nothing else. Run on the machine this was written on
+/// today, `what_a_decode_costs_at_length` reads **13.188 ms a token, 75.8
+/// tok/s**, against a doc two hundred lines above it that says 7.490 ms and
+/// 133.5 tok/s. That is a 76% gap and it is not a regression: nothing in the
+/// decode path has moved. The adapter is an **Apple M1 Max**.
+///
+/// The numbers were never wrong. What was missing is that a reader had no way
+/// to find that out: `gpu()` printed the adapter at the top of a run and the
+/// tables named a chip in prose four hundred lines away, and nothing put the
+/// two in the same sentence. So a slower number here reads as a regression,
+/// and a faster one reads as a win, and both readings are about the machine.
+///
+/// This is the fifth time this campaign that a measured number turned out to
+/// be wearing a name nobody checked -- after a bf16 refusal read as a
+/// failure, a llama-only threshold named generally, a reference table row
+/// that never reproduced, and a four-bit driver judged at f32. The remedy is
+/// the same every time: make the claim state its subject.
+///
+/// No assertion. Nothing in this file gates on wall-clock -- checked, and it
+/// is the reason none of this was ever caught -- and a threshold tuned on one
+/// chip would only move the same mistake into a red gate. A banner is the
+/// whole fix: the comparison a reader would otherwise make silently and
+/// wrongly is made out loud, once, before any number is printed.
+const MEASURED_ON: &str = "Apple M4 Pro";
+
 /// The suite's lock, once an adapter has answered at all.
 ///
 /// The probe device is opened and dropped rather than kept, because every shell
@@ -280,11 +308,26 @@ fn gpu() -> Option<MutexGuard<'static, ()>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match opened() {
         Ok(device) => {
-            println!("adapter: {}", device.name());
+            let here = device.name();
+            println!("adapter: {here}");
+            if here != MEASURED_ON {
+                println!(
+                    "  !! every recorded millisecond in this file was measured \
+                     on {MEASURED_ON} and this is {here}. Numbers printed \
+                     below are NOT comparable with the tables in the docs \
+                     above them: a difference is the chip until something \
+                     rules the chip out"
+                );
+            }
             Some(held)
         }
         Err(why) => {
-            println!("SKIP: no adapter answered ({why}), so nothing here is measured");
+            driver_wgpu::skip::skipped(&format!(
+                "no adapter answered ({why}), so nothing here is measured. \
+                 On a Linux runner `PIE_WGPU_FALLBACK=1` takes the software \
+                 adapter, which is a real implementation of the same WGSL \
+                 and not a way of passing"
+            ));
             None
         }
     }
@@ -384,7 +427,43 @@ fn checkpoint() -> Option<String> {
             return Some(dir.clone());
         }
     }
-    println!(
+    // Through the helper, not `println!`.
+    //
+    // This return is the quietest thing in the file. Every test that wants
+    // real weights funnels through here, and when it hands back `None` each
+    // of them takes its own `else { return }` and is reported `ok` -- with no
+    // `SKIP:` line at all, so not even a human reading `--nocapture` output
+    // has a word to search for. The device gate at least printed something
+    // that could be grepped; this printed a sentence that reads like a
+    // finding.
+    //
+    // `unmeasured`, not `skipped`: a checkpoint IS provisionable, so this is
+    // not the never-fatal half -- but the runner that sets
+    // `PIE_WGPU_REQUIRE_DEVICE` was asked for an adapter and never for a
+    // model. Under its own switch this fires; under the device switch it does
+    // not, which is the difference between holding a runner to its word and
+    // failing it for something nobody requested.
+    //
+    // WHAT THE TWENTY-THREE SAY WHEN THEY ARE GIVEN ONE. `Qwen/Qwen3-0.6B` is
+    // 1.4 GB from the Hub, and with it in the cache this file goes
+    //
+    //     no checkpoint, switch off      37 s   26 passed
+    //     no checkpoint, switch on       37 s    3 passed, 23 failed
+    //     checkpoint,    switch on      192 s   26 passed
+    //
+    // -- five times the wall clock for the same green line, and all of the
+    // difference is whether twenty-three of the twenty-six touched a model.
+    // They pass. Every claim in this file about how the driver serves real
+    // weights is true, and until 2026-08-21 none of them had been asked.
+    //
+    // IT MUST BE THE BF16 ONE. `mlx-community/Qwen3-0.6B-4bit` states the
+    // right config -- 151936 x 1024, twenty-eight layers -- and the loop above
+    // rejects it, because it reads the ARTIFACT and a four-bit MLX pack holds
+    // `model.embed_tokens.weight` as `[151936, 128]`. This function's own doc
+    // says it identifies the snapshot "by what the artifact states rather than
+    // by what a path claims"; that sentence turns out to be load-bearing, and
+    // the hour it costs to learn it is the reason it is written here.
+    driver_wgpu::skip::unmeasured(&format!(
         "no {MODEL} among {} candidate{} in {}, so THE FORWARD PASS COULD NOT BE MEASURED",
         dirs.len(),
         if dirs.len() == 1 { "" } else { "s" },
@@ -393,7 +472,7 @@ fn checkpoint() -> Option<String> {
         } else {
             "the HuggingFace cache"
         },
-    );
+    ));
     None
 }
 
@@ -557,7 +636,12 @@ fn load() -> Option<BTreeMap<String, Vec<u8>>> {
         match model_loader::executor::Execution::new(&plan, std::path::Path::new(&dir)).run() {
             Ok(storage) => storage,
             Err(e) => {
-                println!("the loader would not execute `{MODEL}`'s plan: {e}");
+                // A checkpoint that is present and will not load is a
+                // different fault from one that is absent, and it used to be
+                // reported the same way: a line, and `ok`.
+                driver_wgpu::skip::unmeasured(&format!(
+                    "the loader would not execute `{MODEL}`'s plan: {e}"
+                ));
                 return None;
             }
         };
@@ -644,6 +728,19 @@ fn backend_facts() -> LlamaLikeMetalFacts {
         // across. A fixture is only an answer sheet if it answers the
         // question the shipping build asks.
         qmm_tile: (32, 64),
+        // AND THE THIRD HALF OF THE SAME STAMP. `engine::driver::backend::wgpu`
+        // states `fused_qk_rope: true` since `norm/rms_rope.wgsl` landed. This
+        // fixture inherited `synthetic()`'s `false`, so the whole suite -- the
+        // token pins AND every timing below -- ran the two-dispatch path while
+        // the deployment ran the one-dispatch one, which is the third time this
+        // struct has diverged from the stamp it claims to mirror and the second
+        // time the divergence hid in `..synthetic()`.
+        //
+        // A field that has to be repeated in two places to be right will be
+        // wrong in one of them eventually. It is repeated because the fixture
+        // deliberately does NOT read the deployment -- `shell::Text` explains
+        // why -- so the only remedy available here is to notice.
+        fused_qk_rope: true,
         ..LlamaLikeMetalFacts::synthetic()
     }
 }
@@ -1616,9 +1713,16 @@ fn a_frame_the_engine_built_answers_what_the_drivers_own_turns_do() {
          nothing worth comparing a frame against"
     );
     let seated: Vec<u32> = shell.book().pages(1).expect("its pages").to_vec();
-    assert!(
-        seated.len() >= 2,
-        "the premise: 32 rows over 16-row pages is more than one page"
+    // Exactly two, not "at least two": 32 rows over 16-row pages is arithmetic
+    // with one answer, and `>= 2` would have accepted a book that seated the
+    // conversation across four pages -- which is not the premise this test
+    // goes on to rely on.
+    assert_eq!(
+        seated.len(),
+        2,
+        "the premise: 32 rows over 16-row pages is exactly two pages, and this \
+         book seated them over {}",
+        seated.len()
     );
 
     // ── The engine's path, over a conversation the book knows nothing about,
@@ -2104,9 +2208,7 @@ fn a_seats_answer_does_not_depend_on_how_many_seats_fired_with_it() {
         let seats: Vec<u64> = (0..rows)
             .map(|_| {
                 who += 1;
-                shell
-                    .fork(1, who)
-                    .expect("the prompt can be forked again");
+                shell.fork(1, who).expect("the prompt can be forked again");
                 who
             })
             .collect();
@@ -3025,8 +3127,11 @@ fn the_tiled_gemms_readout_moves_when_the_last_token_moves() {
             .iter()
             .zip(&rb)
             .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
-        eprintln!("  n={n:4} last token moved the readout by {:.3} ({:.1}% of peak)",
-            moved, 100.0 * moved / peak);
+        eprintln!(
+            "  n={n:4} last token moved the readout by {:.3} ({:.1}% of peak)",
+            moved,
+            100.0 * moved / peak
+        );
         assert!(
             moved > 0.01 * peak,
             "at {n} rows the readout moved by {:.4} -- {:.3}% of its own peak \
@@ -3798,7 +3903,7 @@ fn a_step_of_no_turns_is_refused_and_not_served() {
 fn a_run_of_decodes_derives_one_lowering_and_says_the_same_thing() {
     let _lock = gpu();
     let Some(real) = weights() else {
-        eprintln!("no checkpoint; skipped");
+        driver_wgpu::skip::unmeasured("no checkpoint");
         return;
     };
     let prompt = prompt();
@@ -3945,7 +4050,7 @@ fn a_run_of_decodes_derives_one_lowering_and_says_the_same_thing() {
 fn a_real_fire_is_one_command_buffer_and_shadows_nothing() {
     let _lock = gpu();
     let Some(real) = weights() else {
-        eprintln!("no checkpoint; skipped");
+        driver_wgpu::skip::unmeasured("no checkpoint");
         return;
     };
     let mut shell = shelled(real, 64);
@@ -4048,13 +4153,738 @@ fn a_real_fire_is_one_command_buffer_and_shadows_nothing() {
 /// on the last points. Visiting the points round-robin and keeping the
 /// fastest of three rounds makes the drift common to every point instead of
 /// ordered by it, and the tail disappears completely.
+///
+/// ## The same sweep on a different chip, and why it needs saying
+///
+/// Re-run today the sweep reads **13.528 ms over 424 rectangles**, from a
+/// decode whose median is 13.188 ms -- 75.8 tok/s against the 133.5 tok/s
+/// four paragraphs down. The adapter is an **Apple M1 Max**, not the M4 Pro
+/// every table here names.
+///
+/// `(13.528 - 0.582) / 424` is **30.5 microseconds a rectangle** against the
+/// M4 Pro's 19.6. The shape is identical -- flat, every block of 27
+/// rectangles costing 0.64 to 0.97 ms wherever it sits, one layer taken a
+/// rectangle at a time flatter still -- so the CONCLUSION survives the chip
+/// unchanged and only the constant moves. That is the useful half: **the
+/// decode is dispatch-bound on both**, and the lever is the count.
+///
+/// The rectangle count moved 480 -> 424 as well, which is a plan change and
+/// not a chip one, and it is why the two totals cannot be divided against
+/// each other without the per-rectangle number in between.
+///
+/// [`MEASURED_ON`] now says this out loud at the top of every run, because
+/// without it 13.5 against 9.665 reads as a 40% regression and it is a
+/// different computer.
+///
+/// # WHAT THE NUMBER IS WORTH: llama.cpp ON THE SAME MACHINE
+///
+/// Both numbers this file produces finally have a like-for-like opposite.
+/// `llama-bench` 071327508 against `unsloth/Qwen3-0.6B-GGUF` Q4_0 (block 32
+/// symmetric, against this tree's affine gs=64 b=4 -- the nearest published
+/// encoding), same M4 Pro, Metal backend with `simdgroup matrix mul. = true`:
+///
+/// | | pie wgpu | llama.cpp Metal | gap |
+/// | --- | --- | --- | --- |
+/// | pp512, when this was written | 1436 tok/s | 6076 | 4.2x |
+/// | pp512, now | **1642 tok/s** | 6076 | **3.7x** |
+/// | tg128 @ d512, when this was written | 101.8 tok/s | 259 | 2.5x |
+/// | tg128 @ d512, now | **133.5 tok/s** | 259 | **1.94x** |
+///
+/// The decode row moved 9.638 -> 7.730 ms a token, 19.5%, by folding two
+/// reduction ladders into subgroup operations -- the split attention's, once
+/// per key, and every qmv workgroup's tail, once per output row. Neither was
+/// suspected before the GPU's own clock was pointed at them: this file's
+/// standing story was that the launch floor was the lever, and a stamped
+/// decode priced that at 3% of a token. See the `[cost]` section below.
+///
+/// Then 7.730 -> 7.490, another 3.5%, by emptying the split attention's key
+/// loop of its last two `workgroupBarrier()`s. Those survived the fold for a
+/// reason that was not about reduction at all: a 128-wide head is 64 lanes of
+/// bf16 pairs and a simdgroup is 32, so a row STRADDLED TWO SUBGROUPS and the
+/// two halves of its dot had to meet in workgroup memory. Giving each lane two
+/// channel pairs makes a row 32 lanes, and the meeting stops existing. The
+/// ratio crosses under 2x, which is the first time either row of this table
+/// has had a leading 1. `attn/sdpa_paged.wgsl`'s `PIE_DX` carries the probe,
+/// the fix and the gap between them.
+///
+/// The prefill row moved by unrolling the attention's two inner loops (see
+/// below); the decode row did not move at all, and was not expected to --
+/// the decode never enters the tiled arm those unrolls are in. That the
+/// decode reads 101.8 against the 101 measured before is this harness
+/// agreeing with itself across a day, which is worth knowing when reading
+/// any single-digit difference in this file.
+///
+/// The two gaps have DIFFERENT causes and neither is "the kernels are naive".
+///
+/// The prefill gap is a matrix unit. llama.cpp announces
+/// `simdgroup matrix mul. = true` and its GEMM is built on it; `qmm_t.wgsl`
+/// is a scalar-FMA tile because WGSL has no portable equivalent, and the
+/// ~1.8 TFLOP/s it reaches against this part's ~7 fp32 peak is roughly what
+/// hand-written FMA gets when the other side is issuing 8x8x8 matrix ops.
+/// That is a 4x sitting in the instruction set, and it is the honest reason
+/// this backend is not going to close pp512 by tuning tiles. (`shelled_tuned`
+/// notes the adapter DOES offer `EXPERIMENTAL_COOPERATIVE_MATRIX` at
+/// 16x16x16; nothing in this tree stamps a build against it. That is where
+/// the prefill's remaining 4x lives.)
+///
+/// The decode gap is not compute at all, and the arithmetic says so. 358 MiB
+/// of weights streamed once a token at this machine's ~184 GB/s is a **2.0 ms
+/// floor**, and no decode can beat it. llama.cpp's 259 tok/s is 3.86 ms a
+/// token -- within 1.9x of the floor, which is what a well-scheduled
+/// bandwidth-bound decode looks like. This backend's 9.88 ms is **5x the
+/// floor**, and the sweep above already says where the other 7.9 ms goes:
+/// 480 rectangles at a flat 19.6 us each REGARDLESS OF WHAT THEY COMPUTE, of
+/// which 0.22 ms total is CPU. It is all submit-and-wait.
+///
+/// So the decode is not 2.6x slower at arithmetic; it is doing the same
+/// arithmetic inside 5x the wall clock. This used to blame the barrier
+/// `wgpu` inserts before every dispatch. **That is wrong on Metal, which is
+/// the part this was measured on**: `wgpu-hal`'s Metal `transition_buffers`
+/// is an EMPTY function, so those barriers cost nothing here. The 19.6 us is
+/// Metal's own, because `wgpu` opens its compute encoder with plain
+/// `computeCommandEncoder()` and never sets a dispatch type, so it gets
+/// `MTLDispatchTypeSerial` and the driver drains the GPU between every
+/// dispatch. Both source lines are quoted in `device.rs`'s module doc.
+///
+/// The correction matters because it removes a whole class of remedy. The
+/// cost is charged by Metal per dispatch inside the single pass this driver
+/// already records, so no arrangement of passes, command buffers, submits,
+/// bindings or barriers touches it -- and `wgpu` exposes no way to ask for
+/// the concurrent encoder plus explicit `memoryBarrierWithScope` that
+/// llama.cpp uses. **Only firing fewer dispatches helps**, which is what
+/// makes `turns.rs`'s fusion price list the whole decode programme rather
+/// than one option among several.
+///
+/// # What the 480 actually are
+///
+/// `PIE_WGPU_PROBE=1 PIE_WGPU_DUMP=470` on this test prints the census --
+/// 470 rather than 400 because the prefill that builds the context is 452
+/// launches and would otherwise be dumped instead:
+///
+/// ```text
+///   57 x rms_single_row              grid=[1, 1, 1]
+///   56 x affine_qmv_fast_residual    grid=[1, 256, 1]     o, down
+///   56 x affine_qmv_fast             grid=[1, 768, 1]     gate, up
+///   56 x affine_qmv_fast             grid=[1, 256, 1]     k, v
+///   28 x affine_qmv_fast             grid=[1, 512, 1]     q
+///   28 x sdpa_paged_decode_split     grid=[16, 1, 8]
+///   28 x sdpa_paged_decode_merge     grid=[16, 1, 1]
+///   28 x rms_single_row              grid=[16, 1, 1]      q-norm
+///   28 x rms_single_row              grid=[8, 1, 1]       k-norm
+///   28 x neox_mb                     grid=[1, 16, 1]      rope q
+///   28 x neox_mb                     grid=[1, 8, 1]       rope k
+///   28 x kv_append_paged             grid=[1, 8, 1]
+///   28 x silu_mul                    grid=[12, 1, 1]
+///    3 x (embed, gather, lm head)
+/// ```
+///
+/// **`rms_single_row` is 113 of the 480**, 23.5% of the token, and 57 of
+/// those run on a grid of ONE WORKGROUP. `turns.rs`'s fusion price list has
+/// a "rmsnorm into its qmv" row worth 56 launches; this census says the
+/// per-head qk-norms are another 56 that the list never counted, and they
+/// are the cheapest arithmetic in the model. Whatever is done about norms
+/// is worth twice what that list says.
+///
+/// # The rectangles are NOT flat, and the marginal cost is 6 us not 19.6
+///
+/// "19.6 microseconds a rectangle and the number does not vary with what
+/// the rectangle computes" is an AVERAGE -- 9.83 ms over 480 -- and it was
+/// read as a per-rectangle floor. It is not one. Measured by DUPLICATING a
+/// routine's fire, which prices a launch marginally instead of dividing a
+/// total by a count:
+///
+/// | duplicated | launches added | ms | per added launch |
+/// | --- | --- | --- | --- |
+/// | (baseline) | | 9.828 | |
+/// | the per-head `rms_single_row`s | 56 | 10.162 | **6.0 us** |
+/// | every `qmv_fast` | 141 | 13.025 | **22.7 us** |
+///
+/// A launch that computes nothing much costs **6 us**. A `qmv` costs 22.7,
+/// and the difference is not overhead -- this model streams 358 MiB of
+/// weights a token across ~197 weight-reading launches, which is 2.5 MiB
+/// each and 13.8 us at this part's bandwidth. 13.8 + 6 = 20, against 22.7
+/// measured. The qmv rectangles are doing exactly the irreducible work the
+/// 2.0 ms bandwidth floor is made of.
+///
+/// So the decode's 9.83 ms is roughly: ~2.0 ms of weight streaming that no
+/// fusion can remove, ~3 ms of attention (which the split-K sweep below
+/// shows is real work and not floor), and ~2.9 ms of launch floor at 6 us
+/// x 480. **The launch floor is under a third of the token, not all of
+/// it.**
+///
+/// # The marginal census, and where a decode's 9.83 ms actually goes
+///
+/// Every row below was measured the same way -- duplicate that routine's
+/// fire, re-run this bench, divide the increase by the launches added:
+///
+/// | routine | n | marginal us | ms of the token |
+/// | --- | --- | --- | --- |
+/// | `sdpa_paged_decode_split` | 28 | **92.1** | **2.58** |
+/// | `qmv_fast` | 141 | 22.7 | 3.20 |
+/// | `sdpa_paged_decode_merge` | 28 | 12.9 | 0.36 |
+/// | `rms_single_row` (per head) | 56 | 6.0 | 0.34 |
+///
+/// Those four plus the 56 residual qmv account for roughly 8.8 of the 9.83
+/// ms, and the ~3 ms this file previously attributed to attention BY
+/// SUBTRACTION is now 2.94 ms measured directly. The subtraction was right;
+/// it is worth saying so, because the rest of this section exists to record
+/// where subtraction was wrong.
+///
+/// # The decode's attention is 8x off its own traffic, and it is the lever
+///
+/// 92 us is fifteen times the 6 us floor, so almost none of it is launch.
+/// Read its bytes: 16 q heads x 512 keys x 128 dims x 2 bytes, for K and
+/// again for V, is 4.2 MB a layer and 117 MB a token, which at this part's
+/// bandwidth is **0.64 ms**. It takes 2.58. The decode attention is ~4x off
+/// its own traffic, and against the prefill attention's own measured 392
+/// GB/s -- where every load is a cache hit -- it is worse than that.
+///
+/// # What that pointed at, and what it was worth: 101.3 -> 104.9 tok/s
+///
+/// Six probes into the split kernel and every part of its loop is free --
+/// the reduction tree is 5%, the `exp` nothing, the load issue nothing, an
+/// 8x cut in unique traffic 14%, the page walk's integer divide nothing.
+/// A body whose every part is free but whose total scales with the keys is
+/// a body that is WAITING, and what it waits on is how many workgroups a
+/// core can hold beside it. `sdpa_paged.wgsl`'s `PIE_KR` is that, its
+/// sweep predates split-K by a factor of four in grid width, and moving it
+/// from 8 to 2 on the split arm is **9.873 -> 9.529 ms, 101.3 -> 104.9
+/// tok/s**, interleaved A/B. The full table and the reasoning live beside
+/// the constant.
+///
+/// The llama.cpp gap at tg128@d512 is therefore **259 / 104.9 = 2.5x**,
+/// which is where it was: 3.5% does not move a ratio that size, and the
+/// point of the six probes is that nothing else in that kernel will
+/// either.
+///
+/// (Repriced. The last sentence was wrong, and it was wrong in an
+/// instructive way. Six probes changed the kernel's ARITHMETIC -- fewer
+/// keys, cheaper `exp`, wider loads, no divide -- and all six came back
+/// free, from which this note concluded the kernel was saturated. The
+/// seventh probe changed its SHAPE instead: truncating the reduction ladder
+/// from six levels to three took a third of the launch. A level is a
+/// barrier and a workgroup-memory round trip, and neither of those is
+/// arithmetic, so no probe in this list could see it. Folding the ladder
+/// into `subgroupShuffleXor` is 5.7% of a token here and 19.5% once the same
+/// ladder came out of `qmv`; the decode reads 7.730 ms, 129.4 tok/s, and the
+/// ratio is **2.0x**. `PIE_KR` survived the re-sweep unchanged -- see the
+/// second table beside the constant.)
+///
+/// # The first fusion, and what a marginal price does and does not buy
+///
+/// `norm::rms_rope` folds the per-head RMS norm and the NEOX rotation into
+/// one dispatch: 56 `rms_single_row` + 56 `neox_mb` become 56 `rms_rope`,
+/// so a decode token drops 56 of its 480 launches and the whole-corpus
+/// rectangle count in `arena.rs` falls 7224 -> 6920.
+///
+/// The marginal model says 56 x 6 us = **0.34 ms**. Ten interleaved runs,
+/// five pairs, say:
+///
+/// | | base (ms) | fused (ms) |
+/// | --- | --- | --- |
+/// | | 9.631 | 9.524 |
+/// | | 9.495 | 9.487 |
+/// | | 9.646 | 9.127 |
+/// | | 9.554 | 9.497 |
+/// | | 9.593 | 8.995 |
+/// | mean | **9.584** | **9.326** |
+/// | median | 9.593 | 9.487 |
+///
+/// **0.26 ms, 2.7%, ~104.3 -> ~107.2 tok/s** on the means -- close to the
+/// 0.34 the marginal price predicted, and the first end-to-end confirmation
+/// that the 6 us figure is a real recoverable cost and not an artifact of
+/// how it was measured. That matters more than the 2.7%: the remaining
+/// three fusions are priced by the same number.
+///
+/// TWO THINGS THIS TABLE SAYS THAT A SINGLE PAIR WOULD NOT. First, the two
+/// columns have different SHAPES. Base is tight -- 9.495 to 9.646, a 1.6%
+/// spread. Fused is bimodal: three runs near 9.50 and two near 9.06, a 5.9%
+/// spread, and nothing in between. The fusion did not make the decode
+/// uniformly faster, it made a faster outcome available and reached it
+/// twice in five. A 32-of-256-lane rotation riding on a 256-lane norm's
+/// workgroup is a plausible source of that -- occupancy luck, not
+/// arithmetic -- but it is a guess, and the honest number to quote is the
+/// mean over interleaved runs, not the best.
+///
+/// Second, the FIRST pair alone (9.631 vs 9.524) reads 1.1%, and the first
+/// two pairs read 0.6%, which is under this harness's repeatability. Had
+/// this stopped at two pairs it would have recorded "no effect" for a
+/// change that is worth 2.7%, and the remaining fusion programme would have
+/// been abandoned on that. A bimodal result needs more pairs than a
+/// unimodal one, and you cannot know which you have until you have them.
+///
+/// # What made this measurable at all
+///
+/// `backend_facts()` above inherited `fused_qk_rope: false` from
+/// `synthetic()`, so the first run of this bench measured the UNFUSED path
+/// with the fused kernel compiled and never fired. That is the third time
+/// this fixture has diverged from the stamp it says it mirrors, and the
+/// second time the divergence hid in `..synthetic()` -- after
+/// `qmm_fp16_precast` put eleven tests on a broken path and `qmm_tile` made
+/// every timing in this file 23% pessimistic. `arena.rs` had the same hole
+/// and, once closed, immediately named every pin the fold moved. A fact
+/// repeated in three places will be wrong in two of them.
+///
+/// This reorders the whole list. The complete fusion programme is 1.18 ms.
+/// The decode attention is 2.58 ms with a 0.64 ms floor, so **there is
+/// about 1.9 ms in that one kernel, more than every fusion combined**, and
+/// it is the same issue-bound loop that `sdpa_paged.wgsl` documents for the
+/// prefill -- where widening the loads by two was worth 10.6%. Whether the
+/// decode's split entrypoint shares that improvement, and what its 128
+/// workgroups of 64 keys each are actually waiting on, is the open
+/// question this bench now points at.
+///
+/// That reprices the whole fusion programme. `turns.rs` costs a removed
+/// rectangle at ~13 us and reaches ~135 tok/s for all four fusions; at the
+/// measured 6 us, 196 removed launches are 1.18 ms and the answer is
+/// **~115 tok/s**. Still the largest lever this backend has, and still
+/// worth doing -- but it does not close half the gap to llama.cpp's 259,
+/// and no arrangement of these kernels does.
+///
+/// (Repriced twice more since, and the SIGN of the conclusion held while
+/// every figure in it moved. The token is now 7.730 ms, so a fusion is
+/// worth more as a share and less as an absolute: the two projection joins
+/// are no longer 196 launches x a flat 6 us but a MEASURED 0.68 ms --
+/// `q+k+v` 54.6 -> 38.0 us a layer and `gate+up` 60.9 -> 53.1 -- which is
+/// ~9% of a token and lands at ~141 tok/s. The flat-rate estimate was the
+/// wrong shape as well as the wrong number, because a join deletes FIRES,
+/// not rows, so it collects the per-fire term exactly and nothing else. The
+/// last sentence stands: 141 is not 259.)
+///
+/// Two things this census does NOT support, both checked rather than
+/// assumed. The attention's split-and-merge pair is not a candidate for
+/// collapsing to one launch -- doing that is 26% SLOWER, and
+/// `kernels-wgpu`'s `sdpa_paged_decode` carries the sweep. And nothing
+/// here is redundant: every launch computes something the next one needs.
+///
+/// Remove ALL of the dispatch overhead and this model's decode ceiling here
+/// is the same ~2 ms bandwidth floor -- about 500 tok/s, which is ahead of
+/// llama.cpp. That is not a promise, it is a statement about which term is
+/// reducible: the prefill's gap is in an instruction this backend cannot
+/// emit, and the decode's is in a dispatch count this backend chooses.
+///
+/// ## "CANNOT EMIT" IS WRONG, and `tests/cooperative.rs` is why
+///
+/// It can emit it. Today, on the versions already in this tree's lock file,
+/// with no browser and no patched wgpu. That file opens a device with
+/// `ExperimentalFeatures::enabled()` and runs a `coop_mat8x8` f16->f32 GEMM
+/// at qwen3-0.6b's gate/up shape -- `[m 512, n 3072, k 1024]`, which is
+/// exactly rectangles 46 and 47 of the plan sweep -- in **0.524 ms against
+/// the shipped quantised kernel's ~1.25, with every spot-checked output
+/// EXACTLY equal** to an f32 CPU dot over all 1024 terms.
+///
+/// `naga 30` parses `enable wgpu_cooperative_matrix` and its MSL back end
+/// emits `simdgroup_matrix`. This adapter offers three 8x8x8 shapes -- not
+/// the 16x16x16 the note further down recorded, which was a Vulkan adapter.
+/// The only thing between this driver and the matrix unit is `device.rs`
+/// asking for `ExperimentalFeatures::disabled()`, which is a judgement about
+/// shipping an experimental path rather than a fact about the standard.
+///
+/// So that sentence should have said "does not emit". The 2.4x was stated as
+/// an upper bound, because that kernel reads f16 weights where the shipped one
+/// reads 4-bit affine; `what_the_matrix_unit_is_worth_on_this_trees_actual_weights`
+/// closed it. Dequantising 4-bit affine into workgroup memory and feeding the
+/// unit from there reads **0.549 ms, 2.3x, exact** -- within 5% of the f16
+/// ceiling, because eight simdgroups sharing one staged tile amortise the
+/// unpacking over 256 rows until it costs nothing. The matrix unit survives
+/// this tree's encoding.
+///
+/// It reaches the projections only, which is ~2050 tok/s of the 6076.
+/// The other half of the gap is the attention: 5.5 ms, the largest rectangle
+/// in a 12.4 ms layer, and the same instruction again, because a
+/// cooperative-matrix attention is what FlashAttention on a tensor core IS.
+/// Both halves through the matrix unit is the shape of a 3x, not a 1.3x.
+///
+/// What did NOT change is the decode paragraph. The matrix unit is a prefill
+/// lever; at one row a GEMM is a GEMV, there is no tile to feed a matrix
+/// engine with, and the decode's 5x is still the dispatch count.
+///
+/// ## AND THE ATTENTION IS NOT WAITING ON A MATRIX UNIT EITHER
+///
+/// Before writing a cooperative-matrix attention it is worth pricing the one
+/// that is here, because the arithmetic says the instruction set is not what
+/// is wrong with it. qwen3-0.6b is 16 query heads at `head_dim` 128, the
+/// tiled arm is causal (`kp <= q_pos`), and a 512-row prefill therefore does
+/// about 512^2/2 = 131,072 query-key pairs a head. Each pair costs 256 flops
+/// in QK and 256 more accumulating V:
+///
+/// | | GFLOP a layer | ms | TFLOP/s |
+/// | --- | --- | --- | --- |
+/// | seven projections | 16.1 | 6.4 | **2.52** |
+/// | attention | 1.07 | 5.5 | **0.195** |
+///
+/// **The attention runs at a THIRTEENTH of the rate this same backend gets
+/// out of its own scalar GEMM**, on the same part, in the same fire, with no
+/// matrix unit on either side. It is not 13x more arithmetic -- it is a
+/// fifteenth of the arithmetic taking almost as long.
+///
+/// That reorders everything. The projections needed a new instruction to go
+/// 2.3x; the attention is 13x off a target this tree has already hit with
+/// instructions it emits today.
+///
+/// # What the cause turned out to be, and what it was not
+///
+/// This section used to answer that question with "it stages NOTHING",
+/// pointing at the 32 rows of a workgroup re-reading the same keys and at
+/// the query row re-read for every key, against `qmm_t.wgsl` staging both
+/// operands. It named a workgroup-memory rewrite as the fix.
+///
+/// **That was measured and it is wrong.** Staging the group's queries in
+/// workgroup memory is 16% SLOWER (356.7 -> 414.2 ms at 512 rows); the
+/// numbers and the mechanism are in `dot_row`. The reuse it removes was
+/// already L1 -- a query row is 256 bytes -- so the stage swaps one fast
+/// path for another and then charges 8 KB of workgroup memory, which costs
+/// occupancy on a loop that needs it. The page-table cache had found the
+/// same thing on the same loop and the conclusion was not carried across.
+///
+/// What the loop actually wanted was the opposite: not fewer loads, but
+/// more of them in flight. Two words an iteration in the QK dot and two
+/// values an iteration in the V accumulate, no re-association in either,
+/// took a 512-row prefill 354.6 -> 313.4 ms, **1444 -> 1634 tok/s**. This
+/// rectangle went 5.5 -> 4.1 ms with it:
+///
+/// | | GFLOP a layer | ms | TFLOP/s |
+/// | --- | --- | --- | --- |
+/// | seven projections | 16.1 | 6.4 | 2.52 |
+/// | attention, before | 1.07 | 5.5 | 0.195 |
+/// | attention, after | 1.07 | 4.1 | **0.261** |
+///
+/// So the deficit is 13x no longer but 9.7x, and the lesson generalises
+/// past this kernel: on this part, a load that is issued many times is not
+/// thereby expensive, and a loop that looks bandwidth-bound on a traffic
+/// count can be issue-bound instead. Price the next one by trying to widen
+/// it before trying to cache it.
+///
+/// The other 9.7x has since been decomposed, by halving each part of the
+/// loop in turn and re-running this test. The full table is in
+/// `compute_lane`; the short form is that the QK dot's loads are 45% of the
+/// attention and the V accumulate 40%, leaving 15% for the online softmax,
+/// the page walk and the loop together. Hoisting the per-term
+/// `params.scale` -- half the dot's ALU -- is worth 0.4%.
+///
+/// So both candidates this section used to name are dead. It is not the
+/// hand-rolled bf16 unpack and it is not the softmax chain, because it is
+/// not arithmetic at all: 85% of the kernel is streaming K and V a word at
+/// a time. And it is not DRAM either -- the bytes work out to 392 GB/s,
+/// about twice this part's memory bandwidth, so the working set is resident
+/// and every load is a hit. Three separate findings now agree on that.
+///
+/// What is left is that `PIE_TX` lanes each compute the whole dot, so K is
+/// read `PIE_TX` times over. At `d_128` that is 2x, bounded at 8% of a
+/// prefill by the 45% row, and it costs a subgroup reduction and a
+/// re-association three backends would have to agree to. Priced, and not
+/// taken. The shape only changes by reading each K element once for
+/// SEVERAL query rows, which is what a matrix unit does -- and
+/// `tests/cooperative.rs` is the evidence this part has one.
+///
+/// So the order is: find the rest of the attention's 9.7x with the
+/// instructions this backend already emits -- it is the cheapest work left
+/// and needs no experimental token -- and only then ask whether either
+/// kernel wants the matrix unit.
+///
+/// `turns.rs`'s fusion price list is the first 26% of that dispatch count.
+/// It is priced at ~135 tok/s, so it closes a third of the decode gap and no
+/// more; the rest needs the launch count to fall by an order of magnitude,
+/// not a quarter.
+///
+/// (The "and no more" is the part that survived. What the two ladders showed
+/// is that the rest was never all in the dispatch COUNT: the launch floor is
+/// 3% of a token by the GPU's own clock, and 22.3% has now come out of two
+/// kernels without deleting a single launch. The order of the list above is
+/// therefore right for the wrong reason -- attention first, fusions second --
+/// and the reason is not that dispatch is expensive but that the kernels
+/// were.)
+///
+/// # THE STAMP TABLE'S SHARES ARE NOT A BUDGET, AND THIS FILE READ THEM AS ONE
+///
+/// The `[cost]` table below puts `sdpa_paged_decode_split` at 32-35% of a
+/// decode and four sittings treated it as a third of the problem. It is a
+/// fifth. Cutting the kernel at its LOOP BOUNDARY -- force `hi` under `lo`
+/// so the key loop runs zero iterations -- says the whole 64-key loop is
+/// 1.15 ms of a 7.490 ms token, and the pieces outside it price at ~0.25 ms
+/// between them (the merge tail 0.215, the split-state writeout a tie, the
+/// paged gather 0.13 and inside the loop anyway). ~1.4 ms is 19%.
+///
+/// A third measurement, taken for another purpose, agrees: doubling the
+/// split count doubles the WORKGROUPS without changing the key work, and 8
+/// -> 16 costs 0.17 ms end to end. A kernel carrying 1.3 ms of
+/// per-workgroup fixed cost could not add 128 workgroups a layer for that.
+///
+/// The mechanism is the one this file already documents and did not follow
+/// through: Apple has no `TIMESTAMP_QUERY_INSIDE_PASSES`, so stamping forces
+/// ONE COMPUTE PASS PER LAUNCH, and a pass costs in proportion to the state
+/// its launch establishes. This kernel has the widest grid in a decode -- 16
+/// heads x 8 splits x 256 invocations against a `qmv`'s one-dimensional 256
+/// -- so it collects more of that surcharge than anything else in the table.
+/// **The ranking is sound; the shares are inflated for wide grids.** Rule
+/// seven grows a second half: a profiler's window must be cut on the work,
+/// and a profiler's SHARES must be checked against a probe before they are
+/// spent.
+///
+/// # AND THEN THE SHARES WERE TAKEN BY DELETION AND BOTH WERE WRONG
+///
+/// Everything above argues about `[cost]`'s percentages. `device.rs`'s
+/// `PIE_WGPU_SKIP` drops a kernel's fires and the decode is re-timed, which
+/// answers directly. Two rounds, baselines 7.440 and 7.451 ms:
+///
+/// ```text
+///   affine_qmv_fast   3.552 3.528   -> 3.91 ms   52.5%
+///   sdpa_decode_split 5.700 5.768   -> 1.71 ms   23.0%
+///   five small rows       --        -> 1.08 ms   14.4%
+/// ```
+///
+/// Stamped, the attention reads 35-39% and qmv about 47%. Both are wrong and
+/// in the directions the surcharge argument predicts: a stamped fire gets its
+/// own compute pass, a pass costs in proportion to the state its launch
+/// establishes, so the widest grid in the decode is inflated and the narrowest
+/// is not. The 19% correction written into `sdpa_paged.wgsl` was right to
+/// disbelieve the table and a little low.
+///
+/// **qmv is more than half of this decode** -- 3.91 ms against a 1.29 ms
+/// bandwidth floor for the 0.352 GB of weight banks it reads. See `turns.rs`
+/// for the ranking that follows.
+///
+/// # EVERY NUMBER ABOVE THIS LINE WAS TAKEN AT 40 SAMPLES
+///
+/// The body now takes 200, for the reason written beside the loop: at 40
+/// this bench repeated to 3.1%, not the 0.8% the older notes assert, and a
+/// 3.1% instrument cannot see a 2.7% fusion. Nothing above is retracted --
+/// the results that mattered were all taken as interleaved A/B, which is
+/// immune to a wandering baseline in a way a bare before-and-after is not,
+/// and the largest of them (split vs unsplit, 26%; `kv_head = 0`, 14%) are
+/// far outside even the wider band. The two that sit closest to it are the
+/// `PIE_KR` retune at 3.5% over two pairs and `rms_rope` at 2.7% over five;
+/// the second is ~5 sigma on its own spread, the first would be worth
+/// re-running at 200.
+///
+/// What IS retracted is the comparability of absolute figures. A
+/// 200-sample run reads ~9.71 ms / ~103 tok/s where a 40-sample run of the
+/// same build read ~9.31 / ~107, because the longer run warms the part and
+/// reports its steady state. **The steady state is the honest number** --
+/// a decode serving a real conversation is never in the cool state a
+/// 40-sample run samples -- but it means a figure from before this change
+/// and a figure from after it are not the same measurement, and the ~2.5x
+/// llama.cpp ratio quoted above is against the cooler denominator.
+///
+/// # WHERE THE 9.6 ms GOES, SPLIT AT THE ONE PLACE IT CAN BE SPLIT CHEAPLY
+///
+/// (Everything from here to the end of this heading's section was measured at
+/// 9.6 ms a token. It is now 7.49 -- the two ladders this section's `[cost]`
+/// table led to came out, and then the barriers that had been holding one of
+/// them up. The SHARES below therefore no longer add up to the current token,
+/// and they are kept because the reasoning that found them is the point. Each
+/// has a note where its number moved.)
+///
+/// `PIE_WGPU_PROBE=1` stamps each fire at `queue.submit` and again after
+/// `drained()`, which cuts a token into the part the CPU spends BUILDING the
+/// command buffer and the part it spends waiting for the GPU to finish it.
+/// Over 102 consecutive 424-launch fires:
+///
+/// ```text
+///   encode  53.8 ms / 102 =  0.53 ms a fire
+///   gpu    861.5 ms / 102 =  8.45 ms a fire
+///   read     1.7 ms / 102 =  0.02 ms a fire
+/// ```
+///
+/// **The CPU side is 6%.** That retires a standing suspicion with a number:
+/// `device.rs` once worried that `Device::uniform` allocates a buffer per
+/// dispatch, and the bind-group path still builds an `entries` vector and a
+/// hash key of cloned `Arc`s for every one of the 424. Both are now cached and
+/// neither shows up -- half a millisecond covers all of it, and no amount of
+/// CPU-side cleverness can reach the other 8.45.
+///
+/// # AND THEN THE GPU'S OWN CLOCK SAID THE REST OF IT
+///
+/// The paragraph above priced the GPU half by subtraction, using the 4.6 us a
+/// launch the `rms_rope` fusion measured, and concluded that a fifth of the
+/// token was dispatch turnaround. `PIE_WGPU_STAMP` measures it instead. It
+/// opens the device with `TIMESTAMP_QUERY`, puts each launch in its own
+/// compute pass with a stamp at each end -- the only place Apple will sample,
+/// since it offers `atStageBoundary` and not `atDispatchBoundary` -- and
+/// resolves the whole set inside the SAME command buffer, so unlike
+/// `PIE_WGPU_PROBE_EACH` it costs no round trip. Two consecutive windows of a
+/// 424-launch decode:
+///
+/// ```text
+///   inside dispatches   8.555   8.614  ms a fire
+///   first begin..last end   8.857   8.912  ms a fire
+///   between             0.301   0.298  ms a fire   = 3 %
+/// ```
+///
+/// **0.71 us a launch, not 4.6.** And that is measured with ONE ENCODER PER
+/// DISPATCH, where the shipped path opens one encoder for the whole fire, so
+/// it is an upper bound on the shipped turnaround and not an estimate of it.
+/// The GPU is inside a kernel 97% of the time it is busy.
+///
+/// **So what did the `rms_rope` fusion buy?** The kernel, not the launch. The
+/// same instrument prices `rms_single_row` at 7.9 us of GPU apiece; removing
+/// 56 of them for 0.26 ms is 4.6 us each, which is most of a 7.9 us kernel and
+/// none of a turnaround. Fusion still pays -- it just pays for the reason a
+/// reader would have guessed, and the "dispatch floor" story built on top of
+/// it was wrong. **A fold that removes a launch but keeps its work is worth
+/// about 0.7 us.**
+///
+/// The corrected budget, per fire:
+///
+/// ```text
+///   command-buffer encoding                     0.53 ms     6 %
+///   dispatch turnaround, 424 x 0.71 us          0.30 ms     3 %
+///   the kernels actually computing              ~8.3 ms    86 %
+///   readback and scheduler                      ~0.5 ms     5 %
+/// ```
+///
+/// # WHERE THE 8.3 ms IS, BY THE SAME CLOCK
+///
+/// `PIE_WGPU_PROBE=1 PIE_WGPU_STAMP=1` prints a `[cost]` table. Divided by the
+/// window's 65 fires, a 512-key decode:
+///
+/// ```text
+///   2.755 ms  32.2%   28 x  98.4us  sdpa_paged_decode_split   [16,1,8]
+///   1.734 ms  20.3%   56 x  31.0us  affine_qmv_fast           [1,768,1]
+///   1.228 ms  14.3%   56 x  21.9us  affine_qmv_fast_residual  [1,256,1]
+///   0.900 ms  10.5%   56 x  16.1us  affine_qmv_fast           [1,256,1]
+///   0.651 ms   7.6%   28 x  23.2us  affine_qmv_fast           [1,512,1]
+///   0.448 ms   5.2%   57 x   7.9us  rms_single_row            [1,1,1]
+///   0.228 ms   2.7%   28 x   8.1us  rms_rope                  [1,16,1]
+///   0.212 ms   2.5%   28 x   7.6us  rms_rope                  [1,8,1]
+///   0.178 ms   2.1%   28 x   6.4us  sdpa_paged_decode_merge   [16,1,1]
+///   0.122 ms   1.4%   28 x   4.3us  kv_append_paged           [1,8,1]
+///   0.092 ms   1.1%   28 x   3.3us  silu_mul                  [12,1,1]
+///   0.005 ms          1 x           embed_gather_mb_4bit
+///   0.003 ms          1 x           row_gather
+/// ```
+///
+/// Two things in it are worth more than everything the last several sittings
+/// spent on `qmv.wgsl`.
+///
+/// **One. The split attention is the largest single kernel in a decode, at
+/// 32%** -- and a third of it was a reduction ladder. Six levels of workgroup
+/// memory once per four keys, which `sdpa_paged.wgsl`'s own note had priced as
+/// "the ADDS, not the barriers" from an llvmpipe measurement. Truncating the
+/// ladder to three levels removed ELEVEN PERCENT of the adds and a THIRD of
+/// the time, so it was never the adds. The `@subgroup` tier replaces the
+/// levels with register exchanges: **9.593 -> 9.051 ms a token, 0.54 ms,
+/// 5.7%, three interleaved rounds and every one a win** (`PIE_WGPU_TIER`
+/// switches the tier inside one binary, which is what makes it an A/B rather
+/// than two builds). Its share falls to 26%. What follows is the pre-fix
+/// reading and is left as the reasoning that found it.
+///
+/// **One, as measured before the fix.** `attn.rs` had already priced it at 92.1 us marginally; this is 98.4
+/// us from the GPU's own counters, by a completely different method, and the
+/// two agree. It reads about 1 MB a layer, which is ~6 us of this part's
+/// bandwidth, and takes ninety. Its split count is on a measured flat from 4
+/// to 32, so it is not short of parallelism. Nothing in this tree explains it.
+///
+/// **Two. The qmv family is 52.7% and it had a ladder too.** `reduce_store`
+/// ends every workgroup with five levels of a 32-lane tree, and the workgroup
+/// is `@workgroup_size(32, 1, 1)` -- exactly one subgroup on this machine, so
+/// all five fold into register exchanges. Per launch, same window, one binary:
+/// q goes 21.0 -> 17.2 us and gate/up 28.2 -> 22.9. The saving scales with the
+/// ROWS (1.86 and 1.73 ns a row, the same number twice), which identifies it
+/// as 40% of the per-output-row term the byte-keyed table found and could not
+/// name. With both subgroup arms in, three interleaved rounds:
+///
+/// ```text
+///   round        1       2       3
+///   subgroup   7.671   7.772   7.747   ms a token
+///   baseline   9.667   9.575   9.574
+/// ```
+///
+/// **1.88 ms a token, 19.5%**, of which the attention ladder is 0.54.
+///
+/// **Two, as measured before that: the qmv family's FIRES ARE NOT EQUAL.** The
+/// 768-group gate/up pair costs 31.0 us where the 256-group k or v costs 16.1
+/// -- three times the rows for twice the time -- so the small ones really are
+/// paying a fixed cost, and the smallest kernels here (silu at 3.3 us, append
+/// at 4.3) sit on a floor of about 3 us that is INSIDE the dispatch, not
+/// between dispatches.
+///
+/// Two caveats on the table, both found by using it.
+///
+/// One: the table above is missing its largest row. Metal loses the last TWO
+/// encoders' counters to a resolve in the same command buffer, and the last
+/// launch of a decode is the 37984-group lm head, so it came back 0/0 every
+/// time -- counted as `lost=`, never hidden. `device.rs` now buys it back with
+/// two sacrificial one-workgroup dispatches (an EMPTY pass writes no counters
+/// at all, which is why the first attempt failed). It reads **666 us**, so the
+/// rows above are short by 0.67 ms and the lm head alone is ~7% of a token.
+/// That one number is also what broke `qmv.wgsl`'s straight-line fit: it
+/// predicted 1113 us, and the truth is that a qmv's rate RISES with the bytes
+/// in its fire -- 36.6 GB/s at 0.56 MiB to 131.3 at 83.4.
+///
+/// Two, and this one bites harder: **`[cost]` sums over a ONE-SECOND WINDOW,
+/// so it cannot be A/B'd.** This bench's context grows from 512 to 717 keys
+/// across its 205 decodes, and a slower setting advances fewer tokens inside a
+/// window, so two columns of a sweep are means over different key counts. Read
+/// across `PIE_SPLITS` the table says four splits costs 66 us a layer more
+/// than eight -- 1.85 ms a token -- where the 200-sample end-to-end
+/// measurement in `attn.rs` says 0.07 ms.
+///
+/// **`PIE_WGPU_STAMP=<n>` fixes it** by cutting the report every `n` fires
+/// instead, so window `k` covers the same tokens under every setting. Re-swept
+/// that way the same comparison reads +8.5%, +0.7%, +3.0% over this bench's
+/// three decode windows, which is the end-to-end answer. `n = 50` puts the
+/// prefill and the five warm-up decodes in window 0 and the 200 measured
+/// decodes in windows 1 to 3.
+///
+/// Those three windows also show the split attention's share climbing 31.7% ->
+/// 33.8% -> 35.2% as the context grows from 512 to 717 keys, and `between`
+/// holding at 0.29-0.30 ms a fire throughout -- which is the turnaround result
+/// above, repeated across six independent windows.
+///
+/// Three: **the key was too coarse.** `o` and `down` are both
+/// `affine_qmv_fast_residual` at [1,256,1] and the table charged them to one
+/// row, averaging a 1.125 MiB fire and a 1.6875 MiB one into a 21.9 us number
+/// that neither pays. `device.rs::charge` now sums the launch's bound buffer
+/// lengths into the key. Splitting that row is what finally explained the
+/// qmv family, because `down` binds the SAME bytes as `gate`/`up` with a
+/// third of the grid and runs 24% faster, in every window:
+///
+/// ```text
+///   entrypoint    out     in     MiB     us     per the fit
+///   k, v         1024   1024   0.566   15.85      15.35
+///   q            2048   1024   1.131   22.90     fitted
+///   gate, up     3072   1024   1.695   30.45     fitted
+///   o    (res)   1024   2048   1.133   20.35      20.36
+///   down (res)   1024   3072   1.697   23.15      23.16
+///
+///   t = 7.8 us + 4.64 ns/row + 4.96 us/MiB (+2.2 us if residual)
+/// ```
+///
+/// The cost axis is OUTPUT ROWS, not bytes and not the grid, and 4.96 us/MiB
+/// is 209 GB/s of this machine's 273 -- **the decode's qmv is latency-bound,
+/// not bandwidth-bound.** The "rate rises with the bytes" story one paragraph
+/// up was an artefact of three points that all held `in` at 1024. The lm head
+/// still misses (1128 predicted, ~800 read) because at 37984 groups the GPU is
+/// finally occupied and the row term hides under the bandwidth, so the fit is
+/// a LOW-OCCUPANCY model and says so. `qmv.wgsl` carries the derivation.
+///
+/// It also settles both projection joins, since a join deletes fires and not
+/// rows: q||k||v saves 16.6 us a layer and gate||up 7.8, **0.68 ms a token,
+/// 7%** -- and the q||k||v figure agrees with the bound-based 0.39 ms reached
+/// by a different route, which is the first time two estimates here have met.
+///
+/// **That 0.68 is a KERNEL delta and the pipeline collects about half of it;
+/// see `turns.rs`'s "AND 0.68 IS THE KERNEL'S NUMBER, NOT THE PIPELINE'S".**
+/// Three qmv fires become one HERE, but the packed bank still has to be taken
+/// apart before `rms_rope` and `kv_append_paged` read it, and `split_qkv` is a
+/// launch and not a view -- so in a real decode it is three fires becoming
+/// two, and half the q||k||v saving goes straight back. 0.34 to 0.45 ms of the
+/// 7.49 ms token, 4.5% to 6%. The two estimates still MEET, which is what this
+/// paragraph was about; they just meet at a kernel boundary that the decode
+/// does not stop at.
+///
+/// Reproduce with:
+/// `llama-bench -m ~/.cache/pie/gguf/Qwen3-0.6B-Q4_0.gguf -p 512 -n 128 -r 5`
+/// and `-n 128 -d 512 -p 0` for the depth-matched decode. The GGUF is not in
+/// this repo and is not fetched by anything here.
 #[test]
 #[ignore = "measurement"]
 fn what_a_decode_costs_at_length() {
     release_only();
     let _lock = gpu();
     let Some(real) = weights() else {
-        eprintln!("no checkpoint; skipped");
+        driver_wgpu::skip::unmeasured("no checkpoint");
         return;
     };
     // 512, and a whole number of 16-row tiles for the reason `prompt` gives.
@@ -4084,8 +4914,42 @@ fn what_a_decode_costs_at_length() {
             .expect("a decode fires");
         next = argmax(o.logits.row(o.readout_of[0]).expect("it read out"));
     }
+    // TWO HUNDRED SAMPLES, NOT FORTY, AND THE FIVE NUMBERS BELOW SAY WHY.
+    //
+    // At 40 the median's RUN-TO-RUN range was 3.1% -- measured directly, six
+    // interleaved runs of one unchanged configuration -- which is wider than
+    // any fusion in `turns.rs`'s price list is worth. A split-count sweep
+    // taken at 40 read 8/16/32 as 9.311/9.421/9.324 and the spread inside
+    // the `8` column alone was 9.187 to 9.475. Nothing could be concluded,
+    // and the earlier claim that this harness repeats to 0.8% was about a
+    // quieter machine than the one it now runs on.
+    //
+    // The distribution is not noisy so much as RIGHT-SKEWED: a single run of
+    // 40 read p0 8.761 and p100 11.074, a 26% spread, with the mass near the
+    // bottom and a long tail of interference. A median over 40 draws of that
+    // is unstable because 40 draws do not pin a quantile of a skewed
+    // distribution; they pin it to within the tail's leverage.
+    //
+    // At 200, five runs of one configuration give:
+    //
+    // | | p0 | p05 | p10 | p25 | p50 | p75 |
+    // | --- | --- | --- | --- | --- | --- | --- |
+    // | range | 4.9% | 2.5% | 3.3% | **1.6%** | **1.7%** | 3.3% |
+    //
+    // So the MIDDLE of the distribution is what repeats, not its floor --
+    // which is the opposite of the usual benchmarking instinct that the
+    // minimum is the machine speaking with nothing in the way. Here the
+    // minimum is the least repeatable statistic in the table. p25 and p50
+    // repeat to ~1.7%, and that is the number to quote as this harness's
+    // repeatability from now on.
+    //
+    // 200 samples is ~2 s, and it costs one thing worth naming: the run is
+    // long enough that the part warms inside it, so these medians read
+    // ~9.7 rather than the ~9.3 a 40-sample run reported. That is the
+    // steady-state number, which is the one a decode serving hundreds of
+    // tokens actually gets. Only compare against other 200-sample runs.
     let mut ms = Vec::new();
-    for _ in 0..40 {
+    for _ in 0..200 {
         let t = std::time::Instant::now();
         let o = shell
             .step(&[Turn {
@@ -4097,12 +4961,22 @@ fn what_a_decode_costs_at_length() {
         next = argmax(o.logits.row(o.readout_of[0]).expect("it read out"));
     }
     ms.sort_by(f64::total_cmp);
-    let median = ms[ms.len() / 2];
+    let q = |f: f64| ms[((ms.len() - 1) as f64 * f) as usize];
+    let median = q(0.5);
     println!(
         "decode @512: median {median:.3} ms -> {:.1} tok/s",
         1000.0 / median
     );
-    println!("  fastest {:.3}, slowest {:.3}", ms[0], ms[ms.len() - 1]);
+    println!(
+        "  p0 {:.3} p05 {:.3} p10 {:.3} p25 {:.3} p50 {:.3} p75 {:.3} p100 {:.3}",
+        ms[0],
+        q(0.05),
+        q(0.10),
+        q(0.25),
+        median,
+        q(0.75),
+        ms[ms.len() - 1]
+    );
 
     // WHERE THE 10 ms GOES, by the same prefix knob the prefill uses.
     //
@@ -4117,7 +4991,7 @@ fn what_a_decode_costs_at_length() {
     // points are visited ROUND-ROBIN and the fastest of the rounds is kept:
     // the drift is then common to every point instead of ordered by it, which
     // is the same reason the prefill's sweep rounds.
-    let mut decode_at = |shell: &mut Shell, n: Option<usize>, next: &mut u32| -> f64 {
+    let decode_at = |shell: &mut Shell, n: Option<usize>, next: &mut u32| -> f64 {
         shell.fire_prefix(n);
         let mut ms = Vec::new();
         for _ in 0..5 {
@@ -4147,7 +5021,10 @@ fn what_a_decode_costs_at_length() {
         .dispatches;
     println!("  a decode records {total} rectangles");
     let step = total.div_ceil(16);
-    let coarse: Vec<usize> = (0..=total).step_by(step).chain(std::iter::once(total)).collect();
+    let coarse: Vec<usize> = (0..=total)
+        .step_by(step)
+        .chain(std::iter::once(total))
+        .collect();
     let lo = step;
     let hi = (step * 2).min(total);
     let fine: Vec<usize> = (lo..=hi).collect();
@@ -4376,7 +5253,26 @@ fn what_a_decode_costs_at_length() {
 /// | 256 | 179.3 | 1428 | 0.700 |
 /// | 512 | 356.7 | **1436** | 0.697 |
 ///
-/// **169 -> 1436 tok/s, 8.5x**, of which the last 1.24x was free: it was
+/// # And then the attention's two inner loops were unrolled by two, for 13%
+///
+/// | rows | 32 | 64 | 128 | 256 | 512 |
+/// | --- | --- | --- | --- | --- | --- |
+/// | ms | 36.8 | 49.5 | 83.6 | 159.0 | **313.4** |
+/// | tok/s | 870 | 1294 | 1531 | 1610 | **1634** |
+/// | ms a row | 1.149 | 0.773 | 0.653 | 0.621 | 0.612 |
+///
+/// The QK dot was worth 10.6% of that (1444 -> 1597) and the V accumulate
+/// the remaining 2.3% (-> 1634).
+///
+/// `dot_row` in `sdpa_paged.wgsl` now loads two words before doing their
+/// four multiply-adds, in the same order as before. Nothing about the
+/// arithmetic changed; two loads are simply in flight where one was. The
+/// full reasoning, including why unrolling by FOUR is worth 17% and cannot
+/// be taken, is in that function -- it drifts a forked leaf 2.05% from an
+/// unforked seat that heard the same tokens, and a serving system has to
+/// answer a prompt the same way whoever else is in its batch.
+///
+/// **169 -> 1634 tok/s, 9.7x**, of which 1.24x was free: it was
 /// already shipping and the notebook could not see it. The SHAPE is the
 /// better news. Under the old tile the per-row cost fell to 256 rows and
 /// turned back up by 8%; here it falls to 256 and then does not move --
@@ -4532,7 +5428,7 @@ fn what_a_prefill_costs_at_length() {
     release_only();
     let _lock = gpu();
     let Some(real) = weights() else {
-        eprintln!("no checkpoint; skipped");
+        driver_wgpu::skip::unmeasured("no checkpoint");
         return;
     };
     let mut long: Vec<u32> = Vec::new();
@@ -4744,7 +5640,7 @@ fn where_a_prefills_time_goes_across_its_plan() {
     release_only();
     let _lock = gpu();
     let Some(real) = weights() else {
-        eprintln!("no checkpoint; skipped");
+        driver_wgpu::skip::unmeasured("no checkpoint");
         return;
     };
     let mut long: Vec<u32> = Vec::new();
@@ -4867,7 +5763,10 @@ fn where_a_prefills_time_goes_across_its_plan() {
             }
         }
     }
-    println!("  one layer, rectangle by rectangle, fastest of {}:", ROUNDS - 1);
+    println!(
+        "  one layer, rectangle by rectangle, fastest of {}:",
+        ROUNDS - 1
+    );
     for (i, n) in (lo..=hi).enumerate() {
         if i == 0 {
             continue;
@@ -5003,7 +5902,7 @@ fn which_tile_a_512_row_prefill_wants() {
     release_only();
     let _lock = gpu();
     let Some(real) = weights() else {
-        eprintln!("no checkpoint; skipped");
+        driver_wgpu::skip::unmeasured("no checkpoint");
         return;
     };
     let mut long: Vec<u32> = Vec::new();
@@ -5326,4 +6225,3 @@ fn a_prefill_longer_than_the_first_one_is_still_answered() {
         );
     }
 }
-

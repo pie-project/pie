@@ -108,12 +108,10 @@ fn expand_variant(
         .collect();
     defines.extend(variant.defines.clone());
 
-    crate::preproc::expand(text, &defines, &|path| {
-        source(path).map(ToOwned::to_owned)
-    })
-    .map_err(|why| Missing::Unexpandable {
-        file: file.to_owned(),
-        why,
-    })
+    crate::preproc::expand(text, &defines, &|path| source(path).map(ToOwned::to_owned)).map_err(
+        |why| Missing::Unexpandable {
+            file: file.to_owned(),
+            why,
+        },
+    )
 }
-

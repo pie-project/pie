@@ -59,7 +59,6 @@ pub use serde_json;
 // Re-export the attribute macro
 pub use inferlet_macros::main;
 
-
 wit_bindgen::generate!({
     path: "wit",
     world: "inferlet",
@@ -72,7 +71,6 @@ pub use wit_bindgen;
 // Re-export types that don't need async wrappers directly
 pub use pie::inferlet::types;
 
-
 /// The runtime working-set resources (KV page-slot array + recurrent state).
 /// The generated WIT resources, unwrapped; [`ptir::WorkingSet`] is the
 /// pass-facing handle built over them.
@@ -80,16 +78,13 @@ pub mod working_set {
     pub use crate::pie::inferlet::working_set::*;
 }
 
-
 pub mod mask;
 /// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
 /// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `tensor-dsl`
 /// trace `Builder`. The single home of the PTIR authoring surface.
 pub mod ptir;
 
-
 pub mod chat;
-
 
 /// The engine serves exactly one model; these are global functions over
 /// that single bound model. There is no `Model`/`Tokenizer` handle to pass
@@ -106,7 +101,6 @@ pub mod model {
         Token, decode, encode, special_tokens, split_regex, vocabs,
     };
 }
-
 
 pub mod runtime {
     pub use crate::pie::inferlet::system::*;
@@ -152,4 +146,3 @@ pub mod grammar {
 pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }
-

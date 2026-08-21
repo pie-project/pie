@@ -12,7 +12,10 @@ use driver_metal::device::{Context, Memory};
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no allocation was measured");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -20,7 +23,7 @@ fn context() -> Option<Context> {
 #[test]
 fn a_probe_describes_one_machine() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let memory = Memory::probe(&context);

@@ -244,9 +244,7 @@ mod tests {
         let step = step(&ids, &[0, 1]);
         let lower = |cache: &mut Lowerings| {
             cache
-                .for_step(FireClass::Decode, &step, || {
-                    Ok::<_, ()>(empty_plan())
-                })
+                .for_step(FireClass::Decode, &step, || Ok::<_, ()>(empty_plan()))
                 .map(|_| ())
                 .expect("an empty plan lowers");
         };

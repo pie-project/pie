@@ -353,6 +353,24 @@ impl Runtime {
             // temperature published token 0 (`.wiki/migration.md` §11.21). A
             // `Slot::Absent` below is the honest answer if a library region
             // ever arrives unemitted.
+            // A SECOND-PARTY region has no generated kernel and never will: it
+            // is a `kernel_call` or `sink_call`, which is a NAME this driver
+            // launches itself (`fire::lora::read_lora_sink` for `lora`, the
+            // page-mask sink, `envelope_dot`) rather than a body the emitter
+            // could generate. So the emitter declines it -- correctly, with
+            // `generated region contains a non-generated boundary
+            // (second_party)` -- and reading that decline as a compile failure
+            // refused every adapter program this driver can actually run.
+            //
+            // It is the LIBRARY tag that says so, not the decline: an emitter
+            // that declined a genuinely generated region still has to be a
+            // failure, which is what the arms below are for.
+            if plan.fused.get(region_index as usize).is_some_and(|region| {
+                region.kind == driver::driver_api::local::PIE_REGION_LIBRARY
+                    && region.library == driver::driver_api::local::PIE_LIBRARY_SECOND_PARTY
+            }) {
+                continue;
+            }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
                 // NOT a `continue`. "The host declined on purpose" presumes a

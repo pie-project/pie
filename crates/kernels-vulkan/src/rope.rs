@@ -31,7 +31,7 @@ fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 
     ])
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_decode(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -59,7 +59,7 @@ pub fn neox_decode(
     )
 }
 
-#[routine(canon = rope)]
+#[routine(canon = rope, out(x = like(x)))]
 pub fn neox_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -89,7 +89,7 @@ pub fn neox_mb(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_freqs_decode(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -121,7 +121,7 @@ pub fn neox_freqs_decode(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_freqs_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -155,7 +155,7 @@ pub fn neox_freqs_mb(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_prop_decode(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -183,7 +183,7 @@ pub fn neox_prop_decode(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_prop_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -213,7 +213,7 @@ pub fn neox_prop_mb(
     )
 }
 
-#[routine]
+#[routine(out(x = like(x)))]
 pub fn neox_strided(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -250,4 +250,3 @@ pub fn neox_strided(
         ],
     )
 }
-

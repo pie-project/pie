@@ -5,9 +5,9 @@
 //! their rings wedge the epilogue. Both branches apply `kv_translation` with the
 //! same arithmetic, or two requests at logical page 0 collide.
 
+use driver::tensor_ir::registry::Port;
 use driver_api::plan::LaunchPlan;
 use driver_api::submission::{FrameSubmission, StepSubmission};
-use driver::tensor_ir::registry::Port;
 
 use crate::program::channel::Rings;
 use crate::program::session::Session;
@@ -157,6 +157,92 @@ impl Ports {
     }
 }
 
+/// Drain every host-writer descriptor port a HOST-geometry member holds.
+///
+/// A host-written channel's ring has exactly one consumer on this driver:
+/// [`Session::pull_channels`], which copies the engine's mirror cells into the
+/// device ring and advances the mirror's `head` as it goes. That advance is the
+/// ONLY thing that moves `head` -- this driver never writes the binding's head
+/// word from anywhere else -- and `head` is what the engine's writer checks
+/// before it stages a cell:
+///
+/// ```text
+///     if self.writer_tail - head >= capacity { return Err(ChannelError::Full) }
+/// ```
+///
+/// So a host writer that is never pulled gets exactly `capacity` puts and then
+/// `Full` forever. The guest waits on a cell that cannot be staged, the driver
+/// waits on a fire that is never submitted, and NEITHER SIDE SAYS ANYTHING. It
+/// reads as a hang with an idle GPU.
+///
+/// [`compose`] used to pull only on the device-resolved branch, so a pass whose
+/// geometry the ENGINE resolves -- the common case -- wedged the moment it fed
+/// a descriptor port from the host per step. Fixtures that carry their token
+/// on-device never noticed; `contrastive-decoding` and
+/// `classifier-free-guidance`, which host-put the next token each step, died
+/// after exactly `capacity` tokens. At the default capacity of 1 that is the
+/// SECOND decode step.
+///
+/// Called for its effect on the cursors; the cells land in the ring the launch
+/// path will not read for a host-resolved member, which costs one copy and
+/// keeps one drain rather than two.
+fn drain_host_writers(
+    instances: &std::collections::BTreeMap<u64, InstanceEntry>,
+    channels: &std::collections::BTreeMap<u64, ChannelState>,
+    plans: &std::collections::BTreeMap<u64, driver::ExecPlan>,
+    sessions: &mut std::collections::BTreeMap<u64, Session>,
+    rings: &mut Rings,
+    id: u64,
+    stream: crate::device::StreamRef<'_>,
+) -> Result<(), Refused> {
+    let Some(instance) = instances.get(&id) else {
+        return Ok(());
+    };
+    let Some(exec) = plans.get(&instance.program_id) else {
+        return Ok(());
+    };
+    let Some(session) = sessions.get_mut(&id) else {
+        return Ok(());
+    };
+    let mut host: Vec<crate::program::channel::HostChannel> =
+        Vec::with_capacity(instance.channel_ids.len());
+    for channel in &instance.channel_ids {
+        let Some(state) = channels.get(channel) else {
+            return Ok(());
+        };
+        host.push(state.host_plane());
+    }
+    // CONSUMING ports only, which is the whole of the care this needs.
+    //
+    // A port the fire consumes takes a fresh cell per fire, so its ring has to
+    // advance or the writer wedges -- that is what this function is for. A
+    // LATEST-VALUE port does not: `KvLen`, `Pages`, `PageIndptr`, `EmbedIndptr`
+    // and `AttnMask` keep one committed cell that the guest REPLACES with
+    // `Channel::set` rather than re-putting, precisely because nothing on the
+    // device side would ever move their head.
+    //
+    // Draining those breaks them. `set` refuses with `Empty` unless the cell it
+    // is replacing is still committed (`committed_tail <= head` in
+    // `pipeline::channel`), so a drain that takes it turns the guest's next
+    // `set` into an error -- and this function drained EVERY bound port when it
+    // was written, which is how `tart-masked` went from a deadlock to a
+    // `no cell available` the moment the seed cursors were fixed underneath it.
+    let ports = Ports::of(exec);
+    let bound: Vec<u32> = Port::ALL
+        .iter()
+        .filter(|port| port.consumes())
+        .filter_map(|&port| ports.dense(port))
+        .collect();
+    session
+        .pull_channels(rings, &mut host, &bound, stream)
+        .map_err(|why| {
+            Refused(format!(
+                "instance {id} cannot drain its host writers: {why}"
+            ))
+        })?;
+    Ok(())
+}
+
 /// Resolve every device-class member of `step` and translate every member's
 /// pages, or say why not. `Composed::Wire` when nothing needed either.
 ///
@@ -169,7 +255,13 @@ pub(crate) fn compose(
     page: u32,
     stream: crate::device::StreamRef<'_>,
 ) -> Result<Composed, Refused> {
-    let Sites { instances, channels, plans, sessions, rings } = sites;
+    let Sites {
+        instances,
+        channels,
+        plans,
+        sessions,
+        rings,
+    } = sites;
     let wire_rows = step.plan.qo_indptr.len().saturating_sub(1);
     let devices = (0..step.roster_rows.len())
         .map(|m| class_of(step, m))
@@ -188,6 +280,14 @@ pub(crate) fn compose(
         .any(|&c| c != driver_api::local::PIE_GEOMETRY_CLASS_HOST);
     let any_translation = !frame.kv_translation.is_empty();
     if !any_device && !any_translation {
+        // Not before draining: see `drain_host_writers`. Every member here is
+        // host-resolved, and returning `Wire` without touching their rings is
+        // what wedged a per-step host writer after `capacity` puts.
+        for &row in &step.roster_rows {
+            if let Some(&id) = frame.instance_ids.get(row as usize) {
+                drain_host_writers(instances, channels, plans, sessions, rings, id, stream)?;
+            }
+        }
         return Ok(Composed::Wire);
     }
 
@@ -258,6 +358,12 @@ pub(crate) fn compose(
                 page_indptr.push(pages.len() as u32);
                 lens.push(step.plan.kv_last_page_lens.get(r).copied().unwrap_or(0));
             }
+            // The engine resolved this member's geometry, so nothing above read
+            // its rings -- but the guest still WROTE them, and only a pull moves
+            // the mirror's head. See `drain_host_writers`.
+            if let Some(&id) = frame.instance_ids.get(row as usize) {
+                drain_host_writers(instances, channels, plans, sessions, rings, id, stream)?;
+            }
             continue;
         }
 
@@ -298,9 +404,11 @@ pub(crate) fn compose(
         let mut host: Vec<crate::program::channel::HostChannel> =
             Vec::with_capacity(instance.channel_ids.len());
         for channel in &instance.channel_ids {
-            let state = channels
-                .get(channel)
-                .ok_or_else(|| Refused(format!("instance {id} names channel {channel}, which this driver does not hold")))?;
+            let state = channels.get(channel).ok_or_else(|| {
+                Refused(format!(
+                    "instance {id} names channel {channel}, which this driver does not hold"
+                ))
+            })?;
             host.push(state.host_plane());
         }
         let bound: Vec<u32> = ports.channel.values().copied().collect();
@@ -320,7 +428,11 @@ pub(crate) fn compose(
             let Some(dense) = ports.dense(port) else {
                 return Ok(None);
             };
-            let early = Composed::Early { instance: id, channel: dense, port };
+            let early = Composed::Early {
+                instance: id,
+                channel: dense,
+                port,
+            };
             let Some(slot) = session.slot(dense as usize) else {
                 return Err(early);
             };
@@ -437,7 +549,9 @@ pub(crate) fn compose(
                 continue;
             };
             rings.consume_front(slot as usize, stream).map_err(|why| {
-                Refused(format!("instance {id} cannot consume channel {dense}: {why}"))
+                Refused(format!(
+                    "instance {id} cannot consume channel {dense}: {why}"
+                ))
             })?;
         }
     }

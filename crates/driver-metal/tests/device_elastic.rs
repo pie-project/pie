@@ -28,7 +28,10 @@ kernel void touch(device uint* kv [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no heap grew or shrank");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -41,7 +44,7 @@ const VIRTUAL: u64 = 8 * 1024 * 1024;
 #[test]
 fn the_address_survives_growing_and_shrinking() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(64 * 1024 * 1024, 0);
@@ -78,7 +81,7 @@ fn the_address_survives_growing_and_shrinking() {
 #[test]
 fn a_kernel_writes_through_the_address_after_it_grows() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(64 * 1024 * 1024, 0);
@@ -156,7 +159,7 @@ fn read_u32s(t: &driver_metal::device::Transient, count: usize) -> Vec<u32> {
 #[test]
 fn what_was_written_before_a_growth_is_still_there_after_it() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Every other test here asks whether the ADDRESS survives. An address
@@ -230,7 +233,7 @@ fn what_was_written_before_a_growth_is_still_there_after_it() {
 #[test]
 fn the_host_alias_and_the_gpu_address_name_the_same_memory() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // The assumption the whole design rests on, and nothing was asking it.
@@ -318,7 +321,7 @@ fn the_host_alias_and_the_gpu_address_name_the_same_memory() {
 #[test]
 fn a_host_span_past_what_is_mapped_is_refused_rather_than_returned() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Address space is not memory. A pointer into unmapped space would fault
@@ -348,7 +351,7 @@ fn a_host_span_past_what_is_mapped_is_refused_rather_than_returned() {
 #[test]
 fn asking_for_less_than_is_mapped_costs_nothing() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(64 * 1024 * 1024, 0);
@@ -380,7 +383,7 @@ fn asking_for_less_than_is_mapped_costs_nothing() {
 #[test]
 fn growth_is_refused_past_the_budget_and_the_buffer_is_untouched() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Room for two megabytes, and nothing more.
@@ -414,7 +417,7 @@ fn growth_is_refused_past_the_budget_and_the_buffer_is_untouched() {
 #[test]
 fn critical_pressure_refuses_growth_and_still_serves_a_step() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(16 * 1024 * 1024, 0);
@@ -441,7 +444,7 @@ fn critical_pressure_refuses_growth_and_still_serves_a_step() {
 #[test]
 fn a_batch_that_does_not_fit_is_refused_before_anything_is_mapped() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Two megabytes, and the batch below asks for three.
@@ -483,7 +486,7 @@ fn a_batch_that_does_not_fit_is_refused_before_anything_is_mapped() {
 #[test]
 fn a_trimmed_heap_is_given_back_and_the_budget_notices() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(64 * 1024 * 1024, 0);
@@ -516,7 +519,7 @@ fn a_trimmed_heap_is_given_back_and_the_budget_notices() {
 #[test]
 fn dropping_a_buffer_gives_its_bytes_back_to_the_arena() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(8 * 1024 * 1024, 0);
@@ -547,7 +550,7 @@ fn dropping_a_buffer_gives_its_bytes_back_to_the_arena() {
 #[test]
 fn a_zero_length_buffer_is_refused_rather_than_returned_empty() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(1 << 20, 0);
@@ -561,7 +564,7 @@ fn a_zero_length_buffer_is_refused_rather_than_returned_empty() {
 #[test]
 fn a_length_that_is_not_a_whole_tile_is_rounded_up_not_down() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(1 << 20, 0);
@@ -591,7 +594,7 @@ fn a_length_that_is_not_a_whole_tile_is_rounded_up_not_down() {
 #[test]
 fn a_batch_across_two_arenas_is_refused_rather_than_priced_against_one() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Each arena has room for the ask made of its own buffer, so anything
@@ -644,7 +647,7 @@ fn a_batch_across_two_arenas_is_refused_rather_than_priced_against_one() {
 #[test]
 fn a_buffer_dropped_with_its_growth_in_flight_does_not_take_the_gpu_with_it() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let arena = Arena::new(64 * 1024 * 1024, 0);
@@ -671,7 +674,7 @@ fn a_buffer_dropped_with_its_growth_in_flight_does_not_take_the_gpu_with_it() {
 #[test]
 fn a_host_move_over_the_pages_is_what_the_gpu_reads_afterwards() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // What `kv::Pool::apply` needs from an elastic-backed pool: a compaction
@@ -754,7 +757,7 @@ fn a_host_move_over_the_pages_is_what_the_gpu_reads_afterwards() {
 #[test]
 fn a_resized_kv_pool_keeps_every_address_it_handed_out() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // The claim elastic KV exists for. A pool that gave memory back and then
@@ -847,7 +850,7 @@ fn a_resized_kv_pool_keeps_every_address_it_handed_out() {
 #[test]
 fn a_fixed_pool_says_it_cannot_be_resized_rather_than_pretending() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     use driver_metal::layout::kv::Shape;
@@ -887,7 +890,7 @@ fn a_fixed_pool_says_it_cannot_be_resized_rather_than_pretending() {
 #[test]
 fn a_pool_that_gave_memory_back_stops_reserving_it() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // A shrink that moves the bytes but not the accounting is worse than no

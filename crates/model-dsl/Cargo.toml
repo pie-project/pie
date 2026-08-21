@@ -40,6 +40,11 @@ model-ir = { path = "../model-ir" }
 # authoring surface still reaches no device.
 kernels = { path = "../kernels" }
 kernels-cuda = { path = "../kernels-cuda", default-features = false }
+# The metal plane's markers (for the generated wrappers in `metal::generated`)
+# and its census (`kernel_of` — `fire_at`'s check that a stated entrypoint
+# belongs to the routine whose marker fired it). Table only, same rule as
+# `kernels-cuda` above and `model-ir`'s own dependency on this crate.
+kernels-metal = { path = "../kernels-metal", default-features = false }
 
 [dev-dependencies]
 # The wrapper GENERATOR's parser (design-no-ask §10, B4-gen). A dev-dep and
@@ -49,4 +54,7 @@ kernels-cuda = { path = "../kernels-cuda", default-features = false }
 # race parallel builds and break read-only checkouts, and checked-in
 # generation needs no `rerun-if-changed` plumbing. Same version/features
 # line as `kernels-macros`, which parses the same signatures.
-syn = { version = "3.0", features = ["full"] }
+# `visit` joined `full` when the generator grew its metal half: a metal
+# routine's SYMBOL is the entrypoint its body names (`Fire::at(file, entry)`),
+# so the generator walks the body's expressions for that one literal.
+syn = { version = "3.0", features = ["full", "visit"] }

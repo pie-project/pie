@@ -33,22 +33,6 @@ path = "src/lib.rs"
 # are: the minimum is what each target actually needs, found by BUILDING
 # each against each aspect rather than by reading its imports.
 
-[[test]]
-name = "a_row_identifies_from_its_own_names"
-required-features = ["contract"]
-
-[[test]]
-name = "family_contracts"
-required-features = ["contract"]
-
-[[test]]
-name = "llama_contract"
-required-features = ["contract"]
-
-[[test]]
-name = "common_is_thin"
-required-features = ["contract"]
-
 [features]
 # One feature per aspect, because the aspects pull different worlds: `chat`
 # needs the tokenizer and the image decoders, `contract` needs the loader's

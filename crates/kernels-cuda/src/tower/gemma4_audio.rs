@@ -1,4 +1,3 @@
-
 use std::ffi::c_void;
 
 use crate::jit::abi::bf16;
@@ -10,7 +9,6 @@ const WHO: &str = "gemma4_audio";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Clip {
-
     pub w: *const c_void,
     pub imin: *const c_void,
     pub imax: *const c_void,
@@ -19,7 +17,6 @@ pub struct Clip {
 }
 
 impl Clip {
-
     fn of(t: &[*const c_void]) -> Self {
         Self {
             w: t[0],
@@ -33,7 +30,6 @@ impl Clip {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ffn {
-
     pub pre_ln: *const c_void,
     pub post_ln: *const c_void,
     pub fc1: Clip,
@@ -41,7 +37,6 @@ pub struct Ffn {
 }
 
 impl Ffn {
-
     fn of(t: &[*const c_void]) -> Self {
         Self {
             pre_ln: t[0],
@@ -54,7 +49,6 @@ impl Ffn {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Layer {
-
     pub ff1: Ffn,
     pub ff2: Ffn,
     pub norm_pre_attn: *const c_void,
@@ -75,7 +69,6 @@ pub struct Layer {
 
 #[derive(Clone, Debug)]
 pub struct Weights {
-
     pub sscp0_conv: *const c_void,
     pub sscp0_norm: *const c_void,
     pub sscp1_conv: *const c_void,
@@ -102,7 +95,6 @@ pub struct Weights {
 }
 
 impl Weights {
-
     #[allow(clippy::too_many_arguments)]
     pub fn from_flat(
         head: [*const c_void; 8],
@@ -206,7 +198,6 @@ impl Weights {
 }
 
 struct Walk {
-
     hd: i32,
     nh: i32,
     head_dim: i32,
@@ -221,7 +212,6 @@ struct Walk {
 }
 
 impl Walk {
-
     fn new(w: &Weights, n_frames: i32, n_mel: i32, out_len: i32) -> Result<Self> {
         let (hd, nh) = (w.hidden, w.heads);
         if hd != 1024 || nh != 8 {
@@ -338,7 +328,6 @@ fn clin(
 }
 
 struct Arena {
-
     h: *mut c_void,
     hn: *mut c_void,
     xc: *mut c_void,
@@ -646,7 +635,6 @@ pub fn run(
 }
 
 struct SscpStage {
-
     src: *const c_void,
     conv_w: *const c_void,
     norm_w: *const c_void,

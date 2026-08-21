@@ -1,4 +1,3 @@
-
 use std::ffi::c_void;
 
 use crate::jit::abi::bf16;
@@ -13,7 +12,6 @@ const PATCH_DIM: usize = 3 * 16 * 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Clip {
-
     pub w: *const c_void,
     pub imin: *const c_void,
     pub imax: *const c_void,
@@ -22,7 +20,6 @@ pub struct Clip {
 }
 
 impl Clip {
-
     fn of(t: &[*const c_void]) -> Self {
         Self {
             w: t[0],
@@ -36,7 +33,6 @@ impl Clip {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Layer {
-
     pub in_ln: *const c_void,
     pub post_attn_ln: *const c_void,
     pub pre_ff_ln: *const c_void,
@@ -54,7 +50,6 @@ pub struct Layer {
 
 #[derive(Clone, Debug)]
 pub struct Weights {
-
     pub patch_w: *const c_void,
     pub pos_table: *const c_void,
     pub embed_proj: *const c_void,
@@ -70,7 +65,6 @@ pub struct Weights {
 }
 
 impl Weights {
-
     pub fn from_flat(
         patch_w: *const c_void,
         pos_table: *const c_void,
@@ -148,17 +142,24 @@ fn rms(
     call("norm::rmsnorm_strided_bf16", stream, |ctx| {
         norm::rmsnorm_strided_bf16_at(
             ctx,
-            In { ptr: x.cast(), rows, width: hidden },
+            In {
+                ptr: x.cast(),
+                rows,
+                width: hidden,
+            },
             Const { v: weight.cast() },
-            Out { ptr: y.cast(), rows, width: hidden },
+            Out {
+                ptr: y.cast(),
+                rows,
+                width: hidden,
+            },
             eps,
         )
     })
 }
 
 fn extent(what: &'static str, value: i32) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| Refused::new(WHO, format!("{what}: {value} is not an extent")))
+    u32::try_from(value).map_err(|_| Refused::new(WHO, format!("{what}: {value} is not an extent")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -249,8 +250,16 @@ fn run(
         call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
             norm::rmsnorm_no_scale_at(
                 ctx,
-                In { ptr: v.cast_const().cast(), rows: head_rows, width: head_dim },
-                Out { ptr: v.cast(), rows: head_rows, width: head_dim },
+                In {
+                    ptr: v.cast_const().cast(),
+                    rows: head_rows,
+                    width: head_dim,
+                },
+                Out {
+                    ptr: v.cast(),
+                    rows: head_rows,
+                    width: head_dim,
+                },
                 0,
                 eps,
             )
@@ -321,9 +330,21 @@ fn run(
         let ctx = unsafe { crate::jit::Ctx::on(stream.as_raw()) };
         crate::mlp::geglu_tanh::<bf16>(
             &ctx,
-            In { ptr: gate.cast_const().cast(), rows: n, width: im },
-            In { ptr: up.cast_const().cast(), rows: n, width: im },
-            Out { ptr: act.cast(), rows: n, width: im },
+            In {
+                ptr: gate.cast_const().cast(),
+                rows: n,
+                width: im,
+            },
+            In {
+                ptr: up.cast_const().cast(),
+                rows: n,
+                width: im,
+            },
+            Out {
+                ptr: act.cast(),
+                rows: n,
+                width: im,
+            },
         )
         .map_err(|why| Refused::new("mlp::geglu_tanh_bf16", format!("{why:?}")))?;
         clin(
@@ -360,8 +381,16 @@ fn run(
     call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
         norm::rmsnorm_no_scale_at(
             ctx,
-            In { ptr: pooled.cast_const().cast(), rows: out_len, width: hd },
-            Out { ptr: pn.cast(), rows: out_len, width: hd },
+            In {
+                ptr: pooled.cast_const().cast(),
+                rows: out_len,
+                width: hd,
+            },
+            Out {
+                ptr: pn.cast(),
+                rows: out_len,
+                width: hd,
+            },
             0,
             eps,
         )
@@ -394,7 +423,6 @@ fn clin(
     out_width: i32,
     stream: Stream<'_>,
 ) -> Result<()> {
-
     extent("clin rows", n)?;
     extent("clin in", k_in)?;
     extent("clin out", out_width)?;
@@ -418,7 +446,6 @@ fn gemm(
     n: i32,
     k: i32,
 ) {
-
     unsafe {
         crate::gemm::dense::act_x_wt_bf16(handle, act, w, y, m, n, k, 0.0);
     }
@@ -443,8 +470,16 @@ fn residual_add(
     call("norm::residual_add_bf16", stream, |ctx| {
         norm::residual_add::<bf16>(
             ctx,
-            InOut { ptr: y.cast(), rows, width },
-            In { ptr: x.cast(), rows, width },
+            InOut {
+                ptr: y.cast(),
+                rows,
+                width,
+            },
+            In {
+                ptr: x.cast(),
+                rows,
+                width,
+            },
         )
     })
 }
@@ -463,8 +498,8 @@ pub fn encode(
     if num_images == 0 || pixel_byte_indptr.len() < num_images + 1 {
         return Err(Refused::new(WHO, "invalid standalone encode inputs"));
     }
-    let pk = usize::try_from(w.pool_kernel)
-        .map_err(|_| Refused::new(WHO, "pool_kernel is negative"))?;
+    let pk =
+        usize::try_from(w.pool_kernel).map_err(|_| Refused::new(WHO, "pool_kernel is negative"))?;
     let pk2 = pk
         .checked_mul(pk)
         .filter(|v| *v != 0)
@@ -545,8 +580,7 @@ pub fn encode(
             grp_d,
             i32::try_from(n_patch)
                 .map_err(|_| Refused::new(WHO, "patch count overflowed an int"))?,
-            i32::try_from(out_len)
-                .map_err(|_| Refused::new(WHO, "pooled row count overflowed"))?,
+            i32::try_from(out_len).map_err(|_| Refused::new(WHO, "pooled row count overflowed"))?,
             proj_d,
             cublas,
             stream,

@@ -202,7 +202,10 @@ const ROOMS: &[&str] = &[
 /// needed no GPU to be wrong.
 const PORTABLE: &[&str] = &[
     "batch", "channel", "envelope", "error", "layout", "loader", "lowering",
-    "model",
+    // `skip` reads one environment variable and prints a line. It is about
+    // the device in the sense that it is what a test says when there is not
+    // one, which is the opposite of needing it.
+    "model", "skip",
 ];
 
 /// Does `line` name the module path `spelling`, as a whole path segment?

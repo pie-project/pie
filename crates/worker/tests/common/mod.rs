@@ -57,17 +57,35 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     // comparing across two processes -- one boot per process is the harness's
     // standing constraint.
     let streaming = if std::env::var("PIE_CUDA_TEST_STREAM_EXPERTS").as_deref() == Ok("1") {
-        let gb = std::env::var("PIE_CUDA_TEST_EXPERT_CACHE_GB").unwrap_or_else(|_| "0".to_string());
-        {
-            let host = std::env::var("PIE_CUDA_TEST_EXPERT_HOST_CACHE_GB")
+        // The two knobs are `ByteSize` and carry a UNIT -- `expert_cache` and
+        // `expert_host_cache`, not `expert_cache_gb` / `expert_host_cache_gb`,
+        // which is what this wrote until a run answered
+        //
+        //     invalid [model.driver.options] for driver type CudaNative:
+        //     unknown field `expert_cache_gb`
+        //
+        // The ENV knobs keep their `_GB` names, because a fraction of a GiB is
+        // how an operator thinks about a slab meant to be too small (0.0004
+        // GiB is under half a mebibyte, which forces an eviction per layer and
+        // is the only way the eviction path runs at all). Rendered in bytes so
+        // no fraction is lost on the way.
+        let gib = |name: &str| -> Option<u64> {
+            std::env::var(name)
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            format!(
-                "stream_routed_experts = true\nexpert_cache_gb = {gb}\n\
-                 expert_host_cache_gb = {host}\n"
-            )
-        }
+                .filter(|v| *v > 0.0)
+                .map(|v| (v * 1024.0 * 1024.0 * 1024.0) as u64)
+        };
+        // Omitted rather than zero when unset: the field is `Option<ByteSize>`
+        // and its doc says an absent key means "derive one at bootstrap",
+        // while a zero would be a slab with no slots in it.
+        let slab = gib("PIE_CUDA_TEST_EXPERT_CACHE_GB")
+            .map(|b| format!("expert_cache = \"{b}B\"\n"))
+            .unwrap_or_default();
+        let host = gib("PIE_CUDA_TEST_EXPERT_HOST_CACHE_GB")
+            .map(|b| format!("expert_host_cache = \"{b}B\"\n"))
+            .unwrap_or_default();
+        format!("stream_routed_experts = true\n{slab}{host}")
     } else {
         String::new()
     };
@@ -107,11 +125,40 @@ pub fn cuda_toml() -> String {
     cuda_toml_for(&snapshot())
 }
 
+/// Route `tracing` to stderr, once per process, at whatever `RUST_LOG` says
+/// (`error` if it says nothing).
+///
+/// The reason this exists rather than being left to whoever wants it: the
+/// interesting CUDA failures are not the ones this harness asserts on. A
+/// device instantiation that will not compile or load is reported by
+/// `kernels-cuda::jit::ctx::said` through `tracing::error!` and NOWHERE else
+/// -- the `Refusal::Device { why }` it returns holds a `&'static str` and so
+/// cannot carry the driver's sentence -- so the engine's message stops at
+/// "the compile, the load or the launch refused; see the log". Without a
+/// subscriber there is no log, and a `CUDA_ERROR_ILLEGAL_ADDRESS` in one
+/// kernel reads as an unrelated module failing to load in the next, because
+/// that error is sticky.
+fn wire_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
+        // `try_init` and not `init`: a second harness in the same process, or
+        // an engine that wired its own, is not this function's failure.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
+
 /// Boot the embedded cuda engine in-proc with an explicit model snapshot (loads
 /// it onto the GPU + bootstraps the runtime). Use a GDN snapshot for RS fold
 /// validation, the dense default otherwise. Caller holds the handle and
 /// `shutdown()`s it.
 pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
+    wire_tracing();
     let cfg =
         worker::Config::parse(&cuda_toml_for(snapshot_path)).expect("parse cuda worker config");
     worker::run(cfg).await.expect("boot embedded cuda engine")
@@ -123,10 +170,24 @@ pub async fn boot_cuda() -> WorkerHandle {
 }
 
 /// Build a curated inferlet fixture → wasm + manifest + program id.
+///
+/// The fixtures are at the REPOSITORY's `tests/inferlets`, which is two levels
+/// above this crate's manifest and not one: this crate lives at
+/// `crates/worker`. It read `../tests/inferlets` until every caller of this
+/// helper was `#[ignore]`d and nothing noticed, and the way it failed is worth
+/// the extra line below. `Command::current_dir` on a directory that is not
+/// there does not report the directory -- it reports `spawn cargo build for
+/// text-completion: No such file or directory`, which reads as a missing
+/// `cargo` and sent the first person to look at `PATH`.
 pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/inferlets")
+        .join("../../tests/inferlets")
         .join(name);
+    assert!(
+        dir.is_dir(),
+        "no inferlet fixture at {} -- this is the path, not `cargo`",
+        dir.display()
+    );
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "--release"])
         .current_dir(&dir)
@@ -192,10 +253,16 @@ pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<Stri
         Some(tx),
     )
     .expect("spawn process");
-    tokio::time::timeout(Duration::from_secs(180), rx)
-        .await
-        .expect("inferlet did not finish within 180s")
-        .expect("process result channel dropped")
+    // A timeout is an `Err` rather than a panic, because "did not answer" is
+    // a RESULT about the inferlet -- four of the curated fixtures give exactly
+    // that on CUDA today (see `cuda_canaries`' census) -- and a caller that
+    // wants it fatal says `.expect()`, which is what every one of them does.
+    // A panic here instead reports the harness's deadline as though it were
+    // the assertion the caller wrote.
+    match tokio::time::timeout(Duration::from_secs(180), rx).await {
+        Err(_) => Err("no answer within 180s".to_string()),
+        Ok(result) => result.expect("process result channel dropped"),
+    }
 }
 
 /// Build + add + install + spawn an arbitrary curated inferlet fixture with a raw

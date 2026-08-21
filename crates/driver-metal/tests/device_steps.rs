@@ -39,7 +39,10 @@ const PER_CHUNK: usize = 64;
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no step was committed");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -53,7 +56,7 @@ fn read_u32s(r: &impl Region, count: usize) -> Vec<u32> {
 #[test]
 fn a_parallel_batch_is_one_submission_and_one_timeline_point() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -119,7 +122,7 @@ fn a_parallel_batch_is_one_submission_and_one_timeline_point() {
 #[test]
 fn the_host_runs_between_segments_and_after_the_last() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -190,7 +193,7 @@ fn the_host_runs_between_segments_and_after_the_last() {
 #[test]
 fn a_failed_encode_commits_nothing_and_a_failed_callback_stops_the_rest() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -258,7 +261,7 @@ fn a_failed_encode_commits_nothing_and_a_failed_callback_stops_the_rest() {
 #[test]
 fn an_empty_batch_costs_nothing() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut stepper = Stepper::new(&context).expect("stepper");
@@ -291,7 +294,7 @@ fn an_empty_batch_costs_nothing() {
 #[test]
 fn a_second_step_is_queued_while_the_first_is_still_outstanding() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");

@@ -6,15 +6,16 @@
 # Rust test compares line by line against what `bind::service::*` produces
 # from the same inputs.
 #
-# cuBLAS picks its kernel from the device, so this transcript belongs to the
-# GPU that made it -- which is why there is now one golden per architecture
-# rather than one golden, and why this builds for the card in front of it.
+# cuBLAS picks its kernel from the device AND from its own version, so this
+# transcript belongs to the GPU *and the toolkit* that made it -- which is why
+# there is a golden per pair rather than one golden, and why this builds for
+# whatever is in front of it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 
-# A GOLDEN PER ARCHITECTURE, and this never overwrites another card's.
+# A GOLDEN PER (CARD, TOOLKIT), and this never overwrites another pair's.
 #
 # `golden.txt` is sm_89's, the first recording, and stays that. Two of the
 # twenty-eight rows -- the two `out_fp32` shapes large enough for cuBLAS to
@@ -23,17 +24,28 @@ CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 # of this file, that the transcript belongs to the GPU that made it, finally
 # being true of two cards instead of one.
 #
-# So: build for the card that is actually here, and write beside the others.
+# THE TOOLKIT HALF WAS LEARNED LATER, and on the same card. CUDA 13.3's cuBLAS
+# picks a different kernel for `m=33 n=129 k=65` than CUDA 13.0's does on the
+# very sm_89 that recorded `golden.txt`, so a name keyed on the card alone
+# would have overwritten a good transcript with another good transcript and
+# called the difference a port bug either way round.
+#
+# So: build for the card that is actually here, name the file for the pair,
+# and write beside the others. `golden.txt` keeps its bare name because it is
+# the reference the test falls back to when it knows neither.
 CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')"
 if [[ -z "$CC" ]]; then
     echo "cannot read the device's compute capability; is there a GPU?" >&2
     exit 1
 fi
-if [[ "$CC" == "89" ]]; then
-    OUT="$HERE/golden.txt"
-else
-    OUT="$HERE/golden.sm$CC.txt"
+# `13.3` -> `133`, the spelling `golden_for_device` matches against
+# `cudaRuntimeGetVersion`.
+CUDA_VER="$("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1\2/p' | head -1)"
+if [[ -z "$CUDA_VER" ]]; then
+    echo "cannot read nvcc's release version from $CUDA_HOME" >&2
+    exit 1
 fi
+OUT="$HERE/golden.sm$CC.cuda$CUDA_VER.txt"
 
 "$CUDA_HOME/bin/nvcc" -std=c++17 -O2 \
     -gencode "arch=compute_$CC,code=sm_$CC" \
@@ -43,7 +55,7 @@ fi
 "$HERE/oracle.bin" > "$OUT"
 rm -f "$HERE/oracle.bin"
 
-echo "wrote $OUT ($(wc -l < "$OUT") rows, sm_$CC)" >&2
+echo "wrote $OUT ($(wc -l < "$OUT") rows, sm_$CC, CUDA $CUDA_VER)" >&2
 echo "  add it to gemm_service_parity.rs's golden_for_device() if it is new" >&2
 
 # The bias fold: the archive's own `gemv_bf16` against the archive's own

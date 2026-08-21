@@ -24,7 +24,10 @@ kernel void fill(device uint* out [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no page was pooled");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -38,7 +41,7 @@ fn read_u32s(t: &driver_metal::device::Transient, count: usize) -> Vec<u32> {
 #[test]
 fn a_pooled_buffer_is_one_the_gpu_can_write() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -79,7 +82,7 @@ fn a_pooled_buffer_is_one_the_gpu_can_write() {
 #[test]
 fn a_recycled_buffer_comes_back_and_still_works() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -137,7 +140,7 @@ fn a_recycled_buffer_comes_back_and_still_works() {
 #[test]
 fn a_pass_that_repeats_allocates_once_and_reuses_after() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pool = Pool::new(1 << 22);
@@ -165,7 +168,7 @@ fn a_pass_that_repeats_allocates_once_and_reuses_after() {
 #[test]
 fn the_budget_evicts_the_largest_cached_class_first() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Room for the three below (1792 bytes) but not for them plus a 2048.
@@ -208,7 +211,7 @@ fn an_eviction_takes_the_buffer_out_of_the_residency_set() {
     use objc2_metal::MTLResidencySet;
 
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // The pool's own counters cannot see this. A residency set holds its own
@@ -246,7 +249,7 @@ fn a_pool_that_goes_away_takes_its_buffers_out_of_the_residency_set() {
     use objc2_metal::MTLResidencySet;
 
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // The set outlives every pool that registers in it, so dropping a pool is
@@ -280,7 +283,7 @@ fn a_pool_that_goes_away_takes_its_buffers_out_of_the_residency_set() {
 #[test]
 fn a_request_past_the_budget_is_refused_rather_than_allocated() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pool = Pool::new(SMALLEST_CLASS * 2);
@@ -306,7 +309,7 @@ fn a_request_past_the_budget_is_refused_rather_than_allocated() {
 #[test]
 fn a_zero_byte_request_is_refused() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pool = Pool::new(1 << 20);
@@ -320,7 +323,7 @@ fn a_zero_byte_request_is_refused() {
 #[test]
 fn draining_keeps_what_is_outstanding() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pool = Pool::new(1 << 20);
@@ -347,7 +350,7 @@ fn draining_keeps_what_is_outstanding() {
 #[test]
 fn a_buffer_outliving_its_pool_does_not_fault() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pool = Pool::new(1 << 20);
@@ -385,7 +388,7 @@ fn a_buffer_outliving_its_pool_does_not_fault() {
 #[test]
 fn a_forked_seat_carries_both_conv_planes_and_the_memory() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     use driver_metal::layout::region::Region as _;
@@ -429,8 +432,18 @@ fn a_forked_seat_carries_both_conv_planes_and_the_memory() {
         let layer = pool.layer(l).expect("a layer");
         want.push((
             mark(&layer.conv, shape.conv_offset(2), conv_slot, 0x10 + l as u8),
-            mark(&layer.new_conv, shape.conv_offset(2), conv_slot, 0x40 + l as u8),
-            mark(&layer.state, shape.state_offset(2), state_slot, 0x70 + l as u8),
+            mark(
+                &layer.new_conv,
+                shape.conv_offset(2),
+                conv_slot,
+                0x40 + l as u8,
+            ),
+            mark(
+                &layer.state,
+                shape.state_offset(2),
+                state_slot,
+                0x70 + l as u8,
+            ),
         ));
     }
 
@@ -471,7 +484,7 @@ fn a_forked_seat_carries_both_conv_planes_and_the_memory() {
 #[test]
 fn a_seat_the_pool_does_not_have_is_refused() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let shape = driver_metal::layout::recurrent::Shape {

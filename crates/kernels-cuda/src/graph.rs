@@ -1,6 +1,5 @@
-
-use kernels::{Bind, Fire};
 use core::ffi::c_void;
+use kernels::{Bind, Fire};
 
 use crate::jit::{Ctx, Launch, Root};
 use kernels::Refusal;
@@ -13,16 +12,30 @@ pub fn supergraph_set_cond(
     ctx: &Ctx<'_>,
     handle: usize,
     preds: *const c_void,
-    slot: i32) -> Result<(), Refusal> {
-    arm(ctx, "::pie::graph::supergraph_set_cond", handle, preds, slot)
+    slot: i32,
+) -> Result<(), Refusal> {
+    arm(
+        ctx,
+        "::pie::graph::supergraph_set_cond",
+        handle,
+        preds,
+        slot,
+    )
 }
 
 pub fn supergraph_set_switch(
     ctx: &Ctx<'_>,
     handle: usize,
     preds: *const c_void,
-    slot: i32) -> Result<(), Refusal> {
-    arm(ctx, "::pie::graph::supergraph_set_switch", handle, preds, slot)
+    slot: i32,
+) -> Result<(), Refusal> {
+    arm(
+        ctx,
+        "::pie::graph::supergraph_set_switch",
+        handle,
+        preds,
+        slot,
+    )
 }
 
 #[cfg(feature = "_cuda")]
@@ -51,11 +64,17 @@ fn arm(
     instantiation: &'static str,
     handle: usize,
     preds: *const c_void,
-    slot: i32) -> Result<(), Refusal> {
-
+    slot: i32,
+) -> Result<(), Refusal> {
     if slot < 0 {
-        return Err(Refusal::Narrow { what: "the predicate slot", at: i64::from(slot) });
+        return Err(Refusal::Narrow {
+            what: "the predicate slot",
+            at: i64::from(slot),
+        });
     }
 
-    ctx.fire(Fire::at("graph/supergraph.cuh", instantiation).apply(ARM), &[handle.arg(), preds.cast::<u8>().arg(), slot.arg()])
+    ctx.fire(
+        Fire::at("graph/supergraph.cuh", instantiation).apply(ARM),
+        &[handle.arg(), preds.cast::<u8>().arg(), slot.arg()],
+    )
 }

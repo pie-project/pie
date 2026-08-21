@@ -419,7 +419,11 @@ fn a_rectangles_dims_come_from_the_rectangle_and_the_fire_and_nowhere_else() {
             let symbol = low.kernels[launch.kernel as usize].as_str();
             let dims = facts_of(&low, launch, geometry());
             assert_eq!(dims.rows, rows, "`{symbol}` at {rows} rows");
-            assert_eq!(dims.q_heads(), geometry().q_heads, "the fire states the rest");
+            assert_eq!(
+                dims.q_heads(),
+                geometry().q_heads,
+                "the fire states the rest"
+            );
             assert!(
                 dims.width > 0,
                 "`{symbol}` states no widthed operand, so no rule can size it"
@@ -738,9 +742,16 @@ mod state {
             );
             checked += 1;
         }
-        assert!(
-            checked >= 24,
-            "only {checked} kv writes; a 24-layer text has one a layer"
+        // One a layer, and the fixture is Qwen3-0.6B, which has 28. Not a
+        // floor: the count is the fixture's layer count, and the fixture
+        // only changes because someone chose a different model. The old
+        // floor said 24 and read 28, and its message explained the 24 as
+        // "a 24-layer text" -- a sentence about a fixture that had already
+        // been replaced. A number that is allowed to drift from its own
+        // explanation stops being read as either.
+        assert_eq!(
+            checked, 28,
+            "{checked} kv writes for a 28-layer text; there should be one a layer"
         );
     }
 
@@ -1228,8 +1239,7 @@ fn the_strided_activation_reaches_every_row_it_is_given() {
         // `Dispatch::params` is empty by construction -- `ParamSlot::packed`
         // is what carries them. The statement's own run is the same words in
         // the same order, and it is what the block points into.
-        let stated =
-            &low.params[launch.params.start as usize..launch.params.end as usize];
+        let stated = &low.params[launch.params.start as usize..launch.params.end as usize];
         assert_eq!(
             stated[0], dims.width,
             "`{symbol}`: the body divides the thread id by params[0] to get \

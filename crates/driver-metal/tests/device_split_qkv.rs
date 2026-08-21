@@ -13,6 +13,8 @@ use driver_metal::layout::region::Region as _;
 use driver_metal::lowering::dispatch::{Dispatch, Touches};
 use driver_metal::program::Compiler;
 
+use driver_metal::skip::skipped;
+
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -31,7 +33,7 @@ fn from_bf16(bits: u16) -> f32 {
 #[test]
 fn the_split_puts_every_channel_where_its_width_says() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");

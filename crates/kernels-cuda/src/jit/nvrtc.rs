@@ -8,17 +8,14 @@ use crate::source::Header;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompileError {
-
     Nvrtc(String),
     Driver(&'static str, i32),
     NoLoweredName {
-
         symbol: &'static str,
         instantiation: String,
     },
     Refused(String),
     Toolchain {
-
         unit: &'static str,
         needs: Toolchain,
         have: Toolchain,
@@ -30,7 +27,10 @@ impl std::fmt::Display for CompileError {
         match self {
             CompileError::Nvrtc(log) => write!(f, "{log}"),
             CompileError::Driver(call, code) => write!(f, "{call} failed with {code}"),
-            CompileError::NoLoweredName { symbol, instantiation } => write!(
+            CompileError::NoLoweredName {
+                symbol,
+                instantiation,
+            } => write!(
                 f,
                 "`{symbol}` names `{instantiation}`, which NVRTC compiled and did not instantiate"
             ),
@@ -55,7 +55,10 @@ pub fn version() -> Result<Toolchain, CompileError> {
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(CompileError::Driver("nvrtcVersion", code as i32));
     }
-    Ok(Toolchain::new(u32::try_from(major).unwrap_or(0), u32::try_from(minor).unwrap_or(0)))
+    Ok(Toolchain::new(
+        u32::try_from(major).unwrap_or(0),
+        u32::try_from(minor).unwrap_or(0),
+    ))
 }
 
 pub fn admits(unit: &'static str, floor: Toolchain) -> Result<(), CompileError> {
@@ -66,12 +69,15 @@ pub fn admits(unit: &'static str, floor: Toolchain) -> Result<(), CompileError> 
     if floor.met_by(have) {
         Ok(())
     } else {
-        Err(CompileError::Toolchain { unit, needs: floor, have })
+        Err(CompileError::Toolchain {
+            unit,
+            needs: floor,
+            have,
+        })
     }
 }
 
 pub struct Job<'a> {
-
     pub name: &'static str,
     pub source: String,
     pub arch: &'a str,
@@ -83,7 +89,6 @@ pub struct Job<'a> {
 }
 
 pub struct Built {
-
     pub cubin: Vec<u8>,
     pub lowered: Vec<String>,
     pub elapsed: Duration,
@@ -124,8 +129,16 @@ pub fn compile_text(job: &Job<'_>) -> Result<Built, CompileError> {
             root.as_ptr(),
             name.as_ptr(),
             count,
-            if text_ptrs.is_empty() { std::ptr::null() } else { text_ptrs.as_ptr() },
-            if name_ptrs.is_empty() { std::ptr::null() } else { name_ptrs.as_ptr() },
+            if text_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                text_ptrs.as_ptr()
+            },
+            if name_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                name_ptrs.as_ptr()
+            },
         )
     };
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
@@ -145,7 +158,6 @@ pub fn compile_text(job: &Job<'_>) -> Result<Built, CompileError> {
         })
         .collect::<Result<_, CompileError>>()?;
     for expr in &wanted {
-
         let code = unsafe { nvrtc::nvrtcAddNameExpression(program.0, expr.as_ptr()) };
         if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
             return Err(CompileError::Nvrtc(format!(
@@ -187,7 +199,9 @@ pub fn compile_text(job: &Job<'_>) -> Result<Built, CompileError> {
             });
         }
 
-        let mangled = unsafe { CStr::from_ptr(mangled) }.to_string_lossy().into_owned();
+        let mangled = unsafe { CStr::from_ptr(mangled) }
+            .to_string_lossy()
+            .into_owned();
         lowered.push(mangled);
     }
 
@@ -210,7 +224,12 @@ pub fn compile_text(job: &Job<'_>) -> Result<Built, CompileError> {
         cubin = device_link(unit, &cubin)?;
     }
 
-    Ok(Built { cubin, lowered, elapsed: started.elapsed(), log })
+    Ok(Built {
+        cubin,
+        lowered,
+        elapsed: started.elapsed(),
+        log,
+    })
 }
 
 fn cudadevrt() -> Result<std::ffi::CString, CompileError> {
@@ -218,7 +237,11 @@ fn cudadevrt() -> Result<std::ffi::CString, CompileError> {
         .into_iter()
         .filter_map(std::env::var_os)
         .map(std::path::PathBuf::from)
-        .chain(["/usr/local/cuda", "/opt/cuda"].into_iter().map(std::path::PathBuf::from));
+        .chain(
+            ["/usr/local/cuda", "/opt/cuda"]
+                .into_iter()
+                .map(std::path::PathBuf::from),
+        );
     for root in roots {
         for lib in ["lib64", "lib"] {
             let path = root.join(lib).join("libcudadevrt.a");
@@ -250,7 +273,12 @@ fn device_link(unit: &str, relocatable: &[u8]) -> Result<Vec<u8>, CompileError> 
     let mut state: dr::CUlinkState = std::ptr::null_mut();
 
     let code = unsafe {
-        dr::cuLinkCreate_v2(0, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut state)
+        dr::cuLinkCreate_v2(
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut state,
+        )
     };
     if code != dr::CUresult::CUDA_SUCCESS {
         return Err(CompileError::Driver("cuLinkCreate", code as i32));
@@ -259,7 +287,6 @@ fn device_link(unit: &str, relocatable: &[u8]) -> Result<Vec<u8>, CompileError> 
     struct Link(dr::CUlinkState);
     impl Drop for Link {
         fn drop(&mut self) {
-
             unsafe { dr::cuLinkDestroy(self.0) };
         }
     }
@@ -305,18 +332,16 @@ fn device_link(unit: &str, relocatable: &[u8]) -> Result<Vec<u8>, CompileError> 
         return Err(CompileError::Driver("cuLinkComplete", code as i32));
     }
     if image.is_null() || size == 0 {
-        return Err(CompileError::Refused(format!("`{unit}` linked to an empty image")));
+        return Err(CompileError::Refused(format!(
+            "`{unit}` linked to an empty image"
+        )));
     }
 
     let linked = unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec();
     Ok(linked)
 }
 
-fn unassembled_tile_ir(
-    unit: &str,
-    cubin: &[u8],
-    wants_function: bool,
-) -> Result<(), CompileError> {
+fn unassembled_tile_ir(unit: &str, cubin: &[u8], wants_function: bool) -> Result<(), CompileError> {
     let has = |needle: &[u8]| cubin.windows(needle.len()).any(|w| w == needle);
     if wants_function && has(b".note.nv.tkinfo") && !has(b".text.") {
         return Err(CompileError::Refused(format!(
@@ -484,7 +509,6 @@ fn options(arch: &str, extra: &[&str]) -> Result<Vec<CString>, CompileError> {
 struct Program(nvrtc::nvrtcProgram);
 
 impl Program {
-
     fn log(&self) -> Option<String> {
         let mut size = 0usize;
 
@@ -508,7 +532,6 @@ impl Program {
 
 impl Drop for Program {
     fn drop(&mut self) {
-
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut self.0) };
     }
 }

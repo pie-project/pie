@@ -1354,12 +1354,23 @@ fn text_of(
         // that said `false` here does not get an error; it gets a text with no
         // bias in it, which is fluent and wrong.
         add_bias: true,
-        // `false`: only `driver-vulkan` carries `norm::rms_rope`, and
-        // `kernels-wgpu` has no body for it. Saying `true` here would plan a
-        // text this backend cannot fire. Unlike `add_bias` above, `false` is
-        // not a wrong answer quietly taken — the two texts compute the same
-        // thing and differ only in how many dispatches they take to say it.
-        fused_qk_rope: false,
+        // `true` since `kernels-wgpu` grew `norm/rms_rope.wgsl`. It read
+        // `false` while only `driver-vulkan` carried the kernel, and that was
+        // the right answer then: saying `true` without a body plans a text
+        // this backend cannot fire.
+        //
+        // Unlike `add_bias` above, neither answer is a wrong answer quietly
+        // taken — the two texts compute the same thing and differ only in how
+        // many dispatches they take to say it. What they differ by is 56 of a
+        // decode token's 480 launches, measured at **0.26 ms, 2.7%** over ten
+        // interleaved runs; `driver-wgpu/tests/serving.rs` carries the table.
+        //
+        // The fixtures that mirror this stamp — `serving.rs`'s
+        // `backend_facts` and `arena.rs`'s `wgpu_facts` — both inherited
+        // `false` from `synthetic()` and had to be moved by hand. Neither
+        // failed when they were wrong; they simply measured and swept the
+        // unfused text while this line said otherwise.
+        fused_qk_rope: true,
     };
     let decode = row
         .trace(FireClass::Decode, Deployed::metal(&binding))
@@ -1522,7 +1533,7 @@ mod tests {
         let Ok((text, _)) = text_of(row) else {
             // Its text is `moe_mxfp4`-dependent; if this build has none, there
             // is nothing to check and nothing wrong.
-            eprintln!("skipped: this build has no gpt-oss-20b text");
+            driver_wgpu::skip::inapplicable("this build has no gpt-oss-20b text");
             return;
         };
         assert!(

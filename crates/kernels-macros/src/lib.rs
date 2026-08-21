@@ -31,9 +31,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{
-    Error, FnArg, ItemFn, Pat, PatType, Type, parse_macro_input, spanned::Spanned,
-};
+use syn::{Error, FnArg, ItemFn, Pat, PatType, Type, parse_macro_input, spanned::Spanned};
 
 /// Declare a routine: its column, its trace name and its namespace.
 ///
@@ -87,7 +85,8 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // reason to move it -- `#![allow(..)]` covers a whole FILE, so a private
     // helper that really had grown twelve arguments was covered too. This
     // covers routines and nothing else.
-    f.attrs.push(syn::parse_quote!(#[allow(clippy::too_many_arguments)]));
+    f.attrs
+        .push(syn::parse_quote!(#[allow(clippy::too_many_arguments)]));
 
     // THE ELEMENT BOUND IS THE PLANE'S, NOT THE SIGNATURE'S.
     //
@@ -103,9 +102,49 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // needing MORE than the plane's minimum still writes its own -- the one
     // that also wants `MaybeConst<T>: Abi` keeps saying so -- because this
     // only fills an EMPTY bound list and never edits a stated one.
+    //
+    // WHERE THE BOUND LANDS IS NOT COSMETIC. A parameter written `<T>` with
+    // its own bounds in a `where` clause has an EMPTY inline bound list, so
+    // the test above used to add the plane's bound inline and leave the
+    // routine saying `T`'s bounds in two places -- which is exactly what
+    // `clippy::multiple_bound_locations` denies, and it broke the CI gate on
+    // three routines (`mtp_update_pending_hidden`, `dsa_index_knorm_rope`,
+    // `reorder_moe_aligned_output`) that had done nothing but prefer a
+    // `where`. So the bound goes wherever the routine already speaks about
+    // the parameter: into the `where` predicate if there is one, inline if
+    // there is not, and nowhere at all if the routine already states a bound
+    // in that place.
+    let stated: Vec<syn::Ident> = f
+        .sig
+        .generics
+        .where_clause
+        .iter()
+        .flat_map(|w| w.predicates.iter())
+        .filter_map(|p| match p {
+            syn::WherePredicate::Type(t) => match &t.bounded_ty {
+                syn::Type::Path(path) => path.path.get_ident().cloned(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
     for p in f.sig.generics.type_params_mut() {
-        if p.bounds.is_empty() {
+        if p.bounds.is_empty() && !stated.contains(&p.ident) {
             p.bounds.push(syn::parse_quote!(crate::RoutineElem));
+        }
+    }
+    for pred in f
+        .sig
+        .generics
+        .where_clause
+        .iter_mut()
+        .flat_map(|w| w.predicates.iter_mut())
+    {
+        if let syn::WherePredicate::Type(t) = pred
+            && let syn::Type::Path(path) = &t.bounded_ty
+            && path.path.get_ident().is_some()
+        {
+            t.bounds.push(syn::parse_quote!(crate::RoutineElem));
         }
     }
 
@@ -254,13 +293,20 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         vec![(row, row_expr)]
     } else {
-        assert!(!by_path, "`dtypes(..)` on an untraced row stamps nothing a trace can reach");
+        assert!(
+            !by_path,
+            "`dtypes(..)` on an untraced row stamps nothing a trace can reach"
+        );
         spec.dtypes
             .iter()
             .map(|point| {
                 let point_name = point.to_string().to_lowercase();
                 let point_row = syn::Ident::new(
-                    &format!("{}_{}_ROUTINE", trace.to_uppercase(), point_name.to_uppercase()),
+                    &format!(
+                        "{}_{}_ROUTINE",
+                        trace.to_uppercase(),
+                        point_name.to_uppercase()
+                    ),
                     base.span(),
                 );
                 let point_body = quote!(#base::<#point>);
@@ -415,7 +461,14 @@ impl Spec {
         let mut dtypes = Vec::new();
         let mut outs = Vec::new();
         if attr.is_empty() {
-            return Ok(Self { generics, facts, namespace, canon, dtypes, outs });
+            return Ok(Self {
+                generics,
+                facts,
+                namespace,
+                canon,
+                dtypes,
+                outs,
+            });
         }
         let parsed = syn::parse2::<Args>(attr)?;
         for a in parsed.0 {
@@ -437,7 +490,14 @@ impl Spec {
                 Arg::Out(spec) => outs.push(spec),
             }
         }
-        Ok(Self { generics, facts, namespace, canon, dtypes, outs })
+        Ok(Self {
+            generics,
+            facts,
+            namespace,
+            canon,
+            dtypes,
+            outs,
+        })
     }
 
     /// `rmsnorm` + `[bf16]` -> `rmsnorm`. THE SUFFIX IS GONE: the dtype is
@@ -477,6 +537,12 @@ struct Args(Vec<Arg>);
 /// instantiate with.
 enum Arg {
     Fact(syn::Ident),
+    // Boxed, and not for speed. `syn::Type` is 248 bytes against `Fact`'s 24,
+    // so an unboxed enum is 248 bytes wide whichever variant it holds, and
+    // clippy's `large_enum_variant` is a hard error under this workspace's
+    // `-D warnings`. The crate was outside the clippy gate entirely until
+    // now, which is why nobody had seen it. One allocation per macro argument
+    // at COMPILE time is not a cost worth arguing about.
     Generic(syn::Type),
     /// `namespace = "attn"` — the prefix a TRACE spells, where it is not the
     /// module the `fn` lives in.
@@ -499,7 +565,10 @@ struct OutSpec {
 enum RuleExpr {
     Like(syn::Ident),
     Split(syn::Ident, syn::Ident),
-    Shaped { rows_of: syn::Ident, width: WidthExpr },
+    Shaped {
+        rows_of: syn::Ident,
+        width: WidthExpr,
+    },
 }
 
 enum WidthExpr {
@@ -528,7 +597,10 @@ impl syn::parse::Parse for OutSpec {
                 // the `x` separator, then the width constructor
                 let sep: syn::Ident = input.parse()?;
                 if sep != "x" {
-                    return Err(syn::Error::new(sep.span(), "expected `x` between rows(..) and the width"));
+                    return Err(syn::Error::new(
+                        sep.span(),
+                        "expected `x` between rows(..) and the width",
+                    ));
                 }
                 let width = if input.peek(syn::Token![const]) {
                     let _: syn::Token![const] = input.parse()?;
@@ -546,7 +618,9 @@ impl syn::parse::Parse for OutSpec {
                         other => {
                             return Err(syn::Error::new(
                                 wname.span(),
-                                format!("unknown width constructor `{other}`; the vocabulary is half/width/weight/const"),
+                                format!(
+                                    "unknown width constructor `{other}`; the vocabulary is half/width/weight/const"
+                                ),
                             ));
                         }
                     }
@@ -592,10 +666,9 @@ impl syn::parse::Parse for Item {
             }
             let inner;
             syn::parenthesized!(inner in input);
-            let list =
-                syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(
-                    &inner,
-                )?;
+            let list = syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(
+                &inner,
+            )?;
             return Ok(Self::Dtypes(list.into_iter().collect()));
         }
         if input.peek(syn::Ident) && input.peek2(syn::Token![=]) {
@@ -623,8 +696,7 @@ impl syn::parse::Parse for Item {
 
 impl syn::parse::Parse for Args {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let raw =
-            syn::punctuated::Punctuated::<Item, syn::Token![,]>::parse_terminated(input)?;
+        let raw = syn::punctuated::Punctuated::<Item, syn::Token![,]>::parse_terminated(input)?;
         let mut named = Vec::new();
         let mut items = Vec::new();
         for item in raw {
@@ -641,8 +713,13 @@ impl syn::parse::Parse for Args {
         // type. Rust's own convention does the work, and a mistake either way
         // is a name that does not resolve rather than a silent reading.
         const FACTS: [&str; 7] = [
-            "whole", "depth_prefix_plan", "uncolumned", "untraced", "no_join",
-            "internal", "driver",
+            "whole",
+            "depth_prefix_plan",
+            "uncolumned",
+            "untraced",
+            "no_join",
+            "internal",
+            "driver",
         ];
         Ok(Self(
             named
@@ -823,14 +900,10 @@ fn is_nullable(ty: &Type) -> bool {
         // either, being the CONSTRUCTOR the carrier is spelled with rather
         // than the carrier's own shape. Both are walked through in case the
         // `Option` sits further in.
-        "In" | "Out" | "InOut" | "Const" | "Tensor" => {
-            inner(seg).is_some_and(|t| is_nullable(&t))
-        }
+        "In" | "Out" | "InOut" | "Const" | "Tensor" => inner(seg).is_some_and(|t| is_nullable(&t)),
         _ => false,
     }
 }
-
-
 
 /// `Or<*const T>` → `*const T`.
 fn inner(seg: &syn::PathSegment) -> Option<Type> {
@@ -843,9 +916,6 @@ fn inner(seg: &syn::PathSegment) -> Option<Type> {
     })
 }
 
-
-
-
 /// The parameter's own identifier, which is the fact's name.
 fn param_name(pt: &PatType) -> Result<String, Error> {
     match &*pt.pat {
@@ -856,12 +926,6 @@ fn param_name(pt: &PatType) -> Result<String, Error> {
         )),
     }
 }
-
-
-
-
-
-
 
 /// `ty`, with the `fn`'s type parameters replaced by their instantiations.
 ///
@@ -885,8 +949,7 @@ fn substituted(ty: &Type, generics: &syn::Generics, subs: &[syn::Type]) -> Type 
                 if p.qself.is_none()
                     && p.path.segments.len() == 1
                     && p.path.segments[0].arguments.is_none()
-                    && let Some(i) =
-                        names.iter().position(|n| p.path.segments[0].ident == n)
+                    && let Some(i) = names.iter().position(|n| p.path.segments[0].ident == n)
                     && let Some(sub) = subs.get(i)
                 {
                     return sub.clone();
@@ -954,24 +1017,26 @@ fn slot_names(f: &ItemFn) -> SlotNames {
     };
     for arg in f.sig.inputs.iter().skip(1) {
         let FnArg::Typed(t) = arg else { continue };
-        let Pat::Ident(pi) = t.pat.as_ref() else { continue };
+        let Pat::Ident(pi) = t.pat.as_ref() else {
+            continue;
+        };
         let name = pi.ident.to_string();
         // The type's head, through one `Option` layer.
         fn head(ty: &Type) -> Option<(&syn::PathSegment, Option<&Type>)> {
             let Type::Path(p) = ty else { return None };
             let seg = p.path.segments.last()?;
             let inner = match &seg.arguments {
-                syn::PathArguments::AngleBracketed(a) => {
-                    a.args.iter().find_map(|g| match g {
-                        syn::GenericArgument::Type(t) => Some(t),
-                        _ => None,
-                    })
-                }
+                syn::PathArguments::AngleBracketed(a) => a.args.iter().find_map(|g| match g {
+                    syn::GenericArgument::Type(t) => Some(t),
+                    _ => None,
+                }),
                 _ => None,
             };
             Some((seg, inner))
         }
-        let Some((seg, inner)) = head(&t.ty) else { continue };
+        let Some((seg, inner)) = head(&t.ty) else {
+            continue;
+        };
         let (seg, inner) = if seg.ident == "Option" {
             match inner.and_then(head) {
                 Some(x) => x,

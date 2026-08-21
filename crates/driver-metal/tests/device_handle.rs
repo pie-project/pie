@@ -33,7 +33,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no handle was minted");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let heap = Heap::new(&context, HEAP_BYTES).expect("heap");
@@ -55,7 +58,7 @@ fn bytes_of(handle: &Handle) -> Vec<u8> {
 #[test]
 fn a_slice_writes_the_bytes_its_offset_names_in_the_parent() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -88,7 +91,7 @@ fn a_slice_writes_the_bytes_its_offset_names_in_the_parent() {
 #[test]
 fn a_slices_gpu_address_lands_the_dispatch_inside_its_parent() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -150,7 +153,7 @@ fn a_slices_gpu_address_lands_the_dispatch_inside_its_parent() {
 #[test]
 fn a_span_the_parent_never_had_is_refused_not_minted() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -179,7 +182,7 @@ fn a_span_the_parent_never_had_is_refused_not_minted() {
 #[test]
 fn a_slice_of_a_slice_composes_like_one_slice_of_the_base() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -203,7 +206,7 @@ fn a_slice_of_a_slice_composes_like_one_slice_of_the_base() {
 #[test]
 fn an_empty_slice_at_the_boundary_is_a_view_of_nothing_not_an_error() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -221,7 +224,7 @@ fn an_empty_slice_at_the_boundary_is_a_view_of_nothing_not_an_error() {
 #[test]
 fn a_view_keeps_its_allocation_alive_after_every_owner_is_gone() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pool = Pool::new(1 << 20);
@@ -242,7 +245,7 @@ fn a_buffer_the_host_cannot_address_is_refused() {
     use objc2_metal::{MTLDevice, MTLResourceOptions};
 
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let private = f

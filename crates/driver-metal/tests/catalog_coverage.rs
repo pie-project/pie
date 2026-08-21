@@ -208,7 +208,8 @@ fn an_ordinary_row_projects_a_geometry_and_an_extraordinary_one_may_refuse() {
         served + refused
     );
     assert_eq!(
-        served, 42,
+        served,
+        42,
         "{served} of the {} deployed rows project a Metal geometry and this \
          gate expects 42. A FALL here with the total unchanged is a row that \
          stopped projecting -- a model this backend used to serve and now \

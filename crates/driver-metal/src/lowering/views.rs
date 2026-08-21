@@ -50,7 +50,8 @@ pub struct Views<'a> {
     /// Boxed so every address is stable however the vectors grow.
     kv: Vec<Box<PagedKvView>>,
     rs: Vec<Box<RecurrentView>>,
-    mask: Vec<Box<MaskView>>,    split: Vec<Box<SplitView>>,
+    mask: Vec<Box<MaskView>>,
+    split: Vec<Box<SplitView>>,
 }
 
 impl<'a> Views<'a> {
@@ -117,7 +118,10 @@ impl<'a> Views<'a> {
             "attn.split_policy" => {
                 // This plane fires unsplit; one split is the whole answer
                 // and the partials handle is then never read.
-                let view = Box::new(SplitView { partials: Tensor::new(0), splits: 1 });
+                let view = Box::new(SplitView {
+                    partials: Tensor::new(0),
+                    splits: 1,
+                });
                 let at = std::ptr::from_ref::<SplitView>(view.as_ref()) as usize;
                 self.split.push(view);
                 Ok(ArgValue::Raised(at))

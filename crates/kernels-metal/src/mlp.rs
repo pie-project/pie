@@ -1,25 +1,27 @@
 use kernels::Grid;
-use kernels_macros::routine;
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise};
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("mlp/gated.metal", "geglu_tanh_bfloat16").apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
+        Fire::at("mlp/gated.metal", "geglu_tanh_bfloat16")
+            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
         &[gate.arg(), up.arg(), out.arg()],
     )
 }
 
-#[routine]
+#[routine(out(out = rows(gate) x const(stated_width)))]
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -30,11 +32,13 @@ pub fn geglu_tanh_strided(
     gate_pitch: Const<u32>,
     up_pitch: Const<u32>,
     out_pitch: Const<u32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("mlp/gated.metal", "geglu_tanh_strided_bfloat16").apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
+        Fire::at("mlp/gated.metal", "geglu_tanh_strided_bfloat16")
+            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
         &[
             gate.arg(),
             up.arg(),
@@ -48,7 +52,7 @@ pub fn geglu_tanh_strided(
     )
 }
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -57,26 +61,30 @@ pub fn gptoss_swiglu(
     _stated_elements: Const<u32>,
     limit: Const<f32>,
     alpha: Const<f32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("mlp/gated.metal", "gptoss_swiglu_bfloat16").apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
+        Fire::at("mlp/gated.metal", "gptoss_swiglu_bfloat16")
+            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
         &[gate.arg(), up.arg(), out.arg(), limit.arg(), alpha.arg()],
     )
 }
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn silu_mul(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("mlp/gated.metal", "silu_mul_bfloat16").apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
+        Fire::at("mlp/gated.metal", "silu_mul_bfloat16")
+            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
         &[gate.arg(), up.arg(), out.arg()],
     )
 }

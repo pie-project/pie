@@ -4,7 +4,7 @@ use crate::routine::{
 use kernels::routine::Refusal;
 use kernels_macros::routine;
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -24,7 +24,7 @@ pub fn geglu_tanh(
     )
 }
 
-#[routine]
+#[routine(out(out = rows(gate) x const(stated_width)))]
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -58,7 +58,7 @@ pub fn geglu_tanh_strided(
     )
 }
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -81,7 +81,7 @@ pub fn gptoss_swiglu(
     )
 }
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn silu_mul(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -121,4 +121,3 @@ pub fn silu_mul_strided(
         &[gate.arg(), up.arg(), out.arg(), row_pitch.arg()],
     )
 }
-

@@ -322,14 +322,27 @@ mod tests {
     }
 
     fn unique_key(what: &str) -> String {
-        format!("test-{what}-{}-{:?}", std::process::id(), std::thread::current().id())
+        format!(
+            "test-{what}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )
     }
 
     #[test]
     fn a_group_of_one_and_an_unkeyed_group_have_no_all_gather() {
-        assert!(tp_host_allgather(1, "k", 0).is_none(), "one rank has nothing to gather");
-        assert!(tp_host_allgather(4, "", 0).is_none(), "no key is nothing to gather ON");
-        assert!(tp_host_allgather(2, "k", 7).is_none(), "a rank outside its own group");
+        assert!(
+            tp_host_allgather(1, "k", 0).is_none(),
+            "one rank has nothing to gather"
+        );
+        assert!(
+            tp_host_allgather(4, "", 0).is_none(),
+            "no key is nothing to gather ON"
+        );
+        assert!(
+            tp_host_allgather(2, "k", 7).is_none(),
+            "a rank outside its own group"
+        );
     }
 
     /// The `HostAllgather` contract: `recv` is `send.len() * world` bytes and
@@ -345,17 +358,30 @@ mod tests {
                     let gather =
                         tp_host_allgather(world, &key, rank).expect("a group of four gathers");
                     let mut recv = vec![0u8; 8 * world.unsigned_abs() as usize];
-                    gather(&(0xAA00_u64 + rank.unsigned_abs() as u64).to_ne_bytes(), &mut recv);
+                    gather(
+                        &(0xAA00_u64 + rank.unsigned_abs() as u64).to_ne_bytes(),
+                        &mut recv,
+                    );
                     recv
                 })
             })
             .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("rank")).collect();
-        assert!(results.windows(2).all(|w| w[0] == w[1]), "every rank sees the same answer");
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("rank"))
+            .collect();
+        assert!(
+            results.windows(2).all(|w| w[0] == w[1]),
+            "every rank sees the same answer"
+        );
         for r in 0..world.unsigned_abs() as usize {
             let mut word = [0u8; 8];
             word.copy_from_slice(&results[0][r * 8..r * 8 + 8]);
-            assert_eq!(u64::from_ne_bytes(word), 0xAA00 + r as u64, "rank-major, rank {r}");
+            assert_eq!(
+                u64::from_ne_bytes(word),
+                0xAA00 + r as u64,
+                "rank-major, rank {r}"
+            );
         }
     }
 

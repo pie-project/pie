@@ -6,8 +6,8 @@
 //! traffic forward, latency-sensitive commands reverse. Defined ONCE here so
 //! the wire layout and channel ordering cannot drift between the two ends.
 
-use ids::{ReqId, WorkerId};
 use controller_api::WorkerStatus;
+use ids::{ReqId, WorkerId};
 
 mod data;
 mod link;

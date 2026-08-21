@@ -2,8 +2,8 @@ use core::ffi::c_void;
 
 use cudarc::driver::sys as dr;
 
-use crate::jit::Launch;
 use crate::jit::Error;
+use crate::jit::Launch;
 
 const DEFAULT_DYNAMIC_SMEM: u32 = 48 * 1024;
 
@@ -34,7 +34,11 @@ pub unsafe fn issue(
         blockDimZ: launch.block[2],
         sharedMemBytes: launch.smem,
         hStream: stream.cast(),
-        attrs: if n == 0 { std::ptr::null_mut() } else { attrs.as_mut_ptr() },
+        attrs: if n == 0 {
+            std::ptr::null_mut()
+        } else {
+            attrs.as_mut_ptr()
+        },
         numAttrs: n as core::ffi::c_uint,
     };
 
@@ -49,7 +53,11 @@ pub unsafe fn issue(
     if code == dr::CUresult::CUDA_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Driver { what: "cuLaunchKernelEx", code: code as i32, why: format!("{code:?}") })
+        Err(Error::Driver {
+            what: "cuLaunchKernelEx",
+            code: code as i32,
+            why: format!("{code:?}"),
+        })
     }
 }
 
@@ -65,7 +73,9 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Er
         });
     }
     let key = (device, function.addr());
-    let mut granted = GRANTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut granted = GRANTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((_, high_water)) = granted.iter().find(|(k, _)| *k == key)
         && bytes <= *high_water
     {

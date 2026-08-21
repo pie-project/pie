@@ -36,7 +36,11 @@ enum Value {
     F32(f32),
     /// An address the statement placed, WITH the shape it placed it at --
     /// what a mark unpacks a rectangle from.
-    Region { ptr: usize, rows: i32, width: i32 },
+    Region {
+        ptr: usize,
+        rows: i32,
+        width: i32,
+    },
 }
 
 // A PLANE WITH NO ABSENT VALUE, which is a legal answer and the one this
@@ -65,7 +69,9 @@ impl Answers<Test> for Ctx {
     fn resolve(&self, _ty: Ty, source: Source) -> Result<Value, Refusal> {
         match source {
             Source::Named(k) if k == <keys::Rows as keys::Fact>::KEY => Ok(Value::I32(4)),
-            _ => Err(Refusal::Unstated { what: "a fact this backend does not answer" }),
+            _ => Err(Refusal::Unstated {
+                what: "a fact this backend does not answer",
+            }),
         }
     }
 }
@@ -77,7 +83,9 @@ impl Backend for Test {
     fn region(value: &Value) -> Result<Extent, Refusal> {
         match *value {
             Value::Region { rows, width, .. } => Ok(Extent { rows, width }),
-            _ => Err(Refusal::Absent { what: "a region's shape" }),
+            _ => Err(Refusal::Absent {
+                what: "a region's shape",
+            }),
         }
     }
 }
@@ -114,7 +122,21 @@ macro_rules! routine {
 struct Tensor<E>(core::marker::PhantomData<E>);
 
 /// The activation element, as this backend spells it.
-struct Bf16;
+///
+/// It carries the two bytes a bf16 actually is, and that is not decoration:
+/// a unit struct is zero-sized, and `<*const Zst>::add` is a no-op that
+/// `clippy::zst_offset` denies outright -- so a fixture standing in for a
+/// real element has to have the size of one, or `advance_read` below is
+/// deriving its answer from arithmetic that cannot move.
+struct Bf16(
+    #[expect(
+        dead_code,
+        reason = "a pointee is never constructed; \
+    the field is here for its SIZE, which is what makes pointer arithmetic \
+    on it mean anything"
+    )]
+    u16,
+);
 
 impl kernels::Elem for Tensor<Bf16> {
     type Read = *const Bf16;
@@ -148,7 +170,10 @@ impl Arg<Test> for *const Bf16 {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::Region { ptr: p, .. } => Ok(core::ptr::without_provenance(*p)),
-            _ => Err(Refusal::Kind { at, want: <Self as Arg<Test>>::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -158,10 +183,11 @@ impl Arg<Test> for *mut Bf16 {
 
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
-            Value::Region { ptr: p, .. } => {
-                Ok(core::ptr::without_provenance_mut(*p))
-            }
-            _ => Err(Refusal::Kind { at, want: <Self as Arg<Test>>::TY }),
+            Value::Region { ptr: p, .. } => Ok(core::ptr::without_provenance_mut(*p)),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -172,7 +198,10 @@ impl Arg<Test> for i32 {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::I32(v) => Ok(*v),
-            _ => Err(Refusal::Kind { at, want: <Self as Arg<Test>>::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -183,7 +212,10 @@ impl Arg<Test> for f32 {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::F32(v) => Ok(*v),
-            _ => Err(Refusal::Kind { at, want: <Self as Arg<Test>>::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -215,7 +247,10 @@ fn rope_apply(
     match *head_dim {
         64 => ctx.launch("rope::apply_bf16<64>"),
         128 => ctx.launch("rope::apply_bf16<128>"),
-        d => Err(Refusal::Narrow { what: "head_dim", at: d.into() }),
+        d => Err(Refusal::Narrow {
+            what: "head_dim",
+            at: d.into(),
+        }),
     }
 }
 
@@ -239,11 +274,7 @@ fn tanh_bf16(ctx: &Ctx, x: InOut<Tensor<Bf16>>, n: Const<i32>) -> Result<(), Ref
 /// statement's SECOND operand and nobody wrote the index down — `y` wears both
 /// an operand slot and a result slot, so the counter has already moved.
 #[kernels_macros::routine]
-fn residual_add(
-    ctx: &Ctx,
-    y: InOut<Tensor<Bf16>>,
-    x: In<Tensor<Bf16>>,
-) -> Result<(), Refusal> {
+fn residual_add(ctx: &Ctx, y: InOut<Tensor<Bf16>>, x: In<Tensor<Bf16>>) -> Result<(), Refusal> {
     if y.ptr.is_null() || x.ptr.is_null() {
         return Err(Refusal::Null { what: "a region" });
     }
@@ -251,7 +282,10 @@ fn residual_add(
         return Err(Refusal::Empty { what: "rows" });
     }
     if y.width != x.width {
-        return Err(Refusal::Narrow { what: "width", at: x.width.into() });
+        return Err(Refusal::Narrow {
+            what: "width",
+            at: x.width.into(),
+        });
     }
     ctx.launch("norm::residual_add_bf16")
 }
@@ -281,10 +315,23 @@ fn rmsnorm(
 /// `const`-promoted from generic associated consts, so nothing is built at run
 /// time and nothing can be built inconsistently.
 static TABLE: &[Routine<Test>] = &[
-    routine!(rope_apply, derived = <rope_apply as ::kernels::Derivation>::DERIVED),
-    routine!(tanh_bf16, whole, derived = <tanh_bf16 as ::kernels::Derivation>::DERIVED),
-    routine!(residual_add, derived = <residual_add as ::kernels::Derivation>::DERIVED),
-    routine!(rmsnorm, derived = <rmsnorm as ::kernels::Derivation>::DERIVED),
+    routine!(
+        rope_apply,
+        derived = <rope_apply as ::kernels::Derivation>::DERIVED
+    ),
+    routine!(
+        tanh_bf16,
+        whole,
+        derived = <tanh_bf16 as ::kernels::Derivation>::DERIVED
+    ),
+    routine!(
+        residual_add,
+        derived = <residual_add as ::kernels::Derivation>::DERIVED
+    ),
+    routine!(
+        rmsnorm,
+        derived = <rmsnorm as ::kernels::Derivation>::DERIVED
+    ),
 ];
 
 fn find(name: &str) -> &'static Routine<Test> {
@@ -359,7 +406,10 @@ fn a_const_over_a_tensor_claims_the_weight_run() {
     assert!(
         matches!(
             row.sources[1],
-            Some(Source::Or(Source::Named("weight"), Source::Slot(Kind::Weight, 0)))
+            Some(Source::Or(
+                Source::Named("weight"),
+                Source::Slot(Kind::Weight, 0)
+            ))
         ),
         "the named bank first and the positional one after: {:?}",
         row.sources[1]
@@ -404,7 +454,11 @@ fn the_facts_a_body_asks_for_are_enumerated() {
 fn the_erased_body_is_the_typed_one() {
     let ctx = Ctx::default();
     let args = [
-        Value::Region { ptr: 0x1000, rows: 4, width: 64 },
+        Value::Region {
+            ptr: 0x1000,
+            rows: 4,
+            width: 64,
+        },
         Value::I32(64),
         Value::I32(64),
         Value::F32(1e4),
@@ -421,7 +475,11 @@ fn the_erased_body_is_the_typed_one() {
 fn a_refusal_from_the_body_survives_the_erasure() {
     let ctx = Ctx::default();
     let null = [
-        Value::Region { ptr: 0, rows: 4, width: 64 },
+        Value::Region {
+            ptr: 0,
+            rows: 4,
+            width: 64,
+        },
         Value::I32(64),
         Value::I32(64),
         Value::F32(1e4),
@@ -444,14 +502,18 @@ fn an_unanswered_fact_refuses_the_fire() {
     struct Deaf;
     impl Answers<Test> for Deaf {
         fn resolve(&self, _ty: Ty, _source: Source) -> Result<Value, Refusal> {
-            Err(Refusal::Unstated { what: "nothing at all" })
+            Err(Refusal::Unstated {
+                what: "nothing at all",
+            })
         }
     }
     // The `Ctx` a body launches through is this backend's own, so the deaf
     // resolver is exercised directly: what matters is the shape of the answer.
     assert_eq!(
         Asks::<Test>::ask::<i32, keys::Rows>(&Deaf),
-        Err(Refusal::Unstated { what: "nothing at all" })
+        Err(Refusal::Unstated {
+            what: "nothing at all"
+        })
     );
 }
 
@@ -463,14 +525,21 @@ fn a_list_that_does_not_fit_the_signature_is_refused() {
         Err(Refusal::Arity { want: 4, got: 1 })
     );
     let swapped = [
-        Value::Region { ptr: 0x1000, rows: 4, width: 64 },
+        Value::Region {
+            ptr: 0x1000,
+            rows: 4,
+            width: 64,
+        },
         Value::F32(4.0),
         Value::I32(64),
         Value::F32(1e4),
     ];
     assert_eq!(
         (find("rope_apply").body)(&ctx, &swapped),
-        Err(Refusal::Kind { at: 1, want: Ty::I32 }),
+        Err(Refusal::Kind {
+            at: 1,
+            want: Ty::I32
+        }),
         "same width, different kind -- the position is named"
     );
 }
@@ -480,19 +549,38 @@ fn a_list_that_does_not_fit_the_signature_is_refused() {
 fn a_region_is_one_argument() {
     let ctx = Ctx::default();
     let args = [
-        Value::Region { ptr: 0x1000, rows: 4, width: 64 },
-        Value::Region { ptr: 0x2000, rows: 4, width: 64 },
+        Value::Region {
+            ptr: 0x1000,
+            rows: 4,
+            width: 64,
+        },
+        Value::Region {
+            ptr: 0x2000,
+            rows: 4,
+            width: 64,
+        },
     ];
     (find("residual_add").body)(&ctx, &args).expect("matched widths launch");
     assert_eq!(*ctx.fired.borrow(), ["norm::residual_add_bf16"]);
 
     let mismatched = [
-        Value::Region { ptr: 0x1000, rows: 4, width: 64 },
-        Value::Region { ptr: 0x2000, rows: 4, width: 32 },
+        Value::Region {
+            ptr: 0x1000,
+            rows: 4,
+            width: 64,
+        },
+        Value::Region {
+            ptr: 0x2000,
+            rows: 4,
+            width: 32,
+        },
     ];
     assert_eq!(
         (find("residual_add").body)(&ctx, &mismatched),
-        Err(Refusal::Narrow { what: "width", at: 32 }),
+        Err(Refusal::Narrow {
+            what: "width",
+            at: 32
+        }),
         "the rectangle rides with the address, so the body can compare it"
     );
 }

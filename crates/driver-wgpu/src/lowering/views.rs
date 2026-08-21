@@ -51,7 +51,8 @@ pub struct Views {
     /// Boxed so every address is stable however the vectors grow.
     kv: Vec<Box<PagedKvView>>,
     rs: Vec<Box<RecurrentView>>,
-    mask: Vec<Box<MaskView>>,    split: Vec<Box<SplitView>>,
+    mask: Vec<Box<MaskView>>,
+    split: Vec<Box<SplitView>>,
 }
 
 impl Views {
@@ -63,11 +64,7 @@ impl Views {
     /// [`Refusal::Unstated`] when the source is not an input slot, when the
     /// statement placed an ordinary operand where the signature marks a
     /// view, or when the key is not one this driver builds.
-    pub fn raise(
-        &mut self,
-        source: Source,
-        o: &mut Handles<'_>,
-    ) -> Result<ArgValue, Refusal> {
+    pub fn raise(&mut self, source: Source, o: &mut Handles<'_>) -> Result<ArgValue, Refusal> {
         let Source::Slot(Kind::In, n) = source else {
             return Err(Refusal::Unstated {
                 what: "a raised operand whose source is not one of the statement's inputs",
@@ -126,7 +123,11 @@ fn kv(o: &mut Handles<'_>) -> Result<PagedKvView, Refusal> {
     let page_size = o.fire_number(FireNumber::KvPageSize);
     // The relocated `contiguous_pool` guard — see the module doc.
     let stride = |o: &Handles<'_>, which: FireNumber| {
-        if page_size == 0 { u64::from(o.fire_number(which)) } else { 0 }
+        if page_size == 0 {
+            u64::from(o.fire_number(which))
+        } else {
+            0
+        }
     };
     let seq_stride = stride(o, FireNumber::KvSeqStride);
     let head_stride = stride(o, FireNumber::KvHeadStride);
@@ -174,7 +175,13 @@ fn split(o: &mut Handles<'_>) -> SplitView {
     use kernels::shader::ShaderValue;
     let scratch = o.table(FireTable::AttnScratch);
     match scratch.as_buffer() {
-        Some(h) => SplitView { partials: Tensor::new(h), splits: 2 },
-        None => SplitView { partials: Tensor::new(0), splits: 1 },
+        Some(h) => SplitView {
+            partials: Tensor::new(h),
+            splits: 2,
+        },
+        None => SplitView {
+            partials: Tensor::new(0),
+            splits: 1,
+        },
     }
 }

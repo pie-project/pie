@@ -8,7 +8,6 @@ pub const MAX_TOTAL_NUM_WORKS: i32 = 16384;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-
     pub qo_indptr: &'a [i32],
     pub kv_indptr: &'a [i32],
     pub kv_len_arr: &'a [i32],
@@ -32,7 +31,6 @@ struct ClusterWork {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
-
     pub cluster_size: i32,
     pub num_clusters: u32,
     pub cluster_tile_q: i32,
@@ -77,7 +75,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         return Err(Error::EmptyBatch);
     }
     if device.num_sm == 0 {
-        return Err(Error::MergeCtasExceedSm { counter: 0, num_sm: 0 });
+        return Err(Error::MergeCtasExceedSm {
+            counter: 0,
+            num_sm: 0,
+        });
     }
     for (array, len, needed) in [
         ("qo_indptr", req.qo_indptr.len(), batch_size + 1),
@@ -85,7 +86,11 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         ("kv_len_arr", req.kv_len_arr.len(), batch_size),
     ] {
         if len < needed {
-            return Err(Error::IndptrTooShort { array, needed, got: len });
+            return Err(Error::IndptrTooShort {
+                array,
+                needed,
+                got: len,
+            });
         }
     }
 
@@ -110,7 +115,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let cluster_size: i32 = if avg_packed_qo_len > 64 { 2 } else { 1 };
     let num_clusters = device.num_sm / cluster_size as u32;
     if num_clusters == 0 {
-        return Err(Error::MergeCtasExceedSm { counter: 0, num_sm: i64::from(device.num_sm) });
+        return Err(Error::MergeCtasExceedSm {
+            counter: 0,
+            num_sm: i64::from(device.num_sm),
+        });
     }
     const CTA_TILE_Q: i32 = 64;
     let cluster_tile_q = cluster_size * CTA_TILE_Q;
@@ -190,7 +198,9 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
                         .wrapping_add((qo_tile_idx * cluster_tile_q) as u32);
                     merge_packed_offset_start[slot] = base.wrapping_add(offset_start as u32) as i32;
                     merge_packed_offset_end[slot] = base.wrapping_add(
-                        offset_start.wrapping_add(row_chunk_size).min(current_q_tile_end) as u32,
+                        offset_start
+                            .wrapping_add(row_chunk_size)
+                            .min(current_q_tile_end) as u32,
                     ) as i32;
                     merge_partial_packed_offset_start[slot] =
                         partial_o_nnz.wrapping_add(offset_start);
@@ -206,7 +216,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
             while remaining_len > 0 || zero_kv_len {
                 let (cluster_idx, accum_cost) = heap.pop();
                 let actual_len = remaining_len.min(kv_len_limit);
-                heap.insert((cluster_idx, accum_cost + cost_function(cluster_tile_q, actual_len)));
+                heap.insert((
+                    cluster_idx,
+                    accum_cost + cost_function(cluster_tile_q, actual_len),
+                ));
                 let cluster = &mut clusters[cluster_idx as usize];
                 cluster.q_len.push(qo_len);
                 cluster.kv_len.push(kv_len);
@@ -241,7 +254,9 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     for i in 0..num_clusters as usize {
         work_indptr[i + 1] = work_indptr[i].wrapping_add(clusters[i].q_indptr.len() as i32);
     }
-    let total_num_works = *work_indptr.last().expect("work_indptr has num_clusters + 1 entries");
+    let total_num_works = *work_indptr
+        .last()
+        .expect("work_indptr has num_clusters + 1 entries");
     if total_num_works > MAX_TOTAL_NUM_WORKS {
         return Err(Error::TooManyWorks {
             total: i64::from(total_num_works),
@@ -315,7 +330,11 @@ pub fn plan(
     let writes: [(i64, &Vec<i32>, &str); 14] = [
         (info.q_indptr_offset, &sched.q_indptr, "mla_q_indptr"),
         (info.kv_indptr_offset, &sched.kv_indptr, "mla_kv_indptr"),
-        (info.partial_indptr_offset, &sched.partial_indptr, "mla_partial_indptr"),
+        (
+            info.partial_indptr_offset,
+            &sched.partial_indptr,
+            "mla_partial_indptr",
+        ),
         (
             info.merge_packed_offset_start_offset,
             &sched.merge_packed_offset_start,
@@ -336,13 +355,21 @@ pub fn plan(
             &sched.merge_partial_packed_offset_end,
             "mla_merge_partial_packed_offset_end",
         ),
-        (info.merge_partial_stride_offset, &sched.merge_partial_stride, "mla_merge_partial_stride"),
+        (
+            info.merge_partial_stride_offset,
+            &sched.merge_partial_stride,
+            "mla_merge_partial_stride",
+        ),
         (info.q_len_offset, &sched.q_len, "mla_q_len"),
         (info.kv_len_offset, &sched.kv_len, "mla_kv_len"),
         (info.q_start_offset, &sched.q_start, "mla_q_start"),
         (info.kv_start_offset, &sched.kv_start, "mla_kv_start"),
         (info.kv_end_offset, &sched.kv_end, "mla_kv_end"),
-        (info.work_indptr_offset, &sched.work_indptr, "mla_work_indptr"),
+        (
+            info.work_indptr_offset,
+            &sched.work_indptr,
+            "mla_work_indptr",
+        ),
     ];
     for (offset, values, what) in writes {
         staging.put_i32s(offset as usize, values, what)?;
@@ -351,9 +378,11 @@ pub fn plan(
     const SIZEOF_DTYPE_O: usize = 2;
     let mut float_alloc = AlignedAllocator::new(workspace.float_bytes);
     let rows = 2 * sched.num_clusters as usize * sched.cluster_tile_q as usize;
-    info.partial_o_offset =
-        float_alloc.alloc(rows * SIZEOF_DTYPE_O * req.head_dim_o as usize, 16, "mla_partial_o")?
-            as i64;
+    info.partial_o_offset = float_alloc.alloc(
+        rows * SIZEOF_DTYPE_O * req.head_dim_o as usize,
+        16,
+        "mla_partial_o",
+    )? as i64;
     info.partial_lse_offset = float_alloc.alloc(rows * 4, 16, "mla_partial_lse")? as i64;
 
     let int_bytes = int_alloc.used();

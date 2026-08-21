@@ -35,7 +35,13 @@ pub fn matmul(x: &Val, w: &MatW) -> Val {
     weights.extend(w.scale_names());
     let shape = Shape(vec![Dim::Tokens, Dim::Const(w.width)]);
     let id = x.t.with(w.layer, |b| {
-        b.launch(&symbol, weights, None, vec![x.id], vec![(shape, DType::BF16)])[0]
+        b.launch(
+            &symbol,
+            weights,
+            None,
+            vec![x.id],
+            vec![(shape, DType::BF16)],
+        )[0]
     });
     Val {
         t: x.t.clone(),
@@ -146,12 +152,7 @@ pub fn rope(q: &Val, k: &Val, kind: RopeKind, n: RopeShape) -> (Val, Val) {
     ];
     let symbol = q.t.canon("rope");
     let (qo, ko) = q.t.with(q.layer, |b| {
-        let positions = b.runtime_tensor(
-            "positions",
-            None,
-            Shape(vec![Dim::Tokens]),
-            DType::I32,
-        );
+        let positions = b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
         let q_shape = b.value_shape(q.id);
         let k_shape = b.value_shape(k.id);
         let outs = b.launch_with_params(
@@ -188,12 +189,7 @@ pub fn rope_partial(
     let params = vec![rotary_dim, head_dim, theta.to_bits()];
     let symbol = q.t.canon("rope.partial");
     let (qo, ko) = q.t.with(q.layer, |b| {
-        let positions = b.runtime_tensor(
-            "positions",
-            None,
-            Shape(vec![Dim::Tokens]),
-            DType::I32,
-        );
+        let positions = b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
         let q_shape = b.value_shape(q.id);
         let k_shape = b.value_shape(k.id);
         let outs = b.launch_with_params(
@@ -242,7 +238,13 @@ pub fn logits_epilogue(
     );
     let logits = lm_head_tied(t, &normed, tied_embeddings, vocab);
     let logits = if let Some(cap) = logit_softcap {
-        cuda::logit_softcap(&logits, vocab, cap)
+        cuda::generated::logit_softcap(
+            &logits,
+            (Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::BF16),
+            cap,
+            None,
+            None,
+        )
     } else {
         logits
     };
@@ -268,8 +270,17 @@ pub fn mla_latents(
     let (q_a_n, kv_a) = match fused {
         Some(bank) => {
             let qkv_a = matmul(x, bank);
-            let q_a_n =
-                cuda::rmsnorm_strided(&qkv_a, &q_a_norm.name, q_lora_rank, q_a_norm.eps);
+            let q_a_n = cuda::generated::rmsnorm_strided_bf16(
+                &qkv_a,
+                &q_a_norm.name,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(q_lora_rank)]),
+                    DType::BF16,
+                ),
+                q_a_norm.eps,
+                qkv_a.layer(),
+                None,
+            );
             (q_a_n, qkv_a)
         }
         None => {
@@ -338,13 +349,16 @@ pub fn dense_gated_mlp(
 ) -> Val {
     let gate = matmul(m, gate_w);
     let up = matmul(m, up_w);
+    // The pair kernels' results are ruled `like(gate)` on their rows, so
+    // the `intermediate` restatement retired with the hand wrappers.
+    let _ = intermediate;
     let activated = match act {
-        GatedAct::SwiGlu => cuda::swiglu_pair(&gate, &up, intermediate),
+        GatedAct::SwiGlu => cuda::generated::swiglu(&gate, &up, gate.layer(), None),
         GatedAct::SwiGluClamp { limit } => {
-            cuda::swiglu_clamp_pair(&gate, &up, intermediate, limit)
+            cuda::generated::swiglu_clamp(&gate, &up, limit, gate.layer(), None)
         }
         GatedAct::Situ { beta, linear_beta } => {
-            cuda::situ_pair(&gate, &up, intermediate, beta, linear_beta)
+            cuda::generated::situ(&gate, &up, beta, linear_beta, gate.layer(), None)
         }
     };
     matmul(&activated, down_w)
@@ -380,7 +394,10 @@ pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
         b.launch(
             &symbol,
             vec![],
-            Some(StateRef { store: StateStore::KvCache, layer: kv.l }),
+            Some(StateRef {
+                store: StateStore::KvCache,
+                layer: kv.l,
+            }),
             vec![q.id],
             vec![(Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)],
         )[0]
@@ -565,7 +582,10 @@ pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
         b.launch_with_params(
             &symbol,
             weights,
-            Some(StateRef { store: StateStore::RecurrentState, layer: w.layer }),
+            Some(StateRef {
+                store: StateStore::RecurrentState,
+                layer: w.layer,
+            }),
             vec![conv_dim, w.kernel],
             vec![x.id],
             vec![(shape, DType::BF16)],
@@ -606,11 +626,26 @@ pub fn gdn_prep(
             vec![key_heads, value_heads, key_dim, value_dim, conv_dim],
             vec![qkv.id, a.id, b.id],
             vec![
-                (Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]), DType::F32),
-                (Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]), DType::F32),
-                (Shape(vec![Dim::Tokens, Dim::Const(value_heads * value_dim)]), DType::F32),
-                (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::F32),
-                (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::F32),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]),
+                    DType::F32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]),
+                    DType::F32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(value_heads * value_dim)]),
+                    DType::F32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(value_heads)]),
+                    DType::F32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(value_heads)]),
+                    DType::F32,
+                ),
             ],
         )
     });
@@ -619,7 +654,13 @@ pub fn gdn_prep(
         id,
         layer: Some(w.layer),
     };
-    (mk(outs[0]), mk(outs[1]), mk(outs[2]), mk(outs[3]), mk(outs[4]))
+    (
+        mk(outs[0]),
+        mk(outs[1]),
+        mk(outs[2]),
+        mk(outs[3]),
+        mk(outs[4]),
+    )
 }
 
 /// GDN recurrence over `rs`'s layer state. Description form (`canon::`);
@@ -631,7 +672,10 @@ pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> V
         b.launch(
             &symbol,
             vec![],
-            Some(StateRef { store: StateStore::RecurrentState, layer: rs.l }),
+            Some(StateRef {
+                store: StateStore::RecurrentState,
+                layer: rs.l,
+            }),
             vec![q.id, k.id, v.id, g.id, beta.id],
             vec![(shape, DType::F32)],
         )[0]
@@ -663,7 +707,6 @@ pub fn rmsnorm_gated(x: &Val, gate: &Val, w: &NormW) -> Val {
         layer: w.layer,
     }
 }
-
 
 impl std::ops::AddAssign<Val> for Val {
     /// Fold `y += matmul` into the GEMM's beta (`gemm::act_x_w` becomes

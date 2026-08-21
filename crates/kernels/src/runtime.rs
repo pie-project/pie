@@ -34,20 +34,50 @@ pub struct RuntimeEntry {
 pub const TIER1: &[RuntimeEntry] = &[
     // The paged KV cache, one view per (fire, layer): base planes, page
     // tables, geometry, quantisation scheme, and the write descriptor half.
-    RuntimeEntry { name: "kv_cache", resident: true },
+    RuntimeEntry {
+        name: "kv_cache",
+        resident: true,
+    },
     // The recurrent-state slabs, one view per (fire, layer): state slab,
     // slot ids, strides, and the conv-window half.
-    RuntimeEntry { name: "recurrent_state", resident: true },
+    RuntimeEntry {
+        name: "recurrent_state",
+        resident: true,
+    },
     // Per-fire staged streams. Resident is false: the driver stages these
     // for the fire being bound, and a captured replay re-stages them.
-    RuntimeEntry { name: "positions", resident: false },
-    RuntimeEntry { name: "token_ids", resident: false },
-    RuntimeEntry { name: "request_of_token", resident: false },
-    RuntimeEntry { name: "qo_indptr", resident: false },
-    RuntimeEntry { name: "row_valid", resident: false },
-    RuntimeEntry { name: "attention_mask", resident: false },
-    RuntimeEntry { name: "sampling_indices", resident: false },
-    RuntimeEntry { name: "first_token", resident: false },
+    RuntimeEntry {
+        name: "positions",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "token_ids",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "request_of_token",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "qo_indptr",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "row_valid",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "attention_mask",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "sampling_indices",
+        resident: false,
+    },
+    RuntimeEntry {
+        name: "first_token",
+        resident: false,
+    },
 ];
 
 /// Whether `name` is in the tier-1 vocabulary.

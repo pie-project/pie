@@ -209,8 +209,14 @@ impl Shell {
                 // The LINEAR layers' pair, from the recurrent shape the row
                 // published -- `(0, 0)` for every stack that states none,
                 // which `recurrent_at` reads as "the attention pair serves".
-                v_heads: d.recurrent.as_ref().map_or(0, |r| r.v_h.max(0).unsigned_abs()),
-                v_dim: d.recurrent.as_ref().map_or(0, |r| r.v_d.max(0).unsigned_abs()),
+                v_heads: d
+                    .recurrent
+                    .as_ref()
+                    .map_or(0, |r| r.v_h.max(0).unsigned_abs()),
+                v_dim: d
+                    .recurrent
+                    .as_ref()
+                    .map_or(0, |r| r.v_d.max(0).unsigned_abs()),
             }
         };
         let named = std::collections::HashMap::new();
@@ -342,8 +348,7 @@ impl Shell {
                 what: "launch",
                 message: format!("this frame's geometry: {e}"),
             })?;
-            plan
-                .validate_kv_writes(pool.shape().page_size)
+            plan.validate_kv_writes(pool.shape().page_size)
                 .map_err(|e| Error::Unserved {
                     what: "launch",
                     message: format!("this frame's KV writes: {e}"),
@@ -391,16 +396,17 @@ impl Shell {
                         .get(i)
                         .is_some_and(|f| f & driver_api::PIE_RS_FLAG_RESET != 0)
                     {
-                        rs.clear_slot(slot).map_err(|e| crate::error::Error::Unserved {
-                            what: "launch",
-                            message: format!(
-                                "row {i} resets recurrent slot {slot}, which this pool does \
+                        rs.clear_slot(slot)
+                            .map_err(|e| crate::error::Error::Unserved {
+                                what: "launch",
+                                message: format!(
+                                    "row {i} resets recurrent slot {slot}, which this pool does \
                                  not have: {e}. It holds {} seats -- `PIE_METAL_RS_SLOTS` \
                                  sizes it, and a scheduler admitting past what \
                                  `rs_cache_slots` advertised is the other way this happens.",
-                                rs.shape().slots
-                            ),
-                        })?;
+                                    rs.shape().slots
+                                ),
+                            })?;
                     }
                 }
             }
@@ -425,16 +431,17 @@ impl Shell {
             } else {
                 req.iter()
                     .map(|&r| {
-                        plan.rs_slot_ids.get(r as usize).copied().ok_or_else(|| {
-                            Error::Unserved {
+                        plan.rs_slot_ids
+                            .get(r as usize)
+                            .copied()
+                            .ok_or_else(|| Error::Unserved {
                                 what: "launch",
                                 message: format!(
                                     "a token names request {r}, which has no recurrent seat: \
                                      the frame states {} of them",
                                     plan.rs_slot_ids.len()
                                 ),
-                            }
-                        })
+                            })
                     })
                     .collect::<Result<_>>()?
             };
@@ -447,6 +454,12 @@ impl Shell {
                     req_of_token: &req,
                     kv_page_indices: &plan.kv_page_indices,
                     kv_page_indptr: &plan.kv_page_indptr,
+                    // The pool's, so `stage` can check the run reaches the
+                    // last position. `Plan::validate` has already refused a
+                    // short run on this path -- this states the divisor a
+                    // second time so the CHECK is the same one on both paths
+                    // and not a courtesy the serving path happens to get.
+                    page_size: pool.shape().page_size,
                     kv_write_page: &w_page,
                     kv_write_offset: &w_off,
                     rope_frequencies: &self.inv_freq,
@@ -563,11 +576,14 @@ impl Shell {
             // when the value drops, and a returned region is one the next fire
             // may be handed. Dropped here, the next step would stage its token
             // ids over the ones a running fire is still reading.
-            in_flight.push((step, InFlight {
-                fire,
-                readout: lowered.readout,
-                _tables: staged,
-            }));
+            in_flight.push((
+                step,
+                InFlight {
+                    fire,
+                    readout: lowered.readout,
+                    _tables: staged,
+                },
+            ));
             ran_steps += 1;
             // ── A step at a time, when a step at a time is what it takes. ──
             //

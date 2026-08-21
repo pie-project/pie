@@ -4,7 +4,7 @@
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 320
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: nucleus_sample#0 fused#1 flips ok:false -> ok:true, which is the whole change: the CUDA emitter refused every RegionKind::Library for being one, but it implements no library kernels, so that refusal reached the driver as Slot::Refused, the driver skipped the region, and the sampler's 13-node chain never ran -- every nonzero temperature published token 0. Emittability is now decided per node, so a 13-node lift over ordinary ops emits and the single-op lifts (library_op 1/2/4/5, nodes=1) are still refused, by the check that names what they wrap.
+#   reason: EmitError::GeneratedRegionHasBoundary now carries the offending library op's own name, so the refusal reads 'generated region contains a non-generated boundary (top_k)' rather than leaving the reader to add a print to find out which op the partitioner lifted. Text only: no runtime/cuda source changed, no verdict changed, and every previously refused region is still refused for the same reason.
 === beam_epilogue#0 singleton#0
 entry_name: ptir_fused_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -121,7 +121,7 @@ source: bytes=88286 prefix=@runtime tail_bytes=42051 fnv1a64=0xd5c1b42ae1de60fb
 entry_name: ptir_fused_b4fadd8446eb58dd_r14
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 entry_name: ptir_fused_b4fadd8446eb58dd_r14
 === end
 === beam_epilogue#0 singleton#15
@@ -672,7 +672,7 @@ source: bytes=92377 prefix=@runtime tail_bytes=46142 fnv1a64=0xa061a8338b6698eb
 entry_name: ptir_fused_b4fadd8446eb58dd_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 entry_name: ptir_fused_b4fadd8446eb58dd_r1
 === end
 === beam_epilogue#0 fused#2
@@ -967,7 +967,7 @@ source: bytes=88601 prefix=@runtime tail_bytes=42366 fnv1a64=0x5ba4919f843490de
 entry_name: ptir_fused_26849b68dee54237_r3
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_26849b68dee54237_r3
 === end
 === lora_prologue#0 fused#0
@@ -982,7 +982,7 @@ source: bytes=89665 prefix=@runtime tail_bytes=43430 fnv1a64=0xa9fa765600faed77
 entry_name: ptir_fused_26849b68dee54237_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_26849b68dee54237_r1
 === end
 === matrix_mask_apply_packed#0 singleton#0
@@ -1205,7 +1205,7 @@ source: bytes=88301 prefix=@runtime tail_bytes=42066 fnv1a64=0x5e17c7e4741d3f49
 entry_name: ptir_fused_963137d4ffed0445_r13
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (scan)
 entry_name: ptir_fused_963137d4ffed0445_r13
 === end
 === mtp_verify_tail#0 singleton#14
@@ -1308,7 +1308,7 @@ source: bytes=93987 prefix=@runtime tail_bytes=47752 fnv1a64=0xec6feaac4e0a51de
 entry_name: ptir_fused_963137d4ffed0445_r1
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (scan)
 entry_name: ptir_fused_963137d4ffed0445_r1
 === end
 === mtp_verify_tail#0 fused#2
@@ -1491,7 +1491,7 @@ source: bytes=88585 prefix=@runtime tail_bytes=42350 fnv1a64=0x2dd0ac012644fc8f
 entry_name: ptir_fused_14f667a41eb30669_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_14f667a41eb30669_r1
 === end
 === pentathlon_iter#0 singleton#2
@@ -1522,7 +1522,7 @@ source: bytes=88279 prefix=@runtime tail_bytes=42044 fnv1a64=0x02001f35b8cfe166
 entry_name: ptir_fused_14f667a41eb30669_r5
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_14f667a41eb30669_r5
 === end
 === pentathlon_iter#0 fused#0
@@ -1537,7 +1537,7 @@ source: bytes=88585 prefix=@runtime tail_bytes=42350 fnv1a64=0x2dd0ac012644fc8f
 entry_name: ptir_fused_14f667a41eb30669_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_14f667a41eb30669_r1
 === end
 === pentathlon_iter#0 fused#2
@@ -1552,7 +1552,7 @@ source: bytes=88811 prefix=@runtime tail_bytes=42576 fnv1a64=0xb165483ceff9528e
 entry_name: ptir_fused_14f667a41eb30669_r3
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_14f667a41eb30669_r3
 === end
 === pentathlon_iter#1 singleton#0
@@ -1807,7 +1807,7 @@ source: bytes=88302 prefix=@runtime tail_bytes=42067 fnv1a64=0x301974b8fb22864e
 entry_name: ptir_fused_dff3bc6795a9dcdf_r31
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 entry_name: ptir_fused_dff3bc6795a9dcdf_r31
 === end
 === pentathlon_iter#1 singleton#32
@@ -1870,7 +1870,7 @@ source: bytes=98755 prefix=@runtime tail_bytes=52520 fnv1a64=0x43c080894f5a3bdf
 entry_name: ptir_fused_dff3bc6795a9dcdf_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (top_k)
 entry_name: ptir_fused_dff3bc6795a9dcdf_r1
 === end
 === pentathlon_iter#1 fused#2
@@ -2413,7 +2413,7 @@ source: bytes=88505 prefix=@runtime tail_bytes=42270 fnv1a64=0x583de0191846b3a5
 entry_name: ptir_fused_dc132d209d85d958_r1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (sort)
 entry_name: ptir_fused_dc132d209d85d958_r1
 === end
 === synthetic_sort_desc#0 singleton#2
@@ -2444,7 +2444,7 @@ source: bytes=88505 prefix=@runtime tail_bytes=42270 fnv1a64=0x583de0191846b3a5
 entry_name: ptir_fused_dc132d209d85d958_r1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (sort)
 entry_name: ptir_fused_dc132d209d85d958_r1
 === end
 === synthetic_sort_desc#0 fused#2
@@ -2475,7 +2475,7 @@ source: bytes=88505 prefix=@runtime tail_bytes=42270 fnv1a64=0x0131999bacc13b49
 entry_name: ptir_fused_92d86f95b487e729_r2
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (matmul)
 entry_name: ptir_fused_92d86f95b487e729_r2
 === end
 === synthetic_matmul#0 singleton#3
@@ -2498,7 +2498,7 @@ source: bytes=89037 prefix=@runtime tail_bytes=42802 fnv1a64=0x54b9af5152c217a7
 entry_name: ptir_fused_92d86f95b487e729_r1
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (matmul)
 entry_name: ptir_fused_92d86f95b487e729_r1
 === end
 === synthetic_matmul#0 fused#2
@@ -2577,7 +2577,7 @@ source: bytes=88505 prefix=@runtime tail_bytes=42270 fnv1a64=0x5b4c345f788d4298
 entry_name: ptir_fused_a297c60f7a5de47e_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_a297c60f7a5de47e_r1
 === end
 === synthetic_sink_call#0 fused#0
@@ -2592,6 +2592,6 @@ source: bytes=88505 prefix=@runtime tail_bytes=42270 fnv1a64=0x5b4c345f788d4298
 entry_name: ptir_fused_a297c60f7a5de47e_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: false
-error: generated region contains a non-generated boundary
+error: generated region contains a non-generated boundary (second_party)
 entry_name: ptir_fused_a297c60f7a5de47e_r1
 === end

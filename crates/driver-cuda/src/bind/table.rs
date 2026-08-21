@@ -38,7 +38,11 @@ impl<'a> Facts<'a> {
     /// Look at one fire. Infallible, and it resolves nothing.
     #[must_use]
     pub fn at(cx: &'a Cx<'a>) -> Self {
-        Self { cx, rows: cx.rows(), layer: cx.layer() }
+        Self {
+            cx,
+            rows: cx.rows(),
+            layer: cx.layer(),
+        }
     }
 
     /// The `i`th named weight's address. Refuses `Absent`, being indexed.
@@ -78,24 +82,36 @@ impl<'a> Handles<'a> {
         let (ins, rest) = args.split_at(inputs);
         let results = results.min(rest.len());
         let (outs, weights) = rest.split_at(results);
-        Self { ins, outs, weights, taken: Vec::new() }
+        Self {
+            ins,
+            outs,
+            weights,
+            taken: Vec::new(),
+        }
     }
 
     /// The `n`th INPUT, as the address the kernel receives.
     pub fn input(&mut self, n: usize) -> Result<ArgValue, Refusal> {
-        let at = *self.ins.get(n).ok_or(Refusal::Absent { what: "an input operand" })?;
+        let at = *self.ins.get(n).ok_or(Refusal::Absent {
+            what: "an input operand",
+        })?;
         Ok(self.take(at))
     }
 
     /// The `n`th OUTPUT.
     pub fn output(&mut self, n: usize) -> Result<ArgValue, Refusal> {
-        let at = *self.outs.get(n).ok_or(Refusal::Absent { what: "an output operand" })?;
+        let at = *self.outs.get(n).ok_or(Refusal::Absent {
+            what: "an output operand",
+        })?;
         Ok(self.take(at))
     }
 
     /// The `n`th positional WEIGHT.
     pub fn weight(&mut self, n: usize) -> Result<ArgValue, Refusal> {
-        let at = *self.weights.get(n).ok_or(Refusal::Absent { what: "a weight" })?;
+        let at = *self
+            .weights
+            .get(n)
+            .ok_or(Refusal::Absent { what: "a weight" })?;
         Ok(self.take(at))
     }
 
@@ -139,7 +155,10 @@ impl<'a> Handles<'a> {
 /// "the second result has no pitch".
 fn width(at: Option<&BoundArg>, what: &'static str) -> Result<i32, Refusal> {
     let w = at.ok_or(Refusal::Absent { what })?.width;
-    i32::try_from(w).ok().filter(|w| *w > 0).ok_or(Refusal::Absent { what })
+    i32::try_from(w)
+        .ok()
+        .filter(|w| *w > 0)
+        .ok_or(Refusal::Absent { what })
 }
 
 /// One operand's OWN row count, zero where it has none — no refusal, because
@@ -159,10 +178,7 @@ pub type TableArm = fn(&mut Handles<'_>, Facts) -> Result<Vec<ArgValue>, Refusal
 
 /// `sample::lm_head_gemv_argmax_int8`. Head and scale are NAMED weights.
 #[cfg(test)]
-pub fn lm_head_gemv_argmax_int8(
-    o: &mut Handles<'_>,
-    f: Facts,
-) -> Result<Vec<ArgValue>, Refusal> {
+pub fn lm_head_gemv_argmax_int8(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let hidden_states = o.input(0)?;
     let lm_head_weight = ArgValue::Ptr(f.weight_named(0)?);
     let scale_inv = ArgValue::Ptr(f.weight_named(1)?);
@@ -203,10 +219,7 @@ fn as_region(v: ArgValue, rows: i32, width: i32) -> ArgValue {
 
 /// `layout::split_qwen_gdn_ba_bf16`. One list for either instantiation.
 #[cfg(test)]
-pub fn split_qwen_gdn_ba_bf16(
-    o: &mut Handles<'_>,
-    f: Facts,
-) -> Result<Vec<ArgValue>, Refusal> {
+pub fn split_qwen_gdn_ba_bf16(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let ba = o.input(0)?;
     let b_out = o.output(0)?;
     let a_out = o.output(1)?;
@@ -248,10 +261,7 @@ pub fn gather_bf16_rows(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, 
 
 /// `layout::transpose_bf16_nld_to_lnd`. Places operands, computes nothing.
 #[cfg(test)]
-pub fn transpose_bf16_nld_to_lnd(
-    o: &mut Handles<'_>,
-    f: Facts,
-) -> Result<Vec<ArgValue>, Refusal> {
+pub fn transpose_bf16_nld_to_lnd(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let src = o.input(0)?;
     let dst = o.output(0)?;
     let width = o.in_width(0)?;
@@ -277,7 +287,9 @@ pub fn operands(
     args: &[kernels::Ty],
 ) -> Result<Vec<ArgValue>, Refusal> {
     if derived.is_empty() {
-        return Err(Refusal::Unstated { what: "an operand column: the row states no `derived`" });
+        return Err(Refusal::Unstated {
+            what: "an operand column: the row states no `derived`",
+        });
     }
     // THE SAME COLUMN THE THREE SHADER PLANES BIND FROM. It used to be a
     // second one: `#[routine]` read the SYNTAX and filled `Derived::source`,
@@ -294,9 +306,7 @@ pub fn operands(
             // `Derived::nullable` comes from the parameter's own type. Narrowed
             // to `Absent` deliberately: any other refusal a null would bury.
             let v = match operand(o, f, d, source) {
-                Err(Refusal::Absent { .. }) if d.nullable => {
-                    ArgValue::Ptr(core::ptr::null_mut())
-                }
+                Err(Refusal::Absent { .. }) if d.nullable => ArgValue::Ptr(core::ptr::null_mut()),
                 other => other?,
             };
             Ok(as_declared(args.get(i).copied(), v))
@@ -318,14 +328,39 @@ fn as_declared(t: Option<kernels::Ty>, v: ArgValue) -> ArgValue {
         (Ty::I64, ArgValue::I32(n)) => ArgValue::I64(i64::from(n)),
         (Ty::I64, ArgValue::U32(n)) => ArgValue::I64(i64::from(n)),
         (Ty::U32, ArgValue::I32(n)) if n >= 0 => ArgValue::U32(n as u32),
-        (Ty::I32, ArgValue::U32(n)) if n <= i32::MAX as u32 => ArgValue::I32(n as i32),
+        // THE PARAM CHANNEL IS UNTYPED BITS, and this is the only place an
+        // `ArgValue::U32` is ever minted (`operand`'s `Kind::Param` arm; every
+        // other channel arrives typed). A statement writes its scalar into
+        // that run as `n as u32` and the SIGNATURE says how to read it back,
+        // so a routine declaring `Const<i32>` is declaring that the bits are
+        // an i32 -- reinterpreting them is the whole contract, not a wrap.
+        //
+        // The range guard that stood here (`n <= i32::MAX`) read the run as a
+        // genuine unsigned count and refused anything above the signed
+        // ceiling. Every NEGATIVE i32 a statement carries is above it, and the
+        // commonest one in this tree is `window_left = -1` -- "this layer
+        // slides over nothing". So the decode dispatch refused, by argument
+        // NUMBER rather than name, on every deployment without a sliding
+        // window: `argument 3 is I32 and arrived otherwise`.
+        (Ty::I32, ArgValue::U32(n)) => ArgValue::I32(n.cast_signed()),
+        // A RAISE HAS NO SHAPE, so the region `operand` mints for an `In` slot
+        // comes back off again. `In<Struct<Fa2Decode>>` is a mark like any
+        // other and resolves to `Source::Slot(Kind::In, n)`, and the arm for
+        // that slot wraps every pointer in `ArgValue::Region` because a
+        // statement's `In` is normally a rectangle. This one is not: a raise
+        // is ONE OBJECT with one lifetime, `raises.rs` binds it as a typed
+        // pointer on purpose, and `raise_abi!`'s `unpack` takes `Ptr` alone.
+        //
+        // Without this the decode dispatch refused every fire it reached with
+        // *argument 1 is Raised and arrived otherwise* -- the plan arriving as
+        // a region of zero width, which is the right address wearing the wrong
+        // shape. The signature is what knows the difference, which is why the
+        // answer is here rather than in the slot arm: `Ty::Raised` is
+        // `kernels-cuda`'s own declaration for the parameter.
+        (Ty::Raised, ArgValue::Region { ptr, .. }) => ArgValue::Ptr(ptr),
         _ => v,
     }
 }
-
-
-
-
 
 /// One operand, from where its [`Source`] says it comes.
 ///
@@ -377,7 +412,24 @@ fn operand(
             o.output(n as usize).map(|v| region(v, own, width))
         }
         // NOT A REGION: a weight's shape is the MODEL's, not the statement's.
-        Some(Source::Slot(Kind::Weight, n)) => o.weight(n as usize),
+        //
+        // TWO PLACES A WEIGHT CAN COME FROM, and a column has one spelling for
+        // both. A trace `OpKind::Launch` lists its weights BY NAME and the
+        // walk pushes each as an `Arg::Weight` onto the launch's own run, so
+        // `Handles::weight` finds it past the inputs and outputs. A SEMANTIC
+        // op -- `OpKind::LmHead`, `OpKind::Embed`, `OpKind::Matmul` -- has no
+        // such list: the walk emits its kernel from the op kind, and the
+        // weight reaches the dispatch through `LaunchSpec::weight`, resolved
+        // once into the fire's `w_named` before the `Cx` exists.
+        //
+        // The chain is the whole of the difference. Without it every semantic
+        // op's kernel refused with "the fire does not carry a weight" -- and
+        // the loudest was the epilogue, where `gemm::act_x_w` is the lm-head
+        // projection and the run ended one launch short of its logits on
+        // every fire.
+        Some(Source::Slot(Kind::Weight, n)) => o
+            .weight(n as usize)
+            .or_else(|_| f.weight_named(n as usize).map(ArgValue::Ptr)),
         // Two arms: a param is a byte run, so `f32` is a different channel.
         Some(Source::Slot(Kind::Param, n)) => f.cx.param(n as usize).map(ArgValue::U32),
         Some(Source::Slot(Kind::ParamF32, n)) => f.cx.param_f32(n as usize).map(ArgValue::F32),
@@ -425,8 +477,11 @@ pub unsafe fn dispatch(
         crate::bind::route::Route::Bound(routed) => routed,
         _ => bound.kernel,
     };
-    // `None`, NOT a refusal, for a row with no column: `None` means "take the
-    // path you take today", `Some(Err(_))` means "this fire cannot run".
+    // `None`, NOT a refusal, for a row with no column AND no ask list: `None`
+    // means "take the path you take today", `Some(Err(_))` means "this fire
+    // cannot run". A row that asks for its whole input is NOT one of these --
+    // see `route::route`, where the same pair of conditions decides whether
+    // the driver's hand-written match is even the right place to look.
     let row = kernels_cuda::routine(symbol)?;
     if row.derived.is_empty() {
         return None;
@@ -445,16 +500,34 @@ pub unsafe fn dispatch(
             what: "a dispatch without an aux value",
         }));
     }
-    let args = operands(&mut handles, Facts::at(cx), row.derived, row.sources, row.args);
-    let args = match args {
-        Ok(args) => args,
-        Err(why) => return Some(Err(why)),
+    // AN EMPTY COLUMN IS AN EMPTY LIST HERE, and only here. `operands` refuses
+    // `&[]` on purpose -- for a caller that meant to pass a column and passed
+    // nothing, refusing is the whole value of the guard -- but a row that
+    // reached this line with no column and a non-empty ask list has already
+    // been read for exactly that shape twice, in `route::route` and above, and
+    // means it. The body takes no arguments and asks for everything.
+    let args = if row.derived.is_empty() {
+        Vec::new()
+    } else {
+        match operands(
+            &mut handles,
+            Facts::at(cx),
+            row.derived,
+            row.sources,
+            row.args,
+        ) {
+            Ok(args) => args,
+            Err(why) => return Some(Err(why)),
+        }
     };
     // THE WHOLE BOUND LIST, on request. A wrong ADDRESS is invisible: the
     // launch succeeds and the numbers come out wrong, which is the one failure
     // a refusal-driven bring-up cannot see. `PIE_TRACE_BINDS=1` prints it.
     if tracing("PIE_TRACE_BINDS") {
-        eprintln!("[bind] {symbol} n_in={} n_out={} -> {args:?}", spec.n_in, spec.n_out);
+        eprintln!(
+            "[bind] {symbol} n_in={} n_out={} -> {args:?}",
+            spec.n_in, spec.n_out
+        );
     }
     // AND WHAT THE LAUNCH LEFT IN ITS RESULTS. A binding can be right in every
     // address and still run on the wrong NUMBERS; `PIE_TRACE_VALUES=1` reads
@@ -560,15 +633,16 @@ pub fn derived_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let fire = cx.fire();
     // SAFETY: forwarded from `Bound::call`'s contract — `stream` is the fire's,
     // live across the launch, and `bound.args` came from the dispatch site.
-    unsafe { dispatch(fire.bound, fire.spec, cx, stream) }
-        .unwrap_or(Err(Refusal::Unstated { what: "an operand column, on a row that named `derived_arm`" }))
+    unsafe { dispatch(fire.bound, fire.spec, cx, stream) }.unwrap_or(Err(Refusal::Unstated {
+        what: "an operand column, on a row that named `derived_arm`",
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::facts::Fire;
     use super::super::{AttnCtx, DispatchCtx};
+    use super::*;
 
     // RUN THESE WITH `--features cuda-12`, OR THEY DO NOT EXIST: `pub mod bind`
     // is behind `#[cfg(feature = "_cuda")]`, so a bare check compiles nothing.
@@ -605,7 +679,6 @@ mod tests {
                 rows: self.rows,
                 w_named: self.w_named,
                 w_named2: self.w_named2,
-                w_suffixed: &[],
             }
         }
 
@@ -615,7 +688,12 @@ mod tests {
             Self {
                 ctx: dispatch_ctx(),
                 attn: None,
-                bound: BoundLaunch { kernel: "", rows: 0..0, layers: 0..1, args: Vec::new() },
+                bound: BoundLaunch {
+                    kernel: "",
+                    rows: 0..0,
+                    layers: 0..1,
+                    args: Vec::new(),
+                },
                 spec: LaunchSpec::default(),
                 rows: 0,
                 w_named: core::ptr::null(),
@@ -656,13 +734,22 @@ mod tests {
             attn.sm_scale = 0.125;
             attn.layers = vec![kv_layer_view()];
 
-            let mut spec = LaunchSpec::default();
-            spec.per_head_dim = Some(128);
+            // A per-op head width USED TO BE STATED HERE, as
+            // `LaunchSpec::per_head_dim`, so the fixture could disagree with
+            // the attention's. RETIRED with the field: an op's scalars live in
+            // `LaunchSpec::params` now, and `kv_layer_view` still disagrees
+            // with `attn_ctx`, which is the disagreement the tests below read.
+            let spec = LaunchSpec::default();
 
             Self {
                 ctx,
                 attn: Some(attn),
-                bound: BoundLaunch { kernel: "", rows: 0..7, layers: 0..1, args: Vec::new() },
+                bound: BoundLaunch {
+                    kernel: "",
+                    rows: 0..7,
+                    layers: 0..1,
+                    args: Vec::new(),
+                },
                 spec,
                 rows: 7,
                 w_named: at(8),
@@ -815,7 +902,11 @@ mod tests {
     }
 
     fn operand(n: usize, width: u32) -> BoundArg {
-        BoundArg { ptr: at(n), width, rows: 0 }
+        BoundArg {
+            ptr: at(n),
+            width,
+            rows: 0,
+        }
     }
 
     /// The crossed symbols are counted, and the count moves on purpose. A
@@ -937,9 +1028,26 @@ mod tests {
         // `driver-cuda` answers nowhere, and several of them are on the
         // symbols listed above. The two counts moving in opposite directions
         // is the migration being half done, not either census being wrong.
-        let n = kernels_cuda::sigs().iter().filter(|s| crossed(s.symbol)).count();
+        //
+        // 165 -> 167 WHEN AN EMPTY COLUMN STOPPED MEANING AN EMPTY INPUT.
+        // `route` sent every column-less row to `Route::Driver` on the
+        // reading that there was nothing to bind, and for
+        // `attn::write_kv_to_pages` -- a declaration standing for a CHOICE --
+        // that is still true. It is not true of a routine written
+        // `fn f(ctx: &Ctx<'_>)` that reads every address and every number
+        // through `ctx.ask`: its input is complete and its column is empty
+        // because asking is how it takes it. Two rows are that shape,
+        // `attn::dequant_kv_cache_layer_to_bf16_active` and
+        // `gemm::grouped_act_x_wt_bf16`, and the first refused the ninth
+        // launch of every fire with "a driver op with no arm" -- a hand-
+        // written match being asked for an arm whose entire purpose was to
+        // not have to exist.
+        let n = kernels_cuda::sigs()
+            .iter()
+            .filter(|s| crossed(s.symbol))
+            .count();
         assert_eq!(
-            n, 165,
+            n, 167,
             "{n} declared symbols are crossed onto the derived column. \
              Crossing one changes how a real fire is planned, so the count \
              moves only on purpose."
@@ -961,7 +1069,6 @@ mod tests {
     // second way for one to arrive. The name table went with `Derived::source`
     // -- the column these read is `name` and `nullable` now, because a type
     // answers the rest.
-
 
     // AND THE SECOND CENSUS'S CONSTANT OUTLIVED ITS TEST. `NAMED_FACTS = 0`
     // stood right here, documented as a one-way door, with nothing left that
@@ -991,11 +1098,19 @@ mod tests {
         assert_eq!(
             bound,
             vec![
-                ArgValue::Region { ptr: at(0), rows: 7, width: 4096 },
+                ArgValue::Region {
+                    ptr: at(0),
+                    rows: 7,
+                    width: 4096
+                },
                 ArgValue::Ptr(at(8)),
                 ArgValue::Ptr(at(9)),
                 // `vocab` is asked for, so it is not in the column.
-                ArgValue::Region { ptr: at(1), rows: 7, width: 1 },
+                ArgValue::Region {
+                    ptr: at(1),
+                    rows: 7,
+                    width: 1
+                },
             ]
         );
         assert_eq!(
@@ -1051,7 +1166,9 @@ mod tests {
         let mut o = Handles::over(&args, 1, 1);
         assert_eq!(
             split_bf16_rows(&mut o, Facts::at(&cx)),
-            Err(Refusal::Absent { what: "an output operand" })
+            Err(Refusal::Absent {
+                what: "an output operand"
+            })
         );
 
         // And a fact the fire does not state refuses by NAME, in `Cx`'s words.
@@ -1063,7 +1180,9 @@ mod tests {
         let mut o = Handles::over(&args, 1, 1);
         assert_eq!(
             embed_bf16(&mut o, Facts::at(&cx)),
-            Err(Refusal::Absent { what: "a named weight" })
+            Err(Refusal::Absent {
+                what: "a named weight"
+            })
         );
     }
 
@@ -1074,7 +1193,12 @@ mod tests {
         let args = [operand(0, 16)];
         let mut o = Handles::over(&args, 4, 4);
         assert_eq!(o.input(0), Ok(ArgValue::Ptr(at(0))));
-        assert_eq!(o.output(0), Err(Refusal::Absent { what: "an output operand" }));
+        assert_eq!(
+            o.output(0),
+            Err(Refusal::Absent {
+                what: "an output operand"
+            })
+        );
         assert_eq!(o.weight(0), Err(Refusal::Absent { what: "a weight" }));
     }
 
@@ -1082,7 +1206,6 @@ mod tests {
     /// the derived column exists for, run rather than read.
     #[test]
     fn the_derived_column_binds_what_the_hand_arm_binds() {
-
         // `embed_bf16`: one input, one output, two addresses not in the statement.
         let args = [operand(0, 4096), operand(1, 4096)];
         let mut p = Probe::silent();
@@ -1141,7 +1264,6 @@ mod tests {
     /// over-supplied: the question is whether the two AGREE.
     #[test]
     fn every_table_arm_agrees_with_its_own_column() {
-
         let args: Vec<BoundArg> = (0..24).map(|n| operand(n, 4096)).collect();
         let p = stated_probe();
         let fire = p.fire();
@@ -1151,7 +1273,13 @@ mod tests {
         // Each row is `(what, the table arm, its column, n_in, n_out)`.
         type Arm = fn(&mut Handles<'_>, Facts<'_>) -> Result<Vec<ArgValue>, Refusal>;
         let cases: &[(&str, Arm, &[Derived], usize, usize)] = &[
-            ("layout::split_bf16_rows", split_bf16_rows, <kernels_cuda::layout::split_bf16_rows as ::kernels::Derivation>::DERIVED, 1, 2),
+            (
+                "layout::split_bf16_rows",
+                split_bf16_rows,
+                <kernels_cuda::layout::split_bf16_rows as ::kernels::Derivation>::DERIVED,
+                1,
+                2,
+            ),
             (
                 "layout::split_qwen_gdn_ba_bf16",
                 split_qwen_gdn_ba_bf16,
@@ -1186,9 +1314,14 @@ mod tests {
             )
             .map(|v| addressed(&v));
             assert_eq!(
-                made.as_ref().map(Vec::as_slice).map_err(|e| format!("{e:?}")),
-                hand.as_ref().map(|h| addressed(h)).as_ref()
-                    .map(Vec::as_slice).map_err(|e| format!("{e:?}")),
+                made.as_ref()
+                    .map(Vec::as_slice)
+                    .map_err(|e| format!("{e:?}")),
+                hand.as_ref()
+                    .map(|h| addressed(h))
+                    .as_ref()
+                    .map(Vec::as_slice)
+                    .map_err(|e| format!("{e:?}")),
                 "`{what}`'s derived column and its table arm disagree"
             );
         }
@@ -1230,9 +1363,16 @@ mod tests {
         let stated = Facts::at(&cx);
 
         for sig in kernels_cuda::sigs() {
-            let Some(row) = kernels_cuda::routine(sig.symbol) else { continue };
+            let Some(row) = kernels_cuda::routine(sig.symbol) else {
+                continue;
+            };
             if row.derived.is_empty() {
-                if row.args.is_empty() { &mut untraced } else { &mut uncolumned }.push(sig.symbol);
+                if row.args.is_empty() {
+                    &mut untraced
+                } else {
+                    &mut uncolumned
+                }
+                .push(sig.symbol);
                 continue;
             }
             // PROBE WITH EVERYTHING STATED, BECAUSE A DEFAULT CANNOT TELL THE
@@ -1289,8 +1429,10 @@ mod tests {
         // is excluded BY NAME: no `Bound` row and a signature of bare pointers,
         // so a column would claim a binding nobody stated.
         const NO_COLUMN_ON_PURPOSE: &[&str] = &["attn::qkv_decode_fused_dispatch"];
-        let missing: Vec<_> =
-            uncolumned.iter().filter(|s| !NO_COLUMN_ON_PURPOSE.contains(s)).collect();
+        let missing: Vec<_> = uncolumned
+            .iter()
+            .filter(|s| !NO_COLUMN_ON_PURPOSE.contains(s))
+            .collect();
         assert!(
             missing.is_empty(),
             "these `routine!` rows carry an empty column: {missing:?}. Every \
@@ -1307,15 +1449,15 @@ mod tests {
                 matches!(
                     src,
                     // Only what `Facts` cannot hold — the rest are answered.
-                    None | Some(
-                        Source::Slot(Kind::Aux | Kind::Param | Kind::ParamF32, _)
-                            | Source::Named(<keys::KvKeys as keys::Fact>::KEY)
-                            | Source::Named(<keys::KvValues as keys::Fact>::KEY)
-                            | Source::Named(<keys::KvPageIndices as keys::Fact>::KEY)
-                            | Source::Named(<keys::KvPageIndptr as keys::Fact>::KEY)
-                            | Source::Named(<keys::KvHeadStride as keys::Fact>::KEY)
-                            | Source::Named(<keys::KvSeqStride as keys::Fact>::KEY)
-                    )
+                    //
+                    // SIX `Source::Named(<keys::Kv… as keys::Fact>::KEY)`
+                    // ALLOWANCES STOOD HERE: the KV keys, values, page indices,
+                    // page indptr, head stride and seq stride. RETIRED with the
+                    // ask gate that named them -- there is no `Source::Named`
+                    // and no `keys` module any more, so a fire-scoped fact
+                    // cannot be spelled as one, and anything still blocked has
+                    // to be a slot.
+                    None | Some(Source::Slot(Kind::Aux | Kind::Param | Kind::ParamF32, _))
                 ),
                 "`{symbol}`'s `{}` derived {:?}, which is neither `None` \
                  nor one of the fire-scoped facts `Facts`' own doc says it \
@@ -1343,8 +1485,16 @@ mod tests {
         let cx = Cx::new(&fire);
         let args = [operand(0, 16)];
         assert_eq!(
-            operands(&mut Handles::over(&args, 1, 0), Facts::at(&cx), &[], &[], &[]),
-            Err(Refusal::Unstated { what: "an operand column: the row states no `derived`" })
+            operands(
+                &mut Handles::over(&args, 1, 0),
+                Facts::at(&cx),
+                &[],
+                &[],
+                &[]
+            ),
+            Err(Refusal::Unstated {
+                what: "an operand column: the row states no `derived`"
+            })
         );
     }
 }

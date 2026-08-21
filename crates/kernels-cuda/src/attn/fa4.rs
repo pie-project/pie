@@ -1,6 +1,5 @@
-
-use kernels::{Bind, Fire};
 use core::ptr::NonNull;
+use kernels::{Bind, Fire};
 
 use crate::jit::abi::bf16;
 use crate::jit::{Ctx, Launch};
@@ -129,12 +128,24 @@ const fn plan(
     may_split: bool,
 ) -> Plan {
     if num_sms == 0 || batch == 0 || heads_kv == 0 {
-        return Plan { packed: false, splits: 1, small: false };
+        return Plan {
+            packed: false,
+            splits: 1,
+            small: false,
+        };
     }
     let group = heads_q / heads_kv;
-    let tiles = if seqlen_k.div_ceil(TILE_N) == 0 { 1 } else { seqlen_k.div_ceil(TILE_N) };
+    let tiles = if seqlen_k.div_ceil(TILE_N) == 0 {
+        1
+    } else {
+        seqlen_k.div_ceil(TILE_N)
+    };
     let mut best_cost = u32::MAX;
-    let mut best = Plan { packed: false, splits: 1, small: false };
+    let mut best = Plan {
+        packed: false,
+        splits: 1,
+        small: false,
+    };
 
     let mut which = 0;
     while which < 2 {
@@ -148,7 +159,11 @@ const fn plan(
         let m_tiles = blocks_m(seqlen_q, pack, small);
         let blocks = m_tiles * (heads_q / pack) * batch;
         let limit = if may_split && m_tiles == 1 {
-            if tiles < MAX_SPLITS { tiles } else { MAX_SPLITS }
+            if tiles < MAX_SPLITS {
+                tiles
+            } else {
+                MAX_SPLITS
+            }
         } else {
             1
         };
@@ -157,7 +172,11 @@ const fn plan(
             let cost = (blocks * splits).div_ceil(num_sms) * (tiles.div_ceil(splits) + FIXED_TILES);
             if cost < best_cost {
                 best_cost = cost;
-                best = Plan { packed, splits, small };
+                best = Plan {
+                    packed,
+                    splits,
+                    small,
+                };
             }
             splits += 1;
         }
@@ -173,7 +192,8 @@ pub fn split_scratch_elems(
     batch: u32,
     heads_q: u32,
     heads_kv: u32,
-    head_dim: u32) -> (usize, usize) {
+    head_dim: u32,
+) -> (usize, usize) {
     let num_sms = ctx.multiprocessors().unwrap_or(0);
     let p = plan(seqlen_q, seqlen_k, batch, heads_q, heads_kv, num_sms, true);
     if p.splits == 1 {
@@ -193,7 +213,6 @@ fn null_check(is_null: bool, which: &'static str) -> Result<(), Refusal> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Fa4 {
-
     pub q: *const bf16,
     pub k: *const bf16,
     pub v: *const bf16,
@@ -225,8 +244,13 @@ pub struct Fa4 {
     pub scale_log2: f32,
 }
 
+/// # Safety
+///
+/// `job`'s five pointers must address device memory of the extents its
+/// other fields state, and `ctx`'s stream must be live. The null checks
+/// below are a courtesy for the commonest mistake, not a bound check:
+/// a non-null pointer of the wrong size passes them and faults on device.
 pub unsafe fn forward(ctx: &Ctx<'_>, job: Fa4) -> Result<(), Refusal> {
-
     geometry(job.head_dim, false).ok_or(NO_HEAD_DIM)?;
 
     null_check(job.q.is_null(), "q")?;
@@ -260,10 +284,18 @@ pub unsafe fn forward(ctx: &Ctx<'_>, job: Fa4) -> Result<(), Refusal> {
     let num_sms = ctx.multiprocessors().unwrap_or(0);
     if job.o_partial.is_null() != job.lse_partial.is_null() {
         return Err(Refusal::Null {
-            what: if job.o_partial.is_null() { "o_partial" } else { "lse_partial" },
+            what: if job.o_partial.is_null() {
+                "o_partial"
+            } else {
+                "lse_partial"
+            },
         });
     }
-    let Plan { packed, splits, small } = plan(
+    let Plan {
+        packed,
+        splits,
+        small,
+    } = plan(
         job.seqlen_q,
         job.seqlen_k,
         job.batch,
@@ -285,35 +317,39 @@ pub unsafe fn forward(ctx: &Ctx<'_>, job: Fa4) -> Result<(), Refusal> {
         job.batch * splits,
     ];
 
-    ctx.fire(Fire::at("attn/fa4.cuh", instantiation).apply(Launch::grid(grid, [num_threads, 1, 1]).smem(smem)), &[
-                job.q.arg(),
-                job.k.arg(),
-                job.v.arg(),
-                job.o.arg(),
-                NonNull::new(job.lse).arg(),
-                job.q_stride_b.arg(),
-                job.q_stride_s.arg(),
-                job.q_stride_h.arg(),
-                job.k_stride_b.arg(),
-                job.k_stride_s.arg(),
-                job.k_stride_h.arg(),
-                job.v_stride_b.arg(),
-                job.v_stride_s.arg(),
-                job.v_stride_h.arg(),
-                job.o_stride_b.arg(),
-                job.o_stride_s.arg(),
-                job.o_stride_h.arg(),
-                job.lse_stride_b.arg(),
-                job.lse_stride_h.arg(),
-                (job.seqlen_q as i32).arg(),
-                (job.seqlen_k as i32).arg(),
-                group_size.arg(),
-                job.o_partial.arg(),
-                job.lse_partial.arg(),
-                (splits as i32).arg(),
-                (job.heads_q as i32).arg(),
-                job.scale_log2.arg(),
-            ])?;
+    ctx.fire(
+        Fire::at("attn/fa4.cuh", instantiation)
+            .apply(Launch::grid(grid, [num_threads, 1, 1]).smem(smem)),
+        &[
+            job.q.arg(),
+            job.k.arg(),
+            job.v.arg(),
+            job.o.arg(),
+            NonNull::new(job.lse).arg(),
+            job.q_stride_b.arg(),
+            job.q_stride_s.arg(),
+            job.q_stride_h.arg(),
+            job.k_stride_b.arg(),
+            job.k_stride_s.arg(),
+            job.k_stride_h.arg(),
+            job.v_stride_b.arg(),
+            job.v_stride_s.arg(),
+            job.v_stride_h.arg(),
+            job.o_stride_b.arg(),
+            job.o_stride_s.arg(),
+            job.o_stride_h.arg(),
+            job.lse_stride_b.arg(),
+            job.lse_stride_h.arg(),
+            (job.seqlen_q as i32).arg(),
+            (job.seqlen_k as i32).arg(),
+            group_size.arg(),
+            job.o_partial.arg(),
+            job.lse_partial.arg(),
+            (splits as i32).arg(),
+            (job.heads_q as i32).arg(),
+            job.scale_log2.arg(),
+        ],
+    )?;
 
     if splits == 1 {
         return Ok(());
@@ -321,18 +357,21 @@ pub unsafe fn forward(ctx: &Ctx<'_>, job: Fa4) -> Result<(), Refusal> {
 
     let rows = job.batch * job.heads_q * job.seqlen_q;
     let combine = combine_instantiation(job.head_dim).ok_or(NO_HEAD_DIM)?;
-    ctx.fire(Fire::at("attn/fa4.cuh", combine).apply(Launch::grid([rows, 1, 1], [job.head_dim, 1, 1])), &[
-                job.o_partial.cast_const().arg(),
-                job.lse_partial.cast_const().arg(),
-                job.o.arg(),
-                NonNull::new(job.lse).arg(),
-                (splits as i32).arg(),
-                (job.heads_q as i32).arg(),
-                (job.seqlen_q as i32).arg(),
-                job.o_stride_b.arg(),
-                job.o_stride_s.arg(),
-                job.o_stride_h.arg(),
-                job.lse_stride_b.arg(),
-                job.lse_stride_h.arg(),
-            ])
+    ctx.fire(
+        Fire::at("attn/fa4.cuh", combine).apply(Launch::grid([rows, 1, 1], [job.head_dim, 1, 1])),
+        &[
+            job.o_partial.cast_const().arg(),
+            job.lse_partial.cast_const().arg(),
+            job.o.arg(),
+            NonNull::new(job.lse).arg(),
+            (splits as i32).arg(),
+            (job.heads_q as i32).arg(),
+            (job.seqlen_q as i32).arg(),
+            job.o_stride_b.arg(),
+            job.o_stride_s.arg(),
+            job.o_stride_h.arg(),
+            job.lse_stride_b.arg(),
+            job.lse_stride_h.arg(),
+        ],
+    )
 }

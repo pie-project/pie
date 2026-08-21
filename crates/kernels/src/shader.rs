@@ -223,7 +223,6 @@ pub trait Lang: Backend {
 
 pub use crate::routine::Bind;
 
-
 /// WHAT A SHADER-PLANE TENSOR IS MADE OF.
 ///
 /// The element half of [`Tensor`], and the whole of what used to be seven
@@ -382,7 +381,10 @@ impl<E: Element> Tensor<E> {
     /// This handle, as a tensor of `E`.
     #[must_use]
     pub const fn new(handle: u32) -> Self {
-        Self { handle, held: core::marker::PhantomData }
+        Self {
+            handle,
+            held: core::marker::PhantomData,
+        }
     }
 }
 
@@ -394,10 +396,10 @@ where
     const SPELLING: &'static str = spell_read::<B>(E::SPELL);
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        value
-            .as_buffer()
-            .map(Self::new)
-            .ok_or(Refusal::Kind { at, want: E::TY_CONST })
+        value.as_buffer().map(Self::new).ok_or(Refusal::Kind {
+            at,
+            want: E::TY_CONST,
+        })
     }
 }
 
@@ -484,7 +486,10 @@ where
         value
             .as_raised()
             .map(|addr| addr as *const V)
-            .ok_or(Refusal::Kind { at, want: Ty::Raised })
+            .ok_or(Refusal::Kind {
+                at,
+                want: Ty::Raised,
+            })
     }
 }
 
@@ -602,7 +607,6 @@ fn rectangle(width: i32, rows: i32) -> Result<[u32; 2], Refusal> {
     Ok([width.unsigned_abs(), rows.unsigned_abs()])
 }
 
-
 /// Declare one scalar operand over an existing Rust type.
 macro_rules! scalar_arg {
     ($rust:ty, $ty:expr, $read:ident, $make:ident, $spelling:ident) => {
@@ -629,10 +633,6 @@ macro_rules! scalar_arg {
 scalar_arg!(i32, Ty::I32, as_i32, i32, I32);
 scalar_arg!(u32, Ty::U32, as_u32, u32, U32);
 scalar_arg!(f32, Ty::F32, as_f32, f32, F32);
-
-
-
-
 
 #[cfg(test)]
 mod tests {

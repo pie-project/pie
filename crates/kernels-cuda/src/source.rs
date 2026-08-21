@@ -2,7 +2,6 @@ use std::ffi::CString;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
-
     pub name: &'static str,
     pub text: &'static str,
 }
@@ -55,7 +54,10 @@ pub const fn carried(name: &'static str) -> &'static str {
 
 #[must_use]
 pub fn text_of(name: &str) -> Option<&'static str> {
-    LIBRARY.iter().find(|header| header.name == name).map(|header| header.text)
+    LIBRARY
+        .iter()
+        .find(|header| header.name == name)
+        .map(|header| header.text)
 }
 
 pub(crate) const fn str_eq(a: &str, b: &str) -> bool {
@@ -141,7 +143,6 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn fold(mut hash: u64, bytes: &[u8]) -> u64 {
-
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
     for byte in bytes {

@@ -75,7 +75,6 @@ fn qwen3_snapshot() -> Option<std::path::PathBuf> {
     })
 }
 
-
 /// The one-stage epilogue this test registers: read the channel, take an
 /// argmax, publish the index.
 ///

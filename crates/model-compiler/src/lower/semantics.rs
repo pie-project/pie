@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// What a statement without a stated kernel lowers to.
 pub(super) enum Semantic {
     Structural,
@@ -73,7 +72,11 @@ pub(super) fn contiguous(
 }
 
 /// Subtracting an arm must leave one contiguous range.
-pub(super) fn subtract(window: &Range<u32>, taken: &Range<u32>, at: usize) -> Result<Range<u32>, Uncovered> {
+pub(super) fn subtract(
+    window: &Range<u32>,
+    taken: &Range<u32>,
+    at: usize,
+) -> Result<Range<u32>, Uncovered> {
     if taken.start == window.start {
         Ok(taken.end..window.end)
     } else if taken.end == window.end {

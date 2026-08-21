@@ -49,7 +49,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no grouped dispatch ran");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let dir = tempfile::tempdir().expect("tempdir");
@@ -218,7 +221,7 @@ fn ready_fire(f: &mut Fixture, hash: u64) -> Rc<PreparedFire> {
 #[test]
 fn two_fires_sharing_a_stage_become_one_region_dispatch() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let first = ready_fire(&mut f, 1);
@@ -278,7 +281,7 @@ fn two_fires_sharing_a_stage_become_one_region_dispatch() {
 #[test]
 fn a_group_never_encoded_says_so_once_instead_of_faulting_every_lane() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let fire = ready_fire(&mut f, 3);
@@ -308,7 +311,7 @@ fn a_group_never_encoded_says_so_once_instead_of_faulting_every_lane() {
 #[test]
 fn a_lane_that_went_stale_aborts_the_group_composition() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // A put program whose ring must have room; fill the ring so the fire
@@ -371,7 +374,7 @@ fn a_lane_that_went_stale_aborts_the_group_composition() {
 #[test]
 fn two_lanes_sharing_a_ring_are_refused_as_an_alias() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x93, true));

@@ -6,12 +6,12 @@
 
 /// The kernel-facing records and the generated `extern "C"` bridge.
 pub mod abi;
-/// Trace symbol → what runs it, derived from the routine's own row.
-pub mod route;
 /// The query-only fire vocabulary an arm reads facts through.
 pub mod cx;
 /// The driver's answer to every fact a bind arm can ask for.
 pub mod facts;
+/// Trace symbol → what runs it, derived from the routine's own row.
+pub mod route;
 /// The derived column, and the dispatch that binds a crossed symbol from it.
 pub mod table;
 /// The per-fire view arena: the runtime objects this driver answers, built
@@ -179,7 +179,11 @@ impl core::fmt::Display for Unfireable {
 /// scan of the symbol table by kernel id, pure in the table and [`Boot`].
 #[must_use]
 pub fn resolve(lowered: &Lowered, boot: Boot) -> Vec<route::Route> {
-    lowered.kernels.iter().map(|symbol| boot.route(symbol)).collect()
+    lowered
+        .kernels
+        .iter()
+        .map(|symbol| boot.route(symbol))
+        .collect()
 }
 
 /// What the boot decided. `None` means "the boot did not say", not "false":
@@ -225,11 +229,7 @@ impl DispatchPlan {
 
     /// [`Self::new`] with the boot's answer — the only caller of [`resolve`].
     #[must_use]
-    pub fn with_boot(
-        plan: &model_ir::trace::ForwardPlan,
-        lowered: &Lowered,
-        boot: Boot,
-    ) -> Self {
+    pub fn with_boot(plan: &model_ir::trace::ForwardPlan, lowered: &Lowered, boot: Boot) -> Self {
         use model_ir::trace::Dim;
         use model_ir::trace::OpKind;
         let width_of = |v: ValueId| -> u32 {
@@ -317,7 +317,9 @@ impl DispatchPlan {
                 && weights.first().is_some_and(|w| names_up(w))
                 && !op.outputs.is_empty()
             {
-                pair_up.entry(launch.layers.start).or_insert_with(|| out_arg(op.outputs[0]));
+                pair_up
+                    .entry(launch.layers.start)
+                    .or_insert_with(|| out_arg(op.outputs[0]));
             }
         }
         // One scan of the symbol table, resolved here and nowhere else.
@@ -328,7 +330,10 @@ impl DispatchPlan {
             .iter()
             .zip(&routes)
             .filter_map(|(symbol, route)| {
-                route.refusal().map(|why| Unfireable { symbol: symbol.clone(), why })
+                route.refusal().map(|why| Unfireable {
+                    symbol: symbol.clone(),
+                    why,
+                })
             })
             .collect();
         let specs = lowered
@@ -345,9 +350,10 @@ impl DispatchPlan {
                 let mut spec = match &op.kind {
                     // The one structural op that still names a weight of its
                     // own: the epilogue's readout projection.
-                    OpKind::LmHead { weight } => {
-                        LaunchSpec { weight: Some(weight.clone()), ..LaunchSpec::default() }
-                    }
+                    OpKind::LmHead { weight } => LaunchSpec {
+                        weight: Some(weight.clone()),
+                        ..LaunchSpec::default()
+                    },
                     // The FIRST weight rides the spec too, for `scale.*` arms.
                     // `params` does NOT: see below. The semantic variants
                     // (`Embed`, `Matmul`, `Rmsnorm`, ...) are retired wire
@@ -380,11 +386,41 @@ impl DispatchPlan {
                     .unwrap_or_default()
                     .to_vec();
                 spec.outs = outs;
-                spec.n_in = op.inputs.len();
                 // Mirrors the lowerer's split, not the op's dataflow:
                 // `op.dest` is non-empty exactly where `outputs` is empty.
-                spec.n_out =
-                    if op.outputs.is_empty() { op.dest.len() } else { op.outputs.len() };
+                spec.n_out = if op.outputs.is_empty() {
+                    op.dest.len()
+                } else {
+                    op.outputs.len()
+                };
+                // THE ARG RUN, NOT THE OP'S INPUTS.
+                //
+                // `Handles::over` walks `bound.args`, and `bound.args` is
+                // exactly what `lower::walk::emit_bound` pushed -- inputs,
+                // then outputs, then weights. Reading `op.inputs.len()` here
+                // asserted the walk pushed all of them, and the walk does not
+                // always: one op can lower to SEVERAL launches that each take
+                // a different prefix of its inputs. The epilogue is the case
+                // that made this visible. `LmHead` states two inputs, the
+                // hidden rows and the row list a sampling gather collects; the
+                // split leg emits `layout::gather_bf16_rows` with both and
+                // `gemm::act_x_w` with the first alone, because the projection
+                // has no mark for the row list. With `op.inputs.len()` the
+                // projection's single input was counted as two and its output
+                // was read off the end.
+                //
+                // Subtracting is safe because the run's shape is fixed: the
+                // weights are the trailing `weights.len()` args of a stated
+                // launch and a semantic op pushes none, so whatever is left
+                // after the outputs and the weights is the inputs.
+                let n_weight = match &op.kind {
+                    OpKind::Launch { weights, .. } => weights.len(),
+                    _ => 0,
+                };
+                spec.n_in = launch
+                    .args
+                    .len()
+                    .saturating_sub(spec.n_out + n_weight);
                 spec.state = op.kind.state_ref();
                 // `RmsnormPerHead`/`SplitQGate`'s `head_dim` and `Rope`'s
                 // `partial` rode the semantic ops; a swept routine takes each
@@ -406,7 +442,12 @@ impl DispatchPlan {
                 spec
             })
             .collect();
-        Self { specs, routes, unfireable, boot }
+        Self {
+            specs,
+            routes,
+            unfireable,
+            boot,
+        }
     }
 
     /// The spec for launch `i` — index-parallel with [`Lowered::launches`].
@@ -430,7 +471,11 @@ impl DispatchPlan {
     /// at all.
     #[must_use]
     pub fn sweep_progress(&self) -> (usize, usize) {
-        let stuck = self.routes.iter().filter(|r| matches!(r, route::Route::Unknown)).count();
+        let stuck = self
+            .routes
+            .iter()
+            .filter(|r| matches!(r, route::Route::Unknown))
+            .count();
         (stuck, self.routes.len())
     }
 }
@@ -449,7 +494,9 @@ impl DecodePlan {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Box::into_raw(Box::new(kernels_cuda::attn::fa2::plan::DecodePlanCache::default())),
+            cache: Box::into_raw(Box::new(
+                kernels_cuda::attn::fa2::plan::DecodePlanCache::default(),
+            )),
         }
     }
 
@@ -524,6 +571,27 @@ impl DecodePlan {
         use kernels_cuda::attn::fa2::plan as fa2;
 
         let _ = stream;
+        // THE CARVE THE PLAN WAS RAISED IN, STAMPED ON THE CACHE.
+        //
+        // `DecodePlanCache`/`PrefillPlanCache` grew these two pointers when
+        // the no-ask migration retired `keys::AttnWorkspaceFloat` and
+        // `keys::AttnWorkspaceInt`: a launcher used to ASK the driver for the
+        // carve it should accumulate split-KV partials into, and now reads it
+        // off the plan it was handed. The field docs say the driver stamps
+        // them when it raises the cache -- and nothing did. Every planned
+        // dispatch therefore read a null workspace, and the first one to
+        // dereference it refused by the name of a buffer three frames down
+        // (`v is null`, out of `cascade::merge_states_varlen`, because a
+        // split-KV decode folds its partials out of the float carve).
+        //
+        // Stamped BEFORE the planner runs, not after: `plan_decode` reads the
+        // cache it is given and a plan that declines still leaves a cache a
+        // later fire may look at.
+        {
+            let cache = self.get();
+            cache.int_workspace = workspace.int_buffer;
+            cache.float_workspace = workspace.float_buffer;
+        }
         let num_requests =
             i32::try_from(kv_page_indptr_h.len() - 1).expect("request count fits i32");
         let device = fa2::plan_device();
@@ -583,9 +651,9 @@ impl PrefillPlan {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Box::into_raw(
-                Box::new(kernels_cuda::attn::fa2::plan::PrefillPlanCache::default()),
-            ),
+            cache: Box::into_raw(Box::new(
+                kernels_cuda::attn::fa2::plan::PrefillPlanCache::default(),
+            )),
         }
     }
 
@@ -684,6 +752,15 @@ impl PrefillPlan {
         use kernels_cuda::attn::fa2::plan as fa2;
 
         let _ = (stream, kv_last_page_lens_h);
+        // See `DecodePlan::plan_decode_variant`. The prefill cache carries the
+        // two SIZES as well, because the planless leg plans against them.
+        {
+            let cache = self.get();
+            cache.int_workspace = workspace.int_buffer;
+            cache.float_workspace = workspace.float_buffer;
+            cache.int_workspace_bytes = workspace.int_bytes;
+            cache.float_workspace_bytes = workspace.float_bytes;
+        }
         let num_requests = i32::try_from(qo_indptr_h.len() - 1).expect("request count fits i32");
         let total_tokens = i32::try_from(*qo_indptr_h.last().expect("a CSR has a last entry"))
             .expect("token count fits i32");
@@ -846,7 +923,10 @@ impl DispatchCtx {
     /// layer is stated, which the kernel reads as "keep everything".
     #[expect(dead_code, reason = "the FLOOR half of an unbound row")]
     pub(crate) fn altup_std_mult(&self, layer: usize) -> f32 {
-        self.altup_std_mult_by_layer.get(layer).copied().unwrap_or(0.0)
+        self.altup_std_mult_by_layer
+            .get(layer)
+            .copied()
+            .unwrap_or(0.0)
     }
 }
 
@@ -1067,16 +1147,24 @@ fn mla_absorb(
     };
     // SAFETY: `ctx.stream` is this fire's and outlives the launch, and
     // `ctx.cublas` is the engine's handle with that same stream bound.
-    let cx = unsafe {
-        kernels_cuda::jit::Ctx::on(ctx.stream).with_cublas(ctx.cublas)
-    };
+    let cx = unsafe { kernels_cuda::jit::Ctx::on(ctx.stream).with_cublas(ctx.cublas) };
     // The arg indices must agree with `call`'s signature and nothing checks it:
     // `args[0]` `In<0>`, `args[n_in]` `Out<0>`, `args[n_in + n_out]` `Bank<0>`.
     let fired = call(
         &cx,
-        kernels::routine::In { ptr: b.args[0].ptr.cast_const(), rows: 0, width: 0 },
-        kernels::routine::Const { v: b.args[spec.n_in + spec.n_out].ptr.cast_const() },
-        kernels::routine::Out { ptr: b.args[spec.n_in].ptr, rows: 0, width: 0 },
+        kernels::routine::In {
+            ptr: b.args[0].ptr.cast_const(),
+            rows: 0,
+            width: 0,
+        },
+        kernels::routine::Const {
+            v: b.args[spec.n_in + spec.n_out].ptr.cast_const(),
+        },
+        kernels::routine::Out {
+            ptr: b.args[spec.n_in].ptr,
+            rows: 0,
+            width: 0,
+        },
         // THE FOUR EXTENTS THE STATEMENT CARRIES, plus the launch's own row
         // count as the appended `tokens` mark.
         p(0),
@@ -1119,7 +1207,6 @@ pub fn dispatch<R: Resolver>(
 ) -> Result<(), DispatchRefusal> {
     let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("rows fit i32");
 
-
     // The route was resolved at model load; no symbol string is compared here,
     // and a refusal in this match is the final answer, never a fallthrough.
     match spec.route {
@@ -1143,7 +1230,16 @@ pub fn dispatch<R: Resolver>(
             // per-expert arrays through the `expert_weights` view the
             // per-fire arena builds (`bind::views`), so nothing reads a
             // suffix at dispatch any more.
-            let fire = facts::Fire { bound, spec, ctx, attn, gdn, rows, w_named, w_named2 };
+            let fire = facts::Fire {
+                bound,
+                spec,
+                ctx,
+                attn,
+                gdn,
+                rows,
+                w_named,
+                w_named2,
+            };
             return table::derived_arm(&cx::Cx::new(&fire), ctx.stream)
                 .map_err(|r| DispatchRefusal::NoArm(format!("{}: {r}", bound.kernel)));
         }
@@ -1174,7 +1270,11 @@ pub fn dispatch<R: Resolver>(
 
     // The join's placements must window with the args, or a launch reads its
     // input at the window and writes its output at the base.
-    let win = if bound.kernel.ends_with("_devwin") { 0 } else { bound.rows.start };
+    let win = if bound.kernel.ends_with("_devwin") {
+        0
+    } else {
+        bound.rows.start
+    };
 
     // The spec's FOREIGN values (`LaunchSpec::aux`), resolved like the outs.
     let aux_slot = |i: usize, resolver: &mut R| -> Result<BoundArg, DispatchRefusal> {
@@ -1299,7 +1399,10 @@ pub fn dispatch<R: Resolver>(
             // `block_size` is param 0 and `max_blocks` param 1 — the two
             // numbers the operands carry only the PRODUCT of.
             let param = |i: usize| -> i32 {
-                spec.params.get(i).and_then(|v| i32::try_from(*v).ok()).unwrap_or(0)
+                spec.params
+                    .get(i)
+                    .and_then(|v| i32::try_from(*v).ok())
+                    .unwrap_or(0)
             };
             let bank = spec
                 .weight
@@ -1393,6 +1496,31 @@ pub fn dispatch<R: Resolver>(
             let Some((state, scratch)) = ctx.lora else {
                 return Ok(());
             };
+            // THE LANE'S SPAN IS THE FIRE'S, NOT THE SPLIT'S. Every operand
+            // here arrives windowed by `bound.rows.start`, and then
+            // `lora_qkv_correction` windows it AGAIN by the lane's
+            // `token_start` -- which the staging measured from row 0 of the
+            // whole fire, the same base the grouped path's `bf16_row(rows.q,
+            // v.token_start, hq)` uses. With `rows.start` at zero the two
+            // agree and everything below is right; with `rows.start` past zero
+            // the solo path would read and accumulate `rows.start` rows too
+            // far, silently, on an operand nobody would think to check.
+            //
+            // Splitting a lora fire is not supported rather than wrong: a
+            // correct split needs each lane's span intersected with
+            // `bound.rows` and re-based, and there is no fire that asks for it
+            // today (a `Union` lowering sets `captures_across_splits`, so its
+            // launches cover the whole window by construction, and no
+            // `Resolve` fire observed here has ever arrived with a nonzero
+            // start). It refuses so that the day one does, it says so.
+            if bound.rows.start != 0 {
+                return Err(DispatchRefusal::Out(format!(
+                    "{}: a lora fire cannot be split -- lane spans are stated \
+                     against row 0 of the fire, but this launch starts at row \
+                     {}",
+                    bound.kernel, bound.rows.start
+                )));
+            }
             let x = aux_slot(0, resolver)?;
             let (q, v) = (bound.args[0], bound.args[1]);
             // SAFETY: stream and cuBLAS handle are the fire's and live across
@@ -1403,13 +1531,29 @@ pub fn dispatch<R: Resolver>(
                     &jit,
                     (*state).staged(),
                     i32::from(bound.layers.start),
-                    kernels::routine::In { ptr: x.ptr.cast_const(), rows: 0, width: 0 },
+                    kernels::routine::In {
+                        ptr: x.ptr.cast_const(),
+                        rows: 0,
+                        width: 0,
+                    },
                     i32::try_from(x.width).expect("hidden"),
                     i32::try_from(q.width).expect("q width"),
                     i32::try_from(v.width).expect("v width"),
-                    kernels::routine::Out { ptr: q.ptr, rows: 0, width: 0 },
-                    kernels::routine::Out { ptr: v.ptr, rows: 0, width: 0 },
-                    kernels::routine::Out { ptr: scratch, rows: 0, width: 0 },
+                    kernels::routine::Out {
+                        ptr: q.ptr,
+                        rows: 0,
+                        width: 0,
+                    },
+                    kernels::routine::Out {
+                        ptr: v.ptr,
+                        rows: 0,
+                        width: 0,
+                    },
+                    kernels::routine::Out {
+                        ptr: scratch,
+                        rows: 0,
+                        width: 0,
+                    },
                 )
             };
             if let Err(why) = fired {
@@ -1437,6 +1581,15 @@ pub fn dispatch<R: Resolver>(
 pub struct MapResolver {
     weights: std::collections::BTreeMap<String, *const c_void>,
     named: std::collections::BTreeMap<ValueId, *mut c_void>,
+    /// What a `Prep` raised, by the KEY the statement spells.
+    ///
+    /// Keyed on the word and not the value, which is the case
+    /// [`Resolver::raised`]'s doc calls out as the key's own: this map is
+    /// filled by hand, one entry per kind of schedule, by a caller that holds
+    /// one of each. The live path keys on the value because two prefills of
+    /// different head dim both spell `fa2.prefill`; a caller that has two
+    /// wants `fire::launch`'s resolver, not this one.
+    raised: std::collections::BTreeMap<String, *const c_void>,
 }
 
 impl MapResolver {
@@ -1455,6 +1608,16 @@ impl MapResolver {
     pub fn insert_named(&mut self, value: ValueId, ptr: *mut c_void) {
         self.named.insert(value, ptr);
     }
+
+    /// Bind a raise key to the object a prep staged for it.
+    ///
+    /// `"fa2.prefill"` is the one every prefill fixture needs. Without it the
+    /// walk stops at the prefill launcher's first argument with
+    /// [`BindRefusal::RaisedUnbound`], because the default is `None` and
+    /// `None` is a refusal rather than a null.
+    pub fn insert_raised(&mut self, key: impl Into<String>, ptr: *const c_void) {
+        self.raised.insert(key.into(), ptr);
+    }
 }
 
 impl Resolver for MapResolver {
@@ -1470,6 +1633,12 @@ impl Resolver for MapResolver {
     }
     fn named(&mut self, value: ValueId) -> Option<*mut c_void> {
         self.named.get(&value).copied()
+    }
+    fn raised(&mut self, _value: ValueId, key: &str) -> Option<*const c_void> {
+        // BY THE KEY. See the field: this map holds one object per kind, so
+        // the value adds nothing it could tell apart. An unheld key is `None`
+        // and therefore a refusal.
+        self.raised.get(key).copied()
     }
 }
 
@@ -1517,13 +1686,20 @@ impl<'a> AttnRegions<'a> {
     /// A peeled fire: the prefix uses the fire's state, the tail its own.
     #[must_use]
     pub const fn split(fire: &'a AttnCtx, tail: &'a AttnCtx) -> Self {
-        Self { fire: Some(fire), tail: Some(tail) }
+        Self {
+            fire: Some(fire),
+            tail: Some(tail),
+        }
     }
 
     /// The state a rectangle executes against, keyed on whether it is WINDOWED.
     #[must_use]
     pub fn of(&self, rows: &std::ops::Range<u32>) -> Option<&'a AttnCtx> {
-        if rows.start == 0 { self.fire } else { self.tail.or(self.fire) }
+        if rows.start == 0 {
+            self.fire
+        } else {
+            self.tail.or(self.fire)
+        }
     }
 }
 
@@ -1552,9 +1728,20 @@ pub fn run<R: Resolver>(
             kernel: kernel(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(&bound, dplan.spec(i), frame, resolver, ctx, attn.of(&launch.rows), gdn).map_err(
-            |e| RunRefusal { launch: i, kernel: kernel(), why: RunRefusalKind::Dispatch(e) },
-        )?;
+        dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            resolver,
+            ctx,
+            attn.of(&launch.rows),
+            gdn,
+        )
+        .map_err(|e| RunRefusal {
+            launch: i,
+            kernel: kernel(),
+            why: RunRefusalKind::Dispatch(e),
+        })?;
     }
     Ok(lowered.launches.len())
 }
@@ -1623,6 +1810,7 @@ pub fn run_captured<R: Resolver>(
         why: RunRefusalKind::Dispatch(DispatchRefusal::NoArm(format!("capture: {e}"))),
     };
 
+    let outer = ctx.stream;
     for (i, launch) in lowered.launches.iter().enumerate() {
         let kernel = lowered.kernels[launch.kernel as usize].clone();
         let target = cond_path(&lowered.conds, launch.cond);
@@ -1642,7 +1830,9 @@ pub fn run_captured<R: Resolver>(
         while stack.len() > close_to {
             builder.end_body().map_err(|e| cuda(i, &kernel, e))?;
             let f = stack.pop().expect("stack is non-empty");
-            builder.close_cond(&f.cond).map_err(|e| cuda(i, &kernel, e))?;
+            builder
+                .close_cond(&f.cond)
+                .map_err(|e| cuda(i, &kernel, e))?;
         }
 
         if let Some(s) = switch_at {
@@ -1657,13 +1847,16 @@ pub fn run_captured<R: Resolver>(
         for &node in &target[keep..] {
             let region = lowered.conds[node as usize];
             // Always with_else: the sibling arm may arrive later.
-            let cond = builder.open_cond(region.slot, true).map_err(|e| cuda(i, &kernel, e))?;
+            let cond = builder
+                .open_cond(region.slot, true)
+                .map_err(|e| cuda(i, &kernel, e))?;
             let body = arm_body(&cond, &lowered.conds, node);
             builder.begin_body(body).map_err(|e| cuda(i, &kernel, e))?;
             stack.push(OpenCond { cond, node });
         }
 
         ctx.stream = builder.stream().as_raw().cast::<c_void>();
+        bind_cublas_stream(&ctx);
 
         // As `run`'s: the region, before the operands.
         resolver.region(&launch.rows);
@@ -1672,12 +1865,20 @@ pub fn run_captured<R: Resolver>(
             kernel: kernel.clone(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(&bound, dplan.spec(i), frame, resolver, &ctx, attn.of(&launch.rows), gdn)
-            .map_err(|e| RunRefusal {
-                launch: i,
-                kernel: kernel.clone(),
-                why: RunRefusalKind::Dispatch(e),
-            })?;
+        dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            resolver,
+            &ctx,
+            attn.of(&launch.rows),
+            gdn,
+        )
+        .map_err(|e| RunRefusal {
+            launch: i,
+            kernel: kernel.clone(),
+            why: RunRefusalKind::Dispatch(e),
+        })?;
         // Retain the node by INDEX, so a same-topology fire differing only in
         // row count updates instead of recapturing; a no-kernel dispatch gaps.
         builder.retain_node(i);
@@ -1687,10 +1888,54 @@ pub fn run_captured<R: Resolver>(
     let last = lowered.launches.len().saturating_sub(1);
     while let Some(f) = stack.pop() {
         builder.end_body().map_err(|e| cuda(last, "<unwind>", e))?;
-        builder.close_cond(&f.cond).map_err(|e| cuda(last, "<unwind>", e))?;
+        builder
+            .close_cond(&f.cond)
+            .map_err(|e| cuda(last, "<unwind>", e))?;
     }
+    // Back to the stream the fire bound, so the epilogue and the next fire's
+    // eager warm-up do not inherit a body stream that is about to be closed.
+    ctx.stream = outer;
+    bind_cublas_stream(&ctx);
 
     Ok(lowered.launches.len())
+}
+
+/// Point the cuBLAS handle at whatever stream `ctx` now names.
+///
+/// # What this repairs
+///
+/// A kernel launch takes its stream as an argument, so the walk above moving
+/// `ctx.stream` into a conditional's body is enough to put the launch in that
+/// body. A cuBLAS call does not: it takes a HANDLE, and the handle carries the
+/// stream, bound once per fire by `step_impl` and never again.
+///
+/// So every cuBLAS call issued from inside a guard arm was recorded onto the
+/// OUTER capturing stream -- into the graph's main body, not the conditional
+/// node's. It therefore ran unconditionally, and it ran unordered with respect
+/// to the kernels of the region it belongs to, because a conditional node and
+/// the body around it are two different pieces of the graph and nothing joins
+/// them but the node boundary.
+///
+/// The backbone's own projections never noticed, because they are not guarded.
+/// The one guarded region that reaches cuBLAS is the adapter's: the whole of
+/// `gemm::lora_qkv_correction` is cuBLAS, and it sits under `HasLora`. With no
+/// adapter staged, a captured fire and an eager one agreed exactly; with one
+/// staged, the captured fire answered something different on almost every
+/// fire while the eager fire was reproducible to the token.
+#[cfg(feature = "_cuda")]
+fn bind_cublas_stream(ctx: &DispatchCtx) {
+    if ctx.cublas.is_null() {
+        return;
+    }
+    // SAFETY: the handle is the fire's, alive for the whole walk, and the
+    // stream is the one the builder just handed over.
+    let status =
+        unsafe { cudarc::cublas::sys::cublasSetStream_v2(ctx.cublas.cast(), ctx.stream.cast()) };
+    debug_assert_eq!(
+        status,
+        cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+        "cublasSetStream refused the region stream"
+    );
 }
 
 /// Which of a conditional's two bodies serves tree node `node`.
@@ -1701,7 +1946,11 @@ fn arm_body(
     node: u32,
 ) -> cudarc::runtime::sys::cudaGraph_t {
     let on_true = conds.get(node as usize).is_none_or(|r| r.on_true);
-    if on_true { cond.if_body() } else { cond.else_body().unwrap_or_else(|| cond.if_body()) }
+    if on_true {
+        cond.if_body()
+    } else {
+        cond.else_body().unwrap_or_else(|| cond.if_body())
+    }
 }
 
 /// Resolve one [`Arg`]: the three rules, shared by [`bind`] and by the arms
@@ -1735,9 +1984,16 @@ pub fn resolve_arg_windowed<R: Resolver>(
             let skip = row as usize * *width as usize * *bytes as usize;
             let at = *at + skip;
             if at >= frame.arena_bytes {
-                return Err(BindRefusal::ArenaOutOfBounds { at, arena_bytes: frame.arena_bytes });
+                return Err(BindRefusal::ArenaOutOfBounds {
+                    at,
+                    arena_bytes: frame.arena_bytes,
+                });
             }
-            BoundArg { ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(), width: *width, rows: 0 }
+            BoundArg {
+                ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(),
+                width: *width,
+                rows: 0,
+            }
         }
         Arg::Raised { value, key } => {
             // NO ROW WINDOW. `row` offsets a rectangle by its own pitch and a
@@ -1746,10 +2002,20 @@ pub fn resolve_arg_windowed<R: Resolver>(
             let ptr = resolver
                 .raised(*value, key)
                 .ok_or_else(|| BindRefusal::RaisedUnbound { key: key.clone() })?;
-            BoundArg { ptr: ptr.cast_mut(), width: 0, rows: 0 }
+            BoundArg {
+                ptr: ptr.cast_mut(),
+                width: 0,
+                rows: 0,
+            }
         }
-        Arg::Named { value, width, bytes: _ } => BoundArg {
-            ptr: resolver.named(*value).ok_or(BindRefusal::UnknownNamed(*value))?,
+        Arg::Named {
+            value,
+            width,
+            bytes: _,
+        } => BoundArg {
+            ptr: resolver
+                .named(*value)
+                .ok_or(BindRefusal::UnknownNamed(*value))?,
             width: *width,
             rows: 0,
         },
@@ -1757,7 +2023,11 @@ pub fn resolve_arg_windowed<R: Resolver>(
             // `scale.` marks a CONSTANT riding the name slot; the value comes
             // from `DispatchCtx::scales`, and the slot binds a sentinel.
             if name.starts_with("scale.") {
-                BoundArg { ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(), width: 0, rows: 0 }
+                BoundArg {
+                    ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                    width: 0,
+                    rows: 0,
+                }
             } else {
                 BoundArg {
                     ptr: resolver
@@ -1787,7 +2057,11 @@ pub fn bind<'a, R: Resolver>(
     // THE WINDOW, applied here and not in the arms: a peel's tail serves rows
     // `[win_start, ..)` of a full-N buffer, and `outs`/`aux` resolve through the
     // same call. `_devwin` forms take BASE pointers, so they are not windowed.
-    let row = if kernel.ends_with("_devwin") { 0 } else { launch.rows.start };
+    let row = if kernel.ends_with("_devwin") {
+        0
+    } else {
+        launch.rows.start
+    };
     let span = launch.args.start as usize..launch.args.end as usize;
     let mut args = Vec::with_capacity(span.len());
     for (i, arg) in lowered.args[span.clone()].iter().enumerate() {
@@ -1802,5 +2076,10 @@ pub fn bind<'a, R: Resolver>(
         }
         args.push(a);
     }
-    Ok(BoundLaunch { kernel, rows: launch.rows.clone(), layers: launch.layers.clone(), args })
+    Ok(BoundLaunch {
+        kernel,
+        rows: launch.rows.clone(),
+        layers: launch.layers.clone(),
+        args,
+    })
 }

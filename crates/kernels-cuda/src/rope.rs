@@ -1,16 +1,15 @@
-
 #![allow(clippy::too_many_arguments)]
 
-use kernels::{Bind, Fire};
-use kernels::routine::{Const, In, InOut, Out};
-use kernels_macros::routine;
 use crate::jit::Abi;
-use crate::jit::abi::{MaybeConst, bf16, f16};
 use crate::jit::abi::Tensor;
+use crate::jit::abi::{MaybeConst, bf16, f16};
 use crate::jit::{Ctx, Launch};
+use crate::views::KvCache;
 use kernels::Refusal;
 use kernels::raises::Struct;
-use crate::views::KvCache;
+use kernels::routine::{Const, In, InOut, Out};
+use kernels::{Bind, Fire};
+use kernels_macros::routine;
 
 use core::ptr::NonNull;
 
@@ -22,7 +21,11 @@ pub const MAX_CACHED_PAIRS: i32 = 4096;
 
 #[must_use]
 pub const fn heads_per_block(half: i32) -> i32 {
-    if half >= ROTATE_BLOCK { 1 } else { ROTATE_BLOCK / half }
+    if half >= ROTATE_BLOCK {
+        1
+    } else {
+        ROTATE_BLOCK / half
+    }
 }
 
 #[must_use]
@@ -32,19 +35,21 @@ pub const fn cache_pairs(half: i32) -> i32 {
 
 #[must_use]
 const fn fused_launch(rows: i32, total_heads: i32) -> Launch {
-    Launch::grid([rows.unsigned_abs(), total_heads.unsigned_abs(), 1], [FUSED_BLOCK, 1, 1])
+    Launch::grid(
+        [rows.unsigned_abs(), total_heads.unsigned_abs(), 1],
+        [FUSED_BLOCK, 1, 1],
+    )
 }
 
 #[must_use]
 const fn rotate_launch(num_tokens: i32, total_heads: i32, per_block: i32, smem: u32) -> Launch {
-
     #[must_use]
     const fn rotate_grid(num_tokens: i32, total_heads: i32, per_block: i32) -> [u32; 3] {
-    [
-    num_tokens.unsigned_abs(),
-    (total_heads + per_block - 1).unsigned_abs() / per_block.unsigned_abs(),
-    1,
-    ]
+        [
+            num_tokens.unsigned_abs(),
+            (total_heads + per_block - 1).unsigned_abs() / per_block.unsigned_abs(),
+            1,
+        ]
     }
 
     Launch::grid(
@@ -62,7 +67,6 @@ pub fn ramp_bounds(
     beta_slow: f32,
     original_max_position: i32,
 ) -> (f32, f32) {
-
     const TWO_PI: f32 = core::f32::consts::TAU;
     let ln_theta = theta.ln();
     #[allow(clippy::cast_precision_loss)]
@@ -100,14 +104,18 @@ fn heads(width: i32, head_dim: i32) -> Result<i32, Refusal> {
 
 fn q_heads(width: i32, head_dim: i32) -> Result<i32, Refusal> {
     if width <= 0 {
-        return Err(Refusal::Empty { what: "the q region's width" });
+        return Err(Refusal::Empty {
+            what: "the q region's width",
+        });
     }
     heads(width, head_dim)
 }
 
 fn k_heads<T>(q: *mut T, k: *mut T, width: i32, head_dim: i32) -> Result<i32, Refusal> {
     if width <= 0 && !k.is_null() && !core::ptr::eq(k.cast_const(), q.cast_const()) {
-        return Err(Refusal::Empty { what: "the k region's width" });
+        return Err(Refusal::Empty {
+            what: "the k region's width",
+        });
     }
     heads(width, head_dim)
 }
@@ -118,19 +126,26 @@ pub fn rope_standard_table(
     table: Out<Tensor<f32>>,
     head_dim: Const<i32>,
     theta: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
 
     let positions = positions.ptr;
     if head_dim / 2 <= 0 {
-        return Err(Refusal::Empty { what: "head_dim / 2" });
+        return Err(Refusal::Empty {
+            what: "head_dim / 2",
+        });
     }
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::standard_table<::pie::i32>").apply(Launch::per_row(table.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[positions.arg(), table.arg(), head_dim.arg(), theta.arg()])
+    ctx.fire(
+        Fire::at("rope/rope.cuh", "::pie::rope::standard_table<::pie::i32>").apply(
+            Launch::per_row(table.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs()),
+        ),
+        &[positions.arg(), table.arg(), head_dim.arg(), theta.arg()],
+    )
 }
 
-#[routine(canon = rope)]
+#[routine(canon = rope, out(q = like(q)), out(k = like(k)))]
 pub fn rope_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -140,8 +155,8 @@ pub fn rope_bf16(
     head_dim: Const<i32>,
     theta: Const<f32>,
     interleaved: Const<bool>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let num_q_heads = *num_q_heads;
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
@@ -154,31 +169,38 @@ pub fn rope_bf16(
     let smem = pairs.unsigned_abs() * 2 * 4;
     let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate<::pie::false_type::value, false>").apply(rotate_launch(q.rows, total_heads, per_block, smem)), &[
-                q.arg(),
-                k.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                interleaved.arg(),
-                pairs.arg(),
-                per_block.arg(),
-                MaybeConst::<bf16>::none().arg(),
-                None::<NonNull<bf16>>.arg(),
-                None::<NonNull<bf16>>.arg(),
-                MaybeConst::<u32>::none().arg(),
-                MaybeConst::<u32>::none().arg(),
-                MaybeConst::<u32>::none().arg(),
-                MaybeConst::<u32>::none().arg(),
-                MaybeConst::<u8>::none().arg(),
-                0_i32.arg(),
-                0_i32.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "rope/rope.cuh",
+            "::pie::rope::rotate<::pie::false_type::value, false>",
+        )
+        .apply(rotate_launch(q.rows, total_heads, per_block, smem)),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            interleaved.arg(),
+            pairs.arg(),
+            per_block.arg(),
+            MaybeConst::<bf16>::none().arg(),
+            None::<NonNull<bf16>>.arg(),
+            None::<NonNull<bf16>>.arg(),
+            MaybeConst::<u32>::none().arg(),
+            MaybeConst::<u32>::none().arg(),
+            MaybeConst::<u32>::none().arg(),
+            MaybeConst::<u32>::none().arg(),
+            MaybeConst::<u8>::none().arg(),
+            0_i32.arg(),
+            0_i32.arg(),
+        ],
+    )
 }
 
-#[routine(whole)]
+#[routine(whole, out(q = like(q)))]
 pub fn rope_write_kv_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -192,9 +214,12 @@ pub fn rope_write_kv_bf16(
     theta: Const<f32>,
     qo_indptr: In<Tensor<i32>>,
     row_valid: In<Tensor<i32>>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
 
@@ -221,34 +246,45 @@ pub fn rope_write_kv_bf16(
     let smem = pairs.unsigned_abs() * 2 * 4;
     let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
-    let instantiation =
-        if hnd_layout { "::pie::rope::rotate<\
-                             ::pie::true_type::value, true>" } else { "::pie::rope::rotate<::pie::true_type::value, false>" };
-    ctx.fire(Fire::at("rope/rope.cuh", instantiation).apply(rotate_launch(q.rows, total_heads, per_block, smem)), &[
-                q.arg(),
-                k.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                interleaved.arg(),
-                pairs.arg(),
-                per_block.arg(),
-                MaybeConst::new(v.ptr).arg(),
-                NonNull::new(k_pages).arg(),
-                NonNull::new(v_pages).arg(),
-                MaybeConst::new(qo_indptr).arg(),
-                MaybeConst::new(kv_page_indices).arg(),
-                MaybeConst::new(kv_page_indptr).arg(),
-                MaybeConst::new(kv_last_page_lens).arg(),
-                MaybeConst::new(row_valid).arg(),
-                num_requests.arg(),
-                page_size.arg(),
-            ])
+    let instantiation = if hnd_layout {
+        "::pie::rope::rotate<\
+                             ::pie::true_type::value, true>"
+    } else {
+        "::pie::rope::rotate<::pie::true_type::value, false>"
+    };
+    ctx.fire(
+        Fire::at("rope/rope.cuh", instantiation).apply(rotate_launch(
+            q.rows,
+            total_heads,
+            per_block,
+            smem,
+        )),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            interleaved.arg(),
+            pairs.arg(),
+            per_block.arg(),
+            MaybeConst::new(v.ptr).arg(),
+            NonNull::new(k_pages).arg(),
+            NonNull::new(v_pages).arg(),
+            MaybeConst::new(qo_indptr).arg(),
+            MaybeConst::new(kv_page_indices).arg(),
+            MaybeConst::new(kv_page_indptr).arg(),
+            MaybeConst::new(kv_last_page_lens).arg(),
+            MaybeConst::new(row_valid).arg(),
+            num_requests.arg(),
+            page_size.arg(),
+        ],
+    )
 }
 
-#[routine]
+#[routine(out(q = like(q)), out(k = like(k)))]
 pub fn qk_rmsnorm_rope_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -258,28 +294,37 @@ pub fn qk_rmsnorm_rope_bf16(
     head_dim: Const<i32>,
     theta: Const<f32>,
     eps: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
     let eps = *eps;
 
     let positions = positions.ptr;
-    let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
+    let (num_q_heads, num_kv_heads) = (
+        q_heads(q.width, head_dim)?,
+        k_heads(q.ptr, k.ptr, k.width, head_dim)?,
+    );
     let total_heads = num_q_heads + num_kv_heads;
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate<::pie::i32(128)>").apply(fused_launch(q.rows, total_heads)), &[
-                q.arg(),
-                k.arg(),
-                q_weight.arg(),
-                k_weight.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                eps.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "rope/rope.cuh",
+            "::pie::rope::qk_rmsnorm_rotate<::pie::i32(128)>",
+        )
+        .apply(fused_launch(q.rows, total_heads)),
+        &[
+            q.arg(),
+            k.arg(),
+            q_weight.arg(),
+            k_weight.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            eps.arg(),
+        ],
+    )
 }
 
 #[routine(whole)]
@@ -295,8 +340,8 @@ pub fn qk_rmsnorm_rope_bf16_devwin(
     n_max: Const<i32>,
     positions: In<Tensor<i32>>,
     win_start: Const<i32>,
-    win_len: Const<i32>) -> Result<(), Refusal> {
-
+    win_len: Const<i32>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
     let eps = *eps;
@@ -304,25 +349,34 @@ pub fn qk_rmsnorm_rope_bf16_devwin(
     let win = crate::stage_peel_window(ctx, "rope::qk_devwin", *win_start, *win_len)?;
     let n_max = *n_max;
     let positions = positions.ptr;
-    let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
+    let (num_q_heads, num_kv_heads) = (
+        q_heads(q.width, head_dim)?,
+        k_heads(q.ptr, k.ptr, k.width, head_dim)?,
+    );
     let total_heads = num_q_heads + num_kv_heads;
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate_devwin<::pie::i32(128)>").apply(fused_launch(n_max, total_heads)), &[
-                q.arg(),
-                k.arg(),
-                q_weight.arg(),
-                k_weight.arg(),
-                positions.arg(),
-                win.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                eps.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "rope/rope.cuh",
+            "::pie::rope::qk_rmsnorm_rotate_devwin<::pie::i32(128)>",
+        )
+        .apply(fused_launch(n_max, total_heads)),
+        &[
+            q.arg(),
+            k.arg(),
+            q_weight.arg(),
+            k_weight.arg(),
+            positions.arg(),
+            win.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            eps.arg(),
+        ],
+    )
 }
 
-#[routine]
+#[routine(out(q = like(q)), out(k = like(k)))]
 pub fn qk_rmsnorm_mrope_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -337,8 +391,8 @@ pub fn qk_rmsnorm_mrope_bf16(
     head_dim: Const<i32>,
     theta: Const<f32>,
     eps: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let mrope_section_t = *mrope_section_t;
     let mrope_section_h = *mrope_section_h;
     let mrope_section_w = *mrope_section_w;
@@ -350,24 +404,31 @@ pub fn qk_rmsnorm_mrope_bf16(
 
     let positions = positions.ptr;
     let total_heads = num_q_heads + num_kv_heads;
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate_mrope<::pie::i32(128)>").apply(fused_launch(q.rows, total_heads)), &[
-                q.arg(),
-                k.arg(),
-                q_weight.arg(),
-                k_weight.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                eps.arg(),
-                mrope_section_t.arg(),
-                mrope_section_h.arg(),
-                mrope_section_w.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "rope/rope.cuh",
+            "::pie::rope::qk_rmsnorm_rotate_mrope<::pie::i32(128)>",
+        )
+        .apply(fused_launch(q.rows, total_heads)),
+        &[
+            q.arg(),
+            k.arg(),
+            q_weight.arg(),
+            k_weight.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            eps.arg(),
+            mrope_section_t.arg(),
+            mrope_section_h.arg(),
+            mrope_section_w.arg(),
+        ],
+    )
 }
 
-#[routine]
+#[routine(out(q = like(q)), out(k = like(k)))]
 pub fn qk_rmsnorm_rope_bf16_rounded(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -377,31 +438,40 @@ pub fn qk_rmsnorm_rope_bf16_rounded(
     head_dim: Const<i32>,
     theta: Const<f32>,
     eps: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
     let eps = *eps;
 
     let positions = positions.ptr;
-    let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
+    let (num_q_heads, num_kv_heads) = (
+        q_heads(q.width, head_dim)?,
+        k_heads(q.ptr, k.ptr, k.width, head_dim)?,
+    );
     let total_heads = num_q_heads + num_kv_heads;
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate_rounded<::pie::i32(128)>").apply(fused_launch(q.rows, total_heads)), &[
-                q.arg(),
-                k.arg(),
-                q_weight.arg(),
-                k_weight.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                eps.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "rope/rope.cuh",
+            "::pie::rope::qk_rmsnorm_rotate_rounded<::pie::i32(128)>",
+        )
+        .apply(fused_launch(q.rows, total_heads)),
+        &[
+            q.arg(),
+            k.arg(),
+            q_weight.arg(),
+            k_weight.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            eps.arg(),
+        ],
+    )
 }
 
-#[routine]
+#[routine(out(q = like(q)))]
 pub fn q_rmsnorm_rope_bf16_rounded(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -409,8 +479,8 @@ pub fn q_rmsnorm_rope_bf16_rounded(
     head_dim: Const<i32>,
     theta: Const<f32>,
     eps: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     qk_rmsnorm_rope_bf16_rounded(
         ctx,
         q,
@@ -420,7 +490,9 @@ pub fn q_rmsnorm_rope_bf16_rounded(
             width: 0,
         },
         q_weight,
-        Const { v: core::ptr::null() },
+        Const {
+            v: core::ptr::null(),
+        },
         head_dim,
         theta,
         eps,
@@ -428,7 +500,7 @@ pub fn q_rmsnorm_rope_bf16_rounded(
     )
 }
 
-#[routine]
+#[routine(out(q = like(q)), out(k = like(k)))]
 pub fn rope_yarn_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -441,8 +513,8 @@ pub fn rope_yarn_bf16(
     num_kv_heads: Const<i32>,
     head_dim: Const<i32>,
     theta: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     // The YaRN block, which `Cx::yarn` has answered all along: the four
     // numbers were parameters only because no routine asked for them.
     let factor = *factor;
@@ -460,23 +532,31 @@ pub fn rope_yarn_bf16(
     let per_block = heads_per_block(half);
     #[allow(clippy::cast_precision_loss)]
     let orig_max_pos = original_max_position as f32;
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn").apply(rotate_launch(q.rows, total_heads, per_block, 0)), &[
-                q.arg(),
-                k.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                factor.arg(),
-                low_freq_factor.arg(),
-                high_freq_factor.arg(),
-                orig_max_pos.arg(),
-                per_block.arg(),
-            ])
+    ctx.fire(
+        Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn").apply(rotate_launch(
+            q.rows,
+            total_heads,
+            per_block,
+            0,
+        )),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            factor.arg(),
+            low_freq_factor.arg(),
+            high_freq_factor.arg(),
+            orig_max_pos.arg(),
+            per_block.arg(),
+        ],
+    )
 }
 
-#[routine]
+#[routine(out(q = like(q)), out(k = like(k)))]
 pub fn rope_yarn_original_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -489,8 +569,8 @@ pub fn rope_yarn_original_bf16(
     attention_factor: Const<f32>,
     original_max_position: Const<i32>,
     interleaved: Const<bool>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
     let factor = *factor;
@@ -503,38 +583,45 @@ pub fn rope_yarn_original_bf16(
     let positions = positions.ptr;
 
     if original_max_position <= 0 {
-        return Err(Refusal::Unstated { what: "the checkpoint's YaRN block" });
+        return Err(Refusal::Unstated {
+            what: "the checkpoint's YaRN block",
+        });
     }
-    let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
-    let (low_dim, high_dim) = ramp_bounds(
-        head_dim,
-        theta,
-        beta_fast,
-        beta_slow,
-        original_max_position,
+    let (num_q_heads, num_kv_heads) = (
+        q_heads(q.width, head_dim)?,
+        k_heads(q.ptr, k.ptr, k.width, head_dim)?,
     );
+    let (low_dim, high_dim) =
+        ramp_bounds(head_dim, theta, beta_fast, beta_slow, original_max_position);
     let half = head_dim / 2;
     let pairs = cache_pairs(half);
     let smem = pairs.unsigned_abs() * 8;
     let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn_original").apply(rotate_launch(q.rows, total_heads, per_block, smem)), &[
-                q.arg(),
-                k.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                theta.arg(),
-                factor.arg(),
-                low_dim.arg(),
-                high_dim.arg(),
-                attention_factor.arg(),
-                interleaved.arg(),
-                per_block.arg(),
-                pairs.arg(),
-            ])
+    ctx.fire(
+        Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn_original").apply(rotate_launch(
+            q.rows,
+            total_heads,
+            per_block,
+            smem,
+        )),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            theta.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            attention_factor.arg(),
+            interleaved.arg(),
+            per_block.arg(),
+            pairs.arg(),
+        ],
+    )
 }
 
 fn rope_partial<T>(
@@ -548,29 +635,38 @@ fn rope_partial<T>(
     k_width: i32,
     head_dim: i32,
     rotary_dim: i32,
-    theta: f32) -> Result<(), Refusal>
+    theta: f32,
+) -> Result<(), Refusal>
 where
     T: kernels::Elem,
     *mut T: Abi + kernels::Bind<crate::jit::ArgValue>,
     T: kernels::Elem<Write = *mut T>,
     <T as kernels::Elem>::Write: Abi,
 {
-    let (num_q_heads, num_kv_heads) =
-        (q_heads(q_width, head_dim)?, k_heads(q, k, k_width, head_dim)?);
-    ctx.fire(Fire::at("rope/rope.cuh", instantiation).apply(Launch::per_row(num_tokens.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[
-                q.arg(),
-                k.arg(),
-                positions.arg(),
-                0i32.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                rotary_dim.arg(),
-                theta.arg(),
-            ])
+    let (num_q_heads, num_kv_heads) = (
+        q_heads(q_width, head_dim)?,
+        k_heads(q, k, k_width, head_dim)?,
+    );
+    ctx.fire(
+        Fire::at("rope/rope.cuh", instantiation).apply(Launch::per_row(
+            num_tokens.unsigned_abs(),
+            ROTATE_BLOCK.unsigned_abs(),
+        )),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            0i32.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            rotary_dim.arg(),
+            theta.arg(),
+        ],
+    )
 }
 
-#[routine(canon = "rope.partial")]
+#[routine(canon = "rope.partial", out(q = like(q)), out(k = like(k)))]
 pub fn rope_partial_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -578,8 +674,8 @@ pub fn rope_partial_bf16(
     rotary_dim: Const<i32>,
     head_dim: Const<i32>,
     theta: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
     let positions = positions.ptr;
@@ -598,15 +694,15 @@ pub fn rope_partial_bf16(
     )
 }
 
-#[routine]
+#[routine(out(q = like(q)))]
 pub fn rope_partial_q_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
     rotary_dim: Const<i32>,
     head_dim: Const<i32>,
     theta: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let theta = *theta;
     let positions = positions.ptr;
@@ -633,8 +729,8 @@ pub fn rope_partial_f16(
     head_dim: Const<i32>,
     rotary_dim: Const<i32>,
     theta: Const<f32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let rotary_dim = *rotary_dim;
     let theta = *theta;
@@ -668,8 +764,8 @@ pub fn rope_partial_last_bf16(
     yarn_beta_fast: Const<f32>,
     yarn_beta_slow: Const<f32>,
     yarn_original_max_position: Const<i32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let head_dim = *head_dim;
     let rotary_dim = *rotary_dim;
     let theta = *theta;
@@ -692,25 +788,34 @@ pub fn rope_partial_last_bf16(
     } else {
         (0.0, 0.0)
     };
-    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate_partial_last").apply(Launch::per_row(q.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[
-                q.arg(),
-                k.arg(),
-                positions.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                rotary_dim.arg(),
-                theta.arg(),
-                false.arg(),
-                interleaved.arg(),
-                yarn_factor.arg(),
-                low_dim.arg(),
-                high_dim.arg(),
-            ])
+    ctx.fire(
+        Fire::at("rope/rope.cuh", "::pie::rope::rotate_partial_last").apply(Launch::per_row(
+            q.rows.unsigned_abs(),
+            ROTATE_BLOCK.unsigned_abs(),
+        )),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            num_q_heads.arg(),
+            num_kv_heads.arg(),
+            head_dim.arg(),
+            rotary_dim.arg(),
+            theta.arg(),
+            false.arg(),
+            interleaved.arg(),
+            yarn_factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+        ],
+    )
 }
 
-#[expect(clippy::too_many_arguments, reason = "D1: a routine takes fields, never a struct")]
-#[routine]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "D1: a routine takes fields, never a struct"
+)]
+#[routine(out(q = split(q, head_dim)))]
 pub fn rope_partial_last_q_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -722,11 +827,15 @@ pub fn rope_partial_last_q_bf16(
     yarn_beta_fast: Const<f32>,
     yarn_beta_slow: Const<f32>,
     yarn_original_max_position: Const<i32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
-
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     rope_partial_last_bf16(
         ctx,
-        Out { ptr: q.ptr, rows: q.rows, width: q.width },
+        Out {
+            ptr: q.ptr,
+            rows: q.rows,
+            width: q.width,
+        },
         Out {
             ptr: q.ptr,
             rows: q.rows,
@@ -746,7 +855,6 @@ pub fn rope_partial_last_q_bf16(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Yarn {
-
     pub factor: f32,
     pub beta_fast: f32,
     pub beta_slow: f32,
@@ -754,7 +862,6 @@ pub struct Yarn {
     pub original_max_position: i32,
 }
 impl Yarn {
-
     pub const NONE: Self = Self {
         factor: 1.0,
         beta_fast: 0.0,

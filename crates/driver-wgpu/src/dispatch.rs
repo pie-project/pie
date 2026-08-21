@@ -538,7 +538,11 @@ mod tests {
                 arena_arg(2048),
                 arena_arg(4096),
             ],
-            Vec::new(),
+            // ONE SCALAR, `rows`: after the marks migration `argmax_logits`
+            // takes its rectangle as a `Const<u32>` on the statement, so a
+            // fixture with an empty params run refuses in the body before the
+            // dispatch is planned. Matches the launch's own row count.
+            vec![4],
         );
         let buf = Placeholder(1 << 20);
         let store = Store::default();
@@ -617,7 +621,10 @@ mod tests {
         let lowered = plan(
             "copy_logits_bf16",
             vec![wide(0), wide(4096), wide(8192)],
-            Vec::new(),
+            // ONE SCALAR, `rows`: after the marks migration `copy_logits_bf16`
+            // reads its rectangle from the statement's params run rather than
+            // from the fire. Matches the launch's row count.
+            vec![4],
         );
         let buf = Placeholder(1 << 20);
         let store = Store::default();
@@ -682,7 +689,11 @@ mod tests {
                     bytes: 2,
                 },
             ],
-            Vec::new(),
+            // ONE SCALAR, `rows`: after the marks migration `copy_logits_bf16`
+            // takes its rectangle as a `Const<u32>` on the statement. Without
+            // it the arm refuses in `param(0)` before it can look at `vocab`,
+            // and this test would report the wrong refusal.
+            vec![4],
         );
         let buf = Placeholder(1 << 20);
         let store = Store::default();

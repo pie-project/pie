@@ -162,7 +162,8 @@ impl Prepared {
                 eprintln!("[desc] {i} {d:?}");
             }
         }
-        let scratch_layout = layout(&descriptors).map_err(|why| {            Error::invalid(
+        let scratch_layout = layout(&descriptors).map_err(|why| {
+            Error::invalid(
                 "program::run",
                 format!("this fire's scratch does not fit: {why:?}"),
             )

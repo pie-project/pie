@@ -430,11 +430,12 @@ mod tests {
         for key in 0..200u64 {
             seen.insert(select_candidates(&t, &conn, Some("m"), Some(key), &mut rng)[0]);
         }
-        assert!(
-            seen.len() >= 3,
-            "HRW should spread primaries, saw {:?}",
-            seen
-        );
+        // Four workers, 200 keys, an rng that is never consulted -- the
+        // answer is a hash, so it is the same four every run. All four, not
+        // three of four: a floor of 3 passes while one worker is never
+        // anyone's primary, which is the exact shape of HRW failing to
+        // spread.
+        assert_eq!(seen.len(), 4, "HRW should spread primaries, saw {seen:?}");
     }
 
     #[test]

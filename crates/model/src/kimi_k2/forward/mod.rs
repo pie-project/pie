@@ -1,31 +1,9 @@
-//! kimi's forward, declared.
-//!
-//! Transcribed from `driver-cuda/csrc/src/model/kimi/kimi_forward.cpp`.
-//! The second MLA family; what differs from [`crate::glm_5`] is worth
-//! naming, because the shapes are otherwise the same statement:
-//!
-//! * **No DSA.** kimi's attention reads the whole context; there is no
-//!   lightning indexer and no page mask.
-//!
-//! * **The latents may be ONE projection.** With `q_kv_a_fused` bound,
-//!   `[q_lora | kv_lora | rope]` land row-major in one buffer, so the
-//!   query half is normed with a STRIDED kernel rather than a plain one
-//!   — neither latent is a contiguous block of the result. That is a
-//!   BINDING fact, so it is a fact here and both readings are stated.
-//!
-//! * **The experts are WNA16.** The decode leg is
-//!   `launch_wna16_{gate_up,down}_decode_bf16` over packed weights and
-//!   scales, with `bf16_to_fp16` casts on the activation either side —
-//!   the kernel reads fp16. Same rectangle shape as glm5's GEMV leg,
-//!   different kernels, and the casts are real launches that a text
-//!   omitting them would be wrong about.
-
 pub mod facts;
 
 use self::facts::{KimiCudaFacts, KimiFacts};
 use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv, Wna16Ax};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
-use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
+use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, Shape};
 
 struct KimiLayerW {
     attn_norm: NormW,
@@ -82,48 +60,25 @@ impl KimiLayerW {
     }
 }
 
-/// kimi's CUDA text for one fire class.
-///
-/// **Both shaped classes, and the body is the same text for each.** MLA's
-/// attention is one planned dispatch — `attn::plan_attention_mla_bf16` takes
-/// a `qo_indptr` and a `causal` flag, so a decode is the special case where
-/// every request contributes one query row, not a different kernel. Nothing
-/// else here reads the class. So the class reaches only the trace's NAME,
-/// which is what a lowering keys its cache by.
-///
-/// It used to `panic!` on anything but Decode. That was not a statement about
-/// this text — it was the absence of one, and it made every prefill a failed
-/// request.
 pub fn kimi_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &KimiFacts,
     cuda: &KimiCudaFacts,
     class: FireClass,
     norm_eps: f32,
 ) -> ForwardPlan {
-    // The activation axis is DECLARED but pinned until the launch wrappers
-    // take a dtype: every statement below states BF16 outs, so a point
-    // instantiated at another A would lie. The pin is a compile refusal,
-    // not a comment. Same for K: MLA's latent cache is stated bf16 and
-    // nothing here forks on the scheme yet.
+
     const {
         assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
         assert!(K::NATIVE_BF16);
     }
-    // The W4A16 expert packing's quantisation group — W2's, and the ONE
-    // number the wna16 statements read. The family's own value is 32:
-    // `contract.rs` builds the scale slabs at `GROUP = 32` and the
-    // committed contract golden pins `"group_size": 32` on every expert
-    // tensor — which is what `Wna16Ax::REPR` states. A W2 that is not
-    // per-group scaled has no wna16 leg to state, and the refusal is a
-    // monomorphization error, not a fire's.
+
     let wna16_group = const {
         match W2::REPR {
             WeightRepr::Scaled { group, .. } => group,
             _ => panic!("kimi's routed experts are WNA16; W2 must be a Scaled axis"),
         }
     };
-    // The SKU joins the family's FIRST segment ('.'-separated segment two
-    // stays the backend, which `Backend::of_family` parses).
+
     let family = format!(
         "kimi-{}-{}-{}.cuda.{}",
         W1::NAME,
@@ -139,10 +94,6 @@ pub fn kimi_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             let w = KimiLayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
-            // The two latents, fused or not. The FUSED arm norms the
-            // query half in place with a pitch, which is a different
-            // kernel and not a buffer detail — `kernels::norm::rmsnorm_strided_bf16`
-            // reads a row stride the plain one has no parameter for.
             let (q_b, kv_a, _q_a_n) = dsl::mla_latents(
                 &x,
                 cuda.q_kv_a_fused.then_some(&w.q_kv_a),
@@ -189,45 +140,87 @@ pub fn kimi_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             }
 
             let logits = matmul(&m, &w.router);
-            let (experts, weights) = dsl::cuda::topk_sigmoid(
+            let (experts, weights) = dsl::cuda::generated::topk_sigmoid(
                 &logits,
-                facts.moe.top_k,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.top_k)]),
+                    DType::I32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.top_k)]),
+                    DType::F32,
+                ),
+                None,
                 facts.moe.norm_topk_prob,
                 facts.moe.routed_scaling,
+                logits.layer(),
+                None,
             );
 
-            // WNA16: the kernel reads fp16, so the cast either side is a
-            // real launch. Omitting it would make the text claim a
-            // dtype the deployment never has at that point.
-            let m_fp16 = dsl::cuda::bf16_to_fp16(&m);
-            let (gate, up) = dsl::cuda::wna16_gate_up_decode(
+            let m_fp16 = dsl::cuda::generated::bf16_to_fp16(
+                &m,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.hidden)]),
+                    DType::F16,
+                ),
+                m.layer(),
+                None,
+            );
+            let expert_shape = || {
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.moe_intermediate)]),
+                    DType::BF16,
+                )
+            };
+            let bank = format!("layer.{l}.experts");
+            let (gate, up) = dsl::cuda::generated::wna16_gate_up_decode_bf16(
                 &m_fp16,
                 &experts,
-                facts.moe.moe_intermediate,
-                &format!("layer.{l}.experts"),
-                wna16_group,
+                &format!("{bank}.gate_packed"),
+                &format!("{bank}.gate_scale"),
+                &format!("{bank}.up_packed"),
+                &format!("{bank}.up_scale"),
+                expert_shape(),
+                expert_shape(),
+                wna16_group as i32,
+                m_fp16.layer(),
+                None,
             );
-            let act = dsl::cuda::swiglu_pair(&gate, &up, facts.moe.moe_intermediate);
-            let act_fp16 = dsl::cuda::bf16_to_fp16(&act);
-            let route_out = dsl::cuda::wna16_down_decode(
+            let act = dsl::cuda::generated::swiglu(&gate, &up, gate.layer(), None);
+            let act_fp16 = dsl::cuda::generated::bf16_to_fp16(
+                &act,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.moe_intermediate)]),
+                    DType::F16,
+                ),
+                act.layer(),
+                None,
+            );
+            let route_out = dsl::cuda::generated::wna16_down_decode_bf16(
                 &act_fp16,
                 &experts,
-                facts.hidden,
-                &format!("layer.{l}.experts"),
-                wna16_group,
+                &format!("{bank}.down_packed"),
+                &format!("{bank}.down_scale"),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.hidden)]),
+                    DType::BF16,
+                ),
+                wna16_group as i32,
+                act_fp16.layer(),
+                None,
             );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sgate = matmul(&m, &w.shared_gate);
                 let sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::swiglu_pair(&sgate, &sup, facts.moe.shared_intermediate);
+                let sact = dsl::cuda::generated::swiglu(&sgate, &sup, sgate.layer(), None);
                 let shared = matmul(&sact, &w.shared_down);
-                dsl::cuda::residual_add(&routed, &shared, facts.hidden)
+                dsl::cuda::generated::residual_add(&routed, &shared, routed.layer(), None)
             } else {
                 routed
             };
-            y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
+            y = dsl::cuda::generated::residual_add(&y, &moe_out, y.layer(), None);
         }
 
         dsl::logits_epilogue(
@@ -242,36 +235,17 @@ pub fn kimi_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     })
 }
 
-/// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&KimiFacts, &KimiCudaFacts, FireClass, f32) -> ForwardPlan;
 
-/// The shipped SKU's axes — the family's ONE spelling of its point.
-///
-/// Every consumer derives from these aliases rather than restating them:
-/// [`CATALOG`]'s turbofish, `project::trace`'s instantiation,
-/// `project::manifest`'s repr claims, and `contract`'s expert-stack pass
-/// (its group and its load check read `ShippedW2`). A second SKU adds a
-/// second row to the table, not a second spelling of the first.
 pub type ShippedW1 = Bf16Ax;
-/// The routed expert banks' axis: WNA16, the release's packing.
+
 pub type ShippedW2 = Wna16Ax;
-/// The activation axis of the shipped point (pinned BF16 in the text).
+
 pub type ShippedA = Bf16Ax;
-/// The KV axis of the shipped point.
+
 pub type ShippedKv = NativeKv;
 
-/// The family's catalogue — every SKU this build ships, enumerated. ONE
-/// row, and its expert axis is WNA16: the checkpoint ships the routed bank
-/// both as bf16 `.weight` and as W4A16 `.weight_packed` (two ENCODINGS of
-/// one model — `project.rs`'s manifest deliberately names neither), but
-/// this text states exactly one routed leg, the wna16 GEMVs, so one point
-/// is what ships. The coverage test (`model/tests/catalogue_coverage.rs`)
-/// traces each row at both fire classes; `TraceBuilder::finish`'s
-/// `check_plan` then refuses a row whose statements reach a routine point
-/// that does not exist.
-pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    (
-        "kimi-bf16-wna16-kv-bf16",
-        kimi_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
-    ),
-];
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![(
+    "kimi-bf16-wna16-kv-bf16",
+    kimi_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
+),];

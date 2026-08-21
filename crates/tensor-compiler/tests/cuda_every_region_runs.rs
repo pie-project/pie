@@ -35,17 +35,15 @@ use tensor_compiler::plan::{LibraryOp, Region, RegionKind};
 /// grows a case does not need an entry and a corpus that reorders one does not
 /// invalidate any. Each entry is a claim that no plan a deployment builds can
 /// route work through such a region.
-const REFUSED: &[(&str, &str)] = &[
-    (
-        "single-op library lift",
-        "a `RegionKind::Library` wrapping one op whose own tag IS the library op \
+const REFUSED: &[(&str, &str)] = &[(
+    "single-op library lift",
+    "a `RegionKind::Library` wrapping one op whose own tag IS the library op \
          — `top_k`, `sort_desc`, `cumsum`/`cumprod`, `matmul`, a second-party \
          call. The generic emitter would fall back to `ptir_m1_execute`, whose \
          single-threaded forms are O(len^2) or worse and do not return at a \
          real vocabulary, so refusing is the honest answer and the driver now \
          reports it at load rather than skipping it.",
-    ),
-];
+)];
 
 /// One region's identity for the purposes of [`REFUSED`].
 ///
@@ -101,9 +99,7 @@ fn every_planned_region_emits_or_is_named_here() {
     let holes: Vec<String> = survey()
         .into_iter()
         .filter(|(_, _, ok, excuse, _)| !ok && excuse.is_none())
-        .map(|(stage, region, _, _, why)| {
-            format!("{stage} region {region}: {why}")
-        })
+        .map(|(stage, region, _, _, why)| format!("{stage} region {region}: {why}"))
         .collect();
     assert!(
         holes.is_empty(),

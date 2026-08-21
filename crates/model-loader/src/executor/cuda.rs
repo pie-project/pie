@@ -22,8 +22,8 @@ use cudarc::runtime::sys as rt;
 //
 // `scale_rows` takes a fat `Out` rather than a slot, sized by
 // `extent_2d`'s `(rows, width)` pair rather than two separate `i32`s.
-use kernels_cuda::{In, InOut, Out};
 use kernels_cuda::quant;
+use kernels_cuda::{In, InOut, Out};
 
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, TileMapOp};
@@ -402,17 +402,24 @@ impl CudaArena {
         // SAFETY: both spans are in bounds, the plan chose this row for an
         // f32 source and a bf16 destination, and the stream is live for the
         // launch.
-        let width = i32::try_from(n).map_err(|_| {
-            plan_disagrees("the cast covers more elements than one row can state")
-        })?;
+        let width = i32::try_from(n)
+            .map_err(|_| plan_disagrees("the cast covers more elements than one row can state"))?;
         let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
         let fired = quant::cast_fp32_to::<kernels_cuda::jit::abi::bf16>(
             &ctx,
             // ONE ROW OF `n`: the cast is elementwise and the routine reads
             // its extent off the destination, which is what a traced fire's
             // binder mints for it too.
-            In { ptr: self.at(op.src.offset).cast(), rows: 1, width },
-            Out { ptr: self.at(op.dst.offset).cast(), rows: 1, width },
+            In {
+                ptr: self.at(op.src.offset).cast(),
+                rows: 1,
+                width,
+            },
+            Out {
+                ptr: self.at(op.dst.offset).cast(),
+                rows: 1,
+                width,
+            },
         );
         declined(CUDA_CAST_FP32_TO_BF16, fired)
     }
@@ -435,8 +442,16 @@ impl CudaArena {
             &ctx,
             // `InOut`: the kernel scales `dst` IN PLACE, which the comment
             // above already says and the mark now says too.
-            InOut { ptr: self.at(op.dst.offset).cast(), rows: as_int(rows)?, width: as_int(cols)? },
-            In { ptr: self.at(factors.offset).cast_const().cast(), rows: 0, width: 0 },
+            InOut {
+                ptr: self.at(op.dst.offset).cast(),
+                rows: as_int(rows)?,
+                width: as_int(cols)?,
+            },
+            In {
+                ptr: self.at(factors.offset).cast_const().cast(),
+                rows: 0,
+                width: 0,
+            },
         );
         declined(CUDA_SCALE_ROWS_BF16, fired)
     }
@@ -510,7 +525,6 @@ impl CudaArena {
     }
 }
 
-
 /// An extent as the `int` the `__global__` reads it in.
 fn as_int(extent: u32) -> Result<i32, Error> {
     i32::try_from(extent).map_err(|_| plan_disagrees("the extent does not fit an `int`"))
@@ -522,7 +536,6 @@ fn as_int(extent: u32) -> Result<i32, Error> {
 fn plan_disagrees(what: &str) -> Error {
     Error::Contract(format!("cuda arena: the plan named a kernel but {what}"))
 }
-
 
 /// The host program would not launch the row the plan named. Never a
 /// fall-back to the host: these kernels quantise and cast WEIGHTS, so a
@@ -536,10 +549,7 @@ fn plan_disagrees(what: &str) -> Error {
 /// instead, since a host program has no `Result` to put them in and
 /// both are drift between this build and its own device text rather
 /// than a condition a load can report.
-fn declined(
-    symbol: &str,
-    fired: Result<(), kernels_cuda::Refusal>,
-) -> Result<(), Error> {
+fn declined(symbol: &str, fired: Result<(), kernels_cuda::Refusal>) -> Result<(), Error> {
     fired.map_err(|why| {
         Error::Contract(format!(
             "cuda arena: the plan named `{symbol}` and the routine declined it: {why:?}"

@@ -1131,7 +1131,10 @@ mod tests {
                 group_size: 0,
                 channel_axis: None,
             };
-            assert!(spec.scheme.is_self_contained(), "{scheme:?} is a blocked scheme");
+            assert!(
+                spec.scheme.is_self_contained(),
+                "{scheme:?} is a blocked scheme"
+            );
             let (name, _) =
                 profile_of(&Encoding::Quant(spec)).expect("a profile to write it under");
             assert!(

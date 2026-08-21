@@ -168,7 +168,7 @@ fn build_materializes_the_serve_contract() {
     // And the banks are NOT here. `build_policy`'s rule stated as a test: a
     // build must not materialize a tensor that another materialized tensor is
     // a view of.
-    for bank in names.iter().filter(|n| n.contains(".fused.")) {
+    if let Some(bank) = names.iter().find(|n| n.contains(".fused.")) {
         panic!(
             "`{bank}` is a fused bank the projections alias, and a file has no \
              pointers -- persisting it writes the same bytes twice. See \

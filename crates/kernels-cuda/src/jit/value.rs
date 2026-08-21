@@ -2,7 +2,6 @@ use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArgValue {
-
     Ptr(*mut c_void),
     I32(i32),
     U32(u32),
@@ -12,20 +11,17 @@ pub enum ArgValue {
     Bool(bool),
     U8(u8),
     Region {
-
         ptr: *mut c_void,
         rows: i32,
         width: i32,
     },
     Bytes {
-
         ptr: *const u8,
         len: usize,
     },
 }
 
 impl ArgValue {
-
     #[must_use]
     pub const fn kind(self) -> &'static str {
         match self {
@@ -67,7 +63,6 @@ impl ArgValue {
 
 #[cfg(feature = "_cuda")]
 pub struct Bound {
-
     #[allow(clippy::vec_box)]
     cells: Vec<Box<u64>>,
     blobs: Vec<Box<[u8]>>,
@@ -76,7 +71,6 @@ pub struct Bound {
 
 #[cfg(feature = "_cuda")]
 impl Bound {
-
     pub unsafe fn new(values: &[ArgValue]) -> Self {
         let mut out = Self {
             cells: Vec::with_capacity(values.len()),
@@ -86,7 +80,6 @@ impl Bound {
         for value in values {
             match *value {
                 ArgValue::Bytes { ptr, len } => {
-
                     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
                     let mut boxed: Box<[u8]> = bytes.to_vec().into_boxed_slice();
                     let at: *mut u8 = boxed.as_mut_ptr();

@@ -25,6 +25,39 @@
 //!
 //!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_sliding_window_attention_e2e -- --ignored --nocapture
+//!
+//! # What it does on a box that HAS all of that, which is refuse
+//!
+//! Run on the reference 4090 with CUDA 13 and the qwen-3-0.6b snapshot -- so
+//! with every precondition the `#[ignore]` reason used to name -- this gate
+//! boots, loads, spawns, and then dies inside the first fire:
+//!
+//! ```text
+//! inferlet returned an error: pipeline: frame slot 0: pipeline: fire
+//! geometry: EmbedTokens is not host-derivable: channel 0 has no host-known
+//! value
+//! ```
+//!
+//! That sentence is about the symptom. The claim behind it is one line in
+//! `crates/driver-cuda/src/serve/load.rs`, beside `device_geometry_port_mask`:
+//!
+//! > Exactly the three ports `fire::envelope::compose` reads -- `EmbedTokens |
+//! > Positions | KvLen`; the rest a decode derives from the positions.
+//! > `DEVICE_GEOMETRY_PORTS` is deliberately absent: it wins the pool-owned
+//! > class this driver does not build.
+//!
+//! A program whose geometry evolves in-graph -- which is the entire subject of
+//! this file -- is exactly that class. Without the bit the engine classifies
+//! it as a host-evaluated decode, and a host cannot know what token the
+//! epilogue is about to sample. `engine/src/driver/backend/vulkan.rs` and
+//! `.../wgpu.rs` each carry a long note about paying for this twice and then
+//! building the machinery; `.../cuda.rs` has neither the note nor the bit.
+//!
+//! So this is not a test waiting for a GPU. It is a test waiting for
+//! `driver-cuda` to build the pool-owned device-geometry class, and it will
+//! start passing the day the mask above grows `PIE_DEVICE_GEOMETRY_PORTS` and
+//! `PIE_DEVICE_PORT_ATTN_MASK`. Until then `crates/worker/tests/cuda_forward`
+//! carries an epitaph pointing here rather than a second copy of the failure.
 
 mod common;
 
@@ -35,7 +68,9 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "A4 mask-migration device e2e: needs the 4090 + cuda + qwen-3-0.6b"]
+#[ignore = "BLOCKED, and not on hardware: `driver-cuda` does not claim the \
+            pool-owned device-geometry class this program needs. See the \
+            section at the end of this file's header before running it"]
 async fn sliding_window_attention_on_real_driver() -> Result<()> {
     common::init_trace();
     let pie = common::boot_4090().await?;

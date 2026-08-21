@@ -1,7 +1,7 @@
 //! The lowering walk: row windows to launch rectangles.
 
-use super::*;
 use super::semantics::{Semantic, contiguous, kind_name, semantic, subtract};
+use super::*;
 
 /// Lower `plan` over `rows`, in the order the engine seriated them.
 pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Uncovered> {
@@ -260,7 +260,11 @@ impl Lowerer<'_> {
                                     "a prep at op {i} that publishes no value"
                                 )));
                             };
-                            self.preps.push(Prep { at_op: i as u32, kind, value });
+                            self.preps.push(Prep {
+                                at_op: i as u32,
+                                kind,
+                                value,
+                            });
                         }
                         Semantic::Structural => {
                             // Structural sites use the same depth window as launches.
@@ -292,7 +296,7 @@ impl Lowerer<'_> {
         op: &Op,
         window: &Range<u32>,
     ) -> Result<(), Uncovered> {
-        self.emit_bound(at, kernel, op, window, None, None)
+        self.emit_bound(at, kernel, op, window, None, None, None)
     }
 
     /// The epilogue emits only sampled rows; gather uses scratch when sampling a subset.
@@ -304,20 +308,13 @@ impl Lowerer<'_> {
         window: &Range<u32>,
         out: Option<Arg>,
     ) -> Result<(), Uncovered> {
-        self.emit_bound(at, kernel, op, window, None, out)
+        self.emit_bound(at, kernel, op, window, None, out, None)
     }
 
-    /// [`Self::emit`], with the statement's input replaced.
-    fn emit_with_in(
-        &mut self,
-        at: usize,
-        kernel: &str,
-        op: &Op,
-        window: &Range<u32>,
-        input: Option<Arg>,
-    ) -> Result<(), Uncovered> {
-        self.emit_bound(at, kernel, op, window, input, None)
-    }
+    // `emit_with_in` STOOD HERE. Its one caller was the epilogue's split leg,
+    // which now also has to CAP the statement's inputs at one, so it calls
+    // `emit_bound` directly; a helper that takes two of the three overrides is
+    // no shorter than the call it wraps. RETIRED.
 
     fn emit_bound(
         &mut self,
@@ -327,6 +324,7 @@ impl Lowerer<'_> {
         window: &Range<u32>,
         in_override: Option<Arg>,
         out_override: Option<Arg>,
+        in_cap: Option<usize>,
     ) -> Result<(), Uncovered> {
         if window.is_empty() && !self.peel_region.is_some_and(|r| r.rows_device) {
             return Ok(());
@@ -364,7 +362,8 @@ impl Lowerer<'_> {
         } else {
             &op.outputs
         };
-        for (i, &v) in op.inputs.iter().enumerate() {
+        let ins = &op.inputs[..in_cap.unwrap_or(op.inputs.len()).min(op.inputs.len())];
+        for (i, &v) in ins.iter().enumerate() {
             match (i, in_override.clone()) {
                 (0, Some(a)) => self.args.push(a),
                 _ => self.args.push(self.slot(v)),
@@ -408,8 +407,7 @@ impl Lowerer<'_> {
             // split's — no params at all — while the routine reads
             // `[n_max, win_start, win_len]`. The walk supplies the trio the
             // way it supplies every peel window: from its own knowledge.
-            if kernel == "attn::split_qkv_bf16_devwin"
-                && self.params.len() == first_param as usize
+            if kernel == "attn::split_qkv_bf16_devwin" && self.params.len() == first_param as usize
             {
                 let w = self.rectangle_rows(op, window);
                 self.params.push(self.rows.len() as u32);
@@ -458,9 +456,11 @@ impl Lowerer<'_> {
         match info.shape.0.first() {
             Some(Dim::Requests) => self.buffers.n_requests,
             Some(Dim::Tokens) => n,
-            Some(&Dim::MoeAlignedRoutes { top_k, experts, block }) => {
-                Dim::moe_aligned_rows(n, top_k, experts, block)
-            }
+            Some(&Dim::MoeAlignedRoutes {
+                top_k,
+                experts,
+                block,
+            }) => Dim::moe_aligned_rows(n, top_k, experts, block),
             Some(Dim::Const(v)) => *v,
             _ => 0,
         }
@@ -528,7 +528,10 @@ impl Lowerer<'_> {
             .get(v as usize)
             .and_then(|info| info.raised.as_deref())
         {
-            return Arg::Raised { value: v, key: key.to_string() };
+            return Arg::Raised {
+                value: v,
+                key: key.to_string(),
+            };
         }
         let width = self.row_width(v);
         let bytes = self
@@ -582,11 +585,17 @@ impl Lowerer<'_> {
                     .map_or(2, |i| dtype_bytes(i.dtype)),
             });
             self.emit_with_out(at, "layout::gather_bf16_rows", op, &out, temp.clone())?;
-            self.emit_with_in(at, "gemm::act_x_w", op, &out, temp)?;
+            self.emit_bound(at, "gemm::act_x_w", op, &out, temp, None, Some(1))?;
             return Ok(());
         }
         // No final norm: texts already hand `LmHead` a normed value.
-        self.emit(at, "gemm::act_x_w", op, &out)?;
+        //
+        // ONE INPUT, NOT TWO. `LmHead` states a second input for the gather's
+        // sake (the row list the split leg collects); the projection's own
+        // routine has no mark for it, and the driver answers the name with
+        // null when a fire samples every row -- so binding it here would
+        // refuse the launch that needs it least.
+        self.emit_bound(at, "gemm::act_x_w", op, &out, None, None, Some(1))?;
         Ok(())
     }
 

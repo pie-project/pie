@@ -113,6 +113,8 @@ use driver_metal::lowering::executor::{BoundArg, Slice};
 /// times the arithmetic the device delivers, which is the room a wrong kernel
 /// hides in. A hand that widens a bound to quiet a red run trips the floor
 /// instead of getting away with it.
+use driver_metal::skip::skipped;
+
 fn tolerance_holds(worst: f32, what: &str) {
     // Exact agreement is not a loose bound; it is the absence of anything to
     // bound. Two paths that produce identical bits have no headroom to
@@ -411,7 +413,7 @@ fn fire(
 #[ignore = "needs a Metal 4 device"]
 fn every_paged_attention_body_answers_the_same_softmax() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");
@@ -717,7 +719,7 @@ const REQUESTS_32: [i32; ROWS] = [0, 0, 1];
 #[ignore = "needs a Metal 4 device"]
 fn a_page_shaped_decode_answers_the_whole_history() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");
@@ -903,7 +905,7 @@ const POISON: f32 = -7.5;
 #[ignore = "needs a Metal 4 device"]
 fn the_strided_tile_reads_its_rows_a_pitch_apart() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");

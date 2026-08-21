@@ -118,6 +118,18 @@ wgpu = { version = "30", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+# TEST-ONLY, and the one test edge that is a REGULAR dependency of this crate
+# too: `tests/cooperative.rs` opens its own device, because `src/device.rs`
+# asks for `ExperimentalFeatures::disabled()` and that file exists to measure
+# what the experimental token buys. An integration test cannot reach a
+# `[dependencies]` entry, so the same crate is named again here. Identical
+# version and features, so cargo unifies the two and nothing is built twice.
+wgpu = { version = "30", default-features = false, features = [
+    "wgsl",
+    "vulkan",
+    "metal",
+    "dx12",
+] }
 # TEST-ONLY: `tests/arena.rs` states a declaration (`model_dsl::metal::
 # affine_gemm_point`) so the lowering under test is one the surface really
 # produces. `src/` reaches no authoring type, which is why this is a dev edge.
@@ -196,4 +208,11 @@ required-features = ["native"]
 # has neither and says so on its way past.
 [[test]]
 name = "serving"
+required-features = ["native"]
+
+# The matrix unit, which this crate does not use and can. Same stanza and the
+# same reasons; what it adds is a THIRD absence -- the adapter may answer and
+# offer no cooperative matrix, which the tests print and skip on.
+[[test]]
+name = "cooperative"
 required-features = ["native"]

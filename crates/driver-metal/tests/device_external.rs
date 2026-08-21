@@ -28,7 +28,10 @@ kernel void fill(device uint* out [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no external allocation was adopted");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -69,7 +72,7 @@ impl Drop for Pages {
 #[test]
 fn the_gpu_writes_into_the_hosts_own_pages() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -126,7 +129,7 @@ fn the_gpu_writes_into_the_hosts_own_pages() {
 #[test]
 fn a_misaligned_or_empty_mapping_is_refused_with_a_reason() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let pages = Pages::new(1);
@@ -152,7 +155,7 @@ fn a_misaligned_or_empty_mapping_is_refused_with_a_reason() {
 #[test]
 fn an_external_buffer_is_counted_once_and_released_by_the_last_holder() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // A buffer this registry did not allocate. The pool owns it; `Externals`

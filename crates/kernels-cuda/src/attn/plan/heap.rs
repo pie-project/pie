@@ -1,6 +1,4 @@
-
 pub trait Comp<T> {
-
     fn lt(&self, a: &T, b: &T) -> bool;
 }
 
@@ -92,10 +90,11 @@ fn min_heap_comp(a: &(i32, f32), b: &(i32, f32)) -> bool {
 }
 
 impl MinHeap {
-
     #[must_use]
     pub fn new(capacity: u32) -> Self {
-        Self { heap: (0..capacity as i32).map(|i| (i, 0.0)).collect() }
+        Self {
+            heap: (0..capacity as i32).map(|i| (i, 0.0)).collect(),
+        }
     }
 
     pub fn insert(&mut self, element: (i32, f32)) {

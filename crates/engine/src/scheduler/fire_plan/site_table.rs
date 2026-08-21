@@ -179,7 +179,12 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
                     plan.family
                 )
             });
-        let OpKind::Launch { kernel: producer_kernel, params, .. } = &producer.kind else {
+        let OpKind::Launch {
+            kernel: producer_kernel,
+            params,
+            ..
+        } = &producer.kind
+        else {
             panic!(
                 "{}: selector value {selector} produced by {:?}, not the router top-k",
                 plan.family, producer.kind

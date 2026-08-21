@@ -251,7 +251,11 @@ pub(crate) fn build_tp_plane(
         .map(|w| i32::from_ne_bytes([w[0], w[1], w[2], w[3]]))
         .collect();
 
-    let ag = HostAllgather { rank, world_size: world, gather };
+    let ag = HostAllgather {
+        rank,
+        world_size: world,
+        gather,
+    };
     let cfg = Config {
         same_process: true,
         group_devices,
@@ -826,7 +830,10 @@ fn build_moe_expert_ptrs(
         }
         model.weights.insert(
             format!("{bank}_ptrs"),
-            crate::weights::stage::WeightSpan { ptr: buffer.as_ptr(), bytes: host.len() },
+            crate::weights::stage::WeightSpan {
+                ptr: buffer.as_ptr(),
+                bytes: host.len(),
+            },
         );
         model.owned.push(buffer);
     }
@@ -1090,7 +1097,13 @@ pub(crate) fn adopt_and_compile(
     package: driver::driver_api::plan::LaunchPackage,
     kernels: &[driver_api::EmittedKernel],
 ) -> Result<(), i32> {
-    let plan = driver::adopt_launch_package(package)
+    // THIS BACKEND's boundary vocabulary, not the step interpreter's. The bare
+    // `adopt_launch_package` admits only `metal.identity`/`metal.discard`, so
+    // calling it here marked every `lora`, `attn_page_mask` and `envelope_dot`
+    // program non-executable -- and a non-executable program is never compiled,
+    // never found by the fire, and so never runs its epilogue, which is a guest
+    // waiting on a token that will not come rather than an error it can report.
+    let plan = driver::adopt_launch_package_with(package, driver::Boundaries::CUDA)
         .map_err(|error| crate::Error::unsupported("register_program", error))?;
 
     // The compile, when there is a device to compile for (`load_model` binds
@@ -1168,8 +1181,14 @@ mod tests {
 
     #[test]
     fn a_single_rank_needs_no_collective_and_is_never_refused() {
-        assert!(tp_serving_refusal(1, "").is_ok(), "one rank reduces nothing");
-        assert!(tp_serving_refusal(0, "").is_ok(), "and neither does a mis-stated zero");
+        assert!(
+            tp_serving_refusal(1, "").is_ok(),
+            "one rank reduces nothing"
+        );
+        assert!(
+            tp_serving_refusal(0, "").is_ok(),
+            "and neither does a mis-stated zero"
+        );
     }
 
     /// Asserts on the message content, not just `is_err`: the first ceiling that
@@ -1178,7 +1197,10 @@ mod tests {
     fn a_group_is_refused_by_the_condition_that_actually_blocks_it() {
         // A two-rank group's missing piece is the key, and the refusal says so.
         let why = tp_serving_refusal(2, "").expect_err("a group with no key cannot rendezvous");
-        assert!(why.contains("tp_group_id"), "names the value it read: {why}");
+        assert!(
+            why.contains("tp_group_id"),
+            "names the value it read: {why}"
+        );
         assert!(
             !why.contains("CAN_LAUNCH"),
             "there IS device text, so that is not what blocks it: {why}"

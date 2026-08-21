@@ -243,7 +243,6 @@ impl TraceBuilder {
         }
     }
 
-
     /// Mint one TENSOR value. A raise is minted by [`Self::push_prep`], which
     /// is the only op that publishes one.
     fn value(&mut self, shape: Shape, dtype: DType) -> ValueId {
@@ -265,13 +264,7 @@ impl TraceBuilder {
     /// `from` launch producing `rhs`: the kernel swaps to `to` (the beta-one
     /// symbol) and takes the residual as an extra operand. The generalised
     /// form of what `OpKind::Matmul::beta_one` said before the retirement.
-    pub fn try_fold_beta(
-        &mut self,
-        rhs: ValueId,
-        residual: ValueId,
-        from: &str,
-        to: &str,
-    ) -> bool {
+    pub fn try_fold_beta(&mut self, rhs: ValueId, residual: ValueId, from: &str, to: &str) -> bool {
         if self.value_region_depth > 0 {
             return false;
         }
@@ -300,12 +293,20 @@ impl TraceBuilder {
     /// as they take what a [`Self::push_prep`] raised — this is the resident
     /// half of the same channel.
     pub fn runtime_object(&mut self, name: &str, layer: Option<u32>) -> ValueId {
-        if let Some(b) = self.runtime.iter().find(|b| b.name == name && b.layer == layer) {
+        if let Some(b) = self
+            .runtime
+            .iter()
+            .find(|b| b.name == name && b.layer == layer)
+        {
             return b.value;
         }
         let id = self.values.len() as ValueId;
         self.values.push(ValueInfo::raise(name));
-        self.runtime.push(RuntimeBinding { name: name.to_string(), layer, value: id });
+        self.runtime.push(RuntimeBinding {
+            name: name.to_string(),
+            layer,
+            value: id,
+        });
         id
     }
 
@@ -320,11 +321,19 @@ impl TraceBuilder {
         shape: Shape,
         dtype: DType,
     ) -> ValueId {
-        if let Some(b) = self.runtime.iter().find(|b| b.name == name && b.layer == layer) {
+        if let Some(b) = self
+            .runtime
+            .iter()
+            .find(|b| b.name == name && b.layer == layer)
+        {
             return b.value;
         }
         let id = self.value(shape, dtype);
-        self.runtime.push(RuntimeBinding { name: name.to_string(), layer, value: id });
+        self.runtime.push(RuntimeBinding {
+            name: name.to_string(),
+            layer,
+            value: id,
+        });
         id
     }
 
@@ -355,20 +364,6 @@ impl TraceBuilder {
         });
         outputs
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// Record a stated kernel launch ([`OpKind::Launch`]).
     pub fn launch(
@@ -457,18 +452,6 @@ impl TraceBuilder {
         )
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     /// Window `x` along its leading dim; output shape drops that dim.
     pub fn select(&mut self, x: ValueId, index: u32) -> ValueId {
         let shape = self.value_shape(x);
@@ -488,12 +471,26 @@ impl TraceBuilder {
         self.push(OpKind::Select { index }, vec![x], vec![(inner, dtype)])[0]
     }
 
+    /// The epilogue's projection. Two inputs, and the second is the fire's:
+    /// when a fire samples a SUBSET of its rows the walk splits this op into
+    /// `layout::gather_bf16_rows` and `gemm::act_x_w`, and the gather's
+    /// routine takes the row list as an operand (`sampling_indices`). The
+    /// walk mints nothing -- it maps value ids onto slots -- so the id has to
+    /// exist by the time it looks, which means here. The projection itself
+    /// never reads it; an operand a routine's signature does not reach is an
+    /// address nobody binds.
     pub fn lm_head(&mut self, hidden: ValueId, weight: &str, vocab: u32) -> ValueId {
+        let sampled = self.runtime_tensor(
+            "sampling_indices",
+            None,
+            Shape(vec![Dim::Requests]),
+            DType::I32,
+        );
         self.push(
             OpKind::LmHead {
                 weight: weight.to_string(),
             },
-            vec![hidden],
+            vec![hidden, sampled],
             vec![(Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::F32)],
         )[0]
     }

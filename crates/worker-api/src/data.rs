@@ -6,9 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use ids::{ReqId, SessionId, TenantId, WorkerId};
 use client_api::{ClientMessage, ServerMessage};
-
+use ids::{ReqId, SessionId, TenantId, WorkerId};
 
 /// A reference to a large binary input. Blob bytes never travel the command
 /// path: the worker pulls them out-of-band (`GET {origin}/blob/{hash}`).
@@ -23,7 +22,6 @@ pub struct BlobRef {
     /// Base URL of the origin gateway's blob endpoint, so any worker can fetch.
     pub origin: String,
 }
-
 
 /// Scheduling priority for a turn, set at dispatch and adjustable via
 /// [`WorkerControl::set_priority`](crate::WorkerControl::set_priority). Ordered
@@ -40,7 +38,6 @@ pub enum Priority {
     /// Above `Normal`; scheduled ahead of the rest.
     High,
 }
-
 
 /// One dispatched turn (gateway → worker via
 /// [`WorkerControl::dispatch`](crate::WorkerControl::dispatch)). Self-describing,
@@ -73,7 +70,6 @@ pub enum Accepted {
     /// Declined with a suggested target; the gateway should try `worker` next.
     Redirect { worker: WorkerId },
 }
-
 
 /// One item on a turn's output stream (worker → gateway via
 /// [`push_tokens`](crate::GatewayInbound::push_tokens)): [`Chunk`](Tokens::Chunk)s

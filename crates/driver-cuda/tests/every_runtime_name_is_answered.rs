@@ -12,10 +12,8 @@ use std::collections::BTreeSet;
 
 #[test]
 fn every_catalogued_runtime_name_is_answered_or_deliberately_unstaged() {
-    let answered: BTreeSet<&str> =
-        driver_cuda::bind::views::ANSWERED.iter().copied().collect();
-    let unstaged: BTreeSet<&str> =
-        driver_cuda::bind::views::UNSTAGED.iter().copied().collect();
+    let answered: BTreeSet<&str> = driver_cuda::bind::views::ANSWERED.iter().copied().collect();
+    let unstaged: BTreeSet<&str> = driver_cuda::bind::views::UNSTAGED.iter().copied().collect();
 
     let mut seen = BTreeSet::new();
     let mut orphans = Vec::new();
@@ -50,59 +48,130 @@ fn all_catalogued_plans() -> Vec<(String, model_ir::trace::ForwardPlan)> {
     };
 
     {
-        use model::gemma_4::forward::{CATALOG, facts::{Gemma4CudaFacts, Gemma4Facts}};
-        let (f, c) = (Gemma4Facts::gemma_4_e4b(), Gemma4CudaFacts::gemma_4_e4b_synthetic());
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, &c, cl, 1e-6)); } }
+        use model::gemma_4::forward::{
+            CATALOG,
+            facts::{Gemma4CudaFacts, Gemma4Facts},
+        };
+        let (f, c) = (
+            Gemma4Facts::gemma_4_e4b(),
+            Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+        );
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, &c, cl, 1e-6));
+            }
+        }
     }
     {
         use model::gemma_2::forward::{CATALOG, facts::Gemma2Facts};
         let f = Gemma2Facts::gemma_2_9b();
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, cl, 1e-6, 10_000.0)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, cl, 1e-6, 10_000.0));
+            }
+        }
     }
     {
         use model::gemma_3n::forward::{CATALOG, facts::Gemma3nFacts};
         let f = Gemma3nFacts::gemma3n_synthetic();
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, cl, 1e-6, 1_000_000.0, 10_000.0)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, cl, 1e-6, 1_000_000.0, 10_000.0));
+            }
+        }
     }
     {
         use model::glm_5::forward::{CATALOG, facts::Glm5Facts};
         let f = Glm5Facts::glm5_106b_a12b();
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, cl, 1e-6, 10_000.0)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, cl, 1e-6, 10_000.0));
+            }
+        }
     }
     {
-        use model::gpt_oss::forward::{CATALOG, facts::{GptOssCudaFacts, GptOssFacts}};
-        let (f, c) = (GptOssFacts::gpt_oss_20b(), GptOssCudaFacts::gpt_oss_20b_synthetic());
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, &c, cl, 1e-6, 150_000.0, 128)); } }
+        use model::gpt_oss::forward::{
+            CATALOG,
+            facts::{GptOssCudaFacts, GptOssFacts},
+        };
+        let (f, c) = (
+            GptOssFacts::gpt_oss_20b(),
+            GptOssCudaFacts::gpt_oss_20b_synthetic(),
+        );
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, &c, cl, 1e-6, 150_000.0, 128));
+            }
+        }
     }
     {
         use model::deepseek_v4::forward::{CATALOG, facts::Dsv4Facts};
         let f = Dsv4Facts::dsv4_synthetic();
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, cl, 1e-6, 10_000.0)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, cl, 1e-6, 10_000.0));
+            }
+        }
     }
     {
-        use model::kimi_k2::forward::{CATALOG, facts::{KimiCudaFacts, KimiFacts}};
+        use model::kimi_k2::forward::{
+            CATALOG,
+            facts::{KimiCudaFacts, KimiFacts},
+        };
         let (f, c) = (KimiFacts::kimi_k2(), KimiCudaFacts::kimi_k2_synthetic());
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, &c, cl, 1e-6)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, &c, cl, 1e-6));
+            }
+        }
     }
     {
         use model::kimi_k3::forward::{CATALOG, facts::KimiK3Facts};
         let f = KimiK3Facts::kimi_k3_synthetic();
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, cl, 1e-6)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, cl, 1e-6));
+            }
+        }
     }
     {
         use model::nemotron_h::forward::{CATALOG, facts::NemotronHFacts};
         let f = NemotronHFacts::nemotron_h_synthetic();
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, cl, 1e-6, 10_000.0)); } }
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, cl, 1e-6, 10_000.0));
+            }
+        }
     }
     {
-        use model::qwen_3_5::forward::{CATALOG, facts::{Qwen35CudaFacts, Qwen35HybridFacts}};
-        let (f, c) = (Qwen35HybridFacts::qwen3_5_0_8b(), Qwen35CudaFacts::qwen3_5_0_8b_synthetic());
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, &c, cl, 1e-6, 10_000.0)); } }
+        use model::qwen_3_5::forward::{
+            CATALOG,
+            facts::{Qwen35CudaFacts, Qwen35HybridFacts},
+        };
+        let (f, c) = (
+            Qwen35HybridFacts::qwen3_5_0_8b(),
+            Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+        );
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, &c, cl, 1e-6, 10_000.0));
+            }
+        }
     }
     {
-        use model::shared::llama_like::forward::{CATALOG, facts::{LlamaLikeCudaFacts, LlamaLikeFacts}};
-        let (f, c) = (LlamaLikeFacts::qwen3_0_6b(), LlamaLikeCudaFacts::qwen3_0_6b_l40s());
-        for (n, t) in CATALOG { for cl in CLASSES { push(n, t(&f, &c, cl, 1e-6, 10_000.0)); } }
+        use model::shared::llama_like::forward::{
+            CATALOG,
+            facts::{LlamaLikeCudaFacts, LlamaLikeFacts},
+        };
+        let (f, c) = (
+            LlamaLikeFacts::qwen3_0_6b(),
+            LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+        );
+        for (n, t) in CATALOG {
+            for cl in CLASSES {
+                push(n, t(&f, &c, cl, 1e-6, 10_000.0));
+            }
+        }
     }
     out
 }

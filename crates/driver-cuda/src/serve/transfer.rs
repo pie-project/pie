@@ -44,17 +44,77 @@ impl Shell {
                 eprintln!("[driver-cuda] copy_kv: host-to-host moves have no device leg");
                 return Err(PIE_STATUS_UNSUPPORTED);
             }
+            // The pool is ELASTIC: it holds what the frames so far have needed,
+            // not what the scheduler is entitled to hand out, and a copy plan's
+            // destination can name a page one past that high-water mark. Grow
+            // for it rather than refusing.
+            //
+            // `driver-vulkan` and `driver-wgpu` each carry a device test for
+            // exactly this (`a copy plan whose destination is above the pool
+            // GROWS it`), found by the curated-inferlet sweep on
+            // `prefix-tree-kv-cache` and only when it ran after the others --
+            // the signature of a driver whose answer depends on what preceded
+            // it. On CUDA it read
+            //
+            //     pre-launch KV copy rejected: driver-cuda copy_kv failed with
+            //     status -1
+            //
+            // and the bounds check below is right about the pool as it IS and
+            // has no way to know what it could be, so a prefix share aimed one
+            // page past the last prefill's high-water mark died, and the
+            // conversation died with it.
+            //
+            // DESTINATIONS only, and only when the destination is the device.
+            // A SOURCE above the pool stays refused: this pool only ever grows
+            // on demand, so a page it has never held is a page nothing has ever
+            // written, and growing for it would turn a refusal into a copy of
+            // freshly zeroed memory -- history-shaped silence rather than an
+            // error.
+            if !host_dst {
+                let need = desc
+                    .dst_page_ids
+                    .iter()
+                    .copied()
+                    .chain(desc.cells.iter().map(|cell| cell.dst_page_id))
+                    .max()
+                    .map_or(0, |page| page.saturating_add(1));
+                let have = state.kv.as_ref().map_or(0, |kv| kv.num_pages);
+                if need > have {
+                    state.hold_kv_pages(need)?;
+                }
+            }
+
             let (Some(model), Some(_kv)) = (state.model.as_ref(), state.kv.as_ref()) else {
+                eprintln!(
+                    "[driver-cuda] copy_kv: no model or no KV cache is loaded; \
+                     a page move needs both"
+                );
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
             let src_pages = desc.src_page_ids.as_slice();
             let dst_pages = desc.dst_page_ids.as_slice();
             if src_pages.len() != dst_pages.len() {
+                eprintln!(
+                    "[driver-cuda] copy_kv: {} source pages against {} destination \
+                     pages; the lists are positional and must be parallel",
+                    src_pages.len(),
+                    dst_pages.len()
+                );
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
             let cells = desc.cells.as_slice();
+
             if (host_src || host_dst) && !cells.is_empty() {
-                return Err(PIE_STATUS_INVALID_ARGUMENT); // cell moves are device-only
+                // Cell moves run a device kernel over the paged cache; a host
+                // domain has no cache to run it over.
+                eprintln!(
+                    "[driver-cuda] copy_kv: {} cell moves with a host domain on \
+                     one side (src {}, dst {}); cell moves are device-only",
+                    cells.len(),
+                    desc.src_domain,
+                    desc.dst_domain
+                );
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
             let (kv_heads, head_dim) = (
                 i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
@@ -136,6 +196,12 @@ impl Shell {
                 if (!host_src && *s_id >= kv_ref.num_pages)
                     || (!host_dst && *d_id >= kv_ref.num_pages)
                 {
+                    eprintln!(
+                        "[driver-cuda] copy_kv: page {s_id} -> {d_id} is outside \
+                         this pool's {} pages (device side: src {host_src:?} is \
+                         host, dst {host_dst:?} is host)",
+                        kv_ref.num_pages
+                    );
                     return Err(PIE_STATUS_INVALID_ARGUMENT);
                 }
             }
@@ -170,6 +236,11 @@ impl Shell {
                 _ => dev_geometry,
             };
             let Ok(plan) = SwapPlan::build(&geometry, direction, src_pages, dst_pages) else {
+                eprintln!(
+                    "[driver-cuda] copy_kv: SwapPlan::build declined {} pages in \
+                     direction {direction:?} against this geometry",
+                    src_pages.len()
+                );
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
             // A host leg rides the pool's own stream for its direction; a
@@ -315,9 +386,7 @@ impl Shell {
                 return Err(PIE_STATUS_DRIVER_ERROR);
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            state
-                .broker
-                .notify(completion.wait_id, completion.target_epoch);
+            crate::serve::settle_control(&state.broker, completion);
             Ok(())
         })
     }
@@ -331,7 +400,7 @@ impl Shell {
     pub fn copy_state(
         &mut self,
         copy: &driver_api::StateCopyPlan,
-        _completion: driver_api::completion::CompletionTarget,
+        completion: driver_api::completion::CompletionTarget,
     ) -> Result<(), i32> {
         guard("copy_state", Err(PIE_STATUS_DRIVER_ERROR), move || {
             let state = self;
@@ -377,6 +446,8 @@ impl Shell {
             if stream.as_ref().synchronize().is_err() {
                 return Err(PIE_STATUS_DRIVER_ERROR);
             }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            crate::serve::settle_control(&state.broker, completion);
             Ok(())
         })
     }
@@ -402,6 +473,31 @@ impl Shell {
             if target == 0 {
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
+            state.hold_kv_pages(target)?;
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            crate::serve::settle_control(&state.broker, completion);
+            Ok(())
+        })
+    }
+
+    /// Reallocate the KV pool to hold exactly `target` pages, carrying the
+    /// surviving pages forward.
+    ///
+    /// Factored out of [`Self::resize_pool`] because it has a SECOND caller:
+    /// [`Self::copy_kv`] grows through it when a plan names a destination
+    /// above the pool. It is the whole of what a resize does apart from
+    /// settling the completion, so `resize_pool` is now that call plus the
+    /// settle.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` if no model is loaded or the geometry will not
+    /// plan, `EXHAUSTED` if the new pool will not fit in VRAM (the old one is
+    /// still installed and intact in that case), `DRIVER_ERROR` if the
+    /// carry-forward copy or its synchronize fails.
+    fn hold_kv_pages(&mut self, target: u32) -> Result<(), i32> {
+        {
+            let state = self;
             let Some(model) = state.model.as_ref() else {
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
@@ -515,11 +611,7 @@ impl Shell {
             // `Recordings` to recapture instead of replaying into memory the
             // pool no longer owns.
             crate::serve::state::install_kv(&mut state.kv, &mut state.fire_arrays.epoch, fresh);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            state
-                .broker
-                .notify(completion.wait_id, completion.target_epoch);
             Ok(())
-        })
+        }
     }
 }

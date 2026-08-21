@@ -43,7 +43,12 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped(
+                "no Metal 4 device, so the fused kernel was never compared",
+            );
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let dir = tempfile::tempdir().expect("tempdir");
@@ -152,7 +157,7 @@ fn kernels() -> Vec<EmittedKernel> {
 #[test]
 fn a_placed_fire_runs_inside_the_targets_step_and_commits() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x81));
@@ -206,7 +211,7 @@ fn a_placed_fire_runs_inside_the_targets_step_and_commits() {
 #[test]
 fn a_command_never_encoded_reports_never_dispatched_not_a_fault() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x82));
@@ -247,7 +252,7 @@ fn a_command_never_encoded_reports_never_dispatched_not_a_fault() {
 #[test]
 fn a_stage_without_a_fused_executable_cannot_be_placed() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x83));

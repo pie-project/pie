@@ -415,8 +415,8 @@ mod tests {
         // The machinery the claim promises, asked for an instance that is not
         // there: it must answer by NAME rather than by not existing.
         let registry = driver_metal::channel::Registry::new();
-        let refused = driver_metal::envelope::geometry(&registry, 7, 16)
-            .expect_err("there is no instance 7");
+        let refused =
+            driver_metal::envelope::geometry(&registry, 7, 16).expect_err("there is no instance 7");
         assert!(
             refused.to_string().contains('7'),
             "the refusal names the instance it could not find: {refused}"

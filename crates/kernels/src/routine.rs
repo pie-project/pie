@@ -83,9 +83,10 @@ pub trait Backend: Copy + 'static {
     /// [`Refusal::Absent`] when this backend has no region shape at all.
     fn region(value: &Self::Value) -> Result<Extent, Refusal> {
         let _ = value;
-        Err(Refusal::Absent { what: "a region's shape: this binder binds addresses only" })
+        Err(Refusal::Absent {
+            what: "a region's shape: this binder binds addresses only",
+        })
     }
-
 }
 
 /// How many rows a region has and how wide each one is, in elements.
@@ -159,7 +160,10 @@ impl Layout {
     /// once, where a reader looking for it will find it.
     #[must_use]
     pub const fn packed(rows: i32, width: i32) -> Self {
-        Self { dims: [rows, width], strides: [width, 1] }
+        Self {
+            dims: [rows, width],
+            strides: [width, 1],
+        }
     }
 
     /// How many rows the allocation holds.
@@ -468,7 +472,10 @@ pub trait Asks<B: Backend>: Answers<B> {
         i32: Arg<B>,
     {
         <i32 as Arg<B>>::unpack(
-            &self.resolve(<i32 as Arg<B>>::TY, crate::Source::Slot(crate::Kind::Param, n))?,
+            &self.resolve(
+                <i32 as Arg<B>>::TY,
+                crate::Source::Slot(crate::Kind::Param, n),
+            )?,
             usize::from(n),
         )
     }
@@ -655,7 +662,8 @@ impl Fire {
     /// group and `group` threads in it is `rows * group` elements.
     #[must_use]
     pub const fn per_row(self, rows: u32, group: u32) -> Self {
-        self.lanes([rows.saturating_mul(group), 1, 1]).group([group, 1, 1])
+        self.lanes([rows.saturating_mul(group), 1, 1])
+            .group([group, 1, 1])
     }
 
     /// A grid stated as GROUPS on all three axes, with the divisor beside it.
@@ -679,7 +687,13 @@ impl Fire {
     /// `Launch`, and `Launch::into_fire` feeds it here rather than making
     /// every helper return a `Fire` it has no file or entrypoint for.
     #[must_use]
-    pub const fn geometry(mut self, lanes: [u32; 3], group: [u32; 3], smem: u32, cooperative: bool) -> Self {
+    pub const fn geometry(
+        mut self,
+        lanes: [u32; 3],
+        group: [u32; 3],
+        smem: u32,
+        cooperative: bool,
+    ) -> Self {
         self.lanes = lanes;
         self.group = group;
         self.smem = smem;
@@ -719,10 +733,6 @@ impl Fire {
     }
 }
 
-
-
-
-
 // `Clone`/`Copy` BY HAND, BECAUSE `derive` PUTS THE BOUND ON THE PARAMETER.
 // A derived `Copy` on `In<E>` asks for `E: Copy` -- the ELEMENT -- when what
 // has to be `Copy` is the carrier the element names. `bf16` is a pointee that
@@ -747,7 +757,6 @@ impl<E: Elem> Clone for InOut<E> {
     }
 }
 impl<E: Elem> Copy for InOut<E> {}
-
 
 /// A carrier, as the value a launch is given.
 ///
@@ -1135,16 +1144,6 @@ impl<C: ConstRun> core::ops::Deref for Const<C> {
     }
 }
 
-
-
-
-/// A pointee: something a device address can point at, with both of its
-/// pointer ABIs.
-///
-/// Not `jit::abi::Inst`, which is a C++ instantiation marker — how the device
-/// text spells a type — and has implementors that are pure markers with no
-/// pointer ABI at all. This is the host-side pair.
-
 // `Held<Q, T>` STOOD HERE AND WAS THE LAST OF THE FIFTEEN. It set
 // `SOURCE = Q::SOURCE` while forwarding `PROV = T::PROV`, and its doc said
 // why: *"The op DOES carry an operand for `conv_state` and the arity checker
@@ -1166,6 +1165,12 @@ impl<C: ConstRun> core::ops::Deref for Const<C> {
 // `Env<T, Q>` now, which says the same thing about the source and the honest
 // thing about who supplies it.
 
+/// A pointee: something a device address can point at, with both of its
+/// pointer ABIs.
+///
+/// Not `jit::abi::Inst`, which is a C++ instantiation marker — how the device
+/// text spells a type — and has implementors that are pure markers with no
+/// pointer ABI at all. This is the host-side pair.
 pub trait Elem: 'static {
     /// What a launch that READS this element is handed.
     ///
@@ -1271,17 +1276,41 @@ macro_rules! prim_elem {
     };
 }
 
-prim_elem!(i32, "const ::std::int32_t*", "::std::int32_t*", I32s, I32sMut);
+prim_elem!(
+    i32,
+    "const ::std::int32_t*",
+    "::std::int32_t*",
+    I32s,
+    I32sMut
+);
 // `BufMut` AND NOT `I64sMut`, WHICH IS THE `ptr_abi!` LINE'S OWN ASYMMETRY:
 // nothing in the tree writes an `int64_t*` parameter, so the mutable
 // direction falls back to the untyped buffer. The cross-check in
 // `kernels-cuda/src/jit/abi.rs` is what keeps this odd pair honest rather
 // than a reader's memory.
-prim_elem!(i64, "const ::std::int64_t*", "::std::int64_t*", I64s, BufMut);
+prim_elem!(
+    i64,
+    "const ::std::int64_t*",
+    "::std::int64_t*",
+    I64s,
+    BufMut
+);
 prim_elem!(i8, "const ::std::int8_t*", "::std::int8_t*", I8s, I8sMut);
-prim_elem!(u32, "const ::std::uint32_t*", "::std::uint32_t*", U32s, U32sMut);
+prim_elem!(
+    u32,
+    "const ::std::uint32_t*",
+    "::std::uint32_t*",
+    U32s,
+    U32sMut
+);
 prim_elem!(u8, "const ::std::uint8_t*", "::std::uint8_t*", U8s, U8sMut);
-prim_elem!(u16, "const ::std::uint16_t*", "::std::uint16_t*", U16s, U16sMut);
+prim_elem!(
+    u16,
+    "const ::std::uint16_t*",
+    "::std::uint16_t*",
+    U16s,
+    U16sMut
+);
 prim_elem!(f32, "const float*", "float*", F32s, F32sMut);
 // THE OPAQUE POINTEE, AND IT IS A REAL ONE. §5 of the spec says the case that
 // would earn `In<N, Table<Ptr>>` is a non-tensor buffer in operand position,
@@ -1327,10 +1356,34 @@ macro_rules! ptr_elem {
     };
 }
 
-ptr_elem!(*const core::ffi::c_void, "const void* const*", "const void**", BufArray, BufArrayOut);
-ptr_elem!(*mut core::ffi::c_void, "void* const*", "void**", BufArrayMut, BufArrayOutMut);
-ptr_elem!(*const u8, "const ::std::uint8_t* const*", "const ::std::uint8_t**", BufArrayOut, BufArrayOut);
-ptr_elem!(*const i32, "const ::std::int32_t* const*", "const ::std::int32_t**", BufArrayOut, BufArrayOut);
+ptr_elem!(
+    *const core::ffi::c_void,
+    "const void* const*",
+    "const void**",
+    BufArray,
+    BufArrayOut
+);
+ptr_elem!(
+    *mut core::ffi::c_void,
+    "void* const*",
+    "void**",
+    BufArrayMut,
+    BufArrayOutMut
+);
+ptr_elem!(
+    *const u8,
+    "const ::std::uint8_t* const*",
+    "const ::std::uint8_t**",
+    BufArrayOut,
+    BufArrayOut
+);
+ptr_elem!(
+    *const i32,
+    "const ::std::int32_t* const*",
+    "const ::std::int32_t**",
+    BufArrayOut,
+    BufArrayOut
+);
 
 /// What this launch touches of an allocation.
 ///
@@ -1389,7 +1442,12 @@ impl<E: Elem> In<E> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
-        Ok(Region { ptr: self.ptr, rows, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr: self.ptr,
+            rows,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
     /// A WINDOW into the operand: `count` rows starting at row `start`.
     ///
@@ -1416,14 +1474,23 @@ impl<E: Elem> In<E> {
         }
         let end = i64::from(start).saturating_add(i64::from(count.max(0)));
         if end > i64::from(self.rows) {
-            return Err(Refusal::Wide { what, at: end, max: i64::from(self.rows) });
+            return Err(Refusal::Wide {
+                what,
+                at: end,
+                max: i64::from(self.rows),
+            });
         }
         // SAFETY: the bound above proves `start` is within the operand's own
         // rows, and `width` is its pitch, so the product is an offset the
         // allocation covers.
         // SAFETY: the bound above proves the offset lies inside the operand.
         let ptr = unsafe { E::advance_read(self.ptr, start as usize * self.width as usize) };
-        Ok(Region { ptr, rows: count, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr,
+            rows: count,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 
     /// This launch's whole view of the operand.
@@ -1437,7 +1504,12 @@ impl<E: Elem> In<E> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
-        Ok(Region { ptr: self.ptr, rows: self.rows, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr: self.ptr,
+            rows: self.rows,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 }
 
@@ -1452,14 +1524,24 @@ impl<E: Elem> Out<E> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
-        Ok(Region { ptr: self.ptr, rows, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr: self.ptr,
+            rows,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 
     pub fn all(&self, what: &'static str) -> Result<Region<E::Write>, Refusal> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
-        Ok(Region { ptr: self.ptr, rows: self.rows, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr: self.ptr,
+            rows: self.rows,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 }
 
@@ -1664,7 +1746,6 @@ impl<V: Absent, M: Bind<V>> Bind<V> for Option<M> {
         }
     }
 }
-
 
 /// The element's own C++ word, or the carrier's, whichever was written down.
 ///
@@ -2833,7 +2914,10 @@ impl<B: Backend> Routine<B> {
     /// build failure at the row rather than an unreachable routine.
     #[must_use]
     pub const fn canon(mut self, role: &'static str) -> Self {
-        assert!(crate::canon::is_role(role), "not a role `canon.rs` closes over");
+        assert!(
+            crate::canon::is_role(role),
+            "not a role `canon.rs` closes over"
+        );
         self.canon = Some(role);
         self
     }
@@ -2873,7 +2957,6 @@ impl<B: Backend> Routine<B> {
         self.sources = sources;
         self
     }
-
 }
 
 /// One routine's row with its backend forgotten.
@@ -2964,8 +3047,9 @@ pub const fn describe<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [T
 
 /// The same signature's QUESTIONS, in the same order. See [`Ask`].
 #[must_use]
-pub const fn sources<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [Option<crate::Source>]
-{
+pub const fn sources<B: Backend, M, F: KernelFn<B, M>>(
+    _body: F,
+) -> &'static [Option<crate::Source>] {
     F::SOURCES
 }
 
@@ -3206,25 +3290,36 @@ const _: () = {
 
 // ── Constructors, for the fixtures that build a row by hand ──
 
-
 impl<E: Elem> In<E> {
     /// Wear the next input slot for this carrier, with no rectangle stated.
     pub const fn new(ptr: E::Read) -> Self {
-        Self { ptr, rows: 0, width: 0 }
+        Self {
+            ptr,
+            rows: 0,
+            width: 0,
+        }
     }
 }
 
 impl<E: Elem> Out<E> {
     /// Wear the next result slot, with no rectangle stated.
     pub const fn new(ptr: E::Write) -> Self {
-        Self { ptr, rows: 0, width: 0 }
+        Self {
+            ptr,
+            rows: 0,
+            width: 0,
+        }
     }
 }
 
 impl<E: Elem> InOut<E> {
     /// Wear both slots at one address, with no rectangle stated.
     pub const fn new(ptr: E::Write) -> Self {
-        Self { ptr, rows: 0, width: 0 }
+        Self {
+            ptr,
+            rows: 0,
+            width: 0,
+        }
     }
 
     /// A WINDOW into the operand: `count` rows starting at row `start`. See
@@ -3245,11 +3340,20 @@ impl<E: Elem> InOut<E> {
         }
         let end = i64::from(start).saturating_add(i64::from(count.max(0)));
         if end > i64::from(self.rows) {
-            return Err(Refusal::Wide { what, at: end, max: i64::from(self.rows) });
+            return Err(Refusal::Wide {
+                what,
+                at: end,
+                max: i64::from(self.rows),
+            });
         }
         // SAFETY: the bound above proves the offset lies inside the operand.
         let ptr = unsafe { E::advance_write(self.ptr, start as usize * self.width as usize) };
-        Ok(Region { ptr, rows: count, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr,
+            rows: count,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 
     /// This operand's view over a row count the CALLER supplies. See
@@ -3262,7 +3366,12 @@ impl<E: Elem> InOut<E> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
-        Ok(Region { ptr: self.ptr, rows, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr: self.ptr,
+            rows,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 
     /// This launch's whole view of the operand. See [`In::all`].
@@ -3274,7 +3383,12 @@ impl<E: Elem> InOut<E> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
-        Ok(Region { ptr: self.ptr, rows: self.rows, width: self.width, stride: Stride(self.width) })
+        Ok(Region {
+            ptr: self.ptr,
+            rows: self.rows,
+            width: self.width,
+            stride: Stride(self.width),
+        })
     }
 
     /// See [`In::layout`].
@@ -3283,4 +3397,3 @@ impl<E: Elem> InOut<E> {
         Layout::packed(self.rows, self.width)
     }
 }
-

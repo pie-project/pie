@@ -109,7 +109,10 @@ async fn a_second_architecture_answers_on_the_wgpu_driver() -> Result<()> {
     // architecture out of the artifact — but a gate whose whole subject is
     // "a different model" should not be the one place that says otherwise.
     let pie = common::boot_wgpu_named(&model, "qwen2", 256).await?;
-    eprintln!("[wgpu-2nd] booted on {model}, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[wgpu-2nd] booted on {model}, listen_addr={}",
+        pie.listen_addr
+    );
 
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let dir = workspace.join("chat-completion");

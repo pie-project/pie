@@ -686,14 +686,23 @@ mod batch_tests {
         // routes would compile two character-different sources: two archives
         // and two compiles for one set of pipelines.
         let forward = Batch::load_with(
-            &stamped(&[("a.metal", "k", "STAMP(\"k\")"), ("a.metal", "j", "STAMP(\"j\")")]),
+            &stamped(&[
+                ("a.metal", "k", "STAMP(\"k\")"),
+                ("a.metal", "j", "STAMP(\"j\")"),
+            ]),
             files(&[("a.metal", "BODY")]),
         );
         let backward = Batch::load_with(
-            &stamped(&[("a.metal", "k", "STAMP(\"k\")"), ("a.metal", "j", "STAMP(\"j\")")]),
+            &stamped(&[
+                ("a.metal", "k", "STAMP(\"k\")"),
+                ("a.metal", "j", "STAMP(\"j\")"),
+            ]),
             files(&[("a.metal", "BODY")]),
         );
-        assert_eq!(forward.source(0).unwrap().as_ref().unwrap(), backward.source(0).unwrap().as_ref().unwrap());
+        assert_eq!(
+            forward.source(0).unwrap().as_ref().unwrap(),
+            backward.source(0).unwrap().as_ref().unwrap()
+        );
         let a = Batch::load_with(
             &stamped(&[("a.metal", "k", "S(\"k\")"), ("a.metal", "j", "S(\"j\")")]),
             files(&[("a.metal", "BODY")]),
@@ -702,14 +711,20 @@ mod batch_tests {
             &stamped(&[("a.metal", "j", "S(\"j\")"), ("a.metal", "k", "S(\"k\")")]),
             files(&[("a.metal", "BODY")]),
         );
-        assert_eq!(a.source(0).unwrap().as_ref().unwrap(), b.source(0).unwrap().as_ref().unwrap());
+        assert_eq!(
+            a.source(0).unwrap().as_ref().unwrap(),
+            b.source(0).unwrap().as_ref().unwrap()
+        );
     }
 
     #[test]
     fn one_point_asked_for_twice_is_stamped_once() {
         // A redefinition is a compile error, not a duplicate line.
         let batch = Batch::load_with(
-            &stamped(&[("a.metal", "k", "STAMP(\"k\")"), ("a.metal", "k", "STAMP(\"k\")")]),
+            &stamped(&[
+                ("a.metal", "k", "STAMP(\"k\")"),
+                ("a.metal", "k", "STAMP(\"k\")"),
+            ]),
             files(&[("a.metal", "BODY")]),
         );
         let Some(Ok(text)) = batch.source(0) else {
@@ -722,7 +737,10 @@ mod batch_tests {
     fn an_unstamped_request_leaves_its_source_alone() {
         // Every other `.metal` in the tree and every other backend. The empty
         // stamp is not a special case here, it just appends nothing.
-        let batch = Batch::load_with(&requests(&[("a.metal", "k")]), files(&[("a.metal", "BODY")]));
+        let batch = Batch::load_with(
+            &requests(&[("a.metal", "k")]),
+            files(&[("a.metal", "BODY")]),
+        );
         assert!(matches!(batch.source(0), Some(Ok(text)) if text == "BODY"));
     }
 

@@ -4,13 +4,11 @@ use crate::source::{self, ALL_HEADERS, DEVICE_HEADERS, Header};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Toolchain {
-
     pub major: u32,
     pub minor: u32,
 }
 
 impl Toolchain {
-
     pub const ANY: Self = Self { major: 0, minor: 0 };
 
     #[must_use]
@@ -31,19 +29,21 @@ impl Toolchain {
 
 impl fmt::Display for Toolchain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_any() { f.write_str("any") } else { write!(f, "{}.{}", self.major, self.minor) }
+        if self.is_any() {
+            f.write_str("any")
+        } else {
+            write!(f, "{}.{}", self.major, self.minor)
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Headers {
-
     Library,
     LibraryAndUpstream,
 }
 
 impl Headers {
-
     #[must_use]
     pub const fn set(self) -> &'static [Header] {
         match self {
@@ -63,7 +63,6 @@ impl Headers {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Root {
-
     pub name: &'static str,
     pub text: &'static str,
     pub file: &'static str,
@@ -73,10 +72,12 @@ pub struct Root {
 }
 
 const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
-
     (
         "attn/attention_mla_fa2.cuh",
-        &["--device-as-default-execution-space", "--relocatable-device-code=true"],
+        &[
+            "--device-as-default-execution-space",
+            "--relocatable-device-code=true",
+        ],
         Headers::LibraryAndUpstream,
         Toolchain::ANY,
     ),
@@ -110,11 +111,36 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
         Headers::LibraryAndUpstream,
         Toolchain::ANY,
     ),
-    ("tile/alternatives.cuh", &[], Headers::Library, Toolchain::new(13, 3)),
-    ("sample/argmax_tile.cuh", &[], Headers::Library, Toolchain::new(13, 3)),
-    ("layout/gather_rows_tile.cuh", &[], Headers::Library, Toolchain::new(13, 3)),
-    ("quant/dequant_wna16_tile.cuh", &[], Headers::Library, Toolchain::new(13, 3)),
-    ("quant/wna16_gemv_tile.cuh", &[], Headers::Library, Toolchain::new(13, 3)),
+    (
+        "tile/alternatives.cuh",
+        &[],
+        Headers::Library,
+        Toolchain::new(13, 3),
+    ),
+    (
+        "sample/argmax_tile.cuh",
+        &[],
+        Headers::Library,
+        Toolchain::new(13, 3),
+    ),
+    (
+        "layout/gather_rows_tile.cuh",
+        &[],
+        Headers::Library,
+        Toolchain::new(13, 3),
+    ),
+    (
+        "quant/dequant_wna16_tile.cuh",
+        &[],
+        Headers::Library,
+        Toolchain::new(13, 3),
+    ),
+    (
+        "quant/wna16_gemv_tile.cuh",
+        &[],
+        Headers::Library,
+        Toolchain::new(13, 3),
+    ),
 ];
 
 const fn configured_for(file: &str) -> (&'static [&'static str], Headers, Toolchain) {
@@ -130,11 +156,17 @@ const fn configured_for(file: &str) -> (&'static [&'static str], Headers, Toolch
 }
 
 impl Root {
-
     #[must_use]
     pub const fn new(file: &'static str) -> Self {
         let (options, headers, floor) = configured_for(file);
-        Self { name: strip_cuh(file), text: source::carried(file), file, options, headers, floor }
+        Self {
+            name: strip_cuh(file),
+            text: source::carried(file),
+            file,
+            options,
+            headers,
+            floor,
+        }
     }
 
     #[must_use]
@@ -142,13 +174,27 @@ impl Root {
         let text = source::text_of(file)?;
         let name = file.strip_suffix(".cuh")?;
         let (options, headers, floor) = configured_for(file);
-        Some(Self { name, text, file, options, headers, floor })
+        Some(Self {
+            name,
+            text,
+            file,
+            options,
+            headers,
+            floor,
+        })
     }
 
     #[must_use]
     pub const fn variant(name: &'static str, file: &'static str) -> Self {
         let (options, headers, floor) = configured_for(file);
-        Self { name, text: source::carried(file), file, options, headers, floor }
+        Self {
+            name,
+            text: source::carried(file),
+            file,
+            options,
+            headers,
+            floor,
+        }
     }
 
     #[must_use]

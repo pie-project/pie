@@ -786,10 +786,586 @@ impl Serving<'_> {
         //   all four                    7       196   2.55 ms          26.4 %
         // ```
         //
+        // # THE LIST IS MISSING A ROW, AND IT IS THE BIGGEST ONE
+        //
+        // `PIE_WGPU_DUMP` censuses the decode's 480 launches (the table is in
+        // `what_a_decode_costs_at_length`) and `rms_single_row` is **113** of
+        // them -- 23.5% of the token. The row above counts 56: the pre-attn
+        // and pre-mlp norms. The other 57 are one final norm and, per layer,
+        // the two PER-HEAD qk-norms this model has:
+        //
+        // ```text
+        //   fusion                     rects/layer   removed    saved     of 9.83 ms
+        //   q-norm + k-norm into rope            2        56   0.73 ms         7.5 %
+        // ```
+        //
+        // # THAT ROW IS NOW LANDED, AND IT MEASURED 0.26 ms
+        //
+        // `kernels-wgpu`'s `norm::rms_rope` ships and the deployment states
+        // `fused_qk_rope: true`. Ten interleaved runs put it at **0.26 ms,
+        // 2.7%, ~104.3 -> ~107.2 tok/s** -- against the 0.34 ms the marginal
+        // 6 us predicted and the 0.73 ms the 13 us above predicted. The
+        // marginal price is the one that was right, which is the first
+        // end-to-end evidence for any of these estimates and the reason the
+        // three remaining rows should be believed at ~0.34 ms each rather
+        // than ~0.73.
+        //
+        // The full table, including why the fused column is bimodal and why
+        // two interleaved pairs would have reported no effect at all, is in
+        // `what_a_decode_costs_at_length`.
+        //
+        // # AND THE q||k||v ROW IS WORTH MORE THAN A FLOOR, FOR A SECOND REASON
+        //
+        // Every row above prices a fusion as launches removed times a floor,
+        // because the fused pair "keeps its arithmetic". For the three norm and
+        // rope rows that is right. For `q||k||v` and `gate||up` it is not, and
+        // `qmv.wgsl` now carries the measurement that says so.
+        //
+        // qmv's 141 decode fires read 218 MB in 3.20 ms -- **68 GB/s of this
+        // part's 273**. Removing most of the nibble-unpack ALU buys 2.4% and
+        // issuing every weight load twice costs 0.7%, so neither the
+        // arithmetic nor the load count is what holds it at a quarter rate.
+        // Drop the lm head and the remaining 140 fires are 20.8 us each for
+        // 1.8 to 5.5 us of bytes over a 6 us floor: they are too SMALL to fill
+        // the GPU, 256 workgroups of 32 invocations for twenty cores.
+        //
+        // Joining q, k and v does not just delete two launches. It turns three
+        // dispatches of 512, 256 and 256 workgroups into one of 1024 -- it
+        // fixes the thing the fires are actually short of. The 0.34 ms in the
+        // table is therefore a FLOOR on that row, not an estimate of it, and
+        // the same holds for `gate||up` (768 + 768 -> 1536). Neither the
+        // per-head-norm row nor the rope row gets this bonus; they were
+        // already one-workgroup fires where only the floor was ever at stake,
+        // which is exactly why `rms_rope` landed at the marginal 0.26 ms and
+        // not a penny more.
+        //
+        // And `qmv.wgsl` can put a number on the bonus, because it has held a
+        // measured GB/s-against-dispatch-size curve since it was written and
+        // nobody read it that way: 128 workgroups 45 GB/s, 512 -> 96, 2048 ->
+        // 149, 32064 -> 186. Stepping q||k||v from the 256-512 band to 1024,
+        // and gate||up from 768 to 1536, is worth roughly 1.4x on the 143 MB
+        // those five fires read across 28 layers:
+        //
+        // ```text
+        //   fusion       launches   floor      rate        together   of 9.5 ms
+        //   q||k||v            56   0.34 ms    ~0.38 ms    ~0.7 ms        7.4 %
+        //   gate||up           28   0.17 ms    ~0.30 ms    ~0.5 ms        5.0 %
+        // ```
+        //
+        // That is the largest single item left in the decode, it is twice what
+        // the floor-only table said, and both rows are blocked in the same
+        // place -- `builder.rs::dense_fused_projection_joins` returning early,
+        // for this backend at its very first line, because MLX checkpoints
+        // bind under `Projections::InPlace`.
+        //
+        // # AND THE RATE TERM IS NOW MEASURED, NOT EXTRAPOLATED
+        //
+        // `qmv.wgsl` grew a `PIE_ROWREP` knob that makes each workgroup walk
+        // more row-groups and divides the grid to match: identical codes,
+        // identical bytes, identical reduction, only the dispatch size moves.
+        // Three interleaved rounds at 200 samples:
+        //
+        // ```text
+        //   PIE_ROWREP   grid       p50 mean    against 1
+        //   1            rows/4     9.603 ms
+        //   2            rows/8    10.277 ms      +7.0 %
+        //   4            rows/16   12.448 ms     +29.6 %
+        // ```
+        //
+        // Halving qmv's grid costs 21% OF QMV; quartering it costs 89%. The
+        // curve is superlinear and still climbing at the shipped grid, so the
+        // doubling a join would buy is real. The rate column above is the
+        // conservative end of that slope.
+        //
+        // # TWO THINGS THAT LOOK LIKE SHORTCUTS TO THAT GRID AND ARE NOT
+        //
+        // SPLIT-K IN `qmv` ITSELF needs no model crate at all: give each
+        // output row two workgroups over half of K each and merge. It doubles
+        // the grid, which is the measured lever, and it still loses. The slope
+        // says a doubling is worth about 0.55 ms spread over 141 fires -- 3.9
+        // us apiece -- and the merge is a dispatch, which is 6. It loses by
+        // half before the merge kernel does any work, and it loses at EVERY
+        // split factor because the merge count tracks the fire count. That is
+        // why the join is the only way up this curve: it is the only change
+        // that grows the grid while REMOVING launches.
+        //
+        // AND THE JOIN SAVES ONE LAUNCH A LAYER, NOT TWO. `model_dsl::metal`'s
+        // `split_qkv` is a `launch_with_params`, not a view: the packed bank
+        // has to be deinterleaved into three buffers before `rms_rope` and
+        // `kv_append_paged` can read them. So three qmv fires become one qmv
+        // and one split, and 0.17 ms of the 0.34 ms floor saving goes straight
+        // back. The rate term survives whole, which is why the row is still
+        // worth ~0.5 ms.
+        //
+        // # AND THEN THE RATE TERM WAS MEASURED DIRECTLY AND IT IS ZERO
+        //
+        // Everything above about a rate bonus comes from reading two curves
+        // that only ever measured the grid getting SMALLER. `qmv.wgsl`'s
+        // `PIE_ROWW` measures it getting bigger: two output rows a workgroup
+        // instead of four, same weight traffic, grid doubled. Three interleaved
+        // rounds put it at +0.84% with the rounds overlapping, and the same
+        // sweep with the loop's arithmetic stubbed on both arms -- which is the
+        // only thing the probe adds -- puts it at -0.7%, worse in every round.
+        // The two straddle zero.
+        //
+        // There is a knee and the shipped grid is on top of it. Below, the cost
+        // is steep (halving is 7%, quartering 30%); above, the curve is flat.
+        //
+        // So strike the rate column. `q||k||v` is worth its launch floor and
+        // `split_qkv` takes half of that back, which leaves ~0.17 ms and 1.8%;
+        // `gate||up` has no split to pay and is worth ~0.17 ms too. Both still
+        // want the model-crate join, and neither is now the largest item in the
+        // decode -- they are ordinary launch-floor savings like the norm rows,
+        // and they should be planned as such.
+        //
+        // The thing that looked unexplained -- qmv reading its weights at 68
+        // GB/s of 273 with the ALU, the load issue and the dispatch size all
+        // measuring free -- is answered in `device.rs` above the dispatch
+        // loop, and the answer is that wgpu-hal's Metal backend only ever
+        // builds a `MTLDispatchTypeSerial` compute encoder. Independent
+        // dispatches cannot overlap on this backend at any resource layout, so
+        // a kernel whose fires are small spends its time between them and no
+        // knob inside the kernel can reach it.
+        //
+        // # AND THEN THE 4.6 us TURNED OUT NOT TO BE TURNAROUND
+        //
+        // EVERYTHING BELOW THIS HEADING IS PRICED AT 4.6 us A LAUNCH AND THAT
+        // NUMBER IS WRONG AS A LAUNCH PRICE. `PIE_WGPU_STAMP` times each
+        // dispatch with the GPU's own clock; over a 424-launch decode the GPU
+        // is inside a kernel for 8.56 ms of the 8.86 ms it is busy, so
+        // turnaround is **0.71 us a launch**, measured with one encoder per
+        // dispatch where the shipped path uses one for the whole fire. The
+        // 4.6 us the `rms_rope` fusion bought was the KERNEL: `rms_single_row`
+        // costs 7.9 us of GPU and the fusion deleted 56 of them.
+        //
+        // So the rule for this whole list changes shape. A fold is worth what
+        // its DELETED KERNEL costs, minus what it adds to the kernel that
+        // absorbs it, plus 0.71 us. The launch count barely matters. Measured
+        // costs, from `serving.rs`'s table:
+        //
+        // ```text
+        //   kv_append_paged      4.3 us  x 28  = 0.12 ms
+        //   rms_single_row       7.9 us  x 57  = 0.45 ms
+        //   silu_mul             3.3 us  x 28  = 0.09 ms
+        //   sdpa_decode_merge    6.4 us  x 28  = 0.18 ms
+        // ```
+        //
+        // Which KILLS `rms_single_row into its qmv`. The prize is 0.45 ms, but
+        // the five qmv fires a layer that read its output must each redo the
+        // row sum at ~+26% ALU, and the 768-group qmv costs 31.0 us -- +26% is
+        // +8.1 us, MORE than the 7.9 us saved, on each of the five. The fold
+        // makes the token slower. It was ranked last here for having a quarter
+        // of its prize eaten; the real figure is more than all of it.
+        //
+        // And it RE-ARGUES `q||k||v` on completely different grounds. As a
+        // launch-count saving it is now worth 56 x 0.71 us = 0.04 ms and is
+        // not worth the model-crate work. What makes it worth doing is that
+        // qmv's fires are NOT linear in their rows:
+        //
+        // ```text
+        //   [1, 256, 1]   16.1 us      [1, 512, 1]   23.2 us
+        //   [1, 768, 1]   31.0 us
+        // ```
+        //
+        // Three times the rows for twice the time -- and the three shapes fit a
+        // STRAIGHT LINE in the bytes their weight banks hold. At 4-bit with
+        // bf16 scales and biases every 64 those banks are 0.5625, 1.125 and
+        // 1.6875 MiB, and the three stamped times are
+        //
+        //     8.65 us + 13.24 us a MiB
+        //
+        // with the middle point, which the fit does not use, landing at 23.55
+        // against 23.2. So the marginal rate is 79.2 GB/s and **a qmv fire
+        // costs 8.65 us before it reads a byte** -- 12x the 0.71 us of
+        // turnaround, so it is inside the kernel and not the dispatch.
+        //
+        // ## AND THE INTERCEPT IS NOT A qmv FACT. IT IS 45% OF THE TOKEN.
+        //
+        // The 8.65 us above is fitted from ONE kernel's three shapes and reads
+        // like a property of `affine_qmv_fast`. It is not. Three kernels with
+        // nothing in common measure the same constant:
+        //
+        // ```text
+        //   affine_qmv_fast   fitted intercept, three bank sizes     8.65 us
+        //   rms_single_row    its WHOLE cost, grid [1, 1, 1], 2 KiB  7.9  us
+        //   sdpa_..._split    residue with the 64-key loop gutted    ~9    us
+        // ```
+        //
+        // A row reduction over 2 KiB in one workgroup and a 16x8 attention
+        // grid with an empty body have no shared arithmetic, no shared traffic
+        // and no shared occupancy. What they share is being a DISPATCH, and
+        // `device.rs` names the mechanism above `run_all`: wgpu-hal 30 opens
+        // every Metal compute encoder with `computeCommandEncoder()`, which is
+        // `MTLDispatchTypeSerial`, so each dispatch waits for the previous one
+        // to COMPLETE and pays a full drain and refill whatever it computes.
+        //
+        // Count the fires and the term stops being a footnote. Normalising
+        // `PIE_WGPU_STAMP=200`'s table by `kv_append_paged`, which fires
+        // exactly once a layer:
+        //
+        // ```text
+        //   qmv (five rows)        195   rms_single_row          57
+        //   sdpa split + merge      56   rms_rope (two rows)      57
+        //   kv_append               28   silu_mul                 26
+        //                                                    ------
+        //                                                    ~421 a token
+        // ```
+        //
+        // **421 fires x 8 us = 3.4 ms of a 7.465 ms token.** The average fire
+        // is 17.7 us and 8 of that is charged before it reads a byte. That is
+        // the largest single item in this decode by a factor of two over the
+        // attention's whole key loop, and no knob inside any kernel reaches
+        // it -- six probes into the split kernel and three into qmv came back
+        // free for this reason and not by coincidence.
+        //
+        // Two consequences for this list.
+        //
+        // **The rule "a fold is worth its deleted kernel's cost" has a floor
+        // of 8 us, and every candidate here is near it.** `rms_single_row` at
+        // 7.9, `silu_mul` at 3.3 and `sdpa_decode_merge` at 6.4 are not four
+        // different prices; they are one constant plus a little work. So a
+        // fold that deletes one fire a layer is worth about 28 x 8 us = 0.22
+        // ms and NO candidate can be worth much more, which is why the
+        // repriced joins, the rope||append fold and the norm rows all land
+        // between 0.15 and 0.45 ms. The list is flat. Rank it by cost of
+        // implementation, not by prize.
+        //
+        // **And the only change that beats the whole list is not in this
+        // repo.** llama.cpp opens its encoder `MTLDispatchTypeConcurrent` and
+        // places `memoryBarrierWithScope` where it needs one; `wgpu` exposes
+        // no way to ask for that. Reaching it means patching wgpu-hal and
+        // taking over the hazard tracking wgpu currently gets for free from
+        // Metal's ordering -- and most consecutive pairs in this plan ARE
+        // dependent, so the win is only over the genuinely independent runs
+        // (q, k, v; gate, up), which is the same handful of fires the joins
+        // delete anyway. It is a real option and it is a judgement about
+        // dependencies, not a measurement. Do not start it without deciding
+        // that first.
+        //
+        // ## AND THEN A FIRE WAS ACTUALLY DELETED, AND 8 us IS WRONG
+        //
+        // Everything under the heading above is inference. Three routes to
+        // ~8 us and not one of them removed a dispatch: a straight-line fit
+        // through three qmv bank sizes, a kernel small enough to be ASSUMED
+        // all overhead, and the residue of an attention kernel with its loop
+        // gutted. Rule 7 of the measurement discipline says a profiler's
+        // shares must be checked against a probe before they are spent, and
+        // that heading spent them -- 3.4 ms and 45% of a token -- on the same
+        // day it restated the rule.
+        //
+        // `device.rs`'s `PIE_WGPU_SKIP` deletes a kernel's fires outright:
+        // no dispatch, no pipeline switch, no binds, which is what a fold
+        // deletes. Wrong answers, so it is a probe. Three interleaved rounds
+        // at 200 samples, each against its own baseline (7.446, 7.545,
+        // 7.443):
+        //
+        // ```text
+        //   kernel               fires   saved ms         mean    us/fire
+        //   rms_single_row         57   .403 .539 .409   0.450     7.9
+        //   sdpa_decode_merge      28   .159 .291 .149   0.200     7.1
+        //   rms_rope               57   .317 .382 .339   0.346     6.1
+        //   kv_append_paged        28   .051 .180 .100   0.110     3.9
+        //   silu_mul               26   .084 .081 .060   0.075     2.9
+        //                         ---                    -----
+        //   all five at once      196                    1.075
+        // ```
+        //
+        // The singles sum to 1.181 against 1.075 measured together, so the
+        // effects are ADDITIVE within 10%, and the joint figure is one large
+        // well-resolved measurement -- 14.4% of a token -- rather than five
+        // that each sit near the 1.7% repeatability. Read the singles for
+        // ranking and the 1.075 for the total.
+        //
+        // **196 fires for 1.075 ms is 5.5 us each, not 8.** And the spread is
+        // the finding, because it is 2.7x wide and a dispatch drain cannot
+        // have one:
+        //
+        //   * `rms_single_row` reads 2 KiB in ONE workgroup and costs 7.9 us.
+        //   * `kv_append_paged` writes into a 64 MiB pool and costs 3.9.
+        //   * `silu_mul` is 2.9.
+        //
+        // Not traffic, then, and not grid width either -- `merge` at [16,1,1]
+        // is dearer than `silu_mul` at [12,1,1]. What separates them is
+        // whether the kernel REDUCES. `rms_single_row`, `sdpa_decode_merge`
+        // and `rms_rope` all fold a row and cost 6 to 8 us; `kv_append_paged`
+        // and `silu_mul` are elementwise and cost 3 to 4. A reduction in a
+        // single workgroup is a barriered tree whose depth is latency nothing
+        // else in the fire can hide.
+        //
+        // So the model is a ~3 us floor plus 3 to 5 us for a reduction, and
+        // the 8 us "constant" was two reduction kernels agreeing with each
+        // other. `qmv`'s 8.65 us intercept belongs to qmv, `rms_single_row`'s
+        // 7.9 belongs to a row sum, and the split attention's ~9 belongs to
+        // its merge tail -- three kernels, three costs, no shared floor.
+        //
+        // The 45% claim is withdrawn. 196 of ~421 fires carry 1.075 ms; if
+        // the other 225 were the same the whole per-fire term would be ~2.3
+        // ms, and those 225 are qmv and attention, which do the work. Call it
+        // under a third of the token and stop quoting a number nobody
+        // removed a fire to get.
+        //
+        // WHAT IT DOES TO THIS LIST, which is why the probe was written. Every
+        // row's prize is now an UPPER BOUND that was measured rather than
+        // modelled -- upper, because the absorbing kernel takes the work on:
+        //
+        // ```text
+        //   rms_single_row into its qmv       <= 0.450   already lost, below
+        //   merge into the split kernel       <= 0.200   needs a device sync
+        //   q-norm||k-norm in one rms_rope    <= 0.173   half of 57 fires
+        //   rope k + kv_append                <= 0.110   was quoted at 0.12
+        //   silu_mul into its qmv             <= 0.075
+        // ```
+        //
+        // Not one of them reaches the repriced joins' 0.34 to 0.45 ms, so the
+        // joins keep the top of the list -- on their own merits this time,
+        // against bounds instead of against a constant.
+        //
+        // ## AND THE SAME KNOB SETTLES THE SHARES, WHICH WERE WRONG BOTH WAYS
+        //
+        // `[cost]`'s table has ranked this decode since the instrument was
+        // built, and its shares have been argued about for five sittings:
+        // stamped, `sdpa_paged_decode_split` reads 35-39% and the five qmv
+        // rows sum to about 47%. `sdpa_paged.wgsl` then corrected the
+        // attention to 19% from three indirect routes. Skipping the fires
+        // answers it directly. Two rounds, baselines 7.440 and 7.451:
+        //
+        // ```text
+        //   skipped                 ms        saved     share    fires
+        //   affine_qmv_fast     3.552 3.528   3.91 ms   52.5%    ~196
+        //   sdpa_..._split      5.700 5.768   1.71 ms   23.0%      28
+        //   the five above          --        1.08 ms   14.4%     196
+        //                                     -------   -----
+        //                                     6.70 ms   90.0%
+        // ```
+        //
+        // The two rounds agree to 0.06 ms on a 3.9 ms effect, so these are
+        // the firmest numbers in this file.
+        //
+        // **Both stamp shares were wrong, and in the directions the surcharge
+        // theory predicts.** Apple has no `TIMESTAMP_QUERY_INSIDE_PASSES`, so
+        // stamping gives each fire its own compute pass and a pass costs in
+        // proportion to the state its launch establishes -- which inflates
+        // WIDE grids and leaves narrow ones nearly alone. The attention has
+        // the widest grid in a decode (16 x 8 x 256) and stamped 35-39%
+        // against a true 23%. qmv has the narrowest and stamped 47% against a
+        // true 52.5%. A theory that only ever explained one direction has now
+        // been checked in the other.
+        //
+        // The earlier 19% correction was right to disbelieve the stamp and a
+        // little low: 1.71 ms, not 1.4. Its three routes bounded the loop and
+        // the pieces it could name, and it had no way to see what it had not
+        // thought to price. That is the difference between summing parts and
+        // removing the whole.
+        //
+        // **AND IT MOVES THE PROGRAMME. qmv IS MORE THAN HALF THE DECODE.**
+        // 3.91 ms in one kernel family. Its weight banks are 0.352 GB a token
+        // -- 252 MiB of layers plus an 83.8 MiB lm head -- which is 1.29 ms at
+        // this machine's 273 GB/s, so qmv runs at **THREE TIMES its own
+        // bandwidth floor**, and the fitted marginal rate of 79.2 GB/s says
+        // the same thing from the slope. Nothing else in the decode is that
+        // far from a wall it could reach. The fold list above is worth about
+        // 1 ms in total and every row of it needs another crate; closing half
+        // of qmv's gap is worth more than all of them and is entirely inside
+        // `qmv.wgsl`.
+        //
+        // What is already ruled out there, so nobody starts at the top:
+        // `PIE_ROWW` (rows a workgroup, the grid getting BIGGER) straddles
+        // zero over three rounds, dispatch size is free, and load issue is
+        // free. What has NOT been priced is the 4-bit unpack and the affine
+        // dequant on the critical path of every 64 weights.
+        //
+        // A join deletes intercepts, and that is the whole prize:
+        //
+        // ```text
+        //   q + k + v    23.2 + 16.1 + 16.1 = 55.4 us   joined 2.25  MiB -> 38.5
+        //   gate + up           31.0 + 31.0 = 62.0 us   joined 3.375 MiB -> 53.3
+        // ```
+        //
+        // 16.9 and 8.7 us a layer, 0.72 ms a token between them -- EXCEPT that
+        // a fourth point later broke the straight line. The lm head is a qmv
+        // over an 83.4 MiB bank and it reads 666 us where the fit says 1113,
+        // so there is no constant intercept: the rate rises with the bytes in
+        // a fire, 36.6 -> 50.8 -> 57.1 -> 131.3 GB/s across the four. See
+        // `qmv.wgsl`'s `PIE_ROWW` note for why that is consistent with the
+        // grid being measured free.
+        //
+        // Restated as a BOUND, which is what survives. The rate is monotone in
+        // bytes and a joined fire is bigger than every fitted point, so it runs
+        // at no worse than the 57.1 GB/s of the largest one:
+        //
+        // ```text
+        //   q + k + v   55.4 us today   joined <= 41.3 us   saves >= 14.1 us a layer
+        //   gate + up   62.0 us today   joined <= 62.0 us   saves >= 0
+        // ```
+        //
+        // # AND THEN THE COST TABLE LEARNED TO COUNT BYTES, AND BOTH ARE PROVEN
+        //
+        // The table above is keyed by entrypoint and grid, which averaged `o`
+        // and `down` -- both `_residual` at [1,256,1], over 1.125 and 1.6875
+        // MiB -- into one number. `device.rs::charge` now folds the launch's
+        // bound bytes into the key, they came apart, and the pair settled the
+        // whole question. `down` binds the SAME bytes as `gate`/`up` with a
+        // THIRD of the grid and is 24% faster; `o` binds q's bytes with half
+        // the grid and is 11% faster. Repeats in every window.
+        //
+        // So the axis is neither the grid nor the bytes: it is OUTPUT ROWS.
+        // `qmv.wgsl` carries the fit; it is
+        //
+        //   t = 7.8 us + 4.64 ns/row + 4.96 us/MiB (+2.2 us if residual)
+        //
+        // and it lands the residual pair -- which is not fitted for the first
+        // two terms -- within 0.01 us. 4.96 us/MiB is 209 GB/s on a 273 GB/s
+        // machine, so **the decode's qmv is latency-bound, not bandwidth-bound**,
+        // and what is left is a fixed cost a fire plus a cost a row.
+        //
+        // A JOIN DELETES FIRES, NOT ROWS. So it collects `a` per fire deleted,
+        // exactly, and this stops being a bound:
+        //
+        // ```text
+        //   q + k + v   54.6 us today   joined 4096 rows 2.263 MiB -> 38.0
+        //               saves 16.6 us a layer  =  0.46 ms a token  4.8%
+        //   gate + up   60.9 us today   joined 6144 rows 3.390 MiB -> 53.1
+        //               saves  7.8 us a layer  =  0.22 ms a token  2.3%
+        // ```
+        //
+        // **0.68 ms a token, 7%, for the two joins together.** The bound above
+        // said ">= 0.39" for q||k||v from a worse model and the row model says
+        // 0.46 -- the first estimate in this file to be reproduced by an
+        // independent route. And `gate||up` is no longer break-even: it was
+        // never about bytes, it is about deleting a 7.8 us fixed cost.
+        //
+        // Both are now measured facts about the kernel, so the remaining work
+        // is entirely in the model crate -- see the blockers below.
+        //
+        // ## AND 0.68 IS THE KERNEL'S NUMBER, NOT THE PIPELINE'S. HALVE IT.
+        //
+        // This figure has been quoted as the plan's largest remaining item for
+        // four sittings and it is the wrong one to rank with, for two reasons
+        // that are both already written down ABOVE this heading and were never
+        // carried down into the arithmetic here.
+        //
+        // **It does not pay for `split_qkv`.** 54.6 -> 38.0 us is three qmv
+        // fires becoming one. The pipeline needs the packed bank taken apart
+        // again before `rms_rope` and `kv_append_paged` can read it, and
+        // `model_dsl::metal`'s `split_qkv` is a `launch_with_params`, not a
+        // view -- so it is three fires becoming TWO, and "AND THE JOIN SAVES
+        // ONE LAUNCH A LAYER, NOT TWO" above prices the returned half at 0.17
+        // ms. `gate||up` has no split to pay and keeps its 0.22.
+        //
+        // **And the token it is a percentage OF has moved.** 0.68 ms was 9%
+        // of the 7.7 ms token it was measured against. The decode is 7.49 ms
+        // now, and the honest figure -- 0.22 + 0.22, or the 0.17 + 0.17 that
+        // the same section reaches from the launch floor instead of the row
+        // model -- is 0.34 to 0.45 ms, which is 4.5% to 6%.
+        //
+        // Two independent routes to the same halving, so the range is real
+        // and its top is 6%. That does not make the joins worthless; it makes
+        // them an ordinary launch-floor row, the size of two or three of the
+        // norm folds below, bought at the price of a change spanning the model
+        // crate, the shared forward text and a kernel. Rank them there. The
+        // section above already said so in prose -- "they are ordinary
+        // launch-floor savings like the norm rows, and they should be planned
+        // as such" -- and this is that sentence done as arithmetic, because a
+        // number left standing in a table outranks a paragraph every time.
+        //
+        // The one thing above this heading that survives untouched is the
+        // `rope k + kv_append` fold, because it deletes a whole kernel and
+        // adds nothing: 0.12 ms, all of it kept.
+        //
+        // Nothing below is deleted, because the ordering of the REDUNDANCY
+        // column is still right and it is the reasoning that matters. Read it
+        // with 0.71 us substituted for 4.6 and the arithmetic redone.
+        //
+        // # WHICH MAKES THIS LIST THE WHOLE REMAINING PLAN, SO RANK IT
+        //
+        // At 4.6 us a launch, and split by whether the fold does REDUNDANT
+        // WORK -- a fusion that only moves where a value is written is free,
+        // and one that folds a REDUCTION into a wide consumer pays for it once
+        // per workgroup of that consumer:
+        //
+        // ```text
+        //   fold                          launches   saved    redundancy
+        //   rope k + kv_append (k half)         28   0.13 ms   none: a store target
+        //   v projection + kv_append (v)         0   0.00 ms   none, but see below
+        //   q||k||v                             56   0.26 ms   none; needs the model crate
+        //   gate||up                            28   0.13 ms   none; needs the model crate
+        //   silu_mul into down                  28   0.13 ms   ~25% more ALU in `down`
+        //   rms_single_row into its qmv         56   0.26 ms   ~26% more ALU in five fires
+        // ```
+        //
+        // THE FIRST TWO ARE ONE ITEM, not two. `kv_append_paged` appends k AND
+        // v in one launch, so folding only the k half into `rms_rope` leaves
+        // the launch standing for v. The pair has to move together: `rms_rope`
+        // writes its roped k straight into the paged pool, and the v
+        // projection's `affine_qmv_fast` writes its output there instead of
+        // into the arena. Both are changes of DESTINATION -- no value is
+        // recomputed, no arithmetic is added, and the bf16 rounding the
+        // append does today is the rounding the store already does. That makes
+        // it the cheapest 0.13 ms on this list and the one to do first, at the
+        // cost of two kernel variants that take a page table.
+        //
+        // THE LAST TWO ARE NOT FREE and should be priced before they are
+        // written. `rms_single_row` is a reduction over the whole row; five
+        // qmv fires a layer read its output, and each of their 256-to-768
+        // workgroups would have to redo the sum. Against a 4.6 us launch the
+        // redundant reduction is roughly 0.06 ms of the 0.26 ms saved -- still
+        // positive, but a quarter of the prize, and it is the kind of estimate
+        // that has been wrong twice in this file today. Measure it with a
+        // throwaway variant before committing to the fixtures.
+        //
+        // The other 0.17 ms is reachable and is a separate, later change:
+        // nothing downstream actually needs three BUFFERS, it needs three
+        // RANGES. `rms_rope` already takes q and k as two operands and
+        // `kv_append_paged` takes k and v; if an operand could be bound as a
+        // sub-extent of the fused rectangle the split kernel would have no
+        // reason to exist. `binding::extent` binds `rows * width * bytes` from
+        // a rectangle's start, so the missing piece is an offset, and the
+        // missing piece before that is a DSL value that is a view rather than
+        // a launch. Worth stating here because a reader who lands on
+        // `split_qkv` will assume the deinterleave is inherent, and it is not.
+        //
+        // They are the cheapest arithmetic in the model -- a 16- and an
+        // 8-workgroup normalise -- fired as two separate rectangles a layer
+        // immediately before the rope that reads them, which is two more
+        // rectangles a layer than the arithmetic deserves. That makes the
+        // whole norm question worth 112 launches rather than 56, and it makes
+        // rope the natural place to put them, since rope already runs twice a
+        // layer over exactly those two tensors.
+        //
+        // Also checked, so nobody re-checks it: the attention's split and
+        // merge are NOT a collapsible pair. One launch instead of two is 26%
+        // slower, and `kernels-wgpu::attn`'s `splits` carries the sweep and
+        // the reason.
+        //
         // 99.8 tok/s becomes about 135. That is the honest size of the whole
         // fusion program on this machine, and no single one of them is worth
         // an afternoon on its own -- which is the thing the list above could
         // not say before there was a bench.
+        //
+        // **AND THAT ARITHMETIC IS TOO GENEROUS.** The ~13 us a removed
+        // rectangle above comes from dividing a decode by its launch count,
+        // which assumes every launch costs the same. Priced MARGINALLY
+        // instead -- duplicate a routine's fire and read the difference --
+        // a launch that computes little costs **6.0 us** (56 extra per-head
+        // norms: 9.828 -> 10.162 ms) while a `qmv` costs **22.7** (141
+        // extra: -> 13.025 ms), and the gap is this model streaming 2.5 MiB
+        // of weights per qmv, which is 13.8 us of irreducible bandwidth.
+        // The table is in `what_a_decode_costs_at_length`.
+        //
+        // At 6 us, the 196 launches above are 1.18 ms and the whole program
+        // lands near **115 tok/s**, not 135. It remains the largest lever
+        // this backend has and it is still worth doing; it is not a route to
+        // llama.cpp's 259, and nothing in this list is.
+        //
+        // **AND IT IS NO LONGER THE LARGEST LEVER.** Two reduction ladders
+        // came out of `sdpa_paged` and `qmv` -- no launch was deleted -- and
+        // the token went 9.64 -> 7.730 ms, 19.5%, which is more than this
+        // whole list. So the denominator under every figure above has moved
+        // and the ranking has changed: at 7.730 ms the two joins are the
+        // MEASURED 0.68 ms of the section below, ~9% of a token, landing near
+        // 141 tok/s. The flat 6 us was also the wrong shape, because a join
+        // deletes fires and not rows, so it collects the per-fire term
+        // exactly -- see the byte-keyed cost model in `qmv.wgsl`.
         //
         // And not this threshold. Moving it only trades one bad regime for
         // the other: below 4 rows a step is qmv with three quarters of its

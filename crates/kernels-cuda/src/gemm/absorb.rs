@@ -1,11 +1,10 @@
-
-use kernels_macros::routine;
 use core::ffi::c_void;
+use kernels_macros::routine;
 
 use crate::jit::Ctx;
 use crate::jit::abi::Tensor;
-use kernels::routine::{Const, In, Out};
 use kernels::Refusal;
+use kernels::routine::{Const, In, Out};
 
 #[cfg(feature = "_cuda")]
 use cudarc::cublas::sys::{
@@ -39,14 +38,13 @@ unsafe fn absorb(
     heads: i32,
     what: &str,
 ) {
-
     #[cfg(feature = "_cuda")]
     fn absorb_check(status: cublasStatus_t, what: &str) {
-    assert!(
-    status == cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-    "cuBLAS error ({}): {what}",
-    status as i32
-    );
+        assert!(
+            status == cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+            "cuBLAS error ({}): {what}",
+            status as i32
+        );
     }
 
     let alpha = 1.0f32;
@@ -96,7 +94,8 @@ pub fn mla_absorb_q_to_latent_bf16(
     qk_nope_dim: Const<i32>,
     v_head_dim: Const<i32>,
     kv_lora_rank: Const<i32>,
-    tokens: Const<i32>) -> Result<(), Refusal> {
+    tokens: Const<i32>,
+) -> Result<(), Refusal> {
     let (heads, qk_nope_dim, v_head_dim, kv_lora_rank) =
         (heads.v, qk_nope_dim.v, v_head_dim.v, kv_lora_rank.v);
     let tokens = *tokens;
@@ -131,8 +130,17 @@ pub fn mla_absorb_q_to_latent_bf16(
         );
     }
     #[cfg(not(feature = "_cuda"))]
-    let _ =
-        (handle, q_nope.ptr, kv_b_proj.v, q_latent.ptr, tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
+    let _ = (
+        handle,
+        q_nope.ptr,
+        kv_b_proj.v,
+        q_latent.ptr,
+        tokens,
+        heads,
+        qk_nope_dim,
+        v_head_dim,
+        kv_lora_rank,
+    );
     Ok(())
 }
 
@@ -147,7 +155,8 @@ pub fn mla_absorb_latent_to_v_bf16(
     qk_nope_dim: Const<i32>,
     v_head_dim: Const<i32>,
     kv_lora_rank: Const<i32>,
-    tokens: Const<i32>) -> Result<(), Refusal> {
+    tokens: Const<i32>,
+) -> Result<(), Refusal> {
     let (heads, qk_nope_dim, v_head_dim, kv_lora_rank) =
         (heads.v, qk_nope_dim.v, v_head_dim.v, kv_lora_rank.v);
     let tokens = *tokens;
@@ -190,7 +199,16 @@ pub fn mla_absorb_latent_to_v_bf16(
         );
     }
     #[cfg(not(feature = "_cuda"))]
-    let _ =
-        (handle, wv, attn_latent.ptr, attn_v.ptr, tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
+    let _ = (
+        handle,
+        wv,
+        attn_latent.ptr,
+        attn_v.ptr,
+        tokens,
+        heads,
+        qk_nope_dim,
+        v_head_dim,
+        kv_lora_rank,
+    );
     Ok(())
 }

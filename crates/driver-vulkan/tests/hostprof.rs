@@ -569,7 +569,12 @@ fn batched_decode_answers_what_a_single_decode_answers() {
     // another's, so the only witness worth having is one where the rows
     // disagree with each other and each still matches itself run alone.
     let prompt = |who: u64| -> Vec<u32> {
-        vec![PERIOD[0], 2000 * who as u32, 3000 + who as u32, 700 * who as u32 + 11]
+        vec![
+            PERIOD[0],
+            2000 * who as u32,
+            3000 + who as u32,
+            700 * who as u32 + 11,
+        ]
     };
     let greedy = |whos: &[u64]| -> Vec<Vec<u32>> {
         let mut shell = shelled(real, 64 * whos.len() as u32 + 64);

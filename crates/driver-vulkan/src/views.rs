@@ -51,7 +51,8 @@ pub struct Views<'a> {
     /// Boxed so every address is stable however the vectors grow.
     kv: Vec<Box<PagedKvView>>,
     rs: Vec<Box<RecurrentView>>,
-    mask: Vec<Box<MaskView>>,    split: Vec<Box<SplitView>>,
+    mask: Vec<Box<MaskView>>,
+    split: Vec<Box<SplitView>>,
 }
 
 impl<'a> Views<'a> {

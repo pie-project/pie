@@ -129,7 +129,11 @@ fn adapter() -> Option<(Device, MutexGuard<'static, ()>)> {
     match opened {
         Ok(device) => Some((device, held)),
         Err(why) => {
-            println!("SKIP: {why}");
+            driver_wgpu::skip::skipped(&format!(
+                "{why}. On a Linux runner `PIE_WGPU_FALLBACK=1` takes the \
+                 software adapter, which is a real implementation of the \
+                 same WGSL and not a way of passing"
+            ));
             None
         }
     }
@@ -177,32 +181,43 @@ fn adapter() -> Option<(Device, MutexGuard<'static, ()>)> {
 fn the_runner_states_whether_it_has_a_device() {
     const NEEDLE: &str = concat!("= adapter", "() else");
     let gated = include_str!("device.rs").matches(NEEDLE).count();
-    let required = std::env::var_os("PIE_WGPU_REQUIRE_DEVICE").is_some_and(|v| v != "0");
 
+    // THE ASSERTION THAT WAS HERE MOVED INTO `driver_wgpu::skip::skipped`.
+    // It read `PIE_WGPU_REQUIRE_DEVICE` in this function, which meant it
+    // enforced the switch for this file and no other -- and `cooperative.rs`
+    // and `serving.rs` each open their own adapter, for reasons each states,
+    // and each printed a swallowed `SKIP:` line when none answered. The
+    // switch CI sets to prove the llvmpipe install took could not see either.
+    // `adapter()` calls the shared helper now, so under the switch this
+    // function never reaches the `None` arm: the helper fires first, in every
+    // file, with the same sentence.
+    //
+    // What stays here is the part that is about THIS FILE: the count, and
+    // saying it out loud either way, because "18 ran" and "18 did not run"
+    // are the two summaries `cargo test` prints identically.
     match adapter() {
         Some(_) => println!("WGPU DEVICE: PRESENT -- the {gated} gated test(s) here ran"),
-        None => {
-            println!("WGPU DEVICE: ABSENT -- the {gated} gated test(s) here did NOT run");
-            assert!(
-                !required,
-                "`PIE_WGPU_REQUIRE_DEVICE` is set and `adapter()` opened no \
-                 device; its `SKIP:` line above says why. A suite that skips \
-                 in silence is what this test exists to prevent; on a Linux \
-                 runner, `PIE_WGPU_FALLBACK=1` takes the software adapter, \
-                 which is a real implementation of the same WGSL and not a \
-                 way of passing."
-            );
-        }
+        None => println!("WGPU DEVICE: ABSENT -- the {gated} gated test(s) here did NOT run"),
     }
 
     // A control on the count: this file gates its tests the way the doc says
     // it does, so the number above is a measurement rather than a zero that
     // reads like one.
-    assert!(
-        gated >= 15,
-        "only {gated} test(s) in this file are gated on `adapter()`, which is \
-         fewer than it visibly has -- the scan has lost its needle and the \
-         line printed above is not a count of anything."
+    // Pinned, not floored. `>= 15` against a file that gates 25 tolerates
+    // nine of them quietly losing the gate -- and a test that lost its gate
+    // does not fail, it runs without a device and reports whatever that is.
+    // A test added to this file is a deliberate act, so moving this number is
+    // one too.
+    // 24 -> 25 with `a_dozen_devices_in_one_process_all_answer_the_same_adapter`,
+    // which arrived from the NVIDIA side and did not move this line. That is the
+    // pin working: an added test is a deliberate act and so is moving the number,
+    // and the one that was not moved was found by the one that was.
+    assert_eq!(
+        gated, 25,
+        "{gated} test(s) in this file are gated on `adapter()`, not the 25 \
+         this was measured against. If you added or removed one, say so here; \
+         otherwise the scan has lost its needle and the line printed above is \
+         not a count of anything."
     );
 }
 
@@ -1301,7 +1316,7 @@ fn every_refusal_is_a_named_error_and_not_a_panic() {
         device.run(
             pipeline,
             &three,
-                &params,
+            &params,
             [limits.workgroups_per_dimension + 1, 1, 1]
         ),
         Err(Failed::PastLimit {
@@ -1749,7 +1764,9 @@ fn a_buffer_cannot_be_bound_by_the_device_that_did_not_make_it() {
     };
     // A SECOND device, not a second adapter: see the heading above.
     let Ok(other) = Device::open() else {
-        println!("SKIP: a second device would not open, so there is no pair to mix");
+        driver_wgpu::skip::inapplicable(
+            "a second device would not open, so there is no pair to mix",
+        );
         return;
     };
     let theirs = other
@@ -1786,15 +1803,31 @@ fn a_buffer_cannot_be_bound_by_the_device_that_did_not_make_it() {
     std::panic::set_hook(hook);
 
     let why = match bound {
-        // Reached only if `wgpu-core` stopped panicking, in which case this
-        // test is the thing that says so.
+        // NO PANIC, AND THAT IS THE ORDINARY ANSWER NOW.
+        //
+        // The registry miss this was written against needed the two devices to
+        // hold OVERLAPPING ids, and they did because each `Device` made its own
+        // `wgpu::Instance` and each instance numbered from one. `device.rs`'s
+        // `instance()` shares one across the process -- it has to, because the
+        // eleventh `VkInstance` on this machine costs the NVIDIA adapter -- so
+        // the ids are unique and `create_bind_group` gets far enough to VALIDATE
+        // instead of far enough to panic.
+        //
+        // The claim being pinned is unchanged: a buffer does not cross devices.
+        // What changed is which mechanism says so, so the test takes either and
+        // insists on one. A silent accept -- no panic AND an empty error sink --
+        // is the failure, and it is the only thing that ever mattered here.
         Ok(_) => {
-            let _ = device.drained();
-            panic!(
-                "binding another device's buffer was ACCEPTED. Whatever \
-                 stopped this is no longer stopping it, and the sibling \
-                 driver's defect can now be written here too."
-            );
+            let Err(refused) = device.drained() else {
+                panic!(
+                    "binding another device's buffer was ACCEPTED, with nothing \
+                     in the error sink either. Whatever stopped this is no \
+                     longer stopping it, and the sibling driver's defect can \
+                     now be written here too."
+                );
+            };
+            println!("the bind was refused by validation rather than by the registry: {refused}");
+            return;
         }
         Err(payload) => payload
             .downcast_ref::<String>()
@@ -1847,7 +1880,9 @@ fn the_two_adapters_this_crate_offers_are_two_implementations_or_say_so() {
     drop(hardware);
 
     let Ok(soft) = Device::software() else {
-        println!("SKIP: this instance offers no software adapter; `{fast}` is all there is");
+        driver_wgpu::skip::inapplicable(&format!(
+            "this instance offers no software adapter; `{fast}` is all there is"
+        ));
         return;
     };
     let slow = soft.name().to_string();
@@ -1902,7 +1937,7 @@ fn the_fallback_knob_reaches_the_second_adapter_through_open() {
         return;
     };
     let Ok(soft) = Device::software() else {
-        println!("SKIP: no software adapter on this instance");
+        driver_wgpu::skip::inapplicable("no software adapter on this instance");
         return;
     };
     let want = soft.name().to_string();
@@ -1924,8 +1959,65 @@ fn the_fallback_knob_reaches_the_second_adapter_through_open() {
     );
 }
 
-/// Every entrypoint the table ships becomes a real pipeline on this adapter.
+/// THE ELEVENTH `Device::open()` ANSWERS THE SAME ADAPTER AS THE FIRST.
 ///
+/// A `wgpu::Instance` is a `VkInstance`, and [`Device::request`] used to make a
+/// fresh one per device. Ten is what the NVIDIA ICD on this machine will hold:
+/// the eleventh instance stops enumerating the physical device, `request_adapter`
+/// ranks what is left, and Mesa's `llvmpipe` is what is left. No error is
+/// raised anywhere, because from `wgpu`'s side one adapter was asked for and
+/// one was given.
+///
+/// What that cost, before it was found:
+///
+/// * `serving.rs`'s `the_tiled_gemm_answers_the_way_the_vector_kernel_does_at_a_partial_tile`
+///   failed with *"the submission of 452 launches: the device did not answer
+///   within 30s"* -- which is not a timeout, it is a software rasterizer.
+/// * `hybrid_probe.rs`'s `which_of_the_mlps_kernels_carries_the_odd_row_nan`
+///   PASSED, attributing an odd-row NaN that the 4090 does not produce, while
+///   the same test run alone found the fire finite and failed.
+///
+/// Both are the same sentence: a suite long enough to exhaust the ICD stops
+/// measuring the machine it is running on, and says nothing about it.
+///
+/// Twelve rather than eleven, so the count is past the edge rather than on it,
+/// and each device is DROPPED before the next -- which is the part that makes
+/// this surprising, and the part a fix has to survive. Written against
+/// `device_type` rather than the name, because the point is the class of
+/// adapter and not which vendor's card is in the box; on a machine whose only
+/// adapter is a software one it asserts that the answer STAYS software, which
+/// is the same claim.
+#[test]
+fn a_dozen_devices_in_one_process_all_answer_the_same_adapter() {
+    let Some((first, _held)) = adapter() else {
+        return;
+    };
+    let want = first.info().device_type;
+    let name = first.name().to_string();
+    drop(first);
+
+    for i in 1..12 {
+        let device = match Device::open() {
+            Ok(device) => device,
+            Err(why) => panic!(
+                "device {i} of twelve would not open ({why}), where the first \
+                 answered `{name}` -- opening an adapter repeatedly in one \
+                 process is what every test file here does"
+            ),
+        };
+        assert_eq!(
+            device.info().device_type,
+            want,
+            "device {i} of twelve answered `{}` where the first answered \
+             `{name}` -- a suite that opens more adapters than the ICD will \
+             hold stops measuring this machine, and nothing reports an error \
+             when it does",
+            device.name()
+        );
+    }
+}
+
+/// Every entrypoint the table ships becomes a real pipeline on this adapter.///
 /// `kernels-wgpu`'s `every_module_parses_and_validates` proves all 481 survive
 /// `naga`. That is the LANGUAGE, and it is not the same question as whether an
 /// adapter will build one: `create_compute_pipeline` applies limits naga knows
@@ -1975,6 +2067,7 @@ fn every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter() {
         .into_iter()
         .map(|(_, v)| v.entrypoint)
         .collect();
+    let declared = all.len();
     for name in all {
         let Some((source, tier)) = pick(&Embedded, &name, Capability::Baseline) else {
             refused.push(format!("{name}: the tree holds no source for it"));
@@ -1997,10 +2090,35 @@ fn every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter() {
         device.name(),
         refused.join("\n  ")
     );
-    assert!(
-        built >= 481,
-        "only {built} entrypoints were built; the shader tree declares 481 \
-         and a sweep that reads nothing agrees with everything"
+    // The floor here read `built >= 481`, and its own message said "the shader
+    // tree declares 481". The tree declares 490 -- 489 until `norm/rms_rope`
+    // landed, and this pin is the FOURTH place that number is written down,
+    // after three in `reflect.rs` and three in `arena.rs`. It was the one
+    // missed, and it did not fail on the commit that moved the other six: the
+    // generated `source::declared()` table comes from a build script that had
+    // not rescanned the kernels directory, so this binary was still linked
+    // against a list without the new file in it while the RUNNING engine
+    // compiled and fired it. A pin that lags a build script is a pin that
+    // reports last week. Eight entrypoints arrived
+    // after this was written and the floor did not notice, because a floor set
+    // to a corpus size stops being a check the moment the corpus grows: it
+    // then tolerates losing exactly as many as were gained.
+    //
+    // So this asks the corpus instead of remembering it. `built == declared`
+    // is a tautology while `refused` is empty -- which the assertion above has
+    // just established -- so what it really guards is the loop running at all;
+    // and `declared` is pinned because a shader entrypoint appears in this
+    // tree only when someone puts it there.
+    assert_eq!(
+        built, declared,
+        "the sweep built {built} of {declared} declared entrypoints without \
+         refusing any, which means it did not walk all of them"
+    );
+    assert_eq!(
+        declared, 490,
+        "`kernels_wgpu::source::declared()` holds {declared} entrypoints, not \
+         the 490 this was measured against. If the tree gained rows, say so \
+         here; if it lost them, this is the sweep telling you which way."
     );
 }
 
@@ -2319,7 +2437,12 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     //    everything else is a plan this reader cannot honour, and guessing
     //    would read two elements as one.
     for odd in [1u32, 3, 8] {
-        match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 1, 4, odd)), 256), &[]) {
+        match driver_wgpu::serve::logits(
+            &device,
+            &arena,
+            &with(Some(readout(0, 1, 4, odd)), 256),
+            &[],
+        ) {
             Err(driver_wgpu::serve::Unread::Width(b)) => assert_eq!(b, odd),
             other => panic!("expected `Width({odd})`, got {other:?}"),
         }
@@ -2328,8 +2451,12 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     // 4. The device would not give the bytes back: a plan whose arena is
     //    bigger than the buffer it was handed passes the range check above and
     //    is refused here instead.
-    let refused =
-        driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 256, 4)), 1 << 20), &[]);
+    let refused = driver_wgpu::serve::logits(
+        &device,
+        &arena,
+        &with(Some(readout(0, 4, 256, 4)), 1 << 20),
+        &[],
+    );
     match refused {
         Err(driver_wgpu::serve::Unread::Refused(why)) => assert!(
             !why.to_string().is_empty(),
@@ -2421,14 +2548,14 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
     // and `ctx.params()` is the first thing this body asks for. The operands
     // the caller states are handles 1..3, so `held` is laid out to match.
     let held = [&params_b, &proj_b, &token_b, &out_b];
-    // WHAT THE BODY ASKS FOR, ANSWERED. `Env` left the parameter list: the
-    // per-layer table is `ctx.params()` and the row count is
-    // `ctx.ask::<i32, keys::Rows>()`, so an encoder with nothing behind it
-    // refuses both. This is the `answering` channel `lowering::routine`'s
-    // `stating` is for, entered from a test instead of from a plan.
-    let handles = core::cell::RefCell::new(
-        driver_wgpu::lowering::hold::Handles::undivided(&[], &[]),
-    );
+    // WHAT THE BODY ASKS FOR, ANSWERED. `Env` left the parameter list, and
+    // then the `ctx.ask` channel it also used left too: the per-layer table
+    // is `ctx.params()`, but the row count is a `Const<i32>` mark on the
+    // signature now rather than a `keys::Rows` ask -- so this launch states
+    // its rectangle whole through the operands and the trailing mark, and
+    // the encoder answers only handles and the packed scalar run.
+    let handles =
+        core::cell::RefCell::new(driver_wgpu::lowering::hold::Handles::undivided(&[], &[]));
     let facts = driver_wgpu::lowering::hold::facts(
         "ple_combine_bfloat16",
         // One row of `WORDS` elements: the body's `lanes` is `width * rows`,
@@ -2476,6 +2603,11 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
         // reason -- but the routine now states it rather than trusting the
         // caller to have laid it out.
         kernels::routine::Const { v: inv_sqrt2 },
+        // ROWS is a mark now too. `keys::Rows` retired with the whole named
+        // vocabulary, and every routine that used to ask for it takes it as
+        // a `Const<i32>` on its signature. One row is the launch this test
+        // states, so `1` is the honest value here.
+        kernels::routine::Const { v: 1_i32 },
     )
     .expect("the routine dispatches on this adapter");
 

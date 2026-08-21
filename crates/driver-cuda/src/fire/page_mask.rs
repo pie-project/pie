@@ -346,14 +346,20 @@ impl FirePageMask {
         let Some(sink) = self.sink.as_mut() else {
             return;
         };
-        ops.memset_async(sink.keep, 1, sink.num_requests as usize * sink.stride as usize);
+        ops.memset_async(
+            sink.keep,
+            1,
+            sink.num_requests as usize * sink.stride as usize,
+        );
         sink.written_layer = None;
     }
 
     /// Whether the sink was written *for this layer*.
     #[must_use]
     pub fn written_for(&self, layer: u32) -> bool {
-        self.sink.as_ref().is_some_and(|s| s.written_layer == Some(layer))
+        self.sink
+            .as_ref()
+            .is_some_and(|s| s.written_layer == Some(layer))
     }
 
     /// Gather the fire's page table down to the kept pages. `num_requests` must match
@@ -460,7 +466,11 @@ mod tests {
 
     impl Slab {
         fn new() -> Self {
-            Self { bytes: vec![0u8; 8 << 20], next: 0, allocs: 0 }
+            Self {
+                bytes: vec![0u8; 8 << 20],
+                next: 0,
+                allocs: 0,
+            }
         }
     }
 
@@ -553,9 +563,18 @@ mod tests {
 
     #[test]
     fn a_malformed_csr_is_rejected_rather_than_producing_a_short_stride() {
-        assert_eq!(MaskSlotLayout::plan(geometry(&[0, 9, 4, 12])), Err(MaskError::MalformedCsr));
-        assert_eq!(MaskSlotLayout::plan(geometry(&[0, 5, 99, 12])), Err(MaskError::MalformedCsr));
-        assert_eq!(MaskSlotLayout::plan(geometry(&[0, 0, 0])), Err(MaskError::NoPages));
+        assert_eq!(
+            MaskSlotLayout::plan(geometry(&[0, 9, 4, 12])),
+            Err(MaskError::MalformedCsr)
+        );
+        assert_eq!(
+            MaskSlotLayout::plan(geometry(&[0, 5, 99, 12])),
+            Err(MaskError::MalformedCsr)
+        );
+        assert_eq!(
+            MaskSlotLayout::plan(geometry(&[0, 0, 0])),
+            Err(MaskError::NoPages)
+        );
         assert_eq!(FireGeometry::new(&[0]).unwrap_err(), MaskError::NoGeometry);
     }
 
@@ -568,7 +587,9 @@ mod tests {
             vec![0, 8, 16, 24, 32],
             vec![0, 3, 3, 40, 41, 97],
             vec![0, 0, 7],
-            vec![0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135],
+            vec![
+                0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135,
+            ],
         ] {
             let mut mem = Slab::new();
             let mut arena = SidebandArena::new();
@@ -606,7 +627,10 @@ mod tests {
         sink.written_layer = Some(7);
         assert!(mask.written_for(7));
         mask.begin_layer(&mut ops);
-        assert!(!mask.written_for(7), "a new layer must not inherit the previous layer's mask");
+        assert!(
+            !mask.written_for(7),
+            "a new layer must not inherit the previous layer's mask"
+        );
         mask.release(&mut arena);
         arena.destroy(&mut mem);
     }
@@ -626,12 +650,25 @@ mod tests {
             assert_eq!(mask.written_for(layer), layer == 1);
         }
 
-        mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 2).unwrap();
+        mask.compact(
+            &mut ops,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            2,
+        )
+        .unwrap();
         assert_eq!(ops.compactions, 1);
         assert_eq!(ops.last_stride, 8);
 
         assert_eq!(
-            mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 3),
+            mask.compact(
+                &mut ops,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                3
+            ),
             Err(MaskError::RequestCountMismatch),
             "a request-count disagreement must refuse, not launch"
         );
@@ -650,8 +687,14 @@ mod tests {
         assert!(!mask.active());
         assert!(mask.sink().is_none());
         mask.begin_layer(&mut ops);
-        mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 99)
-            .unwrap();
+        mask.compact(
+            &mut ops,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            99,
+        )
+        .unwrap();
         assert!(mask.page_indices().is_null());
         assert!(!mask.written_for(0));
         assert_eq!(ops.memsets.len(), 0);
@@ -704,7 +747,10 @@ mod tests {
             mask.release(&mut arena);
             assert!(!mask.still_holds_slot());
         }
-        assert_eq!(mem.allocs, allocs_after_warm, "the steady state must allocate nothing");
+        assert_eq!(
+            mem.allocs, allocs_after_warm,
+            "the steady state must allocate nothing"
+        );
         arena.destroy(&mut mem);
     }
 
@@ -730,15 +776,53 @@ mod tests {
 }
 
 /// The element mask the custom-mask attention dispatch reads — element-, not
-/// page-granularity like everything above. FlashInfer wants `mask_d` as one byte per
-/// `(q, kv)` pair plus a per-request `mask_indptr_d`.
-/// This always-published causal mask exists so the unmasked arm can still be RECORDED
-/// under `GuardMode::Union`, which captures both arms and aborts if either's mask was
-/// never built.
+/// page-granularity like everything above.
+///
+/// # The layout is BIT-packed, and this file used to think otherwise
+///
+/// Both CUDA kernels that read a custom mask index it the same way, and both
+/// index it by BIT:
+///
+/// ```text
+///   // kernels/flashinfer/attention/variants.cuh
+///   mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
+///   // kernels/attn/attention_naive_paged.cuh
+///   const long long bit  = qo_off * kv_total + kv_idx;
+///   const long long byte = mask_indptr[request_idx] + (bit >> 3);
+///   return ((mask[byte] >> (bit & 7)) & 1) != 0;
+/// ```
+///
+/// So `mask_d` holds `(q, kv)` as one BIT, `mask_indptr_d` counts BYTES, and a
+/// request's mask begins on a byte boundary. This module published one byte per
+/// pair instead, with the CSR counting pairs. The kernel then read pair `8i` as
+/// the whole byte for pairs `8i..8i+8` and took bit `k % 8` of a byte that is
+/// only ever `0` or `1`, so seven of every eight positions were forced closed
+/// and the eighth answered for its neighbours.
+///
+/// Nothing caught it, because nothing READS the mask on the arm that is
+/// exercised. The causal plan below is published unconditionally so the
+/// unmasked arm can still be RECORDED under `GuardMode::Union` — which captures
+/// both arms and aborts if either's mask was never built — but that arm's
+/// kernel is compiled without custom-mask support and never dereferences it.
+/// Only a fire that actually supplies a mask reaches the reading form, and the
+/// one curated fixture that does (`tart-masked`) was wedged on an unrelated
+/// channel-cursor defect for as long as this was here. Its answer with a mask
+/// whose numerics are exactly causal was `" wore of of of.. the."`; without it,
+/// `"<think>\nOkay, the user is asking"`.
 pub mod element_mask {
     /// A mask this large is refused rather than published — the extent (`sum_r
     /// qo_len[r] * kv_len[r]`) grows with the context.
     const MAX_MASK_BYTES: u64 = 1 << 30;
+
+    /// Bytes a request of `cells` `(q, kv)` pairs occupies, one bit each.
+    const fn packed_len(cells: u64) -> usize {
+        cells.div_ceil(8) as usize
+    }
+
+    /// Set pair `index` of the request whose mask starts at byte `base`.
+    fn set_bit(mask: &mut [u8], base: usize, index: usize) {
+        mask[base + (index >> 3)] |= 1 << (index & 7);
+    }
 
     /// One fire's element mask, planned but not allocated.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -749,9 +833,10 @@ pub mod element_mask {
         pub indptr_offset: usize,
         /// Total bytes to allocate.
         pub bytes: usize,
-        /// The CSR, in mask ELEMENTS.
+        /// The CSR, in mask BYTES — what the kernels add `bit >> 3` to.
         pub indptr: Vec<i32>,
-        /// The mask bytes themselves — causal, request by request.
+        /// The mask bits themselves, one `(q, kv)` pair each, request by
+        /// request, every request starting on a byte boundary.
         pub mask: Vec<u8>,
     }
 
@@ -773,6 +858,7 @@ pub mod element_mask {
         let mut indptr = vec![0i32; requests + 1];
         let mut extents = Vec::with_capacity(requests);
         let mut total: u64 = 0;
+        let mut pairs: u64 = 0;
         for r in 0..requests {
             let qo = qo_indptr_h[r + 1].saturating_sub(qo_indptr_h[r]);
             let pages = kv_page_indptr_h[r + 1].saturating_sub(kv_page_indptr_h[r]);
@@ -783,10 +869,15 @@ pub mod element_mask {
             };
             indptr[r] = i32::try_from(total).ok()?;
             extents.push((qo, kv));
-            total += u64::from(qo) * u64::from(kv);
+            let cells = u64::from(qo) * u64::from(kv);
+            pairs += cells;
+            // Byte-aligned per request: the kernel adds `bit >> 3` to
+            // `mask_indptr[r]`, so a request that began mid-byte would read its
+            // neighbour's tail.
+            total += packed_len(cells) as u64;
         }
         indptr[requests] = i32::try_from(total).ok()?;
-        if total == 0 || total > MAX_MASK_BYTES {
+        if pairs == 0 || total > MAX_MASK_BYTES {
             return None;
         }
         let mask_bytes = usize::try_from(total).ok()?;
@@ -798,10 +889,12 @@ pub mod element_mask {
             for qi in 0..qo {
                 let last = kv.saturating_sub(qo) + qi;
                 for ki in 0..kv {
-                    mask[at + (qi * kv + ki) as usize] = u8::from(ki <= last);
+                    if ki <= last {
+                        set_bit(&mut mask, at, (qi * kv + ki) as usize);
+                    }
                 }
             }
-            at += (qo * kv) as usize;
+            at += packed_len(u64::from(qo) * u64::from(kv));
         }
         let indptr_offset = mask_bytes.next_multiple_of(4);
         Some(ElementMaskPlan {
@@ -813,10 +906,11 @@ pub mod element_mask {
         })
     }
 
-    /// The engine's mask, unpacked into the bytes the launcher reads: a packed bitset
-    /// (one mask per query row, bit `i` whether that row attends KV position `i`)
-    /// widened to FlashInfer's one-byte-per-`(q, kv)` layout, with the same CSR as
-    /// [`plan_causal`].
+    /// The engine's mask, repacked into the bits the launcher reads: the engine
+    /// gives one bitset per query row, bit `i` whether that row attends KV
+    /// position `i`, each row starting at bit 0 of its own words; the kernel
+    /// wants one contiguous `qo * kv` bitset per REQUEST, byte-aligned, with
+    /// the same CSR as [`plan_causal`].
     /// `None` when the fire's and table's shapes disagree — a REFUSAL, not a fallback,
     /// since serving causally would look exactly right.
     #[must_use]
@@ -837,6 +931,7 @@ pub mod element_mask {
         let mut indptr = vec![0i32; requests + 1];
         let mut mask: Vec<u8> = Vec::new();
         let mut total: u64 = 0;
+        let mut pairs: u64 = 0;
         for r in 0..requests {
             let qo = qo_indptr_h[r + 1].saturating_sub(qo_indptr_h[r]) as usize;
             let pages = kv_page_indptr_h[r + 1].saturating_sub(kv_page_indptr_h[r]);
@@ -851,7 +946,9 @@ pub mod element_mask {
             if hi.saturating_sub(lo) != qo || hi > word_indptr.len().saturating_sub(1) {
                 return None;
             }
-            for m in lo..hi {
+            let base = mask.len();
+            mask.resize(base + packed_len((qo * kv) as u64), 0);
+            for (qi, m) in (lo..hi).enumerate() {
                 let (wlo, whi) = (word_indptr[m] as usize, word_indptr[m + 1] as usize);
                 let row = words.get(wlo..whi)?;
                 // A mask shorter than the row's KV extent can't say what the tail
@@ -859,12 +956,17 @@ pub mod element_mask {
                 if row.len() * 32 < kv {
                     return None;
                 }
-                mask.extend((0..kv).map(|k| u8::from(row[k / 32] >> (k % 32) & 1 == 1)));
+                for k in 0..kv {
+                    if row[k / 32] >> (k % 32) & 1 == 1 {
+                        set_bit(&mut mask, base, qi * kv + k);
+                    }
+                }
             }
-            total += (qo * kv) as u64;
+            pairs += (qo * kv) as u64;
+            total += packed_len((qo * kv) as u64) as u64;
         }
         indptr[requests] = i32::try_from(total).ok()?;
-        if total == 0 || total > MAX_MASK_BYTES {
+        if pairs == 0 || total > MAX_MASK_BYTES {
             return None;
         }
         let mask_bytes = usize::try_from(total).ok()?;
@@ -883,76 +985,163 @@ pub mod element_mask {
     mod tests {
         use super::*;
 
+        /// The kernels' own read, spelled out once so every expectation below is
+        /// checked against the thing that consumes it rather than against a
+        /// restatement of the packer.
+        ///
+        /// `attention_naive_paged.cuh`:
+        /// ```text
+        ///   bit  = qo_off * kv_total + kv_idx;
+        ///   byte = mask_indptr[request_idx] + (bit >> 3);
+        ///   ((mask[byte] >> (bit & 7)) & 1) != 0
+        /// ```
+        fn kernel_reads(
+            p: &ElementMaskPlan,
+            request: usize,
+            qi: usize,
+            ki: usize,
+            kv: usize,
+        ) -> bool {
+            let bit = qi * kv + ki;
+            let byte = p.indptr[request] as usize + (bit >> 3);
+            (p.mask[byte] >> (bit & 7)) & 1 != 0
+        }
+
+        /// Every pair of a request, as the kernel would read them.
+        fn read_all(p: &ElementMaskPlan, request: usize, qo: usize, kv: usize) -> Vec<bool> {
+            (0..qo)
+                .flat_map(|qi| (0..kv).map(move |ki| (qi, ki)))
+                .map(|(qi, ki)| kernel_reads(p, request, qi, ki, kv))
+                .collect()
+        }
+
         #[test]
         fn a_decode_row_attends_its_whole_context() {
             let p = plan_causal(&[0, 1], &[0, 1], &[3], 16).expect("planned");
-            assert_eq!(p.indptr, vec![0, 3]);
-            assert_eq!(p.mask, vec![1, 1, 1]);
+            // Three pairs is three BITS, so one byte, and the CSR counts bytes.
+            assert_eq!(p.indptr, vec![0, 1]);
+            assert_eq!(p.mask, vec![0b111]);
+            assert_eq!(read_all(&p, 0, 1, 3), vec![true; 3]);
         }
 
         #[test]
         fn a_prefill_row_attends_no_further_than_itself() {
             // 3 query rows against a 3-long context: the plain lower triangle.
             let p = plan_causal(&[0, 3], &[0, 1], &[3], 16).expect("planned");
-            assert_eq!(p.mask, vec![1, 0, 0, 1, 1, 0, 1, 1, 1]);
+            assert_eq!(
+                read_all(&p, 0, 3, 3),
+                vec![true, false, false, true, true, false, true, true, true]
+            );
+            // Nine pairs is two bytes, and the ninth is the low bit of the second.
+            assert_eq!(p.mask, vec![0b1101_1001, 0b1]);
         }
 
         #[test]
         fn a_continuation_attends_the_prefix_it_did_not_write() {
             // 2 new rows onto a 5-long context: rows 3 and 4 are the new ones.
             let p = plan_causal(&[0, 2], &[0, 1], &[5], 16).expect("planned");
-            assert_eq!(p.mask, vec![1, 1, 1, 1, 0, 1, 1, 1, 1, 1]);
+            assert_eq!(
+                read_all(&p, 0, 2, 5),
+                vec![true, true, true, true, false, true, true, true, true, true]
+            );
         }
 
         #[test]
         fn two_requests_get_their_own_bases() {
+            // Two pairs and four pairs: one byte each, because a request has to
+            // START on a byte boundary or the kernel's `bit >> 3` walks into its
+            // neighbour's tail.
             let p = plan_causal(&[0, 1, 3], &[0, 1, 2], &[2, 2], 16).expect("planned");
-            assert_eq!(p.indptr, vec![0, 2, 6]);
+            assert_eq!(p.indptr, vec![0, 1, 2]);
+            assert_eq!(read_all(&p, 0, 1, 2), vec![true, true]);
+            assert_eq!(read_all(&p, 1, 2, 2), vec![true, false, true, true]);
         }
 
-        /// The engine's bitset, widened: one decode row attending 3 KV positions is
-        /// three set bits and three bytes.
+        /// The engine's bitset, repacked: one decode row attending 3 KV positions
+        /// is three set bits in one byte.
         #[test]
-        fn a_set_bit_becomes_a_kept_byte() {
+        fn a_set_bit_survives_the_repack() {
             let p = from_words(&[0, 1], &[0, 1], &[3], 16, &[0, 1], &[0, 1], &[0b111])
                 .expect("decoded");
-            assert_eq!(p.mask, vec![1, 1, 1]);
-            assert_eq!(p.indptr, vec![0, 3]);
+            assert_eq!(p.mask, vec![0b111]);
+            assert_eq!(p.indptr, vec![0, 1]);
+            assert_eq!(read_all(&p, 0, 1, 3), vec![true; 3]);
         }
 
-        /// A CLEARED bit is a byte the kernel skips — the whole point of a caller's
-        /// mask, and what a causal fallback would silently undo.
+        /// A CLEARED bit is a position the kernel skips — the whole point of a
+        /// caller's mask, and what a causal fallback would silently undo.
         #[test]
-        fn a_cleared_bit_becomes_a_dropped_byte() {
+        fn a_cleared_bit_survives_the_repack() {
             let p = from_words(&[0, 1], &[0, 1], &[4], 16, &[0, 1], &[0, 1], &[0b1011])
                 .expect("decoded");
-            assert_eq!(p.mask, vec![1, 1, 0, 1]);
+            assert_eq!(read_all(&p, 0, 1, 4), vec![true, true, false, true]);
         }
 
-        /// A prefill's rows are its own masks, row-major — the same extent
-        /// `plan_causal` produces, so both publish through one path.
+        /// A prefill's rows are its own masks; the repack CONCATENATES them into
+        /// one `qo * kv` bitset, because the engine's rows each start at bit 0 of
+        /// their own words and the kernel's do not.
         #[test]
         fn each_query_row_brings_its_own_mask() {
-            let p = from_words(&[0, 2], &[0, 1], &[3], 16, &[0, 2], &[0, 1, 2], &[0b001, 0b011])
-                .expect("decoded");
-            assert_eq!(p.mask, vec![1, 0, 0, 1, 1, 0]);
+            let p = from_words(
+                &[0, 2],
+                &[0, 1],
+                &[3],
+                16,
+                &[0, 2],
+                &[0, 1, 2],
+                &[0b001, 0b011],
+            )
+            .expect("decoded");
+            assert_eq!(
+                read_all(&p, 0, 2, 3),
+                vec![true, false, false, true, true, false]
+            );
             let causal = plan_causal(&[0, 2], &[0, 1], &[3], 16).expect("causal");
             assert_eq!(p.indptr, causal.indptr, "same geometry, same CSR");
         }
 
-        /// A table describing a different fire is REFUSED — serving it causally would
-        /// look exactly like a correct answer.
+        /// The defect this layout was changed for: a mask whose numerics ARE
+        /// causal has to read back identical to the causal plan, pair for pair.
+        /// It did not — the packer wrote a byte per pair while both kernels read
+        /// a bit per pair, so seven of every eight positions were forced closed.
         #[test]
-        fn a_table_that_does_not_describe_this_fire_is_refused() {
-            // Two query rows, one mask.
-            assert!(
-                from_words(&[0, 2], &[0, 1], &[3], 16, &[0, 1], &[0, 1], &[0b111]).is_none(),
-                "one mask cannot serve two rows"
-            );
-            // A mask too short to say what the row's tail attends.
-            assert!(
-                from_words(&[0, 1], &[0, 3], &[16], 16, &[0, 1], &[0, 1], &[0b1]).is_none(),
-                "32 bits cannot describe 48 KV positions"
+        fn a_causal_custom_mask_reads_back_as_the_causal_plan() {
+            // 24 query rows over 24 keys, which is `tart-masked`'s prefill: two
+            // bytes' worth of row and a row length that is not a multiple of 8,
+            // so every misalignment this could have shows up.
+            let (qo, kv) = (24usize, 24usize);
+            let words: Vec<u32> = (0..qo)
+                .flat_map(|qi| {
+                    let row: u32 = (0..kv).filter(|&ki| ki <= qi).map(|ki| 1u32 << ki).sum();
+                    [row]
+                })
+                .collect();
+            let word_indptr: Vec<u32> = (0..=qo as u32).collect();
+            let user = from_words(
+                &[0, qo as u32],
+                &[0, 2],
+                &[8],
+                16,
+                &[0, qo as u32],
+                &word_indptr,
+                &words,
+            )
+            .expect("decoded");
+            let causal = plan_causal(&[0, qo as u32], &[0, 2], &[8], 16).expect("causal");
+            assert_eq!(user.mask, causal.mask);
+            assert_eq!(user.indptr, causal.indptr);
+            assert_eq!(user.mask.len(), (qo * kv).div_ceil(8));
+        }
+
+        /// A `set` never spills into the neighbouring pair, which one byte per
+        /// pair could not get wrong and one bit per pair can.
+        #[test]
+        fn a_single_open_position_opens_exactly_one() {
+            let p = from_words(&[0, 1], &[0, 1], &[9], 16, &[0, 1], &[0, 1], &[1 << 8])
+                .expect("decoded");
+            assert_eq!(
+                read_all(&p, 0, 1, 9),
+                vec![false, false, false, false, false, false, false, false, true]
             );
         }
 

@@ -185,13 +185,23 @@ impl FireViews {
             },
         );
         let score = attn.map_or(
-            kernels_cuda::views::ScoreView { indptr: core::ptr::null(), window: 0 },
+            kernels_cuda::views::ScoreView {
+                indptr: core::ptr::null(),
+                window: 0,
+            },
             |a| kernels_cuda::views::ScoreView {
                 indptr: a.score_indptr_d,
                 window: a.score_window,
             },
         );
-        Self { kv, recurrent, mask, score, expert_weights: BTreeMap::new(), streams }
+        Self {
+            kv,
+            recurrent,
+            mask,
+            score,
+            expert_weights: BTreeMap::new(),
+            streams,
+        }
     }
 
     /// Fill [`Self::expert_weights`] from the statements of one lowering.
@@ -218,31 +228,32 @@ impl FireViews {
             let spec = dplan.spec(i);
             let run = launch.args.start as usize..launch.args.end as usize;
             for arg in lowered.args.get(run).unwrap_or(&[]) {
-                let Arg::Raised { value, key } = arg else { continue };
+                let Arg::Raised { value, key } = arg else {
+                    continue;
+                };
                 if key != kernels_cuda::views::ExpertWeights::KEY || poisoned.contains(value) {
                     continue;
                 }
-                let Some(bank) = spec.weight.as_deref() else { continue };
+                let Some(bank) = spec.weight.as_deref() else {
+                    continue;
+                };
                 let mut suffixed = |s: &str| weight(&format!("{bank}{s}"));
                 // The two pointer arrays the kernels index per expert are
                 // required; the bias array is a checkpoint's to omit.
-                let (Some(ptrs), Some(scale_ptrs)) =
-                    (suffixed("_ptrs"), suffixed("_scales_ptrs"))
+                let (Some(ptrs), Some(scale_ptrs)) = (suffixed("_ptrs"), suffixed("_scales_ptrs"))
                 else {
                     continue;
                 };
                 let view = ExpertWeightsView {
                     ptrs: ptrs.cast::<u8>(),
                     scale_ptrs: scale_ptrs.cast::<u8>(),
-                    bias_ptrs: suffixed("_bias_ptrs")
-                        .map_or(core::ptr::null(), |p| p.cast::<u8>()),
+                    bias_ptrs: suffixed("_bias_ptrs").map_or(core::ptr::null(), |p| p.cast::<u8>()),
                 };
                 match self.expert_weights.get(value) {
                     None => {
                         self.expert_weights.insert(*value, view);
                     }
-                    Some(held)
-                        if held.ptrs == view.ptrs && held.scale_ptrs == view.scale_ptrs => {}
+                    Some(held) if held.ptrs == view.ptrs && held.scale_ptrs == view.scale_ptrs => {}
                     Some(_) => {
                         // The collision: one value, two banks. Refuse both.
                         self.expert_weights.remove(value);
@@ -269,12 +280,7 @@ impl FireViews {
     ///
     /// [`RaisedUnbound`]: super::BindRefusal::RaisedUnbound
     #[must_use]
-    pub fn raised(
-        &self,
-        name: &str,
-        layer: Option<u32>,
-        value: ValueId,
-    ) -> Option<*const c_void> {
+    pub fn raised(&self, name: &str, layer: Option<u32>, value: ValueId) -> Option<*const c_void> {
         let of = |p: *const c_void| (!p.is_null()).then_some(p);
         match name {
             // Per-layer objects: a mint without a layer is a text error and

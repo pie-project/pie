@@ -1,4 +1,3 @@
-
 use core::ffi::c_void;
 
 use super::{Refused, Result, Stream};
@@ -13,7 +12,6 @@ impl Drop for Block {
 
 fn free(ptr: *mut c_void) {
     if !ptr.is_null() {
-
         unsafe {
             let _ = cudarc::runtime::sys::cudaFree(ptr);
         }
@@ -21,12 +19,10 @@ fn free(ptr: *mut c_void) {
 }
 
 pub struct Scratch {
-
     live: Vec<Block>,
 }
 
 impl Scratch {
-
     #[must_use]
     pub const fn new() -> Self {
         Self { live: Vec::new() }
@@ -61,14 +57,14 @@ impl Scratch {
     }
 
     pub fn upload_f32s(&mut self, src: &[f32], stream: Stream<'_>) -> Result<*mut c_void> {
-
-        let bytes = unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 4) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 4) };
         self.upload(bytes, stream, "tower scratch (f32 upload)")
     }
 
     pub fn upload_i32s(&mut self, src: &[i32], stream: Stream<'_>) -> Result<*mut c_void> {
-
-        let bytes = unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 4) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 4) };
         self.upload(bytes, stream, "tower scratch (i32 upload)")
     }
 
@@ -98,7 +94,9 @@ impl Default for Scratch {
 
 impl core::fmt::Debug for Scratch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Scratch").field("blocks", &self.live.len()).finish()
+        f.debug_struct("Scratch")
+            .field("blocks", &self.live.len())
+            .finish()
     }
 }
 
@@ -108,7 +106,10 @@ fn alloc(bytes: usize, what: &'static str) -> Result<*mut c_void> {
 
     let code = unsafe { cudaMalloc(&raw mut raw, bytes.max(1)) };
     if code != cudaError::cudaSuccess || raw.is_null() {
-        return Err(Refused::new(what, format!("cudaMalloc({bytes}) failed with {code:?}")));
+        return Err(Refused::new(
+            what,
+            format!("cudaMalloc({bytes}) failed with {code:?}"),
+        ));
     }
     Ok(raw)
 }
@@ -174,7 +175,14 @@ pub unsafe fn fill_raw_span(
     }
     {
         check(
-            unsafe { cudarc::runtime::sys::cudaMemsetAsync(dst, i32::from(value), bytes, stream.as_raw().cast()) },
+            unsafe {
+                cudarc::runtime::sys::cudaMemsetAsync(
+                    dst,
+                    i32::from(value),
+                    bytes,
+                    stream.as_raw().cast(),
+                )
+            },
             "cudaMemsetAsync (fill_raw_span)",
         )
     }

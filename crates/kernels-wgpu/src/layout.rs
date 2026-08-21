@@ -4,14 +4,15 @@ use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 use kernels::routine::Refusal;
 use kernels::shader::{elementwise, elementwise_rows};
 
-#[routine]
+#[routine(out(out = like(proj)))]
 pub fn ple_combine(
     ctx: &Ctx<'_>,
     proj: In<Tensor<bf16>>,
     token: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
     inv_sqrt2: Const<f32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = proj.width;
     let rows = *rows;
     if width <= 0 {
@@ -62,7 +63,8 @@ pub fn embed_gather_4bit(
     out: Out<Tensor<bf16>>,
     group: Const<i32>,
     bits: Const<i32>,
-    token_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    token_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     let rows = 1;
@@ -78,8 +80,16 @@ pub fn embed_gather_4bit(
                 "embed_gather_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(lanes),
-        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
+        )
+        .apply(lanes),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+        ],
     )
 }
 
@@ -93,7 +103,8 @@ pub fn embed_gather_mb_4bit(
     group: Const<i32>,
     bits: Const<i32>,
     token_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     let rows = *rows;
@@ -109,8 +120,16 @@ pub fn embed_gather_mb_4bit(
                 "embed_gather_mb_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(lanes),
-        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
+        )
+        .apply(lanes),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+        ],
     )
 }
 
@@ -124,7 +143,8 @@ pub fn embed_gather_scaled_4bit(
     embed_scale: Const<f32>,
     group: Const<i32>,
     bits: Const<i32>,
-    token_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    token_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     let lanes = elementwise(hidden, 1)?;
@@ -139,7 +159,8 @@ pub fn embed_gather_scaled_4bit(
                 "embed_gather_scaled_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_scaled_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(lanes),
+        )
+        .apply(lanes),
         &[
             w.arg(),
             scales.arg(),
@@ -163,7 +184,8 @@ pub fn embed_gather_scaled_mb_4bit(
     group: Const<i32>,
     bits: Const<i32>,
     token_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     let rows = *rows;
@@ -179,7 +201,8 @@ pub fn embed_gather_scaled_mb_4bit(
                 "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(lanes),
+        )
+        .apply(lanes),
         &[
             w.arg(),
             scales.arg(),
@@ -200,7 +223,8 @@ pub fn row_gather(
     width: Const<u32>,
     sampling_indices: In<Tensor<u32>>,
     count: Const<u32>,
-    row_count: Const<i32>) -> Result<(), Refusal> {
+    row_count: Const<i32>,
+) -> Result<(), Refusal> {
     let rows = sampling_indices.ptr;
 
     let count = *count;

@@ -37,6 +37,13 @@
 // whether an invocation arrives. An early return in front of a barrier is a
 // hang, not a wrong number.
 
+//#if defined(PIE_MATRIX)
+// Before every declaration, which is where WGSL requires an `enable`. The
+// preprocessor lines around it are comments, so they do not count as one.
+enable f16;
+enable wgpu_cooperative_matrix;
+//#endif
+
 //#include "common/bf16.inc.wgsl"
 // The codec is only meaningful to the GEMM arm, and the other two arms define
 // neither `PIE_GROUP` nor `PIE_BITS` -- splicing it there would fail to compile
@@ -381,11 +388,16 @@ const PIE_BN4 = PIE_BN / 4;
 // not fill the workgroup, and the reason `r` is bounds-checked below.
 const PIE_ACCV = (PIE_BM * PIE_BN4 + 127) / 128;
 
+//#if !defined(PIE_MATRIX)
+// NOT DECLARED IN THE MATRIX ARM, and that is a limit rather than tidiness:
+// these two are 24 KB at (32, 64) and the cooperative arm's own three tiles
+// are 20, which together are past what one workgroup may address.
 var<workgroup> xs: array<vec4<f32>, PIE_BM * PIE_BK4>;
 // Stored K-major (`ws[kk * BN4 + c4]`) though it is read column-major, so that
 // consecutive lanes -- which hold consecutive `c4` -- touch consecutive words in
 // the inner loop instead of striding by PIE_BK.
 var<workgroup> ws: array<vec4<f32>, PIE_BN4 * PIE_BK>;
+//#endif
 
 fn input_stride() -> u32 {
 //#if defined(PIE_STRIDED)
@@ -400,6 +412,24 @@ fn output_stride() -> u32 {
     return u32(params.row_stride);
 //#else
     return u32(params.n);
+//#endif
+}
+
+// Four consecutive K of one row, out of TWO words instead of four separate
+// one-value loads. Only valid when the flat index is even, which it is
+// whenever the input stride is: the caller checks and falls back.
+fn load_x_quad(row: u32, kk: u32) -> vec4<f32> {
+    let i = row * input_stride() + kk;
+//#if defined(PIE_FP16_PRECAST)
+    let w0 = half_in[i >> 1u];
+    let w1 = half_in[(i >> 1u) + 1u];
+    return vec4<f32>(qmm_f16_to_f32(w0 & 0xffffu), qmm_f16_to_f32(w0 >> 16u),
+                     qmm_f16_to_f32(w1 & 0xffffu), qmm_f16_to_f32(w1 >> 16u));
+//#else
+    let w0 = x[i >> 1u];
+    let w1 = x[(i >> 1u) + 1u];
+    return vec4<f32>(qmm_bf16(w0, 0u), qmm_bf16(w0, 1u),
+                     qmm_bf16(w1, 0u), qmm_bf16(w1, 1u));
 //#endif
 }
 
@@ -507,6 +537,137 @@ fn write_out(row: u32, col: u32, value: f32, slice: u32) {
 //#endif
 }
 
+//#if defined(PIE_MATRIX)
+// ─── THE COOPERATIVE-MATRIX ARM ─────────────────────────────────────────────
+//
+// The design above the instantiate block says what this has to be; this is it.
+// One shape only -- `PIE_BM` 32 by `PIE_BN` 64 -- because the tile counts are
+// unrolled by hand into named accumulators and a cooperative matrix cannot be
+// subscripted by a loop variable. `tests/cooperative.rs` measured a `array<
+// coop_mat8x8<f32, C>, 8>` indexed dynamically at 0.76 TFLOP/s against 2.9 for
+// the identical body with the accumulators named, which is the same lesson
+// `qmm_t`'s scalar arms learned and the reason both are written out.
+//
+// THE OUTPUT BLOCK IS THE SAME 32 x 64 the scalar arm produces, so the grid
+// the driver derives from `bm`/`bn` is untouched and this is a tier swap and
+// not a relayout. Metal's unit is 8x8x8, so that block is 4 tiles down by 8
+// across, split as two simdgroups of 4 x 4 -- 16 accumulators of 8x8 f32 over
+// 32 lanes is 32 f32 registers a lane, which is where this part's sweep and
+// the 4090's both put the register-file knee. 8 x 4 falls off a cliff.
+const PIE_MK: u32 = 64u;
+
+// A is staged as well as B, which the prototype did not have to do: `x` is
+// bf16 inside an `array<u32>` and bf16 is NOT f16, so there is no
+// reinterpretation that turns the binding into the `array<f16>` a cooperative
+// load wants. 32 x 64 and 64 x 64 f16 is 4 KB + 8 KB, and the f32 block the
+// epilogue reads is another 8.
+var<workgroup> ma: array<f16, 32u * PIE_MK>;
+var<workgroup> mb: array<f16, 64u * PIE_MK>;
+var<workgroup> mc: array<f32, 32u * 64u>;
+
+@compute @workgroup_size(32, 2, 2)
+fn main(
+    @builtin(local_invocation_index) local: u32,
+    @builtin(workgroup_id) wg: vec3<u32>,
+) {
+    let tile_row = wg.y * 32u;
+    let tile_col = wg.x * 64u;
+    let sg = local / 32u;
+    let sg_col = sg * 16u;
+    let kn = u32(params.k);
+
+    var a0_0: coop_mat8x8<f32, C>; var a0_1: coop_mat8x8<f32, C>;
+    var a1_0: coop_mat8x8<f32, C>; var a1_1: coop_mat8x8<f32, C>;
+    var a2_0: coop_mat8x8<f32, C>; var a2_1: coop_mat8x8<f32, C>;
+    var a3_0: coop_mat8x8<f32, C>; var a3_1: coop_mat8x8<f32, C>;
+
+    for (var kb = 0u; kb < kn; kb = kb + PIE_MK) {
+        workgroupBarrier();
+        // THE ACTIVATION TILE, four values a step because `load_x` is one bf16
+        // at a time and the row overhang has to be zeroed rather than skipped:
+        // a cooperative load reads the whole 8x8 whatever the real `m` is.
+        for (var e = local; e < 32u * PIE_MK / 4u; e = e + 128u) {
+            let r = e / (PIE_MK / 4u);
+            let k0 = (e % (PIE_MK / 4u)) * 4u;
+            let row = tile_row + r;
+            var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if row < u32(params.m) && kb + k0 + 3u < kn
+                && ((row * input_stride() + kb + k0) & 1u) == 0u {
+                v = load_x_quad(row, kb + k0);
+            } else if row < u32(params.m) {
+                for (var t = 0u; t < 4u; t = t + 1u) {
+                    let kk = kb + k0 + t;
+                    if kk < kn { v[t] = load_x(row, kk); }
+                }
+            }
+            let ab = r * PIE_MK + k0;
+            ma[ab + 0u] = f16(v.x);
+            ma[ab + 1u] = f16(v.y);
+            ma[ab + 2u] = f16(v.z);
+            ma[ab + 3u] = f16(v.w);
+        }
+        // THE WEIGHT TILE, dequantised through `affine_quad` so this arm shares
+        // the layout arithmetic with every other one -- four codes, one word,
+        // one scale and one bias between them.
+        for (var e = local; e < 64u * PIE_MK / 4u; e = e + 128u) {
+            let c = e / (PIE_MK / 4u);
+            let k0 = (e % (PIE_MK / 4u)) * 4u;
+            let col = tile_col + c;
+            var q = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if col < u32(params.n) && kb + k0 + 3u < kn {
+                q = affine_quad(col, kb + k0);
+            }
+            let base = c * PIE_MK + k0;
+            mb[base + 0u] = f16(q.x);
+            mb[base + 1u] = f16(q.y);
+            mb[base + 2u] = f16(q.z);
+            mb[base + 3u] = f16(q.w);
+        }
+        workgroupBarrier();
+
+        for (var kk = 0u; kk < PIE_MK; kk = kk + 8u) {
+            let x0 = coopLoadT<coop_mat8x8<f16, A>>(&ma[0u * PIE_MK + kk], PIE_MK);
+            let x1 = coopLoadT<coop_mat8x8<f16, A>>(&ma[8u * PIE_MK + kk], PIE_MK);
+            let x2 = coopLoadT<coop_mat8x8<f16, A>>(&ma[16u * PIE_MK + kk], PIE_MK);
+            let x3 = coopLoadT<coop_mat8x8<f16, A>>(&ma[24u * PIE_MK + kk], PIE_MK);
+            let y0 = coopLoad<coop_mat8x8<f16, B>>(&mb[(sg_col + 0u) * PIE_MK + kk], PIE_MK);
+            a0_0 = coopMultiplyAdd(x0, y0, a0_0);
+            a1_0 = coopMultiplyAdd(x1, y0, a1_0);
+            a2_0 = coopMultiplyAdd(x2, y0, a2_0);
+            a3_0 = coopMultiplyAdd(x3, y0, a3_0);
+            let y1 = coopLoad<coop_mat8x8<f16, B>>(&mb[(sg_col + 8u) * PIE_MK + kk], PIE_MK);
+            a0_1 = coopMultiplyAdd(x0, y1, a0_1);
+            a1_1 = coopMultiplyAdd(x1, y1, a1_1);
+            a2_1 = coopMultiplyAdd(x2, y1, a2_1);
+            a3_1 = coopMultiplyAdd(x3, y1, a3_1);
+        }
+    }
+
+    // THE STORE GOES THROUGH WORKGROUP MEMORY AND NOT STRAIGHT OUT, because
+    // this variant's output is bf16 behind an `array<atomic<u32>>` and a
+    // cooperative store writes a typed array. Landing the block in f32 first
+    // and letting `write_out` read it back keeps the packing, the `m`/`n`
+    // overhang guards and every future bias, residual and split-K arm exactly
+    // where they already are.
+    workgroupBarrier();
+    coopStoreT(a0_0, &mc[0u * 64u + sg_col + 0u], 64u);
+    coopStoreT(a0_1, &mc[0u * 64u + sg_col + 8u], 64u);
+    coopStoreT(a1_0, &mc[8u * 64u + sg_col + 0u], 64u);
+    coopStoreT(a1_1, &mc[8u * 64u + sg_col + 8u], 64u);
+    coopStoreT(a2_0, &mc[16u * 64u + sg_col + 0u], 64u);
+    coopStoreT(a2_1, &mc[16u * 64u + sg_col + 8u], 64u);
+    coopStoreT(a3_0, &mc[24u * 64u + sg_col + 0u], 64u);
+    coopStoreT(a3_1, &mc[24u * 64u + sg_col + 8u], 64u);
+    workgroupBarrier();
+    for (var e = local; e < 32u * 64u; e = e + 128u) {
+        let r = e / 64u;
+        let c = e % 64u;
+        write_out(tile_row + r, tile_col + c, mc[e], 0u);
+    }
+}
+//#endif
+
+//#if !defined(PIE_MATRIX)
 @compute @workgroup_size(32, 2, 2)
 fn main(
     @builtin(local_invocation_index) local: u32,
@@ -808,7 +969,200 @@ fn main(
     }
 }
 //#endif
+//#endif
 
+// ─── WHAT THE MATRIX ARM COST, AND WHERE IT WENT ──────────────────────────
+//
+// Correct was not the same as fast. The first working version ran a 512-row
+// prefill in 293.4 ms against the scalar arm's 286.2 -- 2.5% SLOWER. Two
+// probes priced it, each by deleting one staging loop and leaving a single
+// live reference behind so the binding survives (delete the last use of `x`
+// and naga drops the binding, the module declares four where five are bound,
+// and the fire is Refused before it ever runs):
+//
+//     activation staging out .......... 257.2 ms  ->  36.2 ms
+//     weight staging out .............. 266.2 ms  ->  27.2 ms
+//
+// So the two staging loops were 63 ms of a 129 ms arm, and the activation
+// half -- 2048 values -- cost MORE than the weight half's 4096. Two reasons,
+// both fixed:
+//
+//  1. `ma` was [k][m]. Four consecutive k written by one lane landed 32 f16
+//     apart, 64 bytes, the same threadgroup-memory bank every time. Storing
+//     [m][k] and reading the operand with `coopLoadT` at stride PIE_MK makes
+//     those four writes contiguous. Worth 4 ms (293.4 -> 289.4). The harness
+//     in tests/cooperative.rs had used exactly this layout all along.
+//
+//  2. `load_x` returns ONE bf16, so staging four values issued four loads of
+//     two words. `load_x_quad` reads the two words once and unpacks all four,
+//     which is what `affine_quad` had always done for the weight side and is
+//     why the weight loop was the cheaper of the two despite twice the values.
+//     Worth 18 ms (289.4 -> 271.3).
+//
+// The even-index fast path is guarded and falls back per value, because
+// nothing promises `input_stride()` is even -- it is `row_stride` in the
+// strided variants and only `params.k` otherwise.
+//
+//     matrix, staged [m][k], quad reads .... 271.3 / 271.5 / 271.3 ms
+//     scalar (PIE_WGPU_TIER=subgroup) ...... 286.0 / 286.1 ms
+//
+// 5.1%, interleaved in one sitting. That is the first time the matrix unit
+// has paid for itself anywhere in this tree.
+//
+// What is left in the arm is ~66 ms of multiply-accumulate and epilogue. The
+// standing suspicion is arithmetic intensity: BM = 32 means each staged
+// weight element is reused only 32 times, 42 flops per staged element. The
+// cooperative harness reaches 0.638 ms at rows = 128. Raising BM needs a new
+// instantiation AND host-side symbol selection, which is a cross-crate change
+// and not this file's decision to make.
+//
+// ─── THE MATRIX-UNIT ARM: WHY IT WAS WRONG FOR TWO SITTINGS ────────────────
+//
+// The arm below is correct and shipped. It took three sittings, and every one
+// of them was spent looking in the wrong place, so what follows is the record
+// of that -- because the bug was not in cooperative matrices at all.
+//
+// # THE SYMPTOM, AND WHY IT MISLED
+//
+// The first arm compiled, bound, dispatched, ran SLOWER (479.9 ms against
+// 286.2) and answered every prompt with the same token. That was written down
+// as "returned zeros", and the word `zeros` sent two sittings chasing the
+// address space: `tests/cooperative.rs` only ever proves the STORAGE address
+// space -- its `a` is a storage `array<f16>` and its `c` a storage
+// `array<f32>` -- while this arm read A and wrote C through workgroup memory.
+// A plausible story, and completely wrong.
+//
+// Both halves were probed in the harness and both PASSED. Routing accumulator
+// `0_0` alone through a `var<workgroup>` with `coopStoreT` and a manual copy
+// out: exact, at 0.724 / 0.608 / 0.572 / 0.558 ms across 1, 2, 4 and 8
+// simdgroups. Routing `av0` alone through a workgroup A tile: exact, at 0.856
+// / 0.671 / 0.638 / 0.646. **Cooperative loads and stores work against
+// workgroup memory in both directions on this part.** Two sittings to learn
+// that neither suspect was real.
+//
+// # WHAT ACTUALLY FOUND IT: A NUMERIC HARNESS AND THREE SUBSTITUTIONS
+//
+// The turn that solved it started by throwing away the token comparison.
+// `serving::the_tiled_gemm_answers_the_way_the_vector_kernel_does` runs in
+// under five seconds and prints the actual disagreement -- "the two families
+// part by 16.65625 at token 88204 (4.09375 vs 20.75)". FOUR POINT NINE, NOT
+// ZERO. The output was never zeros. It was real arithmetic, wrong.
+//
+// From there it was three substitutions, each one keeping everything else:
+//
+//   1. Replace the sixteen `coopMultiplyAdd`s with a scalar MAC over the SAME
+//      staged `ma` and `mb`.                            4.34 -- unchanged.
+//      => the cooperative operations are innocent.
+//   2. Replace `ma[...]` with a direct `load_x`.        4.34 -- bit-identical.
+//      => the activation staging is innocent.
+//   3. Replace `mb[...]` with a direct `affine_quad`.   3.61 -- still wrong.
+//      => the weight staging is innocent too.
+//
+// At which point the arm was a plain scalar GEMM reading both operands
+// straight from the bindings with the same index arithmetic as the scalar main
+// forty lines above it, and it STILL disagreed. That is the moment the search
+// leaves the arithmetic, and there was exactly one structural difference left.
+//
+// # THE BUG: `@workgroup_size(64)`
+//
+// **`kernels-wgpu::quant` computes this kernel's grid in LANES, not in
+// workgroups.** Its `qmm_grid` multiplies the tile counts by `(32, 2, 2)` --
+// the scalar arm's `@workgroup_size` -- and a `Fire` divides what it is given
+// by the module's REAL `@workgroup_size`. Declare 64 and the division comes
+// out `x = tiles_x * 32 / 64`, `y = tiles_y * 2`, `z = 2`: HALF the column
+// tiles are never dispatched, the rows are dispatched twice and the k axis
+// twice. Half the output keeps whatever was in the buffer and the other half
+// is written twice. Plausible numbers, wrong ones -- exactly the symptom.
+//
+// `attn.rs` has the same trap written out at length for `PIE_TX`/`PIE_TY`, and
+// says the failure "is silent and catastrophic". It is the same failure. A
+// tier arm may change its interior freely and may NOT change the invocation
+// count the host plane assumes, and nothing in the tree checks that.
+//
+// So the arm is `@workgroup_size(32, 2, 2)` -- 128 invocations, four
+// simdgroups -- and the 32x64 block is split four ways by COLUMN: each
+// simdgroup owns 16 columns, four row tiles by two column tiles, eight
+// accumulators, sixteen f32 registers a lane. `tests/cooperative.rs`'s own
+// register sweep says 4x4 and 2x4 tie on this part, so nothing is lost by
+// taking the shape the launch geometry dictates.
+//
+// # WHERE IT STANDS
+//
+// Correct, and 293.1 / 293.5 / 294.1 ms against the scalar arm's 286.2 -- 2.5%
+// SLOWER. It has not paid for itself yet. What it has bought is that the
+// matrix unit is now reachable, verified against the vector kernel at both a
+// whole and a partial tile, and the harness says this shape can run at 0.638
+// ms against the shipped kernel's 1.25. The staging is the obvious suspect:
+// `load_x` is one bf16 at a time into f16, and `affine_quad` dequantises four
+// codes into four scalar `mb` writes. Neither was tuned, because neither could
+// be tuned while the answer was wrong.
+//
+// The lesson worth keeping is the harness one. Two sittings of address-space
+// theory came from reading a wrong answer as "zeros" through a chat
+// transcript. Five seconds of a test that PRINTS THE NUMBER ended it.
+
+// ─── WHY THIS INSTANTIATION, AND WHAT THE ARM IS ───────────────────────────
+//
+// `Capability::Matrix` exists as of the commit that signed wgpu's experimental
+// token, and this is the only kernel with a `@matrix` module. The design
+// below is what the arm implements; it was correct all along, which is why the
+// post-mortem above is about a launch geometry and not about any of it.
+//
+// # The target is ONE instantiation, and it is 42.6% of a prefill
+//
+// `PIE_WGPU_SKIP` was pointed at each stem in turn. The whole `affine_qmm_t`
+// family is 184.3 ms of a prefill, but it is not spread evenly: skipping
+// `affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64` alone takes a 512-row prefill
+// from 286.2 ms to 164.2 -- **122.0 ms, 42.6%** -- because that is the shape
+// every one of qwen3's seven projections lands on. At the 2.4x
+// `tests/cooperative.rs` measured on this exact shape, a `@matrix` arm for
+// that ONE line is ~71 ms, a quarter of the phase. Nothing else in either
+// phase is close.
+//
+// # The design, which is the proven prototype fitted to this ABI
+//
+// `tests/cooperative.rs::quantised_wgsl` is a WORKING 4-bit affine
+// cooperative-matrix GEMM on this part -- 0.100 ms against the shipped
+// kernel's ~1.25 at `[m 512, n 3072, k 1024]`, every spot-checked output
+// bit-exact against an f32 CPU dot over all 1024 terms. It is the body to
+// copy. What has to change to make it a kernel rather than a benchmark:
+//
+//  * **The output block must stay 32 x 64**, because the driver derives the
+//    grid from `bm`/`bn` and the arm must not change the launch. Metal's
+//    cooperative matrix is 8x8x8, so that is 4 tiles down by 8 across. Give it
+//    TWO simdgroups, each holding 4x4 tiles -- 32 accumulators of 8x8 f32 over
+//    32 lanes is 32 f32 registers a lane, which is where both this part's and
+//    the 4090's sweeps put the register-file knee. 8x4 falls off a cliff; do
+//    not widen it.
+//
+//  * **A has to be staged too.** The prototype binds `a: array<f16>` because
+//    its harness allocated f16. Here `x` is bf16 in an `array<u32>`, and bf16
+//    is not f16, so it cannot be reinterpreted -- stage a (32, BK) tile into
+//    workgroup memory as f16 alongside the (64, BK) weight tile. At BK = 64
+//    that is 4 KB + 8 KB. (`PIE_FP16_PRECAST`'s `half_in` IS a real f16
+//    buffer and could be loaded directly, but that variant is not the one
+//    that costs 122 ms.)
+//
+//  * **B needs no transpose.** `qmm_t` is already `[n][k]`, which is the
+//    layout `coopLoad<mat<f16, B>>` wants, and it is what the prototype
+//    stages `ws` as.
+//
+//  * **The store cannot be a `coopStore`.** This variant's output is bf16
+//    through `out_: array<atomic<u32>>` and a cooperative store writes a typed
+//    array. `coopStore` the 32x64 f32 block into workgroup memory, barrier,
+//    and let the existing `write_out` path do the packing and the `m`/`n`
+//    overhang guards -- which is also how the bias, residual and split-K arms
+//    stay reachable later without touching any of this.
+//
+//  * **It is f16 accumulation of f16 operands into f32.** The dequantised
+//    weight goes through IEEE binary16 (`through_f16` in the test says what
+//    that costs) and so does the activation, where every other arm in this
+//    file multiplies in f32. That is a REAL numeric change, larger than the
+//    butterfly re-associations elsewhere in this tree, and it is why this arm
+//    must be a tier with a baseline fallback rather than a replacement -- and
+//    why `arena`'s tolerance has to be checked against it deliberately rather
+//    than assumed.
+//
 // pie:instantiate affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16 PIE_GROUP=128 PIE_BITS=4 PIE_BM=16 PIE_BN=16
 // pie:instantiate affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_32 PIE_GROUP=128 PIE_BITS=4 PIE_BM=16 PIE_BN=32
 // pie:instantiate affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_64 PIE_GROUP=128 PIE_BITS=4 PIE_BM=16 PIE_BN=64
@@ -853,6 +1207,7 @@ fn main(
 // pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=32
 // pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=32 PIE_PROBE_SHAPE=1
 // pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64 @matrix PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=64
 // pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=16
 // pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=32
 // pie:instantiate affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=32 PIE_PROBE_SHAPE=1

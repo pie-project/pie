@@ -188,10 +188,8 @@ pub type Routine = kernels::routine::Routine<Vulkan>;
 
 pub use kernels::shader::{elementwise, elementwise_rows};
 
-
 pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
 pub use crate::module::path as module_path;
 
 pub use kernels::routine::{Answers, Asks};
-

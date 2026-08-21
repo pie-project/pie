@@ -8,6 +8,21 @@ name: CI
 on:
   push:
     branches: [main]
+  # `pull_request` is the trigger that is reachable TODAY, and it is the one
+  # this comment spent its whole life not noticing.
+  #
+  # A `pull_request` run checks out the MERGE ref and takes its workflows
+  # from there, so a PR opened from `rewrite` runs `rewrite`'s copy of this
+  # file -- the deleted-`--features forward` version included, which is the
+  # point. Nothing has to reach `main` first. That is also why the filter
+  # here is bare where `main`'s says `branches: [main]`: an unfiltered
+  # `pull_request` matches whatever base the PR names.
+  #
+  # No pull request has ever been opened from `rewrite` (searched: zero, in
+  # any state). So the branch has two ways to be built, has had one of them
+  # available the entire time, and has used neither. Opening a draft PR is
+  # the cheapest way to find out what CI thinks before merge time, and it
+  # needs no default-branch change and no token.
   pull_request:
   # Long-lived rewrite branches are neither. `rewrite` has carried months
   # of work -- a whole Metal driver, a kernel table, a catalog refactor --
@@ -21,14 +36,35 @@ on:
   # theirs. It asks for the branch to be RUNNABLE on demand, by whoever
   # wants the answer before the merge rather than after it.
   #
-  # Whether that works from here is NOT established. GitHub's own docs say
-  # a `workflow_dispatch` workflow must be present on the DEFAULT branch to
-  # be dispatchable, and `main`'s copy of this file does not have this
-  # trigger; reports differ on whether selecting a non-default branch works
-  # anyway. So this line is either already live or arrives the moment the
-  # file reaches `main`, and nobody here can tell which without a token.
-  # It is written down rather than tested because the untested half is
-  # harmless: worst case it is inert, and it is inert TODAY.
+  # Whether that works from here is now MEASURED, and the answer is no --
+  # today, and for a reason that names its own remedy.
+  #
+  # GitHub's docs say a `workflow_dispatch` workflow must be present on the
+  # DEFAULT branch to be dispatchable, and reports differ on whether a
+  # non-default ref can then be selected. Both halves were checked against
+  # this repository's own run history rather than against the reports:
+  #
+  #   * the default branch is `main` (`git ls-remote --symref origin HEAD`),
+  #     and `main`'s copy of THIS file has `push: [main]` and
+  #     `pull_request: branches: [main]` and no dispatch trigger at all. So
+  #     the line below is inert, exactly as feared.
+  #   * `build.yml` DOES carry `workflow_dispatch` on `main`, and of 114
+  #     dispatched runs in this repo, nine ran against non-default refs --
+  #     `agents/alpha` (5), `ci/release-cuda-fixes` (4), `ci/win-cuda-msvc-fix`
+  #     (2) and the `0.4.0` tag (1). So selecting a non-default branch DOES
+  #     work here. The reports that say otherwise are not describing this
+  #     repository.
+  #
+  # Together those say the trigger is not wrong, it is not yet REACHABLE:
+  # presence on the default branch is the whole requirement, and it is the
+  # one thing a commit on `rewrite` cannot supply. The line arrives live the
+  # moment this file reaches `main`, and `build.yml` is the proof that it
+  # will work when it does.
+  #
+  # And the count that makes the case: `ci.yml` has 425 runs and **0 on
+  # `rewrite`**, by any event -- not a push, not a pull request. A branch
+  # carrying months of work has never once been built by the file that
+  # decides whether it builds.
   workflow_dispatch:
 
 permissions:
@@ -186,6 +222,7 @@ jobs:
             -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
             -p driver-wgpu -p kernels-wgpu \
             -p kernels-metal -p kernels-vulkan -p kernels-cuda \
+            -p kernels-macros \
             -p model-dsl -p model-ir \
             -- -D warnings
 
@@ -262,6 +299,7 @@ jobs:
             -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
             -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer \
             -p driver-wgpu -p kernels-wgpu -p driver-vulkan \
+            -p kernels-macros \
             -p model-dsl -p model-ir
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
@@ -310,6 +348,33 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-workspace-verify-
 
+      # `--all-targets` is what makes this job need a shader compiler, and it
+      # took running the command to find out. `kernels-vulkan`'s build script
+      # shells out to `slangc` under `native`; `native` is off by default and
+      # nothing in a plain `cargo build --workspace` turns it on -- but
+      # `--all-targets` builds dev-dependencies, and that edge reaches
+      # `driver-vulkan`, which enables `kernels-vulkan/native`. Measured both
+      # ways on this tree: with `--all-targets` the build script panics with
+      # "cannot run `slangc`"; without it, the same command succeeds.
+      #
+      # So this job -- which installs `build-essential cmake ninja-build
+      # ccache` and nothing else -- has never been able to complete its FIRST
+      # step, and `cargo test (workspace + worker lib)` beneath it has never
+      # been reached at all. Nobody knew, because `ci.yml` does not run on
+      # this branch and no PR has ever been opened from it.
+      #
+      # Same pinned release as the `driver-vulkan` job below, for the reason
+      # stated there: `slangc` chooses the SPIR-V dialect, so the version is
+      # part of the answer and not part of the environment.
+      - name: Install the Slang shader compiler
+        run: |
+          ver=2026.14.1
+          url="https://github.com/shader-slang/slang/releases/download/v$ver/slang-$ver-linux-x86_64-glibc-2.27.tar.gz"
+          mkdir -p "$HOME/slang"
+          curl -fsSL "$url" | tar -xz -C "$HOME/slang"
+          echo "PIE_SLANGC=$HOME/slang/bin/slangc" >> "$GITHUB_ENV"
+          "$HOME/slang/bin/slangc" -v
+
       # Compile every target — including benches and the not-yet-consumed
       # data-plane crate `transport` — so they cannot silently bitrot.
       - name: cargo build (workspace, all targets)
@@ -321,6 +386,24 @@ jobs:
       # worker's library tests are pure-Rust, so run them explicitly here to
       # keep worker test-rot inside the full battery; its `--bin pie` tests need
       # a driver feature and stay in the dedicated jobs below.
+      #
+      # RUN IN FULL for the first time on 2026-08-21, on a Mac with the pinned
+      # `slangc` installed. Everything passes except ONE target, and it is a
+      # standing known failure rather than anything this branch broke:
+      # `kernels`'s `every_plane_is_answered` reports 51 unanswerable asks,
+      # 49 of them in `keys.rs` §M and §L -- the two sections the CUDA mark
+      # migration wrote for itself, whose asking half landed in `930fee2cb`
+      # and whose answering half never did. `driver-cuda` answers NONE of the
+      # 59 keys those sections declare. A body that asks for a fact its
+      # driver cannot answer returns `Refusal::Unstated` and the routine does
+      # not fire, so the gate is right and the CUDA plane list is what is
+      # behind. The failure groups by section and names a different repair
+      # under each; read it before touching a mark.
+      #
+      # That plus the kernel vocabulary audit above are the two steps a first
+      # PR from a rewrite branch should expect red. Everything else in this
+      # job is green, and was green only after `slangc` was installed --
+      # before that the job could not finish its first step.
       - name: cargo test (workspace + worker lib)
         run: |
           cargo test --workspace \
@@ -334,6 +417,23 @@ jobs:
       # five launchers against a 192-row table and reported ZERO UNDECLARED for
       # weeks. A check nobody runs is indistinguishable from a check that
       # passes.
+      #
+      # AND IT IS RED TODAY, on purpose, which the first run of this workflow
+      # on a rewrite branch will discover. Not a rot: the host C++ tree the
+      # audit reads was DELETED rather than moved, and the crate that took
+      # its name compiles device text at run time and launches it by name
+      # from Rust, so there is no host declaration left to scan. The script's
+      # own header forbids repointing the glob -- that would swap an honest
+      # failure for the silent pass this step exists to prevent -- and its
+      # refusal now carries the measurement the redesign needs (347
+      # `__global__` entry points against 34 table symbols).
+      #
+      # It is left in the job rather than commented out. A step removed to
+      # get a green pipeline is the exact failure mode the comment above
+      # describes, one level up: a check nobody runs. Whoever opens the first
+      # PR from a rewrite branch should expect this one line red and every
+      # other step green, and should read `scripts/kernel-vocabulary-audit.py`
+      # before touching either.
       - name: kernel vocabulary audit
         run: python3 scripts/kernel-vocabulary-audit.py
 
@@ -460,8 +560,9 @@ jobs:
       - name: cargo test (driver-cuda, portable half, no feature at all)
         run: cargo test -p driver-cuda
 
-      # THE GATE THAT WOULD HAVE CAUGHT A DEAD KERNEL, and did not exist until
-      # one shipped. Every kernel in `kernels-cuda` is TEXT that NVRTC compiles
+      # THE GATE THAT WOULD HAVE CAUGHT A DEAD KERNEL, kept as a record of
+      # what this job stopped covering -- the step is gone and the reason is
+      # at the bottom of this comment. It did not exist until one shipped. Every kernel in `kernels-cuda` is TEXT that NVRTC compiles
       # at run time, so a root that stops compiling is not a failing test
       # anywhere -- it is a kernel that silently does not exist until something
       # fires it and the request errors. `attn/attention_mla_fa2` shipped that
@@ -479,31 +580,27 @@ jobs:
       # its directory because `libnvrtc.so.13` loads `libnvrtc-builtins.so`
       # beside itself and reports a "corrupted" builtins if it cannot.
       #
-      # WHAT IT COVERS AND WHAT IT DOES NOT, measured rather than assumed. It
-      # compiles 126 of 127 roots and 792 instantiations for real. The 127th is
-      # cooperative: `grid.sync()` leaves an extern that `cuLink` resolves and
-      # `cuLinkCreate` is a context call, so it names itself as skipped and is
-      # covered only where a device exists. And with no device to ask,
-      # `cache::arch()` falls back to `sm_89` -- the floor the fp8 shim sets --
-      # so code gated above that, which is where the bug above lived, still
-      # needs real hardware to see. This is a net, not a proof: it catches the
-      # arch-independent breakage, which is most of it.
+      # WHAT IT COVERED, AND WHY THE STEP IS GONE. `930fee2cb` deleted this
+      # crate's tests when the shader planes moved their numbers to the fires
+      # that read them, and left the step naming two targets:
       #
-      # `typecheck_tu` is the second half of the step and used to be none of
-      # it. It compiles a unit per measured `LAYOUTS` static, and one of its
-      # four roots device-links -- which it treated as grounds to return,
-      # dropping all four. So on THIS runner, the one the step was written for,
-      # it finished in 0.01 s having asserted nothing, and read green. It now
-      # partitions the way its sibling does: 3 of 4 roots, 6 aggregates, 40
-      # assertions, and the 4th named as skipped. Confirmed to still bite by
-      # planting a wrong field offset, which fails the step here.
-      - name: cargo test (kernels-cuda, JIT roots against real NVRTC)
-        run: |
-          python3 -m venv /tmp/nvrtc
-          /tmp/nvrtc/bin/pip install --quiet nvidia-cuda-nvrtc
-          export LD_LIBRARY_PATH="$(echo /tmp/nvrtc/lib/python*/site-packages/nvidia/cu13/lib):$LD_LIBRARY_PATH"
-          cargo test -p kernels-cuda --features cuda-13 \
-            --test every_instantiation_compiles --test typecheck_tu -- --nocapture
+      #     cargo test -p kernels-cuda --features cuda-13 \
+      #       --test every_instantiation_compiles --test typecheck_tu
+      #
+      # which exits `no test target named ...` and reds the job. Nobody saw,
+      # because this workflow does not trigger on the branch the work is on.
+      #
+      # What left with it, recorded because it was measured and is worth
+      # restoring: `every_instantiation_compiles` compiled 126 of 127 roots
+      # and 792 instantiations against real NVRTC -- no toolkit, no driver, no
+      # GPU, just `libnvrtc` from a wheel. The 127th is cooperative
+      # (`grid.sync()` leaves an extern only `cuLink` resolves) and named
+      # itself as skipped. With no device, `cache::arch()` fell back to
+      # `sm_89`, so anything gated above that still needed hardware; it was a
+      # net for arch-independent breakage, which is most of it.
+      # `typecheck_tu` compiled a unit per measured `LAYOUTS` static -- 3 of 4
+      # roots, 6 aggregates, 40 assertions -- and was confirmed to bite by
+      # planting a wrong field offset.
 
       # The test that fires a REAL PTIR program: register bytecode, publish a
       # seed into a channel, read the program's own answer back out. It is the
@@ -804,32 +901,90 @@ jobs:
       - name: Install a software adapter (llvmpipe)
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
 
-      # Most tests in both files open an adapter through an `Option` and print
-      # `SKIP` when there is none, and `cargo test` eats that line without
-      # `--nocapture`. So until the two switches below, both steps read the
-      # SAME GREEN whether every proof ran against llvmpipe or the install
-      # above silently did nothing -- and nothing checked which. The install
-      # exists for the express purpose of making these runnable;
-      # `PIE_WGPU_REQUIRE_ADAPTER` and `PIE_WGPU_REQUIRE_DEVICE` are how the
-      # purpose gets checked rather than assumed.
+      # Most tests in the file below open an adapter through an `Option` and
+      # print `SKIP` when there is none, and `cargo test` eats that line
+      # without `--nocapture`. So until `PIE_WGPU_REQUIRE_DEVICE`, the step
+      # read the SAME GREEN whether every proof ran against llvmpipe or the
+      # install above silently did nothing -- and nothing checked which. The
+      # install exists for the express purpose of making these runnable; the
+      # switch is how the purpose gets checked rather than assumed. If it goes
+      # red, that IS the measurement: the guarantee this job has been printing
+      # all along was never held.
       #
-      # How many that is, each suite counts and prints for itself -- in
-      # `the_runner_states_whether_it_has_an_adapter` and
-      # `..._whether_it_has_a_device`. This comment used to say "51 kernel
-      # proofs and 13 device tests"; they are 55 and 18, which is what a
-      # hand-kept number is worth after a few months.
+      # THERE WERE TWO STEPS HERE. The other ran `-p kernels-wgpu --test gpu`
+      # under `PIE_WGPU_REQUIRE_ADAPTER: "1"`, and `930fee2cb` deleted that
+      # crate's `tests/` directory along with `kernels-vulkan`'s. Since then
+      # the command has exited `no test target named `gpu``, which is a red
+      # job, unseen because this workflow does not trigger on the branch the
+      # work is on. `PIE_WGPU_REQUIRE_ADAPTER` was read by nothing in the tree
+      # even before that, and this comment cited
+      # `the_runner_states_whether_it_has_an_adapter` as where the count gets
+      # printed -- also gone. A step nobody runs decays in every direction at
+      # once, and each rot hid the others.
       #
-      # If either switch goes red, that IS the measurement: it means the
-      # guarantee this job has been printing all along was never held.
-      - name: cargo test (kernels-wgpu, on-device numeric proofs)
-        env:
-          PIE_WGPU_REQUIRE_ADAPTER: "1"
-        run: cargo test -p kernels-wgpu --test gpu
+      # What left with it: 55 numeric proofs of the WGSL shaders against
+      # references, on llvmpipe. `crates/model/tests/every_cfg_names_a_real_feature.rs`
+      # now fails if a workflow names a package or target that does not exist,
+      # so restoring those proofs is a decision somebody makes, not a job
+      # somebody notices.
 
-      - name: cargo test (driver-wgpu, device tests)
+      # NAMED ONE TARGET UNTIL NOW, and the device half has more than one.
+      # `tests/hybrid_probe.rs` is `#![cfg(feature = "native")]` and carries
+      # seventy tests, twenty-one of which need no checkpoint; the `--no-run`
+      # step above BUILT all seventy on every push and `--test device` ran
+      # none of them, so the file has never executed in this workflow. Same
+      # shape as the model crate's `contract` aspect, one crate over, and
+      # the reason it hid is the same: compiling a test reads its types and
+      # never its assertions.
+      #
+      # Measured on an Apple adapter before widening: 194 lib, arena 10,
+      # browser 6, checkpoint 6, citations 4, device 26, hybrid_probe 21,
+      # pure 3, rules 3, serving 26 -- all green, about three minutes, of
+      # which `device` is 95s. The runner's adapter is not this one, so if
+      # something here goes red on a first run it is a fact about the two
+      # adapters and worth exactly that.
+      #
+      # Of that `serving 26`, THREE measure a forward pass here and twenty-
+      # three do not. They gate on a qwen3-0.6b checkpoint, and when there is
+      # none each returns and is reported `ok`; the count above reads the same
+      # either way. That is now `driver_wgpu::skip::unmeasured`, fatal under
+      # `PIE_WGPU_REQUIRE_WEIGHTS`, which is deliberately NOT set below.
+      #
+      # It is not set because this runner has never been asked for a
+      # checkpoint. It is asked for an adapter -- `mesa-vulkan-drivers` is
+      # installed two steps up for exactly that -- and `PIE_WGPU_REQUIRE_DEVICE`
+      # holds it to that word. Failing it for a model nobody told it to fetch
+      # is how the switch that does work gets deleted instead of satisfied.
+      #
+      # To buy the twenty-three: give this job a `PIE_CHECKPOINT` pointing at
+      # a qwen3-0.6b snapshot and set `PIE_WGPU_REQUIRE_WEIGHTS: "1"`. Measured
+      # locally, that turns `26 passed` into `3 passed; 23 failed` on a machine
+      # without one, which is the same suite telling the truth.
+      #
+      # AND NOW MEASURED WITH ONE, which the paragraph above could only
+      # promise. `Qwen/Qwen3-0.6B` is 1.4 GB from the Hub:
+      #
+      #     no checkpoint, switch off      37 s   26 passed
+      #     no checkpoint, switch on       37 s    3 passed, 23 failed
+      #     checkpoint,    switch on      192 s   26 passed
+      #
+      # Five times the wall clock for the same green summary, and the whole
+      # difference is whether twenty-three of the twenty-six touched a model.
+      # They pass. The wgpu serving path answers correctly against real
+      # weights, which is a thing this job has been reporting for its whole
+      # life without ever having checked.
+      #
+      # It must be the BF16 checkpoint. `mlx-community/Qwen3-0.6B-4bit` has
+      # the right config -- 151936 x 1024, 28 layers -- and `checkpoint()`
+      # rejects it anyway, because it reads the artifact rather than the
+      # config and a four-bit MLX pack stores `model.embed_tokens.weight` as
+      # `[151936, 128]`. The helper's doc says it identifies a checkpoint "by
+      # what the artifact states rather than by what a path claims", and this
+      # is that sentence being load-bearing.
+      - name: cargo test (driver-wgpu, device half)
         env:
           PIE_WGPU_REQUIRE_DEVICE: "1"
-        run: cargo test -p driver-wgpu --features native --test device
+        run: cargo test -p driver-wgpu --features native
 
       # This backend's three end-to-end gates, COMPILED. They cannot run here
       # -- each is `#[ignore]` and wants a built model in `PIE_HOME` -- but

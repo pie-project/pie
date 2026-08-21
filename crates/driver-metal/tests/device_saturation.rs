@@ -46,6 +46,8 @@ use driver_metal::lowering::executor::{BoundArg, Slice};
 ///
 /// `44.36` is `ln(f32::MAX) / 2`. Everything at or past it is where a naive
 /// implementation returns NaN and a correct one returns 1.
+use driver_metal::skip::skipped;
+
 const GELU_GATES: [f32; 8] = [1.5, -1.5, 10.0, 10.5, 11.0, 64.0, 1024.0, -1024.0];
 
 /// gemma's cap, and logits either side of `44.36 * cap = 554.5`.
@@ -64,7 +66,7 @@ fn gelu_tanh_reference(g: f32, u: f32) -> f32 {
 #[ignore = "needs a Metal 4 device"]
 fn the_gelu_tanh_activation_saturates_rather_than_overflowing() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");
@@ -134,7 +136,7 @@ fn the_gelu_tanh_activation_saturates_rather_than_overflowing() {
 #[ignore = "needs a Metal 4 device"]
 fn the_logit_softcap_saturates_rather_than_overflowing() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");

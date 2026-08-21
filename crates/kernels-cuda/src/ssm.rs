@@ -1,17 +1,16 @@
-
 #![allow(clippy::too_many_arguments)]
 
-use kernels::{Bind, Fire};
-use kernels_macros::routine;
-use crate::jit::{Ctx, Launch};
 use crate::jit::Abi;
 use crate::jit::abi::Inst;
 use crate::jit::abi::Tensor;
 use crate::jit::abi::{MaybeConst, bf16};
+use crate::jit::{Ctx, Launch};
+use crate::views::{MoeBanks, RecurrentState};
 use kernels::Refusal;
 use kernels::raises::Struct;
 use kernels::routine::{Const, In, Out};
-use crate::views::{MoeBanks, RecurrentState};
+use kernels::{Bind, Fire};
+use kernels_macros::routine;
 
 use core::ffi::c_void;
 
@@ -32,7 +31,10 @@ fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> Launch {
 
     const SINK_BLOCK_MAX: u32 = 128;
 
-    Launch::grid([rows, heads, 1], [head_dim.clamp(SINK_BLOCK_MIN, SINK_BLOCK_MAX), 1, 1])
+    Launch::grid(
+        [rows, heads, 1],
+        [head_dim.clamp(SINK_BLOCK_MIN, SINK_BLOCK_MAX), 1, 1],
+    )
 }
 
 #[must_use]
@@ -52,7 +54,10 @@ const fn recurrent_scan(rows: u32, heads: u32, k_d: u32) -> Launch {
 const fn warp_tiled_scan(rows: u32, heads: u32, value_width: u32) -> Launch {
     const SCAN_WARPS: u32 = 4;
 
-    Launch::grid([rows, heads, value_width.div_ceil(SCAN_WARPS)], [SCAN_WARPS * WARP, 1, 1])
+    Launch::grid(
+        [rows, heads, value_width.div_ceil(SCAN_WARPS)],
+        [SCAN_WARPS * WARP, 1, 1],
+    )
 }
 
 #[must_use]
@@ -64,7 +69,7 @@ const PTRS_BLOCK: u32 = 256;
 
 const GDN_BLOCK: u32 = 128;
 
-#[routine(bf16, canon = causal_conv1d)]
+#[routine(bf16, canon = causal_conv1d, out(y = like(x)))]
 pub fn causal_conv1d_update_batched<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -73,12 +78,15 @@ pub fn causal_conv1d_update_batched<T>(
     y: Out<Tensor<T>>,
     c: Const<i32>,
     k: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal>
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<(), Refusal>
 where
     MaybeConst<T>: Abi,
 {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -92,18 +100,28 @@ where
     }
 
     let r = x.rows;
-    ctx.fire(Fire::at("ssm/causal_conv1d.cuh", crate::jit::symbol(&format!("::pie::ssm::causal_conv1d_update_batched<{}>", T::CPP))).apply(split_packed(r.unsigned_abs(), c.unsigned_abs())), &[
-                x.arg(),
-                weight.arg(),
-                bias.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                slot_stride_elems.arg(),
-                y.arg(),
-                r.arg(),
-                c.arg(),
-                k.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/causal_conv1d.cuh",
+            crate::jit::symbol(&format!(
+                "::pie::ssm::causal_conv1d_update_batched<{}>",
+                T::CPP
+            )),
+        )
+        .apply(split_packed(r.unsigned_abs(), c.unsigned_abs())),
+        &[
+            x.arg(),
+            weight.arg(),
+            bias.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            slot_stride_elems.arg(),
+            y.arg(),
+            r.arg(),
+            c.arg(),
+            k.arg(),
+        ],
+    )
 }
 
 pub fn causal_conv1d_prefill_noact<T>(
@@ -115,26 +133,37 @@ pub fn causal_conv1d_prefill_noact<T>(
     state_out: *mut T,
     n: i32,
     channels: i32,
-    k: i32) -> Result<(), Refusal>
+    k: i32,
+) -> Result<(), Refusal>
 where
     T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
     MaybeConst<T>: Abi,
 {
-    ctx.fire(Fire::at("ssm/causal_conv1d.cuh", crate::jit::symbol(&format!("::pie::ssm::causal_conv1d_prefill<{}, false>", T::CPP))).apply(Launch::grid([channels.unsigned_abs(), 1, 1], [64, 1, 1])), &[
-                x.arg(),
-                weight.arg(),
-                bias.arg(),
-                y.arg(),
-                state_out.arg(),
-                n.arg(),
-                channels.arg(),
-                k.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/causal_conv1d.cuh",
+            crate::jit::symbol(&format!(
+                "::pie::ssm::causal_conv1d_prefill<{}, false>",
+                T::CPP
+            )),
+        )
+        .apply(Launch::grid([channels.unsigned_abs(), 1, 1], [64, 1, 1])),
+        &[
+            x.arg(),
+            weight.arg(),
+            bias.arg(),
+            y.arg(),
+            state_out.arg(),
+            n.arg(),
+            channels.arg(),
+            k.arg(),
+        ],
+    )
 }
 
-#[routine(bf16)]
+#[routine(bf16, out(y = like(x)))]
 pub fn causal_conv1d_prefill_batched<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -145,12 +174,15 @@ pub fn causal_conv1d_prefill_batched<T>(
     k: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     write_state: Const<bool>,
-    qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal>
+    qo_indptr: In<Tensor<i32>>,
+) -> Result<(), Refusal>
 where
     MaybeConst<T>: Abi,
 {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -172,30 +204,39 @@ where
 
     let (instantiation, launch) = if r >= CONV_CHANNEL_TILE_FROM {
         (
-            crate::jit::symbol(&format!("::pie::ssm::causal_conv1d_prefill_batched_channel_tile<{}>", T::CPP)),
+            crate::jit::symbol(&format!(
+                "::pie::ssm::causal_conv1d_prefill_batched_channel_tile<{}>",
+                T::CPP
+            )),
             Launch::grid([chans.div_ceil(CONV_TILE), rows, 1], [CONV_TILE, 1, 1]),
         )
     } else {
         (
-            crate::jit::symbol(&format!("::pie::ssm::causal_conv1d_prefill_batched<{}>", T::CPP)),
+            crate::jit::symbol(&format!(
+                "::pie::ssm::causal_conv1d_prefill_batched<{}>",
+                T::CPP
+            )),
             Launch::grid([chans, rows, 1], [CONV_PER_CHANNEL_BLOCK, 1, 1]),
         )
     };
-    ctx.fire(Fire::at("ssm/causal_conv1d.cuh", instantiation).apply(launch), &[
-                x.arg(),
-                weight.arg(),
-                bias.arg(),
-                y.arg(),
-                state_out_base.arg(),
-                slot_ids.arg(),
-                qo_indptr.arg(),
-                slot_stride_elems.arg(),
-                c.arg(),
-                k.arg(),
-                write_state.arg(),
-                MaybeConst::<u8>::none().arg(),
-                MaybeConst::<i32>::none().arg(),
-            ])
+    ctx.fire(
+        Fire::at("ssm/causal_conv1d.cuh", instantiation).apply(launch),
+        &[
+            x.arg(),
+            weight.arg(),
+            bias.arg(),
+            y.arg(),
+            state_out_base.arg(),
+            slot_ids.arg(),
+            qo_indptr.arg(),
+            slot_stride_elems.arg(),
+            c.arg(),
+            k.arg(),
+            write_state.arg(),
+            MaybeConst::<u8>::none().arg(),
+            MaybeConst::<i32>::none().arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -203,16 +244,24 @@ pub fn bf16_to_fp32(
     ctx: &Ctx<'_>,
     x: In<Tensor<c_void>>,
     y: Out<Tensor<f32>>,
-
 ) -> Result<(), Refusal> {
     let dst = y.all("element count")?;
     let n = dst.elements();
     if n <= 0 {
-        return Err(Refusal::Empty { what: "element count" });
+        return Err(Refusal::Empty {
+            what: "element count",
+        });
     }
     let count = n.unsigned_abs();
     let elems = count as usize;
-    ctx.fire(Fire::at("ssm/gated_delta_net_prep.cuh", "::pie::ssm::widen<::pie::bf16>").apply(elementwise(count)), &[x.arg(), y.arg(), elems.arg()])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net_prep.cuh",
+            "::pie::ssm::widen<::pie::bf16>",
+        )
+        .apply(elementwise(count)),
+        &[x.arg(), y.arg(), elems.arg()],
+    )
 }
 
 #[routine]
@@ -220,16 +269,24 @@ pub fn fp32_to_bf16(
     ctx: &Ctx<'_>,
     x: In<Tensor<f32>>,
     y: Out<Tensor<c_void>>,
-
 ) -> Result<(), Refusal> {
     let dst = y.all("element count")?;
     let n = dst.elements();
     if n <= 0 {
-        return Err(Refusal::Empty { what: "element count" });
+        return Err(Refusal::Empty {
+            what: "element count",
+        });
     }
     let count = n.unsigned_abs();
     let elems = count as usize;
-    ctx.fire(Fire::at("ssm/gated_delta_net_prep.cuh", "::pie::ssm::narrow<::pie::bf16>").apply(elementwise(count)), &[x.arg(), y.arg(), elems.arg()])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net_prep.cuh",
+            "::pie::ssm::narrow<::pie::bf16>",
+        )
+        .apply(elementwise(count)),
+        &[x.arg(), y.arg(), elems.arg()],
+    )
 }
 
 #[routine]
@@ -239,16 +296,23 @@ pub fn repeat_interleave_heads_fp32(
     out: Out<Tensor<f32>>,
     k_h: Const<i32>,
     v_h: Const<i32>,
-    d: Const<i32>) -> Result<(), Refusal> {
-
-    ctx.fire(Fire::at("ssm/gated_delta_net_prep.cuh", "::pie::ssm::repeat_interleave_heads_fp32<::pie::ssm::f32>").apply(gated_rms(in_.rows.unsigned_abs(), v_h.unsigned_abs())), &[
-                in_.arg(),
-                out.arg(),
-                k_h.arg(),
-                v_h.arg(),
-                d.arg(),
-                (*v_h / *k_h).arg(),
-            ])
+    d: Const<i32>,
+) -> Result<(), Refusal> {
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net_prep.cuh",
+            "::pie::ssm::repeat_interleave_heads_fp32<::pie::ssm::f32>",
+        )
+        .apply(gated_rms(in_.rows.unsigned_abs(), v_h.unsigned_abs())),
+        &[
+            in_.arg(),
+            out.arg(),
+            k_h.arg(),
+            v_h.arg(),
+            d.arg(),
+            (*v_h / *k_h).arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -256,8 +320,8 @@ pub fn l2norm_scale_bf16_to_fp32(
     ctx: &Ctx<'_>,
     x: In<Tensor<c_void>>,
     y: Out<Tensor<f32>>,
-    eps: Const<f32>) -> Result<(), Refusal> {
-
+    eps: Const<f32>,
+) -> Result<(), Refusal> {
     let eps = *eps;
 
     #[must_use]
@@ -268,7 +332,14 @@ pub fn l2norm_scale_bf16_to_fp32(
     }
 
     let dst = y.all("the normalised row")?;
-    ctx.fire(Fire::at("ssm/gated_delta_net_prep.cuh", "::pie::ssm::l2norm_scale<::pie::bf16, 128>").apply(per_row_narrow(dst.rows.unsigned_abs())), &[x.arg(), y.arg(), dst.width.arg(), 1.0f32.arg(), eps.arg()])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net_prep.cuh",
+            "::pie::ssm::l2norm_scale<::pie::bf16, 128>",
+        )
+        .apply(per_row_narrow(dst.rows.unsigned_abs())),
+        &[x.arg(), y.arg(), dst.width.arg(), 1.0f32.arg(), eps.arg()],
+    )
 }
 
 #[routine(bf16)]
@@ -280,26 +351,38 @@ pub fn kda_gate_beta<T>(
     dt_bias: Const<Tensor<f32>>,
     gate_out: Out<Tensor<f32>>,
     beta_out: Out<Tensor<f32>>,
-    d: Const<i32>) -> Result<(), Refusal> {
+    d: Const<i32>,
+) -> Result<(), Refusal> {
     let betas = beta_out.all("the KDA head count")?;
     let t = betas.rows;
 
     let h = betas.width;
-    ctx.fire(Fire::at("ssm/kda.cuh", crate::jit::symbol(&format!("::pie::ssm::kda_gate_beta<{}>", T::CPP))).apply(per_head_elementwise(t.unsigned_abs(), h.unsigned_abs(), d.unsigned_abs())), &[
-                raw_g.arg(),
-                raw_beta.arg(),
-                a_log.arg(),
-                dt_bias.arg(),
-                gate_out.arg(),
-                beta_out.arg(),
-                t.arg(),
-                h.arg(),
-                d.arg(),
-                0.0f32.arg(),
-            ],)
+    ctx.fire(
+        Fire::at(
+            "ssm/kda.cuh",
+            crate::jit::symbol(&format!("::pie::ssm::kda_gate_beta<{}>", T::CPP)),
+        )
+        .apply(per_head_elementwise(
+            t.unsigned_abs(),
+            h.unsigned_abs(),
+            d.unsigned_abs(),
+        )),
+        &[
+            raw_g.arg(),
+            raw_beta.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gate_out.arg(),
+            beta_out.arg(),
+            t.arg(),
+            h.arg(),
+            d.arg(),
+            0.0f32.arg(),
+        ],
+    )
 }
 
-#[routine(bf16)]
+#[routine(bf16, out(out = like(g)))]
 pub fn kda_o_norm_gated<T>(
     ctx: &Ctx<'_>,
     o: In<Tensor<f32>>,
@@ -308,11 +391,30 @@ pub fn kda_o_norm_gated<T>(
     out: Out<Tensor<T>>,
     h: Const<i32>,
     d: Const<i32>,
-    eps: Const<f32>) -> Result<(), Refusal> {
-
+    eps: Const<f32>,
+) -> Result<(), Refusal> {
     let eps = *eps;
 
-    ctx.fire(Fire::at("ssm/kda.cuh", crate::jit::symbol(&format!("::pie::ssm::kda_o_norm_gated<{}>", T::CPP))).apply(per_head_elementwise(out.rows.unsigned_abs(), h.unsigned_abs(), d.unsigned_abs())), &[o.arg(), g.arg(), weight.arg(), out.arg(), h.arg(), d.arg(), eps.arg()])
+    ctx.fire(
+        Fire::at(
+            "ssm/kda.cuh",
+            crate::jit::symbol(&format!("::pie::ssm::kda_o_norm_gated<{}>", T::CPP)),
+        )
+        .apply(per_head_elementwise(
+            out.rows.unsigned_abs(),
+            h.unsigned_abs(),
+            d.unsigned_abs(),
+        )),
+        &[
+            o.arg(),
+            g.arg(),
+            weight.arg(),
+            out.arg(),
+            h.arg(),
+            d.arg(),
+            eps.arg(),
+        ],
+    )
 }
 
 #[routine(whole)]
@@ -326,9 +428,12 @@ pub fn kda_recurrent_step_batched(
     out: Out<Tensor<f32>>,
     h: Const<i32>,
     d: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal> {
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let state_base = rsv.slab as *mut core::ffi::c_void;
@@ -338,23 +443,31 @@ pub fn kda_recurrent_step_batched(
     // launch rectangle, so the count is the result's own row count.
     let r = out.rows;
     const KDA_STEP_BLOCK: u32 = 256;
-    ctx.fire(Fire::at("ssm/kda.cuh", "::pie::ssm::kda_recurrent_step_batched").apply(Launch::grid([r.unsigned_abs(), h.unsigned_abs(), 1], [KDA_STEP_BLOCK, 1, 1])
-                .smem(kda_shmem(d.unsigned_abs()))), &[
-                q_norm.arg(),
-                k_norm.arg(),
-                v.arg(),
-                gate.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                h.arg(),
-                d.arg(),
-            ])
+    ctx.fire(
+        Fire::at("ssm/kda.cuh", "::pie::ssm::kda_recurrent_step_batched").apply(
+            Launch::grid(
+                [r.unsigned_abs(), h.unsigned_abs(), 1],
+                [KDA_STEP_BLOCK, 1, 1],
+            )
+            .smem(kda_shmem(d.unsigned_abs())),
+        ),
+        &[
+            q_norm.arg(),
+            k_norm.arg(),
+            v.arg(),
+            gate.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            h.arg(),
+            d.arg(),
+        ],
+    )
 }
 
-#[routine(whole)]
+#[routine(whole, out(out = split(v, d)))]
 pub fn kda_prefill_batched(
     ctx: &Ctx<'_>,
     q_norm: In<Tensor<f32>>,
@@ -366,9 +479,12 @@ pub fn kda_prefill_batched(
     h: Const<i32>,
     d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
-    qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal> {
+    qo_indptr: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     // The request count is the CSR operand's own row count.
@@ -378,24 +494,29 @@ pub fn kda_prefill_batched(
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
     const KDA_PREFILL_MAX_WARPS: i32 = 32;
-    ctx.fire(Fire::at("ssm/kda.cuh", "::pie::ssm::kda_prefill_batched").apply(Launch::grid(
+    ctx.fire(
+        Fire::at("ssm/kda.cuh", "::pie::ssm::kda_prefill_batched").apply(
+            Launch::grid(
                 [r.unsigned_abs(), h.unsigned_abs(), 1],
                 [d.min(KDA_PREFILL_MAX_WARPS).unsigned_abs() * WARP, 1, 1],
             )
-            .smem(kda_shmem(d.unsigned_abs()))), &[
-                q_norm.arg(),
-                k_norm.arg(),
-                v.arg(),
-                gate.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                qo_indptr.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                h.arg(),
-                d.arg(),
-            ])
+            .smem(kda_shmem(d.unsigned_abs())),
+        ),
+        &[
+            q_norm.arg(),
+            k_norm.arg(),
+            v.arg(),
+            gate.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            qo_indptr.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            h.arg(),
+            d.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -407,17 +528,24 @@ pub fn nemotron_prepare_mamba_params(
     a: Out<Tensor<f32>>,
     d_f32: Out<Tensor<f32>>,
     dt_bias_f32: Out<Tensor<f32>>,
-    num_heads: Const<i32>) -> Result<(), Refusal> {
-
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::prepare_mamba_params<::pie::bf16>").apply(elementwise(num_heads.unsigned_abs())), &[
-                a_log.arg(),
-                d.arg(),
-                dt_bias.arg(),
-                a.arg(),
-                d_f32.arg(),
-                dt_bias_f32.arg(),
-                num_heads.arg(),
-            ])
+    num_heads: Const<i32>,
+) -> Result<(), Refusal> {
+    ctx.fire(
+        Fire::at(
+            "ssm/nemotron_h.cuh",
+            "::pie::ssm::prepare_mamba_params<::pie::bf16>",
+        )
+        .apply(elementwise(num_heads.unsigned_abs())),
+        &[
+            a_log.arg(),
+            d.arg(),
+            dt_bias.arg(),
+            a.arg(),
+            d_f32.arg(),
+            dt_bias_f32.arg(),
+            num_heads.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -427,27 +555,36 @@ pub fn nemotron_prepare_mamba_dt_da(
     a: In<Tensor<f32>>,
     dt_bias: In<Tensor<f32>>,
     dt_out: Out<Tensor<f32>>,
-    da_out: Out<Tensor<f32>>) -> Result<(), Refusal> {
-
+    da_out: Out<Tensor<f32>>,
+) -> Result<(), Refusal> {
     let src = dt.all("rows * num_heads")?;
     let num_heads = src.width;
     let total = src.elements();
     if total <= 0 {
-        return Err(Refusal::Empty { what: "rows * num_heads" });
+        return Err(Refusal::Empty {
+            what: "rows * num_heads",
+        });
     }
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::prepare_mamba_dt_da<::pie::bf16>").apply(elementwise(total.unsigned_abs())), &[
-                dt.arg(),
-                a.arg(),
-                dt_bias.arg(),
-                dt_out.arg(),
-                da_out.arg(),
-                total.arg(),
-                num_heads.arg(),
-                0.0f32.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/nemotron_h.cuh",
+            "::pie::ssm::prepare_mamba_dt_da<::pie::bf16>",
+        )
+        .apply(elementwise(total.unsigned_abs())),
+        &[
+            dt.arg(),
+            a.arg(),
+            dt_bias.arg(),
+            dt_out.arg(),
+            da_out.arg(),
+            total.arg(),
+            num_heads.arg(),
+            0.0f32.arg(),
+        ],
+    )
 }
 
-#[routine(bf16)]
+#[routine(bf16, out(y = like(x)))]
 pub fn zamba_rmsnorm_gated<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -455,8 +592,8 @@ pub fn zamba_rmsnorm_gated<T>(
     weight: Const<Tensor<T>>,
     y: Out<Tensor<T>>,
     n_groups: Const<i32>,
-    eps: Const<f32>) -> Result<(), Refusal> {
-
+    eps: Const<f32>,
+) -> Result<(), Refusal> {
     let eps = *eps;
 
     let src = x.all("the normalised row")?;
@@ -464,16 +601,23 @@ pub fn zamba_rmsnorm_gated<T>(
     let hidden = src.width;
 
     let gate_stride = gates.stride;
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", crate::jit::symbol(&format!("::pie::ssm::zamba_rmsnorm_gated<{}>", T::CPP))).apply(gated_rms(src.rows.unsigned_abs(), n_groups.unsigned_abs())), &[
-                x.arg(),
-                gate.arg(),
-                weight.arg(),
-                y.arg(),
-                hidden.arg(),
-                gate_stride.arg(),
-                (hidden / *n_groups).arg(),
-                eps.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/nemotron_h.cuh",
+            crate::jit::symbol(&format!("::pie::ssm::zamba_rmsnorm_gated<{}>", T::CPP)),
+        )
+        .apply(gated_rms(src.rows.unsigned_abs(), n_groups.unsigned_abs())),
+        &[
+            x.arg(),
+            gate.arg(),
+            weight.arg(),
+            y.arg(),
+            hidden.arg(),
+            gate_stride.arg(),
+            (hidden / *n_groups).arg(),
+            eps.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -482,7 +626,8 @@ pub fn nemotron_mamba_split_bf16(
     projected: In<Tensor<c_void>>,
     gate: Out<Tensor<c_void>>,
     conv_in: Out<Tensor<c_void>>,
-    dt: Out<Tensor<c_void>>) -> Result<(), Refusal> {
+    dt: Out<Tensor<c_void>>,
+) -> Result<(), Refusal> {
     const SPLIT_BLOCK: u32 = 256;
 
     let src = projected.all("a split extent")?;
@@ -502,35 +647,45 @@ pub fn nemotron_mamba_split_bf16(
     let total = src.elements();
     let conv_dt_total = n.saturating_mul(conv_dim.saturating_add(num_heads));
     if ungated && conv_dt_total <= 0 {
-        return Err(Refusal::Empty { what: "rows * (conv_dim + num_heads)" });
+        return Err(Refusal::Empty {
+            what: "rows * (conv_dim + num_heads)",
+        });
     }
     if ungated {
-
-        return ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::mamba_split_conv_dt").apply(Launch::grid(
-                    [conv_dt_total.unsigned_abs().div_ceil(SPLIT_BLOCK), 1, 1],
-                    [SPLIT_BLOCK, 1, 1],
-                )), &[
-                    projected.arg(),
-                    conv_in.arg(),
-                    dt.arg(),
-                    projection_dim.arg(),
-                    intermediate.arg(),
-                    conv_dim.arg(),
-                    num_heads.arg(),
-                    conv_dt_total.arg(),
-                ]);
-    }
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::mamba_split").apply(Launch::grid([total.unsigned_abs().div_ceil(SPLIT_BLOCK), 1, 1], [SPLIT_BLOCK, 1, 1])), &[
+        return ctx.fire(
+            Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::mamba_split_conv_dt").apply(Launch::grid(
+                [conv_dt_total.unsigned_abs().div_ceil(SPLIT_BLOCK), 1, 1],
+                [SPLIT_BLOCK, 1, 1],
+            )),
+            &[
                 projected.arg(),
-                gate.arg(),
                 conv_in.arg(),
                 dt.arg(),
                 projection_dim.arg(),
                 intermediate.arg(),
                 conv_dim.arg(),
                 num_heads.arg(),
-                total.arg(),
-            ])
+                conv_dt_total.arg(),
+            ],
+        );
+    }
+    ctx.fire(
+        Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::mamba_split").apply(Launch::grid(
+            [total.unsigned_abs().div_ceil(SPLIT_BLOCK), 1, 1],
+            [SPLIT_BLOCK, 1, 1],
+        )),
+        &[
+            projected.arg(),
+            gate.arg(),
+            conv_in.arg(),
+            dt.arg(),
+            projection_dim.arg(),
+            intermediate.arg(),
+            conv_dim.arg(),
+            num_heads.arg(),
+            total.arg(),
+        ],
+    )
 }
 
 #[routine(whole)]
@@ -550,9 +705,12 @@ pub fn nemotron_mamba_ssm_batched_bf16(
     n_groups: Const<i32>,
     conv_dim: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
-    qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal> {
+    qo_indptr: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -576,7 +734,11 @@ pub fn nemotron_mamba_ssm_batched_bf16(
         (
             "::pie::ssm::mamba_ssm_batched_prefill_reg",
             Launch::grid(
-                [rows, heads, head_dim.unsigned_abs().div_ceil(SSM_PREFILL_BLOCK / WARP)],
+                [
+                    rows,
+                    heads,
+                    head_dim.unsigned_abs().div_ceil(SSM_PREFILL_BLOCK / WARP),
+                ],
                 [SSM_PREFILL_BLOCK, 1, 1],
             )
             .smem(smem),
@@ -587,26 +749,29 @@ pub fn nemotron_mamba_ssm_batched_bf16(
             Launch::grid([rows, heads, 1], [SSM_DECODE_BLOCK, 1, 1]).smem(smem),
         )
     };
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", instantiation).apply(launch), &[
-                conv_out.arg(),
-                dt.arg(),
-                a.arg(),
-                d.arg(),
-                dt_bias.arg(),
-                dt_precomputed.arg(),
-                da_precomputed.arg(),
-                ssm_state_base.arg(),
-                slot_ids.arg(),
-                qo_indptr.arg(),
-                y.arg(),
-                num_heads.arg(),
-                head_dim.arg(),
-                state_size.arg(),
-                n_groups.arg(),
-                conv_dim.arg(),
-                intermediate.arg(),
-                0.0f32.arg(),
-            ])
+    ctx.fire(
+        Fire::at("ssm/nemotron_h.cuh", instantiation).apply(launch),
+        &[
+            conv_out.arg(),
+            dt.arg(),
+            a.arg(),
+            d.arg(),
+            dt_bias.arg(),
+            dt_precomputed.arg(),
+            da_precomputed.arg(),
+            ssm_state_base.arg(),
+            slot_ids.arg(),
+            qo_indptr.arg(),
+            y.arg(),
+            num_heads.arg(),
+            head_dim.arg(),
+            state_size.arg(),
+            n_groups.arg(),
+            conv_dim.arg(),
+            intermediate.arg(),
+            0.0f32.arg(),
+        ],
+    )
 }
 
 #[routine(whole)]
@@ -618,9 +783,12 @@ pub fn build_nemotron_moe_ptrs_decode_batched_bf16(
     top_k: Const<i32>,
     hidden: Const<i32>,
     intermediate: Const<i32>,
-    banks: In<Struct<MoeBanks>>) -> Result<(), Refusal> {
+    banks: In<Struct<MoeBanks>>,
+) -> Result<(), Refusal> {
     if banks.ptr.is_null() {
-        return Err(Refusal::Null { what: "the MoE bank view this statement names" });
+        return Err(Refusal::Null {
+            what: "the MoE bank view this statement names",
+        });
     }
     let banks = unsafe { &*banks.ptr };
     // The routed fanout is the top-k table's own width, and the row count is
@@ -642,27 +810,37 @@ pub fn build_nemotron_moe_ptrs_decode_batched_bf16(
     let c_down_ptrs = banks.c_down_ptrs;
     let weights_out = banks.route_weights;
     let routes = n.saturating_mul(top_k);
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::build_nemotron_moe_ptrs_decode_batched").apply(Launch::grid([routes.unsigned_abs().div_ceil(PTRS_BLOCK), 1, 1], [PTRS_BLOCK, 1, 1])), &[
-                topk_idx.arg(),
-                topk_w.arg(),
-                up_weight_ptrs.arg(),
-                down_weight_ptrs.arg(),
-                norm_x.arg(),
-                expert_up.arg(),
-                expert_act.arg(),
-                expert_out.arg(),
-                a_up_ptrs.arg(),
-                b_up_ptrs.arg(),
-                c_up_ptrs.arg(),
-                a_down_ptrs.arg(),
-                b_down_ptrs.arg(),
-                c_down_ptrs.arg(),
-                weights_out.arg(),
-                routes.arg(),
-                top_k.arg(),
-                hidden.arg(),
-                intermediate.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/nemotron_h.cuh",
+            "::pie::ssm::build_nemotron_moe_ptrs_decode_batched",
+        )
+        .apply(Launch::grid(
+            [routes.unsigned_abs().div_ceil(PTRS_BLOCK), 1, 1],
+            [PTRS_BLOCK, 1, 1],
+        )),
+        &[
+            topk_idx.arg(),
+            topk_w.arg(),
+            up_weight_ptrs.arg(),
+            down_weight_ptrs.arg(),
+            norm_x.arg(),
+            expert_up.arg(),
+            expert_act.arg(),
+            expert_out.arg(),
+            a_up_ptrs.arg(),
+            b_up_ptrs.arg(),
+            c_up_ptrs.arg(),
+            a_down_ptrs.arg(),
+            b_down_ptrs.arg(),
+            c_down_ptrs.arg(),
+            weights_out.arg(),
+            routes.arg(),
+            top_k.arg(),
+            hidden.arg(),
+            intermediate.arg(),
+        ],
+    )
 }
 
 #[routine(whole)]
@@ -674,9 +852,12 @@ pub fn build_nemotron_moe_ptrs_aligned_bf16(
     block_size: Const<i32>,
     hidden: Const<i32>,
     intermediate: Const<i32>,
-    banks: In<Struct<MoeBanks>>) -> Result<(), Refusal> {
+    banks: In<Struct<MoeBanks>>,
+) -> Result<(), Refusal> {
     if banks.ptr.is_null() {
-        return Err(Refusal::Null { what: "the MoE bank view this statement names" });
+        return Err(Refusal::Null {
+            what: "the MoE bank view this statement names",
+        });
     }
     let banks = unsafe { &*banks.ptr };
     let max_blocks = *max_blocks;
@@ -694,28 +875,35 @@ pub fn build_nemotron_moe_ptrs_aligned_bf16(
     let a_down_ptrs = banks.a_down_ptrs;
     let b_down_ptrs = banks.b_down_ptrs;
     let c_down_ptrs = banks.c_down_ptrs;
-    ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::build_nemotron_moe_ptrs_aligned").apply(Launch::grid(
-                [max_blocks.unsigned_abs().div_ceil(PTRS_BLOCK), 1, 1],
-                [PTRS_BLOCK, 1, 1],
-            )), &[
-                expert_ids.arg(),
-                up_weight_ptrs.arg(),
-                down_weight_ptrs.arg(),
-                aligned_in.arg(),
-                aligned_up.arg(),
-                aligned_act.arg(),
-                aligned_out.arg(),
-                a_up_ptrs.arg(),
-                b_up_ptrs.arg(),
-                c_up_ptrs.arg(),
-                a_down_ptrs.arg(),
-                b_down_ptrs.arg(),
-                c_down_ptrs.arg(),
-                max_blocks.arg(),
-                block_size.arg(),
-                hidden.arg(),
-                intermediate.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/nemotron_h.cuh",
+            "::pie::ssm::build_nemotron_moe_ptrs_aligned",
+        )
+        .apply(Launch::grid(
+            [max_blocks.unsigned_abs().div_ceil(PTRS_BLOCK), 1, 1],
+            [PTRS_BLOCK, 1, 1],
+        )),
+        &[
+            expert_ids.arg(),
+            up_weight_ptrs.arg(),
+            down_weight_ptrs.arg(),
+            aligned_in.arg(),
+            aligned_up.arg(),
+            aligned_act.arg(),
+            aligned_out.arg(),
+            a_up_ptrs.arg(),
+            b_up_ptrs.arg(),
+            c_up_ptrs.arg(),
+            a_down_ptrs.arg(),
+            b_down_ptrs.arg(),
+            c_down_ptrs.arg(),
+            max_blocks.arg(),
+            block_size.arg(),
+            hidden.arg(),
+            intermediate.arg(),
+        ],
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -746,37 +934,27 @@ fn chunk_prefill(
     fla: &'static str,
     per_token: &'static str,
     ops: &Operands,
-    shape: Shape) -> Result<(), Refusal> {
+    shape: Shape,
+) -> Result<(), Refusal> {
     const BK_MAX_FLA: i32 = 128;
 
     const BV_FLA: u32 = 128;
 
-    let Shape { r, k_h, v_h, k_d, v_d } = shape;
+    let Shape {
+        r,
+        k_h,
+        v_h,
+        k_d,
+        v_d,
+    } = shape;
     let (rows, heads) = (r.unsigned_abs(), v_h.unsigned_abs());
     if k_d <= BK_MAX_FLA && v_d.unsigned_abs() % BV_FLA == 0 {
-
-        return ctx.fire(Fire::at("ssm/gated_delta_net.cuh", fla).apply(Launch::grid([v_d.unsigned_abs() / BV_FLA, rows, heads], [BV_FLA, 1, 1])
-                    .smem(2 * BK_MAX_FLA.unsigned_abs() * FLOAT)), &[
-                    ops.q_norm.arg(),
-                    ops.k_norm.arg(),
-                    ops.v.arg(),
-                    ops.g_log.arg(),
-                    ops.beta.arg(),
-                    ops.state_base.arg(),
-                    ops.slot_ids.arg(),
-                    ops.qo_indptr.arg(),
-                    ops.slot_stride_elems.arg(),
-                    ops.out.arg(),
-                    k_h.arg(),
-                    v_h.arg(),
-                    k_d.arg(),
-                    v_d.arg(),
-                    ops.write_state.arg(),
-                    MaybeConst::<i32>::none().arg(),
-                    MaybeConst::<u8>::none().arg(),
-                ]);
-    }
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", per_token).apply(Launch::grid([rows, heads, 1], [GDN_BLOCK, 1, 1]).smem(2 * k_d.unsigned_abs() * FLOAT)), &[
+        return ctx.fire(
+            Fire::at("ssm/gated_delta_net.cuh", fla).apply(
+                Launch::grid([v_d.unsigned_abs() / BV_FLA, rows, heads], [BV_FLA, 1, 1])
+                    .smem(2 * BK_MAX_FLA.unsigned_abs() * FLOAT),
+            ),
+            &[
                 ops.q_norm.arg(),
                 ops.k_norm.arg(),
                 ops.v.arg(),
@@ -787,36 +965,70 @@ fn chunk_prefill(
                 ops.qo_indptr.arg(),
                 ops.slot_stride_elems.arg(),
                 ops.out.arg(),
+                k_h.arg(),
                 v_h.arg(),
                 k_d.arg(),
                 v_d.arg(),
-            ])
+                ops.write_state.arg(),
+                MaybeConst::<i32>::none().arg(),
+                MaybeConst::<u8>::none().arg(),
+            ],
+        );
+    }
+    ctx.fire(
+        Fire::at("ssm/gated_delta_net.cuh", per_token).apply(
+            Launch::grid([rows, heads, 1], [GDN_BLOCK, 1, 1]).smem(2 * k_d.unsigned_abs() * FLOAT),
+        ),
+        &[
+            ops.q_norm.arg(),
+            ops.k_norm.arg(),
+            ops.v.arg(),
+            ops.g_log.arg(),
+            ops.beta.arg(),
+            ops.state_base.arg(),
+            ops.slot_ids.arg(),
+            ops.qo_indptr.arg(),
+            ops.slot_stride_elems.arg(),
+            ops.out.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+        ],
+    )
 }
 
 fn cached(
     ctx: &Ctx<'_>,
     instantiation: &'static str,
     ops: &Operands,
-    shape: Shape) -> Result<(), Refusal> {
-    let Shape { r, v_h, k_d, v_d, .. } = shape;
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", instantiation).apply(Launch::grid([r.unsigned_abs(), v_h.unsigned_abs(), 1], [GDN_BLOCK, 1, 1])
-                .smem(k_d.unsigned_abs() * v_d.unsigned_abs() * FLOAT)), &[
-                ops.q_norm.arg(),
-                ops.k_norm.arg(),
-                ops.v.arg(),
-                ops.g_log.arg(),
-                ops.beta.arg(),
-                ops.state_base.arg(),
-                ops.slot_ids.arg(),
-                ops.qo_indptr.arg(),
-                ops.slot_stride_elems.arg(),
-                ops.out.arg(),
-                v_h.arg(),
-                k_d.arg(),
-                v_d.arg(),
-                ops.write_state.arg(),
-                MaybeConst::<u8>::none().arg(),
-            ])
+    shape: Shape,
+) -> Result<(), Refusal> {
+    let Shape {
+        r, v_h, k_d, v_d, ..
+    } = shape;
+    ctx.fire(
+        Fire::at("ssm/gated_delta_net.cuh", instantiation).apply(
+            Launch::grid([r.unsigned_abs(), v_h.unsigned_abs(), 1], [GDN_BLOCK, 1, 1])
+                .smem(k_d.unsigned_abs() * v_d.unsigned_abs() * FLOAT),
+        ),
+        &[
+            ops.q_norm.arg(),
+            ops.k_norm.arg(),
+            ops.v.arg(),
+            ops.g_log.arg(),
+            ops.beta.arg(),
+            ops.state_base.arg(),
+            ops.slot_ids.arg(),
+            ops.qo_indptr.arg(),
+            ops.slot_stride_elems.arg(),
+            ops.out.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+            ops.write_state.arg(),
+            MaybeConst::<u8>::none().arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -834,9 +1046,12 @@ pub fn chunk_gated_delta_prefill_batched(
     v_d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
-    write_state: Const<bool>) -> Result<(), Refusal> {
+    write_state: Const<bool>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -857,14 +1072,20 @@ pub fn chunk_gated_delta_prefill_batched(
             v: v.ptr,
             g_log: g_log.ptr,
             beta: beta.ptr,
-            state_base: state_base,
+            state_base,
             slot_ids,
             qo_indptr,
             slot_stride_elems,
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: *k_h, v_h: *v_h, k_d: *k_d, v_d: *v_d },
+        Shape {
+            r,
+            k_h: *k_h,
+            v_h: *v_h,
+            k_d: *k_d,
+            v_d: *v_d,
+        },
     )
 }
 
@@ -883,9 +1104,12 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
     v_d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
-    write_state: Const<bool>) -> Result<(), Refusal> {
+    write_state: Const<bool>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -906,14 +1130,20 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
             v: v.ptr,
             g_log: g_log.ptr,
             beta: beta.ptr,
-            state_base: state_base,
+            state_base,
             slot_ids,
             qo_indptr,
             slot_stride_elems,
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: *k_h, v_h: *v_h, k_d: *k_d, v_d: *v_d },
+        Shape {
+            r,
+            k_h: *k_h,
+            v_h: *v_h,
+            k_d: *k_d,
+            v_d: *v_d,
+        },
     )
 }
 
@@ -931,9 +1161,12 @@ pub fn chunk_gated_delta_prefill_batched_cached(
     v_d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
-    write_state: Const<bool>) -> Result<(), Refusal> {
+    write_state: Const<bool>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -953,14 +1186,20 @@ pub fn chunk_gated_delta_prefill_batched_cached(
             v: v.ptr,
             g_log: g_log.ptr,
             beta: beta.ptr,
-            state_base: state_base,
+            state_base,
             slot_ids,
             qo_indptr,
             slot_stride_elems,
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: 0, v_h: *v_h, k_d: *k_d, v_d: *v_d },
+        Shape {
+            r,
+            k_h: 0,
+            v_h: *v_h,
+            k_d: *k_d,
+            v_d: *v_d,
+        },
     )
 }
 
@@ -978,9 +1217,12 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     v_d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
-    write_state: Const<bool>) -> Result<(), Refusal> {
+    write_state: Const<bool>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1000,14 +1242,20 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
             v: v.ptr,
             g_log: g_log.ptr,
             beta: beta.ptr,
-            state_base: state_base,
+            state_base,
             slot_ids,
             qo_indptr,
             slot_stride_elems,
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: 0, v_h: *v_h, k_d: *k_d, v_d: *v_d },
+        Shape {
+            r,
+            k_h: 0,
+            v_h: *v_h,
+            k_d: *k_d,
+            v_d: *v_d,
+        },
     )
 }
 
@@ -1025,9 +1273,12 @@ pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
     k_d: Const<i32>,
     v_d: Const<i32>,
     r: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal> {
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1040,14 +1291,21 @@ pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
     const GDN_SMEM_ARM_WIDTH: i32 = 128;
 
     if *v_h % *k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
+        return Err(Refusal::Narrow {
+            what: "v_h per k_h",
+            at: i64::from(*v_h),
+        });
     }
 
     let (instantiation, launch) = if *v_d == GDN_SMEM_ARM_WIDTH && *k_d == GDN_SMEM_ARM_WIDTH {
         (
             "::pie::ssm::recurrent_step_batched_gqa_smem<::pie::ssm::gqa_smem_bv>",
             Launch::grid(
-                [v_d.unsigned_abs().div_ceil(SMEM_BV), r.unsigned_abs(), v_h.unsigned_abs()],
+                [
+                    v_d.unsigned_abs().div_ceil(SMEM_BV),
+                    r.unsigned_abs(),
+                    v_h.unsigned_abs(),
+                ],
                 [SMEM_BV, 1, 1],
             )
             .smem(k_d.unsigned_abs() * SMEM_BV * 2 + 2 * k_d.unsigned_abs() * FLOAT),
@@ -1059,21 +1317,24 @@ pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
                 .smem(2 * k_d.unsigned_abs() * FLOAT),
         )
     };
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", instantiation).apply(launch), &[
-                q_norm_kh.arg(),
-                k_norm_kh.arg(),
-                v.arg(),
-                g_log.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                k_h.arg(),
-                v_h.arg(),
-                k_d.arg(),
-                v_d.arg(),
-            ])
+    ctx.fire(
+        Fire::at("ssm/gated_delta_net.cuh", instantiation).apply(launch),
+        &[
+            q_norm_kh.arg(),
+            k_norm_kh.arg(),
+            v.arg(),
+            g_log.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            k_h.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -1089,9 +1350,12 @@ pub fn recurrent_gated_delta_step_batched(
     k_d: Const<i32>,
     v_d: Const<i32>,
     r: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal> {
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1099,20 +1363,31 @@ pub fn recurrent_gated_delta_step_batched(
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::recurrent_step_batched<::pie::ssm::f32, false>").apply(recurrent_scan(r.unsigned_abs(), v_h.unsigned_abs(), k_d.unsigned_abs())), &[
-                q_norm.arg(),
-                k_norm.arg(),
-                v.arg(),
-                g_log.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                v_h.arg(),
-                k_d.arg(),
-                v_d.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net.cuh",
+            "::pie::ssm::recurrent_step_batched<::pie::ssm::f32, false>",
+        )
+        .apply(recurrent_scan(
+            r.unsigned_abs(),
+            v_h.unsigned_abs(),
+            k_d.unsigned_abs(),
+        )),
+        &[
+            q_norm.arg(),
+            k_norm.arg(),
+            v.arg(),
+            g_log.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -1128,9 +1403,12 @@ pub fn recurrent_gated_delta_step_batched_state_bf16(
     k_d: Const<i32>,
     v_d: Const<i32>,
     r: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal> {
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1138,20 +1416,31 @@ pub fn recurrent_gated_delta_step_batched_state_bf16(
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::recurrent_step_batched<::pie::ssm::state_bf16, false>").apply(recurrent_scan(r.unsigned_abs(), v_h.unsigned_abs(), k_d.unsigned_abs())), &[
-                q_norm.arg(),
-                k_norm.arg(),
-                v.arg(),
-                g_log.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                v_h.arg(),
-                k_d.arg(),
-                v_d.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net.cuh",
+            "::pie::ssm::recurrent_step_batched<::pie::ssm::state_bf16, false>",
+        )
+        .apply(recurrent_scan(
+            r.unsigned_abs(),
+            v_h.unsigned_abs(),
+            k_d.unsigned_abs(),
+        )),
+        &[
+            q_norm.arg(),
+            k_norm.arg(),
+            v.arg(),
+            g_log.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -1168,9 +1457,12 @@ pub fn recurrent_gated_delta_step_batched_gqa(
     k_d: Const<i32>,
     v_d: Const<i32>,
     r: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal> {
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1179,23 +1471,37 @@ pub fn recurrent_gated_delta_step_batched_gqa(
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
     if *v_h % *k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
+        return Err(Refusal::Narrow {
+            what: "v_h per k_h",
+            at: i64::from(*v_h),
+        });
     }
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::recurrent_step_batched_gqa<::pie::ssm::f32, false>").apply(recurrent_scan(r.unsigned_abs(), v_h.unsigned_abs(), k_d.unsigned_abs())), &[
-                q_norm_kh.arg(),
-                k_norm_kh.arg(),
-                v.arg(),
-                g_log.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                k_h.arg(),
-                v_h.arg(),
-                k_d.arg(),
-                v_d.arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net.cuh",
+            "::pie::ssm::recurrent_step_batched_gqa<::pie::ssm::f32, false>",
+        )
+        .apply(recurrent_scan(
+            r.unsigned_abs(),
+            v_h.unsigned_abs(),
+            k_d.unsigned_abs(),
+        )),
+        &[
+            q_norm_kh.arg(),
+            k_norm_kh.arg(),
+            v.arg(),
+            g_log.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            k_h.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -1213,9 +1519,12 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     v_d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
-    write_state: Const<bool>) -> Result<(), Refusal> {
+    write_state: Const<bool>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1227,26 +1536,40 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     let slot_stride_elems = rsv.slot_stride_elems;
     let write_state = *write_state;
     if *v_h % *k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
+        return Err(Refusal::Narrow {
+            what: "v_h per k_h",
+            at: i64::from(*v_h),
+        });
     }
-    ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa<::pie::ssm::f32, false>").apply(warp_tiled_scan(r.unsigned_abs(), v_h.unsigned_abs(), v_d.unsigned_abs())), &[
-                q_norm_kh.arg(),
-                k_norm_kh.arg(),
-                v.arg(),
-                g_log.arg(),
-                beta.arg(),
-                state_base.arg(),
-                slot_ids.arg(),
-                qo_indptr.arg(),
-                slot_stride_elems.arg(),
-                out.arg(),
-                k_h.arg(),
-                v_h.arg(),
-                k_d.arg(),
-                v_d.arg(),
-                write_state.arg(),
-                core::ptr::null::<u8>().arg(),
-            ])
+    ctx.fire(
+        Fire::at(
+            "ssm/gated_delta_net.cuh",
+            "::pie::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa<::pie::ssm::f32, false>",
+        )
+        .apply(warp_tiled_scan(
+            r.unsigned_abs(),
+            v_h.unsigned_abs(),
+            v_d.unsigned_abs(),
+        )),
+        &[
+            q_norm_kh.arg(),
+            k_norm_kh.arg(),
+            v.arg(),
+            g_log.arg(),
+            beta.arg(),
+            state_base.arg(),
+            slot_ids.arg(),
+            qo_indptr.arg(),
+            slot_stride_elems.arg(),
+            out.arg(),
+            k_h.arg(),
+            v_h.arg(),
+            k_d.arg(),
+            v_d.arg(),
+            write_state.arg(),
+            core::ptr::null::<u8>().arg(),
+        ],
+    )
 }
 
 #[routine]
@@ -1264,9 +1587,12 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     v_d: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
-    write_state: Const<bool>) -> Result<(), Refusal> {
+    write_state: Const<bool>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
 
@@ -1278,7 +1604,10 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     let slot_stride_elems = rsv.slot_stride_elems;
     let write_state = *write_state;
     if *v_h % *k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
+        return Err(Refusal::Narrow {
+            what: "v_h per k_h",
+            at: i64::from(*v_h),
+        });
     }
     ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa<::pie::ssm::state_bf16, false>").apply(warp_tiled_scan(r.unsigned_abs(), v_h.unsigned_abs(), v_d.unsigned_abs())), &[
                 q_norm_kh.arg(),
@@ -1306,10 +1635,13 @@ pub fn verify_stash_store(
     _mixed_qkv: In<Tensor<bf16>>,
     _a: In<Tensor<bf16>>,
     _b: In<Tensor<bf16>>,
-    _tokens: i32) -> Result<(), Refusal> {
-    Err(Refusal::Absent { what: "the verify-stash slab: `RecurrentStateLayout` allocates \
+    _tokens: i32,
+) -> Result<(), Refusal> {
+    Err(Refusal::Absent {
+        what: "the verify-stash slab: `RecurrentStateLayout` allocates \
                                  conv state, recurrent state and the MTP pending hidden, \
-                                 and none of the three is this pool" })
+                                 and none of the three is this pool",
+    })
 }
 
 #[routine(untraced)]
@@ -1318,20 +1650,21 @@ pub fn verify_stash_load(
     _mixed_qkv: Out<Tensor<bf16>>,
     _a: Out<Tensor<bf16>>,
     _b: Out<Tensor<bf16>>,
-    _tokens: i32) -> Result<(), Refusal> {
-    Err(Refusal::Absent { what: "the verify-stash slab; see `verify_stash_store`" })
+    _tokens: i32,
+) -> Result<(), Refusal> {
+    Err(Refusal::Absent {
+        what: "the verify-stash slab; see `verify_stash_store`",
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slab {
-
     Conv,
     Recurrent,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Gdn {
-
     pub k_h: i32,
     pub v_h: i32,
     pub k_d: i32,

@@ -127,7 +127,11 @@ struct PlanStaging<E> {
 
 impl<E> Default for PlanStaging<E> {
     fn default() -> Self {
-        Self { host: std::ptr::null_mut(), upload_done: None, upload_pending: false }
+        Self {
+            host: std::ptr::null_mut(),
+            upload_done: None,
+            upload_pending: false,
+        }
     }
 }
 
@@ -157,7 +161,11 @@ impl<E> AttentionWorkspace<E> {
         int_workspace_bytes: usize,
         plan_staging_slots: usize,
     ) -> Result<Self, StagingError> {
-        let slots = if plan_staging_slots == 0 { 1 } else { plan_staging_slots };
+        let slots = if plan_staging_slots == 0 {
+            1
+        } else {
+            plan_staging_slots
+        };
         let mut ws = Self {
             float_buf: std::ptr::null_mut(),
             float_bytes: 0,
@@ -261,8 +269,10 @@ impl<E> AttentionWorkspace<E> {
         let staging = &mut self.plan_staging[self.active_plan_slot];
         ensure_plan_slot(ops, self.staging_bytes, staging)?;
         if staging.upload_pending {
-            let ev =
-                staging.upload_done.as_ref().expect("a pending upload always has its fence event");
+            let ev = staging
+                .upload_done
+                .as_ref()
+                .expect("a pending upload always has its fence event");
             if !ops.event_synchronize(ev) {
                 return Err(StagingError::FenceFailed);
             }
@@ -340,7 +350,9 @@ fn ensure_plan_slot<O: StagingOps>(
     slot: &mut PlanStaging<O::Event>,
 ) -> Result<(), StagingError> {
     if slot.host.is_null() && staging_bytes > 0 {
-        slot.host = ops.malloc_host(staging_bytes).ok_or(StagingError::PinFailed)?;
+        slot.host = ops
+            .malloc_host(staging_bytes)
+            .ok_or(StagingError::PinFailed)?;
     }
     if slot.upload_done.is_none() {
         slot.upload_done = Some(ops.event_create().ok_or(StagingError::EventCreateFailed)?);

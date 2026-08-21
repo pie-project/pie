@@ -29,7 +29,10 @@ kernel void advance(device ulong* words [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no ring entry was written");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -37,7 +40,7 @@ fn context() -> Option<Context> {
 #[test]
 fn a_new_ring_is_empty_zeroed_and_addressable_by_both_sides() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let ring = Ring::new(&context, DType::U32, 4, 2).expect("ring");
@@ -67,7 +70,7 @@ fn a_new_ring_is_empty_zeroed_and_addressable_by_both_sides() {
 #[test]
 fn cells_tile_the_ring_modulo_the_physical_slot_count() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // capacity 2 -> cap1 = 3 physical slots.
@@ -96,7 +99,7 @@ fn cells_tile_the_ring_modulo_the_physical_slot_count() {
 #[test]
 fn a_kernel_advancing_the_words_is_observed_by_the_host() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -134,7 +137,7 @@ fn a_kernel_advancing_the_words_is_observed_by_the_host() {
 #[test]
 fn a_snapshot_feeds_the_same_check_the_interpreter_uses() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let ring = Ring::new(&context, DType::I32, 1, 1).expect("ring");
@@ -158,7 +161,7 @@ fn a_snapshot_feeds_the_same_check_the_interpreter_uses() {
 #[test]
 fn dropping_the_ring_releases_its_buffers_rather_than_leaking_them() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // Inside an autorelease pool, so a buffer parked in the pool by its own

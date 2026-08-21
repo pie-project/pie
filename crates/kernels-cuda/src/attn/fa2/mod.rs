@@ -1,4 +1,3 @@
-
 pub mod geometry;
 
 pub mod params;
@@ -7,24 +6,24 @@ pub mod dispatch;
 
 pub mod plan;
 
-use kernels_macros::routine;
 use core::ffi::c_void;
 use core::mem::size_of;
+use kernels_macros::routine;
 
+use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
 use crate::attn::fa2::params::{
     Buffers, DecodeParams, DecodePlan, DecodeScoreParams, DevicePtr, Partials, PrefillPagedParams,
     PrefillPlan, PrefillScoreParams, make_decode_params, make_prefill_params,
 };
-use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
-use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
-use crate::jit::abi::{bf16, unpack_aggregate};
 use crate::jit::abi::Tensor;
-use kernels::raises::Struct;
+use crate::jit::abi::{bf16, unpack_aggregate};
+use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
 use crate::raises::{Fa2Decode, Fa2Prefill};
-use crate::views::{AttnMask, KvCache, KvPageIndptrHost, QoIndptrHost, AttnScore};
+use crate::routine::Fire;
+use crate::views::{AttnMask, AttnScore, KvCache, KvPageIndptrHost, QoIndptrHost};
+use kernels::raises::Struct;
 use kernels::routine::{Arg, Const, In, Out};
 use kernels::{Refusal, Ty};
-use crate::routine::Fire;
 
 fn dequant_prelude(
     ctx: &Ctx<'_>,
@@ -34,7 +33,11 @@ fn dequant_prelude(
 ) {
     let _ = crate::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
         ctx,
-        In { ptr: kvc, rows: 0, width: 0 },
+        In {
+            ptr: kvc,
+            rows: 0,
+            width: 0,
+        },
         Const { v: num_kv_heads },
         Const { v: head_dim },
     );
@@ -56,7 +59,6 @@ pub const DECODE_GQA: &[u32] = &[1, 2, 3, 4, 8];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeArm {
-
     Full = 0,
     Softcap = 1,
     Window = 2,
@@ -66,7 +68,6 @@ pub enum DecodeArm {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillArm {
-
     CausalFullSoftcap = 0,
     NoneFullSoftcap = 1,
     CausalFull = 2,
@@ -81,7 +82,6 @@ pub enum PrefillArm {
 
 #[derive(Debug)]
 pub struct DecodeRoot {
-
     pub head_dim: u32,
     pub group_size: u32,
     pub root: Root,
@@ -90,7 +90,6 @@ pub struct DecodeRoot {
 
 #[derive(Debug)]
 pub struct PrefillRoot {
-
     pub head_dim: u32,
     pub cta_tile_q: u32,
     pub num_mma_kv: u32,
@@ -127,7 +126,16 @@ macro_rules! decode_root {
                 "attn/fa2.cuh",
             ),
             arms: [
-                decode_inst!($ns, $tile, $vec, $bdx, $bdy, $bdz, "VariantFull", "DecodeParams"),
+                decode_inst!(
+                    $ns,
+                    $tile,
+                    $vec,
+                    $bdx,
+                    $bdy,
+                    $bdz,
+                    "VariantFull",
+                    "DecodeParams"
+                ),
                 decode_inst!(
                     $ns,
                     $tile,
@@ -138,7 +146,16 @@ macro_rules! decode_root {
                     "VariantWindowSoftcap",
                     "DecodeParams"
                 ),
-                decode_inst!($ns, $tile, $vec, $bdx, $bdy, $bdz, "VariantWindow", "DecodeParams"),
+                decode_inst!(
+                    $ns,
+                    $tile,
+                    $vec,
+                    $bdx,
+                    $bdy,
+                    $bdz,
+                    "VariantWindow",
+                    "DecodeParams"
+                ),
                 decode_inst!(
                     $ns,
                     $tile,
@@ -346,26 +363,206 @@ macro_rules! prefill_root {
 }
 
 pub static DECODE: [DecodeRoot; 20] = [
-    decode_root!(hd = 64, gqa = 1, stages = 2, tile = 4, vec = 8, bdx = 8, bdy = 1, bdz = 16),
-    decode_root!(hd = 64, gqa = 2, stages = 2, tile = 1, vec = 8, bdx = 8, bdy = 2, bdz = 8),
-    decode_root!(hd = 64, gqa = 3, stages = 2, tile = 1, vec = 8, bdx = 8, bdy = 3, bdz = 5),
-    decode_root!(hd = 64, gqa = 4, stages = 2, tile = 1, vec = 8, bdx = 8, bdy = 4, bdz = 4),
-    decode_root!(hd = 64, gqa = 8, stages = 2, tile = 1, vec = 8, bdx = 8, bdy = 8, bdz = 2),
-    decode_root!(hd = 128, gqa = 1, stages = 2, tile = 4, vec = 8, bdx = 16, bdy = 1, bdz = 8),
-    decode_root!(hd = 128, gqa = 2, stages = 2, tile = 1, vec = 8, bdx = 16, bdy = 2, bdz = 4),
-    decode_root!(hd = 128, gqa = 3, stages = 2, tile = 1, vec = 8, bdx = 16, bdy = 3, bdz = 2),
-    decode_root!(hd = 128, gqa = 4, stages = 2, tile = 1, vec = 8, bdx = 16, bdy = 4, bdz = 2),
-    decode_root!(hd = 128, gqa = 8, stages = 2, tile = 1, vec = 8, bdx = 16, bdy = 8, bdz = 1),
-    decode_root!(hd = 256, gqa = 1, stages = 2, tile = 4, vec = 8, bdx = 32, bdy = 1, bdz = 4),
-    decode_root!(hd = 256, gqa = 2, stages = 2, tile = 1, vec = 8, bdx = 32, bdy = 2, bdz = 2),
-    decode_root!(hd = 256, gqa = 3, stages = 2, tile = 1, vec = 8, bdx = 32, bdy = 3, bdz = 1),
-    decode_root!(hd = 256, gqa = 4, stages = 2, tile = 1, vec = 8, bdx = 32, bdy = 4, bdz = 1),
-    decode_root!(hd = 256, gqa = 8, stages = 2, tile = 1, vec = 8, bdx = 32, bdy = 8, bdz = 1),
-    decode_root!(hd = 512, gqa = 1, stages = 2, tile = 4, vec = 16, bdx = 32, bdy = 1, bdz = 4),
-    decode_root!(hd = 512, gqa = 2, stages = 2, tile = 1, vec = 16, bdx = 32, bdy = 2, bdz = 2),
-    decode_root!(hd = 512, gqa = 3, stages = 2, tile = 1, vec = 16, bdx = 32, bdy = 3, bdz = 1),
-    decode_root!(hd = 512, gqa = 4, stages = 2, tile = 1, vec = 16, bdx = 32, bdy = 4, bdz = 1),
-    decode_root!(hd = 512, gqa = 8, stages = 2, tile = 1, vec = 16, bdx = 32, bdy = 8, bdz = 1),
+    decode_root!(
+        hd = 64,
+        gqa = 1,
+        stages = 2,
+        tile = 4,
+        vec = 8,
+        bdx = 8,
+        bdy = 1,
+        bdz = 16
+    ),
+    decode_root!(
+        hd = 64,
+        gqa = 2,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 8,
+        bdy = 2,
+        bdz = 8
+    ),
+    decode_root!(
+        hd = 64,
+        gqa = 3,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 8,
+        bdy = 3,
+        bdz = 5
+    ),
+    decode_root!(
+        hd = 64,
+        gqa = 4,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 8,
+        bdy = 4,
+        bdz = 4
+    ),
+    decode_root!(
+        hd = 64,
+        gqa = 8,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 8,
+        bdy = 8,
+        bdz = 2
+    ),
+    decode_root!(
+        hd = 128,
+        gqa = 1,
+        stages = 2,
+        tile = 4,
+        vec = 8,
+        bdx = 16,
+        bdy = 1,
+        bdz = 8
+    ),
+    decode_root!(
+        hd = 128,
+        gqa = 2,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 16,
+        bdy = 2,
+        bdz = 4
+    ),
+    decode_root!(
+        hd = 128,
+        gqa = 3,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 16,
+        bdy = 3,
+        bdz = 2
+    ),
+    decode_root!(
+        hd = 128,
+        gqa = 4,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 16,
+        bdy = 4,
+        bdz = 2
+    ),
+    decode_root!(
+        hd = 128,
+        gqa = 8,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 16,
+        bdy = 8,
+        bdz = 1
+    ),
+    decode_root!(
+        hd = 256,
+        gqa = 1,
+        stages = 2,
+        tile = 4,
+        vec = 8,
+        bdx = 32,
+        bdy = 1,
+        bdz = 4
+    ),
+    decode_root!(
+        hd = 256,
+        gqa = 2,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 32,
+        bdy = 2,
+        bdz = 2
+    ),
+    decode_root!(
+        hd = 256,
+        gqa = 3,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 32,
+        bdy = 3,
+        bdz = 1
+    ),
+    decode_root!(
+        hd = 256,
+        gqa = 4,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 32,
+        bdy = 4,
+        bdz = 1
+    ),
+    decode_root!(
+        hd = 256,
+        gqa = 8,
+        stages = 2,
+        tile = 1,
+        vec = 8,
+        bdx = 32,
+        bdy = 8,
+        bdz = 1
+    ),
+    decode_root!(
+        hd = 512,
+        gqa = 1,
+        stages = 2,
+        tile = 4,
+        vec = 16,
+        bdx = 32,
+        bdy = 1,
+        bdz = 4
+    ),
+    decode_root!(
+        hd = 512,
+        gqa = 2,
+        stages = 2,
+        tile = 1,
+        vec = 16,
+        bdx = 32,
+        bdy = 2,
+        bdz = 2
+    ),
+    decode_root!(
+        hd = 512,
+        gqa = 3,
+        stages = 2,
+        tile = 1,
+        vec = 16,
+        bdx = 32,
+        bdy = 3,
+        bdz = 1
+    ),
+    decode_root!(
+        hd = 512,
+        gqa = 4,
+        stages = 2,
+        tile = 1,
+        vec = 16,
+        bdx = 32,
+        bdy = 4,
+        bdz = 1
+    ),
+    decode_root!(
+        hd = 512,
+        gqa = 8,
+        stages = 2,
+        tile = 1,
+        vec = 16,
+        bdx = 32,
+        bdy = 8,
+        bdz = 1
+    ),
 ];
 
 pub static PREFILL: [PrefillRoot; 36] = [
@@ -733,7 +930,9 @@ pub static PREFILL: [PrefillRoot; 36] = [
 
 #[must_use]
 pub fn decode_root(head_dim: u32, group_size: u32) -> Option<&'static DecodeRoot> {
-    DECODE.iter().find(|p| p.head_dim == head_dim && p.group_size == group_size)
+    DECODE
+        .iter()
+        .find(|p| p.head_dim == head_dim && p.group_size == group_size)
 }
 
 #[must_use]
@@ -768,7 +967,6 @@ pub fn prefill_instantiation(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePoint {
-
     pub head_dim: u32,
     pub group_size: u32,
     pub arm: DecodeArm,
@@ -779,7 +977,6 @@ pub struct DecodePoint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillPoint {
-
     pub head_dim: u32,
     pub cta_tile_q: u32,
     pub arm: PrefillArm,
@@ -797,7 +994,10 @@ impl PrefillBlock for PrefillPagedParams {}
 impl PrefillBlock for PrefillScoreParams {}
 
 fn block<P>(params: &P) -> ArgValue {
-    ArgValue::Bytes { ptr: core::ptr::from_ref(params).cast::<u8>(), len: size_of::<P>() }
+    ArgValue::Bytes {
+        ptr: core::ptr::from_ref(params).cast::<u8>(),
+        len: size_of::<P>(),
+    }
 }
 
 fn no_point(what: &'static str, why: &dyn core::fmt::Display) -> Refusal {
@@ -832,7 +1032,11 @@ pub fn decode<P: DecodeBlock>(ctx: &Ctx<'_>, at: DecodePoint, params: &P) -> Res
     )
 }
 
-pub fn prefill<P: PrefillBlock>(ctx: &Ctx<'_>, at: PrefillPoint, params: &P) -> Result<(), Refusal> {
+pub fn prefill<P: PrefillBlock>(
+    ctx: &Ctx<'_>,
+    at: PrefillPoint,
+    params: &P,
+) -> Result<(), Refusal> {
     let geometry =
         PrefillGeometry::derive(at.head_dim, at.cta_tile_q, KvWidth::BF16, false, at.device)
             .map_err(|why| no_point("the FA2 prefill geometry", &why))?;
@@ -884,7 +1088,11 @@ pub fn decode_capture_arm(
     if logits_soft_cap > 0.0 || window_left >= 0 {
         return None;
     }
-    Some(if full_attention_variant { DecodeArm::CaptureFull } else { DecodeArm::CaptureWindow })
+    Some(if full_attention_variant {
+        DecodeArm::CaptureFull
+    } else {
+        DecodeArm::CaptureWindow
+    })
 }
 
 #[must_use]
@@ -897,7 +1105,11 @@ pub fn prefill_arm(full_attention_variant: bool, causal: bool, logits_soft_cap: 
             (false, false) => PrefillArm::NoneFull,
         };
     }
-    if logits_soft_cap > 0.0 { PrefillArm::CausalSoftcap } else { PrefillArm::CausalWindow }
+    if logits_soft_cap > 0.0 {
+        PrefillArm::CausalSoftcap
+    } else {
+        PrefillArm::CausalWindow
+    }
 }
 
 #[must_use]
@@ -909,12 +1121,20 @@ pub fn prefill_capture_arm(
     if logits_soft_cap > 0.0 || window_left >= 0 {
         return None;
     }
-    Some(if causal { PrefillArm::CausalCapture } else { PrefillArm::NoneCapture })
+    Some(if causal {
+        PrefillArm::CausalCapture
+    } else {
+        PrefillArm::NoneCapture
+    })
 }
 
 #[must_use]
 pub fn prefill_custom_arm(logits_soft_cap: f32) -> PrefillArm {
-    if logits_soft_cap > 0.0 { PrefillArm::CustomSoftcap } else { PrefillArm::Custom }
+    if logits_soft_cap > 0.0 {
+        PrefillArm::CustomSoftcap
+    } else {
+        PrefillArm::Custom
+    }
 }
 
 impl Arg<Cuda> for DecodePlan {
@@ -981,10 +1201,13 @@ fn buffers(
     }
 }
 
-const CAPTURE_VARIANT: Refusal =
-    Refusal::Unstated { what: "a score capture without a soft cap or a window" };
+const CAPTURE_VARIANT: Refusal = Refusal::Unstated {
+    what: "a score capture without a soft cap or a window",
+};
 
-const CAPTURE_SINK: Refusal = Refusal::Absent { what: "the score sink" };
+const CAPTURE_SINK: Refusal = Refusal::Absent {
+    what: "the score sink",
+};
 
 #[routine(depth_prefix_plan, no_join)]
 pub fn dispatch_attention_flashinfer_decode(
@@ -996,9 +1219,12 @@ pub fn dispatch_attention_flashinfer_decode(
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>,
     kvc: In<Struct<KvCache>>,
-    lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc_ptr = kvc.ptr;
     let kvc = unsafe { &*kvc_ptr };
@@ -1016,7 +1242,9 @@ pub fn dispatch_attention_flashinfer_decode(
     let kv_page_indptr = kvc.page_indptr as *const u32;
 
     if plan.ptr.is_null() {
-        return Err(Refusal::Null { what: "the decode plan this statement names" });
+        return Err(Refusal::Null {
+            what: "the decode plan this statement names",
+        });
     }
 
     let cache = unsafe { &*plan.ptr };
@@ -1045,10 +1273,24 @@ pub fn dispatch_attention_flashinfer_decode(
         cache.float_workspace,
     );
     let arm = decode_arm(planned.full_attention_variant, window_left, logits_soft_cap);
-    let (params, split) =
-        make_decode_params(&planned, &bufs, window_left, logits_soft_cap, sm_scale, broadcast_q);
-    decode(ctx, decode_at(&planned, arm, params.padded_batch_size), &params)?;
-    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    let (params, split) = make_decode_params(
+        &planned,
+        &bufs,
+        window_left,
+        logits_soft_cap,
+        sm_scale,
+        broadcast_q,
+    );
+    decode(
+        ctx,
+        decode_at(&planned, arm, params.padded_batch_size),
+        &params,
+    )?;
+    if planned.info.split_kv {
+        fold(ctx, &split)
+    } else {
+        Ok(())
+    }
 }
 
 #[routine(depth_prefix_plan, no_join)]
@@ -1061,7 +1303,8 @@ pub fn dispatch_attention_flashinfer_decode_lse(
     _window_left: Const<i32>,
     _logits_soft_cap: Const<f32>,
     _sm_scale: Const<f32>,
-    kvc: In<Struct<KvCache>>) -> Result<(), Refusal> {
+    kvc: In<Struct<KvCache>>,
+) -> Result<(), Refusal> {
     dispatch_attention_flashinfer_decode(
         ctx,
         q,
@@ -1087,16 +1330,21 @@ pub fn dispatch_attention_flashinfer_decode_capture(
     kvc: In<Struct<KvCache>>,
     score_out: Out<Tensor<f32>>,
     score: In<Struct<AttnScore>>,
-    lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc_ptr = kvc.ptr;
     let kvc = unsafe { &*kvc_ptr };
 
     let score_out = score_out.ptr;
     if score.ptr.is_null() {
-        return Err(Refusal::Null { what: "the score view this statement names" });
+        return Err(Refusal::Null {
+            what: "the score view this statement names",
+        });
     }
     let score_indptr = unsafe { (*score.ptr).indptr };
 
@@ -1109,7 +1357,9 @@ pub fn dispatch_attention_flashinfer_decode_capture(
     let broadcast_q = false;
 
     if plan.ptr.is_null() {
-        return Err(Refusal::Null { what: "the decode plan this statement names" });
+        return Err(Refusal::Null {
+            what: "the decode plan this statement names",
+        });
     }
 
     let cache = unsafe { &*plan.ptr };
@@ -1128,8 +1378,11 @@ pub fn dispatch_attention_flashinfer_decode_capture(
     if score_out.is_null() || score_indptr.is_null() {
         return Err(CAPTURE_SINK);
     }
-    let Some(arm) = decode_capture_arm(planned.full_attention_variant, *window_left, *logits_soft_cap)
-    else {
+    let Some(arm) = decode_capture_arm(
+        planned.full_attention_variant,
+        *window_left,
+        *logits_soft_cap,
+    ) else {
         return Err(CAPTURE_VARIANT);
     };
     let bufs = buffers(
@@ -1145,14 +1398,23 @@ pub fn dispatch_attention_flashinfer_decode_capture(
         int_base,
         cache.float_workspace,
     );
-    let (base, split) = make_decode_params(&planned, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
+    let (base, split) =
+        make_decode_params(&planned, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
     let params = DecodeScoreParams {
         base,
         score_out: addr(score_out),
         score_indptr: addr(score_indptr),
     };
-    decode(ctx, decode_at(&planned, arm, params.base.padded_batch_size), &params)?;
-    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    decode(
+        ctx,
+        decode_at(&planned, arm, params.base.padded_batch_size),
+        &params,
+    )?;
+    if planned.info.split_kv {
+        fold(ctx, &split)
+    } else {
+        Ok(())
+    }
 }
 
 fn prefill_paged(
@@ -1160,12 +1422,25 @@ fn prefill_paged(
     bufs: &Buffers,
     plan: &PrefillPlan,
     logits_soft_cap: f32,
-    sm_scale: f32) -> Result<(), Refusal> {
+    sm_scale: f32,
+) -> Result<(), Refusal> {
     prefill_plan_usable(plan)?;
-    let arm = prefill_arm(plan.full_attention_variant, plan.causal_mask, logits_soft_cap);
+    let arm = prefill_arm(
+        plan.full_attention_variant,
+        plan.causal_mask,
+        logits_soft_cap,
+    );
     let (params, split) = make_prefill_params(plan, bufs, logits_soft_cap, sm_scale);
-    prefill(ctx, prefill_at(plan, arm, params.padded_batch_size), &params)?;
-    if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    prefill(
+        ctx,
+        prefill_at(plan, arm, params.padded_batch_size),
+        &params,
+    )?;
+    if plan.info.split_kv {
+        fold(ctx, &split)
+    } else {
+        Ok(())
+    }
 }
 
 #[routine(no_join)]
@@ -1178,9 +1453,12 @@ pub fn dispatch_attention_flashinfer_prefill_bf16(
     sm_scale: Const<f32>,
     qo_indptr: In<Tensor<i32>>,
     kvc: In<Struct<KvCache>>,
-    lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
 
@@ -1196,7 +1474,9 @@ pub fn dispatch_attention_flashinfer_prefill_bf16(
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
 
     if plan.ptr.is_null() {
-        return Err(Refusal::Null { what: "the prefill plan this statement names" });
+        return Err(Refusal::Null {
+            what: "the prefill plan this statement names",
+        });
     }
 
     let cache = unsafe { &*plan.ptr };
@@ -1242,15 +1522,20 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     qo_indptr: In<Tensor<i32>>,
     score_out: Out<Tensor<f32>>,
     score: In<Struct<AttnScore>>,
-    lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
 
     let score_out = score_out.ptr;
     if score.ptr.is_null() {
-        return Err(Refusal::Null { what: "the score view this statement names" });
+        return Err(Refusal::Null {
+            what: "the score view this statement names",
+        });
     }
     let score_indptr = unsafe { (*score.ptr).indptr };
     let score_window = unsafe { (*score.ptr).window };
@@ -1264,7 +1549,9 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
 
     if plan.ptr.is_null() {
-        return Err(Refusal::Null { what: "the prefill plan this statement names" });
+        return Err(Refusal::Null {
+            what: "the prefill plan this statement names",
+        });
     }
 
     let cache = unsafe { &*plan.ptr };
@@ -1284,7 +1571,8 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     if score_out.is_null() || score_indptr.is_null() || score_window == 0 {
         return Err(CAPTURE_SINK);
     }
-    let Some(arm) = prefill_capture_arm(planned.causal_mask, planned.window_left, *logits_soft_cap) else {
+    let Some(arm) = prefill_capture_arm(planned.causal_mask, planned.window_left, *logits_soft_cap)
+    else {
         return Err(CAPTURE_VARIANT);
     };
     prefill_plan_usable(&planned)?;
@@ -1306,10 +1594,18 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
         base,
         score_out: addr(score_out),
         score_indptr: addr(score_indptr),
-        score_window: score_window,
+        score_window,
     };
-    prefill(ctx, prefill_at(&planned, arm, params.base.padded_batch_size), &params)?;
-    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    prefill(
+        ctx,
+        prefill_at(&planned, arm, params.base.padded_batch_size),
+        &params,
+    )?;
+    if planned.info.split_kv {
+        fold(ctx, &split)
+    } else {
+        Ok(())
+    }
 }
 
 #[routine(no_join)]
@@ -1323,13 +1619,18 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
     maskv: In<Struct<AttnMask>>,
     kvc: In<Struct<KvCache>>,
     qo_indptr: In<Tensor<i32>>,
-    lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc_ptr = kvc.ptr;
     let kvc = unsafe { &*kvc_ptr };
@@ -1346,7 +1647,9 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
 
     if plan.ptr.is_null() {
-        return Err(Refusal::Null { what: "the prefill plan this statement names" });
+        return Err(Refusal::Null {
+            what: "the prefill plan this statement names",
+        });
     }
 
     let cache = unsafe { &*plan.ptr };
@@ -1384,11 +1687,21 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
     params.maybe_custom_mask = addr(mask);
     params.maybe_mask_indptr = addr(mask_indptr);
     params.window_left = -1;
-    prefill(ctx, prefill_at(&planned, arm, params.padded_batch_size), &params)?;
-    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    prefill(
+        ctx,
+        prefill_at(&planned, arm, params.padded_batch_size),
+        &params,
+    )?;
+    if planned.info.split_kv {
+        fold(ctx, &split)
+    } else {
+        Ok(())
+    }
 }
 
-fn plan_own_prefill(ctx: &Ctx<'_>, q_width: i32,
+fn plan_own_prefill(
+    ctx: &Ctx<'_>,
+    q_width: i32,
     requests: i32,
     head_dim: i32,
     rows: i32,
@@ -1397,19 +1710,27 @@ fn plan_own_prefill(ctx: &Ctx<'_>, q_width: i32,
     cache: &mut plan::PrefillPlanCache,
     qo_h: *const u32,
     kv_h: *const u32,
-    window_left: i32) -> Result<PrefillPlan, Refusal> {
+    window_left: i32,
+) -> Result<PrefillPlan, Refusal> {
     if requests <= 0 {
         return Err(Refusal::Empty { what: "the batch" });
     }
 
     if head_dim <= 0 {
-        return Err(Refusal::Empty { what: "the layer's head dim" });
+        return Err(Refusal::Empty {
+            what: "the layer's head dim",
+        });
     }
     if q_width % head_dim != 0 {
-        return Err(Refusal::Narrow { what: "the query width, in heads", at: i64::from(q_width) });
+        return Err(Refusal::Narrow {
+            what: "the query width, in heads",
+            at: i64::from(q_width),
+        });
     }
     if qo_h.is_null() || kv_h.is_null() {
-        return Err(Refusal::Null { what: "the host indptr pair the planless prefill plans from" });
+        return Err(Refusal::Null {
+            what: "the host indptr pair the planless prefill plans from",
+        });
     }
     let n = requests as usize + 1;
 
@@ -1447,15 +1768,16 @@ fn plan_own_prefill(ctx: &Ctx<'_>, q_width: i32,
     );
     if let plan::Planned::Declined(why) = planned {
         tracing::error!(%why, "the planless FA2 prefill could not plan its own fire");
-        return Err(Refusal::Unstated { what: "a plannable FA2 prefill fire; see the log" });
+        return Err(Refusal::Unstated {
+            what: "a plannable FA2 prefill fire; see the log",
+        });
     }
 
     upload_plan(
         ctx,
         cache.int_upload.as_slice().as_ptr(),
         cache.int_upload.as_slice().len(),
-        (cache.int_workspace as usize)
-            .saturating_add(cache.int_base_bytes) as *mut u8,
+        (cache.int_workspace as usize).saturating_add(cache.int_base_bytes) as *mut u8,
     )?;
     Ok(dispatch::prefill_plan_of(cache, plan::fa_device()))
 }
@@ -1475,14 +1797,19 @@ pub fn attention_flashinfer_prefill(
     kv_page_indptr_host: In<Struct<KvPageIndptrHost>>,
     kv_num_heads: Const<i32>,
     window_left: Const<i32>,
-    lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc_ptr = kvc.ptr;
     let kvc = unsafe { &*kvc_ptr };
     if plan_cache.ptr.is_null() {
-        return Err(Refusal::Null { what: "the prefill plan cache this statement names" });
+        return Err(Refusal::Null {
+            what: "the prefill plan cache this statement names",
+        });
     }
     // The planless routine PLANS: it owns the cache for this fire, which is
     // what the `*mut u8` the retired key answered had always meant.
@@ -1544,7 +1871,8 @@ pub fn attention_flashinfer_prefill_lse(
     qo_indptr_host: In<Struct<QoIndptrHost>>,
     kv_page_indptr_host: In<Struct<KvPageIndptrHost>>,
     kv_num_heads: Const<i32>,
-    window_left: Const<i32>) -> Result<(), Refusal> {
+    window_left: Const<i32>,
+) -> Result<(), Refusal> {
     attention_flashinfer_prefill(
         ctx,
         q,
@@ -1564,8 +1892,9 @@ pub fn attention_flashinfer_prefill_lse(
 }
 
 fn prefill_plan_usable(plan: &PrefillPlan) -> Result<(), Refusal> {
-
-    const UNPLANNED_PREFILL: Refusal = Refusal::Unstated { what: "a planned FA2 prefill cache" };
+    const UNPLANNED_PREFILL: Refusal = Refusal::Unstated {
+        what: "a planned FA2 prefill cache",
+    };
 
     const SM90_UNPORTED: Refusal = Refusal::Unstated {
         what: "a non-SM90 FA2 prefill plan; the SM90 launcher is not part of this lattice",
@@ -1613,7 +1942,6 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: Device) -> O
         crate::jit::cache::resolve(&point.root, point.arms[DecodeArm::Full as usize]).ok()?;
 
     if geometry.smem_bytes > 48 * 1024 {
-
         unsafe {
             dr::cuFuncSetAttribute(
                 resolved.function,

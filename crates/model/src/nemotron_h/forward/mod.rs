@@ -1,41 +1,22 @@
-//! nemotron_h's forward, declared.
-//!
-//! Transcribed from `nemotron_h_forward.cpp`. The third hybrid, and the
-//! only one whose schedule is a LIST rather than an interval — and the
-//! only one with THREE layer kinds, because a bare `mlp` layer has no
-//! mixer at all. An interval cannot say that, which is why
-//! `layer_types` is carried verbatim.
-//!
-//! Mamba is the new vocabulary. GDN and KDA carry a decaying state over
-//! key/value pairs; mamba's selective scan carries an explicit
-//! `[heads, head_dim, state_size]` state and reads a per-token `dt` that
-//! decides how much of it to keep. `prepare_mamba_dt_da` is its own
-//! statement for that reason — the softplus-and-scale on `dt` and the
-//! decay `A` it pairs with are computed once per token, before the scan,
-//! not inside it.
-//!
-//! ReLU² where the other families have swiglu, and a GATED norm on the
-//! mamba output (`zamba_rmsnorm_gated`) rather than a plain one.
-
 pub mod facts;
 
 use self::facts::{NemotronHFacts, NemotronLayerKind};
 use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
-use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
+use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, Shape};
 
 struct NhLayerW {
     norm: NormW,
-    // mamba
+
     in_proj: MatW,
     out_proj: MatW,
     gate_norm: NormW,
-    // attention
+
     q_proj: MatW,
     k_proj: MatW,
     v_proj: MatW,
     o_proj: MatW,
-    // mlp / moe
+
     up_proj: MatW,
     down_proj: MatW,
     router: MatW,
@@ -68,8 +49,7 @@ impl NhLayerW {
             k_proj: m("k_proj", f.attn.kv_width()),
             v_proj: m("v_proj", f.attn.kv_width()),
             o_proj: m("o_proj", f.hidden),
-            // ReLU², so ONE projection up and one down — there is no
-            // gate half to pair with.
+
             up_proj: m("up_proj", f.moe.moe_intermediate),
             down_proj: m("down_proj", f.hidden),
             router: m("router", f.moe.num_experts),
@@ -79,29 +59,18 @@ impl NhLayerW {
     }
 }
 
-/// nemotron_h's CUDA text for one fire class.
 pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &NemotronHFacts,
     class: FireClass,
     norm_eps: f32,
     rope_theta: f32,
 ) -> ForwardPlan {
-    // The activation axis is DECLARED but pinned until the launch wrappers
-    // take a dtype: every statement below states BF16 outs, so a point
-    // instantiated at another A would lie. The pin is a compile refusal,
-    // not a comment. Same for K: the attention layers' kv writes state
-    // native bf16 pages and nothing here forks on the scheme yet.
+
     const {
         assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
         assert!(K::NATIVE_BF16);
     }
-    // DECODE AND PREFILL, and the difference is one call. This family
-    // served Decode only and PANICKED on anything else — not refused,
-    // panicked, on the first prefill a serving deployment sends. The
-    // class-dependent sites in this text number exactly one, the
-    // attention op, which `dsl::cuda::attention_for` now holds.
-    // The SKU joins the family's FIRST segment ('.'-separated segment two
-    // stays the backend, which `Backend::of_family` parses).
+
     let family = format!(
         "nemotron_h-{}-{}-{}.cuda.{}",
         W1::NAME,
@@ -114,64 +83,79 @@ pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
 
+        let rt = dsl::rt(t);
         for l in 0..facts.layers() {
-            // THIS LAYER's sliding window, `-1` for none — a
-            // load-time fact the dispatch statements carry, where four
-            // executors used to re-derive it per launch.
+
             let window_left = model_ir::facts::window_left_at(facts.window_left, l);
             let w = NhLayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.norm);
 
             match facts.kind(l) {
                 NemotronLayerKind::Mamba => {
-                    // One projection, three things: `[z | conv_dim | dt]`.
+
                     let packed = matmul(&x, &w.in_proj);
-                    let (z, conv_in, dt_raw) = dsl::cuda::nemotron_mamba_split(
+                    let (z, conv_in, dt_raw) = dsl::cuda::generated::nemotron_mamba_split_bf16(
                         &packed,
-                        mb.intermediate(),
-                        mb.conv_dim(),
-                        mb.num_heads,
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(mb.intermediate())]),
+                            DType::BF16,
+                        ),
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(mb.conv_dim())]),
+                            DType::BF16,
+                        ),
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(mb.num_heads)]),
+                            DType::BF16,
+                        ),
+                        packed.layer(),
+                        None,
                     );
                     let rs = dsl::Rs::at(t, l);
-                    let conv_out = dsl::cuda::gdn_conv_update_batched(
+
+                    let conv_bias = format!("layer.{l}.mamba_conv_bias");
+                    let conv_out = dsl::cuda::generated::causal_conv1d_update_batched(
                         &conv_in,
-                        &dsl::ConvW {
-                            name: format!("layer.{l}.mamba_conv"),
-                            bias: Some(format!("layer.{l}.mamba_conv_bias")),
-                            kernel: mb.conv_kernel,
-                            layer: l,
-                        },
-                        &rs,
-                        // mamba's conv carries the fused `[z | conv_dim | dt]`
-                        // block's middle third. The GDN recurrence numbers are
-                        // not this family's and are stated zero.
-                        dsl::cuda::GdnShape {
-                            k_heads: 0,
-                            v_heads: mb.num_heads,
-                            k_dim: 0,
-                            v_dim: mb.head_dim,
-                            conv_dim: mb.conv_dim(),
-                            conv_k: mb.conv_kernel,
-                        },
+                        &format!("layer.{l}.mamba_conv"),
+                        Some(conv_bias.as_str()),
+                        mb.conv_dim() as i32,
+                        mb.conv_kernel as i32,
+                        &rs.view(),
+                        Some(l),
+                        Some(rs.state()),
                     );
-                    // `dt` and the decay `A` are per-token and computed
-                    // ONCE, before the scan — a separate statement
-                    // because the scan reads them, it does not make them.
-                    let (a_par, d_par, dt_bias) = dsl::cuda::nemotron_prepare_mamba_params(
-                        t,
-                        l,
-                        &format!("layer.{l}.mamba_a_log"),
-                        &format!("layer.{l}.mamba_d"),
-                        &format!("layer.{l}.mamba_dt_bias"),
-                        mb.num_heads,
-                    );
-                    let (dt, da) = dsl::cuda::nemotron_prepare_mamba_dt_da(
+
+                    let head_row = || (Shape(vec![Dim::Const(mb.num_heads)]), DType::F32);
+                    let (a_par, d_par, dt_bias) =
+                        dsl::cuda::generated::nemotron_prepare_mamba_params(
+                            t,
+                            &format!("layer.{l}.mamba_a_log"),
+                            &format!("layer.{l}.mamba_d"),
+                            &format!("layer.{l}.mamba_dt_bias"),
+                            head_row(),
+                            head_row(),
+                            head_row(),
+                            mb.num_heads as i32,
+                            Some(l),
+                            None,
+                        );
+                    let token_row = || {
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(mb.num_heads)]),
+                            DType::F32,
+                        )
+                    };
+                    let (dt, da) = dsl::cuda::generated::nemotron_prepare_mamba_dt_da(
                         &dt_raw,
                         &a_par,
                         &dt_bias,
-                        mb.num_heads,
+                        token_row(),
+                        token_row(),
+                        dt_raw.layer(),
+                        None,
                     );
-                    let core = dsl::cuda::nemotron_mamba_ssm(
+                    let qo_indptr = rt.qo_indptr();
+                    let core = dsl::cuda::generated::nemotron_mamba_ssm_batched_bf16(
                         &conv_out,
                         &dt,
                         &dt_raw,
@@ -179,27 +163,31 @@ pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                         &d_par,
                         &dt_bias,
                         &da,
-                        l,
-                        mb.intermediate(),
-                        // The five the scan took as `keys::Gdn*`. Every one is
-                        // `mb`'s -- the checkpoint's mamba block -- which is
-                        // what makes them the statement's to carry.
-                        mb.num_heads,
-                        mb.head_dim,
-                        mb.state_size,
-                        mb.n_groups,
-                        mb.conv_dim(),
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(mb.intermediate())]),
+                            DType::BF16,
+                        ),
+
+                        mb.num_heads as i32,
+                        mb.head_dim as i32,
+                        mb.state_size as i32,
+                        mb.n_groups as i32,
+                        mb.conv_dim() as i32,
+                        &rs.view(),
+                        &qo_indptr,
+                        Some(l),
+                        Some(rs.state()),
                     );
                     dsl::seam(core.trace(), &dsl::seam::ATTN_OUT, &[&core], Some(l));
-                    // A GATED norm, not a plain one: `z` is the gate the
-                    // split produced and the norm applies it.
-                    let o = dsl::cuda::zamba_rmsnorm_gated(
+
+                    let o = dsl::cuda::generated::zamba_rmsnorm_gated(
                         &core,
                         &z,
                         &w.gate_norm.name,
-                        mb.intermediate(),
-                        mb.n_groups,
+                        mb.n_groups as i32,
                         norm_eps,
+                        core.layer(),
+                        None,
                     );
                     y += matmul(&o, &w.out_proj);
                 }
@@ -207,20 +195,21 @@ pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                     let q = matmul(&x, &w.q_proj);
                     let k = matmul(&x, &w.k_proj);
                     let v = matmul(&x, &w.v_proj);
-                    // The generation's base (no config states one; the
-                    // row's constant records the normalizer's default).
-                    // Stating no pairing means NeoX.
-                    let (q, k) = dsl::cuda::rope(
+
+                    let (q, k) = dsl::cuda::generated::rope_bf16(
                         &q,
                         &k,
-                        facts.attn.heads,
-                        facts.attn.kv_heads,
-                        facts.attn.head_dim,
+                        facts.attn.heads as i32,
+                        facts.attn.kv_heads as i32,
+                        facts.attn.head_dim as i32,
                         rope_theta,
                         false,
+                        &rt.positions(),
+                        q.layer(),
+                        None,
                     );
                     let kv = dsl::Kv::at(t, l);
-                    dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+                    dsl::cuda::write_kv_to_pages(&k, &v, &kv, facts.attn.kv_heads, facts.attn.head_dim);
                     dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
                     let o = dsl::cuda::attention_for(
                         class,
@@ -237,75 +226,87 @@ pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                     y += matmul(&o, &w.o_proj);
                 }
                 NemotronLayerKind::Mlp => {
-                    // No mixer. The layer IS its MLP, and the norm above
-                    // is the only thing before it.
+
                     let up = matmul(&x, &w.up_proj);
-                    let act = dsl::cuda::relu2(&up, facts.moe.moe_intermediate);
+                    let act = dsl::cuda::generated::relu2(&up, up.layer(), None);
                     y += matmul(&act, &w.down_proj);
                     continue;
                 }
             }
 
-            // ── MoE, on the mixer layers ─────────────────────────────
-            // A DENSE stack stops here. Every published Nemotron-H is
-            // dense (`num_experts` is null in all three configs), and
-            // this block ran unconditionally: a dense row would trace a
-            // router of width 0, a top-k of 0 and an expert GEMV over a
-            // bank of no experts, which is not a shape error anywhere —
-            // it is a fire that reads a zero-length weight and returns
-            // zeros. The mixer layers of a dense stack are their mixer
-            // and their residual, and nothing else.
             if facts.moe.num_experts == 0 {
                 continue;
             }
             let m = dsl::cuda::rmsnorm(&y, &w.norm);
-            // FP32 logits — `nemotron_h_forward.cpp` fires
-            // `act_x_wt_bf16_out_fp32` for the router because
-            // `topk_sigmoid_bias_fp32` consumes fp32. The first
-            // transcription stated a plain (bf16) matmul here; the
-            // executor port caught the dtype seam before it ever ran.
-            let logits = dsl::cuda::gemm_out_fp32(&m, &w.router.name, facts.moe.num_experts);
-            let (experts, weights) = dsl::cuda::topk_sigmoid_bias(
+
+            let logits = dsl::cuda::generated::act_x_wt_bf16_out_fp32(
+                &m,
+                &w.router.name,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.num_experts)]),
+                    DType::F32,
+                ),
+                m.layer(),
+                None,
+            );
+            let (experts, weights) = dsl::cuda::generated::topk_sigmoid_bias_fp32(
                 &logits,
                 &format!("layer.{l}.router_bias"),
-                facts.moe.top_k,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.top_k)]),
+                    DType::I32,
+                ),
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(facts.moe.top_k)]),
+                    DType::F32,
+                ),
                 facts.moe.norm_topk_prob,
                 facts.moe.routed_scaling,
+                logits.layer(),
+                None,
             );
-            let gate_up = dsl::cuda::moe_gate_up_gemv(
+            let gate_up = dsl::cuda::generated::moe_gate_up_decode_gemv(
+                &experts,
                 &m,
-                &MatW {
-                    name: format!("layer.{l}.expert.{{e}}.up"),
-                    width: facts.moe.moe_intermediate,
-                    layer: Some(l),
-                    repr: W2::REPR,
-                },
-                &experts,
-                facts.moe.top_k,
+                &format!("layer.{l}.expert.{{e}}.up"),
+                (
+                    Shape(vec![
+                        Dim::Tokens,
+                        Dim::Const(facts.moe.top_k),
+                        Dim::Const(facts.moe.moe_intermediate),
+                    ]),
+                    DType::BF16,
+                ),
+                Some(l),
+                None,
             );
-            let act = dsl::cuda::relu2(&gate_up, facts.moe.moe_intermediate);
-            let route_out = dsl::cuda::moe_down_gemv(
-                &act,
-                &MatW {
-                    name: format!("layer.{l}.expert.{{e}}.down"),
-                    width: facts.hidden,
-                    layer: Some(l),
-                    repr: W2::REPR,
-                },
+            let act = dsl::cuda::generated::relu2(&gate_up, gate_up.layer(), None);
+            let route_out = dsl::cuda::generated::moe_down_decode_gemv(
                 &experts,
-                facts.moe.top_k,
+                &act,
+                &format!("layer.{l}.expert.{{e}}.down"),
+                (
+                    Shape(vec![
+                        Dim::Tokens,
+                        Dim::Const(facts.moe.top_k),
+                        Dim::Const(facts.hidden),
+                    ]),
+                    DType::BF16,
+                ),
+                Some(l),
+                None,
             );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::relu2(&sup, facts.moe.shared_intermediate);
+                let sact = dsl::cuda::generated::relu2(&sup, sup.layer(), None);
                 let shared = matmul(&sact, &w.shared_down);
-                dsl::cuda::residual_add(&routed, &shared, facts.hidden)
+                dsl::cuda::generated::residual_add(&routed, &shared, routed.layer(), None)
             } else {
                 routed
             };
-            y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
+            y = dsl::cuda::generated::residual_add(&y, &moe_out, y.layer(), None);
         }
 
         dsl::logits_epilogue(
@@ -320,28 +321,17 @@ pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     })
 }
 
-/// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&NemotronHFacts, FireClass, f32, f32) -> ForwardPlan;
 
-/// The shipped SKU's axes — the family's ONE spelling of its point.
-/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claims
-/// all derive from these; a second SKU adds a row, not a respelling.
 pub type ShippedW1 = Bf16Ax;
-/// The routed expert banks' axis of the shipped point.
+
 pub type ShippedW2 = Bf16Ax;
-/// The activation axis of the shipped point (pinned BF16 in the text).
+
 pub type ShippedA = Bf16Ax;
-/// The KV axis of the shipped point.
+
 pub type ShippedKv = NativeKv;
 
-/// The family's catalogue — every SKU this build ships, enumerated. The
-/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
-/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
-/// row whose statements reach a routine point that does not exist, which
-/// is how the demand set closes: checked, never hoped.
-pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    (
-        "nemotron_h-bf16-bf16-kv-bf16",
-        nemotron_h_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
-    ),
-];
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![(
+    "nemotron_h-bf16-bf16-kv-bf16",
+    nemotron_h_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
+),];

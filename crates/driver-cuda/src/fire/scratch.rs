@@ -17,6 +17,8 @@ pub(crate) struct Scratch {
     pub(crate) mask: Option<crate::device::DeviceBuffer>,
     /// The driver-owned attention landing buffer — see [`Self::attn_out`].
     pub(crate) attn_out: Option<crate::device::DeviceBuffer>,
+    /// The adapter correction's xAᵀ staging — see [`Self::lora_gate`].
+    pub(crate) lora_gate: Option<crate::device::DeviceBuffer>,
     /// The attention log-sum-exp — see [`Self::lse`].
     pub(crate) lse: Option<crate::device::DeviceBuffer>,
     /// The per-row live flags — see [`Self::row_valid`].
@@ -71,7 +73,11 @@ impl Scratch {
         if slot.as_ref().is_none_or(|b| b.len() < bytes) {
             // `Exhausted` carries the byte figure the engine needs to choose
             // between evicting, shrinking the batch and refusing.
-            *slot = Some(alloc.alloc(bytes).map_err(|_| crate::Error::exhausted(what, bytes))?);
+            *slot = Some(
+                alloc
+                    .alloc(bytes)
+                    .map_err(|_| crate::Error::exhausted(what, bytes))?,
+            );
             epoch.bump();
         }
         Ok(())
@@ -95,7 +101,13 @@ impl Scratch {
         plan: &crate::fire::attn_score::ScoreSinkPlan,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.score, &mut self.epoch, alloc, "attention score sink", plan.bytes)?;
+        Self::grow(
+            &mut self.score,
+            &mut self.epoch,
+            alloc,
+            "attention score sink",
+            plan.bytes,
+        )?;
         let b = self.score.as_mut().expect("just grown");
         let mut csr = Vec::with_capacity(plan.indptr.len() * 4);
         for v in &plan.indptr {
@@ -114,8 +126,54 @@ impl Scratch {
         bytes: usize,
     ) -> crate::Result<*mut std::ffi::c_void> {
         let bytes = bytes.max(64);
-        Self::grow(&mut self.attn_out, &mut self.epoch, alloc, "attention landing", bytes)?;
+        Self::grow(
+            &mut self.attn_out,
+            &mut self.epoch,
+            alloc,
+            "attention landing",
+            bytes,
+        )?;
         Ok(self.attn_out.as_ref().expect("just grown").as_ptr())
+    }
+
+    /// The adapter correction's xAᵀ staging: rank-wide rows the low-rank GEMM
+    /// writes and then reads back through B.
+    ///
+    /// # Why this is not [`Self::attn_out`]
+    ///
+    /// It was. The adapter phase asked `attn_out` for its gate, and on any
+    /// family whose `attn_output` is `DriverPinned` -- qwen3 among them --
+    /// that is the SAME buffer the attention dispatch lands its output in. The
+    /// correction then wrote xAᵀ over the attention output, and whether the
+    /// answer survived depended on which of the two touched the bytes last.
+    ///
+    /// # What that cost
+    ///
+    /// `lora-probe` at `adapter_scale: 0.0` -- a zero-B adapter, whose
+    /// correction is EXACTLY zero and whose answer must therefore be the base
+    /// model's, byte for byte -- answered the base model on some runs and
+    /// something else on others, in the same process, with the same seed. The
+    /// correction's OUTPUT was zero every time and correctly so; it was the
+    /// intermediate, which is not zero because A is not zero, that landed on
+    /// somebody else's rows.
+    ///
+    /// The fixture's whole reason to exist is the §5.1 claim that no adapter
+    /// means no difference, and the aliasing falsified it nondeterministically,
+    /// which is the one failure mode a parity gate cannot be written against.
+    pub(crate) fn lora_gate(
+        &mut self,
+        alloc: &crate::device::Allocator,
+        bytes: usize,
+    ) -> crate::Result<*mut std::ffi::c_void> {
+        let bytes = bytes.max(64);
+        Self::grow(
+            &mut self.lora_gate,
+            &mut self.epoch,
+            alloc,
+            "lora gate",
+            bytes,
+        )?;
+        Ok(self.lora_gate.as_ref().expect("just grown").as_ptr())
     }
 
     /// The log-sum-exp the attention dispatches write beside their output.
@@ -124,7 +182,13 @@ impl Scratch {
         alloc: &crate::device::Allocator,
         bytes: usize,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.lse, &mut self.epoch, alloc, "attention lse", bytes.max(64))?;
+        Self::grow(
+            &mut self.lse,
+            &mut self.epoch,
+            alloc,
+            "attention lse",
+            bytes.max(64),
+        )?;
         Ok(self.lse.as_ref().expect("just grown").as_ptr())
     }
 
@@ -135,7 +199,13 @@ impl Scratch {
         rows: usize,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.row_valid, &mut self.epoch, alloc, "row valid", rows.max(64))?;
+        Self::grow(
+            &mut self.row_valid,
+            &mut self.epoch,
+            alloc,
+            "row valid",
+            rows.max(64),
+        )?;
         let b = self.row_valid.as_mut().expect("just grown");
         b.memset(1, stream)?;
         Ok(b.as_ptr())
@@ -148,7 +218,13 @@ impl Scratch {
         plan: &crate::fire::page_mask::element_mask::ElementMaskPlan,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.mask, &mut self.epoch, alloc, "attention mask", plan.bytes)?;
+        Self::grow(
+            &mut self.mask,
+            &mut self.epoch,
+            alloc,
+            "attention mask",
+            plan.bytes,
+        )?;
         let b = self.mask.as_mut().expect("just grown");
         b.write_at(0, &plan.mask, stream)?;
         let mut csr = Vec::with_capacity(plan.indptr.len() * 4);
@@ -188,7 +264,13 @@ impl Scratch {
         for (dst, v) in pin.as_mut_slice()[..live].chunks_exact_mut(4).zip(vals) {
             dst.copy_from_slice(&v.to_le_bytes());
         }
-        Self::grow(&mut self.slots[slot], &mut self.epoch, alloc, "fire descriptor array", need)?;
+        Self::grow(
+            &mut self.slots[slot],
+            &mut self.epoch,
+            alloc,
+            "fire descriptor array",
+            need,
+        )?;
         let src = &self.staging[slot].as_ref().expect("just sized").as_slice()[..live];
         let b = self.slots[slot].as_mut().expect("just grown");
         b.copy_from_host(src, stream)?;
@@ -208,7 +290,13 @@ impl Scratch {
         // assigns, so an `Exhausted` here would drop a buffer whose address a
         // capture baked, with no epoch bump to mark it stale.
         let mut held = self.named.remove(&v);
-        let grown = Self::grow(&mut held, &mut self.epoch, alloc, "named seam buffer", bytes);
+        let grown = Self::grow(
+            &mut held,
+            &mut self.epoch,
+            alloc,
+            "named seam buffer",
+            bytes,
+        );
         if let Some(back) = held {
             self.named.insert(v, back);
         }

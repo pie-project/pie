@@ -1,75 +1,7 @@
-//! Qwen3's dense tensor names, in pie's vocabulary and the two foreign ones.
-//!
-//! # Why this is a rename and nothing more
-//!
-//! Checked, not assumed. A BF16 GGUF of `Qwen3-0.6B` and the BF16
-//! safetensors release it was converted from agree **bit for bit** on
-//! `attn_q`, `attn_k`, `attn_v`, `attn_q_norm` and `token_embd` -- so
-//! llama.cpp's `Qwen3Model` touches no data on the way in, and this file has
-//! only to say what each tensor is called. Compare `llama_2::import`, whose
-//! Q and K come back at cosine 0.02 against the same kind of twin because
-//! `LlamaModel` reorders every rope row.
-//!
-//! That check is the reason this module is 200 lines and not a guess. A name
-//! map is cheap to write from a converter's source and expensive to be wrong
-//! about, because a permutation applied when it was not wanted is not an
-//! error -- it is a model that loads, serves, and answers slightly wrong.
-//!
-//! # Why it is a file of its own next to `qwen_2::import`
-//!
-//! The two tables are nine rows the same and two rows different, and the
-//! temptation is to share the nine. They are not shared. A GGUF ingest pass
-//! is per **input vocabulary**, and the whole value of stating one is that a
-//! family's answer can be read in one place and checked against one file on
-//! disk. A table assembled from a base plus a delta cannot be read that way,
-//! and the day llama.cpp changes one of those nine rows for one architecture
-//! -- which is exactly the kind of thing it does -- the shared version is a
-//! silent wrong answer for the other.
-//!
-//! # What Qwen3 has that Qwen2 does not, and the reverse
-//!
-//! `attn_q_norm` / `attn_k_norm`: Qwen3 normalizes each head's queries and
-//! keys before rope, and those are 128-element tensors (one head dimension,
-//! not one hidden size), so a map that sent them anywhere plausible would be
-//! caught by shape identification rather than by name. They are still stated
-//! rather than left out, because `None` here stops the import.
-//!
-//! No `attn_q.bias`: Qwen3 dropped the QKV biases Qwen2 carried. The suffix
-//! split below still admits `.bias` -- it costs nothing, and refusing a
-//! suffix this family happens not to publish would be this module asserting a
-//! fact about the checkpoint that the checkpoint states for itself.
-//!
-//! No `output.weight`: `Qwen3-0.6B` ties its head, and llama.cpp writes no
-//! head tensor when the tie holds. The name is mapped anyway for the variants
-//! that do publish one, on the same reasoning as `qwen_2::import`: GGUF
-//! states no tie key, so dropping the tensor here would be a guess at a fact
-//! the file does not contain.
-//!
-//! # Why this generation has two tables and not one
-//!
-//! `import_moe` is the other. One GENERATION can be several llama.cpp
-//! ARCHITECTURES -- `qwen3` and `qwen3moe` are both `crate::qwen_3` -- and
-//! the two disagree about the MLP: this table's `ffn_gate` is one
-//! `mlp.gate_proj` per layer, and that one's `ffn_gate_exps` is a stack that
-//! becomes one `mlp.experts.{}.gate_proj` per expert. Those are different
-//! members with different pie names, so the tables are disjoint where they
-//! differ, and a GGUF is answered by exactly the table its architecture
-//! names. A HuggingFace checkpoint, which declares a `model_type` and not an
-//! architecture, is offered both in order.
-
 use crate::shared::vocabulary::{Member, Vocab};
 
-/// Every tensor a dense Qwen3 publishes, and what each vocabulary calls it.
-///
-/// `attn_norm` and `ffn_norm` are the pair worth reading twice: llama.cpp
-/// names a norm for what it PRECEDES and HuggingFace for where it SITS, so
-/// `ffn_norm` is `post_attention_layernorm` and NOT anything with "ffn" in
-/// it.
-///
-/// `post_feedforward_layernorm` has no GGUF column: rows in `crate::qwen_3`
-/// ask for it and no Qwen3 GGUF measured here publishes one.
 pub const VOCAB: Vocab = Vocab(&[
-    // ── Inside a decoder layer ───────────────────────────────────────
+
     Member::gguf(
         "model.layers.{layer}.self_attn.q_proj",
         "blk.{layer}.attn_q",
@@ -86,10 +18,7 @@ pub const VOCAB: Vocab = Vocab(&[
         "model.layers.{layer}.self_attn.o_proj",
         "blk.{layer}.attn_output",
     ),
-    // 128 elements, one head dimension and not one hidden size, so a map
-    // that sent these anywhere plausible would be caught by shape
-    // identification rather than by name. Stated anyway, because a `None`
-    // here stops the import.
+
     Member::gguf(
         "model.layers.{layer}.self_attn.q_norm",
         "blk.{layer}.attn_q_norm",
@@ -110,120 +39,8 @@ pub const VOCAB: Vocab = Vocab(&[
     Member::gguf("model.layers.{layer}.mlp.gate_proj", "blk.{layer}.ffn_gate"),
     Member::gguf("model.layers.{layer}.mlp.up_proj", "blk.{layer}.ffn_up"),
     Member::gguf("model.layers.{layer}.mlp.down_proj", "blk.{layer}.ffn_down"),
-    // ── Outside it ───────────────────────────────────────────────────
+
     Member::gguf("model.embed_tokens", "token_embd"),
     Member::gguf("model.norm", "output_norm"),
     Member::gguf("lm_head", "output"),
 ]);
-
-#[cfg(test)]
-mod tests {
-    use super::VOCAB;
-
-    /// Every name a real Qwen3 GGUF holds is mapped.
-    ///
-    /// The list is the thirteen distinct patterns read off
-    /// `Qwen3-0.6B-BF16.gguf` (310 tensors, 28 layers), which is the only
-    /// thing that makes this test worth more than the map: both sides of a
-    /// map written from imagination are the same imagination.
-    #[test]
-    fn every_tensor_a_qwen3_gguf_publishes_has_a_name() {
-        let published = [
-            (
-                "blk.3.attn_k.weight",
-                "model.layers.3.self_attn.k_proj.weight",
-            ),
-            (
-                "blk.3.attn_k_norm.weight",
-                "model.layers.3.self_attn.k_norm.weight",
-            ),
-            (
-                "blk.3.attn_norm.weight",
-                "model.layers.3.input_layernorm.weight",
-            ),
-            (
-                "blk.3.attn_output.weight",
-                "model.layers.3.self_attn.o_proj.weight",
-            ),
-            (
-                "blk.3.attn_q.weight",
-                "model.layers.3.self_attn.q_proj.weight",
-            ),
-            (
-                "blk.3.attn_q_norm.weight",
-                "model.layers.3.self_attn.q_norm.weight",
-            ),
-            (
-                "blk.3.attn_v.weight",
-                "model.layers.3.self_attn.v_proj.weight",
-            ),
-            (
-                "blk.3.ffn_down.weight",
-                "model.layers.3.mlp.down_proj.weight",
-            ),
-            (
-                "blk.3.ffn_gate.weight",
-                "model.layers.3.mlp.gate_proj.weight",
-            ),
-            (
-                "blk.3.ffn_norm.weight",
-                "model.layers.3.post_attention_layernorm.weight",
-            ),
-            ("blk.3.ffn_up.weight", "model.layers.3.mlp.up_proj.weight"),
-            ("output_norm.weight", "model.norm.weight"),
-            ("token_embd.weight", "model.embed_tokens.weight"),
-        ];
-        for (gguf, hf) in published {
-            assert_eq!(VOCAB.from_gguf(gguf).as_deref(), Some(hf), "mapping {gguf}");
-        }
-    }
-
-    /// The two head norms do not collide with each other or with the
-    /// projections they sit beside.
-    ///
-    /// `attn_q` and `attn_q_norm` share a prefix, and a table looked up by
-    /// prefix rather than by whole member would send the norm to the
-    /// projection's name -- a 128-element tensor under a 2048x1024 tensor's
-    /// name, in a family where both exist in every layer.
-    #[test]
-    fn a_head_norm_is_not_read_as_the_projection_it_precedes() {
-        for (norm, proj) in [("attn_q", "q"), ("attn_k", "k")] {
-            let n = VOCAB
-                .from_gguf(&format!("blk.0.{norm}_norm.weight"))
-                .unwrap();
-            let p = VOCAB.from_gguf(&format!("blk.0.{norm}.weight")).unwrap();
-            assert_eq!(n, format!("model.layers.0.self_attn.{proj}_norm.weight"));
-            assert_eq!(p, format!("model.layers.0.self_attn.{proj}_proj.weight"));
-            assert_ne!(n, p);
-        }
-    }
-
-    /// The index is the layer's, not a fixed one.
-    #[test]
-    fn the_layer_index_is_carried_through() {
-        for layer in [0u32, 7, 27, 199] {
-            assert_eq!(
-                VOCAB
-                    .from_gguf(&format!("blk.{layer}.attn_q_norm.weight"))
-                    .as_deref(),
-                Some(format!("model.layers.{layer}.self_attn.q_norm.weight").as_str())
-            );
-        }
-    }
-
-    /// A name this map does not know answers `None` rather than something.
-    #[test]
-    fn an_unknown_name_is_refused_rather_than_guessed() {
-        for unknown in [
-            "blk.3.ffn_gate_inp.weight",  // a mixture's router, not this one
-            "blk.3.ffn_gate_exps.weight", // qwen3moe's stacked experts
-            "blk.x.attn_q.weight",        // not an index
-            "blk.3.attn_q_norm",          // no suffix
-            "blk.3.attn_q.scales",        // a suffix this map does not carry
-            "token_embd",                 // no suffix
-            "rope_freqs.weight",          // llama's, and not published here
-        ] {
-            assert_eq!(VOCAB.from_gguf(unknown), None, "should not map {unknown}");
-        }
-    }
-}

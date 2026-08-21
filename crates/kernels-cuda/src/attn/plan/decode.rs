@@ -5,7 +5,6 @@ use super::{Error, Plan, Sizes, Workspace};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-
     pub kv_indptr: &'a [i32],
     pub batch_size: u32,
     pub num_qo_heads: u32,
@@ -35,7 +34,6 @@ impl Request<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkEstimate {
-
     pub split_kv: bool,
     pub max_grid_size: u32,
     pub kv_chunk_size_in_pages: u32,
@@ -44,36 +42,36 @@ pub struct WorkEstimate {
 }
 
 pub fn estimate(req: &Request<'_>, max_grid_size: u32) -> Result<WorkEstimate, Error> {
-
     #[must_use]
     pub fn partition_min_pages_per_batch(
-    max_grid_size: u32,
-    gdy: u32,
-    num_pages: &[i32],
-    min_num_pages_per_batch: u32,
+        max_grid_size: u32,
+        gdy: u32,
+        num_pages: &[i32],
+        min_num_pages_per_batch: u32,
     ) -> (u32, u32) {
-    let mut low = min_num_pages_per_batch;
-    let mut high = 0u32;
-    for &elem in num_pages {
-    high = cuda_max_u32_i32(high, elem);
-    }
-    while low < high {
-    let mid = (low + high) / 2;
-    let mut new_batch_size = 0u32;
-    for &elem in num_pages {
-    new_batch_size = new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem, mid) as u32);
-    }
-    if new_batch_size.wrapping_mul(gdy) > max_grid_size {
-    low = mid + 1;
-    } else {
-    high = mid;
-    }
-    }
-    let mut new_batch_size = 0u32;
-    for &elem in num_pages {
-    new_batch_size = new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem.max(1), low) as u32);
-    }
-    (low, new_batch_size)
+        let mut low = min_num_pages_per_batch;
+        let mut high = 0u32;
+        for &elem in num_pages {
+            high = cuda_max_u32_i32(high, elem);
+        }
+        while low < high {
+            let mid = (low + high) / 2;
+            let mut new_batch_size = 0u32;
+            for &elem in num_pages {
+                new_batch_size = new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem, mid) as u32);
+            }
+            if new_batch_size.wrapping_mul(gdy) > max_grid_size {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let mut new_batch_size = 0u32;
+        for &elem in num_pages {
+            new_batch_size =
+                new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem.max(1), low) as u32);
+        }
+        (low, new_batch_size)
     }
 
     req.check()?;
@@ -111,12 +109,25 @@ pub fn plan(
     max_grid_size: u32,
     workspace: Workspace,
 ) -> Result<Plan<DecodePlanInfo>, Error> {
-    plan_impl(req, max_grid_size, workspace, Staging::new(workspace.int_bytes))
+    plan_impl(
+        req,
+        max_grid_size,
+        workspace,
+        Staging::new(workspace.int_bytes),
+    )
 }
 
 pub fn workspace_size(req: &Request<'_>, max_grid_size: u32) -> Result<Sizes, Error> {
-    let plan = plan_impl(req, max_grid_size, Workspace::unbounded(), Staging::sizing())?;
-    Ok(Sizes { float_bytes: plan.float_bytes, int_bytes: plan.int_bytes })
+    let plan = plan_impl(
+        req,
+        max_grid_size,
+        Workspace::unbounded(),
+        Staging::sizing(),
+    )?;
+    Ok(Sizes {
+        float_bytes: plan.float_bytes,
+        int_bytes: plan.int_bytes,
+    })
 }
 
 fn plan_impl(
@@ -125,35 +136,38 @@ fn plan_impl(
     workspace: Workspace,
     mut staging: Staging,
 ) -> Result<Plan<DecodePlanInfo>, Error> {
+    #[must_use]
+    pub fn split_kv_indptr(
+        kv_indptr: &[i32],
+        batch_size: u32,
+        kv_chunk_size: u32,
+    ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+        let mut request_indices = Vec::new();
+        let mut kv_tile_indices = Vec::new();
+        let mut o_indptr = vec![0i32];
 
-     #[must_use]
-     pub fn split_kv_indptr(
-     kv_indptr: &[i32],
-     batch_size: u32,
-     kv_chunk_size: u32,
-     ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-     let mut request_indices = Vec::new();
-     let mut kv_tile_indices = Vec::new();
-     let mut o_indptr = vec![0i32];
+        for batch_idx in 0..batch_size as usize {
+            let pages = kv_indptr[batch_idx + 1].wrapping_sub(kv_indptr[batch_idx]) as u32;
+            let num_chunks_kv = ceil_div_u32(pages.max(1), kv_chunk_size);
+            for kv_tile_idx in 0..num_chunks_kv {
+                request_indices.push(batch_idx as i32);
+                kv_tile_indices.push(kv_tile_idx as i32);
+            }
+            let back = *o_indptr.last().expect("o_indptr starts with a zero");
+            o_indptr.push((back as u32).wrapping_add(num_chunks_kv) as i32);
+        }
 
-     for batch_idx in 0..batch_size as usize {
-     let pages = kv_indptr[batch_idx + 1].wrapping_sub(kv_indptr[batch_idx]) as u32;
-     let num_chunks_kv = ceil_div_u32(pages.max(1), kv_chunk_size);
-     for kv_tile_idx in 0..num_chunks_kv {
-     request_indices.push(batch_idx as i32);
-     kv_tile_indices.push(kv_tile_idx as i32);
-     }
-     let back = *o_indptr.last().expect("o_indptr starts with a zero");
-     o_indptr.push((back as u32).wrapping_add(num_chunks_kv) as i32);
-     }
-
-     (request_indices, kv_tile_indices, o_indptr)
-     }
+        (request_indices, kv_tile_indices, o_indptr)
+    }
 
     let est = estimate(req, max_grid_size)?;
 
     let padded_batch_size: u64 = if req.enable_cuda_graph {
-        if est.split_kv { u64::from(max_grid_size / est.gdy) } else { u64::from(req.batch_size) }
+        if est.split_kv {
+            u64::from(max_grid_size / est.gdy)
+        } else {
+            u64::from(req.batch_size)
+        }
     } else {
         u64::from(est.new_batch_size)
     };
@@ -188,7 +202,11 @@ fn plan_impl(
             &kv_tile_indices,
             "batch_decode_kv_tile_indices",
         )?;
-        staging.put_i32s(info.o_indptr_offset as usize, &o_indptr, "batch_decode_o_indptr")?;
+        staging.put_i32s(
+            info.o_indptr_offset as usize,
+            &o_indptr,
+            "batch_decode_o_indptr",
+        )?;
         staging.put_i32(
             info.kv_chunk_size_ptr_offset as usize,
             est.kv_chunk_size_in_pages.wrapping_mul(req.page_size) as i32,
@@ -208,9 +226,11 @@ fn plan_impl(
             16,
             "batch_decode_tmp_v",
         )? as i64;
-        info.s_offset =
-            float_alloc.alloc((heads * padded_batch_size * 4) as usize, 16, "batch_decode_tmp_s")?
-                as i64;
+        info.s_offset = float_alloc.alloc(
+            (heads * padded_batch_size * 4) as usize,
+            16,
+            "batch_decode_tmp_s",
+        )? as i64;
         info.block_valid_mask_offset =
             int_alloc.alloc(padded, 16, "batch_decode_block_valid_mask")? as i64;
         if staging.materialises() {

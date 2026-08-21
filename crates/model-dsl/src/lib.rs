@@ -200,11 +200,32 @@ impl Kv {
             b.launch(
                 "attn::write_kv_to_pages",
                 vec![],
-                Some(StateRef { store: StateStore::KvCache, layer: self.l }),
+                Some(StateRef {
+                    store: StateStore::KvCache,
+                    layer: self.l,
+                }),
                 vec![k.id, v.id],
                 vec![],
             );
         });
+    }
+
+    /// The state this layer's KV statements address — what every hand
+    /// wrapper's `kv_state` computed in private; a generated statement
+    /// takes it as its `state` argument (design-no-ask §10).
+    #[must_use]
+    pub fn state(&self) -> StateRef {
+        StateRef {
+            store: StateStore::KvCache,
+            layer: self.l,
+        }
+    }
+
+    /// The layer's paged-KV VIEW as an operand — the tier-1 `kv_cache`
+    /// object, minted through the trace's dedup.
+    #[must_use]
+    pub fn cache(&self) -> Val {
+        runtime::kv_cache(&self.t, self.l)
     }
 }
 
@@ -237,6 +258,23 @@ impl Rs {
     /// `pub`: same external-namespace reason as `Kv::at`.
     pub fn at(t: &Trace, l: u32) -> Rs {
         Rs { t: t.clone(), l }
+    }
+
+    /// The state this layer's recurrent statements address —
+    /// [`Kv::state`]'s twin on the recurrent store.
+    #[must_use]
+    pub fn state(&self) -> StateRef {
+        StateRef {
+            store: StateStore::RecurrentState,
+            layer: self.l,
+        }
+    }
+
+    /// The layer's recurrent-state VIEW as an operand — the tier-1
+    /// `recurrent_state` object, minted through the trace's dedup.
+    #[must_use]
+    pub fn view(&self) -> Val {
+        runtime::recurrent(&self.t, self.l)
     }
 }
 
@@ -531,12 +569,7 @@ pub fn input(t: &Trace, hidden: u32) -> Val {
 /// vocab rides the params run — the swept signature's appended pair.
 pub fn embed_with(t: &Trace, weight: &str, hidden: u32, vocab: u32) -> Val {
     let id = t.with(None, |b| {
-        let token_ids = b.runtime_tensor(
-            "token_ids",
-            None,
-            Shape(vec![Dim::Tokens]),
-            DType::I32,
-        );
+        let token_ids = b.runtime_tensor("token_ids", None, Shape(vec![Dim::Tokens]), DType::I32);
         b.launch_with_params(
             weight_launch::EMBED,
             vec![weight.to_string()],
@@ -582,7 +615,11 @@ pub mod runtime {
 
     fn tensor(t: &Trace, name: &str, shape: Shape, dtype: DType) -> Val {
         let id = t.with(None, |b| b.runtime_tensor(name, None, shape, dtype));
-        Val { t: t.clone(), id, layer: None }
+        Val {
+            t: t.clone(),
+            id,
+            layer: None,
+        }
     }
 
     /// Per-token absolute positions, `[Tokens]` i32.
@@ -610,14 +647,20 @@ pub mod runtime {
     /// (`[Tokens]` i32) paired with the qo CSR — the ragged pair, minted
     /// together so the halves cannot come from two different fires.
     pub fn token_stream(t: &Trace) -> RaggedVal {
-        RaggedVal { data: token_ids(t), indptr: qo_indptr(t) }
+        RaggedVal {
+            data: token_ids(t),
+            indptr: qo_indptr(t),
+        }
     }
 
     /// Pair a token-rowed stream the caller computed — attention's q —
     /// with the fire's query-window CSR. The statement-level spelling of
     /// "these rows are ragged over the fire's requests".
     pub fn query_windows(data: &Val) -> RaggedVal {
-        RaggedVal { data: data.clone(), indptr: qo_indptr(&data.t) }
+        RaggedVal {
+            data: data.clone(),
+            indptr: qo_indptr(&data.t),
+        }
     }
 
     /// Row-validity mask, `[Tokens]` i32.
@@ -627,7 +670,12 @@ pub mod runtime {
 
     /// Rows the fire samples, `[Requests]` i32.
     pub fn sampling_indices(t: &Trace) -> Val {
-        tensor(t, "sampling_indices", Shape(vec![Dim::Requests]), DType::I32)
+        tensor(
+            t,
+            "sampling_indices",
+            Shape(vec![Dim::Requests]),
+            DType::I32,
+        )
     }
 
     /// First-token flags, `[Requests]` i32.
@@ -639,19 +687,135 @@ pub mod runtime {
     /// name, read by the routine through `In<Struct<KvCache>>`.
     pub fn kv_cache(t: &Trace, l: u32) -> Val {
         let id = t.with(Some(l), |b| b.runtime_object("kv_cache", Some(l)));
-        Val { t: t.clone(), id, layer: Some(l) }
+        Val {
+            t: t.clone(),
+            id,
+            layer: Some(l),
+        }
     }
 
     /// The layer's recurrent-state view (slab + conv half).
     pub fn recurrent(t: &Trace, l: u32) -> Val {
         let id = t.with(Some(l), |b| b.runtime_object("recurrent_state", Some(l)));
-        Val { t: t.clone(), id, layer: Some(l) }
+        Val {
+            t: t.clone(),
+            id,
+            layer: Some(l),
+        }
     }
 
     /// The custom-mask view; null/false inside when the fire has none.
     pub fn attention_mask(t: &Trace) -> Val {
         let id = t.with(None, |b| b.runtime_object("attention_mask", None));
-        Val { t: t.clone(), id, layer: None }
+        Val {
+            t: t.clone(),
+            id,
+            layer: None,
+        }
+    }
+}
+
+/// The fire's runtime values as a HANDLE the forward mints once and passes
+/// into statements — design-no-ask §10's `let rt = dsl::rt(t);`.
+///
+/// A generated wrapper takes one argument per mark with no secret mints,
+/// runtime streams included: a reader of
+/// `generated::rope_bf16(&q, &k, .., &rt.positions(), ..)` can SEE the
+/// statement depends on `positions`. Each accessor mints through
+/// `TraceBuilder`'s `(name, layer)` dedup, so a stream named by twenty
+/// statements is one value — exactly what the hand wrappers' hidden
+/// `rt_tokens` calls recorded, now in the caller's hand.
+///
+/// The per-layer handles fold in beside it ([`Rt::kv`]/[`Rt::rs`]); the
+/// handles themselves stay — they answer layer identity, this answers
+/// fire-scope identity.
+#[derive(Clone)]
+pub struct Rt {
+    t: Trace,
+}
+
+/// Mint the runtime handle for this trace scope.
+#[must_use]
+pub fn rt(t: &Trace) -> Rt {
+    Rt { t: t.clone() }
+}
+
+impl Rt {
+    /// Per-token absolute positions, `[Tokens]` i32.
+    #[must_use]
+    pub fn positions(&self) -> Val {
+        runtime::positions(&self.t)
+    }
+
+    /// The fire's token ids, `[Tokens]` i32.
+    #[must_use]
+    pub fn token_ids(&self) -> Val {
+        runtime::token_ids(&self.t)
+    }
+
+    /// Which request each token row belongs to, `[Tokens]` i32.
+    #[must_use]
+    pub fn request_of_token(&self) -> Val {
+        runtime::request_of_token(&self.t)
+    }
+
+    /// The query-window CSR, `[Requests]` i32 (the driver stages the `+1`
+    /// row the CSR convention implies).
+    #[must_use]
+    pub fn qo_indptr(&self) -> Val {
+        runtime::qo_indptr(&self.t)
+    }
+
+    /// Row-validity mask, `[Tokens]` i32.
+    #[must_use]
+    pub fn row_valid(&self) -> Val {
+        runtime::row_valid(&self.t)
+    }
+
+    /// Rows the fire samples, `[Requests]` i32.
+    #[must_use]
+    pub fn sampling_indices(&self) -> Val {
+        runtime::sampling_indices(&self.t)
+    }
+
+    /// First-token flags, `[Requests]` i32.
+    #[must_use]
+    pub fn first_token(&self) -> Val {
+        runtime::first_token(&self.t)
+    }
+
+    /// The custom-mask view; null/false inside when the fire has none.
+    #[must_use]
+    pub fn attention_mask(&self) -> Val {
+        runtime::attention_mask(&self.t)
+    }
+
+    /// The layer's KV handle — [`Kv::at`], folded beside the runtime
+    /// handle so a forward mints both from one place.
+    #[must_use]
+    pub fn kv(&self, l: u32) -> Kv {
+        Kv::at(&self.t, l)
+    }
+
+    /// The layer's recurrent handle — [`Rs::at`]'s fold, as [`Rt::kv`].
+    #[must_use]
+    pub fn rs(&self, l: u32) -> Rs {
+        Rs::at(&self.t, l)
+    }
+
+    /// A TIER-2 runtime OBJECT by its dotted, plane-declared name
+    /// (`"fa2.prefill"`, `"moe.banks"`, `"dsv4.ape"`, …) — the driver
+    /// answers the name at bind, and `check_plan` refuses a spelling
+    /// outside the vocabulary. Tier-1 objects have their own accessors;
+    /// this is the operand form of what a plane declares for itself.
+    #[must_use]
+    pub fn object(&self, name: &str, layer: Option<u32>) -> Val {
+        let id = self.t.with(layer, |b| b.runtime_object(name, layer));
+        Val {
+            t: self.t.clone(),
+            id,
+            layer,
+        }
     }
 }
 
@@ -796,10 +960,7 @@ pub mod fire {
     /// (`check_plan` re-checks the recorded statement either way).
     /// `SOURCES` and `DERIVED` are both one entry per parameter with the
     /// `Ctx` dropped, so the zip is aligned by construction.
-    fn counts(
-        sources: &[Option<Source>],
-        derived: &[kernels::Derived],
-    ) -> [(usize, usize); 4] {
+    fn counts(sources: &[Option<Source>], derived: &[kernels::Derived]) -> [(usize, usize); 4] {
         let mut runs = [(0usize, 0usize); 4];
         for (i, s) in sources.iter().enumerate() {
             let nullable = derived.get(i).is_some_and(|d| d.nullable);
@@ -829,8 +990,44 @@ pub mod fire {
     /// time — when the call does not fill the column: a statement short of
     /// its signature must not become a statement at all. A run with
     /// nullable slots may be filled short by exactly the absent ones.
-    pub fn fire<R: kernels::Signature + kernels::Derivation>(
+    pub fn fire<R: kernels::Signature + kernels::Derivation>(t: &Trace, call: Call) -> Vec<Val> {
+        let symbol = format!("{}::{}", R::NAMESPACE, R::NAME);
+        checked::<R>(t, &symbol, call)
+    }
+
+    /// [`fire()`], with the statement's SYMBOL supplied by the caller — the
+    /// SHADER-plane spelling. A CUDA statement states `namespace::name` and
+    /// the marker fixes it; a metal/vulkan/wgpu statement states an
+    /// instantiated ENTRYPOINT (`rms_single_row_bfloat16`,
+    /// `affine_qmv_fast_bfloat16_gs_64_b_4`), resolved back to its routine
+    /// by the census stem (`kernels_metal::kernel_of`) — so the symbol
+    /// carries the routine's own dtype point plus whatever instantiation
+    /// axes the caller chose, and cannot come off the marker alone.
+    ///
+    /// The column validation is [`fire()`]'s, and one check is added: the
+    /// symbol must resolve to `R`'s own name, so a wrapper cannot fire one
+    /// routine's marker under another routine's entrypoint.
+    pub fn fire_at<R: kernels::Signature + kernels::Derivation>(
         t: &Trace,
+        symbol: &str,
+        call: Call,
+    ) -> Vec<Val> {
+        assert!(
+            kernels_metal::kernel_of(symbol).is_some_and(|n| n == R::NAME),
+            "`{symbol}` does not resolve to routine `{}` in the shader planes' \
+             census (it resolves to {:?}); the statement would name one \
+             routine's symbol under another routine's column",
+            R::NAME,
+            kernels_metal::kernel_of(symbol),
+        );
+        checked::<R>(t, symbol, call)
+    }
+
+    /// The shared half of [`fire()`]/[`fire_at`]: the column check and the
+    /// recording.
+    fn checked<R: kernels::Signature + kernels::Derivation>(
+        t: &Trace,
+        symbol: &str,
         call: Call,
     ) -> Vec<Val> {
         let runs = counts(R::SOURCES, R::DERIVED);
@@ -853,11 +1050,10 @@ pub mod fire {
                 },
             );
         }
-        let symbol = format!("{}::{}", R::NAMESPACE, R::NAME);
         let layer = call.layer;
         let ids = t.with(layer, |b| {
             b.launch_devwin(
-                &symbol,
+                symbol,
                 call.weights,
                 call.state,
                 call.params,
@@ -867,8 +1063,52 @@ pub mod fire {
                 call.outs,
             )
         });
-        ids.into_iter().map(|id| Val { t: t.clone(), id, layer }).collect()
+        ids.into_iter()
+            .map(|id| Val {
+                t: t.clone(),
+                id,
+                layer,
+            })
+            .collect()
     }
+}
+
+/// One result's geometry, resolved from the ROUTINE's stated `out(..)` rule
+/// against the statement's own operands — the trace-time half of B4-gen
+/// (design-no-ask §10). `inputs` is the statement's operand run in slot
+/// order; the rule's ordinals index into it. Shared by both generated
+/// planes (`cuda::generated`, `metal::generated`).
+///
+/// Panics — at trace time, which is load time — when the rule does not
+/// resolve, because a result the rule cannot shape must not become a
+/// statement. `Unstated` never reaches here: an unruled result keeps its
+/// `(Shape, DType)` parameter on the generated wrapper.
+pub(crate) fn ruled_out(
+    t: &Trace,
+    routine: &str,
+    rule: kernels::OutRule,
+    inputs: &[model_ir::trace::ValueId],
+    params: &[u32],
+) -> (Shape, DType) {
+    let b = t.inner.borrow();
+    // A raise (a runtime OBJECT operand) has no rectangle; a rule must
+    // never name one, so it enters the slot table as the empty shape,
+    // which every constructor refuses rather than reads.
+    let shapes: Vec<Shape> = inputs
+        .iter()
+        .map(|&id| {
+            if b.is_raised(id) {
+                Shape(vec![])
+            } else {
+                b.value_shape(id)
+            }
+        })
+        .collect();
+    let dtypes: Vec<DType> = inputs.iter().map(|&id| b.value_dtype(id)).collect();
+    let refs: Vec<&Shape> = shapes.iter().collect();
+    model_ir::kernels::out_shape(rule, &refs, &dtypes, params).unwrap_or_else(|| {
+        panic!("`{routine}`'s out rule does not resolve against this statement's operands")
+    })
 }
 
 pub mod cuda;

@@ -1,4 +1,3 @@
-
 #[must_use]
 pub const fn ceil_div_u32(x: u32, y: u32) -> u32 {
     x.wrapping_add(y).wrapping_sub(1) / y
@@ -54,8 +53,10 @@ pub const fn packed_causal_kv_end(
         return kv_len;
     }
     let kv_len_init = kv_len - qo_len;
-    let end = kv_len_init
-        .wrapping_add(ceil_div_i32((qo_tile_idx + 1).wrapping_mul(cluster_tile_q), group_size));
+    let end = kv_len_init.wrapping_add(ceil_div_i32(
+        (qo_tile_idx + 1).wrapping_mul(cluster_tile_q),
+        group_size,
+    ));
     let clamped = if end < kv_len { end } else { kv_len };
     if clamped > 0 { clamped } else { 0 }
 }

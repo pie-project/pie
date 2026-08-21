@@ -1,4 +1,3 @@
-
 use crate::attn::fa2::geometry::Device;
 use crate::attn::plan::info::{DecodePlanInfo, PrefillPlanInfo};
 
@@ -7,13 +6,11 @@ pub type DevicePtr = u64;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct FastModDiv {
-
     pub divisor: u32,
     pub magic: u64,
 }
 
 impl FastModDiv {
-
     #[must_use]
     pub const fn new(divisor: u32) -> Self {
         let d = if divisor == 0 { 1 } else { divisor };
@@ -21,31 +18,34 @@ impl FastModDiv {
         let q = all_ones / d as u64;
         let r = all_ones % d as u64;
         let carry = if r + 1 == d as u64 { 1 } else { 0 };
-        Self { divisor: d, magic: q.wrapping_add(carry).wrapping_add(1) }
+        Self {
+            divisor: d,
+            magic: q.wrapping_add(carry).wrapping_add(1),
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct UintFastdiv {
-
     pub magic: FastModDiv,
     pub d: u32,
 }
 
 impl UintFastdiv {
-
     #[must_use]
     pub const fn new(divisor: u32) -> Self {
         let d = if divisor == 0 { 1 } else { divisor };
-        Self { magic: FastModDiv::new(d), d }
+        Self {
+            magic: FastModDiv::new(d),
+            d,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct PagedKv {
-
     pub page_size: UintFastdiv,
     pub num_heads: u32,
     pub head_dim: u32,
@@ -64,7 +64,6 @@ pub struct PagedKv {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct DecodeParams {
-
     pub q: DevicePtr,
     pub q_rope_offset: DevicePtr,
     pub paged_kv: PagedKv,
@@ -91,7 +90,6 @@ pub struct DecodeParams {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillPagedParams {
-
     pub q: DevicePtr,
     pub paged_kv: PagedKv,
     pub maybe_custom_mask: DevicePtr,
@@ -136,7 +134,6 @@ pub struct PrefillPagedParams {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct DecodeScoreParams {
-
     pub base: DecodeParams,
     pub score_out: DevicePtr,
     pub score_indptr: DevicePtr,
@@ -145,7 +142,6 @@ pub struct DecodeScoreParams {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillScoreParams {
-
     pub base: PrefillPagedParams,
     pub score_out: DevicePtr,
     pub score_indptr: DevicePtr,
@@ -154,7 +150,6 @@ pub struct PrefillScoreParams {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Buffers {
-
     pub q: DevicePtr,
     pub k_pages: DevicePtr,
     pub v_pages: DevicePtr,
@@ -170,7 +165,6 @@ pub struct Buffers {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Partials {
-
     pub tmp_v: DevicePtr,
     pub tmp_s: DevicePtr,
     pub indptr: DevicePtr,
@@ -184,7 +178,6 @@ pub struct Partials {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
-
     pub info: DecodePlanInfo,
     pub device: Device,
     pub num_requests: i32,
@@ -200,7 +193,6 @@ pub struct DecodePlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillPlan {
-
     pub info: PrefillPlanInfo,
     pub device: Device,
     pub num_requests: i32,
@@ -218,28 +210,42 @@ pub struct PrefillPlan {
 }
 
 impl DecodePlan {
-
     #[must_use]
     pub const fn group_size(&self) -> u32 {
-        if self.num_kv_heads > 0 { (self.num_q_heads / self.num_kv_heads) as u32 } else { 1 }
+        if self.num_kv_heads > 0 {
+            (self.num_q_heads / self.num_kv_heads) as u32
+        } else {
+            1
+        }
     }
 }
 
 impl PrefillPlan {
-
     #[must_use]
     pub const fn group_size(&self) -> u32 {
-        if self.num_kv_heads > 0 { (self.num_q_heads / self.num_kv_heads) as u32 } else { 1 }
+        if self.num_kv_heads > 0 {
+            (self.num_q_heads / self.num_kv_heads) as u32
+        } else {
+            1
+        }
     }
 }
 
 const fn offset_ptr(base: DevicePtr, off: i64) -> DevicePtr {
-    if off < 0 { base } else { base.saturating_add(off as u64) }
+    if off < 0 {
+        base
+    } else {
+        base.saturating_add(off as u64)
+    }
 }
 
 #[must_use]
 pub fn sm_scale_or_default(sm_scale: f32, head_dim: i32) -> f32 {
-    if sm_scale > 0.0 { sm_scale } else { 1.0 / (head_dim as f32).sqrt() }
+    if sm_scale > 0.0 {
+        sm_scale
+    } else {
+        1.0 / (head_dim as f32).sqrt()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,8 +268,16 @@ pub fn make_paged_kv(
         head_dim,
         batch_size,
         stride_page: num_heads.wrapping_mul(page_size).wrapping_mul(head_dim),
-        stride_n: if hnd_layout { head_dim } else { num_heads.wrapping_mul(head_dim) },
-        stride_h: if hnd_layout { page_size.wrapping_mul(head_dim) } else { head_dim },
+        stride_n: if hnd_layout {
+            head_dim
+        } else {
+            num_heads.wrapping_mul(head_dim)
+        },
+        stride_h: if hnd_layout {
+            page_size.wrapping_mul(head_dim)
+        } else {
+            head_dim
+        },
         k_data,
         v_data,
         indices,
@@ -302,7 +316,11 @@ pub fn make_decode_params(
         lse: bufs.lse,
         maybe_alibi_slopes: 0,
         num_qo_heads: plan.num_q_heads as u32,
-        q_stride_n: if broadcast_q { 0 } else { plan.num_q_heads * plan.head_dim },
+        q_stride_n: if broadcast_q {
+            0
+        } else {
+            plan.num_q_heads * plan.head_dim
+        },
         q_stride_h: plan.head_dim,
         window_left,
         logits_soft_cap,

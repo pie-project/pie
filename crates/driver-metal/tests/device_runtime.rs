@@ -43,7 +43,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no runtime step ran");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let dir = tempfile::tempdir().expect("tempdir");
@@ -139,7 +142,7 @@ fn kernels() -> Vec<EmittedKernel> {
 #[test]
 fn compiling_the_same_program_twice_compiles_once_and_hits_memory_after() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(one_stage_package(0x51, 0xD1));
@@ -178,7 +181,7 @@ fn compiling_the_same_program_twice_compiles_once_and_hits_memory_after() {
 #[test]
 fn a_plan_that_cannot_execute_is_rejected_once_and_replayed_after() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // A hidden-state intrinsic marks the plan non-executable at adoption.
@@ -215,7 +218,7 @@ fn a_plan_that_cannot_execute_is_rejected_once_and_replayed_after() {
 #[test]
 fn a_compile_error_is_retryable_and_poisons_nothing() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(one_stage_package(0x53, 0xD3));
@@ -255,7 +258,7 @@ fn a_compile_error_is_retryable_and_poisons_nothing() {
 #[test]
 fn two_programs_sharing_a_stage_share_its_compiled_executable() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(one_stage_package(0x54, 0xD4));
@@ -285,7 +288,7 @@ fn two_programs_sharing_a_stage_share_its_compiled_executable() {
 #[test]
 fn a_missing_singleton_kernel_is_a_deterministic_reject() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(one_stage_package(0x55, 0xD5));
@@ -309,7 +312,7 @@ fn a_missing_singleton_kernel_is_a_deterministic_reject() {
 #[test]
 fn a_fused_refusal_is_data_and_the_program_still_compiles() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut package = one_stage_package(0x56, 0xD6);
@@ -344,7 +347,7 @@ fn a_fused_refusal_is_data_and_the_program_still_compiles() {
 #[test]
 fn more_channel_slots_than_a_lane_can_bind_is_refused() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut package = one_stage_package(0x57, 0xD7);
@@ -371,7 +374,7 @@ fn more_channel_slots_than_a_lane_can_bind_is_refused() {
 #[test]
 fn a_new_emitter_version_recompiles_rather_than_reusing_the_stage() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(one_stage_package(0x58, 0xD8));
@@ -402,7 +405,7 @@ fn a_new_emitter_version_recompiles_rather_than_reusing_the_stage() {
 #[test]
 fn a_second_runtime_replays_the_whole_program_from_the_archive() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let Fixture {

@@ -1,11 +1,9 @@
-
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use kernels::Ty;
 
 pub trait Abi: Copy {
-
     const CPP: &'static str;
 
     const TY: Ty;
@@ -28,7 +26,6 @@ pub fn unpack_aggregate<T: Copy>(
 ) -> Result<T, kernels::Refusal> {
     match value {
         crate::jit::ArgValue::Bytes { ptr, len } if *len == core::mem::size_of::<T>() => {
-
             Ok(unsafe { ptr.cast::<T>().read_unaligned() })
         }
         _ => Err(wrong_kind(at, want)),
@@ -51,7 +48,6 @@ pub struct f16(pub u16);
 pub struct fp8_e4m3(pub u8);
 
 pub trait Inst {
-
     const CPP: &'static str;
 }
 
@@ -130,7 +126,6 @@ impl<T: 'static> kernels::Elem for MaybeConst<T> {
 }
 
 impl<T> MaybeConst<T> {
-
     #[must_use]
     pub fn new(p: *const T) -> Self {
         Self(NonNull::new(p.cast_mut()))
@@ -214,8 +209,7 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p)
-                    | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
                         Ok(p.cast::<$pointee>().cast_const())
                     }
                     _ => Err(wrong_kind(at, Ty::$const_ty)),
@@ -230,8 +224,9 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p)
-                    | crate::jit::ArgValue::Region { ptr: p, .. } => Ok(p.cast::<$pointee>()),
+                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                        Ok(p.cast::<$pointee>())
+                    }
                     _ => Err(wrong_kind(at, Ty::$mut_ty)),
                 }
             }
@@ -248,8 +243,7 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p)
-                    | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
                         Ok(NonNull::new(p.cast::<$pointee>()))
                     }
                     _ => Err(wrong_kind(at, Ty::$mut_ty)),
@@ -263,13 +257,13 @@ macro_rules! ptr_abi {
             const NULLABLE: bool = true;
             fn arg(&self) -> crate::jit::ArgValue {
                 crate::jit::ArgValue::Ptr(
-                    self.0.map_or(core::ptr::null_mut(), |p| p.as_ptr().cast::<c_void>()),
+                    self.0
+                        .map_or(core::ptr::null_mut(), |p| p.as_ptr().cast::<c_void>()),
                 )
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p)
-                    | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
                         Ok(MaybeConst(NonNull::new(p.cast::<$pointee>())))
                     }
                     _ => Err(wrong_kind(at, Ty::$const_ty)),
@@ -309,12 +303,10 @@ impl<E: kernels::Elem> kernels::Elem for Tensor<E> {
     type Write = E::Write;
 
     unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
-
         unsafe { E::advance_read(read, elems) }
     }
 
     unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
-
         unsafe { E::advance_write(write, elems) }
     }
 
@@ -331,17 +323,14 @@ impl<E: kernels::Elem> kernels::ConstRun for Tensor<E> {
 }
 
 impl kernels::Elem for bf16 {
-
     type Read = *const bf16;
     type Write = *mut bf16;
 
     unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
-
         unsafe { read.add(elems) }
     }
 
     unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
-
         unsafe { write.add(elems) }
     }
 
@@ -352,17 +341,14 @@ impl kernels::Elem for bf16 {
 }
 
 impl kernels::Elem for f16 {
-
     type Read = *const f16;
     type Write = *mut f16;
 
     unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
-
         unsafe { read.add(elems) }
     }
 
     unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
-
         unsafe { write.add(elems) }
     }
 
@@ -372,20 +358,8 @@ impl kernels::Elem for f16 {
     const TY_MUT: Ty = Ty::F16sMut;
 }
 
-ptr_abi!(
-    bf16,
-    "const ::pie::bf16*",
-    Bf16s,
-    "::pie::bf16*",
-    Bf16sMut
-);
-ptr_abi!(
-    f16,
-    "const ::pie::f16*",
-    F16s,
-    "::pie::f16*",
-    F16sMut
-);
+ptr_abi!(bf16, "const ::pie::bf16*", Bf16s, "::pie::bf16*", Bf16sMut);
+ptr_abi!(f16, "const ::pie::f16*", F16s, "::pie::f16*", F16sMut);
 ptr_abi!(
     fp8_e4m3,
     "const ::pie::fp8_e4m3*",
@@ -393,9 +367,21 @@ ptr_abi!(
     "::pie::fp8_e4m3*",
     BufMut
 );
-ptr_abi!(i32, "const ::std::int32_t*", I32s, "::std::int32_t*", I32sMut);
+ptr_abi!(
+    i32,
+    "const ::std::int32_t*",
+    I32s,
+    "::std::int32_t*",
+    I32sMut
+);
 
-ptr_abi!(i64, "const ::std::int64_t*", I64s, "::std::int64_t*", BufMut);
+ptr_abi!(
+    i64,
+    "const ::std::int64_t*",
+    I64s,
+    "::std::int64_t*",
+    BufMut
+);
 
 ptr_abi!(
     *const bf16,
@@ -426,16 +412,40 @@ ptr_abi!(
     BufArrayOut
 );
 ptr_abi!(i8, "const ::std::int8_t*", I8s, "::std::int8_t*", I8sMut);
-ptr_abi!(u32, "const ::std::uint32_t*", U32s, "::std::uint32_t*", U32sMut);
+ptr_abi!(
+    u32,
+    "const ::std::uint32_t*",
+    U32s,
+    "::std::uint32_t*",
+    U32sMut
+);
 ptr_abi!(u8, "const ::std::uint8_t*", U8s, "::std::uint8_t*", U8sMut);
 
-ptr_abi!(u16, "const ::std::uint16_t*", U16s, "::std::uint16_t*", U16sMut);
+ptr_abi!(
+    u16,
+    "const ::std::uint16_t*",
+    U16s,
+    "::std::uint16_t*",
+    U16sMut
+);
 ptr_abi!(f32, "const float*", F32s, "float*", F32sMut);
 
 ptr_abi!(c_void, "const void*", Buf, "void*", BufMut);
 
-ptr_abi!(*const c_void, "const void* const*", BufArray, "const void**", BufArrayOut);
-ptr_abi!(*mut c_void, "void* const*", BufArrayMut, "void**", BufArrayOutMut);
+ptr_abi!(
+    *const c_void,
+    "const void* const*",
+    BufArray,
+    "const void**",
+    BufArrayOut
+);
+ptr_abi!(
+    *mut c_void,
+    "void* const*",
+    BufArrayMut,
+    "void**",
+    BufArrayOutMut
+);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Stream(pub *mut c_void);
@@ -448,7 +458,9 @@ impl Abi for Stream {
     }
     fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
         match value {
-            crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => Ok(Self(*p)),
+            crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                Ok(Self(*p))
+            }
             _ => Err(wrong_kind(at, Ty::Stream)),
         }
     }
@@ -460,7 +472,6 @@ pub type DevicePtr = u64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
-
     pub cpp: &'static str,
     pub size: usize,
     pub align: usize,
@@ -469,7 +480,6 @@ pub struct Layout {
 }
 
 pub trait ByValue: Abi {
-
     const LAYOUT: Layout;
 }
 
@@ -606,16 +616,17 @@ macro_rules! by_value {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Bytes<'a> {
-
     pub bytes: &'a [u8],
     pub cpp: &'static str,
 }
 
 impl<'a> Bytes<'a> {
-
     #[must_use]
     pub fn arg(self) -> crate::jit::ArgValue {
-        crate::jit::ArgValue::Bytes { ptr: self.bytes.as_ptr(), len: self.bytes.len() }
+        crate::jit::ArgValue::Bytes {
+            ptr: self.bytes.as_ptr(),
+            len: self.bytes.len(),
+        }
     }
 }
 
@@ -657,7 +668,10 @@ pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
             push_static_assert(
                 &mut out,
                 &format!("__INTADDR__(&((({cpp}*)0)->{field})) == {at}"),
-                &format!("{field}'s offset disagrees with the measurement in {}", layout.probe),
+                &format!(
+                    "{field}'s offset disagrees with the measurement in {}",
+                    layout.probe
+                ),
             );
         }
     }
@@ -671,8 +685,8 @@ pub trait Pointee:
     + kernels::routine::Elem<
         Read: Abi + kernels::routine::Bind<crate::jit::ArgValue>,
         Write: Abi
-            + kernels::routine::Bind<crate::jit::ArgValue>
-            + kernels::routine::BindMut<crate::jit::ArgValue>,
+                   + kernels::routine::Bind<crate::jit::ArgValue>
+                   + kernels::routine::BindMut<crate::jit::ArgValue>,
     >
 {
 }
@@ -682,8 +696,8 @@ impl<T> Pointee for T where
         + kernels::routine::Elem<
             Read: Abi + kernels::routine::Bind<crate::jit::ArgValue>,
             Write: Abi
-            + kernels::routine::Bind<crate::jit::ArgValue>
-            + kernels::routine::BindMut<crate::jit::ArgValue>,
+                       + kernels::routine::Bind<crate::jit::ArgValue>
+                       + kernels::routine::BindMut<crate::jit::ArgValue>,
         >
 {
 }

@@ -196,8 +196,7 @@ fn a_packed_slot_stages_every_word_its_shader_struct_reads() {
     // that the fixture still lowers something routed is
     // `the_fixture_is_routed`'s question, not this one's.
     assert_eq!(
-        seen,
-        0,
+        seen, 0,
         "a dispatch bound a packed struct AND the table names its word count, so the \
          packed convention is back and `PACKED_STRUCT_WORDS` should say so in its text \
          as well as in its rows"

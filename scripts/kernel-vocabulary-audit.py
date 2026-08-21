@@ -94,11 +94,25 @@ for h in HDRS:
 # read it before touching either path.
 if len(launchers) < 100:
     raise SystemExit(
-        f"only {len(launchers)} launchers found under crates/kernels-cuda "
-        f"-- the headers moved and HDRS above no longer reaches them. This "
-        f"audit reports nonsense rather than nothing when that happens: too "
-        f"few launchers makes every table symbol look declared, and it prints "
-        f"a clean bill of health. Fix the glob."
+        f"only {len(launchers)} launchers found under crates/kernels-cuda, "
+        f"and the repair is NOT to fix the glob -- read the paragraph above "
+        f"`HDRS`. The host C++ tree this scans was DELETED, not moved. A "
+        f"launcher is defined here as a host declaration taking a "
+        f"`cudaStream_t` or `cublasHandle_t`, and the live JIT crate has no "
+        f"host C++ at all: its device text is `.cuh` compiled by NVRTC at "
+        f"run time and launched by name from Rust. There is no declaration "
+        f"to find, so repointing the glob would swap this honest failure for "
+        f"a silent pass.\n\n"
+        f"What answering it needs, measured 2026-08-21 rather than guessed: "
+        f"`crates/kernels-cuda/kernels/**/*.cuh` holds 347 distinct "
+        f"`__global__` entry points. The table under `src/` yields 68 symbol "
+        f"strings at this file's `glob`, 271 at `rglob`. The overlap is 23 "
+        f"and 34. So `__global__` is NOT simply the new spelling of "
+        f"'declared' -- the table names logical kernels and the device text "
+        f"is mostly templated internals, and 313 of 347 are named nowhere. "
+        f"Deciding which `__global__`s are the crate's VOCABULARY, as "
+        f"opposed to its private helpers, is the design question. It is a "
+        f"day's work on the naming, not an edit to a path."
     )
 
 # What the table declares (strip the C++ namespace the symbol may carry).

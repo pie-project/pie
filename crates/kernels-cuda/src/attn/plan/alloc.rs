@@ -7,10 +7,12 @@ pub struct AlignedAllocator {
 }
 
 impl AlignedAllocator {
-
     #[must_use]
     pub const fn new(space: usize) -> Self {
-        Self { allocated: 0, remaining: space }
+        Self {
+            allocated: 0,
+            remaining: space,
+        }
     }
 
     #[must_use]
@@ -24,8 +26,11 @@ impl AlignedAllocator {
         alignment: usize,
         what: &'static str,
     ) -> Result<usize, Error> {
-        let padding =
-            if alignment > 1 { (alignment - (self.allocated % alignment)) % alignment } else { 0 };
+        let padding = if alignment > 1 {
+            (alignment - (self.allocated % alignment)) % alignment
+        } else {
+            0
+        };
         if padding > self.remaining || size > self.remaining - padding {
             return Err(Error::WorkspaceOverflow {
                 what,
@@ -52,10 +57,11 @@ pub struct Staging {
 }
 
 impl Staging {
-
     #[must_use]
     pub fn new(len: usize) -> Self {
-        Self { bytes: vec![0u8; len] }
+        Self {
+            bytes: vec![0u8; len],
+        }
     }
 
     #[must_use]

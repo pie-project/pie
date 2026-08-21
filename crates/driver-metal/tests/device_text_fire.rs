@@ -43,6 +43,8 @@ use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFa
 use model::shared::llama_like::forward::llama_like_metal;
 use model_ir::trace::{FireClass, ValueId};
 
+use driver_metal::skip::skipped;
+
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -183,7 +185,7 @@ fn gemma_geometry() -> Geometry {
 #[test]
 fn a_mixture_fires_on_the_device_through_the_same_executor() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -214,10 +216,19 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
         .iter()
         .filter(|k| k.contains("routed") || k.starts_with("route_") || k.contains("router"))
         .count();
-    assert!(
-        routed >= 4,
-        "a mixture states a router, a sort, a gather and three routed \
-         matmuls; found {routed} in {:?}",
+    // Four, exactly, and the four are `router_topk`, `route_sort`,
+    // `route_gather` and `affine_qmv_routed`. The old message counted six
+    // -- "a router, a sort, a gather and three routed matmuls" -- which is
+    // a count of LAUNCHES, and this counts distinct kernel NAMES. The three
+    // routed matmuls differ by which weight they read, not by which kernel
+    // runs, so they are one name; and the stage that puts the experts back
+    // together is `combine_sorted`, which none of these three substrings
+    // catch. Two different things were being counted under one number, and
+    // a floor of 4 let them stay different.
+    assert_eq!(
+        routed, 4,
+        "a mixture names a router, a sort, a gather and a routed matmul; \
+         found {routed} in {:?}",
         lowered.kernels
     );
 
@@ -278,7 +289,7 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
 #[test]
 fn gpt_oss_fires_on_the_device_through_the_same_executor() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -390,7 +401,7 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
 #[test]
 fn gemmas_side_network_fires_on_the_device() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -490,7 +501,7 @@ fn gemmas_side_network_fires_on_the_device() {
 #[test]
 fn the_other_gemmas_per_layer_scalar_fires_on_the_device() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -583,7 +594,7 @@ fn the_other_gemmas_per_layer_scalar_fires_on_the_device() {
 #[test]
 fn the_whole_metal_text_fires_on_the_device() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -677,7 +688,7 @@ fn the_whole_metal_text_fires_on_the_device() {
 #[test]
 fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -749,7 +760,7 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
     use driver_metal::pools::kv::{Pool, translate};
 
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let g = geometry();
@@ -808,7 +819,7 @@ fn a_move_plan_slides_rows_without_smearing_them() {
     use driver_metal::pools::kv::Pool;
 
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     // One layer, one head, tiny pages: the arithmetic is the subject, not the
@@ -886,7 +897,7 @@ fn a_move_plan_slides_rows_without_smearing_them() {
 #[test]
 fn two_whole_text_fires_are_in_flight_at_once() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");

@@ -1064,7 +1064,7 @@ mod tests {
     use tokenizer::Tokenizer;
 
     #[test]
-    #[ignore] // Run with: cargo test diagnostic_per_byte_stats -- --ignored --nocapture
+    #[ignore = "per-byte statistics, not an assertion; -- --ignored --nocapture"]
     fn diagnostic_per_byte_stats() {
         let json_schema = r#"{
             "type": "object",

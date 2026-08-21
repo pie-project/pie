@@ -741,9 +741,8 @@ fn plan_by_routine<'a, R: driver_vulkan::binding::Resolve>(
         geometry,
         min_offset,
     } = binding;
-    let routine = driver_vulkan::hold::routine_for(symbol).unwrap_or_else(|| {
-        panic!("`{symbol}` reaches no routine, so no plan can be made for it")
-    });
+    let routine = driver_vulkan::hold::routine_for(symbol)
+        .unwrap_or_else(|| panic!("`{symbol}` reaches no routine, so no plan can be made for it"));
     let reflection = driver_vulkan::serve::Reflection::new(modules, Capability::Baseline);
     driver_vulkan::serve::plan_routine(
         low,
@@ -1849,7 +1848,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                             rotary_dims: facts.head_dim,
                             n_experts: facts.n_experts,
                             experts_per_token: facts.experts_per_token,
-            ..Default::default()
+                            ..Default::default()
                         },
                         min_offset: device.min_storage_offset(),
                     },
@@ -2425,9 +2424,7 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
             device.run_all(&run).expect("the chain records and submits");
         } else {
             for b in &sets {
-                device
-                    .run(pipeline, b, &params, groups)
-                    .expect("dispatch");
+                device.run(pipeline, b, &params, groups).expect("dispatch");
             }
         }
         let out = device.read(&rows).expect("read back");
@@ -2948,7 +2945,7 @@ fn whole_plan(
         rotary_dims: facts.head_dim,
         n_experts: facts.n_experts,
         experts_per_token: facts.experts_per_token,
-            ..Default::default()
+        ..Default::default()
     };
 
     // Through `serve::fire`, which is the call. This test used to assemble
@@ -3959,7 +3956,7 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
                 rotary_dims: facts.head_dim,
                 n_experts: facts.n_experts,
                 experts_per_token: facts.experts_per_token,
-            ..Default::default()
+                ..Default::default()
             },
             min_offset: device.min_storage_offset(),
         },
@@ -5681,7 +5678,7 @@ fn the_logits_a_fire_leaves_are_one_row_per_readout_and_are_not_f32() {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
-            ..Default::default()
+                ..Default::default()
             },
             tier: Capability::Baseline,
             one_at_a_time: false,
@@ -6337,7 +6334,8 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     // a two-row step of single tokens was never a good witness for "a prefill
     // selects the tiled attention", because it is not one.
     assert_eq!(
-        second.pipelines, first.pipelines,
+        second.pipelines,
+        first.pipelines,
         "the second step built {} pipelines the first did not, but every row \
          of it is a one-token window and so takes the same decode attention",
         second.pipelines - first.pipelines
@@ -8250,7 +8248,7 @@ fn a_shell_refuses_a_model_assembled_out_of_two() {
         rotary_dims: f.head_dim,
         n_experts: 0,
         experts_per_token: 0,
-            ..Default::default()
+        ..Default::default()
     };
     let whole = || Text {
         decode: llama_like_metal(&facts, &metal, FireClass::Decode),

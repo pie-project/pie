@@ -32,7 +32,23 @@
 //! }
 //! ```
 
-#![forbid(unsafe_code)]
+// WAS `forbid`, AND THE ONE THING THAT TOOK IT DOWN IS NAMED HERE.
+//
+// The manifest's note still holds for all but one line: `wgpu` is a safe API
+// and this crate is safe Rust, including the whole device half. The exception
+// is `wgpu::ExperimentalFeatures::enabled()`, which is the only way to ask an
+// adapter for `EXPERIMENTAL_COOPERATIVE_MATRIX` and is `unsafe` because its
+// contract reads *"there may be UB-containing bugs in these apis"* -- an
+// admission about wgpu's own implementation, not a proof obligation this
+// crate can discharge by reasoning about a pointer.
+//
+// So the ratchet is `deny` and not `forbid`, and there is exactly ONE
+// `#[expect(unsafe_code)]` in the tree, in `device.rs` beside the device
+// request, with the argument for it written out there. `deny` still makes any
+// second one a compile error, and `expect` makes the first one a compile error
+// the day it stops being needed. Grep for `unsafe_code` to audit this crate;
+// two hits is the whole story.
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(
     clippy::todo,
@@ -58,6 +74,7 @@ pub use driver::names;
 pub mod programs;
 pub mod reflect;
 pub mod rope;
+pub mod skip;
 
 // The device half: everything below needs an ADAPTER to answer.
 #[cfg(feature = "native")]

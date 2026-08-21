@@ -53,14 +53,22 @@ pub fn bind(
     // same order, same slot numbering, same refusals.
     let mut out = Vec::with_capacity(args.len());
     for (at, ty) in args.iter().enumerate() {
-        let source = sources.get(at).copied().flatten().ok_or(Refusal::Unstated {
-            what: "an argument whose signature does not say where it comes from",
-        })?;
+        let source = sources
+            .get(at)
+            .copied()
+            .flatten()
+            .ok_or(Refusal::Unstated {
+                what: "an argument whose signature does not say where it comes from",
+            })?;
         if matches!(ty, Ty::Raised) {
             out.push(views.raise(source, o, f)?);
             continue;
         }
-        out.push(kernels::bind::one::<ArgValue, _>(*ty, source, &mut Held { o, f })?);
+        out.push(kernels::bind::one::<ArgValue, _>(
+            *ty,
+            source,
+            &mut Held { o, f },
+        )?);
     }
     Ok(out)
 }
@@ -74,12 +82,7 @@ pub fn bind(
 ///
 /// [`Refusal::Unstated`] for a fact this backend does not answer, and whatever
 /// the fact's own absence means otherwise.
-pub fn one(
-    ty: Ty,
-    source: Source,
-    o: &mut Handles<'_>,
-    f: Facts,
-) -> Result<ArgValue, Refusal> {
+pub fn one(ty: Ty, source: Source, o: &mut Handles<'_>, f: Facts) -> Result<ArgValue, Refusal> {
     kernels::bind::one::<ArgValue, _>(ty, source, &mut Held { o, f })
 }
 
@@ -124,7 +127,6 @@ impl Holds for Held<'_, '_> {
         self.o.out_width(n)
     }
 
-
     fn param(&self, n: usize) -> Result<i32, Refusal> {
         self.o.param(n)
     }
@@ -142,5 +144,3 @@ impl Holds for Held<'_, '_> {
         self.f.rows.cast_signed()
     }
 }
-
-

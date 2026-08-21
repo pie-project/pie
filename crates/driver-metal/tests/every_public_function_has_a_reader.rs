@@ -190,8 +190,7 @@ fn applications(text: &str, out: &mut BTreeMap<String, usize>) {
             while after < bytes.len() && bytes[after].is_ascii_whitespace() {
                 after += 1;
             }
-            let applied = bytes.get(after) == Some(&b'(')
-                || bytes[after..].starts_with(b"::<");
+            let applied = bytes.get(after) == Some(&b'(') || bytes[after..].starts_with(b"::<");
             if applied && previous != "fn" {
                 *out.entry(word.to_string()).or_default() += 1;
             }

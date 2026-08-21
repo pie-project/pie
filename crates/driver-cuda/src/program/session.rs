@@ -14,7 +14,6 @@
 
 use super::run::Lane;
 use driver::Extents;
-use driver::driver_api::plan::LaunchStagePlan;
 use driver::tensor_ir::op::IntrinsicId;
 
 use super::channel::{ChannelShape, Rings};
@@ -247,7 +246,7 @@ impl Session {
         Ok(moved)
     }
 
-    /// Run one stage of a compiled program, end to end.
+    /// Run every stage of a compiled program, end to end, as ONE fire.
     ///
     /// `logits` is the readout buffer and `vocab` its row width; `row_of` says
     /// which row a lane samples. One [`Extents`] per lane: a grouped fire's
@@ -255,23 +254,42 @@ impl Session {
     /// submitted. The buffer is the model fire's and is handed in, so a program
     /// that reads no intrinsic may pass a null base.
     ///
-    /// Only one stage: `Prepared` is built from one plan — its value types size
-    /// the scratch, its bindings index the lane table, its op count strides the
-    /// params — so a second stage's regions would index the first stage's
-    /// memory with nothing on the device to fault on. A multi-stage program is
-    /// refused until each stage gets its own `Prepared` sharing one commit (the
-    /// channel cursors advance per fire, not per stage).
+    /// # One `Prepared` per stage, one commit for the program
+    ///
+    /// `Prepared` is built from ONE plan — its value types size the scratch,
+    /// its bindings index the lane table, its op count strides the params — so
+    /// each stage gets its own. Nothing flows between them in scratch: stages
+    /// are separate programs joined only by channels, and by the sinks a
+    /// prologue configures the forward with.
+    ///
+    /// The COMMIT is the program's, not a stage's, because the channel cursors
+    /// advance per fire. Three things follow, and all three are why this cannot
+    /// be a loop over `fire`:
+    ///
+    /// * The readiness gate and the commit read the PROGRAM's channel sets
+    ///   (`program_channels`), so a channel one stage reads and another puts is
+    ///   gated once on its first touch anywhere.
+    /// * Every stage's `Prepared` resolves its cell addresses from the same
+    ///   cursors, which is correct precisely because nothing advances them
+    ///   until the commit at the end.
+    /// * A stage that refuses (clears its commit slot) refuses the whole fire.
+    ///   Every stage still launches — the dummy run, so a blocked fire costs
+    ///   what a running one does — and then nothing moves.
+    ///
+    /// What this REPLACES is a guard that refused any program with more than
+    /// one stage. It also took the caller's chosen plan as an argument, which
+    /// no longer means anything: a program's stages carry their own plans and
+    /// the loop pairs them by index. See `stages_and_plans_agree`.
     ///
     /// # Errors
     ///
-    /// If the program has more than one stage, if the channel sets cannot be
-    /// derived, if a copy fails, or if a region refuses to launch.
+    /// If a launching stage has no plan, if the channel sets cannot be derived,
+    /// if a copy fails, or if a region refuses to launch.
     #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,
         rings: &mut Rings,
         compiled: &Compiled,
-        plan: &LaunchStagePlan,
         control: &Control,
         host: &mut [HostChannel],
         logits: (u64, u32, u32),
@@ -280,14 +298,17 @@ impl Session {
         alloc: &Allocator,
         stream: StreamRef<'_>,
     ) -> Result<Fired> {
-        one_stage_only(compiled)?;
-        let sets = super::channel::stage_channels(plan)
+        stages_and_plans_agree(compiled)?;
+        let sets = super::channel::program_channels(&compiled.plans)
             .map_err(|why| Error::invalid("ptir::session", why))?;
 
         self.pull(rings, host, &sets, stream)?;
         // The control kernels index the registry's flat arrays, so map the
         // dense channel numbers to slots before gating.
-        let (need_full, need_empty) = (self.global(&sets.need_full)?, self.global(&sets.need_empty)?);
+        let (need_full, need_empty) = (
+            self.global(&sets.need_full)?,
+            self.global(&sets.need_empty)?,
+        );
         if !launch_control::readiness(control, rings, &need_full, &need_empty, alloc, stream)? {
             // Name which channel and direction, not a bare `NotReady`. The env
             // check is inline rather than `fire::launch::sg_trace` because that
@@ -342,49 +363,71 @@ impl Session {
                 extents,
             })
             .collect();
-        // WHAT THE PROGRAM IS. A sampler that publishes a constant is
-        // indistinguishable from one that never read the logits, and the ops
-        // are the only place the difference shows.
-        if std::env::var_os("PIE_TRACE_VALUES").is_some() {
-            eprintln!(
-                "[plan] flags={:#x} ops={} values={} error={:?}",
-                plan.flags,
-                plan.ops.len(),
-                plan.value_types.len(),
-                plan.error
-            );
-            for (i, op) in plan.ops.iter().enumerate() {
-                eprintln!(
-                    "[op] {i} code={:#x} intrinsic={} results={}",
-                    op.code, op.intrinsic, op.result_count
-                );
-            }
-        }
-        let mut prepared = Prepared::build(alloc, plan, &members, stream)?;
-        let (base, vocab, row_stride) = logits;
-        if base != 0 {
-            prepared.bind_intrinsic(
-                IntrinsicId::Logits,
-                base,
-                // Raw bf16, which is what the fire writes into the pin:
-                // `deliver_logits` reads the buffer as bf16 and widens
-                // `(bits as u32) << 16`, matching `m1_intrinsic_row_base` for
-                // mode 1. F32 mode (wire byte 0) would stride four bytes per
-                // logit through a two-byte buffer and select different tokens.
-                crate::program::params::INTRINSIC_STORAGE_RAW_BF16,
-                vocab,
-                row_stride,
-                row_of,
-                stream,
-            )?;
-        }
+        // WHAT THE PROGRAM IS -- printed per stage inside the loop below, since
+        // "the plan" is now one of several and a sampler that publishes a
+        // constant is indistinguishable from one that never read the logits.
         // WHICH REGIONS ACTUALLY LAUNCH. A stage's region list is what the
         // compile plane kept, not what the plan declared, so a region dropped
         // there is invisible from every other vantage point: the values it
         // would have written read back as the zeros `Prepared::build` wrote,
         // and nothing faults. `.wiki/migration.md` §11.21.
         let trace = std::env::var_os("PIE_TRACE_VALUES").is_some();
-        for stage in compiled.stages.iter() {
+        let (base, vocab, row_stride) = logits;
+        // Every stage's verdict, ANDed: one refusal refuses the fire. Starts
+        // true so a program whose stages all launch nothing still commits --
+        // the forward ran, the sinks configured it, and the cursors should
+        // advance for the channels its ops named.
+        let mut committed = true;
+        for (index, stage) in compiled.stages.iter().enumerate() {
+            // Its OWN plan. Reaching for the caller's would size stage 1's
+            // scratch from stage 0's value types and launch into it without
+            // faulting, which is the thing `one_prepared_only` used to prevent
+            // by refusing the shape outright.
+            let stage_plan = compiled.plans.get(index).ok_or_else(|| {
+                Error::invalid(
+                    "ptir::session",
+                    format!("stage {index} has regions to launch and no plan to prepare from"),
+                )
+            })?;
+            // A stage with nothing to launch needs no buffers. It is not an
+            // empty case either: the adapter prologue is exactly this, its one
+            // region being a `lora` sink the fire reads out of the plan.
+            if stage.regions.is_empty() {
+                continue;
+            }
+            if trace {
+                eprintln!(
+                    "[plan] stage={index} flags={:#x} ops={} values={} error={:?}",
+                    stage_plan.flags,
+                    stage_plan.ops.len(),
+                    stage_plan.value_types.len(),
+                    stage_plan.error
+                );
+                for (i, op) in stage_plan.ops.iter().enumerate() {
+                    eprintln!(
+                        "[op] {i} code={:#x} intrinsic={} results={}",
+                        op.code, op.intrinsic, op.result_count
+                    );
+                }
+            }
+            let mut prepared = Prepared::build(alloc, stage_plan, &members, stream)?;
+            if base != 0 {
+                prepared.bind_intrinsic(
+                    IntrinsicId::Logits,
+                    base,
+                    // Raw bf16, which is what the fire writes into the pin:
+                    // `deliver_logits` reads the buffer as bf16 and widens
+                    // `(bits as u32) << 16`, matching `m1_intrinsic_row_base`
+                    // for mode 1. F32 mode (wire byte 0) would stride four
+                    // bytes per logit through a two-byte buffer and select
+                    // different tokens.
+                    crate::program::params::INTRINSIC_STORAGE_RAW_BF16,
+                    vocab,
+                    row_stride,
+                    &row_of,
+                    stream,
+                )?;
+            }
             for region in stage.regions.iter() {
                 if trace {
                     eprintln!(
@@ -396,13 +439,15 @@ impl Session {
                 }
                 prepared.launch_region(region, stream)?;
             }
-        }
-        stream.synchronize()?;
-        if trace {
-            prepared.trace_scratch(0, stream)?;
+            // Per stage, because the next stage's regions may read a channel
+            // cell this one wrote through the shared rings.
+            stream.synchronize()?;
+            if trace {
+                prepared.trace_scratch(0, stream)?;
+            }
+            committed &= prepared.committed(stream)?;
         }
 
-        let committed = prepared.committed(stream)?;
         let (taken, put) = (self.global(&sets.taken)?, self.global(&sets.put)?);
         launch_control::commit(control, rings, &taken, &put, committed, alloc, stream)?;
         stream.synchronize()?;
@@ -414,19 +459,73 @@ impl Session {
     }
 }
 
-/// The one-stage precondition, named so a test can reach it without a GPU.
-fn one_stage_only(compiled: &Compiled) -> Result<()> {
-    if compiled.stages.len() > 1 {
+/// The pairing every stage's `Prepared` depends on, named so a test can reach
+/// it without a GPU.
+///
+/// `Session::fire` builds one `Prepared` per launching stage from
+/// `compiled.plans[index]`, so the two arrays have to be parallel and each
+/// launching stage has to be the one its plan describes. A plan that is off by
+/// one sizes a stage's scratch from someone else's value types, indexes the
+/// lane table with someone else's bindings, and strides the params by someone
+/// else's op count — none of which faults on the device.
+///
+/// # What this replaces
+///
+/// A guard that refused any program with more than one COMPILED STAGE, on the
+/// grounds that the fire prepared exactly one and every region indexed it. That
+/// was true when it was written and it is what refused every adapter program:
+/// a `lora` prologue plus a sampling epilogue is two stages, and `lora-probe`
+/// did not merely fail on it — the refusal reached the guest as a fire that
+/// never completed, so it hung at one token with the forward pass running to
+/// completion underneath.
+fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
+    stage_plans_are_parallel(
+        &compiled
+            .stages
+            .iter()
+            .map(|stage| (stage.signature_hash, !stage.regions.is_empty()))
+            .collect::<Vec<_>>(),
+        &compiled
+            .plans
+            .iter()
+            .map(|plan| plan.signature_hash)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The decision [`stages_and_plans_agree`] makes, over the facts it reads.
+///
+/// Projected to signatures and "launches?" first, because a `Region` owns a
+/// loaded cubin and a precondition nobody can test on the host is a
+/// precondition nobody tests.
+fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()> {
+    if stages.len() != plans.len() {
         return Err(Error::invalid(
             "ptir::session",
             format!(
-                "this program has {} stages and the fire prepares one: every \
-                 region would index the first stage's descriptors, scratch and \
-                 channel table. Each stage needs its own `Prepared`, sharing one \
-                 commit because the channel cursors advance per fire",
-                compiled.stages.len()
+                "this program has {} compiled stages and {} plans: the fire pairs \
+                 them by index to prepare each stage's own scratch, so it cannot \
+                 tell which plan describes which stage",
+                stages.len(),
+                plans.len()
             ),
         ));
+    }
+    for (index, (&(signature, launches), &plan)) in stages.iter().zip(plans).enumerate() {
+        // Only a LAUNCHING stage is prepared, so only a launching stage's
+        // signature has to match. A stage with no regions -- the adapter
+        // prologue, whose one region is a sink read out of the plan rather than
+        // compiled -- is skipped by the fire and carries nothing to compare.
+        if launches && signature != plan {
+            return Err(Error::invalid(
+                "ptir::session",
+                format!(
+                    "stage {index} has regions to launch and the plan at that index \
+                     describes a different stage: its regions would index scratch, \
+                     descriptors and a channel table sized for someone else"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -437,46 +536,98 @@ mod tests {
 
     use super::super::runtime::{Compiled, Stage};
 
-    /// A two-stage program is refused before anything is prepared — the check
-    /// is on the compiled stage count, which the caller (passing one plan)
-    /// cannot see. No GPU is touched; the refusal precedes every device call.
+    /// The served shape, and the one that used to be refused outright: an
+    /// adapter prologue that launches nothing plus a sampling epilogue that
+    /// does. Two stages, two plans, one fire.
     #[test]
-    fn a_two_stage_program_is_refused_rather_than_run_against_one_prepared() {
-        let stage = || Stage {
-            signature_hash: 0,
-            regions: Arc::new(Vec::new()),
-        };
-        let two = Compiled {
-            stages: Arc::new(vec![stage(), stage()]),
-            plans: Arc::new(vec![
-                driver::driver_api::plan::LaunchStagePlan::default(),
-                driver::driver_api::plan::LaunchStagePlan::default(),
+    fn an_adapter_prologue_and_a_sampling_epilogue_are_one_fire() {
+        super::stage_plans_are_parallel(&[(0xa11, false), (0xb22, true)], &[0xa11, 0xb22])
+            .expect("the plans are parallel and the launching stage is its own");
+    }
+
+    /// Two stages that BOTH launch is now served too — each gets its own
+    /// `Prepared` and they share the commit.
+    #[test]
+    fn two_launching_stages_each_get_their_own_plan() {
+        super::stage_plans_are_parallel(&[(0xa11, true), (0xb22, true)], &[0xa11, 0xb22])
+            .expect("both launch, both are prepared from their own plan");
+    }
+
+    /// A plan array that is not parallel is refused before anything is
+    /// prepared: the fire pairs by index and has nothing else to pair on.
+    #[test]
+    fn stages_without_a_plan_apiece_are_refused() {
+        let refusal = super::stage_plans_are_parallel(&[(0xa11, true), (0xb22, true)], &[0xa11])
+            .expect_err("two stages, one plan");
+        let text = format!("{refusal:?}");
+        assert!(text.contains("2 compiled stages"), "names how many: {text}");
+        assert!(
+            text.contains("1 plans"),
+            "and how many of the other: {text}"
+        );
+    }
+
+    /// And a launching stage paired with somebody else's plan is refused,
+    /// which is the failure nothing on the device would fault on.
+    #[test]
+    fn a_launching_stage_paired_with_the_wrong_plan_is_refused() {
+        let refusal =
+            super::stage_plans_are_parallel(&[(0xa11, true), (0xb22, true)], &[0xa11, 0xdead])
+                .expect_err("stage 1 is not what plan 1 describes");
+        let text = format!("{refusal:?}");
+        assert!(text.contains("stage 1"), "names which: {text}");
+        assert!(
+            text.contains("scratch") || text.contains("descriptors"),
+            "and what would go wrong: {text}"
+        );
+    }
+
+    /// A stage that launches nothing is never prepared, so its signature is
+    /// never compared -- and demanding a match would refuse the adapter
+    /// prologue for a plan the fire does not read.
+    #[test]
+    fn a_stage_that_launches_nothing_is_not_compared() {
+        super::stage_plans_are_parallel(&[(0xa11, false)], &[0xdead])
+            .expect("nothing is prepared from it");
+    }
+
+    /// The projection the guard actually reads, wired to the real types once,
+    /// so the two halves cannot drift: an empty region list is "launches
+    /// nothing" and a plan's signature is what it describes.
+    #[test]
+    fn the_projection_reads_emptiness_and_the_plans_signature() {
+        let compiled = Compiled {
+            stages: Arc::new(vec![
+                Stage {
+                    signature_hash: 0xa11,
+                    regions: Arc::new(Vec::new()),
+                },
+                Stage {
+                    signature_hash: 0xb22,
+                    regions: Arc::new(Vec::new()),
+                },
             ]),
-            // The coming shape: an adapter prologue and a sampling epilogue.
+            plans: Arc::new(vec![
+                driver::driver_api::plan::LaunchStagePlan {
+                    signature_hash: 0xa11,
+                    ..Default::default()
+                },
+                driver::driver_api::plan::LaunchStagePlan {
+                    signature_hash: 0xb22,
+                    ..Default::default()
+                },
+            ]),
             kinds: Arc::new(vec![
                 super::super::runtime::stage_kind::PROLOGUE,
                 super::super::runtime::stage_kind::EPILOGUE,
             ]),
         };
-        let refusal = super::one_stage_only(&two).expect_err("two stages is refused");
-        // The message names the count, so a caller knows how many to split.
-        let text = format!("{refusal:?}");
-        assert!(
-            text.contains("2 stages"),
-            "the refusal states how many: {text}"
-        );
-        assert!(
-            text.contains("descriptors") || text.contains("scratch"),
-            "and what would go wrong, not merely that something did: {text}"
-        );
+        super::stages_and_plans_agree(&compiled).expect("parallel and paired");
 
-        // One stage is the served case; without this the guard could refuse
-        // everything and still pass above.
-        let one = Compiled {
-            stages: Arc::new(vec![stage()]),
+        let crossed = Compiled {
             plans: Arc::new(vec![driver::driver_api::plan::LaunchStagePlan::default()]),
-            kinds: Arc::new(vec![super::super::runtime::stage_kind::EPILOGUE]),
+            ..compiled
         };
-        super::one_stage_only(&one).expect("one stage is what runs today");
+        super::stages_and_plans_agree(&crossed).expect_err("two stages, one plan");
     }
 }

@@ -1,39 +1,9 @@
-//! gemma3n's forward, declared.
-//!
-//! Transcribed from `gemma3n.cpp`. The second rank-K residual in the
-//! tree, and it shares no statement with the first:
-//!
-//! * deepseek_v4's hyper-connections MIX K streams every layer —
-//!   `hc_pre` reads a mix, `hc_post` writes one back, and no stream is
-//!   ever singled out.
-//! * gemma3n's AltUp PREDICTS the other streams from the active one,
-//!   runs the layer body on that prediction, then CORRECTS all of them
-//!   from the result.
-//!
-//! That difference is what asked the IR two new questions, and both are
-//! now answered: `select` states the window the body READS, and
-//! `kernel!`'s `in_place` states that the per-layer embedding's add
-//! LANDS in the window it read. Neither is gemma3n-specific; both are
-//! things the DSL simply could not say before.
-//!
-//! Both coefficient sets come from the SAME three-statement shape — norm,
-//! scale, a projection through `tanh`, a projection — and then an
-//! unpack. `unpack_predict_coefs` and `unpack_correct_coefs` are separate
-//! symbols because they unpack different layouts, not because the shape
-//! differs.
-//!
-//! Two more things belong to this family alone. `laurel` is a low-rank
-//! branch that lands beside attention and is normed before it does. And
-//! the per-layer embeddings are read PER LAYER, gated, and added to the
-//! corrected streams EXCEPT the active one — which is what makes them a
-//! residual input rather than a second embedding.
-
 pub mod facts;
 
 use self::facts::Gemma3nFacts;
 use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, Val, matmul};
-use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
+use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, Shape};
 
 struct G3nLayerW {
     altup_norm: NormW,
@@ -120,18 +90,14 @@ impl G3nLayerW {
     }
 }
 
-/// The coefficient shape both AltUp halves share, stated once because it
-/// IS one shape: the halves differ only in which weights they read and
-/// how the result unpacks.
 fn altup_coefs(x: &Val, norm: &NormW, router: &MatW, coefs: &MatW, scale: &str) -> Val {
     let n = dsl::cuda::rmsnorm(x, norm);
     let n = dsl::cuda::scalar_mul(&n, scale, None);
     let modality = matmul(&n, router);
-    let modality = dsl::cuda::tanh(&modality);
+    let modality = dsl::cuda::generated::tanh(&modality, modality.layer(), None);
     matmul(&modality, coefs)
 }
 
-/// gemma3n's CUDA text for one fire class.
 pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &Gemma3nFacts,
     class: FireClass,
@@ -139,44 +105,35 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     rope_theta_global: f32,
     rope_theta_local: f32,
 ) -> ForwardPlan {
-    // The activation axis is DECLARED but pinned until the launch wrappers
-    // take a dtype: every statement below states BF16 outs, so a point
-    // instantiated at another A would lie. The pin is a compile refusal,
-    // not a comment. Same for K: the kv writes state native bf16 pages
-    // and nothing here forks on the scheme yet.
+
     const {
         assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
         assert!(K::NATIVE_BF16);
     }
-    // DECODE AND PREFILL, and the difference is one call. This family
-    // served Decode only and PANICKED on anything else — not refused,
-    // panicked, on the first prefill a serving deployment sends. The
-    // class-dependent sites in this text number exactly one, the
-    // attention op, which `dsl::cuda::attention_for` now holds.
-    // The SKU joins the family's FIRST segment ('.'-separated segment two
-    // stays the backend, which `Backend::of_family` parses).
-    let family = format!(
-        "gemma3n-{}-{}.cuda.{}",
-        W1::NAME,
-        K::NAME,
-        class.suffix()
-    );
+
+    let family = format!("gemma3n-{}-{}.cuda.{}", W1::NAME, K::NAME, class.suffix());
     let k = facts.altup.num_streams;
     let active = facts.altup.active;
     dsl::trace_named(&family, |t| {
         dsl::seam(t, &dsl::seam::IN, &[], None);
         let embedded = dsl::embed_with(t, "embed", facts.hidden, facts.vocab);
-        let mut streams = dsl::cuda::hc_expand(&embedded, k, facts.hidden);
+        let mut streams = dsl::cuda::generated::hc_expand(
+            &embedded,
+            (
+                Shape(vec![Dim::Tokens, Dim::Const(k), Dim::Const(facts.hidden)]),
+                DType::BF16,
+            ),
+            embedded.layer(),
+            None,
+        );
 
+        let rt = dsl::rt(t);
         for l in 0..facts.layers() {
-            // THIS LAYER's sliding window, `-1` for none — a
-            // load-time fact the dispatch statements carry, where four
-            // executors used to re-derive it per launch.
+
             let window_left = model_ir::facts::window_left_at(facts.window_left, l);
             let w = G3nLayerW::new(l, facts, norm_eps, W1::REPR);
             let active_in = dsl::select(&streams, active);
 
-            // ── AltUp.predict ────────────────────────────────────────
             let packed = altup_coefs(
                 &active_in,
                 &w.altup_norm,
@@ -184,13 +141,26 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                 &w.altup_predict_coefs,
                 &format!("layer.{l}.altup_scale"),
             );
-            let pcoefs = dsl::cuda::altup_unpack_predict_coefs(&packed, k);
-            let predictions = dsl::cuda::altup_predict(&streams, &pcoefs, k, facts.hidden);
+            let pcoefs = dsl::cuda::generated::altup_unpack_predict_coefs(
+                &packed,
+                (
+                    Shape(vec![Dim::Tokens, Dim::Const(k), Dim::Const(k)]),
+                    DType::F32,
+                ),
+                packed.layer(),
+                None,
+            );
+            let predictions = dsl::cuda::generated::altup_predict(
+                &streams,
+                &pcoefs,
+                (
+                    Shape(vec![Dim::Const(k), Dim::Tokens, Dim::Const(facts.hidden)]),
+                    DType::BF16,
+                ),
+                streams.layer(),
+                None,
+            );
 
-            // ── The layer body, on the ACTIVE prediction ─────────────
-            // `select` is the whole reason this line can exist: in
-            // `gemma3n.cpp` it is `predictions + active * N * H`, a
-            // pointer offset with no kernel behind it.
             let p_active = dsl::select(&predictions, active);
             let x = dsl::cuda::rmsnorm(&p_active, &w.attn_norm);
 
@@ -203,28 +173,34 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             let v = matmul(&x, &w.v_proj);
             let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
             let kk = dsl::cuda::rmsnorm(&kk, &w.k_norm);
-            // The value takes the SCALE-LESS norm: gemma3n norms v too,
-            // and with no gamma.
-            let v = dsl::cuda::rmsnorm_no_scale(&v, facts.attn.head_dim, norm_eps);
-            // Full-attention layers rotate on the global base, sliding
-            // ones on the local — project.rs states the same per-layer
-            // rule for the deployment. No pairing stated means NeoX.
+
+            let v = dsl::cuda::generated::rmsnorm_no_scale(
+                &v,
+                facts.attn.head_dim as i32,
+                norm_eps,
+                v.layer(),
+                None,
+            );
+
             let theta = if window_left < 0 {
                 rope_theta_global
             } else {
                 rope_theta_local
             };
-            let (q, kk) = dsl::cuda::rope(
+            let (q, kk) = dsl::cuda::generated::rope_bf16(
                 &q,
                 &kk,
-                facts.attn.heads,
-                facts.attn.kv_heads,
-                facts.attn.head_dim,
+                facts.attn.heads as i32,
+                facts.attn.kv_heads as i32,
+                facts.attn.head_dim as i32,
                 theta,
                 false,
+                &rt.positions(),
+                q.layer(),
+                None,
             );
             let kv = dsl::Kv::at(t, l);
-            dsl::cuda::write_kv_to_pages(&kk, &v, &kv);
+            dsl::cuda::write_kv_to_pages(&kk, &v, &kv, facts.attn.kv_heads, facts.attn.head_dim);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
             let o = dsl::cuda::attention_for(
                 class,
@@ -239,25 +215,28 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
             .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
-            let mid = dsl::cuda::residual_add(&p_active, &o, facts.hidden);
-            let mid = dsl::cuda::residual_add(&mid, &lau, facts.hidden);
+            let mid = dsl::cuda::generated::residual_add(&p_active, &o, p_active.layer(), None);
+            let mid = dsl::cuda::generated::residual_add(&mid, &lau, mid.layer(), None);
             let mid = dsl::cuda::scalar_mul(&mid, &format!("layer.{l}.laurel_scale"), None);
 
-            // ── MLP ──────────────────────────────────────────────────
             let m = dsl::cuda::rmsnorm(&mid, &w.mlp_norm);
             let gate = matmul(&m, &w.gate_proj);
             let up = matmul(&m, &w.up_proj);
             let gate = if facts.is_sparse(l) {
-                dsl::cuda::gaussian_topk(&gate, facts.intermediate(l), facts.sparsity_std_mult())
+                dsl::cuda::generated::gaussian_topk(
+                    &gate,
+                    facts.sparsity_std_mult(),
+                    gate.layer(),
+                    None,
+                )
             } else {
                 gate
             };
-            let act = dsl::cuda::geglu_tanh_pair(&gate, &up, facts.intermediate(l));
+            let act = dsl::cuda::generated::geglu_tanh(&gate, &up, gate.layer(), None);
             let mlp = matmul(&act, &w.down_proj);
             let mlp = dsl::cuda::rmsnorm(&mlp, &w.post_mlp_norm);
-            let activated = dsl::cuda::residual_add(&mid, &mlp, facts.hidden);
+            let activated = dsl::cuda::generated::residual_add(&mid, &mlp, mid.layer(), None);
 
-            // ── AltUp.correct ────────────────────────────────────────
             let packed = altup_coefs(
                 &activated,
                 &w.altup_correct_norm,
@@ -265,26 +244,27 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                 &w.altup_correct_coefs,
                 &format!("layer.{l}.altup_correct_scale"),
             );
-            let ccoefs = dsl::cuda::altup_unpack_correct_coefs(&packed, k);
-            streams = dsl::cuda::altup_correct(
+            let ccoefs = dsl::cuda::generated::altup_unpack_correct_coefs(
+                &packed,
+                (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::F32),
+                packed.layer(),
+                None,
+            );
+            streams = dsl::cuda::generated::altup_correct(
                 &predictions,
                 &activated,
                 &ccoefs,
-                k,
-                facts.hidden,
-                active,
+                active as i32,
+                predictions.layer(),
+                None,
             );
 
-            // ── PLE: gated, added into every stream but the active ───
-            // K-1 in-place adds, each through its own window — the
-            // driver's `for (k) if (k != act_idx) residual_add(...)`,
-            // launch for launch. `in_place` is what makes each land in
-            // the window it read instead of in a value nothing reads.
             let ple = dsl::embed_with(
                 t,
                 &format!("layer.{l}.embed_per_layer"),
                 facts.ple_width,
-                facts.vocab,
+
+                facts.ple_vocab,
             );
             let g = matmul(&x, &w.ple_gate);
             let ple = dsl::sigmoid_gate_mul(&ple, &g);
@@ -294,53 +274,50 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                     continue;
                 }
                 let win = dsl::select(&streams, s);
-                // `let _`, because the K-1 per-stream PLE adds are IN PLACE
-                // and the value the statement produces is `win` again.
-                // `builder!` blanket-`#[must_use]`s what it generates
-                // (`model-dsl/src/cuda/mod.rs:278`), which is right for a
-                // surface where dropping a result is normally a lost launch;
-                // this is the one site on the surface where it is not.
-                let _ = dsl::cuda::residual_add(&win, &ple, facts.hidden);
+
+                let _ = dsl::cuda::generated::residual_add(&win, &ple, win.layer(), None);
             }
         }
 
-        // The streams collapse by their MEAN, rescaled to the magnitude a
-        // single stream would have had.
         let active_final = dsl::select(&streams, active);
-        let target = dsl::cuda::compute_rms(&active_final);
-        let y = dsl::cuda::mean_streams(&streams, facts.hidden);
-        let y = dsl::cuda::magnitude_rescale(&y, &target, facts.hidden);
+        let target = dsl::cuda::generated::compute_rms(
+            &active_final,
+            (Shape(vec![Dim::Tokens]), DType::F32),
+            active_final.layer(),
+            None,
+        );
+        let y = dsl::cuda::generated::mean_streams(
+            &streams,
+            (
+                Shape(vec![Dim::Tokens, Dim::Const(facts.hidden)]),
+                DType::BF16,
+            ),
+            streams.layer(),
+            None,
+        );
+        let y = dsl::cuda::generated::magnitude_rescale(&y, &target, y.layer(), None);
         dsl::logits_epilogue(
             t,
             &y,
             NormVariant::Gemma,
             false,
             facts.vocab,
-            // Every published gemma-3n caps at 30.0 — the deployment's
-            // `logit_softcap` states the same constant.
+
             Some(crate::gemma_3n::project::FINAL_LOGIT_SOFTCAP),
             norm_eps,
         );
     })
 }
 
-/// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Gemma3nFacts, FireClass, f32, f32, f32) -> ForwardPlan;
 
-/// The shipped SKU's axes — the family's ONE spelling of its point.
-/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claim
-/// all derive from these; a second SKU adds a row, not a respelling.
 pub type ShippedW1 = Bf16Ax;
-/// The activation axis of the shipped point (pinned BF16 in the text).
+
 pub type ShippedA = Bf16Ax;
-/// The KV axis of the shipped point.
+
 pub type ShippedKv = NativeKv;
 
-/// The family's catalogue — every SKU this build ships, enumerated. The
-/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
-/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
-/// row whose statements reach a routine point that does not exist, which
-/// is how the demand set closes: checked, never hoped.
-pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    ("gemma3n-bf16-kv-bf16", gemma3n_cuda::<ShippedW1, ShippedA, ShippedKv>),
-];
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![(
+    "gemma3n-bf16-kv-bf16",
+    gemma3n_cuda::<ShippedW1, ShippedA, ShippedKv>
+),];

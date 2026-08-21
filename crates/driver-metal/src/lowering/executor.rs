@@ -320,10 +320,17 @@ pub fn resolve_arg<S: Resolver>(
         // `lowering::bind::bind` intercepts the `Ty::Raised` argument before
         // `Handles::input` is ever asked for it.
         Arg::Raised { .. } => BoundArg {
-            slice: Slice { address: 0, bytes: 0 },
+            slice: Slice {
+                address: 0,
+                bytes: 0,
+            },
             width: 0,
         },
-        Arg::Arena { at, width, bytes: stride } => {
+        Arg::Arena {
+            at,
+            width,
+            bytes: stride,
+        } => {
             let at64 = *at as u64;
             let bytes = frame.arena.bytes;
             // The row is `width` elements from `at`; the arena must hold the
@@ -589,7 +596,12 @@ mod tests {
         let frame = arena(64);
         let mut store = Store::default();
         assert_eq!(
-            resolve_arg(&Arg::Weight("layer.3.q_proj".into()), frame, Some(1), &mut store),
+            resolve_arg(
+                &Arg::Weight("layer.3.q_proj".into()),
+                frame,
+                Some(1),
+                &mut store
+            ),
             Err(BindRefusal::UnknownWeight("layer.3.q_proj".into())),
             "a trace naming a weight the store lacks was traced against another binding"
         );
@@ -602,8 +614,13 @@ mod tests {
         store
             .weights
             .insert("layer.3.q_proj".into(), slice(0xABC0, 8192));
-        let bound = resolve_arg(&Arg::Weight("layer.3.q_proj".into()), frame, Some(1), &mut store)
-            .expect("the store holds it");
+        let bound = resolve_arg(
+            &Arg::Weight("layer.3.q_proj".into()),
+            frame,
+            Some(1),
+            &mut store,
+        )
+        .expect("the store holds it");
         assert_eq!(bound.slice, slice(0xABC0, 8192));
         assert_eq!(bound.width, 0, "zero is not a missing value here");
     }
@@ -615,8 +632,13 @@ mod tests {
         // dispatch constant. The store is never asked.
         let frame = arena(64);
         let mut store = Store::default();
-        let bound = resolve_arg(&Arg::Weight("scale.rope_theta".into()), frame, Some(1), &mut store)
-            .expect("a scale never refuses");
+        let bound = resolve_arg(
+            &Arg::Weight("scale.rope_theta".into()),
+            frame,
+            Some(1),
+            &mut store,
+        )
+        .expect("a scale never refuses");
         assert_eq!(bound.slice, slice(0, 0));
         assert!(store.weights.is_empty(), "and nothing was looked up");
     }

@@ -359,7 +359,13 @@ fn a_host_side_emitter_bump_recompiles_rather_than_reusing() {
     // A DIFFERENT program hash, so the program tier cannot answer and the
     // question is really about the identity the stage and disk tiers key on.
     runtime
-        .compile(0xC4, &plan, &kernels, Versions::from_compiler(real + 1), target)
+        .compile(
+            0xC4,
+            &plan,
+            &kernels,
+            Versions::from_compiler(real + 1),
+            target,
+        )
         .expect("a bumped emitter version");
     assert!(
         runtime.stats().compilations > after_first,

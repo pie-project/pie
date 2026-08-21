@@ -14,6 +14,7 @@
 //! statement's tags, uniformly. Recording goes through
 //! [`crate::fire::fire`], so the symbol and the run arities come off the
 //! routine's own marker.
+#![cfg_attr(rustfmt, rustfmt::skip)]
 
 // The prelude is fixed while the surface below is generated from another
 // crate's tree, so any one regeneration may leave part of it unused.
@@ -421,7 +422,6 @@ pub fn attention_flashinfer_prefill_lse(
 pub fn mtp_shift_hidden(
     target_hidden: &Val,
     pending_hidden: &Val,
-    out: (Shape, DType),
     qo_indptr: &Val,
     rsv: &Val,
     layer: Option<u32>,
@@ -436,7 +436,9 @@ pub fn mtp_shift_hidden(
         rsv.id,
     ];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::mtp_shift_hidden", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::mtp_shift_hidden>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -483,9 +485,6 @@ pub fn mtp_update_pending_hidden(
 #[must_use]
 pub fn dsv4_boundary_meta_decode(
     positions: &Val,
-    out_pos: (Shape, DType),
-    out_req: (Shape, DType),
-    out_rope: (Shape, DType),
     ratio: i32,
     row_valid: &Val,
     layer: Option<u32>,
@@ -495,7 +494,11 @@ pub fn dsv4_boundary_meta_decode(
     let run_params = vec![ratio as u32];
     let run_inputs = vec![positions.id, row_valid.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![out_pos, out_req, out_rope];
+    let run_outs = vec![
+        ruled_out(&t, "attn::dsv4_boundary_meta_decode", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "attn::dsv4_boundary_meta_decode", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "attn::dsv4_boundary_meta_decode", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::dsv4_boundary_meta_decode>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -518,9 +521,6 @@ pub fn dsv4_boundary_meta_decode(
 #[must_use]
 pub fn dsv4_boundary_meta_paged(
     positions: &Val,
-    out_pos: (Shape, DType),
-    out_req: (Shape, DType),
-    out_rope: (Shape, DType),
     ratio: i32,
     row_valid: &Val,
     qo_indptr: &Val,
@@ -531,7 +531,11 @@ pub fn dsv4_boundary_meta_paged(
     let run_params = vec![ratio as u32];
     let run_inputs = vec![positions.id, row_valid.id, qo_indptr.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![out_pos, out_req, out_rope];
+    let run_outs = vec![
+        ruled_out(&t, "attn::dsv4_boundary_meta_paged", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "attn::dsv4_boundary_meta_paged", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "attn::dsv4_boundary_meta_paged", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::dsv4_boundary_meta_paged>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -605,7 +609,6 @@ pub fn attention_compressed_paged_bf16(
 #[must_use]
 pub fn dsa_index_knorm_rope(
     idx_k: &Val,
-    idx_k_out: (Shape, DType),
     k_norm_weight: &str,
     k_norm_bias: &str,
     rope_dim: i32,
@@ -622,7 +625,9 @@ pub fn dsa_index_knorm_rope(
         k_norm_weight.to_string(),
         k_norm_bias.to_string(),
     ];
-    let run_outs = vec![idx_k_out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::dsa_index_knorm_rope", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::dsa_index_knorm_rope>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -641,7 +646,6 @@ pub fn dsa_index_knorm_rope(
 #[must_use]
 pub fn dsa_index_q_rope(
     idx_q: &Val,
-    idx_q_out: (Shape, DType),
     n_heads: i32,
     head_dim: i32,
     rope_dim: i32,
@@ -659,7 +663,9 @@ pub fn dsa_index_q_rope(
     ];
     let run_inputs = vec![idx_q.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![idx_q_out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::dsa_index_q_rope", OutRule::Split { of: 0, dim_param: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::dsa_index_q_rope>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -956,9 +962,9 @@ pub fn write_kv_to_pages_bf16(
     kvc: &Val,
     num_kv_heads: i32,
     head_dim: i32,
+    first_token: &Val,
     qo_indptr: &Val,
     row_valid: &Val,
-    first_token: &Val,
     layer: Option<u32>,
     state: Option<StateRef>,
 ) {
@@ -968,9 +974,9 @@ pub fn write_kv_to_pages_bf16(
         k_curr.id,
         v_curr.id,
         kvc.id,
+        first_token.id,
         qo_indptr.id,
         row_valid.id,
-        first_token.id,
     ];
     let run_weights: Vec<String> = Vec::new();
     let run_outs: Vec<(Shape, DType)> = Vec::new();
@@ -1024,13 +1030,41 @@ pub fn write_kv_to_pages_quantised(
     assert!(made.is_empty(), "`attn::write_kv_to_pages_quantised` states no result");
 }
 
+/// Generated for `attn::dequant_kv_cache_layer_to_bf16_active` from the
+/// routine's own signature
+/// (`kernels_cuda::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active`);
+/// the statement records through [`crate::fire::fire`], one argument per
+/// mark.
+pub fn dequant_kv_cache_layer_to_bf16_active(
+    kvc: &Val,
+    num_kv_heads: i32,
+    head_dim: i32,
+    layer: Option<u32>,
+    state: Option<StateRef>,
+) {
+    let t = kvc.t.clone();
+    let run_params = vec![num_kv_heads as u32, head_dim as u32];
+    let run_inputs = vec![kvc.id];
+    let run_weights: Vec<String> = Vec::new();
+    let run_outs: Vec<(Shape, DType)> = Vec::new();
+    let made = fire::<kernels_cuda::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active>(&t, Call {
+        inputs: run_inputs,
+        weights: run_weights,
+        params: run_params,
+        outs: run_outs,
+        state,
+        layer,
+        extents: Vec::new(),
+    });
+    assert!(made.is_empty(), "`attn::dequant_kv_cache_layer_to_bf16_active` states no result");
+}
+
 /// Generated for `attn::lse_log2_to_ln` from the routine's own signature
 /// (`kernels_cuda::attn::lse_log2_to_ln`); the statement records through
 /// [`crate::fire::fire`], one argument per mark.
 #[must_use]
 pub fn lse_log2_to_ln(
     lse: &Val,
-    lse_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -1038,7 +1072,9 @@ pub fn lse_log2_to_ln(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![lse.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![lse_out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::lse_log2_to_ln", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::lse_log2_to_ln>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1057,7 +1093,6 @@ pub fn lse_log2_to_ln(
 #[must_use]
 pub fn attention_sink_rescale(
     o: &Val,
-    o_out: (Shape, DType),
     lse: &Val,
     sinks: &str,
     num_q_heads: i32,
@@ -1069,7 +1104,9 @@ pub fn attention_sink_rescale(
     let run_params = vec![num_q_heads as u32, head_dim as u32];
     let run_inputs = vec![o.id, lse.id];
     let run_weights = vec![sinks.to_string()];
-    let run_outs = vec![o_out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::attention_sink_rescale", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::attention_sink_rescale>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1176,7 +1213,6 @@ pub fn attn_res_blend(
     blocks: &Val,
     norm_weight: &str,
     proj_weight: &str,
-    out: (Shape, DType),
     eps: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -1185,7 +1221,9 @@ pub fn attn_res_blend(
     let run_params = vec![eps.to_bits()];
     let run_inputs = vec![prefix.id, blocks.id];
     let run_weights = vec![norm_weight.to_string(), proj_weight.to_string()];
-    let run_outs = vec![out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::attn_res_blend", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::attn_res_blend>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1232,7 +1270,6 @@ pub fn pad_head_dim(
 #[must_use]
 pub fn strip_head_dim(
     padded: &Val,
-    packed: (Shape, DType),
     head_dim: i32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -1241,7 +1278,9 @@ pub fn strip_head_dim(
     let run_params = vec![head_dim as u32];
     let run_inputs = vec![padded.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![packed];
+    let run_outs = vec![
+        ruled_out(&t, "attn::strip_head_dim", OutRule::Shaped { rows_of: 0, width: OutWidth::Param { of: 0 } }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::strip_head_dim>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1358,8 +1397,6 @@ pub fn combine_attn_outputs(
     lse1: &Val,
     o2: &Val,
     lse2: &Val,
-    o_out: (Shape, DType),
-    lse_out: (Shape, DType),
     num_heads: i32,
     head_dim: i32,
     layer: Option<u32>,
@@ -1369,7 +1406,10 @@ pub fn combine_attn_outputs(
     let run_params = vec![num_heads as u32, head_dim as u32];
     let run_inputs = vec![o1.id, lse1.id, o2.id, lse2.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![o_out, lse_out];
+    let run_outs = vec![
+        ruled_out(&t, "attn::combine_attn_outputs", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "attn::combine_attn_outputs", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::attn::combine_attn_outputs>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1431,7 +1471,6 @@ pub fn attention_xqa_decode_bf16_prepared(
 #[must_use]
 pub fn all_reduce_bf16(
     buf: &Val,
-    buf_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -1439,7 +1478,9 @@ pub fn all_reduce_bf16(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![buf.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![buf_out];
+    let run_outs = vec![
+        ruled_out(&t, "dist::all_reduce_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::dist::all_reduce_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1458,7 +1499,6 @@ pub fn all_reduce_bf16(
 #[must_use]
 pub fn all_reduce_bf16_out(
     src: &Val,
-    dst: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -1466,7 +1506,9 @@ pub fn all_reduce_bf16_out(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![src.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![dst];
+    let run_outs = vec![
+        ruled_out(&t, "dist::all_reduce_bf16_out", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::dist::all_reduce_bf16_out>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1631,7 +1673,6 @@ pub fn split_q_gate_bf16(
 #[must_use]
 pub fn sigmoid_gate_inplace_bf16(
     x: &Val,
-    x_out: (Shape, DType),
     gate: &Val,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -1640,7 +1681,9 @@ pub fn sigmoid_gate_inplace_bf16(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![x.id, gate.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![x_out];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::sigmoid_gate_inplace_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::driver_internal::sigmoid_gate_inplace_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1656,6 +1699,10 @@ pub fn sigmoid_gate_inplace_bf16(
 /// Generated for `gemm::act_x_wt_bf16` from the routine's own signature
 /// (`kernels_cuda::gemm::act_x_wt_bf16`); the statement records through
 /// [`crate::fire::fire`], one argument per mark.
+///
+/// The routine's `out(y = rows(..) x weight(w))` rule needs the weight
+/// handle's width, which the statement does not carry; the result stays
+/// `Unstated` and the caller supplies the `Shape`.
 #[must_use]
 pub fn act_x_wt_bf16(
     act: &Val,
@@ -1684,6 +1731,10 @@ pub fn act_x_wt_bf16(
 /// Generated for `gemm::act_x_w` from the routine's own signature
 /// (`kernels_cuda::gemm::act_x_w`); the statement records through
 /// [`crate::fire::fire`], one argument per mark.
+///
+/// The routine's `out(y = rows(..) x weight(w))` rule needs the weight
+/// handle's width, which the statement does not carry; the result stays
+/// `Unstated` and the caller supplies the `Shape`.
 #[must_use]
 pub fn act_x_w(
     act: &Val,
@@ -1717,7 +1768,6 @@ pub fn act_x_w_acc(
     act: &Val,
     w: &str,
     y: &Val,
-    y_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -1725,7 +1775,9 @@ pub fn act_x_w_acc(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![act.id, y.id];
     let run_weights = vec![w.to_string()];
-    let run_outs = vec![y_out];
+    let run_outs = vec![
+        ruled_out(&t, "gemm::act_x_w_acc", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::gemm::act_x_w_acc>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1803,6 +1855,10 @@ pub fn grouped_act_x_wt_bf16(
 /// Generated for `gemm::act_x_wt_bias_bf16` from the routine's own
 /// signature (`kernels_cuda::gemm::act_x_wt_bias_bf16`); the statement
 /// records through [`crate::fire::fire`], one argument per mark.
+///
+/// The routine's `out(y = rows(..) x weight(w))` rule needs the weight
+/// handle's width, which the statement does not carry; the result stays
+/// `Unstated` and the caller supplies the `Shape`.
 #[must_use]
 pub fn act_x_wt_bias_bf16(
     act: &Val,
@@ -1866,8 +1922,6 @@ pub fn split_bf16_rows(
 #[must_use]
 pub fn split_qwen_gdn_ba(
     ba: &Val,
-    b_out: (Shape, DType),
-    a_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> (Val, Val) {
@@ -1875,7 +1929,10 @@ pub fn split_qwen_gdn_ba(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![ba.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![b_out, a_out];
+    let run_outs = vec![
+        ruled_out(&t, "layout::split_qwen_gdn_ba", OutRule::Shaped { rows_of: 0, width: OutWidth::Half { of: 0 } }, &run_inputs, &run_params),
+        ruled_out(&t, "layout::split_qwen_gdn_ba", OutRule::Shaped { rows_of: 0, width: OutWidth::Half { of: 0 } }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::layout::split_qwen_gdn_ba>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -1983,7 +2040,6 @@ pub fn embed_bf16(
 pub fn swiglu(
     gate: &Val,
     up: &Val,
-    y: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -1991,7 +2047,9 @@ pub fn swiglu(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![gate.id, up.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::swiglu", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::swiglu>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2011,7 +2069,6 @@ pub fn swiglu(
 pub fn swiglu_clamp(
     gate: &Val,
     up: &Val,
-    y: (Shape, DType),
     limit: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -2020,7 +2077,9 @@ pub fn swiglu_clamp(
     let run_params = vec![limit.to_bits()];
     let run_inputs = vec![gate.id, up.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::swiglu_clamp", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::swiglu_clamp>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2040,7 +2099,6 @@ pub fn swiglu_clamp(
 pub fn situ(
     gate: &Val,
     up: &Val,
-    y: (Shape, DType),
     beta: f32,
     linear_beta: f32,
     layer: Option<u32>,
@@ -2050,7 +2108,9 @@ pub fn situ(
     let run_params = vec![beta.to_bits(), linear_beta.to_bits()];
     let run_inputs = vec![gate.id, up.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::situ", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::situ>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2070,7 +2130,6 @@ pub fn situ(
 pub fn geglu_tanh(
     gate: &Val,
     up: &Val,
-    y: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -2078,7 +2137,9 @@ pub fn geglu_tanh(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![gate.id, up.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::geglu_tanh", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::geglu_tanh>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2126,7 +2187,6 @@ pub fn relu2(
 pub fn gpt_oss_glu(
     gate: &Val,
     up: &Val,
-    y: (Shape, DType),
     limit: f32,
     alpha: f32,
     layer: Option<u32>,
@@ -2136,7 +2196,9 @@ pub fn gpt_oss_glu(
     let run_params = vec![limit.to_bits(), alpha.to_bits()];
     let run_inputs = vec![gate.id, up.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::gpt_oss_glu", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::gpt_oss_glu>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2184,7 +2246,6 @@ pub fn chunked_swiglu(
 pub fn chunked_swiglu_into(
     packed: &Val,
     y: &Val,
-    y_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -2192,7 +2253,9 @@ pub fn chunked_swiglu_into(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![packed.id, y.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y_out];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::chunked_swiglu_into", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::chunked_swiglu_into>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2211,7 +2274,6 @@ pub fn chunked_swiglu_into(
 #[must_use]
 pub fn chunked_swiglu_clamp(
     packed: &Val,
-    y: (Shape, DType),
     limit: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -2220,7 +2282,9 @@ pub fn chunked_swiglu_clamp(
     let run_params = vec![limit.to_bits()];
     let run_inputs = vec![packed.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::chunked_swiglu_clamp", OutRule::Shaped { rows_of: 0, width: OutWidth::Half { of: 0 } }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::chunked_swiglu_clamp>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2239,7 +2303,6 @@ pub fn chunked_swiglu_clamp(
 #[must_use]
 pub fn chunked_situ(
     packed: &Val,
-    y: (Shape, DType),
     beta: f32,
     linear_beta: f32,
     layer: Option<u32>,
@@ -2249,7 +2312,9 @@ pub fn chunked_situ(
     let run_params = vec![beta.to_bits(), linear_beta.to_bits()];
     let run_inputs = vec![packed.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::chunked_situ", OutRule::Shaped { rows_of: 0, width: OutWidth::Half { of: 0 } }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::chunked_situ>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2268,7 +2333,6 @@ pub fn chunked_situ(
 #[must_use]
 pub fn chunked_geglu_tanh(
     packed: &Val,
-    y: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -2276,7 +2340,9 @@ pub fn chunked_geglu_tanh(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![packed.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::chunked_geglu_tanh", OutRule::Shaped { rows_of: 0, width: OutWidth::Half { of: 0 } }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::chunked_geglu_tanh>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2297,7 +2363,6 @@ pub fn sigmoid_dot_scalar_gate_add(
     x: &Val,
     gate_w: &str,
     out: &Val,
-    out_out: (Shape, DType),
     y: &Val,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -2306,7 +2371,9 @@ pub fn sigmoid_dot_scalar_gate_add(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![x.id, out.id, y.id];
     let run_weights = vec![gate_w.to_string()];
-    let run_outs = vec![out_out];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::sigmoid_dot_scalar_gate_add", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::sigmoid_dot_scalar_gate_add>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2325,7 +2392,6 @@ pub fn sigmoid_dot_scalar_gate_add(
 #[must_use]
 pub fn gaussian_topk(
     x: &Val,
-    x_out: (Shape, DType),
     std_multiplier: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -2334,7 +2400,9 @@ pub fn gaussian_topk(
     let run_params = vec![std_multiplier.to_bits()];
     let run_inputs = vec![x.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![x_out];
+    let run_outs = vec![
+        ruled_out(&t, "mlp::gaussian_topk", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::mlp::gaussian_topk>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2542,7 +2610,6 @@ pub fn topk_sigmoid_bias_fp32(
 pub fn apply_per_expert_scale(
     topk_idx: &Val,
     topk_w: &Val,
-    topk_w_out: (Shape, DType),
     per_expert_scale: &str,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -2551,7 +2618,9 @@ pub fn apply_per_expert_scale(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![topk_idx.id, topk_w.id];
     let run_weights = vec![per_expert_scale.to_string()];
-    let run_outs = vec![topk_w_out];
+    let run_outs = vec![
+        ruled_out(&t, "moe::apply_per_expert_scale", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::moe::apply_per_expert_scale>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2820,7 +2889,6 @@ pub fn token_batched_weighted_sum_add(
     src: &Val,
     weights: &Val,
     out: &Val,
-    out_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -2828,7 +2896,9 @@ pub fn token_batched_weighted_sum_add(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![src.id, weights.id, out.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![out_out];
+    let run_outs = vec![
+        ruled_out(&t, "moe::token_batched_weighted_sum_add", OutRule::Like { of: 2 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::moe::token_batched_weighted_sum_add>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2847,7 +2917,6 @@ pub fn token_batched_weighted_sum_add(
 #[must_use]
 pub fn add_moe_route_bias(
     out: &Val,
-    out_out: (Shape, DType),
     bias: &str,
     topk_idx: &Val,
     out_stride: i32,
@@ -2858,7 +2927,9 @@ pub fn add_moe_route_bias(
     let run_params = vec![out_stride as u32];
     let run_inputs = vec![out.id, topk_idx.id];
     let run_weights = vec![bias.to_string()];
-    let run_outs = vec![out_out];
+    let run_outs = vec![
+        ruled_out(&t, "moe::add_moe_route_bias", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::moe::add_moe_route_bias>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2907,7 +2978,6 @@ pub fn rmsnorm_strided_bf16(
 pub fn rmsnorm_bf16_with_fp16(
     x: &Val,
     weight: &str,
-    y: (Shape, DType),
     y_fp16: (Shape, DType),
     eps: f32,
     layer: Option<u32>,
@@ -2917,7 +2987,10 @@ pub fn rmsnorm_bf16_with_fp16(
     let run_params = vec![eps.to_bits()];
     let run_inputs = vec![x.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![y, y_fp16];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_bf16_with_fp16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        y_fp16,
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_bf16_with_fp16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2940,7 +3013,6 @@ pub fn rmsnorm_bf16_with_fp16(
 pub fn rmsnorm(
     x: &Val,
     weight: &str,
-    y: (Shape, DType),
     per_head_dim: i32,
     eps: f32,
     layer: Option<u32>,
@@ -2950,7 +3022,9 @@ pub fn rmsnorm(
     let run_params = vec![per_head_dim as u32, eps.to_bits()];
     let run_inputs = vec![x.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2970,7 +3044,6 @@ pub fn rmsnorm(
 pub fn rmsnorm_gemma(
     x: &Val,
     weight: &str,
-    y: (Shape, DType),
     per_head_dim: i32,
     eps: f32,
     layer: Option<u32>,
@@ -2980,7 +3053,9 @@ pub fn rmsnorm_gemma(
     let run_params = vec![per_head_dim as u32, eps.to_bits()];
     let run_inputs = vec![x.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_gemma", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_gemma>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -2999,7 +3074,6 @@ pub fn rmsnorm_gemma(
 #[must_use]
 pub fn rmsnorm_no_scale(
     x: &Val,
-    y: (Shape, DType),
     per_head_dim: i32,
     eps: f32,
     layer: Option<u32>,
@@ -3009,7 +3083,9 @@ pub fn rmsnorm_no_scale(
     let run_params = vec![per_head_dim as u32, eps.to_bits()];
     let run_inputs = vec![x.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_no_scale", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_no_scale>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3030,7 +3106,6 @@ pub fn rmsnorm_gated(
     x: &Val,
     gate: &Val,
     weight: &str,
-    y: (Shape, DType),
     per_head_dim: i32,
     eps: f32,
     layer: Option<u32>,
@@ -3040,7 +3115,9 @@ pub fn rmsnorm_gated(
     let run_params = vec![per_head_dim as u32, eps.to_bits()];
     let run_inputs = vec![x.id, gate.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_gated", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_gated>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3061,7 +3138,6 @@ pub fn rmsnorm_gated_fp32_in(
     x: &Val,
     gate: &Val,
     weight: &str,
-    y: (Shape, DType),
     eps: f32,
     per_head_dim: i32,
     layer: Option<u32>,
@@ -3071,7 +3147,9 @@ pub fn rmsnorm_gated_fp32_in(
     let run_params = vec![eps.to_bits(), per_head_dim as u32];
     let run_inputs = vec![x.id, gate.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_gated_fp32_in", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_gated_fp32_in>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3092,7 +3170,6 @@ pub fn residual_add_rmsnorm(
     hidden: &Val,
     residual: &Val,
     weight: &str,
-    norm_out: (Shape, DType),
     eps: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3101,7 +3178,9 @@ pub fn residual_add_rmsnorm(
     let run_params = vec![eps.to_bits()];
     let run_inputs = vec![hidden.id, residual.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![norm_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::residual_add_rmsnorm", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::residual_add_rmsnorm>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3122,7 +3201,6 @@ pub fn rmsnorm_residual_add(
     x: &Val,
     weight: &str,
     hidden: &Val,
-    hidden_out: (Shape, DType),
     eps: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3131,7 +3209,9 @@ pub fn rmsnorm_residual_add(
     let run_params = vec![eps.to_bits()];
     let run_inputs = vec![x.id, hidden.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![hidden_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_residual_add", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_residual_add>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3153,10 +3233,8 @@ pub fn rmsnorm_residual_add_scale_rmsnorm_bf16(
     x: &Val,
     weight: &str,
     hidden: &Val,
-    hidden_out: (Shape, DType),
     scale: f32,
     next_weight: &str,
-    norm_out: (Shape, DType),
     eps: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3165,7 +3243,10 @@ pub fn rmsnorm_residual_add_scale_rmsnorm_bf16(
     let run_params = vec![scale.to_bits(), eps.to_bits()];
     let run_inputs = vec![x.id, hidden.id];
     let run_weights = vec![weight.to_string(), next_weight.to_string()];
-    let run_outs = vec![hidden_out, norm_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::rmsnorm_residual_add_scale_rmsnorm_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+        ruled_out(&t, "norm::rmsnorm_residual_add_scale_rmsnorm_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::rmsnorm_residual_add_scale_rmsnorm_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3187,7 +3268,6 @@ pub fn rmsnorm_residual_add_scale_rmsnorm_bf16(
 #[must_use]
 pub fn add_bias(
     out: &Val,
-    out_out: (Shape, DType),
     bias: &str,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3196,7 +3276,9 @@ pub fn add_bias(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![out.id];
     let run_weights = vec![bias.to_string()];
-    let run_outs = vec![out_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::add_bias", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::add_bias>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3245,7 +3327,6 @@ pub fn altup_correct(
     predictions: &Val,
     activated: &Val,
     correction_coefs_plus_one: &Val,
-    corrected: (Shape, DType),
     active_idx: i32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3258,7 +3339,9 @@ pub fn altup_correct(
         correction_coefs_plus_one.id,
     ];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![corrected];
+    let run_outs = vec![
+        ruled_out(&t, "norm::altup_correct", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::altup_correct>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3304,7 +3387,6 @@ pub fn compute_rms(
 #[must_use]
 pub fn magnitude_rescale(
     x: &Val,
-    x_out: (Shape, DType),
     target_rms: &Val,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3313,7 +3395,9 @@ pub fn magnitude_rescale(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![x.id, target_rms.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![x_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::magnitude_rescale", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::magnitude_rescale>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3413,7 +3497,6 @@ pub fn altup_unpack_correct_coefs(
 #[must_use]
 pub fn tanh(
     x: &Val,
-    x_out: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -3421,7 +3504,9 @@ pub fn tanh(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![x.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![x_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::tanh", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::tanh>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3440,7 +3525,6 @@ pub fn tanh(
 #[must_use]
 pub fn residual_add(
     y: &Val,
-    y_out: (Shape, DType),
     x: &Val,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3449,7 +3533,9 @@ pub fn residual_add(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![y.id, x.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![y_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::residual_add", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::residual_add>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3468,7 +3554,6 @@ pub fn residual_add(
 #[must_use]
 pub fn scalar_mul(
     x: &Val,
-    x_out: (Shape, DType),
     s: f32,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3477,7 +3562,9 @@ pub fn scalar_mul(
     let run_params = vec![s.to_bits()];
     let run_inputs = vec![x.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![x_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::scalar_mul", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::scalar_mul>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3542,7 +3629,6 @@ pub fn hc_post(
     residual: &Val,
     post_mix: &Val,
     comb_mix: &Val,
-    out_residual: (Shape, DType),
     layer: Option<u32>,
     state: Option<StateRef>,
 ) -> Val {
@@ -3550,7 +3636,9 @@ pub fn hc_post(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![x.id, residual.id, post_mix.id, comb_mix.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![out_residual];
+    let run_outs = vec![
+        ruled_out(&t, "norm::hc_post", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::hc_post>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3655,7 +3743,6 @@ pub fn hc_rmsnorm_to_f32(
 #[must_use]
 pub fn attn_sink_correction(
     out: &Val,
-    out_out: (Shape, DType),
     lse: &Val,
     sink: &str,
     head_dim: i32,
@@ -3666,7 +3753,9 @@ pub fn attn_sink_correction(
     let run_params = vec![head_dim as u32];
     let run_inputs = vec![out.id, lse.id];
     let run_weights = vec![sink.to_string()];
-    let run_outs = vec![out_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::attn_sink_correction", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::attn_sink_correction>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3685,7 +3774,6 @@ pub fn attn_sink_correction(
 #[must_use]
 pub fn per_head_rmsnorm(
     q: &Val,
-    q_out: (Shape, DType),
     head_dim: i32,
     eps: f32,
     layer: Option<u32>,
@@ -3695,7 +3783,9 @@ pub fn per_head_rmsnorm(
     let run_params = vec![head_dim as u32, eps.to_bits()];
     let run_inputs = vec![q.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out];
+    let run_outs = vec![
+        ruled_out(&t, "norm::per_head_rmsnorm", OutRule::Split { of: 0, dim_param: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::norm::per_head_rmsnorm>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -3741,7 +3831,6 @@ pub fn cast_fp32_to(
 #[must_use]
 pub fn scale_rows(
     buf_bf16: &Val,
-    buf_bf16_out: (Shape, DType),
     l_bf16: &Val,
     layer: Option<u32>,
     state: Option<StateRef>,
@@ -3750,7 +3839,9 @@ pub fn scale_rows(
     let run_params: Vec<u32> = Vec::new();
     let run_inputs = vec![buf_bf16.id, l_bf16.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![buf_bf16_out];
+    let run_outs = vec![
+        ruled_out(&t, "quant::scale_rows", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::quant::scale_rows>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4165,9 +4256,7 @@ pub fn rope_standard_table(
 #[must_use]
 pub fn rope_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     num_q_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -4187,7 +4276,10 @@ pub fn rope_bf16(
     ];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::rope_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4209,7 +4301,6 @@ pub fn rope_bf16(
 #[must_use]
 pub fn rope_write_kv_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
     v: &Val,
     interleaved: bool,
@@ -4242,7 +4333,9 @@ pub fn rope_write_kv_bf16(
         positions.id,
     ];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_write_kv_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_write_kv_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4261,9 +4354,7 @@ pub fn rope_write_kv_bf16(
 #[must_use]
 pub fn qk_rmsnorm_rope_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     q_weight: &str,
     k_weight: &str,
     head_dim: i32,
@@ -4277,7 +4368,10 @@ pub fn qk_rmsnorm_rope_bf16(
     let run_params = vec![head_dim as u32, theta.to_bits(), eps.to_bits()];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights = vec![q_weight.to_string(), k_weight.to_string()];
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::qk_rmsnorm_rope_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::qk_rmsnorm_rope_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::qk_rmsnorm_rope_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4347,9 +4441,7 @@ pub fn qk_rmsnorm_rope_bf16_devwin(
 #[must_use]
 pub fn qk_rmsnorm_mrope_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     q_weight: &str,
     k_weight: &str,
     mrope_section_t: i32,
@@ -4377,7 +4469,10 @@ pub fn qk_rmsnorm_mrope_bf16(
     ];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights = vec![q_weight.to_string(), k_weight.to_string()];
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::qk_rmsnorm_mrope_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::qk_rmsnorm_mrope_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::qk_rmsnorm_mrope_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4399,9 +4494,7 @@ pub fn qk_rmsnorm_mrope_bf16(
 #[must_use]
 pub fn qk_rmsnorm_rope_bf16_rounded(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     q_weight: &str,
     k_weight: &str,
     head_dim: i32,
@@ -4415,7 +4508,10 @@ pub fn qk_rmsnorm_rope_bf16_rounded(
     let run_params = vec![head_dim as u32, theta.to_bits(), eps.to_bits()];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights = vec![q_weight.to_string(), k_weight.to_string()];
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::qk_rmsnorm_rope_bf16_rounded", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::qk_rmsnorm_rope_bf16_rounded", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::qk_rmsnorm_rope_bf16_rounded>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4437,7 +4533,6 @@ pub fn qk_rmsnorm_rope_bf16_rounded(
 #[must_use]
 pub fn q_rmsnorm_rope_bf16_rounded(
     q: &Val,
-    q_out: (Shape, DType),
     q_weight: &str,
     head_dim: i32,
     theta: f32,
@@ -4450,7 +4545,9 @@ pub fn q_rmsnorm_rope_bf16_rounded(
     let run_params = vec![head_dim as u32, theta.to_bits(), eps.to_bits()];
     let run_inputs = vec![q.id, positions.id];
     let run_weights = vec![q_weight.to_string()];
-    let run_outs = vec![q_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::q_rmsnorm_rope_bf16_rounded", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::q_rmsnorm_rope_bf16_rounded>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4469,9 +4566,7 @@ pub fn q_rmsnorm_rope_bf16_rounded(
 #[must_use]
 pub fn rope_yarn_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     factor: f32,
     low_freq_factor: f32,
     high_freq_factor: f32,
@@ -4497,7 +4592,10 @@ pub fn rope_yarn_bf16(
     ];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_yarn_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::rope_yarn_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_yarn_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4519,9 +4617,7 @@ pub fn rope_yarn_bf16(
 #[must_use]
 pub fn rope_yarn_original_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     head_dim: i32,
     theta: f32,
     factor: f32,
@@ -4547,7 +4643,10 @@ pub fn rope_yarn_original_bf16(
     ];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_yarn_original_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::rope_yarn_original_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_yarn_original_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4569,9 +4668,7 @@ pub fn rope_yarn_original_bf16(
 #[must_use]
 pub fn rope_partial_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     k: &Val,
-    k_out: (Shape, DType),
     rotary_dim: i32,
     head_dim: i32,
     theta: f32,
@@ -4587,7 +4684,10 @@ pub fn rope_partial_bf16(
     ];
     let run_inputs = vec![q.id, k.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out, k_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_partial_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+        ruled_out(&t, "rope::rope_partial_bf16", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_partial_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4609,7 +4709,6 @@ pub fn rope_partial_bf16(
 #[must_use]
 pub fn rope_partial_q_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     rotary_dim: i32,
     head_dim: i32,
     theta: f32,
@@ -4625,7 +4724,9 @@ pub fn rope_partial_q_bf16(
     ];
     let run_inputs = vec![q.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_partial_q_bf16", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_partial_q_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4692,7 +4793,6 @@ pub fn rope_partial_last_bf16(
 #[must_use]
 pub fn rope_partial_last_q_bf16(
     q: &Val,
-    q_out: (Shape, DType),
     head_dim: i32,
     rotary_dim: i32,
     theta: f32,
@@ -4718,7 +4818,9 @@ pub fn rope_partial_last_q_bf16(
     ];
     let run_inputs = vec![q.id, positions.id];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![q_out];
+    let run_outs = vec![
+        ruled_out(&t, "rope::rope_partial_last_q_bf16", OutRule::Split { of: 0, dim_param: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::rope::rope_partial_last_q_bf16>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4769,7 +4871,6 @@ pub fn causal_conv1d_update_batched(
     x: &Val,
     weight: &str,
     bias: Option<&str>,
-    y: (Shape, DType),
     c: i32,
     k: i32,
     rsv: &Val,
@@ -4784,7 +4885,9 @@ pub fn causal_conv1d_update_batched(
     if let Some(w) = bias {
         run_weights.push(w.to_string());
     }
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "ssm::causal_conv1d_update_batched", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::ssm::causal_conv1d_update_batched>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4805,7 +4908,6 @@ pub fn causal_conv1d_prefill_batched(
     x: &Val,
     weight: &str,
     bias: Option<&str>,
-    y: (Shape, DType),
     c: i32,
     k: i32,
     rsv: &Val,
@@ -4822,7 +4924,9 @@ pub fn causal_conv1d_prefill_batched(
     if let Some(w) = bias {
         run_weights.push(w.to_string());
     }
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "ssm::causal_conv1d_prefill_batched", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::ssm::causal_conv1d_prefill_batched>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -4990,7 +5094,6 @@ pub fn kda_o_norm_gated(
     o: &Val,
     g: &Val,
     weight: &str,
-    out: (Shape, DType),
     h: i32,
     d: i32,
     eps: f32,
@@ -5001,7 +5104,9 @@ pub fn kda_o_norm_gated(
     let run_params = vec![h as u32, d as u32, eps.to_bits()];
     let run_inputs = vec![o.id, g.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![out];
+    let run_outs = vec![
+        ruled_out(&t, "ssm::kda_o_norm_gated", OutRule::Like { of: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::ssm::kda_o_norm_gated>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -5065,7 +5170,6 @@ pub fn kda_prefill_batched(
     v: &Val,
     gate: &Val,
     beta: &Val,
-    out: (Shape, DType),
     h: i32,
     d: i32,
     rsv: &Val,
@@ -5085,7 +5189,9 @@ pub fn kda_prefill_batched(
         qo_indptr.id,
     ];
     let run_weights: Vec<String> = Vec::new();
-    let run_outs = vec![out];
+    let run_outs = vec![
+        ruled_out(&t, "ssm::kda_prefill_batched", OutRule::Split { of: 2, dim_param: 1 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::ssm::kda_prefill_batched>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,
@@ -5180,7 +5286,6 @@ pub fn zamba_rmsnorm_gated(
     x: &Val,
     gate: &Val,
     weight: &str,
-    y: (Shape, DType),
     n_groups: i32,
     eps: f32,
     layer: Option<u32>,
@@ -5190,7 +5295,9 @@ pub fn zamba_rmsnorm_gated(
     let run_params = vec![n_groups as u32, eps.to_bits()];
     let run_inputs = vec![x.id, gate.id];
     let run_weights = vec![weight.to_string()];
-    let run_outs = vec![y];
+    let run_outs = vec![
+        ruled_out(&t, "ssm::zamba_rmsnorm_gated", OutRule::Like { of: 0 }, &run_inputs, &run_params),
+    ];
     let made = fire::<kernels_cuda::ssm::zamba_rmsnorm_gated>(&t, Call {
         inputs: run_inputs,
         weights: run_weights,

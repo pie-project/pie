@@ -249,9 +249,7 @@ impl Pipelines {
         }
         let requests: Vec<Request> = wanted
             .iter()
-            .map(|(file, symbol, stamp)| {
-                Request::stamped(self.root.join(file), *symbol, *stamp)
-            })
+            .map(|(file, symbol, stamp)| Request::stamped(self.root.join(file), *symbol, *stamp))
             .collect();
         let compiled = compiler.compile_batch(context, &requests);
         for ((_, symbol, _), built) in wanted.iter().zip(compiled.pipelines) {
@@ -517,10 +515,7 @@ pub fn encode(
         n += 1;
     }
     if std::env::var_os("PIE_METAL_BARRIER_COUNT").is_some() {
-        eprintln!(
-            "barriers {n} of {} dispatches {tally:?}",
-            dispatches.len()
-        );
+        eprintln!("barriers {n} of {} dispatches {tally:?}", dispatches.len());
     }
     Ok(())
 }

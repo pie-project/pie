@@ -64,8 +64,7 @@ fn a_claim_is_unique_per_plane_on_the_shader_planes() {
 /// nowhere. (Tier-2 names are the plane's own and deliberately absent.)
 #[test]
 fn the_tier1_runtime_vocabulary_is_closed_and_spelled_once() {
-    let names: BTreeSet<&str> =
-        kernels::runtime::TIER1.iter().map(|e| e.name).collect();
+    let names: BTreeSet<&str> = kernels::runtime::TIER1.iter().map(|e| e.name).collect();
     assert_eq!(names.len(), kernels::runtime::TIER1.len(), "a name repeats");
     for required in ["kv_cache", "recurrent_state", "positions", "token_ids"] {
         assert!(names.contains(required), "`{required}` left the vocabulary");

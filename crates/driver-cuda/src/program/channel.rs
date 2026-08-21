@@ -678,6 +678,28 @@ pub struct StageChannels {
 pub fn stage_channels(
     plan: &driver::driver_api::plan::LaunchStagePlan,
 ) -> std::result::Result<StageChannels, String> {
+    program_channels(std::slice::from_ref(plan))
+}
+
+/// The channel sets for a whole PROGRAM: every stage, in stage order.
+///
+/// A fire runs all of a program's stages against one set of rings and ONE
+/// commit, because the cursors advance per fire and not per stage. So the sets
+/// the readiness gate and the commit read have to be the program's, not a
+/// stage's — and first touch has to mean first touch anywhere in the program,
+/// or a channel the prologue reads and the epilogue puts lands in `need_full`
+/// AND `need_empty` and demands a ring at once non-empty and non-full, which
+/// at capacity 1 is unsatisfiable and reads as a fire that is never ready.
+///
+/// Stage order is the order the stages launch in, which is the order this walks
+/// them, so "first" means the same thing to both.
+///
+/// # Errors
+///
+/// If an op names a local slot its plan's bindings do not cover.
+pub fn program_channels(
+    plans: &[driver::driver_api::plan::LaunchStagePlan],
+) -> std::result::Result<StageChannels, String> {
     use driver::tensor_ir::op::tags;
 
     let mut out = StageChannels::default();
@@ -688,16 +710,21 @@ pub fn stage_channels(
     };
     // Channels that have already answered the readiness question (first touch).
     let mut gated: Vec<u32> = Vec::new();
-    for op in &plan.ops {
+    for op in plans.iter().flat_map(|plan| {
+        plan.ops
+            .iter()
+            .map(move |op| (op, plan.channel_bindings.as_slice()))
+    }) {
+        let (op, channel_bindings) = op;
         let local = op.channel;
         if local == u32::MAX {
             continue;
         }
-        let Some(&global) = plan.channel_bindings.get(local as usize) else {
+        let Some(&global) = channel_bindings.get(local as usize) else {
             return Err(format!(
                 "op {:#04x} names local channel slot {local} and the plan binds {}",
                 op.code,
-                plan.channel_bindings.len()
+                channel_bindings.len()
             ));
         };
         // `tags::*` are `u8` and `code` is a `u16`; widen the tag rather than

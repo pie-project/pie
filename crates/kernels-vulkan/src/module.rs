@@ -58,4 +58,3 @@ fn intern(name: &str) -> &'static str {
 pub fn at(file: &str) -> Option<&'static [u8]> {
     stem(file.strip_suffix(".spv").unwrap_or(file))
 }
-

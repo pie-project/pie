@@ -152,7 +152,11 @@ impl LoraOps for LiveLoraOps {
                 &ctx,
                 // ONE ROW OF `elems`: the cast is elementwise and the routine
                 // reads its extent off the destination now.
-                kernels::routine::In { ptr: src.cast::<f32>(), rows: 1, width },
+                kernels::routine::In {
+                    ptr: src.cast::<f32>(),
+                    rows: 1,
+                    width,
+                },
                 kernels::routine::Out {
                     ptr: dst.cast::<kernels_cuda::jit::abi::bf16>(),
                     rows: 1,

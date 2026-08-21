@@ -70,7 +70,7 @@ use cudarc::runtime::sys::{
 // directly below -- and the import outlived them because a test target is not
 // built by `cargo check`.
 use driver_cuda::bind::DispatchCtx;
-use kernels::routine::{In, Out, Const};
+use kernels::routine::{Const, In, Out};
 
 /// The facts the launchers in this file ask their context for.
 ///
@@ -197,6 +197,24 @@ const GOLDEN: &str = include_str!("oracle/gemm_service/golden.txt");
 /// disagreement is entirely between the two CARDS.
 const GOLDEN_SM120: &str = include_str!("oracle/gemm_service/golden.sm120.txt");
 
+/// The same archive, same sweep, on **sm_89** again -- under **CUDA 13.3**.
+///
+/// THE CARD IS NOT THE WHOLE KEY, which is what this file cost to learn. The
+/// header above says cuBLAS picks its kernel from the device, and that is
+/// true and incomplete: it picks from the LIBRARY as well, and a cuBLAS
+/// three minor versions on picks differently for the sweep's largest shape.
+/// One row of twenty-eight moves, `out_fp32 m=33 n=129 k=65`, and it moved on
+/// the same GPU that recorded `golden.txt`.
+///
+/// Measured twice, because a single measurement here cannot tell a port bug
+/// from a library's choice. `oracle.cu` was rebuilt with this host's nvcc and
+/// run on this host's card: the C++ answers `5b7d1f277aef5e64`, which is
+/// exactly what `kernels_cuda::gemm` answers. And against a plain fp32 CPU
+/// reference the row is wrong by 2.9e-5 relative -- the same order as
+/// `m=64 n=64 k=64`, which agrees byte for byte. A permutation is wrong by
+/// order one. This is a different legal summation order and nothing else.
+const GOLDEN_SM89_CUDA133: &str = include_str!("oracle/gemm_service/golden.sm89.cuda133.txt");
+
 /// The transcript recorded on the running device, and what it is called.
 ///
 /// A golden per architecture rather than a tolerance or an exclusion list:
@@ -211,15 +229,29 @@ fn golden_for_device() -> (&'static str, String, bool) {
     let cc = driver_cuda::device::Device::bind(0)
         .and_then(|d| d.compute_capability())
         .ok();
+    // THE LIBRARY IS HALF THE KEY. `cudaRuntimeGetVersion` reports the
+    // toolkit whose cuBLAS is loaded (`13030` is 13.3), and that is what
+    // separates the two sm_89 transcripts: same card, same archive, one row
+    // of twenty-eight. Read as major*1000 + minor*10, the form CUDA states.
+    let rt = driver_cuda::device::Device::runtime_version().unwrap_or(0);
     match cc {
         Some((12, 0)) => (GOLDEN_SM120, "golden.sm120.txt (this device)".into(), true),
+        Some((8, 9)) if rt >= 13_030 => (
+            GOLDEN_SM89_CUDA133,
+            "golden.sm89.cuda133.txt (this device, sm_89, CUDA 13.3)".into(),
+            true,
+        ),
         Some((8, 9)) => (GOLDEN, "golden.txt (this device, sm_89)".into(), true),
         Some((a, b)) => (
             GOLDEN,
             format!("golden.txt -- recorded on sm_89, and this is sm_{a}{b}"),
             false,
         ),
-        None => (GOLDEN, "golden.txt (device capability unreadable)".into(), false),
+        None => (
+            GOLDEN,
+            "golden.txt (device capability unreadable)".into(),
+            false,
+        ),
     }
 }
 
@@ -282,7 +314,10 @@ impl Dev {
         // zero-length allocation legal so a degenerate shape still has a
         // distinct, freeable pointer to hand cuBLAS.
         unsafe {
-            assert_eq!(cudaMalloc(&raw mut p, bytes.max(16)), cudaError::cudaSuccess);
+            assert_eq!(
+                cudaMalloc(&raw mut p, bytes.max(16)),
+                cudaError::cudaSuccess
+            );
             if bytes > 0 {
                 assert_eq!(
                     cudaMemcpy(p, src, bytes, cudaMemcpyKind::cudaMemcpyHostToDevice),
@@ -466,7 +501,11 @@ fn transcript() -> Vec<String> {
                 // by k, the result is m by n -- so `k` is the shared inner
                 // extent and appears as the INPUT's width, while `n` appears
                 // as the OUTPUT's. Swapping them once compiled.
-                In { ptr: dact.0, rows: m, width: k },
+                In {
+                    ptr: dact.0,
+                    rows: m,
+                    width: k,
+                },
                 // `Weight(..)`, because the launcher's `w` is
                 // `Weight<*const c_void>` now. This test hands over a
                 // device buffer it filled itself rather than a bank out of
@@ -482,7 +521,11 @@ fn transcript() -> Vec<String> {
                 // perfectly well and neither of them is the statement's to
                 // tell.
                 kernels::routine::Const { v: dw.0 },
-                Out { ptr: dy.0.cast(), rows: m, width: n },
+                Out {
+                    ptr: dy.0.cast(),
+                    rows: m,
+                    width: n,
+                },
             )
             .ok()
             .expect(
@@ -494,7 +537,11 @@ fn transcript() -> Vec<String> {
         sync();
         dy.back_f32(&mut y);
         let bytes: Vec<u8> = y.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        rows.push(format!("out_fp32 m={m} n={n} k={k} {:016x} {}", fnv1a(&bytes), bytes.len()));
+        rows.push(format!(
+            "out_fp32 m={m} n={n} k={k} {:016x} {}",
+            fnv1a(&bytes),
+            bytes.len()
+        ));
     }
 
     for &(ms, n, k, beta) in GROUPED {
@@ -611,12 +658,16 @@ fn transcript() -> Vec<String> {
     for &(tokens, heads, nope, vhead, lora) in MLA {
         // Both absorptions ask for `keys::Rows`, and it varies per row of the
         // table, so the plane is rebuilt here rather than shared with `jit`.
-        let facts = Facts { rows: tokens, n: 0, k: 0, grouped: None };
+        let facts = Facts {
+            rows: tokens,
+            n: 0,
+            k: 0,
+            grouped: None,
+        };
         // SAFETY: `handle` is live for the whole function, as `jit`'s is.
-        let mla = unsafe {
-            kernels_cuda::jit::Ctx::on(std::ptr::null_mut()).with_cublas(handle.cast())
-        }
-        .with_env(&facts);
+        let mla =
+            unsafe { kernels_cuda::jit::Ctx::on(std::ptr::null_mut()).with_cublas(handle.cast()) }
+                .with_env(&facts);
         let bank = (heads * (nope + vhead) * lora) as usize;
         let kvb = fill_bf16(
             bank.max(1),
@@ -639,14 +690,24 @@ fn transcript() -> Vec<String> {
             // is who is answerable for them.
             let fired = kernels_cuda::gemm::absorb::mla_absorb_q_to_latent_bf16(
                 &mla,
-                In { ptr: dq.0.cast_const(), rows: 0, width: 0 },
-                Const { v: dk.0.cast_const() },
+                In {
+                    ptr: dq.0.cast_const(),
+                    rows: 0,
+                    width: 0,
+                },
+                Const {
+                    v: dk.0.cast_const(),
+                },
                 // THE ROW COUNT LEFT THE PARAMETER LIST. It was
                 // `Rows::env(tokens)` -- a fact handed over as an argument --
                 // and the body asks its context for it now, so a caller that
                 // holds no `Fire` passes the rectangle instead: `rows` on the
                 // operand is the same number the fact carried.
-                Out { ptr: dout.0, rows: tokens, width: 0 },
+                Out {
+                    ptr: dout.0,
+                    rows: tokens,
+                    width: 0,
+                },
                 // `Const`, because the four are declared `Const<i32>` now:
                 // the statement carries them, each absorb takes the WHOLE
                 // `kv_b_proj` bank and slices it itself, so no operand's
@@ -671,7 +732,7 @@ fn transcript() -> Vec<String> {
             } else {
                 fired.expect("the absorb fires");
             }
-        
+
             sync();
             dout.back_u16(&mut out);
             let bytes: Vec<u8> = out[..ob].iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -695,14 +756,24 @@ fn transcript() -> Vec<String> {
             // halves of the absorb pair.
             let fired = kernels_cuda::gemm::absorb::mla_absorb_latent_to_v_bf16(
                 &mla,
-                In { ptr: dl.0.cast_const(), rows: 0, width: 0 },
-                Const { v: dk.0.cast_const() },
+                In {
+                    ptr: dl.0.cast_const(),
+                    rows: 0,
+                    width: 0,
+                },
+                Const {
+                    v: dk.0.cast_const(),
+                },
                 // THE ROW COUNT LEFT THE PARAMETER LIST. It was
                 // `Rows::env(tokens)` -- a fact handed over as an argument --
                 // and the body asks its context for it now, so a caller that
                 // holds no `Fire` passes the rectangle instead: `rows` on the
                 // operand is the same number the fact carried.
-                Out { ptr: dout.0, rows: tokens, width: 0 },
+                Out {
+                    ptr: dout.0,
+                    rows: tokens,
+                    width: 0,
+                },
                 // `Const`, because the four are declared `Const<i32>` now:
                 // the statement carries them, each absorb takes the WHOLE
                 // `kv_b_proj` bank and slices it itself, so no operand's
@@ -727,7 +798,7 @@ fn transcript() -> Vec<String> {
             } else {
                 fired.expect("the absorb fires");
             }
-        
+
             sync();
             dout.back_u16(&mut out);
             let bytes: Vec<u8> = out[..ob].iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -789,17 +860,30 @@ fn the_shapes_are_not_one_shape() {
     let ms: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.0).collect();
     let ns: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.1).collect();
     let ks: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.2).collect();
-    assert!(ms.len() >= 5 && ns.len() >= 5 && ks.len() >= 5, "M, N and K each move");
+    assert!(
+        ms.len() >= 5 && ns.len() >= 5 && ks.len() >= 5,
+        "M, N and K each move"
+    );
     assert!(ms.contains(&0), "M=0 is the empty rectangle");
-    assert!(ns.contains(&1) && ks.contains(&1), "N=1 and K=1 are degenerate axes");
-    assert!(GROUPED.iter().any(|g| g.0.is_empty()), "group_count=0 is the archive's early return");
-    assert!(GROUPED.iter().any(|g| g.3 != 0.0), "beta != 0 reads the output and so pins ldc");
+    assert!(
+        ns.contains(&1) && ks.contains(&1),
+        "N=1 and K=1 are degenerate axes"
+    );
+    assert!(
+        GROUPED.iter().any(|g| g.0.is_empty()),
+        "group_count=0 is the archive's early return"
+    );
+    assert!(
+        GROUPED.iter().any(|g| g.3 != 0.0),
+        "beta != 0 reads the output and so pins ldc"
+    );
     assert!(
         MLA.iter().any(|m| m.0 == 0) && MLA.iter().any(|m| m.1 == 0),
         "tokens=0 and heads=0 are both halves of the absorbs' early return"
     );
     assert!(
-        MLA.iter().any(|m| m.2 != m.3 && m.3 != m.4 && m.2 != m.4 && m.0 != m.1),
+        MLA.iter()
+            .any(|m| m.2 != m.3 && m.3 != m.4 && m.2 != m.4 && m.0 != m.1),
         "at least one MLA shape has no two dims equal, so a swapped stride cannot hide"
     );
 }
@@ -836,10 +920,16 @@ fn the_moved_cublas_calls_write_the_archives_bytes() {
         bad.is_empty(),
         "{} of {} shapes disagree with the archive, BYTE FOR BYTE:\n{}\n\n\
          Each line is `<shape> <fnv1a64 of the output buffer> <bytes>`. Equal \
-         byte counts with different hashes is a PERMUTATION -- a transposed \
-         `lda`, a stride that took the slice pitch instead of the bank's, or \
-         an offset counted in elements where the archive counted bytes. \
-         The right-hand side is {}.{}",
+         byte counts with different hashes is USUALLY a permutation -- a \
+         transposed `lda`, a stride that took the slice pitch instead of the \
+         bank's, or an offset counted in elements where the archive counted \
+         bytes -- and that is what to look for first. It is not the only \
+         reading: cuBLAS chooses its kernel from the card AND from its own \
+         version, so the sweep's largest shapes can differ by summation \
+         ORDER between two toolkits on one card. Rebuild \
+         tests/oracle/gemm_service/oracle.cu here and run it; if the C++ \
+         agrees with the Rust, the transcript is what is stale, not the \
+         port. The right-hand side is {}.{}",
         bad.len(),
         want.len(),
         bad.join("\n"),
@@ -917,7 +1007,11 @@ fn the_lost_bias_fusion_cost_no_answer() {
             .and_then(|s| s.parse().ok())
             .expect("differing= count");
         assert_eq!(differing, 0, "{differing} cells differ: {r}");
-        let n: usize = r.split("of ").nth(1).and_then(|s| s.trim().parse().ok()).expect("of <n>");
+        let n: usize = r
+            .split("of ")
+            .nth(1)
+            .and_then(|s| s.trim().parse().ok())
+            .expect("of <n>");
         launched += 1;
         values += n;
     }
@@ -975,17 +1069,35 @@ fn the_empty_rectangle_reads_the_same_with_a_bias_and_without() {
         let (bare, biased) = (
             kernels_cuda::gemm::act_x_wt_bias_bf16(
                 &jit,
-                In { ptr: dact.0, rows: m, width: k },
+                In {
+                    ptr: dact.0,
+                    rows: m,
+                    width: k,
+                },
                 Const { v: dw.0 },
-                Const { v: std::ptr::null() },
-                Out { ptr: dy.0, rows: m, width: n },
+                Const {
+                    v: std::ptr::null(),
+                },
+                Out {
+                    ptr: dy.0,
+                    rows: m,
+                    width: n,
+                },
             ),
             kernels_cuda::gemm::act_x_wt_bias_bf16(
                 &jit,
-                In { ptr: dact.0, rows: m, width: k },
+                In {
+                    ptr: dact.0,
+                    rows: m,
+                    width: k,
+                },
                 Const { v: dw.0 },
                 Const { v: db.0 },
-                Out { ptr: dy.0, rows: m, width: n },
+                Out {
+                    ptr: dy.0,
+                    rows: m,
+                    width: n,
+                },
             ),
         );
         sync();

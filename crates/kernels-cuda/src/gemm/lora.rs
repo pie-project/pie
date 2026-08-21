@@ -1,11 +1,10 @@
-
-use kernels_macros::routine;
 use core::ffi::c_void;
+use kernels_macros::routine;
 
 use crate::jit::Ctx;
+use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
 use kernels::Refusal;
-use crate::jit::abi::Tensor;
 
 use kernels::routine::{Const, In, InOut, Out};
 
@@ -29,7 +28,6 @@ pub const LORA_SITES_CONSUMED: u64 = LORA_SITE_Q | LORA_SITE_V;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub enum LoraForm {
-
     #[default]
     LowRank = 0,
     Scale = 1,
@@ -37,7 +35,6 @@ pub enum LoraForm {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LoraLaneView {
-
     pub a: *const c_void,
     pub b: *const c_void,
     pub sites_bits: u64,
@@ -52,7 +49,6 @@ pub struct LoraLaneView {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane {
-
     pub view: LoraLaneView,
     pub a_bf16: *mut c_void,
     pub b_bf16: *mut c_void,
@@ -62,7 +58,6 @@ pub struct Lane {
 
 #[derive(Debug, Clone, Default)]
 pub struct Group {
-
     pub rank: i32,
     pub d_in: i32,
     pub d_out: i32,
@@ -77,7 +72,6 @@ pub struct Group {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Staged<'a> {
-
     pub lanes: &'a [Lane],
     pub groups: &'a [Group],
     pub ptr_slab: *mut c_void,
@@ -90,6 +84,7 @@ pub fn bf16_row(base: *const c_void, row: u32, width: i32) -> *const c_void {
     unsafe { base.cast::<u8>().add(off).cast() }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn grouped(
     ctx: &Ctx<'_>,
     act_ptrs_dev: *const *const c_void,
@@ -106,12 +101,29 @@ unsafe fn grouped(
     #[cfg(feature = "_cuda")]
     unsafe {
         super::dense::grouped_act_x_wt_bf16(
-            handle, act_ptrs_dev, w_ptrs_dev, y_ptrs_dev, m_array_host, group_count, n, k, beta,
+            handle,
+            act_ptrs_dev,
+            w_ptrs_dev,
+            y_ptrs_dev,
+            m_array_host,
+            group_count,
+            n,
+            k,
+            beta,
         );
     }
     #[cfg(not(feature = "_cuda"))]
-    let _ =
-        (handle, act_ptrs_dev, w_ptrs_dev, y_ptrs_dev, m_array_host, group_count, n, k, beta);
+    let _ = (
+        handle,
+        act_ptrs_dev,
+        w_ptrs_dev,
+        y_ptrs_dev,
+        m_array_host,
+        group_count,
+        n,
+        k,
+        beta,
+    );
     Ok(())
 }
 
@@ -131,10 +143,9 @@ pub fn lora_qkv_correction(
     // `keys::` ask here could never be answered, whoever published it. The
     // staging that allocated this slab is the caller, and `Out` is how it
     // already hands over `q_out` and `v_out`.
-    xa_scratch: Out<Tensor<c_void>>) -> Result<(), Refusal> {
-
-    let (qkv_in, q_out, v_out, xa_scratch) =
-        (qkv_in.ptr, q_out.ptr, v_out.ptr, xa_scratch.ptr);
+    xa_scratch: Out<Tensor<c_void>>,
+) -> Result<(), Refusal> {
+    let (qkv_in, q_out, v_out, xa_scratch) = (qkv_in.ptr, q_out.ptr, v_out.ptr, xa_scratch.ptr);
     let layer_u = usize::try_from(layer).unwrap_or(0);
 
     for lane in staged.lanes {
@@ -161,16 +172,28 @@ pub fn lora_qkv_correction(
 
         super::act_x_wt_bf16_beta(
             ctx,
-            In { ptr: x, rows: t, width: h },
+            In {
+                ptr: x,
+                rows: t,
+                width: h,
+            },
             Const { v: a_l },
-            Out { ptr: xa_scratch, rows: t, width: r },
+            Out {
+                ptr: xa_scratch,
+                rows: t,
+                width: r,
+            },
             0.0,
         )?;
         let d_out = i32::try_from(v.d_out).unwrap_or(0);
         if v.sites_bits & LORA_SITE_Q != 0 {
             super::act_x_wt_bf16_beta(
                 ctx,
-                In { ptr: xa_scratch.cast_const(), rows: t, width: r },
+                In {
+                    ptr: xa_scratch.cast_const(),
+                    rows: t,
+                    width: r,
+                },
                 Const { v: b_l },
                 Out {
                     ptr: bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
@@ -183,7 +206,11 @@ pub fn lora_qkv_correction(
         if v.sites_bits & LORA_SITE_V != 0 {
             super::act_x_wt_bf16_beta(
                 ctx,
-                In { ptr: xa_scratch.cast_const(), rows: t, width: r },
+                In {
+                    ptr: xa_scratch.cast_const(),
+                    rows: t,
+                    width: r,
+                },
                 Const { v: b_l },
                 Out {
                     ptr: bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
@@ -259,7 +286,11 @@ pub fn lora_qkv_correction(
         }
         let t = i32::try_from(v.token_count).unwrap_or(0);
         let d_out = i32::try_from(v.d_out).unwrap_or(0);
-        let l_l = bf16_row(lane.a_bf16.cast_const(), u32::try_from(layer_u).unwrap_or(0), d_out);
+        let l_l = bf16_row(
+            lane.a_bf16.cast_const(),
+            u32::try_from(layer_u).unwrap_or(0),
+            d_out,
+        );
         if v.sites_bits & LORA_SITE_Q != 0 {
             crate::quant::scale_rows::<bf16>(
                 ctx,

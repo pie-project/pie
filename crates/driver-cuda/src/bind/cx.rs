@@ -24,7 +24,10 @@ pub struct Cx<'a> {
 impl core::fmt::Debug for Cx<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let rows = self.fire.rows();
-        f.debug_struct("Cx").field("layer", &self.fire.layer()).field("rows", &rows).finish()
+        f.debug_struct("Cx")
+            .field("layer", &self.fire.layer())
+            .field("rows", &rows)
+            .finish()
     }
 }
 
@@ -46,14 +49,18 @@ impl<'a> Cx<'a> {
     ///
     /// # Errors
     pub fn weight_named(&self, i: usize) -> Result<*mut c_void, Refusal> {
-        self.fire.weight_named(i).ok_or(Refusal::Absent { what: "a named weight" })
+        self.fire.weight_named(i).ok_or(Refusal::Absent {
+            what: "a named weight",
+        })
     }
 
     /// The `i`th statement parameter.
     ///
     /// # Errors
     pub fn param(&self, i: usize) -> Result<u32, Refusal> {
-        self.fire.param(i).ok_or(Refusal::Absent { what: "a statement parameter" })
+        self.fire.param(i).ok_or(Refusal::Absent {
+            what: "a statement parameter",
+        })
     }
 
     /// The `i`th statement parameter as a float.

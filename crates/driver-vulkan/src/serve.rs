@@ -842,8 +842,7 @@ fn plan_and_fire<R: Resolve, M: Modules>(
                     .borrow()
                     .iter()
                     .filter(|(file, made)| {
-                        made.is_some()
-                            && tag_of(file).is_some_and(|c| c != Capability::Baseline)
+                        made.is_some() && tag_of(file).is_some_and(|c| c != Capability::Baseline)
                     })
                     .count(),
                 ..f
@@ -1411,9 +1410,7 @@ impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
                     std::rc::Rc::new(d),
                 )
             });
-        self.seen
-            .borrow_mut()
-            .insert(file.to_owned(), made.clone());
+        self.seen.borrow_mut().insert(file.to_owned(), made.clone());
         made
     }
 }
@@ -1558,17 +1555,16 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
         .map(|at| lowered.params.get(at).copied())
         .collect();
 
-    let widths: Vec<u32> = args
-        .iter()
-        .filter_map(|a| match a {
-            model_compiler::lower::Arg::Arena { width, .. }
-            | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
-            // A raise contributes no width; see `Arg::Raised`.
-            model_compiler::lower::Arg::Weight(_) | model_compiler::lower::Arg::Raised { .. } => {
-                None
-            }
-        })
-        .collect();
+    let widths: Vec<u32> =
+        args.iter()
+            .filter_map(|a| match a {
+                model_compiler::lower::Arg::Arena { width, .. }
+                | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
+                // A raise contributes no width; see `Arg::Raised`.
+                model_compiler::lower::Arg::Weight(_)
+                | model_compiler::lower::Arg::Raised { .. } => None,
+            })
+            .collect();
     // The same numbers, kept PER ARGUMENT rather than compacted, because
     // `Handles` indexes them the way `split` indexes `args` -- a weight holds
     // a place there and carries no width, so dropping it shifts every operand
@@ -1630,7 +1626,13 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
     // staged fact takes a handle. The binder's own borrow ends on this line,
     // so the two never overlap.
     let handles = core::cell::RefCell::new(crate::hold::Handles::new(
-        &bound, &arg_widths, &ins, &outs, &weights, &params, resolver,
+        &bound,
+        &arg_widths,
+        &ins,
+        &outs,
+        &weights,
+        &params,
+        resolver,
     ));
     // THE VIEWS OUTLIVE THE BODY. `bind` boxes a host view per `Ty::Raised`
     // operand (`In<Struct<KvCache>>` and its siblings) and hands its ADDRESS

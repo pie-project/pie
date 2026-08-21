@@ -157,6 +157,8 @@ use driver_metal::weights::load::load;
 use model::catalog::MetalBinding;
 use model_ir::trace::{FireClass, ForwardPlan};
 
+use driver_metal::skip::{inapplicable, skipped};
+
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -166,61 +168,6 @@ fn kernels_dir() -> PathBuf {
 
 fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
-}
-
-/// State that this gate checked nothing, and why.
-///
-/// # Every skip in this file goes through here, and that is the point
-///
-/// There are twenty-odd of them and five reasons: no checkpoint named, no
-/// Metal 4 device, no measurement taken for this checkpoint, this device
-/// cannot hold this checkpoint, and this checkpoint does not have the feature
-/// the gate is about. All five are honest — a gate that cannot run should not
-/// PASS, and asserting a llama reference against gemma reports the rig as a
-/// driver defect — and all five print to stderr and let the harness say `ok`.
-///
-/// Which is fine when a human reads the stderr and fatal when nobody does.
-/// `cargo test` reports "19 passed" for a run in which nineteen gates printed
-/// SKIP and compared nothing, and that report is indistinguishable from the
-/// one where a real device ran the whole suite. The elapsed time is the only
-/// tell, and it is not in the summary.
-///
-/// So `PIE_METAL_NO_SKIP` turns every one of them into a failure. It is opt-in
-/// rather than the default because the default has to stay green on a Linux
-/// box with no Metal at all — that is what `#[ignore]` and the SKIPs are for —
-/// and because the reasons are genuinely different in kind: only the runner
-/// knows whether "no measurement for this checkpoint" is a gap it accepts.
-/// What it buys is a run that CANNOT lie about having checked something:
-/// point it at a checkpoint on a machine with a device, and either every gate
-/// compares something or the suite is red.
-///
-/// Measured on this machine before it existed: the whole target on
-/// `Qwen3.6-35B-A3B-4bit` (19 GB, the largest checkpoint here) reports 19
-/// passed and skips nothing for the device, so the staging ceiling this was
-/// written against does not bite at that size today. "Today" and "at that
-/// size" are exactly the qualifications that make the flag worth having.
-fn skipped(why: &str) {
-    assert!(
-        std::env::var_os("PIE_METAL_NO_SKIP").is_none(),
-        "SKIP under PIE_METAL_NO_SKIP: {why}"
-    );
-    eprintln!("SKIP: {why}");
-}
-
-/// State that this gate's PREMISE does not hold for this checkpoint.
-///
-/// The other half of the split, and the reason [`skipped`] can be made fatal
-/// at all. Some gates come in exclusive pairs — a checkpoint either rescales
-/// its rope ladder or it does not, and the two gates that check the two lanes
-/// cannot both run against one snapshot. No runner setup fixes that, so
-/// failing on it under `PIE_METAL_NO_SKIP` would make the flag permanently
-/// red and therefore useless.
-///
-/// The distinction is whose gap it is. A [`skipped`] gate could have run:
-/// point at a checkpoint, run on a device with room, take the measurement.
-/// One of these could not, and saying so is a different sentence.
-fn inapplicable(why: &str) {
-    eprintln!("SKIP: {why}");
 }
 
 /// Two bf16 ulps at `v`, which is what "a tolerance about the FORMAT" means
@@ -457,6 +404,62 @@ const REFERENCES: &[Reference] = &[
         // way a hundred and twenty-eight chosen eight do. Zero, and it holds.
         routing: 0.0,
     },
+    // THE SMALLEST CHECKPOINT IN THE TABLE, at 335 MB, and it is here so a
+    // contributor can run this file at all. Every other row costs between
+    // 700 MB and 20 GB, and without one of them this file skips twenty
+    // times and reports a clean run.
+    //
+    // # A prediction this row made and then failed
+    //
+    // The ranks below are the tightest in the table by two orders of
+    // magnitude. Second, third and fourth are 4.298675, 4.298367 and
+    // 4.297505: consecutive ranks a THOUSANDTH apart, where the bf16 ulp at
+    // that magnitude is 0.03125. Even the argmax leads second place by
+    // 0.031972, which is 1.02 ulps. Reading `next` against `top[4]` says the
+    // same -- 4.253981 against 4.249192, a sixth of an ulp.
+    //
+    // On that arithmetic this row was first NOT written. A mechanism was
+    // added instead, a table of checkpoints whose position-zero order was
+    // measured and found unresolvable, routed to `inapplicable` on the
+    // argument that an order is only a fact where the readout can separate
+    // it. The argument is sound and the conclusion was wrong: pointed at the
+    // snapshot, this driver reproduces all five ranks IN ORDER, plus the
+    // span, plus ranks 100, 1000 and 10000. The mechanism was deleted and
+    // this row written in its place.
+    //
+    // What that measures is not the model, it is the READOUT: both sides are
+    // f32 end to end here, so a thousandth is a thousandth and the bf16 ulp
+    // the prediction reasoned from never enters. The prediction was about a
+    // dtype this path does not use. It is left written down because the next
+    // person to see a tight `next` will make it again.
+    //
+    // `widest` is 6489.311, and it earns its own paragraph: without it the
+    // saturation gate falls to the `1e3` fallback, and this checkpoint's
+    // arena reads 6880. That is the gpt-oss failure exactly -- a constant
+    // taken from llama-1B calling another model's real magnitudes a
+    // saturation -- and it fired again here, on the second checkpoint ever
+    // pointed at it. MLX's own f32 forward over the same twenty tokens
+    // reaches 6489.311 at a `QuantizedLinear`, six percent from what the
+    // driver read. Taken by patching `__call__` on `QuantizedLinear`,
+    // `Linear`, `RMSNorm` and `QuantizedEmbedding` at the CLASS level, not
+    // by walking the residual stream.
+    Reference {
+        model: "Qwen3-0.6B-4bit",
+        bos: 151_643,
+        top: [
+            (361, 4.330647),
+            (220, 4.298675),
+            (1117, 4.298367),
+            (454, 4.297505),
+            (681, 4.253981),
+        ],
+        next: Some(4.249192),
+        span: (-5.475843, 4.330647),
+        mid: [(2300, 3.311598), (1649, 2.300898), (10722, 0.939615)],
+        widest: Some(6489.311),
+        cap: 0.0,
+        routing: 0.0,
+    },
     Reference {
         model: "gemma-4-31b-it-4bit",
         bos: 2,
@@ -616,6 +619,7 @@ const REFERENCES: &[Reference] = &[
 
 /// The reference for whichever checkpoint the runner has, or `None` with a
 /// SKIP naming what is missing.
+///
 fn reference_for(snapshot: &Path) -> Option<&'static Reference> {
     let path = snapshot.to_string_lossy();
     let found = REFERENCES.iter().find(|r| path.contains(r.model));
@@ -769,6 +773,98 @@ const GENERATIONS: &[Generation] = &[
         continuation: &[236_743, 236_770, 236_771, 236_771],
         // Margins, top against second, at the four steps: 3.125/5.0/8.625/10.875.
     },
+    // THE SMALLEST CHECKPOINT IN THE TABLE, at 335 MB, and the only row
+    // whose prompt is not a sentence.
+    //
+    // It is here because every other row costs between 700 MB and 20 GB to
+    // download before this file can check anything, and a contributor
+    // without one of them gets twenty skips. This one is a `pip`-sized
+    // download and the file runs.
+    //
+    // Its prompt COUNTS, and the reason is the margins. Six sentences were
+    // measured on this checkpoint before this one was kept:
+    //
+    //   "The capital of France is"                     1.067/0.020/0.560/2.312
+    //   "Once upon a time, ... lived in a"              0.021/1.315/0.958/0.782
+    //   "The quick brown fox jumps over the lazy"       1.267/0.029/0.388/0.736
+    //   "def add(a, b): return a +"                     6.589/1.417/0.096/0.516
+    //   "Water boils at one hundred degrees"            0.507/1.116/0.177/0.935
+    //   "Q: What is 2 + 2? A:"                          4.277/1.542/0.401/0.892
+    //   "1, 2, 3, 4, 5, 6, 7,"                          5.147/5.090/5.526/5.724
+    //
+    // Every sentence has a step under a tenth of a logit somewhere in it,
+    // which at these magnitudes is a THIRD of a bf16 ulp -- a coin, not a
+    // fact, and the same thing that moved gemma-4-31b off the shared prompt
+    // two rows up. A 0.6B model is small enough that natural language does
+    // not commit it to anything. Counting does: the answer after seven is
+    // eight in a way no rounding reaches, and the tightest of the four steps
+    // leads by 5.09, which is the widest minimum in this table by a factor
+    // of six.
+    Generation {
+        model: "Qwen3-0.6B-4bit",
+        prompt: &[
+            16, 11, 220, 17, 11, 220, 18, 11, 220, 19, 11, 220, 20, 11, 220, 21, 11, 220, 22, 11,
+        ],
+        continuation: &[220, 23, 11, 220],
+        //
+        // # NINE RUNS THAT BLAMED THE DRIVER, AND THE DEFECT WAS HERE
+        //
+        // This row is green. It was red for three commits, and what was
+        // written about it in those three commits was wrong in a way worth
+        // keeping, because every step of it was measured and the conclusion
+        // was still somebody else's name on this rig's mistake.
+        //
+        // It began as a disagreement with MLX and became something worse:
+        // nine runs of one binary against one snapshot with one set of
+        // flags, one process each, gave six different continuations.
+        //
+        //   turn      0     1     2     3
+        //   MLX     220    23    11   220
+        //   run a   220    20    11   220
+        //   run b   220    20   220   220
+        //   run c   220   220   220   220
+        //   run d   323  1283  1549   624
+        //   run e  1124  1124  1124  1124
+        //   run g    11   220    20    11
+        //   run i   431  1863  1863  1863
+        //
+        // The first four said the prefill held still and only decodes moved,
+        // which was four samples of something with a favourite. Two gates
+        // ruled out a race and ruled out arena residue -- correctly, and
+        // both are still worth having. The arena is zeroed before every fire
+        // and the pool at allocation, which is true, was checked, and led
+        // straight to "threadgroup memory, which nobody zeroes". That was a
+        // good guess about the wrong lane.
+        //
+        // What settled it was a probe that swept the prefill width instead
+        // of arguing about kernels, three fires per width in one process:
+        //
+        //   n      2    4    8   12   16 | 17   18   20   24   32   64
+        //   same   3    3    3    3    3 |  1    1    1    1    1    1  (of 3)
+        //
+        // Sixteen is not a tile, a simdgroup or a head. It is
+        // `Shape::page_size`, and this gate staged `kv_page_indices: &[0]`
+        // with `kv_page_indptr: &[0, 1]` -- ONE page for the request. At
+        // position sixteen the kernel indexes `kv_page_indices[page_base +
+        // kp / page_size]` one element past a one-element list and attends
+        // against whatever follows it. Deterministic up to sixteen tokens,
+        // arbitrary after.
+        //
+        // Six other rows exist and none of them could see it: llama's prompt
+        // is six tokens, gpt-oss's six, both qwen3.6's five, both gemma's
+        // six and seven. Every prompt in this table fits in one page. The
+        // counting prompt is twenty tokens, and the first row in years to
+        // cross a page boundary found a rig that had never been asked to.
+        //
+        // Handed every page its history sits in, the driver answers
+        // `220, 23, 11, 220` -- MLX token for token -- in three consecutive
+        // processes, and the whole file is twenty-one green on this
+        // checkpoint. There was never a defect in the M > 1 lane. The prompt
+        // stays twenty tokens long ON PURPOSE: it is the only row here that
+        // exercises a second page, and that is worth more than its margins.
+        //
+        // Margins, top against second, at the four steps: 5.147/5.09/5.526/5.724.
+    },
     Generation {
         model: "gemma-4-26b-a4b-it-4bit",
         prompt: &[2, 818, 5279, 529, 7001, 563],
@@ -916,6 +1012,37 @@ fn served(
             skipped(&format!(
                 "THIS DEVICE cannot hold `{}` -- not a driver defect \
                  and not a missing measurement. {message}",
+                snapshot.display(),
+            ));
+            return None;
+        }
+        // A CHECKPOINT THIS DRIVER DOES NOT SERVE IS NOT A DEFECT IN IT.
+        //
+        // The arm above is about a device too small for a snapshot, which is
+        // a gap a bigger machine closes -- so it is `skipped`. This one is
+        // not: the Metal path binds every projection through affine-U4, and
+        // an unquantized bf16 checkpoint has no `.scales` for it to bind. No
+        // runner setup fixes that. It is the same distinction
+        // `device_checkpoint_names.rs` draws when it meets a tokenizer-only
+        // download -- "not a checkpoint that failed, it is not a checkpoint"
+        // -- and it earns the same helper.
+        //
+        // Found by pointing `PIE_METAL_SMOKE_CHECKPOINT` at `Qwen/Qwen3-0.6B`,
+        // the bf16 original of a model this suite already passes on in its
+        // `mlx-community` four-bit conversion. Eighteen of the twenty tests
+        // in this file turned red with an identical panic quoting a refusal
+        // that reads, correctly and at length, as a REFUSAL: "this checkpoint
+        // carries no `.scales` tensors ... use a pre-quantized repo". The
+        // driver said the right thing and the harness reported it as
+        // eighteen failures of the driver.
+        Err(driver_metal::Error::Create {
+            what: "load plan",
+            message,
+        }) if message.contains("needs quantized weights") => {
+            inapplicable(&format!(
+                "`{}` is unquantized, and the Metal path has no lane that \
+                 binds it -- not a defect and not a gap a runner can close. \
+                 {message}",
                 snapshot.display(),
             ));
             return None;
@@ -1471,6 +1598,7 @@ fn stage_tables(
             req_of_token: &req_of_token,
             kv_page_indices: &each,
             kv_page_indptr: &indptr,
+            page_size,
             kv_write_page: &kv_write_page,
             kv_write_offset: &w_off,
             rope_frequencies: &inv_freq,
@@ -3780,14 +3908,45 @@ fn stage_prefill(
         req_of_token = vec![0; n as usize];
         positions = (0..n).collect();
     }
-    // ONE PAGE PER REQUEST, so a request's keys are somewhere another request
-    // is not looking. Each request's rows are far inside one page here; a
-    // longer prefill would need a run of them, and `pages_for` is where that
-    // would go.
+    // A RUN OF PAGES PER REQUEST, so a request's keys are somewhere another
+    // request is not looking AND the run reaches the last position.
+    //
+    // This said ONE page per request, with a comment conceding that "a longer
+    // prefill would need a run of them". That was true and undefended, and
+    // the two sites that had the same sentence took three commits to blame
+    // the driver for it: a 16-row page and prompts of five to seven tokens
+    // meant no caller had ever crossed the boundary, so the concession sat
+    // there being correct about a bug nobody had triggered yet.
+    //
+    // Counted from the LAST POSITION and not the token count. They differ
+    // wherever a fire does not start at zero, and the position is the number
+    // the kernel indexes with.
     let requests = requests.max(1) as u32;
-    let each: Vec<u32> = (0..requests).collect();
-    let indptr: Vec<u32> = (0..=requests).collect();
-    let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
+    let page = page_size.max(1);
+    let per_request: Vec<u32> = (0..requests)
+        .map(|r| {
+            positions
+                .iter()
+                .zip(&req_of_token)
+                .filter(|&(_, &q)| q == r)
+                .map(|(&p, _)| p / page + 1)
+                .max()
+                .unwrap_or(1)
+        })
+        .collect();
+    let indptr: Vec<u32> = std::iter::once(0)
+        .chain(per_request.iter().scan(0u32, |a, n| {
+            *a += n;
+            Some(*a)
+        }))
+        .collect();
+    let each: Vec<u32> = (0..*indptr.last().expect("one request at least")).collect();
+    let w_page: Vec<u32> = positions
+        .iter()
+        .zip(&req_of_token)
+        .map(|(&p, &r)| indptr[r as usize] + p / page)
+        .collect();
+    let w_off: Vec<u32> = positions.iter().map(|p| p % page).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
         context,
@@ -3800,7 +3959,12 @@ fn stage_prefill(
             req_of_token: &req_of_token,
             kv_page_indices: &each,
             kv_page_indptr: &indptr,
-            kv_write_page: &req_of_token,
+            page_size,
+            // The PHYSICAL page, which is the request's run offset plus the
+            // virtual page the position falls in. This read `req_of_token`,
+            // which is the same number only while every request holds exactly
+            // one page.
+            kv_write_page: &w_page,
             kv_write_offset: &w_off,
             rope_frequencies: &inv_freq,
             // The FIRE's rows, exactly as `serve::launch` stages them: the
@@ -3948,6 +4112,23 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         // POSITION, which is what makes each fire land after the last.
         let zeros: Vec<u32> = vec![0; n as usize];
         let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
+        // EVERY PAGE THE SEQUENCE REACHES, and not the first one.
+        //
+        // `kv_page_indices: &[0]` with `kv_page_indptr: &[0, 1]` says this
+        // request owns ONE page. A page holds `shape.page_size` positions --
+        // sixteen here -- so the moment a sequence reaches position sixteen
+        // the kernel indexes `kv_page_indices[page_base + kp / page_size]`
+        // one past the end of a one-element list and attends against
+        // whatever is there. See the `Qwen3-0.6B-4bit` generation row for
+        // the nine runs that were blamed on the driver before this existed.
+        //
+        // The LAST POSITION decides the count, not `n`: a decode is one
+        // token at position `first`, and it must be handed every page its
+        // history sits in, not the one page its own token lands on.
+        let last_pos = first + n - 1;
+        let n_pages = last_pos / shape.page_size + 1;
+        let page_ids: Vec<u32> = (0..n_pages).collect();
+        let w_page: Vec<u32> = positions.iter().map(|p| p / shape.page_size).collect();
         let staged = driver_metal::bind::tables::stage(
             &context,
             &driver_metal::fire::Scratch::new(),
@@ -3955,9 +4136,10 @@ fn a_generation_agrees_with_mlx_token_for_token() {
                 token_ids: &tokens,
                 position_ids: &positions,
                 req_of_token: &zeros,
-                kv_page_indices: &[0],
-                kv_page_indptr: &[0, 1],
-                kv_write_page: &zeros,
+                kv_page_indices: &page_ids,
+                kv_page_indptr: &[0, n_pages],
+                page_size: shape.page_size,
+                kv_write_page: &w_page,
                 kv_write_offset: &w_off,
                 rope_frequencies: &inv_freq,
                 sampling_indices: &[n - 1],
@@ -4045,6 +4227,262 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         "{} diverged from MLX. A first token that agrees and a second that \
          does not is the KV carryover, which no single-fire gate reaches.",
         reference.model
+    );
+}
+
+/// **The same decode, fired twice, against itself.**
+///
+/// # Why this gate exists and why it needs no reference
+///
+/// `a_generation_agrees_with_mlx_token_for_token` went red on
+/// `Qwen3-0.6B-4bit` and the useful part of that was not the disagreement.
+/// It was that four runs of the same binary against the same snapshot with
+/// the same flags produced four DIFFERENT continuations, while turn zero --
+/// the prefill -- was correct in all four. A wrong kernel is wrong the same
+/// way twice. Something the decode path reads is not something the decode
+/// path wrote.
+///
+/// Every gate in this file that could have seen that needs an MLX row first,
+/// so it can only see it on the six checkpoints somebody has measured, and
+/// it reports it as "diverged from MLX" -- which names the wrong defect and
+/// sends the reader to the reference. This one compares the driver against
+/// ITSELF. No reference, no tokenizer, no checkpoint-specific number: fire
+/// the same decode twice into two arenas and require the two readouts to be
+/// equal BIT FOR BIT.
+///
+/// That makes it the one A/B gate here that runs on any checkpoint at all,
+/// including the ones nobody has an oracle for, and it is a stronger claim
+/// than agreement with MLX rather than a weaker one -- a driver may round
+/// differently from MLX and be correct, and may not round differently from
+/// itself under any circumstances.
+///
+/// Bitwise and not approximate, deliberately. A tolerance here would be a
+/// tolerance for reading uninitialized memory that happens to be small.
+///
+/// # IT IS GREEN, AND WHAT THAT MEANT WAS NOT WHAT WAS WRITTEN HERE
+///
+/// This gate was written to catch a wandering generation on
+/// `Qwen3-0.6B-4bit` and it did not. Both spellings passed -- back to back,
+/// and with a wider fire scribbling between them -- zero differing logits
+/// of 151936 and of 128256.
+///
+/// That was read as ruling out a race and ruling out arena residue, which
+/// it does, and then as pointing at memory a process is handed once, which
+/// it did not. The prefill this gate runs before its two decodes is EIGHT
+/// tokens long. A page holds sixteen. The rig staged one page, so eight
+/// tokens never reached the end of it and the fire this gate was built to
+/// interrogate was the one shape that could not misbehave. It was green
+/// because it was under the boundary, not because the boundary was
+/// elsewhere.
+///
+/// The defect was the staging, it is fixed in the closure below, and the
+/// generation row it was written for is green against MLX in three
+/// consecutive processes.
+///
+/// The gate stays, for two reasons. It is still the only A/B claim in this
+/// file that needs no reference and therefore runs on any checkpoint at
+/// all. And a fire that stops agreeing with itself back to back remains a
+/// worse defect than any disagreement with MLX, which is a floor worth
+/// holding whether or not anything is standing on it today.
+///
+/// It is also, now, the gate that would have said something. With the
+/// staging fixed it fires a prompt that crosses no page and would keep
+/// passing if it were broken again -- so the prompt is left at eight and
+/// the honest reading is written here rather than implied by a green tick.
+///
+/// # What it does NOT prove
+///
+/// Two equal answers can both be wrong, and this gate would pass on a driver
+/// that returned the same garbage twice. It is a floor, not a ceiling, and
+/// the MLX rows above are the ceiling. What it buys is that when they
+/// disagree, this says whether the question is "which answer" or "an
+/// answer".
+#[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
+fn the_same_decode_twice_reads_the_same_logits() {
+    let Some(snapshot) = snapshot() else {
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        skipped("no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+
+    let shape = pool_shape(&dg, 16);
+    let pool = Pool::allocate(&context, shape).expect("a pool");
+    let pages = |layer: u16, values: bool| {
+        pool.layer(u32::from(layer)).map(|l| Slice {
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
+            bytes: shape.layer_bytes_at(u32::from(layer)),
+        })
+    };
+    let freqs = driver_metal::model::rope::table(&dg);
+    let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
+
+    // A PREFILL first, and it is not decoration. A decode reads the pages a
+    // prefill wrote, so a decode fired into an empty pool is not the fire
+    // this gate is about.
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let mut fire = |tokens: &[u32], first: u32| -> Vec<f32> {
+        let n = tokens.len() as u32;
+        let positions: Vec<u32> = (first..first + n).collect();
+        let class = if n > 1 {
+            FireClass::Prefill
+        } else {
+            FireClass::Decode
+        };
+        let step = Step {
+            token_ids: tokens,
+            qo_indptr: &[0, n],
+            sampling_indices: &[n - 1],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        };
+        let plan = text(row, class, &binding);
+        let lowered = lower_step(&plan, &step).expect("the step lowers");
+        let zeros: Vec<u32> = vec![0; n as usize];
+        let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
+        // EVERY PAGE THE SEQUENCE REACHES, and not the first one.
+        //
+        // `kv_page_indices: &[0]` with `kv_page_indptr: &[0, 1]` says this
+        // request owns ONE page. A page holds `shape.page_size` positions --
+        // sixteen here -- so the moment a sequence reaches position sixteen
+        // the kernel indexes `kv_page_indices[page_base + kp / page_size]`
+        // one past the end of a one-element list and attends against
+        // whatever is there. See the `Qwen3-0.6B-4bit` generation row for
+        // the nine runs that were blamed on the driver before this existed.
+        //
+        // The LAST POSITION decides the count, not `n`: a decode is one
+        // token at position `first`, and it must be handed every page its
+        // history sits in, not the one page its own token lands on.
+        let last_pos = first + n - 1;
+        let n_pages = last_pos / shape.page_size + 1;
+        let page_ids: Vec<u32> = (0..n_pages).collect();
+        let w_page: Vec<u32> = positions.iter().map(|p| p / shape.page_size).collect();
+        let staged = driver_metal::bind::tables::stage(
+            &context,
+            &driver_metal::fire::Scratch::new(),
+            driver_metal::bind::tables::Frame {
+                token_ids: tokens,
+                position_ids: &positions,
+                req_of_token: &zeros,
+                kv_page_indices: &page_ids,
+                kv_page_indptr: &[0, n_pages],
+                page_size: shape.page_size,
+                kv_write_page: &w_page,
+                kv_write_offset: &w_off,
+                rope_frequencies: &inv_freq,
+                sampling_indices: &[n - 1],
+                recurrent_slots: &zeros,
+            },
+        )
+        .expect("the tables stage");
+        let named = HashMap::new();
+        let mut live = Live {
+            store: Store::new(Names::mlx(), &loaded.tensors, &named),
+            tables: &staged,
+            shape,
+            pages: &pages,
+            slabs: Some(&slabs),
+        };
+        let (_, arena) = driver_metal::fire::run::run_keeping_arena(
+            &context,
+            &compiler,
+            &mut pipelines,
+            &lowered,
+            dispatch_geometry(&dg, &binding),
+            &mut live,
+        )
+        .expect("the fire runs");
+        let mut read = vec![0u8; arena.len() as usize];
+        // SAFETY: the command buffer retired before the call returned.
+        unsafe {
+            let raw = core::slice::from_raw_parts(
+                arena.contents().as_ptr().cast_const().cast::<u8>(),
+                arena.len() as usize,
+            );
+            read.copy_from_slice(raw);
+        }
+        let r = lowered.readout.expect("the text states an exit seam");
+        let (at, width, element) = (r.at, r.vocab as usize, r.bytes as usize);
+        read[at..at + width * element]
+            .chunks_exact(element)
+            .map(|c| {
+                if element == 4 {
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                } else {
+                    f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
+                }
+            })
+            .collect()
+    };
+
+    fire(&prompt, 0);
+    if let Some(rs) = rs.as_ref() {
+        // SAFETY: the fire has retired, so nothing is reading either plane.
+        unsafe { rs.pool.carry_forward() }.expect("the conv planes carry");
+    }
+
+    // THE SAME DECODE, TWICE. Same token, same position, same pages, same
+    // weights. The pool is written with the identical key and value both
+    // times, so the second fire reads exactly what the first one did.
+    let last = *prompt.last().expect("a prompt");
+    let at = prompt.len() as u32 - 1;
+    let a = fire(&[last], at);
+    // AND A FIRE BETWEEN THEM, which is the whole gate.
+    //
+    // Back to back the two decodes agree bit for bit on every checkpoint
+    // tried, including the one whose generation wanders -- measured, that
+    // version of this gate passed on `Qwen3-0.6B-4bit` in 0.85 s and on
+    // `Llama-3.2-1B-Instruct-4bit` in 2.91 s. So whatever moves is not
+    // between two adjacent fires; it is HISTORY. Four runs of the
+    // generation gate differed, and the one that differed most was the run
+    // with a different set of tests ahead of it in the same process.
+    //
+    // A prefill of the same prompt writes the same keys and values to the
+    // same slots -- the pool is left exactly as it was -- and scribbles over
+    // an arena far wider than a decode's. If the decode after it disagrees
+    // with the decode before it, the difference came out of the arena and
+    // not out of the model.
+    fire(&prompt, 0);
+    if let Some(rs) = rs.as_ref() {
+        // SAFETY: the fire has retired, so nothing is reading either plane.
+        unsafe { rs.pool.carry_forward() }.expect("the conv planes carry");
+    }
+    let b = fire(&[last], at);
+
+    let differing = a
+        .iter()
+        .zip(&b)
+        .enumerate()
+        .filter(|(_, (x, y))| x.to_bits() != y.to_bits())
+        .count();
+    let worst = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        differing == 0,
+        "the same decode fired twice disagreed with itself in {differing} of \
+         {} logits, worst by {worst}. Nothing about the two fires differs -- \
+         same token, same position, same pool, same weights -- so this is \
+         state the decode path READ that the decode path did not WRITE, and \
+         no MLX reference is involved in saying so.",
+        a.len()
     );
 }
 
@@ -4376,6 +4814,7 @@ fn stage_prefill_fleet(
             req_of_token: &req_of_token,
             kv_page_indices: &page_indices,
             kv_page_indptr: &page_indptr,
+            page_size,
             kv_write_page: &write_page,
             kv_write_offset: &write_offset,
             rope_frequencies: &inv_freq,
@@ -5197,7 +5636,38 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
 /// minority of an unsized prefill. The header said 39% at n=2048 on the 30B;
 /// this says 47% on the 1B. Two machines, two models, one shape.
 ///
-/// **The claim.** Attention costs less than 40% of a 2048-token prefill.
+/// **What it measures on a narrow dense model** (Qwen3-0.6B-4bit, 28 layers
+/// of 1024 with 16 heads of 128, release, milliseconds):
+///
+/// ```text
+///     n     decode kernel   tiled kernel
+///  2048        1383.6           915.9
+///   c       2.122e-4        1.368e-4      ms per token^2
+///   quadratic term at n=2048:
+///              890 ms (64%)    574 ms (63%)
+/// ```
+///
+/// Here the SHARE fails from the other side. The two wirings are 64% and
+/// 63% apart by one point, narrower than the share's own run-to-run spread,
+/// so the threshold cannot sit between them and this gate refuses on this
+/// checkpoint too -- for the opposite reason to the mixture above, and by a
+/// second refusal added when this row was measured. The model is 1024 wide
+/// with 128-wide heads: `28*16*128` is 1.75x Llama-3.2-1B's quadratic work
+/// over roughly 0.37x its per-token work, and a share that starts at 25%
+/// does not survive being multiplied by four and change. Attention really
+/// is most of what this model does at 2048 tokens.
+///
+/// Two things came out of measuring it. The head width picks the kernel --
+/// `sdpa_paged_mma` exists at `_d_64` alone -- so the decode-over-wired
+/// ratio is 8.6x at 64 and a MEASURED 1.55x at 128, and one constant for
+/// both was a llama-1B number wearing a general name. And the quadratic
+/// coefficient came back 1.365e-4, 1.382e-4 and 1.368e-4 across two debug
+/// builds and a release one while the total moved 947 -> 916 ms: `c` is pure
+/// GPU and does not know what profile encoded it, which is the argument for
+/// the estimator and against the share it feeds.
+///
+/// **The claim.** Attention costs less than 40% of a 2048-token prefill,
+/// on a checkpoint shaped so that a minority is possible at all.
 /// Measured on the dense checkpoint at 8% with the mma kernel the DSL now
 /// prefers at `_d_64`, 25% with the tiled one behind it, and 47% with the
 /// row-by-row decode kernel both replace -- so the threshold sits above
@@ -5367,17 +5837,37 @@ fn attention_is_a_minority_of_a_long_prefill() {
          the timings are too noisy to say anything about attention"
     );
     // How much dearer the row-by-row kernel's quadratic term is than the one
-    // the DSL actually wires, which at `_d_64` is the matrix-unit form and
-    // not the tiled one. Measured twice: 10.8x on Llama-3.2-1B (2.788e-4
-    // against 2.589e-5) and 8.6x on gpt-oss-20b (4.215e-4 against 4.883e-5).
-    // The smaller is taken, so the sensitivity below is the conservative one.
+    // the DSL actually wires. THIS DEPENDS ON THE HEAD WIDTH, because the
+    // wiring does: `sdpa_paged_mma` exists at `_d_64` alone, so a 64-wide
+    // head gets the matrix-unit form and every other width falls through to
+    // the tiled one. Two kernels, two ratios, and a single constant for both
+    // is a llama-1B number wearing a general name.
     //
-    // It tracks the WIRED kernel by construction. Were the mma preference
-    // removed and the tiled form left to serve 64-wide heads, the ratio
-    // would fall to 2.5x-2.7x and this constant would be wrong in the safe
-    // direction -- it would refuse to answer on checkpoints it could still
-    // have judged, rather than passing one it could not.
-    const DECODE_OVER_WIRED: f64 = 8.6;
+    // Measured, quadratic coefficient of the decode kernel over the wired
+    // one, in ms per token^2:
+    //
+    // ```text
+    //   head_dim  checkpoint          decode     wired            ratio
+    //     64      Llama-3.2-1B      2.788e-4  2.589e-5 (mma)      10.8x
+    //     64      gpt-oss-20b       4.215e-4  4.883e-5 (mma)       8.6x
+    //    128      Qwen3-0.6B-4bit   2.122e-4  1.368e-4 (tiled)     1.55x
+    // ```
+    //
+    // The 128-wide number was taken the only way it can be: by editing
+    // `dsl::metal::sdpa`'s match so the `(true, false, true, _)` arm names
+    // `sdpa_paged_decode` instead of `sdpa_paged_tiled`, running this gate,
+    // and putting the arm back. It is 1.55x and not the 2.5x-2.7x the text
+    // above predicted for an unwired tiled form, and the reason is in the
+    // shader: `KT = 4096/D`, so doubling the head width halves the key tile
+    // the threadgroup stages, and half the reuse is half the saving. The
+    // prediction was made at `_d_64` and read as a property of the kernel;
+    // it is a property of the kernel AT ONE WIDTH.
+    //
+    // That correction matters in the UNSAFE direction, which is why it is
+    // here. 8.6x applied to a 128-wide checkpoint overstates what unwiring
+    // would cost, which makes the refusal below LESS likely to fire and the
+    // gate more likely to claim it judged a wiring it could not tell apart.
+    let decode_over_wired: f64 = if dg.head_dim == 64 { 8.6 } else { 1.55 };
     // A checkpoint whose per-token work swamps attention passes the claim
     // below whichever kernel is wired, and a gate that cannot fail is worse
     // than no gate: it reports a wiring it never tested. So the gate asks
@@ -5394,16 +5884,126 @@ fn attention_is_a_minority_of_a_long_prefill() {
     // made that a red suite that no change could turn green, which trains a
     // reader to ignore the colour. The gate is out of scope for this row; it
     // is not failing on it.
-    if share * DECODE_OVER_WIRED < 0.40 {
+    // Scaled the same way as the refusal below it and for the same reason:
+    // the naive `share * ratio` moves attention without moving the total it
+    // is a share of, and it overstates. On Llama-3.2-1B it reads 69% where
+    // the honest correction reads 42% -- both clear the bar, so no verdict
+    // changed, but only one of them is the number it claims to be.
+    let dearer = attention * decode_over_wired;
+    let share_ceiling = dearer / (ms[2] - attention + dearer);
+    if share_ceiling < 0.40 {
         inapplicable(&format!(
             "this checkpoint cannot tell the two attention kernels \
              apart: at {:.0}% of a {longest:.0}-token prefill, attention \
-             would still be under the 40% threshold at {DECODE_OVER_WIRED}x \
-             the cost. Its per-token work swamps the quadratic term -- run \
+             would reach only {:.0}% at {decode_over_wired}x \
+             the cost, short of the 40% threshold. Its per-token work swamps the quadratic term -- run \
              this gate on a dense checkpoint (Llama-3.2-1B measured 8% on the \
              wired mma kernel against 47% on the decode kernel it replaces) \
              where the threshold sits between the two states.",
-            share * 100.0
+            share * 100.0,
+            share_ceiling * 100.0
+        ));
+        return;
+    }
+    // AND THE SYMMETRIC REFUSAL, which this gate went without for as long as
+    // every checkpoint it met had llama's proportions. The guard above asks
+    // whether the threshold is too HIGH to separate the two wirings -- a
+    // checkpoint whose per-token work swamps attention passes at either
+    // kernel. This one asks whether it is too LOW: a checkpoint whose
+    // per-token work is small enough that attention is a majority at BOTH
+    // kernels fails at either, and a gate that cannot pass names a wiring
+    // just as poorly as one that cannot fail.
+    //
+    // Qwen3-0.6B-4bit is the checkpoint that found it, and the arithmetic
+    // says it had to be some checkpoint like it. Against Llama-3.2-1B the
+    // quadratic work per token^2 -- `layers * q_heads * head_dim` -- is
+    // 28*16*128 = 57344 against 16*32*64 = 32768, so 1.75x MORE; and the
+    // per-token work, `layers * hidden * (projections + 3*mlp)`, is about
+    // 28*1024*12288 against 16*2048*28672, so 0.37x as much. A quadratic
+    // term 1.75x larger over a linear term 0.37x smaller moves the SHARE by
+    // something near 4.7x, and 25% times 4.7 is past 100%. The share was
+    // never going to be a minority on this model. It is 1024 wide with 16
+    // heads of 128 -- attention is simply most of what this model does at
+    // 2048 tokens.
+    //
+    // MEASURED, both wirings, best of six, release and debug:
+    //
+    // ```text
+    //   wiring              c (ms/token^2)   n=2048         share
+    //   tiled  (wired)         1.368e-4    574 of 916 ms     63%
+    //   tiled  (wired, debug)  1.365e-4    572 of 947 ms     60%
+    //   tiled  (wired, debug)  1.382e-4    580 of 951 ms     61%
+    //   decode (unwired)       2.122e-4    890 of 1384 ms    64%
+    // ```
+    //
+    // 63% against 64% is the whole falsification margin the SHARE offers
+    // here, and it is smaller than the run-to-run spread of the share
+    // itself. The gate would have been reporting a coin toss. The
+    // COEFFICIENT separates the same two states by 1.55x and does it
+    // reproducibly, which is the more interesting half of this measurement:
+    // `c` came back 1.365e-4, 1.382e-4 and 1.368e-4 across two debug builds
+    // and a release one, so the quadratic term is pure GPU and does not know
+    // what profile encoded it, while the TOTAL moved 947 -> 916 ms because
+    // the constant and linear terms are where a debug build's cost sits.
+    // That is the argument for the estimator and against the share: the
+    // number the share divides by is the number that depends on everything
+    // this gate is not asking about.
+    //
+    // A skip and not a failure, for the same reason as above: this is the
+    // shape of the checkpoint, so it will refuse on every run of every build
+    // forever, and a permanent red teaches a reader to stop reading.
+    //
+    // FALSIFIED, and this is the falsification that mattered, because a
+    // refusal added to stop a checkpoint failing is one edit away from a
+    // refusal that stops every checkpoint failing. Unwiring the mma arm in
+    // `dsl::metal::sdpa` so a 64-wide head names `sdpa_paged_decode` and
+    // running this gate on Llama-3.2-1B: attention 881 ms of 1682 ms, 52%,
+    // and a floor of 11% because 881/8.6 is 102 ms against 801 ms of linear
+    // work. 11% is under the threshold, so the shape is NOT the explanation,
+    // so the refusal does not fire and the assert does. Red, with the right
+    // message. The arm was put back and the gate is green again at 15%.
+    //
+    // Which is the whole design in one line: the refusal fires when the
+    // model could not show a minority at ANY wiring, and the assert fires
+    // when it could and did not.
+    // The arithmetic, because dividing the SHARE by the ratio is the wrong
+    // correction and was the first thing written here. A share is a ratio of
+    // attention to a total that CONTAINS it, so scaling attention moves the
+    // denominator too. Holding the linear part fixed and rescaling only the
+    // quadratic one is the correction that means anything:
+    //
+    // ```text
+    //   linear      = total - attention
+    //   if_cheaper  = attention / decode_over_wired
+    //   share_floor = if_cheaper / (linear + if_cheaper)
+    // ```
+    //
+    // `share_floor` is the smallest share this checkpoint could show with
+    // the cheap kernel in. If it is still a majority, no wiring explains the
+    // observation and the shape does. If it is not, then a majority observed
+    // is a majority the wiring caused, which is the failure below. The two
+    // spellings disagree by more than bookkeeping: on Qwen3-0.6B the naive
+    // one reads 40.6% and clears the bar by a point and a half, while this
+    // one reads 52% and clears it by twelve. A gate should not sit on a
+    // boundary that an arithmetic slip put it on.
+    let linear = ms[2] - attention;
+    let if_cheaper = attention / decode_over_wired;
+    let share_floor = if_cheaper / (linear + if_cheaper);
+    if share_floor >= 0.40 {
+        inapplicable(&format!(
+            "this checkpoint cannot tell the two attention kernels apart \
+             either: attention is {:.0}% of a {longest:.0}-token prefill, and \
+             at {decode_over_wired}x cheaper it would still be {:.0}%, so the \
+             40% threshold does not sit between the two wirings and no \
+             verdict here names one. Its per-token work is too small for the \
+             quadratic term to be a minority OF -- Qwen3-0.6B-4bit measured \
+             63% with the tiled kernel wired and 64% with it unwired, a \
+             margin narrower than the share's own run-to-run spread. Run \
+             this gate on a checkpoint with llama's proportions, or read the \
+             quadratic coefficient, which separated those same two states by \
+             1.55x where the share could not.",
+            share * 100.0,
+            share_floor * 100.0
         ));
         return;
     }
@@ -5791,6 +6391,7 @@ fn what_a_decode_costs_at_length() {
                     req_of_token: &zeros,
                     kv_page_indices: &page_list,
                     kv_page_indptr: &[0, held],
+                    page_size: shape.page_size,
                     kv_write_page: &w_page,
                     kv_write_offset: &w_off,
                     rope_frequencies: &inv_freq,
@@ -6120,6 +6721,7 @@ fn tier_one_prefill_then_decode() {
                 req_of_token: &zeros,
                 kv_page_indices: &page_list,
                 kv_page_indptr: &[0, held],
+                page_size: shape.page_size,
                 kv_write_page: &w_page,
                 kv_write_offset: &w_off,
                 rope_frequencies: &inv_freq,
@@ -6514,6 +7116,7 @@ fn where_a_decode_spends_its_time() {
                 req_of_token: &[0],
                 kv_page_indices: &page_list,
                 kv_page_indptr: &[0, held],
+                page_size: shape.page_size,
                 kv_write_page: &[ctx / shape.page_size],
                 kv_write_offset: &[ctx % shape.page_size],
                 rope_frequencies: &inv_freq,

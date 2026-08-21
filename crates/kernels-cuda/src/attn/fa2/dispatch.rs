@@ -1,4 +1,3 @@
-
 use super::geometry::Device as FaDevice;
 use crate::attn::fa2::params::{PrefillPagedParams, make_prefill_params};
 use crate::attn::fa2::{PrefillArm, PrefillPoint};
@@ -10,14 +9,12 @@ use crate::attn::fa2::params::{Buffers, DecodePlan, Partials, PrefillPlan};
 #[must_use]
 #[derive(Clone, Copy, Debug)]
 pub enum Fired<D> {
-
     Whole(D),
     Split(D, Partials),
     Declined(Decline),
 }
 
 impl<D> Fired<D> {
-
     pub fn dispatch(&self) -> Option<&D> {
         match self {
             Self::Whole(d) | Self::Split(d, _) => Some(d),
@@ -36,7 +33,6 @@ impl<D> Fired<D> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decline {
-
     Unplanned,
     CaptureVariantUnsupported,
     CaptureSinkMissing,
@@ -47,7 +43,10 @@ impl core::fmt::Display for Decline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
             Self::Unplanned => {
-                write!(f, "flashinfer fa2 dispatch: the plan cache is empty; plan before firing")
+                write!(
+                    f,
+                    "flashinfer fa2 dispatch: the plan cache is empty; plan before firing"
+                )
             }
             Self::CaptureVariantUnsupported => write!(
                 f,
@@ -69,7 +68,6 @@ impl core::fmt::Display for Decline {
 }
 
 impl Partials {
-
     #[must_use]
     pub const fn merge_job(self) -> crate::cascade::merge_states::VarLen {
         crate::cascade::merge_states::VarLen {
@@ -125,7 +123,6 @@ pub fn prefill_plan_of(cache: &PrefillPlanCache, device: FaDevice) -> PrefillPla
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillDispatch<P = PrefillPagedParams> {
-
     pub at: PrefillPoint,
     pub params: P,
 }
@@ -138,15 +135,14 @@ pub fn prefill(
     logits_soft_cap: f32,
     sm_scale: f32,
 ) -> Fired<PrefillDispatch> {
-
     fn prefill_plan_usable(cache: &PrefillPlanCache) -> Result<(), Decline> {
-    if !cache.valid {
-    return Err(Decline::Unplanned);
-    }
-    if cache.use_sm90 {
-    return Err(Decline::Sm90Unported);
-    }
-    Ok(())
+        if !cache.valid {
+            return Err(Decline::Unplanned);
+        }
+        if cache.use_sm90 {
+            return Err(Decline::Sm90Unported);
+        }
+        Ok(())
     }
 
     if let Err(why) = prefill_plan_usable(cache) {
@@ -156,6 +152,13 @@ pub fn prefill(
 
     let (params, partials) = make_prefill_params(&plan, bufs, logits_soft_cap, sm_scale);
 
-    let ready = PrefillDispatch { at: super::prefill_at(&plan, arm, params.padded_batch_size), params };
-    if cache.plan_info.split_kv { Fired::Split(ready, partials) } else { Fired::Whole(ready) }
+    let ready = PrefillDispatch {
+        at: super::prefill_at(&plan, arm, params.padded_batch_size),
+        params,
+    };
+    if cache.plan_info.split_kv {
+        Fired::Split(ready, partials)
+    } else {
+        Fired::Whole(ready)
+    }
 }

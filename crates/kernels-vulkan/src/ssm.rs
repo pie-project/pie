@@ -1,7 +1,7 @@
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
-use kernels::raises::Struct;
 use crate::views::RecurrentState;
 use kernels::BindMut;
+use kernels::raises::Struct;
 use kernels::routine::Refusal;
 use kernels_macros::routine;
 
@@ -75,7 +75,9 @@ pub fn gdn_core(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -141,7 +143,9 @@ pub fn gdn_core_slotted(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -211,7 +215,9 @@ pub fn gdn_prep(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -279,7 +285,9 @@ pub fn gdn_prep_slotted(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -349,7 +357,9 @@ pub fn gdn_prep_prefill(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -421,7 +431,9 @@ pub fn gdn_core_recurrent(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -485,7 +497,9 @@ pub fn gdn_core_recurrent_slotted(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -551,7 +565,9 @@ pub fn gdn_core_recurrent_prefill(
     n_scan: Const<i32>,
 ) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let hv = *v_heads;
@@ -571,7 +587,8 @@ pub fn gdn_core_recurrent_prefill(
     let per_group = (32 / lanes.unsigned_abs()) * vrows.unsigned_abs();
     ctx.fire(
         Fire::at(
-            crate::routine::module_path([
+            crate::routine::module_path(
+                [
                     "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
                     "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
                     "gdn_core_recurrent_prefill_bfloat16_l_16_v_4",
@@ -581,7 +598,9 @@ pub fn gdn_core_recurrent_prefill(
                     "gdn_core_recurrent_prefill_bfloat16_l_4_v_1",
                     "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
                     "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
-                ][point], ctx.best()),
+                ][point],
+                ctx.best(),
+            ),
             [
                 "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
                 "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
@@ -618,4 +637,3 @@ pub fn gdn_core_recurrent_prefill(
         ],
     )
 }
-

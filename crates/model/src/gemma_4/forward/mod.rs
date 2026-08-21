@@ -1,17 +1,10 @@
-//! `gemma-4`.
-
 pub mod facts;
 
 use self::facts::{Gemma4CudaFacts, Gemma4Facts};
 use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, matmul};
-use model_ir::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, RopeKind, Shape};
 
-// ── gemma-4 ──────────────────────────────────────────────────────────
-
-/// One gemma-4 layer's weight namespace, named after the driver's own
-/// fields (`Gemma4LayerWeights`) so the executor's binder is a straight
-/// map rather than a translation.
 struct Gemma4LayerW {
     attn_norm: NormW,
     post_attn_norm: NormW,
@@ -43,11 +36,7 @@ impl Gemma4LayerW {
             layer: Some(l),
             repr,
         };
-        // PLAIN, despite the family name: `gemma4.cpp` fires
-        // `kernels::norm::rmsnorm` at all fourteen of its norm sites and
-        // `kernels::norm::rmsnorm_gemma` at none. The `(1 + w)` fold is
-        // done to the tensors at LOAD for this family, so a declaration
-        // that stated Gemma would be stating a second fold.
+
         let norm = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
@@ -74,8 +63,7 @@ impl Gemma4LayerW {
             o_proj: mat("o_proj", f.hidden),
             q_norm: head_norm("q_norm"),
             k_norm: head_norm("k_norm"),
-            // The double-wide variant widens exactly the KV-shared
-            // layers, so the width is per-layer and erases here.
+
             gate_up: mat("gate_up", 2 * f.intermediate_of(l)),
             gate_proj: mat("gate_proj", f.intermediate_of(l)),
             up_proj: mat("up_proj", f.intermediate_of(l)),
@@ -87,84 +75,37 @@ impl Gemma4LayerW {
     }
 }
 
-/// The gemma-4 model's CUDA reading — `gemma4.cpp`'s decode path as a
-/// list of stated kernels.
-///
-/// # The three things a reader should look for
-///
-/// **The input norm is missing from every layer but the first.** That is
-/// not an omission: layer `l`'s PLE epilogue fires
-/// `kernels::norm::rmsnorm_residual_add_scale_rmsnorm_bf16`, whose FOURTH
-/// statement is layer `l+1`'s `attn_norm`. The fusion crosses the layer
-/// boundary, so the declaration does too — `gemma4.cpp:1999` produces
-/// it and `:1529` is the guard that skips re-computing it.
-///
-/// **A KV-shared layer's statements are ABSENT, not skipped.** The
-/// trailing [`Gemma4Facts::kv_shared_layers`] layers project no k/v,
-/// norm neither, rope no k and write no cache; their attention names
-/// the SOURCE layer's cache handle. Nothing here tests a flag per fire,
-/// because there is nothing per fire about it — the binding decided at
-/// load, and a fact is a trace-time `match`.
-///
-/// **The two layer kinds differ by WIDTH, not by function.** Sliding
-/// layers rope fully at `head_dim`; full layers rope partially at
-/// `global_head_dim`. That is why the full layers cannot take the fused
-/// packed post (its predicate reads `!partial`) and fall to the
-/// separate norm/rope statements instead.
-///
-/// Prefill and the service classes are not stated yet: this is the
-/// decode reading, and the class parameter is here so the next rung adds
-/// them where llama_like's does.
 pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &Gemma4Facts,
     cuda: &Gemma4CudaFacts,
     class: FireClass,
     norm_eps: f32,
 ) -> ForwardPlan {
-    // The activation axis is DECLARED but pinned until the launch wrappers
-    // take a dtype: every statement below states BF16 outs, so a point
-    // instantiated at another A would lie. The pin is a compile refusal,
-    // not a comment.
+
     const {
         assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
     }
-    // The SKU joins the family's FIRST segment ('.'-separated segment two
-    // stays the backend, which `Backend::of_family` parses).
-    let family = format!(
-        "gemma4-{}-{}.cuda.{}",
-        W1::NAME,
-        K::NAME,
-        class.suffix()
-    );
+
+    let family = format!("gemma4-{}-{}.cuda.{}", W1::NAME, K::NAME, class.suffix());
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
-        // The entry boundary. A `Put` attachment lands device embeds or
-        // channel reads here, before anything reads the stream.
+
         dsl::seam(t, &dsl::seam::IN, &[], None);
 
-        // ── Prologue ────────────────────────────────────────────────
-        // The token embedding, scaled by sqrt(hidden).
         let mut y = dsl::cuda::scalar_mul(
             &dsl::embed_with(t, "embed", hidden, facts.vocab),
             "sqrt_hidden",
             Some((hidden as f32).sqrt()),
         );
 
-        // PLE: a SECOND embedding table, projected to the whole stack's
-        // per-layer width, normed, scaled and relaid so each layer reads
-        // a contiguous slice. Once per fire, not per layer — which is
-        // the entire reason for the relay.
         let ple_total = facts.layers * facts.ple_dim;
         let table = dsl::cuda::scalar_mul(
-            &dsl::embed_with(t, "embed_per_layer", ple_total, facts.vocab),
+
+            &dsl::embed_with(t, "embed_per_layer", ple_total, facts.ple_vocab),
             "sqrt_ple_dim",
             Some((facts.ple_dim as f32).sqrt()),
         );
-        // The projection consumes the MAIN embedding, not the table:
-        // `per_layer_proj = inputs_embeds @ ple_model_proj.T`. The table
-        // is the other addend of the residual below. Reading the call
-        // site is what settled it — the body had the projection eating
-        // its own table, which is a plausible pipeline and not this one.
+
         let ple = matmul(
             &y,
             &MatW {
@@ -186,77 +127,88 @@ pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                 eps: norm_eps,
             },
         );
-        // The projection lands back on the SCALED TABLE, not on nothing:
-        // `(proj + table) / sqrt(2)`. The residual add was missing from
-        // this prologue until an executor arm went looking for the value
-        // its scale consumes and found two producers where the trace had
-        // one.
-        let ple = dsl::cuda::residual_add(&normed_ple, &table, ple_total);
+
+        let ple = dsl::cuda::generated::residual_add(&normed_ple, &table, normed_ple.layer(), None);
         let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2", Some(1.0 / 2f32.sqrt()));
-        let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
+        let ple_table = dsl::cuda::generated::transpose_bf16_nld_to_lnd(
+            &ple,
+            (
+                Shape(vec![
+                    Dim::Const(facts.layers),
+                    Dim::Tokens,
+                    Dim::Const(facts.ple_dim),
+                ]),
+                DType::BF16,
+            ),
+            facts.ple_dim as i32,
+            None,
+            None,
+        );
 
-        // ── Layers ──────────────────────────────────────────────────
-        // Layer 0 norms the stream itself; every other layer received
-        // its input norm from the layer before (see the doc above).
-        let mut normed = dsl::cuda::rmsnorm(&y, &Gemma4LayerW::new(0, facts, norm_eps, W1::REPR).attn_norm);
+        let mut normed = dsl::cuda::rmsnorm(
+            &y,
+            &Gemma4LayerW::new(0, facts, norm_eps, W1::REPR).attn_norm,
+        );
 
+        let rt = dsl::rt(t);
         for l in 0..facts.layers {
-            // THIS LAYER's sliding window, `-1` for none — a
-            // load-time fact the dispatch statements carry, where four
-            // executors used to re-derive it per launch.
+
             let window_left = model_ir::facts::window_left_at(&cuda.window_left, l);
             let w = Gemma4LayerW::new(l, facts, norm_eps, W1::REPR);
             let full = facts.is_full_attn(l);
             let d = facts.head_dim_of(l);
             let shared = facts.is_kv_shared(l);
-            // A shared layer attends through the pages of the last
-            // earlier layer of its own kind. The handle IS the sharing.
+
             let kv = dsl::Kv::at(t, facts.kv_source(l).unwrap_or(l));
 
-            // The fused post writes k/v to the pages itself, so it is
-            // unavailable to a layer that writes none — and to the full
-            // layers, whose partial rope it does not implement.
-            let fused_post = cuda.fused_qkv
-                && K::NATIVE_BF16
-                && !full
-                && !shared
-                && class == FireClass::Decode;
+            let fused_post =
+                cuda.fused_qkv && K::NATIVE_BF16 && !full && !shared && class == FireClass::Decode;
 
             let attn_in = if fused_post {
                 let packed = matmul(&normed, &w.qkv);
-                dsl::cuda::qkv_packed_post(
+                dsl::cuda::generated::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
                     &packed,
-                    &w.q_norm,
-                    &w.k_norm,
-                    &kv,
-                    facts.q_heads * d,
-                    facts.kv_heads,
-                    // The fused post is sliding-only (its predicate reads
-                    // `!full`), and a sliding layer rotates on the local
-                    // base — project.rs's `layer_attention` rule.
+                    (
+                        Shape(vec![Dim::Tokens, Dim::Const(facts.q_heads * d)]),
+                        DType::BF16,
+                    ),
+                    &w.q_norm.name,
+                    &w.k_norm.name,
+                    facts.kv_heads as i32,
+                    d as i32,
+                    &kv.cache(),
+
                     crate::gemma_4::project::ROPE_THETA_LOCAL,
+                    w.q_norm.eps,
+                    &rt.positions(),
+                    &rt.row_valid(),
+                    w.q_norm.layer,
+                    Some(kv.state()),
                 )
             } else if shared {
-                // A shared layer takes only the Q leg: no k/v
-                // projection, no k/v norm, no rope on k, no write. Which
-                // KERNEL rotates q still follows the layer kind, because
-                // the driver reaches both by passing `num_kv_heads = 0`
-                // to the launcher the un-shared layer of that kind would
-                // have used — NOT by falling back to a generic rope.
+
                 let q = matmul(&normed, &w.q_proj);
                 if full {
                     let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
-                    dsl::cuda::rope_partial_q_only(
+                    dsl::cuda::generated::rope_partial_q_bf16(
                         &q,
-                        facts.global_rotary_dim,
-                        d,
+                        facts.global_rotary_dim as i32,
+                        d as i32,
                         crate::gemma_4::project::ROPE_THETA_GLOBAL,
+                        &rt.positions(),
+                        q.layer(),
+                        None,
                     )
                 } else {
-                    dsl::cuda::qk_rmsnorm_rope_rounded_q_only(
+                    dsl::cuda::generated::q_rmsnorm_rope_bf16_rounded(
                         &q,
-                        &w.q_norm,
+                        &w.q_norm.name,
+                        d as i32,
                         crate::gemma_4::project::ROPE_THETA_LOCAL,
+                        w.q_norm.eps,
+                        &rt.positions(),
+                        w.q_norm.layer,
+                        None,
                     )
                 }
             } else {
@@ -270,17 +222,12 @@ pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                         matmul(&normed, &w.v_proj),
                     )
                 };
-                // The adapter seam, and its POSITION is the point: the
-                // correction lands on the RAW projections. `v`'s norm is
-                // the next statement, so anywhere below this is already
-                // different arithmetic -- which is what
-                // `seam::check_plan` refuses.
+
                 dsl::seam(q.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
-                let v = dsl::cuda::rmsnorm_no_scale(&v, d, norm_eps);
+                let v =
+                    dsl::cuda::generated::rmsnorm_no_scale(&v, d as i32, norm_eps, v.layer(), None);
                 let (q, k) = if full {
-                    // Partial rope has no fused pair, so the norms are
-                    // their own statements — `can_fuse_qk_norm_rope`
-                    // reads `!partial`.
+
                     let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
                     let k = dsl::cuda::rmsnorm(&k, &w.k_norm);
                     dsl::rope_partial(
@@ -292,35 +239,27 @@ pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                         crate::gemma_4::project::ROPE_THETA_GLOBAL,
                     )
                 } else {
-                    dsl::cuda::qk_rmsnorm_rope_rounded(
+                    dsl::cuda::generated::qk_rmsnorm_rope_bf16_rounded(
                         &q,
                         &k,
-                        &w.q_norm,
-                        &w.k_norm,
+                        &w.q_norm.name,
+                        &w.k_norm.name,
+                        d as i32,
                         crate::gemma_4::project::ROPE_THETA_LOCAL,
+                        w.q_norm.eps,
+                        &rt.positions(),
+                        w.q_norm.layer,
+                        None,
                     )
                 };
-                dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+                dsl::cuda::write_kv_to_pages(&k, &v, &kv, facts.kv_heads, d);
                 q
             };
 
-            // The dispatch is the one place the two classes diverge, and
-            // the PREFILL side diverges again per layer — on the HEAD
-            // DIM, not on the layer kind. flashinfer 0.6.x refuses to
-            // instantiate its TC prefill template at head_dim 512
-            // ("NUM_MMA_D_QK=32"), so gemma-4's full-attention layers
-            // take a naive paged kernel there while decode at 512 is
-            // fine. Reading the driver's own test (`d == 512`) is what
-            // this states; `is_full_attn` happens to agree on E4B and is
-            // not the question asked.
-            // Pre-attention observation, and where a page-mask sink
-            // lands.
             dsl::seam(attn_in.trace(), &dsl::seam::ATTN_Q, &[&attn_in], Some(l));
             let a = match class {
                 FireClass::Decode => {
-                    // No cap, and gemma-4 STATES ITS SCALE AND IT IS 1.0 — the
-                    // per-head norms already divided (the prefill arm below
-                    // and project.rs's per-layer table say the same).
+
                     dsl::cuda::attention_flashinfer_decode(
                         &attn_in,
                         &kv,
@@ -340,10 +279,7 @@ pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                     0.0,
                 ),
                 FireClass::Prefill => {
-                    // GEMMA-4 STATES ITS SCALE AND IT IS 1.0, not `1/sqrt(d)`:
-                    // the per-head `q_norm`/`k_norm` above have already
-                    // divided by what the derivation would divide by again,
-                    // and a second division is finite, varied and wrong.
+
                     dsl::cuda::attention_flashinfer_prefill_planless(
                         &dsl::runtime::query_windows(&attn_in),
                         &kv,
@@ -356,106 +292,74 @@ pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
                 }
             }
             .expect("the class states its attention");
-            // Post-attention observation. Whether the scores are actually
-            // servable is the dispatch's business -- `attention_naive_paged`
-            // above declares `lacks Scores`, and the table is where that is
-            // written down.
+
             let attn_out = dsl::attention_landing(&a, &w.o_proj, l);
 
-            // Post-attention norm, land on the stream, scale, and norm
-            // for the MLP — four statements, one launch.
-            let (landed, mlp_in) = dsl::cuda::norm_residual_scale_norm(
+            let (landed, mlp_in) = dsl::cuda::generated::rmsnorm_residual_add_scale_rmsnorm_bf16(
                 &attn_out,
+                &w.post_attn_norm.name,
                 &y,
-                &w.post_attn_norm,
-                &w.pre_ffw_norm,
-                hidden,
-                // The identity, which is what gemma-4's own last layer
-                // applies: it lands through the unfused
-                // `norm::rmsnorm_residual_add`, which scales by nothing,
-                // so the fused path must agree with it about the same
-                // landing. `rsqrt_2` was tried here and the generation stayed
-                // incoherent either way -- this row's numerics need more than
-                // this one number, and guessing it is not the repair.
+
                 1.0,
+                &w.pre_ffw_norm.name,
+                w.post_attn_norm.eps,
+                w.post_attn_norm.layer,
+                None,
             );
             y = landed;
 
-            // The projection follows the BINDING, not just the
-            // activation: a deployment without the packed bank (E2B —
-            // the fuse is gated on E4B's exact dims) runs two gemms and
-            // the PAIR activation. Stating only the fused shape made the
-            // trace name a `gate_up` weight E2B never binds, which the
-            // executor caught at LOAD.
             let inter = facts.intermediate_of(l);
             let act = if cuda.gate_up_fused {
                 dsl::cuda::geglu_tanh(&matmul(&mlp_in, &w.gate_up), inter, true)
             } else {
                 let gate = matmul(&mlp_in, &w.gate_proj);
                 let up = matmul(&mlp_in, &w.up_proj);
-                dsl::cuda::geglu_tanh_pair(&gate, &up, inter)
+                dsl::cuda::generated::geglu_tanh(&gate, &up, gate.layer(), None)
             };
             let mlp_out = matmul(&act, &w.down);
-            y = dsl::cuda::norm_residual_add(&mlp_out, &y, &w.post_ffw_norm, hidden);
+            y = dsl::cuda::generated::rmsnorm_residual_add(
+                &mlp_out,
+                &w.post_ffw_norm.name,
+                &y,
+                w.post_ffw_norm.eps,
+                w.post_ffw_norm.layer,
+                None,
+            );
 
-            // ── The PLE epilogue ────────────────────────────────────
-            // Gate this layer's slice of the per-layer table into the
-            // stream, then land it — and, for every layer but the last,
-            // produce the NEXT layer's input norm in the same launch.
             let gate = matmul(&y, &w.ple_gate);
-            // THIS LAYER's slice of the relay, as a `select` rather than
-            // as an offset the executor computes. The relay is `[L,
-            // Tokens, ple_dim]` -- the layer axis leads, which is the
-            // whole reason the transpose above exists -- so a select at
-            // `l` IS the slice, and `Buffers::assign` places it at
-            // `offset(relay) + l * N * ple_dim` without being told.
-            //
-            // The arm used to add that offset itself, and to tell this
-            // site from the MLP's by comparing the result's WIDTH
-            // against `ple_dim`. Both go: the two sites now differ only
-            // in which values they name.
+
             let slice = dsl::select(&ple_table, l);
-            let gated = dsl::cuda::geglu_tanh_pair(&gate, &slice, facts.ple_dim);
+            let gated = dsl::cuda::generated::geglu_tanh(&gate, &slice, gate.layer(), None);
             let ple_out = matmul(&gated, &w.ple_proj);
             if l + 1 < facts.layers {
                 let next = Gemma4LayerW::new(l + 1, facts, norm_eps, W1::REPR);
-                let (landed, next_norm) = dsl::cuda::norm_residual_scale_norm(
-                    &ple_out,
-                    &y,
-                    &w.ple_norm,
-                    &next.attn_norm,
-                    hidden,
-                    // THE CHECKPOINT'S NUMBER, where this stated `1.0`. The
-                    // argument for the identity was that gemma-4's last layer
-                    // lands unfused through `norm_residual_add`, which applies
-                    // no scale, so the fused path must agree with it. The
-                    // premise is true and the conclusion does not follow: the
-                    // kernel applies `scale` to the SUM, and the epilogue
-                    // RMS-norms `y` immediately after the last landing, so a
-                    // uniform scale there is invisible and the two branches
-                    // agree whatever the last layer does. Every OTHER layer's
-                    // scale is visible, because the next layer adds an
-                    // unscaled contribution to a scaled stream.
-                    //
-                    // Measured: with the identity, the residual before the
-                    // final norm reaches norm 3227, every top logit saturates
-                    // the softcap at ~29.9 and HF's argmax is nowhere in our
-                    // top 8. With the checkpoint's scalars the residual is
-                    // 145, the top logit is 12.4 against HF's 13.0, and HF's
-                    // argmax is in our top 6.
-                    cuda.layer_scalars.get(l as usize).copied().unwrap_or(1.0),
-                );
+                let (landed, next_norm) =
+                    dsl::cuda::generated::rmsnorm_residual_add_scale_rmsnorm_bf16(
+                        &ple_out,
+                        &w.ple_norm.name,
+                        &y,
+
+                        cuda.layer_scalars.get(l as usize).copied().unwrap_or(1.0),
+                        &next.attn_norm.name,
+                        w.ple_norm.eps,
+                        w.ple_norm.layer,
+                        None,
+                    );
                 y = landed;
                 normed = next_norm;
             } else {
-                // The last layer has no next input norm to fuse, so it
-                // lands unfused and the epilogue norms for itself —
-                // `gemma4.cpp`'s :2010 arm.
-                y = dsl::cuda::norm_residual_add(&ple_out, &y, &w.ple_norm, hidden);
+
+                y = dsl::cuda::generated::rmsnorm_residual_add(
+                    &ple_out,
+                    &w.ple_norm.name,
+                    &y,
+                    w.ple_norm.eps,
+                    w.ple_norm.layer,
+                    None,
+                );
             }
         }
 
-        // ── Epilogue ────────────────────────────────────────────────
         let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
@@ -468,37 +372,33 @@ pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
         );
         let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
         let logits = if facts.logit_softcap > 0.0 {
-            dsl::cuda::logit_softcap(&logits, facts.vocab, facts.logit_softcap)
+            dsl::cuda::generated::logit_softcap(
+                &logits,
+                (
+                    Shape(vec![Dim::Requests, Dim::Const(facts.vocab)]),
+                    DType::BF16,
+                ),
+                facts.logit_softcap,
+                None,
+                None,
+            )
         } else {
             logits
         };
-        // The exit boundary: where sampling and host-visible emits attach.
-        // It sees the logits AFTER the softcap, because that is what a
-        // sampler would draw from.
+
         dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })
 }
 
-/// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Gemma4Facts, &Gemma4CudaFacts, FireClass, f32) -> ForwardPlan;
 
-/// The shipped SKU's axes — the family's ONE spelling of its point.
-///
-/// Every consumer derives from these aliases rather than restating them:
-/// [`CATALOG`]'s turbofish, `project::trace`'s instantiation, and
-/// `project::manifest`'s repr claims. A second SKU adds a second row to
-/// the table, not a second spelling of the first.
 pub type ShippedW1 = Bf16Ax;
-/// The activation axis of the shipped point (pinned BF16 in the text).
+
 pub type ShippedA = Bf16Ax;
-/// The KV axis of the shipped point.
+
 pub type ShippedKv = NativeKv;
 
-/// The family's catalogue — every SKU this build ships, enumerated. The
-/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
-/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
-/// row whose statements reach a routine point that does not exist, which
-/// is how the demand set closes: checked, never hoped.
-pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    ("gemma4-bf16-kv-bf16", gemma4_cuda::<ShippedW1, ShippedA, ShippedKv>),
-];
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![(
+    "gemma4-bf16-kv-bf16",
+    gemma4_cuda::<ShippedW1, ShippedA, ShippedKv>
+),];

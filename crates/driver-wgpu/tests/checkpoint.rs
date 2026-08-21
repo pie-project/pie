@@ -552,7 +552,15 @@ fn measurable(named: bool, dirs: &[String]) -> Vec<(String, &'static Fixture)> {
             Ok(meta) => meta,
             Err(e) => {
                 if named {
-                    eprintln!("{dir} is not readable as a checkpoint ({e}), so it is unmeasured");
+                    // This was a bare string literal, so `{dir}` and `{e}`
+                    // went out VERBATIM: a skip that named neither the file
+                    // it could not read nor the reason. Every sibling call in
+                    // this crate wraps its message in `&format!` and this one
+                    // did not, which is why `e` was an unused binding and why
+                    // CI's clippy gate is the thing that found it.
+                    driver_wgpu::skip::unmeasured(&format!(
+                        "{dir} is not readable as a checkpoint ({e}), so it is unmeasured",
+                    ));
                 }
                 continue;
             }
@@ -1138,7 +1146,9 @@ fn the_zero_point_this_table_finds_is_a_zero_point() {
         );
     }
     if checked == 0 {
-        eprintln!("no `.zeros` name resolved, so the zero point's identity is unmeasured");
+        driver_wgpu::skip::unmeasured(
+            "no `.zeros` name resolved, so the zero point's identity is unmeasured",
+        );
     }
 }
 
@@ -1191,7 +1201,9 @@ fn the_catalog_places_the_checkpoints_it_can() {
         }
     }
     if placed == 0 {
-        eprintln!("no checkpoint was identified, so `catalog::identify` is unmeasured here");
+        driver_wgpu::skip::unmeasured(
+            "no checkpoint was identified, so `catalog::identify` is unmeasured here",
+        );
     }
 }
 

@@ -263,7 +263,11 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     // refused, because import is the family-blind half of the pair and
     // converting a model pie cannot serve is still a conversion.
     let attributes = gguf_attributes(&source, &metadata);
-    let ingest = ingest_map(attributes.as_ref(), &metadata, &declared_model_type(&source));
+    let ingest = ingest_map(
+        attributes.as_ref(),
+        &metadata,
+        &declared_model_type(&source),
+    );
     let rename = ingest.as_ref().map(|map| {
         map.iter()
             .filter_map(|(src, what)| Some((src.clone(), what.name()?.to_string())))

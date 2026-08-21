@@ -389,6 +389,31 @@ pub const PIE_REGION_GENERATED: u8 = 0;
 /// The region is served by a vendor or second-party library call.
 pub const PIE_REGION_LIBRARY: u8 = 1;
 
+// Which library, for a `PIE_REGION_LIBRARY` region -- `LaunchRegion::library`.
+//
+// These were implied by the declaration order of the compiler's `LibraryOp`
+// and written to the wire as `op as u8`, which is an ABI nobody could read
+// from the driver side: a driver wanting to know whether a region was a
+// second-party call had to hardcode `5`. Stating them here makes the wire
+// value a fact both ends can name, and `library_tag` maps onto these rather
+// than onto a discriminant.
+
+/// Fused nucleus (top-p) sampling.
+pub const PIE_LIBRARY_NUCLEUS_SAMPLE: u8 = 0;
+/// Top-k selection.
+pub const PIE_LIBRARY_TOP_K: u8 = 1;
+/// Descending sort.
+pub const PIE_LIBRARY_SORT: u8 = 2;
+/// A prefix scan -- cumulative sum or product.
+pub const PIE_LIBRARY_SCAN: u8 = 3;
+/// Matrix multiply.
+pub const PIE_LIBRARY_MATMUL: u8 = 4;
+/// A second-party kernel or sink call: the region is a NAME the backend either
+/// launches itself or cannot run at all. There is no generated kernel for one,
+/// so a driver that requires every region to arrive compiled must skip these
+/// explicitly rather than read the emitter's decline as a failure.
+pub const PIE_LIBRARY_SECOND_PARTY: u8 = 5;
+
 /// A dimension is a literal extent, not a symbolic one.
 pub const PIE_EXTENT_STATIC: u8 = 0xff;
 

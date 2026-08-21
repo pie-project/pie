@@ -58,12 +58,17 @@ fn emit_entrypoints(kernels: &Path) {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
             walk(&path, out);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("metal" | "h")) {
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("metal" | "h")
+        ) {
             out.push(path);
         }
     }
@@ -76,9 +81,15 @@ fn expand(text: &str, file: &str) -> Vec<String> {
 
     for line in joined.lines() {
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("#define ") else { continue };
-        let Some((head, body)) = rest.split_once(')') else { continue };
-        let Some((name, params)) = head.split_once('(') else { continue };
+        let Some(rest) = trimmed.strip_prefix("#define ") else {
+            continue;
+        };
+        let Some((head, body)) = rest.split_once(')') else {
+            continue;
+        };
+        let Some((name, params)) = head.split_once('(') else {
+            continue;
+        };
         if !name.starts_with("instantiate_") {
             continue;
         }
@@ -91,7 +102,9 @@ fn expand(text: &str, file: &str) -> Vec<String> {
         );
     }
 
-    for (at, _) in joined.match_indices("kernel]] void ").chain(joined.match_indices("kernel void "))
+    for (at, _) in joined
+        .match_indices("kernel]] void ")
+        .chain(joined.match_indices("kernel void "))
     {
         let line_start = joined[..at].rfind('\n').map_or(0, |i| i + 1);
         let line_head = joined[line_start..at].trim_start();
@@ -99,16 +112,23 @@ fn expand(text: &str, file: &str) -> Vec<String> {
             continue;
         }
         let before = joined[..at].trim_end();
-        if before.ends_with("host_name") || before.contains("host_name(") && {
-            before.rfind("host_name(").is_some_and(|h| h > line_start.saturating_sub(1))
-        } {
+        if before.ends_with("host_name")
+            || before.contains("host_name(") && {
+                before
+                    .rfind("host_name(")
+                    .is_some_and(|h| h > line_start.saturating_sub(1))
+            }
+        {
             continue;
         }
 
         if line_head.starts_with("template") || preceded_by_template(&joined[..line_start]) {
             continue;
         }
-        let after = joined[at..].split_once(" void ").map(|(_, t)| t).unwrap_or("");
+        let after = joined[at..]
+            .split_once(" void ")
+            .map(|(_, t)| t)
+            .unwrap_or("");
         if let Some((name, _)) = after.split_once('(') {
             let name = name.trim();
             if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -195,7 +215,9 @@ fn literal_host_names(line: &str) -> Vec<String> {
     let mut rest = line;
     while let Some(at) = rest.find("host_name(\"") {
         rest = &rest[at + "host_name(\"".len()..];
-        let Some((name, tail)) = rest.split_once('"') else { break };
+        let Some((name, tail)) = rest.split_once('"') else {
+            break;
+        };
         out.push(name.to_owned());
         rest = tail;
     }
@@ -280,12 +302,16 @@ fn nested_calls(body: &str) -> Vec<(String, Vec<String>)> {
     let mut rest = body;
     while let Some(at) = rest.find("instantiate_") {
         rest = &rest[at..];
-        let Some((name, tail)) = rest.split_once('(') else { break };
+        let Some((name, tail)) = rest.split_once('(') else {
+            break;
+        };
         if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             rest = &rest["instantiate_".len()..];
             continue;
         }
-        let Some((args, after)) = tail.split_once(')') else { break };
+        let Some((args, after)) = tail.split_once(')') else {
+            break;
+        };
         out.push((name.to_owned(), split_args(args)));
         rest = after;
     }
@@ -293,7 +319,10 @@ fn nested_calls(body: &str) -> Vec<(String, Vec<String>)> {
 }
 
 fn split_args(args: &str) -> Vec<String> {
-    args.split(',').map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect()
+    args.split(',')
+        .map(|a| a.trim().to_owned())
+        .filter(|a| !a.is_empty())
+        .collect()
 }
 
 fn stage_rng_preamble(kernels: &Path) {

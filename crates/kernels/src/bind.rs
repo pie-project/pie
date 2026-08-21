@@ -58,7 +58,6 @@ pub trait Holds {
     /// [`Refusal::Absent`] when the statement carries no such operand.
     fn weight(&mut self, n: usize) -> Result<u32, Refusal>;
 
-
     /// The statement's `n`th scalar.
     ///
     /// # Errors
@@ -94,7 +93,9 @@ pub trait Holds {
     /// states no width for.
     fn in_width(&self, n: usize) -> Result<i32, Refusal> {
         let _ = n;
-        Err(Refusal::Unstated { what: "an input's row width, which this backend does not carry" })
+        Err(Refusal::Unstated {
+            what: "an input's row width, which this backend does not carry",
+        })
     }
 
     /// Elements per row of the statement's `n`th RESULT. See
@@ -105,7 +106,9 @@ pub trait Holds {
     /// As [`Self::in_width`].
     fn out_width(&self, n: usize) -> Result<i32, Refusal> {
         let _ = n;
-        Err(Refusal::Unstated { what: "a result's row width, which this backend does not carry" })
+        Err(Refusal::Unstated {
+            what: "a result's row width, which this backend does not carry",
+        })
     }
 
     /// How many elements the statement's `n`th RESULT holds in total.
@@ -118,9 +121,10 @@ pub trait Holds {
     /// As [`Self::in_width`].
     fn out_elements(&self, n: usize) -> Result<i32, Refusal> {
         let _ = n;
-        Err(Refusal::Unstated { what: "a result's element count, which this backend does not carry" })
+        Err(Refusal::Unstated {
+            what: "a result's element count, which this backend does not carry",
+        })
     }
-
 
     /// This launch's row count — the rectangle's, which the driver that
     /// built the launch always has. Zero is this crate's word for "no
@@ -149,9 +153,13 @@ pub fn bind<V: ShaderValue, H: Holds + ?Sized>(
 ) -> Result<Vec<V>, Refusal> {
     let mut out = Vec::with_capacity(args.len());
     for (at, ty) in args.iter().enumerate() {
-        let source = sources.get(at).copied().flatten().ok_or(Refusal::Unstated {
-            what: "an argument whose signature does not say where it comes from",
-        })?;
+        let source = sources
+            .get(at)
+            .copied()
+            .flatten()
+            .ok_or(Refusal::Unstated {
+                what: "an argument whose signature does not say where it comes from",
+            })?;
         out.push(one(*ty, source, h)?);
     }
     Ok(out)
@@ -195,9 +203,7 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
         // THE CARRIER SAYS WHICH READING. `Param<2, f32>` and `ParamF32<2>`
         // name the same scalar and differ only in how its bits are read.
         // Refusing the first spelling was a real defect, not a hypothetical.
-        Source::Slot(Kind::Param, n) if matches!(ty, Ty::F32) => {
-            Ok(V::f32(h.param_f32(n.into())?))
-        }
+        Source::Slot(Kind::Param, n) if matches!(ty, Ty::F32) => Ok(V::f32(h.param_f32(n.into())?)),
         Source::Slot(Kind::Param, n) => number(ty, h.param(n.into())?),
         Source::Slot(Kind::ParamF32, n) => Ok(V::f32(h.param_f32(n.into())?)),
         // A RECTANGLE'S OWN EXTENTS, which are read rather than reckoned.
@@ -355,8 +361,6 @@ fn number<V: ShaderValue>(ty: Ty, n: i32) -> Result<V, Refusal> {
         }
     })
 }
-
-
 
 /// The refusal for a slot kind no signature states.
 fn unstated(kind: Kind) -> Refusal {

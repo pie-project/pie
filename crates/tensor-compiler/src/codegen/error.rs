@@ -116,7 +116,16 @@ pub enum EmitError {
     /// a hand-written kernel rather than generated source.
     FusedRequiresGeneratedRegion,
     /// A generated region reached a boundary op, which cannot be generated.
-    GeneratedRegionHasBoundary,
+    ///
+    /// Carries the library op's own name rather than just the fact, because
+    /// the fact alone is unactionable: three curated inferlets refused here
+    /// and the only way to learn WHICH op the partitioner had folded in was
+    /// to add a print. The name is the tagged enum's own label, passed as a
+    /// `&'static str` so this file keeps its one dependency on `core::fmt`.
+    GeneratedRegionHasBoundary {
+        /// The library op's tagged-enum name, e.g. `top_k` or `matmul`.
+        library_op: &'static str,
+    },
 
     // --- invalid plan: region structure ---
     /// A region's node list indexes past the stage's ops.
@@ -221,9 +230,10 @@ impl fmt::Display for EmitError {
             EmitError::FusedRequiresGeneratedRegion => {
                 f.write_str("fused CUDA emitter requires a non-library generated region")
             }
-            EmitError::GeneratedRegionHasBoundary => {
-                f.write_str("generated region contains a non-generated boundary")
-            }
+            EmitError::GeneratedRegionHasBoundary { library_op } => write!(
+                f,
+                "generated region contains a non-generated boundary ({library_op})"
+            ),
             EmitError::RegionNodeOutOfRange(form) => match form {
                 RegionForm::Fused => f.write_str("fused region node out of range"),
                 RegionForm::GroupedFused => f.write_str("grouped fused region node out of range"),
@@ -366,8 +376,10 @@ mod tests {
                 "fused CUDA emitter requires a non-library generated region",
             ),
             (
-                EmitError::GeneratedRegionHasBoundary,
-                "generated region contains a non-generated boundary",
+                EmitError::GeneratedRegionHasBoundary {
+                    library_op: "top_k",
+                },
+                "generated region contains a non-generated boundary (top_k)",
             ),
             (
                 EmitError::RegionNodeOutOfRange(RegionForm::Fused),

@@ -423,11 +423,7 @@ fn directed(args: &[BoundArg], values: &[ArgValue]) -> Touches {
 }
 
 impl Encode for Planner<'_> {
-    fn resolve(
-        &self,
-        ty: kernels::Ty,
-        source: kernels::Source,
-    ) -> Result<ArgValue, Refusal> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
             what: "a fact, on a planner with no fire behind it",
         })?;
@@ -480,7 +476,9 @@ impl Encode for Planner<'_> {
         // a handle at a slot, so nothing downstream could tell them apart.
         let live = self.answers.map(|(cell, _)| cell.borrow());
         let handles = live.as_deref().map_or(self.handles, |h| h.bound());
-        let staged = live.as_deref().map_or(self.staged, super::hold::Handles::staged);
+        let staged = live
+            .as_deref()
+            .map_or(self.staged, super::hold::Handles::staged);
         let (bound, param_slots, params) = lay_out(args, self.types, handles, staged)?;
         drop(live);
         self.out.borrow_mut().push(Dispatch {
@@ -567,7 +565,10 @@ const LIVE: &[(&str, &str)] = &[
     ("qmv_routed_bias", "affine_qmv_routed_bias"),
     ("router_topk_scaled", "router_topk_scaled"),
     ("shared_expert_combine", "shared_expert_combine"),
-    ("shared_expert_combine_strided", "shared_expert_combine_strided"),
+    (
+        "shared_expert_combine_strided",
+        "shared_expert_combine_strided",
+    ),
     ("kv_append_paged", "kv_append_paged"),
     ("sdpa_paged_decode", "sdpa_paged_decode"),
     ("sdpa_paged_decode_sink", "sdpa_paged_decode_sink"),
@@ -580,29 +581,65 @@ const LIVE: &[(&str, &str)] = &[
     ("sdpa_vector_decode_sink", "sdpa_vector_decode_sink"),
     ("sdpa_vector_decode_swa", "sdpa_vector_decode_swa"),
     ("split_qkv_bf16", "split_qkv_bf16"),
-    ("cast_qmm_input_bfloat16_to_float16", "cast_qmm_input_bfloat16_to_float16"),
-    ("cast_qmm_input_strided_bfloat16_to_float16", "cast_qmm_input_strided_bfloat16_to_float16"),
+    (
+        "cast_qmm_input_bfloat16_to_float16",
+        "cast_qmm_input_bfloat16_to_float16",
+    ),
+    (
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        "cast_qmm_input_strided_bfloat16_to_float16",
+    ),
     ("encode_u4_bf16", "affine_encode_u4_bf16"),
     ("encode_u4_f32", "affine_encode_u4_f32"),
     ("mxfp4_dequant_bf16", "mxfp4_dequant_bf16"),
     ("qmm_splitk_reduce", "qmm_splitk_reduce"),
     ("qmm_splitk_reduce_f32", "qmm_splitk_reduce_f32"),
-    ("qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4", "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4"),
-    ("qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2", "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2"),
-    ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2"),
-    ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1"),
-    ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4"),
+    (
+        "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+    ),
+    (
+        "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+    ),
+    (
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+    ),
+    (
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+    ),
+    (
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+    ),
     ("qmm_t_bias_fp16_precast", "affine_qmm_t_bias_fp16_precast"),
     ("qmm_t_fp16_precast", "affine_qmm_t_fp16_precast"),
     ("qmm_t_residual", "affine_qmm_t_residual"),
-    ("qmm_t_residual_fp16_precast", "affine_qmm_t_residual_fp16_precast"),
+    (
+        "qmm_t_residual_fp16_precast",
+        "affine_qmm_t_residual_fp16_precast",
+    ),
     ("qmm_t_splitk", "affine_qmm_t_splitk"),
     ("qmm_t_splitk_f32", "affine_qmm_t_splitk_f32"),
-    ("qmm_t_splitk_fp16_precast", "affine_qmm_t_splitk_fp16_precast"),
-    ("qmm_t_splitk_fp16_precast_f32", "affine_qmm_t_splitk_fp16_precast_f32"),
+    (
+        "qmm_t_splitk_fp16_precast",
+        "affine_qmm_t_splitk_fp16_precast",
+    ),
+    (
+        "qmm_t_splitk_fp16_precast_f32",
+        "affine_qmm_t_splitk_fp16_precast_f32",
+    ),
     ("qmm_t_strided", "affine_qmm_t_strided"),
-    ("qmm_t_strided_fp16_precast", "affine_qmm_t_strided_fp16_precast"),
-    ("qmm_t_strided_fp16_precast_residual", "affine_qmm_t_strided_fp16_precast_residual"),
+    (
+        "qmm_t_strided_fp16_precast",
+        "affine_qmm_t_strided_fp16_precast",
+    ),
+    (
+        "qmm_t_strided_fp16_precast_residual",
+        "affine_qmm_t_strided_fp16_precast_residual",
+    ),
     ("qmm_t_strided_residual", "affine_qmm_t_strided_residual"),
     ("qmv_fast_residual", "affine_qmv_fast_residual"),
     ("qmv_tail_bias", "affine_qmv_tail_bias"),
@@ -712,7 +749,8 @@ pub fn crossed(symbol: &str) -> Option<&'static Routine<Metal>> {
 /// family has retired its rows, so a sweep keyed on the table now reaches
 /// nothing and says so by passing.
 pub fn stems() -> impl Iterator<Item = (&'static str, &'static Routine<Metal>)> {
-    LIVE.iter().filter_map(|(name, stem)| Some((*stem, row(name)?)))
+    LIVE.iter()
+        .filter_map(|(name, stem)| Some((*stem, row(name)?)))
 }
 
 /// Entrypoint stems this backend deliberately does NOT cross, and why.
@@ -795,8 +833,9 @@ mod tests {
     }
 
     /// The row `scale_rows` derives, for a planner to read its types off.
-    static ROUTINE: std::sync::LazyLock<Routine<Metal>> =
-        std::sync::LazyLock::new(|| kernels::routine!(Metal, "scale_rows", scale_rows, namespace = ""));
+    static ROUTINE: std::sync::LazyLock<Routine<Metal>> = std::sync::LazyLock::new(|| {
+        kernels::routine!(Metal, "scale_rows", scale_rows, namespace = "")
+    });
 
     /// The planner turns a body's statement into the dispatch the encoder
     /// already knows how to run.
@@ -812,8 +851,15 @@ mod tests {
         let handles = [handle(0x1000, 64), handle(0x2000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
 
-        scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 64, Usize(128), 8)
-            .expect("eight rows is a launch");
+        scale_rows(
+            &planner,
+            In::new(Tensor::new(0)),
+            Out::new(Tensor::new(1)),
+            64,
+            Usize(128),
+            8,
+        )
+        .expect("eight rows is a launch");
 
         let plan = planner.finish();
         assert_eq!(plan.len(), 1, "one statement is one dispatch");
@@ -902,7 +948,14 @@ mod tests {
     fn a_body_with_pad_slots_still_declares_the_buffer_it_writes() {
         let handles = [handle(0x1000, 64), handle(0x2000, 64), handle(0x3000, 64)];
         let planner = Planner::new(&HOLED, &handles, NO_BLOCK, 0..1, 0);
-        holed(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), In::new(Tensor::new(2)), 64).expect("a launch");
+        holed(
+            &planner,
+            In::new(Tensor::new(0)),
+            Out::new(Tensor::new(1)),
+            In::new(Tensor::new(2)),
+            64,
+        )
+        .expect("a launch");
         let plan = planner.finish();
         let d = &plan[0];
         assert_eq!(
@@ -927,7 +980,14 @@ mod tests {
         let handles = [handle(0x1000, 64), handle(0x2000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
         assert_eq!(
-            scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 64, Usize(128), 0),
+            scale_rows(
+                &planner,
+                In::new(Tensor::new(0)),
+                Out::new(Tensor::new(1)),
+                64,
+                Usize(128),
+                0
+            ),
             Err(Refusal::Empty { what: "rows" })
         );
         assert!(planner.finish().is_empty());
@@ -939,7 +999,14 @@ mod tests {
         let handles = [handle(0x1000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
         assert_eq!(
-            scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 64, Usize(128), 8),
+            scale_rows(
+                &planner,
+                In::new(Tensor::new(0)),
+                Out::new(Tensor::new(1)),
+                64,
+                Usize(128),
+                8
+            ),
             Err(Refusal::Absent { what: "a buffer" })
         );
         assert!(
@@ -961,7 +1028,14 @@ mod tests {
         let handles = [handle(0x1000, 64), handle(0x2000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
         assert_eq!(
-            scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 0, Usize(128), 8),
+            scale_rows(
+                &planner,
+                In::new(Tensor::new(0)),
+                Out::new(Tensor::new(1)),
+                0,
+                Usize(128),
+                8
+            ),
             Err(Refusal::Grid {
                 what: "the threads a routine asked for",
                 at: 0
@@ -1073,8 +1147,8 @@ mod tests {
     #[test]
     fn every_routine_states_the_argument_list_it_declares() {
         use crate::lowering::dispatch::Geometry;
-        use crate::lowering::hold::{Facts, Handles};
         use crate::lowering::executor::{FireTable, Resolver};
+        use crate::lowering::hold::{Facts, Handles};
         use kernels_metal::routine::ArgValue;
 
         /// One region, big enough that nothing an arm asks for falls off it.
@@ -1294,8 +1368,6 @@ mod tests {
         }
     }
 
-
-
     /// Every source in the column is one the binder has a case for --
     /// including the halves a full statement never reaches.
     ///
@@ -1331,8 +1403,8 @@ mod tests {
     /// and `bind::named` had no case for it.
     #[test]
     fn every_source_in_the_column_is_one_the_binder_answers() {
-        use crate::lowering::executor::{FireTable, Resolver};
         use crate::lowering::dispatch::Geometry;
+        use crate::lowering::executor::{FireTable, Resolver};
         use crate::lowering::hold::{Facts, Handles};
 
         const SOMEWHERE: Slice = Slice {
@@ -1451,5 +1523,4 @@ mod tests {
         );
         println!("arguments asked: {asked}");
     }
-
 }

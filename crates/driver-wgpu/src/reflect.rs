@@ -503,10 +503,10 @@ pub fn point(name: &str) -> Result<Declared, Unreadable> {
     use std::sync::{Mutex, OnceLock};
     static MEMO: OnceLock<Mutex<std::collections::BTreeMap<String, Declared>>> = OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
-    if let Ok(seen) = memo.lock() {
-        if let Some(hit) = seen.get(name) {
-            return Ok(hit.clone());
-        }
+    if let Ok(seen) = memo.lock()
+        && let Some(hit) = seen.get(name)
+    {
+        return Ok(hit.clone());
     }
     let read = entrypoint(name, kernels_wgpu::Capability::Baseline)?;
     if let Ok(mut seen) = memo.lock() {
@@ -1068,15 +1068,15 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
         // it -- and a sweep whose total is not pinned silently covers less.
         //
         // UP is a family crossing and needs this line moved. It was 481 over
-        // 99 rows when this was written and is 489 over 100 now: the rows and
+        // 99 rows when this was written and is 490 over 100 now: the rows and
         // the entrypoints both grew, which is the shape a crossing has.
         //
         // DOWN is a loss. An entrypoint that stops being named is a body that
         // stopped being dispatchable, and the number falling on its own is
         // the only thing that reports it.
         assert_eq!(
-            read, 489,
-            "100 rows over 489 entrypoints, the count `kernels-wgpu`'s \
+            read, 490,
+            "100 rows over 490 entrypoints, the count `kernels-wgpu`'s \
              `tests/entrypoints.rs` pins from the other side"
         );
     }

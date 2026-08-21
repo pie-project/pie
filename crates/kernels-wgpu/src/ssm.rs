@@ -1,9 +1,9 @@
-use kernels_macros::routine;
 use kernels::BindMut;
+use kernels_macros::routine;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
-use kernels::raises::Struct;
 use crate::views::RecurrentState;
+use kernels::raises::Struct;
 use kernels::routine::Refusal;
 
 fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
@@ -73,9 +73,12 @@ pub fn gdn_core(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -134,9 +137,12 @@ pub fn gdn_core_slotted(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -145,7 +151,8 @@ pub fn gdn_core_slotted(
     let slot_ids = rsv.slots;
     let rows = *rows;
     ctx.fire(
-        Fire::at("ssm/gdn_core.wgsl", "gdn_core_slotted_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at("ssm/gdn_core.wgsl", "gdn_core_slotted_bfloat16")
+            .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -199,9 +206,12 @@ pub fn gdn_prep(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -262,9 +272,12 @@ pub fn gdn_prep_slotted(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -272,7 +285,8 @@ pub fn gdn_prep_slotted(
     let slot_ids = rsv.slots;
     let rows = *rows;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_slotted_bfloat16").apply(prep_grid(rows, *v_heads)?),
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_slotted_bfloat16")
+            .apply(prep_grid(rows, *v_heads)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -327,9 +341,12 @@ pub fn gdn_prep_prefill(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    n_scan: Const<i32>) -> Result<(), Refusal> {
+    n_scan: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -339,7 +356,8 @@ pub fn gdn_prep_prefill(
     let n_scan = *n_scan;
     let rows = n_scan;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_prefill_bfloat16").apply(prep_grid(rows, *v_heads)?),
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_prefill_bfloat16")
+            .apply(prep_grid(rows, *v_heads)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -393,9 +411,12 @@ pub fn gdn_core_recurrent(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -403,7 +424,8 @@ pub fn gdn_core_recurrent(
     let new_conv_state = rsv.new_conv_state;
     let rows = *rows;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_bfloat16")
+            .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -452,9 +474,12 @@ pub fn gdn_core_recurrent_slotted(
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
     rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let conv_state = rsv.conv_state;
@@ -463,7 +488,8 @@ pub fn gdn_core_recurrent_slotted(
     let slot_ids = rsv.slots;
     let rows = *rows;
     ctx.fire(
-        Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_slotted_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_slotted_bfloat16")
+            .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -494,8 +520,7 @@ pub fn gdn_core_recurrent_slotted(
 #[routine]
 pub fn gdn_core_recurrent_prefill(
     ctx: &Ctx<'_>,
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     core_out: Out<Tensor<bf16>>,
     pre_q: In<Tensor<f32>>,
     pre_k: In<Tensor<f32>>,
@@ -514,9 +539,12 @@ pub fn gdn_core_recurrent_prefill(
     lanes: Const<i32>,
     vrows: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
-    n_scan: Const<i32>) -> Result<(), Refusal> {
+    n_scan: Const<i32>,
+) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+        return Err(Refusal::Null {
+            what: "the recurrent view this statement names",
+        });
     }
     let rsv = unsafe { &*rsv.ptr };
     let hv = *v_heads;
@@ -535,7 +563,9 @@ pub fn gdn_core_recurrent_prefill(
     }
     let per_group = (32 / lanes.unsigned_abs()) * vrows.unsigned_abs();
     ctx.fire(
-        Fire::at("ssm/gdn_prep.wgsl", [
+        Fire::at(
+            "ssm/gdn_prep.wgsl",
+            [
                 "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
                 "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
                 "gdn_core_recurrent_prefill_bfloat16_l_16_v_4",
@@ -545,11 +575,9 @@ pub fn gdn_core_recurrent_prefill(
                 "gdn_core_recurrent_prefill_bfloat16_l_4_v_1",
                 "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
                 "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
-            ][point]).apply([
-                32,
-                dv.unsigned_abs().div_ceil(per_group),
-                hv.unsigned_abs(),
-            ]),
+            ][point],
+        )
+        .apply([32, dv.unsigned_abs().div_ceil(per_group), hv.unsigned_abs()]),
         &[
             rstate.arg_mut(),
             core_out.arg(),
@@ -573,4 +601,3 @@ pub fn gdn_core_recurrent_prefill(
         ],
     )
 }
-

@@ -42,14 +42,20 @@ fn is_header(path: &Path) -> bool {
 
 /// Every file under `dir`, as paths relative to it.
 fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut sorted: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     sorted.sort();
     for path in sorted {
         if path.is_dir() {
             walk(&path, base, out);
         } else if is_header(&path) {
-            out.push(path.strip_prefix(base).expect("walked from base").to_path_buf());
+            out.push(
+                path.strip_prefix(base)
+                    .expect("walked from base")
+                    .to_path_buf(),
+            );
         }
     }
 }
@@ -149,7 +155,9 @@ fn main() {
             if named.contains_key(spelling) {
                 continue;
             }
-            let Some(target) = normalise(&dir, spelling) else { continue };
+            let Some(target) = normalise(&dir, spelling) else {
+                continue;
+            };
             if kernels.join(&target).is_file() {
                 extra.insert((spelling.to_owned(), spell(&target)));
             }

@@ -6,8 +6,8 @@ use core::ffi::{c_int, c_void};
 
 use crate::dtype::DType;
 
-    /// How a KV cache stores its pages. Discriminants are the C++ enum's: the
-    /// value crosses as the one byte `enum class KvCacheScheme : std::uint8_t`.
+/// How a KV cache stores its pages. Discriminants are the C++ enum's: the
+/// value crosses as the one byte `enum class KvCacheScheme : std::uint8_t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum KvCacheScheme {
@@ -23,8 +23,8 @@ pub enum KvCacheScheme {
     Fp4Block = 4,
 }
 
-    /// One layer's KV storage, as a kernel sees it. Field order is the C++'s:
-    /// the mirror is checked positionally.
+/// One layer's KV storage, as a kernel sees it. Field order is the C++'s:
+/// the mirror is checked positionally.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct KvCacheLayerView {
@@ -42,7 +42,7 @@ pub struct KvCacheLayerView {
     pub head_dim: c_int,
     /// How the pages are stored, and so whether the scale planes matter.
     pub scheme: KvCacheScheme,
-        /// The element type the pages hold; the model's dtype only when `Native`.
+    /// The element type the pages hold; the model's dtype only when `Native`.
     pub storage_dtype: DType,
     /// The quantisation block, for the schemes that have one.
     pub block_size: c_int,
@@ -71,8 +71,8 @@ pub struct KvCacheLayerView {
 }
 
 impl KvCacheLayerView {
-        /// Both envelope planes are present. Tests BOTH pointers, as the C++
-        /// does: a cache can half-allocate.
+    /// Both envelope planes are present. Tests BOTH pointers, as the C++
+    /// does: a cache can half-allocate.
     pub fn has_envelopes(&self) -> bool {
         !self.k_env_min.is_null() && !self.k_env_max.is_null()
     }
@@ -83,8 +83,8 @@ impl KvCacheLayerView {
     }
 }
 
-    /// The attention scratch, as a launcher sees it: the five values kernels
-    /// read out of the driver's pool, passed by value.
+/// The attention scratch, as a launcher sees it: the five values kernels
+/// read out of the driver's pool, passed by value.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct AttentionWorkspaceView {
@@ -101,8 +101,8 @@ pub struct AttentionWorkspaceView {
     pub page_locked_int: *mut c_void,
 }
 
-    /// One layer's paged MLA cache. Its own descriptor, not a null-filled
-    /// [`KvCacheLayerView`]: the two caches have different page SHAPES.
+/// One layer's paged MLA cache. Its own descriptor, not a null-filled
+/// [`KvCacheLayerView`]: the two caches have different page SHAPES.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct MlaCacheLayerView {
@@ -122,8 +122,8 @@ pub struct MlaCacheLayerView {
     pub kpe_pages: *mut c_void,
 }
 
-    /// FlashInfer's sm90 prefill schedule. Offsets into the workspace's
-    /// `int_buffer`, not pointers: the buffer moves and the schedule does not.
+/// FlashInfer's sm90 prefill schedule. Offsets into the workspace's
+/// `int_buffer`, not pointers: the buffer moves and the schedule does not.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct HopperPrefillPlan {
@@ -165,8 +165,8 @@ pub struct HopperPrefillPlan {
     pub valid: bool,
 }
 
-    /// Original-YaRN scaling, for the MLA rope. Passed by `const*` rather than
-    /// `const&` because it is OPTIONAL.
+/// Original-YaRN scaling, for the MLA rope. Passed by `const*` rather than
+/// `const&` because it is OPTIONAL.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct YarnOriginalParams {
@@ -182,13 +182,13 @@ pub struct YarnOriginalParams {
     pub original_max_position: c_int,
 }
 
-    /// One lane's structured-mask descriptor, for `attn::pack_structured_mask`.
-    /// **Re-exported, not defined here**: `kernels-cuda` owns `attn`'s device
-    /// text, and `Ty::StructuredMasks` spells the name unqualified.
+/// One lane's structured-mask descriptor, for `attn::pack_structured_mask`.
+/// **Re-exported, not defined here**: `kernels-cuda` owns `attn`'s device
+/// text, and `Ty::StructuredMasks` spells the name unqualified.
 pub use kernels_cuda::attn::params::StructuredMaskParams;
 
-    /// The activation the fused CUTLASS MoE runs between its two grouped GEMMs.
-    /// Mirror of `moe::MoeActivation` (`enum class`, default `int`), by value.
+/// The activation the fused CUTLASS MoE runs between its two grouped GEMMs.
+/// Mirror of `moe::MoeActivation` (`enum class`, default `int`), by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum MoeActivation {
@@ -214,9 +214,9 @@ pub enum Mxfp4RowSelect {
 }
 
 #[cfg(feature = "_cuda")]
-    /// Seed a KV cache's envelope tiers as EMPTY. Safe because the planes are
-    /// the cache's own allocation at its own extents, and a null plane is a
-    /// cache with no envelopes — which the launcher reads as nothing to do.
+/// Seed a KV cache's envelope tiers as EMPTY. Safe because the planes are
+/// the cache's own allocation at its own extents, and a null plane is a
+/// cache with no envelopes — which the launcher reads as nothing to do.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn seed_envelopes_empty(
     env_min: *mut u16,
@@ -232,8 +232,16 @@ pub fn seed_envelopes_empty(
     // `Unbound` because no fire exists yet: this runs at pool construction.
     let _ = kernels_cuda::layout::envelope_seed_empty(
         &ctx,
-        kernels::routine::Out { ptr: env_min.cast(), rows: 0, width: 0 },
-        kernels::routine::Out { ptr: env_max.cast(), rows: 0, width: 0 },
+        kernels::routine::Out {
+            ptr: env_min.cast(),
+            rows: 0,
+            width: 0,
+        },
+        kernels::routine::Out {
+            ptr: env_max.cast(),
+            rows: 0,
+            width: 0,
+        },
         num_pages,
         num_kv_heads,
         head_dim,

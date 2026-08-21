@@ -1,17 +1,17 @@
-
 #![allow(clippy::too_many_arguments)]
 
 pub mod merge_states;
 
-use kernels::{Bind, Fire};
 use core::ptr::NonNull;
+use kernels::{Bind, Fire};
 
-use crate::jit::{Ctx, Launch};
 use crate::jit::abi::bf16;
+use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
 
-const NO_ROW: Refusal =
-    Refusal::Unstated { what: "a cascade merge at this head dim -- 64, 128, 256 and 512 are here" };
+const NO_ROW: Refusal = Refusal::Unstated {
+    what: "a cascade merge at this head dim -- 64, 128, 256 and 512 are here",
+};
 
 pub const HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
 
@@ -40,38 +40,58 @@ pub const fn smem_bytes(head_dim: u32) -> Option<u32> {
 
 const fn merge_inst(head_dim: u32) -> Option<&'static str> {
     match head_dim {
-        64 | 128 | 256 => Some("::flashinfer::MergeStatesKernel<\
-                                    8, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>"),
-        512 => Some("::flashinfer::MergeStatesKernel<\
-                         16, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>"),
+        64 | 128 | 256 => Some(
+            "::flashinfer::MergeStatesKernel<\
+                                    8, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>",
+        ),
+        512 => Some(
+            "::flashinfer::MergeStatesKernel<\
+                         16, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>",
+        ),
         _ => None,
     }
 }
 
 const fn merge_large_inst(head_dim: u32) -> Option<&'static str> {
     match head_dim {
-        64 => Some("::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
-                        8, 8, 16, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>"),
-        128 => Some("::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
-                         8, 16, 8, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>"),
-        256 => Some("::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
-                         8, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>"),
-        512 => Some("::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
-                         16, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>"),
+        64 => Some(
+            "::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
+                        8, 8, 16, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>",
+        ),
+        128 => Some(
+            "::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
+                         8, 16, 8, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>",
+        ),
+        256 => Some(
+            "::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
+                         8, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>",
+        ),
+        512 => Some(
+            "::flashinfer::MergeStatesLargeNumIndexSetsKernel<\
+                         16, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO>",
+        ),
         _ => None,
     }
 }
 
 const fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
     match head_dim {
-        64 => Some("::flashinfer::PersistentVariableLengthMergeStatesKernel<\
-                        8, 8, 16, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>"),
-        128 => Some("::flashinfer::PersistentVariableLengthMergeStatesKernel<\
-                         8, 16, 8, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>"),
-        256 => Some("::flashinfer::PersistentVariableLengthMergeStatesKernel<\
-                         8, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>"),
-        512 => Some("::flashinfer::PersistentVariableLengthMergeStatesKernel<\
-                         16, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>"),
+        64 => Some(
+            "::flashinfer::PersistentVariableLengthMergeStatesKernel<\
+                        8, 8, 16, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>",
+        ),
+        128 => Some(
+            "::flashinfer::PersistentVariableLengthMergeStatesKernel<\
+                         8, 16, 8, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>",
+        ),
+        256 => Some(
+            "::flashinfer::PersistentVariableLengthMergeStatesKernel<\
+                         8, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>",
+        ),
+        512 => Some(
+            "::flashinfer::PersistentVariableLengthMergeStatesKernel<\
+                         16, 32, 4, 4, ::pie::cascade::DTypeIn, ::pie::cascade::DTypeO, ::pie::cascade::IdType>",
+        ),
         _ => None,
     }
 }
@@ -85,8 +105,8 @@ pub fn merge_states(
     num_index_sets: u32,
     seq_len: u32,
     num_heads: u32,
-    head_dim: u32) -> Result<(), Refusal> {
-
+    head_dim: u32,
+) -> Result<(), Refusal> {
     const MAX_BLOCK_THREADS: u32 = 1024;
 
     let (_, bdx, bdy) = geometry(head_dim).ok_or(NO_ROW)?;
@@ -95,18 +115,21 @@ pub fn merge_states(
     null_check(v_merged.is_null(), "v_merged")?;
 
     if num_index_sets >= seq_len {
-
         let smem = smem_bytes(head_dim).ok_or(NO_ROW)?;
         let instantiation = merge_large_inst(head_dim).ok_or(NO_ROW)?;
 
-        return ctx.fire(Fire::at("cascade/merge_states.cuh", instantiation).apply(Launch::grid([seq_len, num_heads, 1], [bdx, bdy, 1]).smem(smem)), &[
-                    v.arg(),
-                    s.arg(),
-                    v_merged.arg(),
-                    NonNull::new(s_merged).arg(),
-                    num_index_sets.arg(),
-                    num_heads.arg(),
-                ]);
+        return ctx.fire(
+            Fire::at("cascade/merge_states.cuh", instantiation)
+                .apply(Launch::grid([seq_len, num_heads, 1], [bdx, bdy, 1]).smem(smem)),
+            &[
+                v.arg(),
+                s.arg(),
+                v_merged.arg(),
+                NonNull::new(s_merged).arg(),
+                num_index_sets.arg(),
+                num_heads.arg(),
+            ],
+        );
     }
 
     let threads = bdx.saturating_mul(num_heads);
@@ -119,15 +142,19 @@ pub fn merge_states(
     }
     let instantiation = merge_inst(head_dim).ok_or(NO_ROW)?;
 
-    ctx.fire(Fire::at("cascade/merge_states.cuh", instantiation).apply(Launch::grid([seq_len, 1, 1], [bdx, num_heads, 1])), &[
-                v.arg(),
-                s.arg(),
-                v_merged.arg(),
-                NonNull::new(s_merged).arg(),
-                num_index_sets.arg(),
-                num_heads.arg(),
-                head_dim.arg(),
-            ])
+    ctx.fire(
+        Fire::at("cascade/merge_states.cuh", instantiation)
+            .apply(Launch::grid([seq_len, 1, 1], [bdx, num_heads, 1])),
+        &[
+            v.arg(),
+            s.arg(),
+            v_merged.arg(),
+            NonNull::new(s_merged).arg(),
+            num_index_sets.arg(),
+            num_heads.arg(),
+            head_dim.arg(),
+        ],
+    )
 }
 
 pub fn merge_states_varlen(
@@ -140,7 +167,8 @@ pub fn merge_states_varlen(
     max_seq_len: u32,
     seq_len: *mut u32,
     num_heads: u32,
-    head_dim: u32) -> Result<(), Refusal> {
+    head_dim: u32,
+) -> Result<(), Refusal> {
     let (_, bdx, bdy) = geometry(head_dim).ok_or(NO_ROW)?;
     let smem = smem_bytes(head_dim).ok_or(NO_ROW)?;
     let instantiation = merge_varlen_inst(head_dim).ok_or(NO_ROW)?;
@@ -150,27 +178,42 @@ pub fn merge_states_varlen(
     null_check(v_merged.is_null(), "v_merged")?;
 
     let num_sms = ctx.multiprocessors()?.max(1);
-    let blocks = grid_blocks(blocks_per_sm(instantiation, smem), max_seq_len, num_heads, num_sms);
+    let blocks = grid_blocks(
+        blocks_per_sm(instantiation, smem),
+        max_seq_len,
+        num_heads,
+        num_sms,
+    );
 
-    ctx.fire(Fire::at("cascade/merge_states.cuh", instantiation).apply(Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem)), &[
-                v.arg(),
-                s.arg(),
-                indptr.arg(),
-                v_merged.arg(),
-                NonNull::new(s_merged).arg(),
-                max_seq_len.arg(),
-                NonNull::new(seq_len).arg(),
-                num_heads.arg(),
-            ])
+    ctx.fire(
+        Fire::at("cascade/merge_states.cuh", instantiation)
+            .apply(Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem)),
+        &[
+            v.arg(),
+            s.arg(),
+            indptr.arg(),
+            v_merged.arg(),
+            NonNull::new(s_merged).arg(),
+            max_seq_len.arg(),
+            NonNull::new(seq_len).arg(),
+            num_heads.arg(),
+        ],
+    )
 }
 
 fn null_check(is_null: bool, which: &'static str) -> Result<(), Refusal> {
-    if is_null { Err(Refusal::Null { what: which }) } else { Ok(()) }
+    if is_null {
+        Err(Refusal::Null { what: which })
+    } else {
+        Ok(())
+    }
 }
 
 fn grid_blocks(per_sm: u32, max_seq_len: u32, num_heads: u32, num_sms: u32) -> u32 {
-
-    let work_bound = max_seq_len.saturating_mul(num_heads).div_ceil(num_sms).max(1);
+    let work_bound = max_seq_len
+        .saturating_mul(num_heads)
+        .div_ceil(num_sms)
+        .max(1);
     per_sm.min(work_bound).saturating_mul(num_sms).max(num_sms)
 }
 
@@ -178,7 +221,10 @@ fn grid_blocks(per_sm: u32, max_seq_len: u32, num_heads: u32, num_sms: u32) -> u
 fn blocks_per_sm(instantiation: &str, smem: u32) -> u32 {
     use cudarc::driver::sys as dr;
 
-    let Ok(resolved) = crate::jit::cache::resolve(&crate::jit::Root::new("cascade/merge_states.cuh"), instantiation) else {
+    let Ok(resolved) = crate::jit::cache::resolve(
+        &crate::jit::Root::new("cascade/merge_states.cuh"),
+        instantiation,
+    ) else {
         return 1;
     };
     let mut blocks: core::ffi::c_int = 0;

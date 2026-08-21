@@ -91,7 +91,10 @@ pub unsafe fn copy_kv_cells_bf16(
     stream: *mut std::ffi::c_void,
 ) -> CopyKvCells {
     // Scheme is checked before extent, so a quantised cache is wrong regardless of `n`.
-    assert!(layer.is_native_bf16(), "attn::copy_kv_cells_bf16 requires native bf16 KV cache");
+    assert!(
+        layer.is_native_bf16(),
+        "attn::copy_kv_cells_bf16 requires native bf16 KV cache"
+    );
     if n <= 0 {
         return CopyKvCells::Declined(CopyDecline::NoCells);
     }
@@ -102,8 +105,7 @@ pub unsafe fn copy_kv_cells_bf16(
         "::pie::attn::copy_kv_cells<::pie::false_type::value>"
     };
 
-    let launch =
-        kernels_cuda::jit::Launch::grid([n.unsigned_abs(), 1, 1], [BLOCK, 1, 1]).smem(0);
+    let launch = kernels_cuda::jit::Launch::grid([n.unsigned_abs(), 1, 1], [BLOCK, 1, 1]).smem(0);
 
     // Operand order is the `__global__`'s: the row takes the two page pointers the launcher held as a view.
     let values = [
@@ -119,13 +121,7 @@ pub unsafe fn copy_kv_cells_bf16(
         ArgValue::I32(layer.head_dim),
     ];
 
-    super::hand::fire(
-        "attn/kv_paged.cuh",
-        instantiation,
-        launch,
-        &values,
-        stream,
-    );
+    super::hand::fire("attn/kv_paged.cuh", instantiation, launch, &values, stream);
     CopyKvCells::Launched
 }
 

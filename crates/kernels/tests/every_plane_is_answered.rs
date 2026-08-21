@@ -38,6 +38,57 @@
 //! `Reckoned` product of two facts — and the migration invented the key to
 //! ask with, which is why HEAD has no parameter anywhere naming `RowStride`
 //! or `SplitK`.
+//!
+//! # What was left, and why it is NOT the same thing
+//!
+//! Fifty asks survived that sweep and read for a long while as its remainder —
+//! the same mistake, not yet got to. They are not. Counted 2026-08-21:
+//!
+//! - **Forty-eight of the fifty are declared in `keys.rs` §M or §L**, the two
+//!   sections the CUDA mark migration wrote for itself. Both refuse a mark IN
+//!   WRITING and give the reason: §M refuses `Out` because an `Out` mark is a
+//!   claim the allocator reads, so marking a buffer the driver carved and a
+//!   later statement still reads shortens its life to one fire; §L refuses
+//!   `Const` because a `Const` promises the statement carries the number at
+//!   its slot in the params run, and where nothing states one the promise
+//!   breaks at the fire rather than at the type. The key is the right shape.
+//! - **The other two, `NumExperts` and `RecurrentSlots`, sit in §1 ANSWERED**,
+//!   and three drivers do answer them — `driver-metal`, `driver-wgpu`,
+//!   `driver-vulkan`. Only `driver-cuda` does not, under a heading that says
+//!   it does.
+//!
+//! So the debt is one-sided rather than mistaken, and it is one-sided
+//! completely: §M and §L declare fifty-nine keys between them and
+//! `driver-cuda` answers NOT ONE. Forty-seven of the forty-eight were declared
+//! and first asked for in the SAME commit, `930fee2cb`, whose subject is about
+//! the three SHADER planes and whose body carries the CUDA half as a rider:
+//! *"The `kernels-cuda` mark migration rides along"*. The asking half of that
+//! migration landed and the answering half did not, and nothing measured the
+//! gap until this scan.
+//!
+//! # The scan believed a sentence that denied it
+//!
+//! "Not one" was "exactly one" until the strip below existed. `MoeMaxBlocks`
+//! read as answered because `driver-cuda` names it — once, in a comment, which
+//! reads in full: *"the signature takes as `Const` because no driver answers
+//! `keys::MoeMaxBlocks` or `keys::MoeAlignedRows`"*. The scan took a sentence
+//! whose subject is the ABSENCE of an answer as the answer. Stripping comments
+//! from both sides moved the count from fifty to fifty-one, and the single new
+//! line was that key.
+//!
+//! It is the `X` hole one direction over. That one is recorded further down —
+//! a placeholder in `Asks::ask`'s doc, quoted in `kernels-cuda`, collected as
+//! a real ask and excused by name because teaching the scan prose was dearer
+//! than one entry. It was not dearer; it was seventy lines, and it closes both
+//! directions at once. The excuse was cheaper only while the second hole was
+//! still unknown.
+//!
+//! That is why the failure groups by section and says a different repair under
+//! each. The message used to send every one of the fifty toward `Const` or
+//! `Asks::param` — advice that is right for the hundred and six and that two
+//! sections of the registry refuse by name for the forty-eight. A gate that
+//! names the wrong repair costs more than one that only counts, because the
+//! reader who follows it undoes a decision someone already made on purpose.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -76,9 +127,86 @@ fn plane_text(plane: &str) -> String {
     let mut out = String::new();
     for path in sources(&workspace_root().join(format!("crates/kernels-{plane}/src"))) {
         let src = std::fs::read_to_string(&path).unwrap_or_default();
-        let live = src.find("\n#[cfg(test)]").map_or(src.as_str(), |at| &src[..at]);
-        out.push_str(live);
+        let live = src
+            .find("\n#[cfg(test)]")
+            .map_or(src.as_str(), |at| &src[..at]);
+        out.push_str(&without_comments(live));
         out.push('\n');
+    }
+    out
+}
+
+/// `src` with its comments blanked out, string literals left whole.
+///
+/// # Why the scan cannot read prose
+///
+/// A driver "answers" a key here by naming it, and until this existed a
+/// COMMENT naming it counted. That is not a hypothetical: the one key this
+/// test believed `driver-cuda` answered out of §M and §L's fifty-nine was
+/// `MoeMaxBlocks`, and its only mention in the whole crate is
+/// `fire/moe_grouped.rs` saying *"the signature takes as `Const` because no
+/// driver answers `keys::MoeMaxBlocks`"* — a sentence stating the exact
+/// opposite of what the scan concluded from it. A gate that reads a denial as
+/// a confirmation is worse than one that cannot read at all.
+///
+/// The reverse hole is already known and recorded above: `ask::<_, keys::X>`
+/// in a doc comment was once collected as an ask. Both directions are the same
+/// hole and this closes them together, since the plane text is stripped too.
+///
+/// String literals must SURVIVE, because matching `"conv_state"` out of
+/// `driver-metal`'s `SLABS` table is one of the two legitimate answer routes.
+/// So this tracks quotes rather than blanking from `//` to end of line.
+fn without_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                // Copy the literal whole, honouring `\"`. Raw strings (`r"`,
+                // `r#"`) copy correctly too: the opening quote is reached the
+                // same way and no escape inside one can close it early.
+                out.push('"');
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        out.push(b[i] as char);
+                        i += 1;
+                    }
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+                if i < b.len() {
+                    out.push('"');
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // Nested, because rustc's block comments nest.
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
     }
     out
 }
@@ -86,7 +214,9 @@ fn plane_text(plane: &str) -> String {
 fn driver_text(driver: &str) -> String {
     let mut out = String::new();
     for path in sources(&workspace_root().join(format!("crates/driver-{driver}/src"))) {
-        out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        out.push_str(&without_comments(
+            &std::fs::read_to_string(&path).unwrap_or_default(),
+        ));
         out.push('\n');
     }
     out
@@ -118,183 +248,60 @@ fn asked(text: &str) -> BTreeSet<String> {
                 _ => {}
             }
         }
-        let (Some(comma), Some(close)) = (comma, close) else { break };
+        let (Some(comma), Some(close)) = (comma, close) else {
+            break;
+        };
         let after = rest[comma + 1..close].trim();
-        if let Some(name) = after.strip_prefix("keys::") {
-            if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
-                out.insert(name.to_string());
-            }
+        if let Some(name) = after.strip_prefix("keys::")
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            out.insert(name.to_string());
         }
     }
     out
 }
 
-/// Each key's declared name and whether its source is a positional SLOT.
+/// The migration's END STATE, held: the question this file was born to ask
+/// — *"does every driver answer every fact its own kernels name"* — is
+/// answered by there being NOTHING LEFT TO ASK. `ctx.ask` and `keys.rs`
+/// are deleted; every need a routine names is an OPERAND now, enumerable
+/// in `plan.runtime` and the derived column, and the walkable half of the
+/// old question lives in its successors:
 ///
-/// A `Slot` key is resolved by the binder out of the statement — an operand's
-/// width, a scalar's position — and reaches no fact table at all, so a driver
-/// that never names it is answering it all the same.
-fn key_table() -> BTreeMap<String, (String, bool)> {
-    let src = std::fs::read_to_string(workspace_root().join("crates/kernels/src/keys.rs"))
-        .expect("the key registry");
-    let mut out = BTreeMap::new();
-    for chunk in src.split("fact!(").skip(1) {
-        // `Name = "string" => SOURCE => Ty);`
-        let Some(eq) = chunk.find(" = \"") else { continue };
-        let name: String = chunk[..eq]
-            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let after = &chunk[eq + " = \"".len()..];
-        let Some(quote) = after.find('"') else { continue };
-        let string = after[..quote].to_string();
-        let tail = &after[quote..];
-        let source = tail.split("=>").nth(1).unwrap_or_default();
-        out.insert(name, (string, source.contains("Source::Slot")));
-    }
-    out
-}
-
-/// The keys `plane` asks for that `driver` names by neither route.
+/// - `check_plan`'s closed-vocabulary rule (model-ir) refuses a runtime
+///   name outside the floor's tier-1 list or a plane's dotted key, at
+///   LOAD;
+/// - `driver-cuda/tests/every_runtime_name_is_answered.rs` walks every
+///   catalogued SKU's `plan.runtime` against the driver's exported
+///   `ANSWERED`/`UNSTAGED` sets;
+/// - `canon_claims_agree` holds the three shader planes' claims equal.
 ///
-/// Two routes because the drivers use both: `driver-cuda` writes
-/// `<keys::RmsEps as keys::Fact>::KEY` and `driver-metal` matches the string
-/// `"conv_state"` out of a `SLABS` table.
-fn unanswered(plane: &str, driver: &str) -> Vec<String> {
-    let keys = key_table();
-    let text = driver_text(driver);
-    asked(&plane_text(plane))
-        .into_iter()
-        .filter(|name| {
-            let Some((string, slot)) = keys.get(name) else {
-                return false;
-            };
-            !slot && !text.contains(&format!("keys::{name}")) && !text.contains(&format!("\"{string}\""))
-        })
-        .collect()
-}
-
-/// `kernels-vulkan` is measured against `driver-wgpu`, which is not its own.
-///
-/// There is no `driver-vulkan` in this tree — `.wiki/driver-vulkan.md` is the
-/// design and not a crate — so the two attention facts below are unanswered
-/// because the answering half does not exist here, not because a body reaches
-/// for something that was never a fact. They are `Ask<..>` at HEAD too.
-const NO_DRIVER_OF_ITS_OWN: &[&str] = &["AttnPartials", "AttnSplits"];
-
-/// What a driver genuinely does not answer, with the reason.
-///
-/// Each entry is a DEBT and its own sentence has to say why, because the cost
-/// is the same either way: the body refuses `Unstated` and the routine does
-/// not fire.
-const UNANSWERED: &[(&str, &str, &str)] = &[
-    (
-        "cuda",
-        "RequestOfToken",
-        "`attention_compressed_paged_bf16`'s, and `Env<keys::RequestOfToken>` \
-         at HEAD as well -- `driver-cuda` has never answered it, so the \
-         compressed-KV prefill this deepseek path states cannot fire on this \
-         driver and could not before the marks either.",
-    ),
-];
-
-// THE `X` EXCUSE IS GONE, AND IT WAS NEVER A DEBT.
-//
-// `X` is the placeholder identifier in `Asks::ask`'s own doc comment, and
-// `kernels-cuda/src/lib.rs` quoted that line. A scan of source text cannot
-// tell a doc example from a call, so the placeholder was excused by name --
-// cheaper than teaching the scan prose. The quotation went with the CUDA
-// comment sweep and the excuse became exactly what the gate below is for: an
-// entry that reads as a known debt while the thing it excused has gone.
-//
-// It is deleted rather than kept, unlike the budget lines in
-// `driver-cuda`'s family census: those record a permission a later file
-// could inherit, and this records a parsing artefact that either recurs
-// verbatim or does not. If some file quotes `ask::<_, keys::X>` again the
-// entry comes back with it.
-
+/// What this file still holds, with the scan it always used: that no ask
+/// COMES BACK. A `ctx.ask::<..>` reappearing in a plane (a merge landing
+/// stale code wrote exactly this, twice) compiles against nothing today —
+/// but the scan refuses it with a sentence naming the channel it should
+/// take, which is a better failure than "no method named `ask`".
 #[test]
-fn every_fact_a_plane_asks_for_is_one_its_driver_answers() {
-    // The pairing, and `vulkan` is the odd one: it has no driver here.
-    const PAIRS: [(&str, &str); 4] = [
-        ("cuda", "cuda"),
-        ("metal", "metal"),
-        ("vulkan", "wgpu"),
-        ("wgpu", "wgpu"),
-    ];
-
-    let excused: BTreeSet<(&str, &str)> =
-        UNANSWERED.iter().map(|(plane, key, _)| (*plane, *key)).collect();
-
-    let mut asked_total = 0usize;
-    let mut problems = Vec::new();
-    for (plane, driver) in PAIRS {
-        let missing = unanswered(plane, driver);
-        asked_total += asked(&plane_text(plane)).len();
-        for key in missing {
-            if excused.contains(&(plane, key.as_str())) {
-                continue;
-            }
-            if plane == "vulkan" && NO_DRIVER_OF_ITS_OWN.contains(&key.as_str()) {
-                continue;
-            }
-            problems.push(format!(
-                "  kernels-{plane} asks for `keys::{key}` and driver-{driver} names it nowhere"
-            ));
+fn no_plane_asks_for_anything() {
+    let mut sites = Vec::new();
+    for plane in ["kernels-cuda", "kernels-metal", "kernels-vulkan", "kernels-wgpu"] {
+        let text = plane_text(plane);
+        for key in asked(&text) {
+            sites.push(format!("{plane}: ctx.ask for `{key}`"));
         }
-    }
-
-    assert!(
-        problems.is_empty(),
-        "{} unanswerable ask(s). A body that reaches for a fact its driver \
-         cannot answer returns `Refusal::Unstated`, so the routine does not \
-         fire at all:\n{}\n\nBefore adding a key, check what the number was \
-         BEFORE the marks. Every one of the hundred and six this test first \
-         found was a `Param<N, i32>`, a bare `i32` argument or a `Reckoned` \
-         product -- the statement's own geometry, which belongs on the \
-         signature as a `Const` mark (or is read by index with \
-         `Asks::param` where the params run is the shader's struct), not in a \
-         fact table.",
-        problems.len(),
-        problems.join("\n"),
-    );
-
-    // A FLOOR, because a scan that stopped finding `ask::<` would pass. The
-    // four planes ask for some 160 keys between them; half of that is a
-    // margin wide enough for a family to retire and narrow enough to catch
-    // the parse breaking.
-    assert!(
-        asked_total > 80,
-        "only {asked_total} asks found across the four planes, so this scan \
-         has stopped reading them rather than found them answered"
-    );
-}
-
-/// Every excuse names a key some plane actually asks for.
-///
-/// A stale entry is worse than none: it reads as a known debt while the thing
-/// it excused has gone, and the next real one to take that name is excused
-/// silently.
-#[test]
-fn every_excuse_names_a_key_a_plane_still_asks_for() {
-    let mut stale = Vec::new();
-    for (plane, key, _) in UNANSWERED {
-        if !asked(&plane_text(plane)).contains(*key) {
-            stale.push(format!("  kernels-{plane} no longer asks for `keys::{key}`"));
-        }
-    }
-    for key in NO_DRIVER_OF_ITS_OWN {
-        if !asked(&plane_text("vulkan")).contains(*key) {
-            stale.push(format!("  kernels-vulkan no longer asks for `keys::{key}`"));
-        }
+        // The vocabulary itself must stay gone too.
+        assert!(
+            !workspace_root().join("crates/kernels/src/keys.rs").exists(),
+            "keys.rs is back; the ask vocabulary was deleted by the no-ask \
+             migration and returns through no merge"
+        );
     }
     assert!(
-        stale.is_empty(),
-        "these excuses have outlived what they excused:\n{}",
-        stale.join("\n"),
+        sites.is_empty(),
+        "ask sites in a tree with no ask machinery — each names a need that \
+         is an OPERAND now (a Const on the statement, a fire extent, or a \
+         runtime view/stream the driver answers by name):\n  {}",
+        sites.join("\n  ")
     );
 }

@@ -105,14 +105,7 @@ fn encode_audio_arm(
     // Two arrays, not positional args: a transposed `(sscp_ch0, sscp_ch1)` in
     // a positional list would be silent at the call site.
     let heads_flat = [
-        sscp0_conv,
-        sscp0_norm,
-        sscp1_conv,
-        sscp1_norm,
-        sscp_proj,
-        out_w,
-        out_b,
-        embed_p,
+        sscp0_conv, sscp0_norm, sscp1_conv, sscp1_norm, sscp_proj, out_w, out_b, embed_p,
     ];
     let dims = [
         ac.hidden as i32,
@@ -218,9 +211,7 @@ impl Shell {
             }
             let notify_done = |state: &Shell| {
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                state
-                    .broker
-                    .notify(completion.wait_id, completion.target_epoch);
+                crate::serve::settle_control(&state.broker, completion);
             };
             if num_images == 0 {
                 // Audio only: the helper writes the whole CSR itself.
@@ -340,8 +331,7 @@ impl Shell {
                     return Err(PIE_STATUS_DRIVER_ERROR);
                 }
             };
-            let cublas_raw: *mut std::ffi::c_void =
-                cublas.handle().expect("just created").cast();
+            let cublas_raw: *mut std::ffi::c_void = cublas.handle().expect("just created").cast();
             let mut vis_bounds = vec![0u32; num_images + 1];
             let walked = vis_tower::encode(
                 &weights,

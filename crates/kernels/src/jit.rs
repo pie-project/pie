@@ -278,8 +278,17 @@ fn load<B: Compiles>(
 /// out. Two backends cannot collide, because a `TypeId` is in the key and the
 /// downcast would fail if it somehow were not.
 fn slot<B: Compiles>(key: &str) -> &'static Slot<B> {
-    static SLOTS: OnceLock<Mutex<HashMap<(TypeId, String), &'static (dyn Any + Send + Sync)>>> =
-        OnceLock::new();
+    /// One erased slot: a `Slot<B>` for a `B` this map cannot name, because
+    /// the map is one item shared by every instantiation and the paragraph
+    /// above says why it has to be.
+    type Erased = &'static (dyn Any + Send + Sync);
+    /// The map itself, spelled once. Its own name is here rather than inline
+    /// because a five-deep generic on one line is a type `clippy` refuses to
+    /// let a reader parse, and it is not wrong: the shape is a lock around a
+    /// map from a backend-and-point pair to an erased slot, which is four
+    /// facts, and a name is where four facts belong.
+    type Slots = OnceLock<Mutex<HashMap<(TypeId, String), Erased>>>;
+    static SLOTS: Slots = OnceLock::new();
     let mut map = SLOTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

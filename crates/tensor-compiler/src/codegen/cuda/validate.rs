@@ -7,9 +7,7 @@
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::wellformed::{ops_valid, region_ranges_valid, value_types_valid};
 
-use crate::plan::{
-    CompiledStage, LibraryOp, Region, RegionKind, library_op_for_tag,
-};
+use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind, library_op_for_tag};
 use tensor_ir::op::Op;
 use tensor_ir::registry::Stage;
 use tensor_ir::types::DType;
@@ -145,8 +143,10 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         // `sink_call` only, and would have let a fused `top_k`, `sort_desc`,
         // `cumsum`, `cumprod` or `matmul` through to an emitter with no arm
         // for it.
-        if library_op_for_tag(op.tag()).is_some() {
-            return Err(EmitError::GeneratedRegionHasBoundary);
+        if let Some(library) = library_op_for_tag(op.tag()) {
+            return Err(EmitError::GeneratedRegionHasBoundary {
+                library_op: library.name(),
+            });
         }
     }
     Ok(())

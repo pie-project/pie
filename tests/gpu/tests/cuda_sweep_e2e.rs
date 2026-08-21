@@ -81,7 +81,7 @@ fn probe_candidates() -> Vec<Knobs> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "needs a GPU, a built model in PIE_HOME and a wasm guest built on the spot"]
 async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result<()> {
     common::init_trace();
 

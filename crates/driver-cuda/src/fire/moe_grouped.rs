@@ -34,7 +34,9 @@ pub unsafe fn grouped_gemm_bf16(
 ) -> Result<(), Refusal> {
     // `batched_act_x_wt_bf16` returns silently on `batch_count <= 0`.
     if max_blocks <= 0 {
-        return Err(Refusal::Empty { what: "the padded block count" });
+        return Err(Refusal::Empty {
+            what: "the padded block count",
+        });
     }
 
     if kernels_cuda::moe::supported(m, n, k).is_ok() {
@@ -42,13 +44,27 @@ pub unsafe fn grouped_gemm_bf16(
         let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream) };
         return match kernels_cuda::moe::moe_grouped_gemm::<bf16>(
             &ctx,
-            kernels::routine::In { ptr: a.cast::<bf16>(), rows: 0, width: k },
-            kernels::routine::Const { v: bank.cast::<bf16>() },
-            kernels::routine::In { ptr: expert_ids.cast::<i32>(), rows: 0, width: 0 },
+            kernels::routine::In {
+                ptr: a.cast::<bf16>(),
+                rows: 0,
+                width: k,
+            },
+            kernels::routine::Const {
+                v: bank.cast::<bf16>(),
+            },
+            kernels::routine::In {
+                ptr: expert_ids.cast::<i32>(),
+                rows: 0,
+                width: 0,
+            },
             // ONE ADDRESS IN BOTH RUNS, and LAST: the grouped GEMM
             // accumulates into the statement's third input, which is what
             // `in_place = &[(0, 2)]` used to say beside the row.
-            kernels::routine::InOut { ptr: c.cast::<bf16>(), rows: 0, width: n },
+            kernels::routine::InOut {
+                ptr: c.cast::<bf16>(),
+                rows: 0,
+                width: n,
+            },
             // The alignment's own two numbers, which the signature takes as
             // `Const` because no driver answers `keys::MoeMaxBlocks` or
             // `keys::MoeAlignedRows` — see `kernels-cuda/src/moe.rs`. This

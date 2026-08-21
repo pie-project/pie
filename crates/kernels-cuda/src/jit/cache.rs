@@ -10,7 +10,6 @@ use crate::jit::Root;
 use crate::jit::{Error, nvrtc};
 
 pub struct Resolved {
-
     #[allow(dead_code)]
     module: dr::CUmodule,
     pub function: dr::CUfunction,
@@ -41,15 +40,13 @@ pub fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Er
     bind_context()?;
     let arch = arch().ok_or(Error::NoDevice)?;
     let key = root.key(instantiation, arch);
-    slot(&key).get_or_init(|| load(root, instantiation, &key, arch)).as_ref().map_err(Clone::clone)
+    slot(&key)
+        .get_or_init(|| load(root, instantiation, &key, arch))
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
-fn load(
-    root: &Root,
-    instantiation: &str,
-    key: &str,
-    arch: &str,
-) -> Result<Resolved, Error> {
+fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Error> {
     let started = std::time::Instant::now();
     let (cubin, mangled, compiled) = match read_disk(key) {
         Some(hit) => (hit.0, hit.1, false),
@@ -64,7 +61,10 @@ fn load(
                 wanted: std::slice::from_ref(&instantiation.to_owned()),
                 device_link: root.needs_device_runtime(),
             })
-            .map_err(|why| Error::Compile { unit: root.name, why: why.to_string() })?;
+            .map_err(|why| Error::Compile {
+                unit: root.name,
+                why: why.to_string(),
+            })?;
             if !built.log.trim().is_empty() {
                 tracing::warn!(
                     root = root.name,
@@ -74,10 +74,14 @@ fn load(
                     "a device instantiation compiled with something to say"
                 );
             }
-            let mangled = built.lowered.into_iter().next().ok_or_else(|| Error::Compile {
-                unit: root.name,
-                why: format!("`{instantiation}` compiled and NVRTC named nothing for it"),
-            })?;
+            let mangled = built
+                .lowered
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Compile {
+                    unit: root.name,
+                    why: format!("`{instantiation}` compiled and NVRTC named nothing for it"),
+                })?;
             write_disk(key, &built.cubin, &mangled);
             (built.cubin, mangled, true)
         }
@@ -85,7 +89,6 @@ fn load(
 
     let module = load_image(root.name, &cubin)?;
     let function = entry_by_name(root.name, module, instantiation, &mangled).inspect_err(|_| {
-
         unsafe { dr::cuModuleUnload(module) };
     })?;
     tracing::info!(
@@ -112,7 +115,11 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Error> {
     if code == dr::CUresult::CUDA_SUCCESS {
         Ok(module)
     } else {
-        Err(Error::Driver { what: "cuModuleLoadData", code: code as i32, why: format!("{code:?}") })
+        Err(Error::Driver {
+            what: "cuModuleLoadData",
+            code: code as i32,
+            why: format!("{code:?}"),
+        })
     }
 }
 
@@ -146,18 +153,23 @@ fn entry_by_name(
 }
 
 fn disk_path(key: &str) -> Option<PathBuf> {
-    let base =
-        std::env::var("XDG_CACHE_HOME").ok().filter(|s| !s.is_empty()).map(PathBuf::from).or_else(
-            || {
-                std::env::var("HOME")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .map(|home| PathBuf::from(home).join(".cache"))
-            },
-        )?;
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })?;
 
     let digest = crate::source::fnv1a64(key.as_bytes());
-    Some(base.join("pie").join("kernels").join(format!("{digest:016x}.cubin")))
+    Some(
+        base.join("pie")
+            .join("kernels")
+            .join(format!("{digest:016x}.cubin")),
+    )
 }
 
 fn read_disk(key: &str) -> Option<(Vec<u8>, String)> {

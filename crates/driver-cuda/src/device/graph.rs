@@ -757,7 +757,10 @@ impl Drop for SupergraphBuilder<'_> {
                 // SAFETY: the stream is capturing, which is exactly the
                 // precondition `cudaStreamEndCapture` states.
                 let ended = unsafe {
-                    cudarc::runtime::sys::cudaStreamEndCapture(stream, std::ptr::from_mut(&mut graph))
+                    cudarc::runtime::sys::cudaStreamEndCapture(
+                        stream,
+                        std::ptr::from_mut(&mut graph),
+                    )
                 };
                 if ended == cudarc::runtime::sys::cudaError::cudaSuccess && !graph.is_null() {
                     // SAFETY: `cudaStreamEndCapture` handed the graph over, and

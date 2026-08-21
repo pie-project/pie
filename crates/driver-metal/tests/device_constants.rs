@@ -30,7 +30,10 @@ kernel void spread(device uint* out [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no constant reached a pipeline");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -38,7 +41,7 @@ fn context() -> Option<Context> {
 #[test]
 fn rebinding_a_constant_a_hundred_times_costs_one_placement() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = Heap::new(&context, 1 << 20).expect("heap");
@@ -86,7 +89,7 @@ fn rebinding_a_constant_a_hundred_times_costs_one_placement() {
 #[test]
 fn a_size_that_grows_is_a_different_constant() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = Heap::new(&context, 1 << 20).expect("heap");
@@ -128,7 +131,7 @@ fn a_size_that_grows_is_a_different_constant() {
 #[test]
 fn a_constant_rewritten_between_steps_is_read_at_its_new_value() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");

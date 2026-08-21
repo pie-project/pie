@@ -1,4 +1,3 @@
-
 use core::ffi::c_void;
 
 use kernels::Refusal;
@@ -13,15 +12,16 @@ pub use scratch::{Scratch, fill_raw_span, read_raw_span, write_raw_span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
-
     pub who: &'static str,
     pub why: String,
 }
 
 impl Refused {
-
     pub fn new(who: &'static str, why: impl Into<String>) -> Self {
-        Self { who, why: why.into() }
+        Self {
+            who,
+            why: why.into(),
+        }
     }
 }
 
@@ -37,16 +37,17 @@ pub type Result<T> = core::result::Result<T, Refused>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Stream<'a> {
-
     raw: *mut c_void,
     _owner: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> Stream<'a> {
-
     #[must_use]
     pub const unsafe fn new(raw: *mut c_void) -> Self {
-        Self { raw, _owner: core::marker::PhantomData }
+        Self {
+            raw,
+            _owner: core::marker::PhantomData,
+        }
     }
 
     #[must_use]
@@ -68,7 +69,10 @@ impl<'a> Stream<'a> {
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            Err(Refused::new("cudaStreamSynchronize", "this build selected no CUDA runtime"))
+            Err(Refused::new(
+                "cudaStreamSynchronize",
+                "this build selected no CUDA runtime",
+            ))
         }
     }
 }
@@ -78,7 +82,6 @@ pub fn call(
     stream: Stream<'_>,
     body: impl FnOnce(&Ctx) -> core::result::Result<(), Refusal>,
 ) -> Result<()> {
-
     let ctx = unsafe { Ctx::on(stream.as_raw()) };
     body(&ctx).map_err(|why| Refused::new(what, format!("{why:?}")))
 }

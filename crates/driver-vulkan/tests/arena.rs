@@ -163,7 +163,7 @@ fn geometric() -> Vec<(String, Lowered, driver_vulkan::dispatch::Geometry)> {
                         rotary_dims: facts.head_dim,
                         n_experts: facts.n_experts,
                         experts_per_token: facts.experts_per_token,
-            ..Default::default()
+                        ..Default::default()
                     },
                 ));
             }
@@ -1789,9 +1789,9 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
 /// changes which value lands where and this notices.
 #[test]
 fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
-    use driver_vulkan::hold::{Facts, Handles};
     use driver_vulkan::binding::{FireNumber, FireTable, Resolve};
     use driver_vulkan::device::{Bound, Buffer};
+    use driver_vulkan::hold::{Facts, Handles};
     use model_ir::trace::ValueId;
 
     if !kernels_vulkan::embedded() {
@@ -1869,9 +1869,8 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     ) -> Vec<u32> {
         let r = driver_vulkan::hold::routine_for(stem)
             .unwrap_or_else(|| panic!("nothing serves `{stem}`"));
-        let handles = std::cell::RefCell::new(Handles::new(
-            args, widths, ins, outs, weights, params, pool,
-        ));
+        let handles =
+            std::cell::RefCell::new(Handles::new(args, widths, ins, outs, weights, params, pool));
         let values = driver_vulkan::bind::bind(r.args, r.sources, &mut handles.borrow_mut(), f)
             .unwrap_or_else(|e| panic!("`{stem}` places its scalars: {e:?}"));
         // The body may still ASK, which MINTS a handle, so the vectors the
@@ -2003,6 +2002,3 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
         assert!(present, "`{name}` reached no shader through the binder");
     }
 }
-
-
-

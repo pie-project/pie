@@ -20,6 +20,8 @@ use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
 use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
 
+use driver_metal::skip::skipped;
+
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -38,7 +40,7 @@ fn from_bf16(bits: u16) -> f32 {
 #[test]
 fn the_bias_lands_on_every_row_and_on_the_right_column() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = driver_metal::program::Compiler::new(&context).expect("a compiler");

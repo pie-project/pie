@@ -3,9 +3,9 @@
 use crate::routine::{
     Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
 };
-use kernels::raises::Struct;
-use crate::views::{AttnMask, KvCache, AttnSplit};
+use crate::views::{AttnMask, AttnSplit, KvCache};
 use kernels::BindMut;
+use kernels::raises::Struct;
 use kernels::routine::Refusal;
 use kernels_macros::routine;
 
@@ -119,7 +119,7 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
     ])
 }
 
-#[routine(canon = split_qkv)]
+#[routine(canon = split_qkv, out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -149,7 +149,7 @@ pub fn split_qkv_bf16(
     )
 }
 
-#[routine(canon = sigmoid_gate_mul)]
+#[routine(canon = sigmoid_gate_mul, out(attn = like(attn)))]
 pub fn gate(
     ctx: &Ctx<'_>,
     attn: InOut<Tensor<bf16>>,
@@ -210,7 +210,9 @@ pub fn kv_append(
     positions: In<Tensor<i32>>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let k_cache = kvc.keys;
@@ -248,7 +250,9 @@ pub fn kv_append_paged(
     tokens: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let page_size = kvc.page_size;
@@ -278,7 +282,7 @@ pub fn kv_append_paged(
     )
 }
 
-#[routine]
+#[routine(out(out = like(logits)))]
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
@@ -296,7 +300,7 @@ pub fn logit_softcap(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_decode(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -314,11 +318,15 @@ pub fn sdpa_paged_decode(
     split: In<Struct<AttnSplit>>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -339,7 +347,9 @@ pub fn sdpa_paged_decode(
     let attention_mask_stride = maskv.stride;
     let attention_mask_enabled = maskv.enabled;
     if split.ptr.is_null() {
-        return Err(Refusal::Null { what: "the split policy this statement names" });
+        return Err(Refusal::Null {
+            what: "the split policy this statement names",
+        });
     }
     let sv = unsafe { &*split.ptr };
     let partials = sv.partials;
@@ -504,7 +514,7 @@ fn flash_decode(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_decode_sink(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -523,11 +533,15 @@ pub fn sdpa_paged_decode_sink(
     split: In<Struct<AttnSplit>>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -548,7 +562,9 @@ pub fn sdpa_paged_decode_sink(
     let attention_mask_stride = maskv.stride;
     let attention_mask_enabled = maskv.enabled;
     if split.ptr.is_null() {
-        return Err(Refusal::Null { what: "the split policy this statement names" });
+        return Err(Refusal::Null {
+            what: "the split policy this statement names",
+        });
     }
     let sv = unsafe { &*split.ptr };
     let partials = sv.partials;
@@ -614,7 +630,7 @@ pub fn sdpa_paged_decode_sink(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_tiled(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -631,11 +647,15 @@ pub fn sdpa_paged_tiled(
     n_rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -697,7 +717,7 @@ pub fn sdpa_paged_tiled(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_tiled_sink(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -715,11 +735,15 @@ pub fn sdpa_paged_tiled_sink(
     n_rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -787,11 +811,15 @@ pub fn sdpa_paged_tiled_strided(
     n_rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -847,7 +875,7 @@ pub fn sdpa_paged_tiled_strided(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_mma(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -864,11 +892,15 @@ pub fn sdpa_paged_mma(
     n_rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -918,7 +950,7 @@ pub fn sdpa_paged_mma(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_mma_sink(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -936,11 +968,15 @@ pub fn sdpa_paged_mma_sink(
     n_rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -991,7 +1027,7 @@ pub fn sdpa_paged_mma_sink(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_vector_decode(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -1004,7 +1040,9 @@ pub fn sdpa_vector_decode(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let keys = kvc.keys;
@@ -1071,7 +1109,9 @@ pub fn sdpa_vector_decode_swa(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let keys = kvc.keys;
@@ -1140,7 +1180,9 @@ pub fn sdpa_vector_decode_sink(
     rows: Const<i32>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let keys = kvc.keys;
@@ -1184,4 +1226,3 @@ pub fn sdpa_vector_decode_sink(
         ],
     )
 }
-

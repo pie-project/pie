@@ -952,6 +952,88 @@ mod tests {
         args
     }
 
+    /// [`statement_wide`], with `Arg::Raised` in the input slots the
+    /// signature marks as views.
+    ///
+    /// # Why this is separate rather than a change to `statement_wide`
+    ///
+    /// The uniform-across-inputs fixture above still fits every body whose
+    /// signature reads its inputs as buffers -- the routed matvec, the norms,
+    /// the epilogue -- and reshaping it in place would change what those
+    /// sweeps state. The bodies that need `Raised` are the attention family,
+    /// and only there: `In<Struct<KvCache>>` is a runtime-object handle the
+    /// driver builds through `views::raise`, not an arena operand the
+    /// resolver holds. The two fixture shapes are two facts about the signature
+    /// surface after the marks migration and both are captured here so a
+    /// caller reading either can see which one it needs.
+    ///
+    /// # The slot mapping is stated per-symbol
+    ///
+    /// `Ty::Raised` is a variant of the argument type, but the KEY the
+    /// `raise!`/`resident!` macros wrote is not on the type alone -- it
+    /// crosses through the trait, not through the routine's runtime metadata.
+    /// Every symbol this test names is written here beside its input-slot
+    /// layout, so the fixture and the routine's own signature can be read
+    /// side by side; a shape change on either that misses the other lands as
+    /// a refusal at bind rather than as a silent skip.
+    fn statement_for(symbol: &str, width: u32) -> Vec<model_compiler::lower::Arg> {
+        use model_compiler::lower::Arg;
+        // (input-slot index, raise key) for every `In<Struct<..>>` on the
+        // signature, in the order the routine states them.
+        let raises: &[(usize, &str)] = if symbol.starts_with("sdpa_paged_decode") {
+            // `queries`, `kvc`, `positions`, `request_of_token`, `maskv`,
+            // `split`: six inputs, three of them raised. The `_sink` form
+            // has the same input surface -- the sink table is a
+            // `Const<Tensor<..>>`, which is a weight, not an input.
+            &[(1, "kv_cache"), (4, "attention_mask"), (5, "attn.split_policy")]
+        } else if symbol.starts_with("sdpa_vector_decode") {
+            // `queries`, `kvc`: two inputs, one raised, for every vector
+            // decode form (plain, swa, sink). The kv view is the only
+            // per-fire object these bodies name.
+            &[(1, "kv_cache")]
+        } else {
+            &[]
+        };
+        // How many inputs the widest routine among the ones this fixture
+        // covers takes. Ten is comfortably wider than the six `sdpa_paged`
+        // states, so a body reading `input(n)` for a slot the routine
+        // declares always finds one; the two the vector decodes state ride
+        // the leading pair of the same array.
+        let n_ins = 10usize;
+        let mut args: Vec<Arg> = (0..n_ins)
+            .map(|n| {
+                if let Some((_, key)) = raises.iter().find(|(at, _)| *at == n) {
+                    // A raised view carries no rectangle -- it is a HOST
+                    // aggregate a body reads at bind, so the width/bytes fields
+                    // above have no meaning here. `value` is written zero
+                    // because `Handles::raised_key` matches on the variant and
+                    // reads the key, not the value id.
+                    Arg::Raised {
+                        value: 0,
+                        key: (*key).to_owned(),
+                    }
+                } else {
+                    Arg::Arena {
+                        at: n * 256,
+                        width,
+                        bytes: 2,
+                    }
+                }
+            })
+            .collect();
+        // Outputs and weights ride behind the inputs, matching
+        // `statement_wide`'s shape so a routine that names more of either
+        // than the fixture holds refuses on a NAMED slot -- not on a shape
+        // mismatch nothing else in this test would explain.
+        args.extend((0..2usize).map(|n| Arg::Arena {
+            at: (n_ins + n) * 256,
+            width,
+            bytes: 2,
+        }));
+        args.extend((0..6).map(|n| Arg::Weight(format!("w.{n}"))));
+        args
+    }
+
     /// The fire a sweep states, as the `Env` values a body reads.
     fn firing(symbol: &str, rows: u32, width: u32, fire: crate::dispatch::Geometry) -> Facts {
         crate::lowering::hold::facts(symbol, rows, fire, 3, width, width)
@@ -971,6 +1053,25 @@ mod tests {
         fired_wide(symbol, facts, scalars, 128)
     }
 
+    /// [`fired_wide`], with the fixture that names the raised inputs its
+    /// signature marks. See [`statement_for`] for how the mapping is stated.
+    fn fired_for(symbol: &str, facts: Facts, scalars: &[u32], width: u32) -> Result<Vec<Stated>, String> {
+        let routine = crate::lowering::routine::armed(symbol)
+            .ok_or_else(|| format!("`{symbol}` is claimed by no armed stem"))?;
+        let args = statement_for(symbol, width);
+        let mut handles = crate::lowering::hold::Handles::with_scalars(
+            &args,
+            crate::lowering::routine::results(routine),
+            scalars,
+        );
+        let mut views = crate::lowering::views::Views::default();
+        let taken = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
+            .map_err(|why| format!("the binder refused: {why:?}"))?;
+        let handles = core::cell::RefCell::new(handles);
+        crate::lowering::routine::stating(routine, &taken, &handles, facts)
+            .map_err(|why| why.to_string())
+    }
+
     /// [`fired`], over a statement whose operands are `width` wide.
     fn fired_wide(
         symbol: &str,
@@ -986,9 +1087,9 @@ mod tests {
             crate::lowering::routine::results(routine),
             scalars,
         );
-        let taken =
-            crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts)
-                .map_err(|why| format!("the binder refused: {why:?}"))?;
+        let mut views = crate::lowering::views::Views::default();
+        let taken = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
+            .map_err(|why| format!("the binder refused: {why:?}"))?;
         // ON A PLANNER THAT CAN ANSWER, because these bodies ask. A fact only
         // the fire can answer is no longer bound into `args` before the body
         // runs -- that is the whole of the marks migration -- so `state`'s
@@ -1628,37 +1729,50 @@ mod tests {
                 // A width this body is not compiled for is a refusal and not a
                 // gap: the pinned list below is what says which pairs were
                 // supposed to answer.
-                // THE WIDTH THIS CASE IS ABOUT, at the slot the routines read
-                // it from. `head_dim` is `Const<i32>` at params[3] now -- it
-                // was a fact the driver recovered from the SYMBOL -- so a run
-                // of eights of 128 named the 128-wide module whatever width
-                // the case swept.
-                // `[n_kv_heads, scale, window, head_dim, q_heads]`, which is
-                // the run these routines' `Const` marks claim, in order. It
-                // was a flat run of 128s -- a head width of 128 whatever the
-                // case swept, and a q-head count of 128 against the fire's
-                // four.
-                // THE TWO FAMILIES DECLARE DIFFERENT RUNS. `sdpa_paged_*`
-                // takes `[n_kv_heads, scale, window, head_dim, q_heads]`;
-                // `sdpa_vector_*` has no paging and takes `[scale, head_dim,
-                // q_heads]`, so its width is at slot 1 and not 3. A flat run
-                // of 128s named the 128-wide module whatever the case swept.
-                let mut scalars = [128u32; 8];
-                if stem.starts_with("sdpa_paged") {
-                    scalars[0] = 2;
-                    scalars[3] = head_dim;
-                    scalars[4] = q_heads;
+                //
+                // THE MARK RUN, WHICH DIFFERS PER FAMILY.
+                //
+                // Each of these bodies reads its rectangle facts as
+                // `Const<i32>`/`Const<f32>` slots off the statement's params
+                // run, in the order the routine's signature states them --
+                // and the signatures differ. What used to be a single flat
+                // run of 128s is now three layouts:
+                //
+                // * `sdpa_paged_*`: `[n_kv_heads, scale, window, head_dim,
+                //    q_heads, rows]`, six slots. The paged form is the only
+                //    one that names `n_kv_heads`, because a paged decode
+                //    reaches page tables and its GQA fold is stated where
+                //    the page geometry is; the vector forms carry it later
+                //    in the run instead.
+                // * `sdpa_vector_decode`: `[scale, head_dim, q_heads,
+                //    n_kv_heads, rows]`, five slots. No window and no page
+                //    tables, so `n_kv_heads` slides down and `rows` is
+                //    at slot 4.
+                // * `sdpa_vector_decode_swa`, `_sink`: `[scale, window,
+                //    head_dim, q_heads, q_row_stride, o_row_stride,
+                //    n_kv_heads, rows]`, eight slots. Sliding-window needs
+                //    the window count; sink adds no scalar (the sink table
+                //    is a weight).
+                //
+                // `rows` MUST be positive or the body refuses `Empty {
+                // what: "rows" }` before it can pick a module. The scale is
+                // a bit pattern read as `f32`, and any positive-finite one
+                // will do -- 128 is such a pattern read as `1.7524e-40`,
+                // but the shader is not asked to make sense of it here.
+                let scalars: [u32; 8] = if stem.starts_with("sdpa_paged") {
+                    // n_kv_heads=2, scale, window (unused), head_dim, q_heads, rows.
+                    [2, 128, 128, head_dim, q_heads, rows, 0, 0]
                 } else if stem.contains("swa") || stem.contains("sink") {
-                    // `[scale, window, head_dim, q_heads]`: the window stands
-                    // between the scale and the width. `sinks` is a WEIGHT and
-                    // takes no slot in the scalar run.
-                    scalars[2] = head_dim;
-                    scalars[3] = q_heads;
+                    // scale, window, head_dim, q_heads, q_row_stride,
+                    // o_row_stride, n_kv_heads, rows.
+                    [128, 128, head_dim, q_heads, head_dim, head_dim, 2, rows]
                 } else {
-                    scalars[1] = head_dim;
-                    scalars[2] = q_heads;
-                }
-                let Ok(stated) = fired(&symbol, firing(&symbol, rows, 128, fire), &scalars) else {
+                    // scale, head_dim, q_heads, n_kv_heads, rows.
+                    [128, head_dim, q_heads, 2, rows, 0, 0, 0]
+                };
+                let Ok(stated) =
+                    fired_for(&symbol, firing(&symbol, rows, 128, fire), &scalars, 128)
+                else {
                     continue;
                 };
                 // ONE DISPATCH OR TWO, and the second is not a surprise: a
@@ -2190,17 +2304,23 @@ mod tests {
             // multiple the two agree and this check proves nothing -- which is
             // how the defect survived a suite that used them.
             for out_vec in [13u32, 47, 1] {
-                // Word 1 is `out_vec_size` and word 4 is the slot count: the
-                // same run the shader's uniform block gets, read by the arm
-                // and handed to the body, which is the only path a y extent
-                // takes now.
-                // `[x_slot_stride, x_row_stride, slots_per_row]`, which is
-                // the run this routine's three `Const` marks claim, in order.
-                // It was `[128, out_vec, 128, 128, slots, ..]` -- the shader's
-                // uniform block as the ARM once packed it, with the slot count
-                // at word 4. The body reads slot 2 now, and `out_vec` is not a
-                // scalar at all: it is `y.width`, the rectangle above.
-                let scalars = [128, 128, slots, 0, 0, 0, 0, 0];
+                // Four marks the arm reads in this order:
+                // `[x_slot_stride, x_row_stride, slots_per_row, rows]`.
+                //
+                // # Why the layout looks like this now
+                //
+                // The old row wrote `[128, out_vec, 128, 128, slots, ..]` --
+                // the shader's uniform block as the ARM once packed it, with
+                // the slot count at word 4. The marks migration retired the
+                // arm's uniform packing: `qmv_routed` declares four
+                // `Const<i32>` slots, so the block is now exactly those four
+                // in the order they are stated on the routine's signature.
+                // Word 1 is no longer `out_vec_size` (that is `y.width`, the
+                // rectangle, not a scalar the statement carries), and
+                // `slots_per_row` is at slot 2. `rows` closes the run and MUST
+                // be positive or the body refuses `Empty { what: "rows" }`
+                // before the geometry it is measured for is ever computed.
+                let scalars = [128, 128, slots, rows];
                 let fire = crate::dispatch::Geometry {
                     q_heads: 4,
                     kv_heads: 2,
@@ -2210,11 +2330,13 @@ mod tests {
                     experts_per_token: slots,
                     ..Default::default()
                 };
-                let stated =
-                    fired_wide(symbol, firing(symbol, rows, out_vec, fire), &scalars, out_vec)
-                        .unwrap_or_else(|e| {
-                            panic!("`{symbol}` is a matvec this tree plans: {e}")
-                        });
+                let stated = fired_wide(
+                    symbol,
+                    firing(symbol, rows, out_vec, fire),
+                    &scalars,
+                    out_vec,
+                )
+                .unwrap_or_else(|e| panic!("`{symbol}` is a matvec this tree plans: {e}"));
                 assert_eq!(stated.len(), 1, "`{symbol}` is one dispatch");
                 let name = stated[0].entrypoint.clone();
                 let declared =

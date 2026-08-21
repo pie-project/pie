@@ -335,10 +335,17 @@ fn every_rectangle_of_qwen3_5s_hybrid_forward_is_planned_or_named() {
         !low.launches.is_empty(),
         "the hybrid lowered to no launches at all"
     );
-    assert!(
-        v.planned.len() >= 12,
-        "only {} of qwen3.5's symbols plan; it was twelve when this was \
-         written, and a FALL means something that worked stopped. {:?}",
+    // "It was twelve when this was written" was the whole argument for the
+    // number, and it is twelve now -- so the floor has never once been the
+    // thing under test. A RISE is worth knowing about too: a symbol that
+    // starts planning without anyone deciding it should is the same class of
+    // news as one that stops.
+    assert_eq!(
+        v.planned.len(),
+        12,
+        "{} of qwen3.5's symbols plan, not the twelve this was measured \
+         against. A FALL means something that worked stopped; a RISE means \
+         say so here. {:?}",
         v.planned.len(),
         v.refused,
     );
@@ -617,7 +624,7 @@ fn a_stated_recurrent_shape_becomes_planes_an_arm_can_reach() {
     use driver_wgpu::resources::{Recurrent, RecurrentPool};
 
     let Some(device) = adapter() else {
-        println!("no adapter, so the allocation could not be measured");
+        driver_wgpu::skip::skipped("no adapter, so the allocation could not be measured");
         return;
     };
     // Small on purpose: this measures the WIRING, not the size, and the
@@ -665,10 +672,15 @@ fn a_stated_recurrent_shape_becomes_planes_an_arm_can_reach() {
         },
     )
     .expect("a small kv pool");
+    // A `Model` needs a runtime `Streams` too now — that is the no-ask
+    // channel's staged half, and this test only cares about the slab, so an
+    // empty map answers nothing wrongly rather than nothing at all.
+    let streams = driver_wgpu::runtime::Streams::default();
     let with = driver_wgpu::resources::Model {
         weights: &weights,
         pool: &kv,
         recurrent: Some(&pool),
+        runtime: &streams,
     };
     assert!(
         Resolve::slab(&with, 1, "recurrent_state").is_some(),
@@ -678,6 +690,7 @@ fn a_stated_recurrent_shape_becomes_planes_an_arm_can_reach() {
         weights: &weights,
         pool: &kv,
         recurrent: None,
+        runtime: &streams,
     };
     assert!(
         Resolve::slab(&without, 1, "recurrent_state").is_none(),
@@ -687,8 +700,43 @@ fn a_stated_recurrent_shape_becomes_planes_an_arm_can_reach() {
 }
 
 /// The adapter, or `None` on a machine without one.
+///
+/// **It refuses a SOFTWARE adapter unless one was asked for**, and that is not
+/// a hypothetical. Run one at a time, every probe in this file opens the RTX
+/// 4090 this was measured on. Run six in one process with `--test-threads=1`,
+/// the sixth prints `adapter: llvmpipe (LLVM 21.1.8, 256 bits)` -- and then
+/// goes on to report timings, tolerances and NaN counts as if they were the
+/// card's. `which_of_the_mlps_kernels_carries_the_odd_row_nan` is the one that
+/// makes the difference legible: alone it finds a three-row fire FINITE and
+/// says so, in a batch it finds a NaN and attributes it, and neither reading
+/// was of the same device.
+///
+/// `Device::open`'s own doc says this cannot happen -- *"a power preference
+/// RANKS adapters and never reaches a software one, which needs
+/// `force_fallback_adapter`"* -- and on a rested machine it is right. What it
+/// does not cover is an adapter that stops answering: five `Shell`s of 424 MB
+/// have been opened and dropped by then, and when the NVIDIA ICD declines to
+/// enumerate, `request_adapter` ranks what is left and Mesa's software adapter
+/// is left. There is no error to check, because from `wgpu`'s side nothing
+/// went wrong.
+///
+/// So the check is here, where the consequence is. A probe that cannot have the
+/// card prints why and measures nothing, which is this file's contract for
+/// every other resource it cannot get. `PIE_WGPU_FALLBACK` still asks for
+/// `llvmpipe` deliberately, and then it is not a fallback.
 fn adapter() -> Option<driver_wgpu::device::Device> {
-    driver_wgpu::device::Device::open().ok()
+    let device = driver_wgpu::device::Device::open().ok()?;
+    if device.info().device_type == wgpu::DeviceType::Cpu
+        && std::env::var_os("PIE_WGPU_FALLBACK").is_none()
+    {
+        println!(
+            "the only adapter left is the software one (`{}`), and a number \
+             read off it is not this machine's -- so IT COULD NOT BE MEASURED",
+            device.name()
+        );
+        return None;
+    }
+    Some(device)
 }
 
 /// How far the WEIGHTS are, and against the right surface.
@@ -1191,9 +1239,7 @@ fn fire_once(shell: &mut driver_wgpu::shell::Shell, who: u64) -> Vec<f32> {
 /// recurrent rows the pool opens: a test that runs two conversations against
 /// one shell needs at least two, and a pool that is one short refuses at the
 /// step rather than at the open.
-fn qwen3_5_shell(
-    slots: u32,
-) -> Option<(driver_wgpu::shell::Shell, BTreeMap<String, Vec<u8>>)> {
+fn qwen3_5_shell(slots: u32) -> Option<(driver_wgpu::shell::Shell, BTreeMap<String, Vec<u8>>)> {
     qwen3_5_shell_at(slots, 4, model::shared::policy::RuntimeQuant::Int4)
 }
 
@@ -1206,7 +1252,7 @@ fn qwen3_5_shell_at(
     let dir = match qwen3_5_snapshot() {
         Some(dir) => dir,
         None => {
-            println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+            driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
             return None;
         }
     };
@@ -1230,7 +1276,7 @@ fn qwen3_5_shell_in(
     let device = match adapter() {
         Some(device) => device,
         None => {
-            println!("no adapter, so IT COULD NOT BE MEASURED");
+            driver_wgpu::skip::skipped("no adapter, so IT COULD NOT BE MEASURED");
             return None;
         }
     };
@@ -1628,6 +1674,35 @@ fn the_prefill_and_the_decode_are_one_recurrence_written_twice() {
     );
 }
 
+/// The rows ONE TURN OF `n` TOKENS is actually lowered against.
+///
+/// `Frame::seriation` in `driver-wgpu::resources` is what a real fire uses, and
+/// a test that hand-rolls `vec![Row { samples: true, .. }; n]` instead is
+/// stating a DIFFERENT fire. Two fields separate them and both change the
+/// lowering:
+///
+/// * `multi_token` is true for every row of a turn contributing more than one,
+///   which is what tells the attention it is a prefill.
+/// * `samples` is true only where `sampling_indices` points, and for a single
+///   turn that is the LAST row alone. It used to be every row -- `turns.rs`
+///   forced it, because the texts spell their epilogue as plain launches and
+///   `Lowered::arg_rows` did not exist to widen the gather's input. It does
+///   now, so a 512-token prefill reads out ONE distribution instead of 512.
+///
+/// Every extra sampled row is another `vocab` of logits in the arena, so a
+/// probe that compares `step.arena.len()` against its own `lower(..)` is off by
+/// exactly `(n - 1) * vocab * 2` bytes -- 1,489,920 of them at four rows here,
+/// which is how this was found.
+fn turn_rows(n: usize) -> Vec<Row> {
+    (0..n)
+        .map(|t| Row {
+            multi_token: n > 1,
+            samples: t + 1 == n,
+            ..Row::default()
+        })
+        .collect()
+}
+
 /// Which id holds the widest value.
 fn argmax_of(row: &[f32]) -> usize {
     row.iter()
@@ -1656,7 +1731,11 @@ fn span_of(row: &[f32]) -> f32 {
 fn shape_of(row: &[f32]) -> String {
     let nan = row.iter().filter(|v| v.is_nan()).count();
     let inf = row.iter().filter(|v| v.is_infinite()).count();
-    let span = row.iter().copied().filter(|v| v.is_finite()).fold(0.0f32, |m, v| m.max(v.abs()));
+    let span = row
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(0.0f32, |m, v| m.max(v.abs()));
     format!(
         "{} values, {nan} NaN, {inf} inf, widest finite {span:.5}",
         row.len()
@@ -1914,7 +1993,11 @@ fn how_many_fires_a_shell_answers_before_it_goes_dark() {
             continue;
         };
         who += 1;
-        let canary = fire_span(&mut shell, who, &[PERIOD[0], PERIOD[1], PERIOD[2], PERIOD[3]]);
+        let canary = fire_span(
+            &mut shell,
+            who,
+            &[PERIOD[0], PERIOD[1], PERIOD[2], PERIOD[3]],
+        );
         println!(
             "fire {}: {n:>2} tokens -> span {span:>8.3} ({dispatches} rectangles) \
              canary(4) -> {}   lowerings {}",
@@ -2392,8 +2475,7 @@ fn what_the_lowering_does_differently_at_the_row_counts_that_go_dark() {
             let symbol = &low.kernels[launch.kernel as usize];
             for arg in &low.args[launch.args.start as usize..launch.args.end as usize] {
                 let (width, bytes) = match arg {
-                    Arg::Arena { width, bytes, .. }
-                    | Arg::Named { width, bytes, .. } => {
+                    Arg::Arena { width, bytes, .. } | Arg::Named { width, bytes, .. } => {
                         (*width, *bytes)
                     }
                     _ => continue,
@@ -2446,16 +2528,17 @@ fn what_the_lowering_does_differently_at_the_row_counts_that_go_dark() {
                 };
                 let end = at + span * (*width as usize) * (*bytes as usize);
                 if end > low.arena_bytes {
-                    past.push(format!(
-                        "{symbol}: {at}..{end} past {}",
-                        low.arena_bytes
-                    ));
+                    past.push(format!("{symbol}: {at}..{end} past {}", low.arena_bytes));
                 }
             }
         }
         past.sort_unstable();
         past.dedup();
-        println!("  {n} rows (arena {}): {} such", low.arena_bytes, past.len());
+        println!(
+            "  {n} rows (arena {}): {} such",
+            low.arena_bytes,
+            past.len()
+        );
         for line in past.iter().take(6) {
             println!("      {line}");
         }
@@ -2637,7 +2720,7 @@ fn the_same_prompt_twice_is_the_same_answer_or_the_scan_is_racing() {
 #[ignore = "opens a real adapter; run it deliberately"]
 fn a_carry_with_no_slot_to_live_in_is_refused_rather_than_clamped() {
     let Some(device) = adapter() else {
-        println!("no adapter, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::skipped("no adapter, so IT COULD NOT BE MEASURED");
         return;
     };
     let facts = Qwen35HybridFacts::qwen3_5_0_8b();
@@ -2887,14 +2970,14 @@ fn what_the_row_count_changes_about_a_rectangle_and_what_it_does_not() {
                 }
             }
         }
-        println!("-- {n} rows: {} kinds of refusal at a 256-byte alignment", refused.len());
+        println!(
+            "-- {n} rows: {} kinds of refusal at a 256-byte alignment",
+            refused.len()
+        );
         for (why, count) in &refused {
             println!("     x{count}: {why}");
         }
-        raw.insert(
-            n,
-            low.kernels.iter().cloned().collect::<BTreeSet<String>>(),
-        );
+        raw.insert(n, low.kernels.iter().cloned().collect::<BTreeSet<String>>());
         // The per-symbol LAUNCH COUNT too: a guard that swaps an arm can keep
         // both symbols in the table and change how often each fires.
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -2937,10 +3020,7 @@ fn what_the_row_count_changes_about_a_rectangle_and_what_it_does_not() {
     }
 
     println!("== SYMBOLS FIRED A DIFFERENT NUMBER OF TIMES ==");
-    let (t3, t4) = (
-        tally.get(&3).expect("three"),
-        tally.get(&4).expect("four"),
-    );
+    let (t3, t4) = (tally.get(&3).expect("three"), tally.get(&4).expect("four"));
     for (symbol, n3) in t3 {
         let n4 = t4.get(symbol).copied().unwrap_or(0);
         if *n3 != n4 {
@@ -2959,13 +3039,11 @@ fn what_the_row_count_changes_about_a_rectangle_and_what_it_does_not() {
         let (Some((g3, e3)), Some((g4, e4))) = (at_three.first(), at_four.first()) else {
             continue;
         };
-        let scaled: Vec<bool> = e3
-            .iter()
-            .zip(e4)
-            .map(|(a, b)| *b * 3 == *a * 4)
-            .collect();
+        let scaled: Vec<bool> = e3.iter().zip(e4).map(|(a, b)| *b * 3 == *a * 4).collect();
         if scaled.iter().any(|s| !s) {
-            println!("  {symbol}\n      3: grid {g3} extents {e3:?}\n      4: grid {g4} extents {e4:?}");
+            println!(
+                "  {symbol}\n      3: grid {g3} extents {e3:?}\n      4: grid {g4} extents {e4:?}"
+            );
             flagged += 1;
         }
     }
@@ -3278,11 +3356,36 @@ fn which_of_the_mlps_kernels_carries_the_odd_row_nan() {
 
     let base = fire_row(&mut shell, 1, &three);
     println!("\nbaseline, 3 rows: {}", shape_of(&base));
-    assert!(
-        base.iter().any(|v| v.is_nan()),
-        "three rows is finite on this build, so there is no NaN here to \
-         attribute and every reading below would be of a model that works"
-    );
+    // THE PREMISE, AND IT IS NO LONGER MET ON A CARD.
+    //
+    // This asserted the NaN and failed without it, which is right for a test
+    // that only attributes -- every row below would otherwise be a reading of
+    // a model that works. What it could not tell apart is a premise that has
+    // been FIXED from one that never held, and on an RTX 4090 a three-row fire
+    // now reads out 248,320 finite values with a widest of 14.44.
+    //
+    // It went on passing in a batch, which is the part worth writing down: by
+    // the sixth `#[ignore]` probe in one process the NVIDIA adapter stops
+    // answering and `Device::open` hands back `llvmpipe`, whose three-row fire
+    // does carry a NaN. So the assertion was green on a SOFTWARE adapter and
+    // red on the card, and the file's central symptom belongs to one of them
+    // and not to the other. `adapter()` now refuses the software one, which is
+    // what makes that visible rather than confusing.
+    //
+    // Non-finite INTERMEDIATES do survive on the card -- ten of 6,144 in layer
+    // 0's `gdn_core_recurrent_prefill`, per
+    // `the_rectangle_the_odd_row_nan_first_appears_at` -- so there is still
+    // something here. It just does not reach the readout, and a table of
+    // logits-NaN attributions cannot say anything about it.
+    if !base.iter().any(|v| v.is_nan()) {
+        println!(
+            "  three rows READS OUT FINITE on this adapter, so there is no \
+             NaN in the logits to attribute; the intermediates that are not \
+             finite are `the_rectangle_the_odd_row_nan_first_appears_at`'s \
+             question, not this one"
+        );
+        return;
+    }
 
     // One suffix at a time, each restored before the next, so every row of the
     // table is a measurement of ONE change rather than of the pile of them.
@@ -3411,7 +3514,10 @@ fn whether_two_operands_of_one_rectangle_land_on_each_other() {
 
     let three = found.get(&3).expect("three lowered");
     let four = found.get(&4).expect("four lowered");
-    println!("\nat three rows and not four: {}", three.difference(four).count());
+    println!(
+        "\nat three rows and not four: {}",
+        three.difference(four).count()
+    );
     for line in three.difference(four).take(6) {
         println!("    {line}");
     }
@@ -3455,13 +3561,11 @@ fn the_first_value_of_an_odd_row_fire_that_is_not_finite() {
 
     for n in [4usize, 3] {
         let tokens: Vec<u32> = (0..n).map(|t| PERIOD[t % PERIOD.len()]).collect();
-        let rows: Vec<Row> = vec![
-            Row {
-                samples: true,
-                ..Row::default()
-            };
-            n
-        ];
+        // THE ROWS THE FIRE BELOW IS ACTUALLY LOWERED AGAINST, which is not
+        // `samples: true` on all of them -- see [`turn_rows`]. This asserts the
+        // arena SIZE, so it is the one probe in this file that the difference
+        // could not hide from.
+        let rows = turn_rows(n);
         let low = lower(
             &plan,
             &rows,
@@ -3803,7 +3907,7 @@ fn one_text_inner(layers: u32, vector: bool, one_at_a_time: bool) -> bool {
 /// before or after it to confuse an arena readback.
 fn one_text_full(layers: u32, vector: bool, one_at_a_time: bool, interval: u32) -> bool {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return false;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
@@ -3811,7 +3915,7 @@ fn one_text_full(layers: u32, vector: bool, one_at_a_time: bool, interval: u32) 
         return false;
     };
     let Some(device) = adapter() else {
-        println!("no adapter, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::skipped("no adapter, so IT COULD NOT BE MEASURED");
         return false;
     };
 
@@ -3901,7 +4005,11 @@ fn one_text_full(layers: u32, vector: bool, one_at_a_time: bool, interval: u32) 
         let nan = out.iter().any(|v| v.is_nan());
         line.push_str(&format!(
             "  {n} rows: {}",
-            if nan { "NaN     ".to_owned() } else { format!("{:<8.3}", span_of(&out)) }
+            if nan {
+                "NaN     ".to_owned()
+            } else {
+                format!("{:<8.3}", span_of(&out))
+            }
         ));
     }
     println!(
@@ -3949,7 +4057,10 @@ fn what_the_two_texts_differ_by_at_a_three_row_fire() {
         .collect()
     };
     let prefill = of(&hybrid_plan(&facts));
-    let decode = of(&hybrid_plan_class(&facts, model_ir::trace::FireClass::Decode));
+    let decode = of(&hybrid_plan_class(
+        &facts,
+        model_ir::trace::FireClass::Decode,
+    ));
 
     println!("only the PREFILL text launches these:");
     for k in prefill.difference(&decode) {
@@ -4004,14 +4115,14 @@ fn what_the_two_texts_differ_by_at_a_three_row_fire() {
 #[ignore = "loads and encodes a real checkpoint; run it deliberately"]
 fn whether_the_tiled_softmax_makes_the_nan_or_reads_one() {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
         return;
     };
     let Some(device) = adapter() else {
-        println!("no adapter, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::skipped("no adapter, so IT COULD NOT BE MEASURED");
         return;
     };
     let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
@@ -4080,13 +4191,13 @@ fn whether_the_tiled_softmax_makes_the_nan_or_reads_one() {
     const PERIOD: [u32; 6] = [15_339, 1_723, 88_204, 6_100, 41_777, 2_930];
     for n in [4usize, 3] {
         let tokens: Vec<u32> = (0..n).map(|t| PERIOD[t % PERIOD.len()]).collect();
-        let rows: Vec<Row> = vec![
-            Row {
-                samples: true,
-                ..Row::default()
-            };
-            n
-        ];
+        // As in `the_first_value_of_an_odd_row_fire_that_is_not_finite`: the
+        // rows a real turn is lowered against, not `samples` on all of them.
+        // The guard below then reports a genuine disagreement rather than the
+        // one this test was writing itself, and it was writing itself one --
+        // which is why it printed and skipped both row counts and looked like
+        // a probe that had nothing to say.
+        let rows = turn_rows(n);
         let low = lower(
             &plan,
             &rows,
@@ -4103,8 +4214,12 @@ fn whether_the_tiled_softmax_makes_the_nan_or_reads_one() {
             continue;
         };
         if step.arena.len() != low.arena_bytes {
-            println!("{n} rows: the arena is {} and the lowering states {}, so \
-                 the offsets would index something else", step.arena.len(), low.arena_bytes);
+            println!(
+                "{n} rows: the arena is {} and the lowering states {}, so \
+                 the offsets would index something else",
+                step.arena.len(),
+                low.arena_bytes
+            );
             continue;
         }
 
@@ -4127,7 +4242,11 @@ fn whether_the_tiled_softmax_makes_the_nan_or_reads_one() {
                         .filter(|v| !v.is_finite())
                         .count();
                     let e = per_layer.entry(launch.layers.start).or_insert((0, 0));
-                    if bad > 0 { e.1 += 1; } else { e.0 += 1; }
+                    if bad > 0 {
+                        e.1 += 1;
+                    } else {
+                        e.0 += 1;
+                    }
                 }
             }
             if !symbol.starts_with("sdpa") {
@@ -4147,12 +4266,18 @@ fn whether_the_tiled_softmax_makes_the_nan_or_reads_one() {
                             })
                             .filter(|v| !v.is_finite())
                             .count();
-                        Some(format!("at {at}: {bad} of {} not finite", span * *width as usize))
+                        Some(format!(
+                            "at {at}: {bad} of {} not finite",
+                            span * *width as usize
+                        ))
                     }
                     _ => None,
                 })
                 .collect();
-            println!("{n} rows: {symbol} layer {} -> {ranges:?}", launch.layers.start);
+            println!(
+                "{n} rows: {symbol} layer {} -> {ranges:?}",
+                launch.layers.start
+            );
         }
         println!("{n} rows, ranges finite/not by layer: {per_layer:?}");
     }
@@ -4283,14 +4408,14 @@ fn whether_anything_writes_the_tiled_softmaxs_queries_after_it_runs() {
 #[ignore = "loads and encodes a real checkpoint and fires it ~10 times; slow"]
 fn the_rectangle_the_odd_row_nan_first_appears_at() {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
         return;
     };
     let Some(device) = adapter() else {
-        println!("no adapter, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::skipped("no adapter, so IT COULD NOT BE MEASURED");
         return;
     };
     let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
@@ -4453,9 +4578,7 @@ fn the_rectangle_the_odd_row_nan_first_appears_at() {
     println!(
         "\nTHE FIRST NON-FINITE VALUE APPEARS AT RECTANGLE {hi} of {total}: \
          `{}`, layer {}, rows {:?}",
-        low.kernels[launch.kernel as usize],
-        launch.layers.start,
-        launch.rows,
+        low.kernels[launch.kernel as usize], launch.layers.start, launch.rows,
     );
 
     // The neighbourhood, free from the lowering, so the answer can be read
@@ -4477,8 +4600,15 @@ fn the_rectangle_the_odd_row_nan_first_appears_at() {
     // what say this one is real.
     let before = dirty(&mut shell, hi.saturating_sub(1));
     let after = dirty(&mut shell, hi);
-    println!("  after {} rectangles: {}", hi - 1, if before { "dirty" } else { "clean" });
-    println!("  after {hi} rectangles: {}", if after { "dirty" } else { "clean" });
+    println!(
+        "  after {} rectangles: {}",
+        hi - 1,
+        if before { "dirty" } else { "clean" }
+    );
+    println!(
+        "  after {hi} rectangles: {}",
+        if after { "dirty" } else { "clean" }
+    );
     assert!(
         !before && after,
         "rectangle {hi} is not where it changes, so the predicate is not monotone in the prefix and the bisection reported an index it invented"
@@ -4546,7 +4676,13 @@ fn the_rectangle_the_odd_row_nan_first_appears_at() {
                     // finite `f32` rounding up at the top of it lands on inf.
                     where_.push(format!(
                         "({} t{} h{} d{})",
-                        if v.is_nan() { "NaN" } else if v > 0.0 { "+inf" } else { "-inf" },
+                        if v.is_nan() {
+                            "NaN"
+                        } else if v > 0.0 {
+                            "+inf"
+                        } else {
+                            "-inf"
+                        },
                         t,
                         rest / dv,
                         rest % dv
@@ -4684,8 +4820,7 @@ fn the_rectangle_the_odd_row_nan_first_appears_at() {
                 named += 1;
                 println!(
                     "    {} layer {}: at {at}..{end} ({sp} x {width} x {bytes}B) -> {bad} not finite",
-                    low.kernels[l.kernel as usize],
-                    l.layers.start,
+                    low.kernels[l.kernel as usize], l.layers.start,
                 );
             }
         }
@@ -4751,7 +4886,10 @@ fn whether_one_token_at_a_time_continues_the_pattern() {
 
     // The prefill of the same prompt, for the comparison this exists to make.
     let whole = fire_row(&mut shell, 2, &tokens);
-    println!("  the same prompt as ONE prefill wants {}", argmax_of(&whole));
+    println!(
+        "  the same prompt as ONE prefill wants {}",
+        argmax_of(&whole)
+    );
 
     if u32::try_from(top[0].0) == Ok(PERIOD[2]) {
         println!(
@@ -4825,14 +4963,14 @@ fn how_much_each_layer_adds_to_the_residual_stream_at_full_depth() {
 
 fn residual_survey(layers: u32, only_residual: bool) {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
         return;
     };
     let Some(device) = adapter() else {
-        println!("no adapter, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::skipped("no adapter, so IT COULD NOT BE MEASURED");
         return;
     };
     let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
@@ -4945,9 +5083,11 @@ fn residual_survey(layers: u32, only_residual: bool) {
             let mut top = 0.0f32;
             let mut nan = 0usize;
             let vals: Box<dyn Iterator<Item = f32>> = if *bytes == 2 {
-                Box::new(step.arena[*at..end].chunks_exact(2).map(|c| {
-                    f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
-                }))
+                Box::new(
+                    step.arena[*at..end]
+                        .chunks_exact(2)
+                        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)),
+                )
             } else {
                 Box::new(
                     step.arena[*at..end]
@@ -5013,6 +5153,185 @@ fn residual_survey(layers: u32, only_residual: bool) {
 /// last token of a six-token period at every phase. So passing here is
 /// necessary and nowhere near sufficient, and the period continuation is the
 /// question that separates the two.
+///
+/// # Why FIRST-OR-SECOND and not first, which is four bits and not a defect
+///
+/// It asserted 4 of 4 and got 3, deterministically, on an RTX 4090. The one it
+/// misses is 88204, and the checkpoint itself says why. Run through
+/// `transformers` at bf16, the four prompts answer their own token by these
+/// margins over the runner-up:
+///
+/// | token | is | first | second | margin |
+/// |---|---|---|---|---|
+/// | 15339 | `' reads'` | 18.75 | 14.00 `'\n'` | 4.75 |
+/// | 1723 | `'-c'` | 20.00 | 15.19 `'\n'` | 4.81 |
+/// | 88204 | `'))=='` | 15.88 | 14.88 `'=='` | **1.00** |
+/// | 6100 | `'ospital'` | 20.25 | 18.38 `'hospital'` | 1.87 |
+///
+/// `'))==' x16` is `'))==))==))=='`, and `'=='` is a reading of that string a
+/// tokenizer boundary makes almost as good. This driver runs the weights at
+/// FOUR BITS -- `RuntimeQuant::Int4` over groups of 64 -- and reports 14.69 for
+/// `'=='` against 13.06 for `'))=='`. A one-logit margin is inside what that
+/// quantization costs, and the other three, at 1.87 and above, survive it.
+///
+/// So the floor is stated as FIRST OR SECOND, which is the strongest claim
+/// four-bit weights support against a one-logit reference margin. The collapse
+/// this test was written for -- every prompt answering a space, a comma or a
+/// newline -- puts the prompt's own token nowhere near the top two and still
+/// fails it, and the count of exact firsts is printed either way.
+///
+/// # What it said the first time anybody ran it
+///
+/// This test was written, `#[ignore]`d, and left. No workflow passes
+/// `--include-ignored` to this target, so between being written and
+/// 2026-08-21 it had never executed. Run against a fetched
+/// `Qwen/Qwen3.5-0.8B` on an Apple M1 Max, it is RED, and it fails on the
+/// exact shape it names:
+///
+/// ```text
+///   [one prefill ]    15339 x16 ->  15339 (19.12), 15339 scored 19.12
+///   [one prefill ]     1723 x16 ->   1723 (21.12),  1723 scored 21.12
+///   [16 decodes  ]    88204 x16 ->    198 (15.00), 88204 scored 11.75
+///   [16 decodes  ]     6100 x16 ->   6100 (19.00),  6100 scored 19.00
+/// ```
+///
+/// The doc above predicts trouble at `88204` and predicts the WRONG trouble.
+/// Its argument is that `'))=='` leads `'=='` by only 1.00 in the reference,
+/// which four-bit weights can flip -- so second place would be forgivable.
+/// What actually happens is that a NEWLINE wins by 3.25 over the prompt's own
+/// token, which is not a margin flip. It is the collapse the last paragraph
+/// describes, arriving on one token of four.
+///
+/// It is not the decode path as such: `6100`, the other token fired one at a
+/// time, answers itself at 19.00 and first. It is not a race: two runs give
+/// bit-identical numbers. Whatever it is, it is specific, reproducible, and
+/// was sitting behind an `#[ignore]` the whole time.
+///
+/// # What an oracle said about the reference table, 2026-08-21
+///
+/// Everything above this heading reasons from a `transformers` bf16 table
+/// that nobody had re-measured. One of its four rows does not reproduce, and
+/// it is the row every threshold in this doc was set by.
+///
+/// `Qwen/Qwen3.5-0.8B` through mlx-lm 0.31.3, measured four ways -- f32 and
+/// bf16, one sixteen-token forward and sixteen cached one-token steps -- all
+/// four agreeing:
+///
+/// ```text
+///   prompt            first            second           margin   own token
+///   15339  ' reads'   15339 (20.41)    198   (16.01)      4.40   first
+///    1723  '-c'        1723 (21.71)    198   (17.96)      3.75   first
+///   88204  '))=='       410 (17.16)  43835   (13.94)      3.22   FIFTH (13.10)
+///    6100  'ospital'   6100 (21.70)  67656   (19.22)      2.48   first
+/// ```
+///
+/// Three rows land within about a logit of the table above (4.75/4.81/1.87
+/// against 4.40/3.75/2.48). The fourth inverts: the table has `'))=='` first
+/// at 15.88 and `'=='` second at 14.88, a margin of 1.00; the checkpoint puts
+/// `'=='` first by 3.22 and `'))=='` FIFTH, 4.06 down. Sixteen `'))=='` spell
+/// `'))==))==...'` and the model prefers the reading that takes the `'=='`
+/// and leaves the parens -- which is the same observation the table made,
+/// arriving at the opposite order.
+///
+/// Two things follow. The FIRST-OR-SECOND concession is unnecessary: it
+/// exists to survive a 1.00 margin that is not there, and the smallest real
+/// margin is 2.48, which this doc already argues four-bit weights survive.
+/// And the claim itself was wrong -- "a prompt of one repeated token predicts
+/// that token" is a guess about the model, and on one prompt in four the
+/// model does not do it. The gate now asserts the ORACLE's answer, which is a
+/// measurement of the model rather than an assumption about it.
+///
+/// # What the benchmark was actually discriminating, and a fifth prompt
+///
+/// `lm_head` is TIED to the embedding. The vacuity guard in
+/// [`which_half_of_the_hybrid_carries_the_wrong_answer`] states the
+/// consequence: a residual stream no layer has touched still argmaxes to the
+/// token it was embedded from, so **a model with every layer silent passes a
+/// repeated prompt whose answer is that prompt's own token**. Three of the
+/// four originals are exactly that. The benchmark had ONE discriminating row
+/// and reported it as one failure in four.
+///
+/// Sweeping 180 random token ids through the oracle measured how rare a
+/// discriminating row is: 6 of 186 repeated prompts do not continue
+/// themselves, and only two of the six by any distance. The premise is true
+/// 97% of the time, which is why it survived, and false exactly where a test
+/// would want it to be.
+///
+/// The best of them is now the fifth row:
+///
+/// ```text
+///   85890 '_ComCallableWrapper' -> 198 '\n' (13.68), own token 4.61, RANK 1993
+/// ```
+///
+/// A silent model answers `85890` first. The checkpoint puts it 9.07 logits
+/// down and nineteen hundred ranks back, and no quantization crosses that.
+/// **This backend passes it**, and not narrowly: `198` at 12.94 against the
+/// oracle's 13.68, with the prompt's own token pushed to 2.98 against the
+/// oracle's 4.61. The layers are not silent, and "the model this driver
+/// computes is not the model on disk" is too strong a sentence for what is
+/// left.
+///
+/// # What is left, measured
+///
+/// One prompt of five, and it is the smallest miss this test has ever
+/// reported:
+///
+/// ```text
+///           this backend            the checkpoint
+///   88204   198 15.00  410 14.44    410 17.16  198 13.35
+/// ```
+///
+/// A pair inverted by 0.56 where the model separates it by 3.81. For scale,
+/// this backend's top logit runs below the oracle's on every prompt it gets
+/// RIGHT -- by 1.41, 0.59, 2.70 and 0.74 -- so a 2.72 shortfall on `410` is
+/// inside the range it shows when it is correct, and the 1.65 that `198`
+/// gains is not. It is not a landslide, it is not the decode path -- `6100`
+/// and `85890` both fire one token at a time and both agree -- and it is not
+/// a race.
+///
+/// # It was the four bits, and a second oracle says so, 2026-08-21
+///
+/// Everything above compares a driver that runs [`RuntimeQuant::Int4`]
+/// against a reference measured at f32. That is the same mistake as the
+/// reference table, one storey up: a claim about the driver resting on a
+/// number measured of a different model. So the checkpoint was quantized --
+/// `mlx_lm convert -q --q-bits 4 --q-group-size 64` -- and asked again.
+///
+/// ```text
+///   88204   this backend                the same checkpoint at four bits
+///           198(15.00) 410(14.44)       198(15.00) 410(14.38)
+///           43835 590                   43835(14.19) 590(13.44)
+/// ```
+///
+/// The same four tokens, in the same order, agreeing to a hundredth of a
+/// logit -- INCLUDING `590`, which is nowhere in the f32 oracle's top five.
+/// The miss this test has chased for its whole life is what four-bit weights
+/// do to this prompt, reproduced by an independent quantizer that shares no
+/// code with this driver.
+///
+/// `85890` shows the converse and is why the gate needs two columns rather
+/// than one. There the two quantizations disagree with EACH OTHER: mlx puts
+/// `9930` first by 0.18 over `198`, this driver puts `198` first and matches
+/// f32. mlx's convert reports 4.508 bits per weight -- it keeps some tensors
+/// wider -- so these are two different four-bit models, and where their top
+/// two sit a fifth of a logit apart, neither can arbitrate the other.
+///
+/// So the table carries the f32 answer AND the four-bit answer, and the
+/// claims are split by what each can carry. The vacuity claim -- that a
+/// prompt the model does not continue is not answered with its own token --
+/// is asserted on EVERY such row, because 3.31 and 9.95 logits of separation
+/// are not a width question and a silent stack scores 0.00. The top-1 claim
+/// is asserted only where f32 and four bits agree, because where they do not
+/// the prompt is not decidable at this width and a disagreement would carry
+/// no information about this driver at all. Two coverage asserts keep the
+/// table from being gutted into vacuity: at least two rows the model does not
+/// continue, at least three rows decidable.
+///
+/// GREEN, for the first time, on a claim that is true. It was red for five
+/// months on one that was not. Falsified twice before it was believed:
+/// `NOT_CONTINUED_BY` raised to 3.5 fires on `88204` at 3.31, and pointing
+/// that row's four-bit column at `410` fires the top-1 assert on a prompt
+/// four bits does not decide.
 #[test]
 #[ignore = "needs a Qwen3.5-0.8B snapshot and an adapter"]
 fn whether_a_prompt_of_one_repeated_token_predicts_that_token() {
@@ -5021,17 +5340,155 @@ fn whether_a_prompt_of_one_repeated_token_predicts_that_token() {
     };
     println!("\nONE TOKEN, REPEATED SIXTEEN TIMES:");
     let mut right = 0;
+    let mut near = 0;
     let mut fired = 0;
-    // BOTH PATHS, because they are two implementations of one recurrence and
-    // `whether_the_prefill_and_the_decode_leave_the_same_carry` says they do
-    // not agree: at two tokens, from a zeroed seat, 261,247 of layer 0's
-    // 262,144 state elements differ. One of them is wrong, the arithmetic in
-    // the two kernel bodies is line-for-line the same, and the model itself
-    // is the tiebreaker -- whichever path answers its own prompt is the one
-    // computing the recurrence on disk.
-    for (i, tok) in [15_339u32, 1_723, 88_204, 6_100].into_iter().enumerate() {
-        let who = 900 + i as u64;
-        let one_at_a_time = i >= 2;
+    // BOTH PATHS, because they are two implementations of one recurrence.
+    //
+    // This said they DO NOT AGREE, citing a count of differing state elements
+    // from `whether_the_prefill_and_the_decode_leave_the_same_carry`, and
+    // called the model the tiebreaker between them. That gate has since been
+    // given a scale, and the counts were f32 and bf16 last bits: every
+    // disagreement is inside one bf16 ulp of its slab, the widest being 42
+    // against 42.25, which is the ulp at 42 exactly. The two paths compute
+    // the same recurrence.
+    //
+    // So both are still fired, but not as a tiebreak. They are fired because
+    // the four prompts split two and two across them, and that turns out to
+    // matter in the other direction: `6100` goes through sixteen decodes and
+    // agrees with the checkpoint to three places, which is what says the miss
+    // on `88204` is not the decode path as such.
+    // THE PROMPT AND WHAT THE MODEL ANSWERS IT WITH, which are not the same
+    // number and this test spent its whole life assuming they were.
+    //
+    // Measured on `Qwen/Qwen3.5-0.8B` through mlx-lm 0.31.3, four ways -- f32
+    // and bf16, a single sixteen-token forward and sixteen cached one-token
+    // steps -- and all four agree on every row:
+    //
+    // ```text
+    //   prompt              oracle top five, f32
+    //   15339 ' reads'  15339(20.41) 198(16.01) 1301(14.94) 13(14.77) 29369
+    //    1723 '-c'       1723(21.71) 198(17.96)  271(16.26) 12(15.57)     1
+    //   88204 '))=='       410(17.16) 43835(13.94) 10089(13.44) 198(13.35) 88204(13.10)
+    //    6100 'ospital'  6100(21.70) 67656(19.22) 198(16.66) 271(16.05) 78657
+    // ```
+    //
+    // Three of the four continue themselves. `88204` DOES NOT, and it is not
+    // close: `'=='` leads by 3.22 over the runner-up and the prompt's own
+    // token is FIFTH, 4.06 down. Sixteen `'))=='` spell `'))==))==...'`, and
+    // the reading the model prefers of that string is the one that takes the
+    // `'=='` and leaves the parens.
+    //
+    // WHICH MAKES THE DOC ABOVE WRONG on the row it leans on hardest. Its
+    // `transformers` table has `'))=='` FIRST at 15.88 with `'=='` second at
+    // 14.88, a margin of 1.00, and the whole "first or second, which is what
+    // four-bit weights support" concession was built to survive that margin.
+    // There is no such margin. The other three rows of that table reproduce
+    // here within a logit or so -- 4.75/4.81/1.87 against 4.40/3.75/2.48 --
+    // and this one inverts. One row of a four-row reference did not
+    // reproduce, and it was the row that set the threshold.
+    //
+    // So the claim is no longer "a prompt of one repeated token predicts that
+    // token", which is a guess about the model, but "this backend answers
+    // what the model answers", which is a measurement of it. Every margin
+    // above is 2.48 or more, so no concession to four-bit weights is needed:
+    // the doc's own argument is that 1.87 survives quantization.
+    //
+    // The last column is WHETHER THIS PROMPT DISCRIMINATES, and it is the
+    // column this test spent its life without. `lm_head` is tied to the
+    // embedding -- the vacuity guard in
+    // `which_half_of_the_hybrid_carries_the_wrong_answer` says so -- so a
+    // residual stream no layer has touched still argmaxes to the token it was
+    // embedded from. A prompt whose answer IS its own token is therefore
+    // passed by a model with every layer silent, and three of the four
+    // originals are exactly that. The benchmark had one discriminating row
+    // and reported it as one failure in four.
+    //
+    // `85890` was found by sweeping 180 random token ids through the oracle,
+    // which also measured how rare this is: 6 of 186 repeated prompts do not
+    // continue themselves, and only two of the six by any distance. That is
+    // why the premise looked reasonable for as long as it did -- it is true
+    // 97% of the time, and false exactly where a test would want it to be.
+    //
+    // It is the stronger of the two, and not by the top-1 margin, which is
+    // 1.52 against `88204`'s 3.22. By the number that matters here -- how far
+    // the model puts the PROMPT's own token below its answer -- it is 9.07
+    // against 4.06, and the own token sits at rank 1993 of the vocabulary. A
+    // silent model answers it first. There is no quantization that crosses
+    // nineteen hundred ranks.
+    //
+    // ```text
+    //   85890 '_ComCallableWrapper' -> 198 '\n' (13.68), own token 4.61, rank 1993
+    // ```
+    //
+    // The last column also replaces `i >= 2` for choosing the fire class,
+    // which silently re-assigned every row the moment one was inserted.
+    //
+    // AND A SECOND ORACLE, AT THE WIDTH THIS DRIVER ACTUALLY RUNS. The
+    // reference above is the checkpoint at f32, which is what the weights
+    // MEAN. This loader quantizes them at load time -- `RuntimeQuant::Int4`,
+    // four bits over groups of 64 -- and that is a different model. Comparing
+    // one against the other and calling the difference a defect is what this
+    // test did for its whole life.
+    //
+    // Measured by converting the same checkpoint with `mlx_lm convert -q
+    // --q-bits 4 --q-group-size 64` and firing it the same sixteen ways:
+    //
+    // ```text
+    //   prompt   f32 answer          4-bit answer         this backend
+    //   15339    15339 (20.41)       15339 (19.12)        15339 (19.00)
+    //    1723     1723 (21.71)        1723 (21.12)         1723 (21.12)
+    //   88204      410 (17.16)         198 (15.00)          198 (15.00)
+    //    6100     6100 (21.70)        6100 (19.00)         6100 (19.00)
+    //   85890      198 (13.68)        9930 (12.56)          198 (12.94)
+    // ```
+    //
+    // `88204` settles at a glance. At four bits the CHECKPOINT ITSELF answers
+    // `198`, and its top four are `198(15.00) 410(14.38) 43835(14.19)
+    // 590(13.44)` against this backend's `198(15.00) 410(14.44) 43835
+    // 590` -- the same four tokens in the same order, agreeing to a hundredth
+    // on the two that matter, including `590`, which is not in the f32
+    // oracle's top five at all. The miss this test has reported since the day
+    // it was written is the cost of four-bit weights, reproduced independently
+    // by a different quantizer.
+    //
+    // `85890` shows the other half of that sentence and is why the two
+    // columns are not merged. There the two quantizations DISAGREE with each
+    // other: mlx puts `9930` first by 0.18 over `198` and this backend puts
+    // `198` first, matching f32. mlx's convert reports 4.508 bits per weight
+    // -- it keeps some tensors wider -- so these are two different four-bit
+    // models, and where their top two sit within a fifth of a logit the
+    // prompt is simply not decidable at this width by either of them.
+    //
+    // So the top-1 claim is asserted only where the two oracles AGREE, which
+    // is where a disagreement could mean something. It is the weaker claim
+    // and it is deliberately weak.
+    //
+    // THE CLAIM THAT CARRIES THIS TEST is the other one, below: the prompt's
+    // own token must land where the model puts it. That is what a silent
+    // model fails, it is what `85890` was added for, and it is the one number
+    // here that four bits cannot move -- own-token rank on `85890` is 1993 at
+    // f32, 11158 at mlx's four bits, and this backend puts it 9.96 logits
+    // below its own top.
+    //
+    // Columns: prompt, f32 answer, four-bit answer, does the model continue
+    // itself, fire one token at a time.
+    const ORACLE: [(u32, u32, u32, bool, bool); 5] = [
+        (15_339, 15_339, 15_339, true, false),
+        (1_723, 1_723, 1_723, true, false),
+        (88_204, 410, 198, false, true),
+        (6_100, 6_100, 6_100, true, true),
+        (85_890, 198, 9_930, false, true),
+    ];
+    // How far below the top a prompt token has to sit before "the model does
+    // not continue this one" is a thing this backend has demonstrated rather
+    // than got away with. Three logits, against measured gaps of 3.31 and
+    // 9.96 -- and against 0.00 for a model whose layers are silent, which is
+    // the failure this number exists to catch.
+    const NOT_CONTINUED_BY: f32 = 3.0;
+    let mut vacuous = 0;
+    let mut decidable = 0;
+    for (tok, want, want_q4, continues, one_at_a_time) in ORACLE {
+        let who = 900 + u64::from(tok);
         let row = if one_at_a_time {
             let mut last = Vec::new();
             for _ in 0..16 {
@@ -5060,26 +5517,95 @@ fn whether_a_prompt_of_one_repeated_token_predicts_that_token() {
         top.sort_by(|a, b| b.1.total_cmp(&a.1));
         let got = u32::try_from(top[0].0).unwrap_or(u32::MAX);
         let at = row.get(tok as usize).copied().unwrap_or(f32::NAN);
+        // WHERE THE MODEL'S ANSWER LANDED, which is the number that makes a
+        // miss quantitative. A top token and a count say "wrong"; the
+        // oracle's own answer with a rank and a score says by how much and in
+        // which direction, and that is what separates a quantization cost
+        // from a different model.
+        let want_at = row.get(want as usize).copied().unwrap_or(f32::NAN);
+        let want_rank = top
+            .iter()
+            .position(|(t, _)| *t == want as usize)
+            .unwrap_or(usize::MAX);
         println!(
-            "  {tok:>6} x16 -> {got:>6} ({:.2}), and {tok} scored {at:.2}; \
+            "  {tok:>6} x16 -> {got:>6} ({:.2}); the model answers {want} and this \
+             scores it {want_at:.2} at rank {want_rank}, prompt token {at:.2}; \
              top {:?}",
             top[0].1,
             top[..4].iter().map(|(t, _)| *t).collect::<Vec<_>>()
         );
-        if got == tok {
+        if got == want {
             right += 1;
+        }
+        // THE CLAIM. Where the model does not continue a repeated prompt,
+        // this backend must not either, and must put the prompt's own token a
+        // stated distance below whatever it does answer. A tied `lm_head`
+        // makes the prompt token the answer of a model that computes NOTHING,
+        // so this is the only row of the four claims here that a silent stack
+        // cannot walk through.
+        if !continues {
+            let below = top[0].1 - at;
+            println!(
+                "      the model does not continue this prompt; this backend \
+                 puts it {below:.2} below its own answer"
+            );
+            assert!(
+                got != tok && below >= NOT_CONTINUED_BY,
+                "the checkpoint does not continue {tok} -- it ranks it 1993rd \
+                 at f32 and 11158th at four bits -- and this backend answers \
+                 {got} with it only {below:.2} down. A tied `lm_head` makes the \
+                 prompt's own token the answer of a stack that computed \
+                 nothing, so a prompt token near the top here is the shape of \
+                 silence, not of a close call"
+            );
+            vacuous += 1;
+        }
+        // TOP-1, asserted only where f32 and four bits agree on the answer.
+        // Where they do not, the prompt is undecidable at this width and a
+        // disagreement here would carry no information -- see the two-column
+        // table above.
+        if want == want_q4 {
+            decidable += 1;
+            assert!(
+                got == want,
+                "both the f32 checkpoint and a four-bit quantization of it \
+                 answer {want} to {tok} x16, so this one is not a width \
+                 question, and this backend answers {got}"
+            );
+        }
+        // SECOND PLACE, kept as a separate count and no longer as the claim.
+        // It is what tells a reader whether a miss is a margin flip or a
+        // different answer entirely, and on `88204` it says the latter: the
+        // oracle puts 410 and 198 3.81 logits apart and this backend puts
+        // them the other way round.
+        if top[..2].iter().any(|(t, _)| *t == want as usize) {
+            near += 1;
         }
     }
     if fired == 0 {
-        println!("  nothing fired, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("  nothing fired, so IT COULD NOT BE MEASURED");
         return;
     }
-    println!("\n  {right} of {fired} repeated prompts answered with their own token");
+    println!(
+        "\n  {right} of {fired} answered what the f32 checkpoint answers, \
+         {near} of {fired} put it first or second, {decidable} prompts were \
+         decidable at four bits, and {vacuous} could not have been passed by \
+         a silent stack"
+    );
+    // BOTH COUNTS, because a gate whose fixtures quietly stopped covering
+    // what it claims is the failure this test spent its life being. The
+    // asserts above are per-prompt; these say the prompts are still there.
     assert!(
-        right == fired,
-        "a prompt of one repeated token is the easiest continuation there is, \
-         and this backend gets {right} of {fired} -- so what is wrong is the \
-         model this driver computes, not the difficulty of the benchmark"
+        vacuous >= 2,
+        "only {vacuous} of {fired} prompts are ones the model does not \
+         continue, and those are the only ones a silent stack cannot walk \
+         through. `lm_head` is tied to the embedding: a prompt answered by \
+         its own token is passed by a model with every layer zeroed"
+    );
+    assert!(
+        decidable >= 3,
+        "only {decidable} of {fired} prompts have the same answer at f32 and \
+         at four bits, and the top-1 claim says nothing on the others"
     );
 }
 
@@ -5193,7 +5719,11 @@ fn which_half_of_the_hybrid_carries_the_wrong_answer() {
         let got = ask(&mut shell, 960 + what.len() as u64);
         println!(
             "    {} the unsilenced answer",
-            if got == both { "same as" } else { "DIFFERENT from" }
+            if got == both {
+                "same as"
+            } else {
+                "DIFFERENT from"
+            }
         );
         // Put them back, so the next cut is a cut of the whole model.
         for (name, bytes) in &real {
@@ -5206,10 +5736,15 @@ fn which_half_of_the_hybrid_carries_the_wrong_answer() {
 
 /// Whether the prefill and the decode leave the SAME recurrent state.
 ///
-/// [`the_prefill_and_the_decode_are_one_recurrence_written_twice`] says the
-/// two paths disagree by 3.5 on logits that span 18, already at two tokens.
-/// One of them is wrong and the model cannot say which, because the attention
-/// half alone answers correctly and the gated-DeltaNet half alone does not.
+/// [`the_prefill_and_the_decode_are_one_recurrence_written_twice`] SAID the
+/// two paths disagree by 3.5 on logits that span 18, already at two tokens,
+/// and that one of them had to be wrong. That is why this test exists.
+///
+/// It no longer says it. Run on 2026-08-21 over six lengths it reports a
+/// widest disagreement of 0.1953 on logits spanning 15, with the argmax
+/// agreeing at every length -- `THE TWO IMPLEMENTATIONS AGREE`. Both of this
+/// test's premises have therefore expired, and the section at the bottom is
+/// what came of asking it anyway.
 ///
 /// This splits the disagreement in half without needing a reference. A GDN
 /// layer produces two things from one recurrence: the carry it leaves in
@@ -5221,6 +5756,54 @@ fn which_half_of_the_hybrid_carries_the_wrong_answer() {
 /// Two seats, not one released and re-taken: a released slot is not zeroed,
 /// so the second conversation would begin on the first one's carry and the
 /// comparison would be of a thing against itself plus a fire.
+///
+/// # The answer, once the difference was given a scale
+///
+/// This printed a COUNT and an ABSOLUTE and concluded from any nonzero at all
+/// that "the two paths do not compute the same recurrence". A count of
+/// differing elements is not a measurement of disagreement, and the numbers
+/// say so as soon as each is put beside the magnitude it is a difference of:
+///
+/// ```text
+///   recurrent_state  layer 0:  142371 of 262144 differ, widest 0.000000 of  0.5065   5.88e-8
+///   recurrent_state  layer 1:  262135 of 262144 differ, widest 0.001549 of  1.4327   1.08e-3
+///   recurrent_state  layer 2:  262144 of 262144 differ, widest 0.004804 of  2.4827   1.93e-3
+///   recurrent_state  layer 3:       0 of 262144 differ                               0
+///   recurrent_state  layer 4:  262143 of 262144 differ, widest 0.058933 of 10.4293   5.65e-3
+///   recurrent_state  layer 5:  262144 of 262144 differ, widest 0.018313 of  3.0933   5.92e-3
+///   conv_state       layer 0:       3 of  24576 differ, widest 0.000122 of 14.2500   8.57e-6
+///   conv_state       layer 1:    1762 of  24576 differ, widest 0.015625 of 25.6250   6.10e-4
+///   conv_state       layer 2:    7919 of  24576 differ, widest 0.125000 of 28.8750   4.33e-3
+///   conv_state       layer 3:       0 of  24576 differ                               0
+///   conv_state       layer 4:    8723 of  24576 differ, widest 0.250000 of 77.5000   3.23e-3
+///   conv_state       layer 5:    8883 of  24576 differ, widest 0.125000 of 26.3750   4.74e-3
+/// ```
+///
+/// Every one is inside one bf16 ulp, which is `2^-7` of the value, or
+/// 7.81e-3; the widest is 5.92e-3. **The two paths compute the same
+/// recurrence.**
+///
+/// Layer 0 is the line that makes the point on its own: 142,371 elements
+/// differ and the widest of them is below what six decimal places can print,
+/// against a magnitude of 0.5065. That is f32's last bits, reported for years
+/// as a different recurrence.
+///
+/// And the widest disagreement anywhere is not merely small, it is exact:
+/// `42` against `42.25` on a conv_state. The bf16 ulp at 42 IS 0.25. One
+/// rounding, one step, no drift.
+///
+/// The normalisation is by the SLAB's magnitude and not the element's, on
+/// purpose. A recurrent state is read by a weighted sum over all of it, so
+/// what propagates to an answer is an absolute error against the state's own
+/// scale; an elementwise ratio on a near-zero element is a large number about
+/// nothing. The worst case here survives either reading -- 42 vs 42.25 is one
+/// ulp elementwise too.
+///
+/// What this retires: every argument in this file of the form "the two paths
+/// disagree, so one of them is wrong, and the model is the tiebreaker". They
+/// do not disagree. Whatever makes this backend answer `198` where the
+/// checkpoint answers `410` is not the prefill/decode recurrence split, and
+/// the next question has to be asked somewhere else.
 #[test]
 #[ignore = "needs a Qwen3.5-0.8B snapshot and an adapter"]
 fn whether_the_prefill_and_the_decode_leave_the_same_carry() {
@@ -5233,12 +5816,16 @@ fn whether_the_prefill_and_the_decode_leave_the_same_carry() {
     let a = 1_000u64;
     let b = 1_001u64;
     if fire_row(&mut shell, a, &PERIOD[..2]).is_empty() {
-        println!("the two-token prefill was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured(
+            "the two-token prefill was refused, so IT COULD NOT BE MEASURED",
+        );
         return;
     }
     for t in &PERIOD[..2] {
         if fire_row(&mut shell, b, std::slice::from_ref(t)).is_empty() {
-            println!("a one-token decode was refused, so IT COULD NOT BE MEASURED");
+            driver_wgpu::skip::unmeasured(
+                "a one-token decode was refused, so IT COULD NOT BE MEASURED",
+            );
             return;
         }
     }
@@ -5253,11 +5840,14 @@ fn whether_the_prefill_and_the_decode_leave_the_same_carry() {
     let slots = 8u32;
 
     let mut worst = 0.0f32;
+    let mut worst_rel = 0.0f32;
     let mut worst_where = String::new();
     let mut checked = 0usize;
     for which in ["recurrent_state", "conv_state"] {
         for layer in 0..6u16 {
-            let Some(pool) = shell.recurrent() else { return };
+            let Some(pool) = shell.recurrent() else {
+                return;
+            };
             let Some(slab) = pool.slab(layer, which) else {
                 continue;
             };
@@ -5298,10 +5888,25 @@ fn whether_the_prefill_and_the_decode_leave_the_same_carry() {
             // already differs there is the recurrence differing; a carry that
             // agrees there and differs later is a difference arriving from
             // upstream, and the two want opposite next questions.
+            // THE SCALE THE DIFFERENCE IS A DIFFERENCE OF, without which the
+            // count above says nothing. This printed a count and an absolute
+            // and concluded "the two paths do not compute the same
+            // recurrence" from any nonzero at all -- so layer 0's 142,371
+            // differing elements at a widest of 0.000000 read as a different
+            // recurrence, when they are f32 last bits.
+            let mag = ra
+                .iter()
+                .fold(0.0f32, |m, x| if x.abs() > m { x.abs() } else { m });
+            let rel = if mag > 0.0 { here / mag } else { 0.0 };
             println!(
-                "    {which:<16} layer {layer:>2}: {nonzero:>7} of {} differ, widest {here:.6}",
-                ra.len()
+                "    {which:<16} layer {layer:>2}: {nonzero:>7} of {} differ, \
+                 widest {here:.6} against a magnitude of {mag:.4} ({:.2e} of it)",
+                ra.len(),
+                rel
             );
+            if rel > worst_rel {
+                worst_rel = rel;
+            }
             if here > worst {
                 worst = here;
                 worst_where = format!(
@@ -5311,15 +5916,33 @@ fn whether_the_prefill_and_the_decode_leave_the_same_carry() {
             }
         }
     }
-    assert!(checked > 0, "no slab could be read, so nothing was compared");
+    assert!(
+        checked > 0,
+        "no slab could be read, so nothing was compared"
+    );
     println!("  {checked} slabs compared");
     println!("  widest disagreement {worst:.6} at {worst_where}");
+    println!("  widest RELATIVE disagreement {worst_rel:.2e} of its slab's magnitude");
+    // ONE bf16 ULP, which is the unit the answer turned out to be in.
+    //
+    // bf16 keeps eight mantissa bits, so its ulp is 2^-8 of the value and a
+    // rounding either way is at most 2^-7. That is the line between "these
+    // are two spellings of one recurrence, rounded differently" and "these
+    // are two recurrences". It is not a tolerance chosen to make this pass:
+    // the widest disagreement this test has ever printed is 42 vs 42.25 on a
+    // conv_state, and 0.25 IS the bf16 ulp at 42, exactly, to the bit.
+    const ONE_BF16_ULP: f32 = 1.0 / 128.0;
     println!(
         "\n  {}",
         if worst == 0.0 {
             "THE CARRY IS IDENTICAL, so the recurrence agrees and what differs is the READOUT."
+        } else if worst_rel <= ONE_BF16_ULP {
+            "THE CARRY AGREES TO ROUNDING: every disagreement is inside one bf16 ulp of \
+             its own slab, so the two paths compute the same recurrence and spell it \
+             differently. A COUNT of differing elements does not say this and never did."
         } else {
-            "THE CARRY ITSELF DIFFERS, so the two paths do not compute the same recurrence."
+            "THE CARRY ITSELF DIFFERS BY MORE THAN ROUNDING, so the two paths do not \
+             compute the same recurrence."
         }
     );
 }
@@ -5368,48 +5991,54 @@ fn what_the_two_gated_deltanet_paths_actually_run() {
     // The rectangle that stages the prep, in each plan, at LAYER 0 -- found by
     // name rather than by index, because the two lowerings are different
     // shapes and an index is only ever right for one of them.
-    let find = |plan: &model_ir::trace::ForwardPlan, rows: usize, stem: &str| -> Option<(usize, usize)> {
-        let rows: Vec<Row> = vec![
-            Row {
-                samples: true,
-                ..Row::default()
+    let find =
+        |plan: &model_ir::trace::ForwardPlan, rows: usize, stem: &str| -> Option<(usize, usize)> {
+            let rows: Vec<Row> = vec![
+                Row {
+                    samples: true,
+                    ..Row::default()
+                };
+                rows
+            ];
+            let low = lower(
+                plan,
+                &rows,
+                Fire {
+                    captures_across_splits: false,
+                },
+            )
+            .ok()?;
+            let at = low.launches.iter().position(|l| {
+                low.kernels[l.kernel as usize].starts_with(stem) && l.layers.start == 0
+            });
+            let Some(at) = at else {
+                println!("  no `{stem}` at layer 0; layer 0 runs:");
+                for l in low.launches.iter().filter(|l| l.layers.start == 0) {
+                    println!("      {}", low.kernels[l.kernel as usize]);
+                }
+                return None;
             };
-            rows
-        ];
-        let low = lower(
-            plan,
-            &rows,
-            Fire {
-                captures_across_splits: false,
-            },
-        )
-        .ok()?;
-        let at = low.launches.iter().position(|l| {
-            low.kernels[l.kernel as usize].starts_with(stem) && l.layers.start == 0
-        });
-        let Some(at) = at else {
-            println!("  no `{stem}` at layer 0; layer 0 runs:");
-            for l in low.launches.iter().filter(|l| l.layers.start == 0) {
-                println!("      {}", low.kernels[l.kernel as usize]);
+            // The three staged outputs are the LAST three arena ranges of the
+            // rectangle: `pre_q`, `pre_k`, `pre_gate`, in the statement's order.
+            let l = &low.launches[at];
+            let arenas: Vec<(usize, usize)> = low.args[l.args.start as usize..l.args.end as usize]
+                .iter()
+                .filter_map(|a| match a {
+                    Arg::Arena { at, width, bytes } => {
+                        Some((*at, *width as usize * *bytes as usize))
+                    }
+                    _ => None,
+                })
+                .collect();
+            println!(
+                "  {stem} is rectangle {at}, with {} arena ranges",
+                arenas.len()
+            );
+            for (i, (o, w)) in arenas.iter().enumerate() {
+                println!("      range {i}: at {o}, {w} bytes per row");
             }
-            return None;
+            Some((at, arenas.len()))
         };
-        // The three staged outputs are the LAST three arena ranges of the
-        // rectangle: `pre_q`, `pre_k`, `pre_gate`, in the statement's order.
-        let l = &low.launches[at];
-        let arenas: Vec<(usize, usize)> = low.args[l.args.start as usize..l.args.end as usize]
-            .iter()
-            .filter_map(|a| match a {
-                Arg::Arena { at, width, bytes } => Some((*at, *width as usize * *bytes as usize)),
-                _ => None,
-            })
-            .collect();
-        println!("  {stem} is rectangle {at}, with {} arena ranges", arenas.len());
-        for (i, (o, w)) in arenas.iter().enumerate() {
-            println!("      range {i}: at {o}, {w} bytes per row");
-        }
-        Some((at, arenas.len()))
-    };
     println!("\nPREFILL, two rows:");
     let Some((pre_at, _)) = find(&prefill, 2, "gdn_prep_prefill") else {
         println!("  no `gdn_prep_prefill` at layer 0");
@@ -5499,7 +6128,7 @@ fn the_numbers_every_gated_deltanet_dispatch_is_handed() {
 #[ignore = "needs a Qwen3.5-0.8B snapshot"]
 fn whether_the_gated_deltanets_shape_is_the_checkpoints() {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
@@ -5507,7 +6136,7 @@ fn whether_the_gated_deltanets_shape_is_the_checkpoints() {
     };
     let facts = Qwen35HybridFacts::qwen3_5_0_8b();
     let Some(real) = qwen3_5_weights(&dir, row, &hybrid_plan(&facts)) else {
-        println!("the weights would not load, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("the weights would not load, so IT COULD NOT BE MEASURED");
         return;
     };
     // Layer 0 is a gated-DeltaNet layer, and every checkpoint tensor is bf16
@@ -5515,7 +6144,13 @@ fn whether_the_gated_deltanets_shape_is_the_checkpoints() {
     let len = |name: &str| real.get(name).map(Vec::len);
     println!("\nthe gated-DeltaNet tensors of layer 0, as bytes:");
     for n in [
-        "gate_norm", "a_log", "dt", "conv_w", "conv_b", "in_proj_qkv", "in_proj_z",
+        "gate_norm",
+        "a_log",
+        "dt",
+        "conv_w",
+        "conv_b",
+        "in_proj_qkv",
+        "in_proj_z",
     ] {
         let full = format!("layer.0.{n}");
         match len(&full) {
@@ -5536,14 +6171,21 @@ fn whether_the_gated_deltanets_shape_is_the_checkpoints() {
             if n == want { "agree" } else { "DISAGREE" }
         );
         if n != want {
-            disagree.push(format!("{what} reads {n} where the declaration says {want}"));
+            disagree.push(format!(
+                "{what} reads {n} where the declaration says {want}"
+            ));
         }
     };
     println!("\nwhat the tensors say against what the plan states:");
     say("gate_norm is `[Dv]`", len("layer.0.gate_norm"), dv, 2);
     say("a_log is `[Hv]`", len("layer.0.a_log"), hv, 4);
     say("dt is `[Hv]`", len("layer.0.dt"), hv, 2);
-    say("conv_w is `[conv_dim, Kc]`", len("layer.0.conv_w"), conv_dim * kc, 2);
+    say(
+        "conv_w is `[conv_dim, Kc]`",
+        len("layer.0.conv_w"),
+        conv_dim * kc,
+        2,
+    );
     say("conv_b is `[conv_dim]`", len("layer.0.conv_b"), conv_dim, 2);
     let _ = dk;
     assert!(
@@ -5642,7 +6284,7 @@ fn whether_the_two_gate_projections_are_the_right_way_round() {
     }
     println!("\n  SWAPPED `in_proj_a` <-> `in_proj_b`: {swapped} tensors exchanged");
     if swapped == 0 {
-        println!("    nothing was exchanged, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("    nothing was exchanged, so IT COULD NOT BE MEASURED");
         return;
     }
     let after: Vec<Option<u32>> = PROBES
@@ -5710,7 +6352,7 @@ fn which_gated_deltanet_weights_reach_the_answer() {
     };
     let base = logits(&mut shell, 1_400);
     if base.is_empty() {
-        println!("the baseline fire was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("the baseline fire was refused, so IT COULD NOT BE MEASURED");
         return;
     }
     println!("\n  what each gated-DeltaNet weight is worth to the answer:");
@@ -5739,7 +6381,9 @@ fn which_gated_deltanet_weights_reach_the_answer() {
         for layer in 0..24u32 {
             for part in parts {
                 let name = format!("layer.{layer}.{kind}{part}");
-                let Some(bytes) = real.get(&name) else { continue };
+                let Some(bytes) = real.get(&name) else {
+                    continue;
+                };
                 if shell.hold(&name, &vec![0u8; bytes.len()]).is_ok() {
                     n += 1;
                 }
@@ -5809,7 +6453,9 @@ fn which_gated_deltanet_weights_reach_the_answer() {
         base.len(),
         inert.join("\n  ")
     );
-    println!("  every gated-DeltaNet weight reaches the answer, so none is bound where nothing reads it.");
+    println!(
+        "  every gated-DeltaNet weight reaches the answer, so none is bound where nothing reads it."
+    );
 }
 
 /// Whether `in_proj_qkv` is packed in the order the plan reads it.
@@ -5865,7 +6511,10 @@ fn whether_the_fused_projection_is_packed_in_the_order_the_plan_reads_it() {
                 right += 1;
             }
         }
-        println!("    {right} of {} answered with their own token", PROBES.len());
+        println!(
+            "    {right} of {} answered with their own token",
+            PROBES.len()
+        );
         right
     };
     // THE DISCRIMINATOR. A repeated token is answerable by a model that has
@@ -5977,7 +6626,10 @@ fn whether_the_fused_projection_is_packed_in_the_order_the_plan_reads_it() {
         }
     }
     let _ = BLOCKS;
-    println!("\n  as packed answered {base} of {} correctly", PROBES.len() + 3);
+    println!(
+        "\n  as packed answered {base} of {} correctly",
+        PROBES.len() + 3
+    );
 }
 
 /// The recurrence, recomputed on the CPU from the kernel's OWN staged inputs.
@@ -6053,7 +6705,10 @@ fn whether_the_scan_computes_the_recurrence_its_own_inputs_imply() {
         .collect();
     // `mixed`, `a`, `b`, then the three staged outputs.
     if arenas.len() != 6 {
-        println!("`gdn_prep_prefill` has {} arena ranges, not 6", arenas.len());
+        println!(
+            "`gdn_prep_prefill` has {} arena ranges, not 6",
+            arenas.len()
+        );
         return;
     }
 
@@ -6121,16 +6776,17 @@ fn whether_the_scan_computes_the_recurrence_its_own_inputs_imply() {
     }
 
     // Now the two devices' carries, each on its own fresh seat.
-    let full = |shell: &mut driver_wgpu::shell::Shell, who: u64, one_at_a_time: bool| -> Option<u32> {
-        if one_at_a_time {
-            for t in tokens {
-                fire_row(shell, who, std::slice::from_ref(t));
+    let full =
+        |shell: &mut driver_wgpu::shell::Shell, who: u64, one_at_a_time: bool| -> Option<u32> {
+            if one_at_a_time {
+                for t in tokens {
+                    fire_row(shell, who, std::slice::from_ref(t));
+                }
+            } else {
+                fire_row(shell, who, tokens);
             }
-        } else {
-            fire_row(shell, who, tokens);
-        }
-        shell.book().slot(who)
-    };
+            shell.book().slot(who)
+        };
     let scan_slot = full(&mut shell, 2_001, false);
     let dec_slot = full(&mut shell, 2_002, true);
     // A third seat that stops after ONE token, which is the state the decode's
@@ -6142,7 +6798,9 @@ fn whether_the_scan_computes_the_recurrence_its_own_inputs_imply() {
         println!("one of the three conversations has no seat");
         return;
     };
-    let Some(pool) = shell.recurrent() else { return };
+    let Some(pool) = shell.recurrent() else {
+        return;
+    };
     let Some(slab) = pool.slab(0, "recurrent_state") else {
         return;
     };
@@ -6275,10 +6933,18 @@ fn whether_the_scan_computes_the_recurrence_its_own_inputs_imply() {
         let (ak, bk, rk) = fit(sn, so, k);
         let (aq, bq, rq) = fit(sn, so, q);
         let (ac, bc, rc) = fit(&want[base..base + dk], &after_one[base..base + dk], k);
-        println!("    head {h:>2} channel {dv:>3}: the recurrence says decay {ga:.6}, delta {want_delta:.6}");
-        println!("        fit against the REFERENCE:  decay {ac:.6}, delta {bc:.6}, relative residual {rc:.6}");
-        println!("        fit against staged `k`: decay {ak:.6}, delta {bk:.6}, relative residual {rk:.6}");
-        println!("        fit against staged `q`: decay {aq:.6}, delta {bq:.6}, relative residual {rq:.6}");
+        println!(
+            "    head {h:>2} channel {dv:>3}: the recurrence says decay {ga:.6}, delta {want_delta:.6}"
+        );
+        println!(
+            "        fit against the REFERENCE:  decay {ac:.6}, delta {bc:.6}, relative residual {rc:.6}"
+        );
+        println!(
+            "        fit against staged `k`: decay {ak:.6}, delta {bk:.6}, relative residual {rk:.6}"
+        );
+        println!(
+            "        fit against staged `q`: decay {aq:.6}, delta {bq:.6}, relative residual {rq:.6}"
+        );
     }
 
     // WHAT DIRECTION DID IT ADD? The step is `S_new = ga*S_old + u*delta`, so
@@ -6319,8 +6985,8 @@ fn whether_the_scan_computes_the_recurrence_its_own_inputs_imply() {
                 let base = (h * dv_n + dv) * dk;
                 let mut dot = 0.0f64;
                 for i in 0..dk {
-                    dot += (f64::from(dec[base + i]) - g * f64::from(old[base + i]))
-                        * f64::from(k[i]);
+                    dot +=
+                        (f64::from(dec[base + i]) - g * f64::from(old[base + i])) * f64::from(k[i]);
                 }
                 let delta = dot / kk.max(1e-30);
                 for i in 0..dk {
@@ -6385,16 +7051,17 @@ fn whether_the_scan_computes_the_recurrence_its_own_inputs_imply() {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let tap = |slot: u32, j: usize, c: usize| -> f32 {
-            cs[(slot as usize * kc + j) * conv_dim + c]
-        };
+        let tap =
+            |slot: u32, j: usize, c: usize| -> f32 { cs[(slot as usize * kc + j) * conv_dim + c] };
         let silu = |x: f32| x / (1.0 + (-x).exp());
         let k_off = 2048usize;
         println!("\n  THE WINDOW THE DECODE CONVOLVED, by angle against what it added:");
         for h in [8usize, 0, 3] {
             let ga = pre_gate[1][2 * h];
             let base = (h * dv_n + 81) * dk;
-            let u: Vec<f32> = (0..dk).map(|i| dec[base + i] - ga * old[base + i]).collect();
+            let u: Vec<f32> = (0..dk)
+                .map(|i| dec[base + i] - ga * old[base + i])
+                .collect();
             let mut both = vec![0.0f32; dk];
             let mut only1 = vec![0.0f32; dk];
             for d in 0..dk {
@@ -6593,7 +7260,8 @@ fn whether_the_scan_stays_exact_as_the_prompt_grows() {
             continue;
         };
         let Some(at) = low.launches.iter().position(|l| {
-            low.kernels[l.kernel as usize].starts_with("gdn_prep_prefill") && l.layers.start == layer
+            low.kernels[l.kernel as usize].starts_with("gdn_prep_prefill")
+                && l.layers.start == layer
         }) else {
             println!("    n = {n:>2} layer {layer:>2}: no `gdn_prep_prefill` there");
             continue;
@@ -6618,7 +7286,9 @@ fn whether_the_scan_stays_exact_as_the_prompt_grows() {
         let step = match staged {
             Ok(step) => step,
             Err(why) => {
-                println!("    n = {n:>2} layer {layer:>2}: the truncated prefill was refused ({why})");
+                println!(
+                    "    n = {n:>2} layer {layer:>2}: the truncated prefill was refused ({why})"
+                );
                 continue;
             }
         };
@@ -6665,7 +7335,9 @@ fn whether_the_scan_stays_exact_as_the_prompt_grows() {
         let Some(slot) = shell.book().slot(who) else {
             continue;
         };
-        let Some(pool) = shell.recurrent() else { return };
+        let Some(pool) = shell.recurrent() else {
+            return;
+        };
         let Some(slab) = pool.slab(layer, "recurrent_state") else {
             return;
         };
@@ -6794,7 +7466,10 @@ fn whether_the_prep_stages_what_the_convolution_implies() {
         })
         .collect();
     if arenas.len() != 6 {
-        println!("`gdn_prep_prefill` has {} arena ranges, not 6", arenas.len());
+        println!(
+            "`gdn_prep_prefill` has {} arena ranges, not 6",
+            arenas.len()
+        );
         return;
     }
     shell.fire_prefix(Some(at + 1));
@@ -6990,7 +7665,10 @@ fn whether_the_gated_norm_computes_what_its_operands_imply() {
             _ => None,
         })
         .collect();
-    println!("\n  `gated_rms` at layer 0 is rectangle {at}, with {} arena ranges", arenas.len());
+    println!(
+        "\n  `gated_rms` at layer 0 is rectangle {at}, with {} arena ranges",
+        arenas.len()
+    );
     if arenas.len() != 3 {
         println!("  not the three this test knows how to read");
         return;
@@ -7068,7 +7746,9 @@ fn whether_the_gated_norm_computes_what_its_operands_imply() {
         worst_wholerow = worst_wholerow.min(w_whole);
     }
     let rel = worst / scale.max(1e-30);
-    println!("    per-head norm, gate after:   widest {worst:e}, relative {rel:e} (one bf16 step is 3.9e-3)");
+    println!(
+        "    per-head norm, gate after:   widest {worst:e}, relative {rel:e} (one bf16 step is 3.9e-3)"
+    );
     println!("    the same with NO gate:       widest {worst_ungated:e}");
     println!("    whole-row norm, gate after:  widest {worst_wholerow:e}");
     println!("    against values reaching {scale:.6}");
@@ -7298,153 +7978,155 @@ fn whether_the_first_row_of_attention_is_its_own_value() {
     // the prompt is, so which row it copies, as `n` moves, is what tells a
     // REVERSAL (`n - 1 - p`) from a fixed stride.
     for n in [2usize, 3, 5] {
-    let tokens: Vec<u32> = (0..n).map(|t| PERIOD[t % 6]).collect();
-    let rows: Vec<Row> = vec![
-        Row {
-            samples: true,
-            ..Row::default()
+        let tokens: Vec<u32> = (0..n).map(|t| PERIOD[t % 6]).collect();
+        let rows: Vec<Row> = vec![
+            Row {
+                samples: true,
+                ..Row::default()
+            };
+            n
+        ];
+        let low = lower(
+            &plan,
+            &rows,
+            Fire {
+                captures_across_splits: false,
+            },
+        )
+        .expect("the hybrid lowers");
+        let ranges = |at: usize| -> Vec<(usize, usize, u32)> {
+            let l = &low.launches[at];
+            low.args[l.args.start as usize..l.args.end as usize]
+                .iter()
+                .filter_map(|a| match a {
+                    Arg::Arena { at, width, bytes } => {
+                        Some((*at, *width as usize * *bytes as usize, *bytes))
+                    }
+                    _ => None,
+                })
+                .collect()
         };
-        n
-    ];
-    let low = lower(
-        &plan,
-        &rows,
-        Fire {
-            captures_across_splits: false,
-        },
-    )
-    .expect("the hybrid lowers");
-    let ranges = |at: usize| -> Vec<(usize, usize, u32)> {
-        let l = &low.launches[at];
-        low.args[l.args.start as usize..l.args.end as usize]
-            .iter()
-            .filter_map(|a| match a {
-                Arg::Arena { at, width, bytes } => {
-                    Some((*at, *width as usize * *bytes as usize, *bytes))
-                }
-                _ => None,
+        let find = |stem: &str| -> Option<usize> {
+            low.launches.iter().position(|l| {
+                low.kernels[l.kernel as usize].starts_with(stem) && l.layers.start == 3
             })
-            .collect()
-    };
-    let find = |stem: &str| -> Option<usize> {
-        low.launches
-            .iter()
-            .position(|l| low.kernels[l.kernel as usize].starts_with(stem) && l.layers.start == 3)
-    };
-    let (Some(sdpa), Some(append)) = (find("sdpa_paged_tiled"), find("kv_append_paged")) else {
-        println!("layer 3 has no tiled sdpa and kv append");
-        continue;
-    };
-    shell.fire_prefix(Some(sdpa + 1));
-    let arena = match shell.step(&[driver_wgpu::turns::Turn {
-        who: 4_300 + n as u64,
-        tokens: tokens.clone(),
-    }]) {
-        Ok(s) => s.arena,
-        Err(why) => {
-            println!("the truncated prefill was refused: {why}");
+        };
+        let (Some(sdpa), Some(append)) = (find("sdpa_paged_tiled"), find("kv_append_paged")) else {
+            println!("layer 3 has no tiled sdpa and kv append");
+            continue;
+        };
+        shell.fire_prefix(Some(sdpa + 1));
+        let arena = match shell.step(&[driver_wgpu::turns::Turn {
+            who: 4_300 + n as u64,
+            tokens: tokens.clone(),
+        }]) {
+            Ok(s) => s.arena,
+            Err(why) => {
+                println!("the truncated prefill was refused: {why}");
+                continue;
+            }
+        };
+        shell.fire_prefix(None);
+        let bf16 = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(2)
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .collect()
+        };
+        let read = |rs: &[(usize, usize, u32)], i: usize, t: usize| -> Vec<f32> {
+            let (o, stride, _) = rs[i];
+            bf16(&arena[o + t * stride..o + (t + 1) * stride])
+        };
+        let (ar, sr) = (ranges(append), ranges(sdpa));
+        if ar.len() < 2 || sr.len() < 2 {
+            println!("  not the shape this test knows how to read");
             continue;
         }
-    };
-    shell.fire_prefix(None);
-    let bf16 = |b: &[u8]| -> Vec<f32> {
-        b.chunks_exact(2)
-            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-            .collect()
-    };
-    let read = |rs: &[(usize, usize, u32)], i: usize, t: usize| -> Vec<f32> {
-        let (o, stride, _) = rs[i];
-        bf16(&arena[o + t * stride..o + (t + 1) * stride])
-    };
-    let (ar, sr) = (ranges(append), ranges(sdpa));
-    if ar.len() < 2 || sr.len() < 2 {
-        println!("  not the shape this test knows how to read");
-        continue;
-    }
-    // `kv_append_paged` takes k then v; the sdpa's last range is its output.
-    let v0 = read(&ar, ar.len() - 1, 0);
-    let out0 = read(&sr, sr.len() - 1, 0);
-    let (q_heads, kv_heads, head_dim) = (8usize, 2usize, 256usize);
-    let rep = q_heads / kv_heads;
-    if v0.len() != kv_heads * head_dim || out0.len() != q_heads * head_dim {
-        println!("  widths are not `[kv_heads, head_dim]` and `[q_heads, head_dim]`");
-        continue;
-    }
-    println!("\n  n = {n}: which `v` row each head of OUT ROW 0 copies");
-    // BOTH GQA MAPPINGS AND EVERY ROW'S `v`, because "not its own value" has
-    // three shapes and they want different fixes. `h / rep` is blocked and
-    // `h % kv_heads` is interleaved -- the classic pair -- and matching a
-    // LATER row's `v` instead of row 0's is a causality or mask fault rather
-    // than a mapping one.
-    let cos = |a: &[f32], b: &[f32]| -> f32 {
-        let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
-        for i in 0..a.len() {
-            ab += f64::from(a[i]) * f64::from(b[i]);
-            aa += f64::from(a[i]) * f64::from(a[i]);
-            bb += f64::from(b[i]) * f64::from(b[i]);
+        // `kv_append_paged` takes k then v; the sdpa's last range is its output.
+        let v0 = read(&ar, ar.len() - 1, 0);
+        let out0 = read(&sr, sr.len() - 1, 0);
+        let (q_heads, kv_heads, head_dim) = (8usize, 2usize, 256usize);
+        let rep = q_heads / kv_heads;
+        if v0.len() != kv_heads * head_dim || out0.len() != q_heads * head_dim {
+            println!("  widths are not `[kv_heads, head_dim]` and `[q_heads, head_dim]`");
+            continue;
         }
-        (ab / (aa.sqrt() * bb.sqrt()).max(1e-30)) as f32
-    };
-    for h in [0usize, 4] {
-        let o = &out0[h * head_dim..(h + 1) * head_dim];
-        let mut best = (0.0f32, String::new());
-        let mut line = String::new();
-        for r in 0..n {
-            let vr = read(&ar, ar.len() - 1, r);
-            for (name, kv) in [("blocked", h / rep), ("interleaved", h % kv_heads)] {
-                let c = cos(o, &vr[kv * head_dim..(kv + 1) * head_dim]);
-                if c.abs() > best.0.abs() {
-                    best = (c, format!("row {r} kv {kv} ({name})"));
-                }
-                if r == 0 {
-                    line.push_str(&format!(" {name}={c:+.4}"));
+        println!("\n  n = {n}: which `v` row each head of OUT ROW 0 copies");
+        // BOTH GQA MAPPINGS AND EVERY ROW'S `v`, because "not its own value" has
+        // three shapes and they want different fixes. `h / rep` is blocked and
+        // `h % kv_heads` is interleaved -- the classic pair -- and matching a
+        // LATER row's `v` instead of row 0's is a causality or mask fault rather
+        // than a mapping one.
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..a.len() {
+                ab += f64::from(a[i]) * f64::from(b[i]);
+                aa += f64::from(a[i]) * f64::from(a[i]);
+                bb += f64::from(b[i]) * f64::from(b[i]);
+            }
+            (ab / (aa.sqrt() * bb.sqrt()).max(1e-30)) as f32
+        };
+        for h in [0usize, 4] {
+            let o = &out0[h * head_dim..(h + 1) * head_dim];
+            let mut best = (0.0f32, String::new());
+            let mut line = String::new();
+            for r in 0..n {
+                let vr = read(&ar, ar.len() - 1, r);
+                for (name, kv) in [("blocked", h / rep), ("interleaved", h % kv_heads)] {
+                    let c = cos(o, &vr[kv * head_dim..(kv + 1) * head_dim]);
+                    if c.abs() > best.0.abs() {
+                        best = (c, format!("row {r} kv {kv} ({name})"));
+                    }
+                    if r == 0 {
+                        line.push_str(&format!(" {name}={c:+.4}"));
+                    }
                 }
             }
+            let _ = line;
+            // COSINE CANNOT TELL PARALLEL FROM EQUAL, and a softmax produces a
+            // convex combination, so a true copy has relative difference zero and
+            // not merely angle zero. Both, per candidate row.
+            let mut diffs = String::new();
+            for r in 0..n {
+                let vr = read(&ar, ar.len() - 1, r);
+                let kv = h / rep;
+                let (mut w, mut sc) = (0.0f32, 0.0f32);
+                for d in 0..head_dim {
+                    w = w.max((o[d] - vr[kv * head_dim + d]).abs());
+                    sc = sc.max(vr[kv * head_dim + d].abs());
+                }
+                diffs.push_str(&format!(" r{r}={:.3}", w / sc.max(1e-30)));
+            }
+            let mag = o.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            println!(
+                "      head {h}: best cos {:+.4} at {}; |out| {mag:.4}; relative diff{diffs}",
+                best.0, best.1
+            );
         }
-        let _ = line;
-        // COSINE CANNOT TELL PARALLEL FROM EQUAL, and a softmax produces a
-        // convex combination, so a true copy has relative difference zero and
-        // not merely angle zero. Both, per candidate row.
-        let mut diffs = String::new();
-        for r in 0..n {
-            let vr = read(&ar, ar.len() - 1, r);
+        let (mut worst, mut scale, mut at_h) = (0.0f32, 0.0f32, 0usize);
+        for h in 0..q_heads {
             let kv = h / rep;
-            let (mut w, mut sc) = (0.0f32, 0.0f32);
             for d in 0..head_dim {
-                w = w.max((o[d] - vr[kv * head_dim + d]).abs());
-                sc = sc.max(vr[kv * head_dim + d].abs());
+                let want = v0[kv * head_dim + d];
+                let got = out0[h * head_dim + d];
+                if (want - got).abs() > worst {
+                    worst = (want - got).abs();
+                    at_h = h;
+                }
+                scale = scale.max(want.abs());
             }
-            diffs.push_str(&format!(" r{r}={:.3}", w / sc.max(1e-30)));
         }
-        let mag = o.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let rel = worst / scale.max(1e-30);
         println!(
-            "      head {h}: best cos {:+.4} at {}; |out| {mag:.4}; relative diff{diffs}",
-            best.0, best.1
+            "    widest |v0 - out0| {worst:e} at head {at_h}, against values reaching {scale:.6} -- relative {rel:e}"
         );
-    }
-    let (mut worst, mut scale, mut at_h) = (0.0f32, 0.0f32, 0usize);
-    for h in 0..q_heads {
-        let kv = h / rep;
-        for d in 0..head_dim {
-            let want = v0[kv * head_dim + d];
-            let got = out0[h * head_dim + d];
-            if (want - got).abs() > worst {
-                worst = (want - got).abs();
-                at_h = h;
+        println!(
+            "    {}",
+            if rel < 1e-2 {
+                "row 0 IS its own value here"
+            } else {
+                "row 0 is NOT its own value here"
             }
-            scale = scale.max(want.abs());
-        }
-    }
-    let rel = worst / scale.max(1e-30);
-    println!("    widest |v0 - out0| {worst:e} at head {at_h}, against values reaching {scale:.6} -- relative {rel:e}");
-    println!(
-        "    {}",
-        if rel < 1e-2 {
-            "row 0 IS its own value here"
-        } else {
-            "row 0 is NOT its own value here"
-        }
-    );
+        );
     }
 }
 
@@ -7531,7 +8213,7 @@ fn whether_a_later_token_moves_an_earlier_rows_attention() {
     let a = fire(&mut shell, 4_400, PERIOD[2]);
     let b = fire(&mut shell, 4_401, PERIOD[5]);
     if a.is_empty() || b.is_empty() {
-        println!("a fire was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("a fire was refused, so IT COULD NOT BE MEASURED");
         return;
     }
     let (q_heads, head_dim) = (8usize, 256usize);
@@ -7674,7 +8356,11 @@ fn where_in_the_kv_cache_attentions_first_row_reads() {
         return;
     };
     let vc = bf16(&vbytes);
-    println!("  the value cache is {} elements, {} blocks of {head_dim}", vc.len(), vc.len() / head_dim);
+    println!(
+        "  the value cache is {} elements, {} blocks of {head_dim}",
+        vc.len(),
+        vc.len() / head_dim
+    );
 
     // Both buffers as flat `head_dim` blocks, matched by CONTENT.
     let same = |a: &[f32], b: &[f32]| -> bool { a.iter().zip(b).all(|(x, y)| x == y) };
@@ -7839,11 +8525,7 @@ fn whether_attention_is_the_softmax_over_the_cache_it_reads() {
     let rep = q_heads / kv_heads;
     println!("\n  {q_heads} query heads of {head_dim} over {kv_heads} kv heads, {n} rows");
     let per_row = q_heads * head_dim;
-    for scale in [
-        1.0 / (head_dim as f32).sqrt(),
-        1.0 / 128.0f32.sqrt(),
-        1.0,
-    ] {
+    for scale in [1.0 / (head_dim as f32).sqrt(), 1.0 / 128.0f32.sqrt(), 1.0] {
         let (mut worst, mut mag) = (0.0f32, 0.0f32);
         for t in 0..n {
             for h in 0..q_heads {
@@ -7928,9 +8610,11 @@ fn whether_the_query_gate_split_and_the_output_gate_do_what_they_say() {
             .iter()
             .position(|l| low.kernels[l.kernel as usize].starts_with(stem) && l.layers.start == 3)
     };
-    let (Some(split), Some(sdpa), Some(gate)) =
-        (find("q_gate_split"), find("sdpa_paged_tiled"), find("gate_bfloat16"))
-    else {
+    let (Some(split), Some(sdpa), Some(gate)) = (
+        find("q_gate_split"),
+        find("sdpa_paged_tiled"),
+        find("gate_bfloat16"),
+    ) else {
         println!("layer 3 does not run all three");
         return;
     };
@@ -7965,7 +8649,7 @@ fn whether_the_query_gate_split_and_the_output_gate_do_what_they_say() {
     let a_sdpa = fire(&mut shell, 4_701, sdpa);
     let a_gate = fire(&mut shell, 4_702, gate);
     if a_split.is_empty() || a_sdpa.is_empty() || a_gate.is_empty() {
-        println!("a fire was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("a fire was refused, so IT COULD NOT BE MEASURED");
         return;
     }
     let (head_dim, q_heads) = (256usize, 8usize);
@@ -8018,7 +8702,10 @@ fn whether_the_query_gate_split_and_the_output_gate_do_what_they_say() {
         }
     }
     println!("  gate, against `attn * sigmoid(gate)`:");
-    println!("    widest {worst:e}, against {gmag:.6} -- relative {:e}", worst / gmag.max(1e-30));
+    println!(
+        "    widest {worst:e}, against {gmag:.6} -- relative {:e}",
+        worst / gmag.max(1e-30)
+    );
     println!("  (one bf16 step is 3.9e-3)");
 }
 
@@ -8217,7 +8904,12 @@ fn what_the_model_answers_when_the_question_is_in_its_own_vocabulary() {
     let Some((mut shell, _real)) = qwen3_5_shell(16) else {
         return;
     };
-    let ask = |shell: &mut driver_wgpu::shell::Shell, who: u64, tokens: &[u32], want: u32, what: &str| -> bool {
+    let ask = |shell: &mut driver_wgpu::shell::Shell,
+               who: u64,
+               tokens: &[u32],
+               want: u32,
+               what: &str|
+     -> bool {
         let row = fire_row(shell, who, tokens);
         if row.is_empty() {
             println!("    {what}: refused");
@@ -8297,7 +8989,9 @@ fn whether_the_logits_are_the_readout_of_the_state_the_fire_produced() {
     facts.layers = 24;
     let plan = hybrid_plan(&facts);
     // "The capital of France is Paris. The capital of France is"
-    let tokens: Vec<u32> = vec![561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369];
+    let tokens: Vec<u32> = vec![
+        561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369,
+    ];
     let n = tokens.len();
     let rows: Vec<Row> = vec![
         Row {
@@ -8443,7 +9137,9 @@ fn whether_the_logits_are_the_readout_of_the_state_the_fire_produced() {
                     d = d.max((a - b).abs());
                 }
             }
-            println!("    logits row {i}: widest gap to what the kernel wrote at row {picked}: {d:.4}");
+            println!(
+                "    logits row {i}: widest gap to what the kernel wrote at row {picked}: {d:.4}"
+            );
         }
     }
     println!(
@@ -8515,7 +9211,9 @@ fn whether_eight_bits_answers_what_four_does_not() {
         }
     }
     println!("\n  AT EIGHT BITS -- a fact stated once and asked again:");
-    let fact: Vec<u32> = vec![561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369];
+    let fact: Vec<u32> = vec![
+        561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369,
+    ];
     asked += 1;
     if ask(&mut shell, 7_100, &fact, 11751, "capital of France") {
         right += 1;
@@ -8555,7 +9253,7 @@ fn whether_eight_bits_answers_what_four_does_not() {
 #[ignore = "needs a Qwen3.5-0.8B snapshot"]
 fn what_the_int4_encode_costs_against_the_bfloat_it_came_from() {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
@@ -8642,7 +9340,8 @@ fn what_the_int4_encode_costs_against_the_bfloat_it_came_from() {
             .filter(|r| *r < n_rows)
         {
             let mut raw = vec![0u8; hidden * 2];
-            if f.seek(SeekFrom::Start(base + off + (r * hidden * 2) as u64)).is_err()
+            if f.seek(SeekFrom::Start(base + off + (r * hidden * 2) as u64))
+                .is_err()
                 || f.read_exact(&mut raw).is_err()
             {
                 continue;
@@ -8706,28 +9405,35 @@ fn what_the_model_generates_rather_than_what_it_scores_in_one_step() {
     let Some((mut shell, _real)) = qwen3_5_shell(16) else {
         return;
     };
-    let step_once = |shell: &mut driver_wgpu::shell::Shell, who: u64, toks: &[u32]| -> Option<u32> {
-        let row = fire_row(shell, who, toks);
-        if row.is_empty() {
-            return None;
-        }
-        let mut best = (0usize, f32::NEG_INFINITY);
-        for (i, v) in row.iter().enumerate() {
-            if *v > best.1 {
-                best = (i, *v);
+    let step_once =
+        |shell: &mut driver_wgpu::shell::Shell, who: u64, toks: &[u32]| -> Option<u32> {
+            let row = fire_row(shell, who, toks);
+            if row.is_empty() {
+                return None;
             }
-        }
-        u32::try_from(best.0).ok()
-    };
+            let mut best = (0usize, f32::NEG_INFINITY);
+            for (i, v) in row.iter().enumerate() {
+                if *v > best.1 {
+                    best = (i, *v);
+                }
+            }
+            u32::try_from(best.0).ok()
+        };
     let cases: [(&str, &[u32], &[u32]); 4] = [
         // "The capital of France is Paris. The capital of France is" -> Paris
         (
             "capital of France",
-            &[561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369],
+            &[
+                561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369,
+            ],
             &[11751, 57590],
         ),
         // "one two three four one two three" -> four
-        ("counting", &[799, 1330, 2250, 2943, 799, 1330, 2250], &[2943, 32897]),
+        (
+            "counting",
+            &[799, 1330, 2250, 2943, 799, 1330, 2250],
+            &[2943, 32897],
+        ),
         ("the x16", &[279; 16], &[279, 1719]),
         ("cat x16", &[7993; 16], &[7993, 4466]),
     ];
@@ -8791,7 +9497,7 @@ fn what_the_model_generates_rather_than_what_it_scores_in_one_step() {
 #[test]
 fn which_checkpoint_layer_each_driver_layer_is_actually_holding() {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
@@ -8848,7 +9554,9 @@ fn which_checkpoint_layer_each_driver_layer_is_actually_holding() {
         }
     }
     if source.is_empty() {
-        println!("the checkpoint carries no `linear_attn.conv1d.weight`, so THE MAPPING COULD NOT BE READ");
+        println!(
+            "the checkpoint carries no `linear_attn.conv1d.weight`, so THE MAPPING COULD NOT BE READ"
+        );
         return;
     }
 
@@ -8941,7 +9649,7 @@ fn which_checkpoint_layer_each_driver_layer_is_actually_holding() {
 #[test]
 fn where_every_raw_weight_the_driver_holds_actually_came_from() {
     let Some(dir) = qwen3_5_snapshot() else {
-        println!("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("no Qwen3.5-0.8B snapshot, so IT COULD NOT BE MEASURED");
         return;
     };
     let Some(row) = model::catalog::find("qwen3.5-0.8b-base") else {
@@ -9114,7 +9822,9 @@ fn where_every_raw_weight_the_driver_holds_actually_came_from() {
         let bytes = real[k].len();
         let sourced = head.iter().any(|(n, meta)| {
             elements(meta).is_some_and(|e| e == bytes / 2 || e == bytes / 4)
-                && layer.as_ref().is_none_or(|i| n.contains(&format!(".layers.{i}.")))
+                && layer
+                    .as_ref()
+                    .is_none_or(|i| n.contains(&format!(".layers.{i}.")))
         });
         let e = by_kind.entry(kind).or_default();
         e.0 += 1;
@@ -9226,9 +9936,7 @@ fn whether_the_mlp_computes_the_swiglu_its_weights_imply() {
         low.launches
             .iter()
             .enumerate()
-            .filter(|(_, l)| {
-                l.layers.start == 0 && low.kernels[l.kernel as usize].starts_with(k)
-            })
+            .filter(|(_, l)| l.layers.start == 0 && low.kernels[l.kernel as usize].starts_with(k))
             .map(|(i, _)| i)
             .nth(skip)
     };
@@ -9250,8 +9958,10 @@ fn whether_the_mlp_computes_the_swiglu_its_weights_imply() {
         println!("layer 0 does not lower to the MLP block this test reads");
         return;
     };
-    let (Some(gate_l), Some(up_l)) = (at("affine_qmv_fast_bfloat16", 4), at("affine_qmv_fast_bfloat16", 5))
-    else {
+    let (Some(gate_l), Some(up_l)) = (
+        at("affine_qmv_fast_bfloat16", 4),
+        at("affine_qmv_fast_bfloat16", 5),
+    ) else {
         println!("the two MLP projections are not where this test looks");
         return;
     };
@@ -9291,7 +10001,8 @@ fn whether_the_mlp_computes_the_swiglu_its_weights_imply() {
             .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
             .collect()
     };
-    let row = |o: usize, w: usize, t: usize| -> Vec<f32> { bf16(&arena[o + t * w..o + (t + 1) * w]) };
+    let row =
+        |o: usize, w: usize, t: usize| -> Vec<f32> { bf16(&arena[o + t * w..o + (t + 1) * w]) };
 
     let (hidden, inter, group) = (1024usize, 3584usize, 64usize);
     let want = |name: &str, out_n: usize, in_n: usize| -> Option<(Vec<u8>, Vec<f32>, Vec<f32>)> {
@@ -9300,7 +10011,8 @@ fn whether_the_mlp_computes_the_swiglu_its_weights_imply() {
             real.get(&format!("{name}.scales")).map(|b| bf16(b))?,
             real.get(&format!("{name}.zeros")).map(|b| bf16(b))?,
         );
-        (c.len() == out_n * in_n / 2 && s.len() == out_n * (in_n / group)).then(|| (c.clone(), s, z))
+        (c.len() == out_n * in_n / 2 && s.len() == out_n * (in_n / group))
+            .then(|| (c.clone(), s, z))
     };
     let (Some(wg), Some(wu), Some(wd), Some(wn)) = (
         want("layer.0.gate_proj", inter, hidden),
@@ -9424,7 +10136,9 @@ fn whether_the_tied_readout_ranks_the_same_at_four_bits_and_at_sixteen() {
     facts.layers = 24;
     let plan = hybrid_plan(&facts);
     // "The capital of France is Paris. The capital of France is"
-    let tokens: Vec<u32> = vec![561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369];
+    let tokens: Vec<u32> = vec![
+        561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369,
+    ];
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -9444,7 +10158,9 @@ fn whether_the_tied_readout_ranks_the_same_at_four_bits_and_at_sixteen() {
     let (mut arenas, mut weights) = (Vec::new(), Vec::new());
     for a in &low.args[l.args.start as usize..l.args.end as usize] {
         match a {
-            Arg::Arena { at, width, bytes } => arenas.push((*at, *width as usize * *bytes as usize)),
+            Arg::Arena { at, width, bytes } => {
+                arenas.push((*at, *width as usize * *bytes as usize))
+            }
             Arg::Weight(n) => weights.push(n.clone()),
             // Neither is a RECTANGLE this probe can read back: a named
             // value is bound by the backend rather than placed in the arena,
@@ -9452,7 +10168,8 @@ fn whether_the_tied_readout_ranks_the_same_at_four_bits_and_at_sixteen() {
             Arg::Named { .. } | Arg::Raised { .. } => {}
         }
     }
-    let (Some((o, stride)), Some(stem)) = (arenas.first().copied(), weights.first().cloned()) else {
+    let (Some((o, stride)), Some(stem)) = (arenas.first().copied(), weights.first().cloned())
+    else {
         return;
     };
     let step = match shell.step(&[driver_wgpu::turns::Turn {
@@ -9511,7 +10228,10 @@ fn whether_the_tied_readout_ranks_the_same_at_four_bits_and_at_sixteen() {
         return;
     };
     if meta["dtype"].as_str() != Some("BF16") {
-        println!("`{src}` is {:?}, which this test does not read", meta["dtype"]);
+        println!(
+            "`{src}` is {:?}, which this test does not read",
+            meta["dtype"]
+        );
         return;
     }
     let (a, b) = (
@@ -9525,7 +10245,10 @@ fn whether_the_tied_readout_ranks_the_same_at_four_bits_and_at_sixteen() {
          {vocab} rows of {hidden}"
     );
     if vocab == 0 || vocab > gpu.len() {
-        println!("  the table is {vocab} rows and the fire answered {} -- not comparable", gpu.len());
+        println!(
+            "  the table is {vocab} rows and the fire answered {} -- not comparable",
+            gpu.len()
+        );
         return;
     }
     if f.seek(SeekFrom::Start(base)).is_err() {
@@ -9658,7 +10381,9 @@ fn whether_the_rotation_turns_the_dimensions_it_is_supposed_to() {
         return;
     };
     if q_at != out_at {
-        println!("the rotation is not in place, so this test's two-fire trick is unnecessary and wrong");
+        println!(
+            "the rotation is not in place, so this test's two-fire trick is unnecessary and wrong"
+        );
         return;
     }
     let bf16 = |b: &[u8]| -> Vec<f32> {
@@ -9717,7 +10442,9 @@ fn whether_the_rotation_turns_the_dimensions_it_is_supposed_to() {
             for i in 0..rot / 2 {
                 let ang = t as f64 * theta.powf(-2.0 * i as f64 / rot as f64);
                 let (c, s) = (ang.cos() as f32, ang.sin() as f32);
-                for (which, (p, q)) in [(i, i + rot / 2), (2 * i, 2 * i + 1)].into_iter().enumerate()
+                for (which, (p, q)) in [(i, i + rot / 2), (2 * i, 2 * i + 1)]
+                    .into_iter()
+                    .enumerate()
                 {
                     let (x, y) = (before[t][base + p], before[t][base + q]);
                     let (wp, wq) = (x * c - y * s, y * c + x * s);
@@ -9730,8 +10457,16 @@ fn whether_the_rotation_turns_the_dimensions_it_is_supposed_to() {
         }
     }
     let rel = worst.map(|w| w / scale.max(1e-30));
-    println!("    neox pairing (i, i+{}): widest {:e}, relative {:e}", rot / 2, worst[0], rel[0]);
-    println!("    gptj pairing (2i, 2i+1): widest {:e}, relative {:e}", worst[1], rel[1]);
+    println!(
+        "    neox pairing (i, i+{}): widest {:e}, relative {:e}",
+        rot / 2,
+        worst[0],
+        rel[0]
+    );
+    println!(
+        "    gptj pairing (2i, 2i+1): widest {:e}, relative {:e}",
+        worst[1], rel[1]
+    );
     let good = rel[0] < 3e-2 || rel[1] < 3e-2;
     println!(
         "\n  {}",
@@ -9748,12 +10483,16 @@ fn whether_the_rotation_turns_the_dimensions_it_is_supposed_to() {
 /// WHICH FOLD THE FINAL NORM APPLIES, AND WHICH ONE THIS CHECKPOINT WANTS.
 ///
 /// Gemma's RMSNorm is not the usual one: it scales by `1 + w` rather than by
-/// `w`. `Qwen35HybridFacts::qwen3_5_0_8b` USED to state `NormVariant::Gemma`
-/// and now states `Plain` -- `model/src/qwen_3_5/spec.rs` gives the evidence
-/// on both sides -- so this test's job is unchanged and its expected answer is
-/// not: it measures which fold the device applied, whichever one the facts
-/// currently ask for. That difference is invisible to every other check in
-/// this file.
+/// `w`. `Qwen35HybridFacts::qwen3_5_0_8b` states `NormVariant::Gemma`, because
+/// this checkpoint's gains are trained from ZERO -- `layer.0.attn_norm` means
+/// 0.238 and `layer.0.mlp_norm` means 0.086, which this test prints -- and a
+/// tensor centred on zero cannot be the multiplier in `x * w`. A window in
+/// which the fixtures said `Plain` STOOD HERE and is written up in
+/// `model/src/qwen_3_5/spec.rs`; the short of it is that where the `1 +` lives
+/// is a fact about the ARTIFACT, and the 4-bit conversions that motivated
+/// `Plain` had already folded the offset in. This test measures which fold the
+/// device applied, whichever one the facts ask for. That difference is
+/// invisible to every other check in this file.
 /// `whether_the_logits_are_the_readout_of_the_state_the_fire_produced` starts
 /// FROM the normalized state and asks whether the readout of it is right, so a
 /// state normalized the wrong way is not a disagreement there -- it is a
@@ -9767,10 +10506,12 @@ fn whether_the_rotation_turns_the_dimensions_it_is_supposed_to() {
 /// contentless part of the vocabulary. A model that answers space, comma,
 /// period, newline to every prompt is what that looks like.
 ///
-/// `whether_the_mlp_computes_the_swiglu_its_weights_imply` already showed the
-/// PER-BLOCK norms fold plainly: its reference multiplies by `w` and its
-/// projections agree to one bf16 step, which `1 + w` could not do. So the two
-/// folds coexist in one model, and at most one of them is right.
+/// `whether_the_mlp_computes_the_swiglu_its_weights_imply` reads the PER-BLOCK
+/// norms through the same `1 + w`, and its projections then agree with the
+/// device to one bf16 step. Its reference multiplied by `w` when it was
+/// written and agreed just as tightly, because both were doing the same wrong
+/// thing -- which is why a reference that follows the device proves nothing
+/// about the fold, and this test asks the checkpoint instead.
 ///
 /// This settles it by consequence rather than by argument. Recover `xhat` from
 /// the final norm's own input, build both candidates, and check which the
@@ -9787,7 +10528,9 @@ fn which_fold_the_final_norm_applies_and_what_each_one_answers() {
     facts.layers = 24;
     let plan = hybrid_plan(&facts);
     // "The capital of France is Paris. The capital of France is"
-    let tokens: Vec<u32> = vec![561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369];
+    let tokens: Vec<u32> = vec![
+        561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369,
+    ];
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -9824,7 +10567,8 @@ fn which_fold_the_final_norm_applies_and_what_each_one_answers() {
             Arg::Named { .. } | Arg::Raised { .. } => {}
         }
     }
-    let ([(in_at, in_w), (out_at, out_w)], [stem]) = (a[..].try_into().unwrap_or([(0, 0); 2]), &w[..])
+    let ([(in_at, in_w), (out_at, out_w)], [stem]) =
+        (a[..].try_into().unwrap_or([(0, 0); 2]), &w[..])
     else {
         println!("the final norm does not take the operands this test reads");
         return;
@@ -9965,9 +10709,7 @@ fn which_fold_the_final_norm_applies_and_what_each_one_answers() {
     println!("\n  \"The capital of France is Paris. The capital of France is\" ->");
     println!("    with x*w      : {:?}", top(&logits[0]));
     println!("    with x*(1+w)  : {:?}", top(&logits[1]));
-    println!(
-        "  (11751 is ` Paris`, 220 is a space, 11 a comma, 13 a period, 198 a newline)"
-    );
+    println!("  (11751 is ` Paris`, 220 is a space, 11 a comma, 13 a period, 198 a newline)");
     // THE GUARD. What this test is FOR, now that the fold is fixed: the device
     // must still be folding as gemma does. Reverting `Ctx::norm` to `Plain`
     // makes this model answer a space to every prompt, and nothing else in
@@ -10016,7 +10758,9 @@ fn which_fold_the_final_norm_applies_and_what_each_one_answers() {
 #[ignore = "loads a second real checkpoint; run explicitly"]
 fn whether_the_instruct_checkpoint_leaves_the_whitespace_basin_too() {
     let Some(dir) = qwen3_5_snapshot_of(&["models--Qwen--Qwen3.5-0.8B"]) else {
-        println!("no Qwen3.5-0.8B (instruct) snapshot, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured(
+            "no Qwen3.5-0.8B (instruct) snapshot, so IT COULD NOT BE MEASURED",
+        );
         return;
     };
     println!("  the instruct checkpoint at {dir}");
@@ -10075,9 +10819,7 @@ fn whether_the_instruct_checkpoint_leaves_the_whitespace_basin_too() {
             if out { "not filler" } else { "ALL FILLER" }
         );
     }
-    println!(
-        "\n  {escaped} of {asked} prompts generated something outside the filler set"
-    );
+    println!("\n  {escaped} of {asked} prompts generated something outside the filler set");
     println!(
         "  {}",
         if escaped == asked && asked > 0 {
@@ -10107,11 +10849,12 @@ fn whether_the_instruct_checkpoint_leaves_the_whitespace_basin_too() {
 /// # It pins the EQUIVALENCE, not the fold
 ///
 /// The first draft asserted `NormVariant::Gemma` and `plus_one == 1` outright,
-/// and went red when `Qwen35HybridFacts::qwen3_5_0_8b` moved to `Plain` -- see
-/// `model/src/qwen_3_5/spec.rs`, which says the `Gemma` reading rested on
-/// `qwen3_5_forward.cpp` launching `rmsnorm_gemma_bf16` with no 0.8B staged to
-/// check it, while the two measurable Qwen3.6 checkpoints and `mlx_lm`'s
-/// `nn.RMSNorm` for the whole family say plain.
+/// and went red when `Qwen35HybridFacts::qwen3_5_0_8b` moved to `Plain`, then
+/// would have gone red again when it moved back -- see
+/// `model/src/qwen_3_5/spec.rs`, which now has the 0.8B's own gains (0.238 and
+/// 0.086, trained from zero) on one side and the 4-bit conversions' folded-in
+/// 0.98-1.03 on the other, and reconciles them: the `1 +` belongs to the
+/// ARTIFACT, not to the architecture.
 ///
 /// A test that has to be edited every time that reading is revisited is a test
 /// that will be edited WITHOUT being thought about. So it asserts the thing
@@ -10138,7 +10881,13 @@ fn every_norm_in_the_plan_folds_the_way_the_facts_state() {
     const PLUS_ONE: usize = 3;
     let (mut folded, mut plain, mut gated) = (0usize, Vec::new(), 0usize);
     for op in &plan.ops {
-        let model_ir::trace::OpKind::Launch { kernel, params, weights, .. } = &op.kind else {
+        let model_ir::trace::OpKind::Launch {
+            kernel,
+            params,
+            weights,
+            ..
+        } = &op.kind
+        else {
             continue;
         };
         if kernel.starts_with("gated_rms") {
@@ -10181,14 +10930,22 @@ fn every_norm_in_the_plan_folds_the_way_the_facts_state() {
 
 /// SPLITTING A CONVERSATION MUST NOT CHANGE ITS ANSWER.
 ///
-/// [`whether_the_prefill_and_the_decode_leave_the_same_carry`] reports that
-/// the two recurrences leave different `recurrent_state`: 262,144 of 262,144
-/// elements at layers 1, 2, 4 and 5, widest 5.42, while `conv_state` agrees to
-/// the byte. Layer 3 agrees only because it is a FULL-ATTENTION layer and has
-/// no gated-DeltaNet carry to disagree about.
+/// [`whether_the_prefill_and_the_decode_leave_the_same_carry`] used to report
+/// that the two recurrences leave different `recurrent_state`: 262,144 of
+/// 262,144 elements at layers 1, 2, 4 and 5, while `conv_state` agreed to the
+/// byte. Layer 3 agreed only because it is a FULL-ATTENTION layer and has no
+/// gated-DeltaNet carry to disagree about.
 ///
-/// That reading has never been settled, and a raw state comparison cannot
-/// settle it. Two paths can hold the same recurrence in different internal
+/// **That reading was wrong and is now settled.** The paragraph below says a
+/// raw state comparison cannot settle it, and the reason it could not was
+/// that it compared counts without magnitudes. Given one, every disagreement
+/// is inside one bf16 ulp of its own slab -- the widest is 42 against 42.25,
+/// and 0.25 is the ulp at 42 -- so the two paths compute the same recurrence.
+///
+/// This test is therefore no longer a tiebreak between two candidate
+/// recurrences. It is what it says it is: splitting a conversation must not
+/// change its answer, which is a property serving needs whether or not any
+/// two implementations of the carry disagree. Two paths can hold the same recurrence in different internal
 /// arrangements and both be right, and a byte-for-byte disagreement between
 /// two slots that never meet is consistent with that. What is NOT consistent
 /// with it is the property serving actually needs, which is this one:
@@ -10214,7 +10971,9 @@ fn whether_a_split_conversation_answers_what_an_unsplit_one_does() {
         return;
     };
     // "The capital of France is Paris. The capital of France is"
-    let all: Vec<u32> = vec![561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369];
+    let all: Vec<u32> = vec![
+        561, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 9338, 369,
+    ];
     let cut = all.len() - 1;
     let ask = |shell: &mut driver_wgpu::shell::Shell, who: u64, t: &[u32]| -> Option<Vec<f32>> {
         let out = shell
@@ -10355,11 +11114,15 @@ fn whether_one_decode_step_leaves_what_one_more_prefill_token_would() {
     // defect on a comparison of a thing with itself. The whole seat must never
     // take a second fire.
     if fire_row(&mut shell, whole, &PERIOD[..4]).is_empty() {
-        println!("the four-token prefill was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured(
+            "the four-token prefill was refused, so IT COULD NOT BE MEASURED",
+        );
         return;
     }
     if fire_row(&mut shell, split, &PERIOD[..3]).is_empty() {
-        println!("the three-token prefill was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured(
+            "the three-token prefill was refused, so IT COULD NOT BE MEASURED",
+        );
         return;
     }
     if fire_row(&mut shell, split, &PERIOD[3..4]).is_empty() {
@@ -10388,7 +11151,9 @@ fn whether_one_decode_step_leaves_what_one_more_prefill_token_would() {
     let (mut worst, mut worst_where) = (0.0f32, String::new());
     for which in ["recurrent_state", "conv_state"] {
         for layer in 0..6u16 {
-            let Some(pool) = shell.recurrent() else { return };
+            let Some(pool) = shell.recurrent() else {
+                return;
+            };
             let Some(slab) = pool.slab(layer, which) else {
                 continue;
             };
@@ -10551,8 +11316,17 @@ fn whether_the_fused_decode_computes_the_step_its_own_operands_imply() {
         &Qwen35HybridFacts::qwen3_5_0_8b(),
         model_ir::trace::FireClass::Decode,
     );
-    let rows0: Vec<Row> = vec![Row { samples: true, ..Row::default() }];
-    let Ok(low0) = lower(&plan0, &rows0, Fire { captures_across_splits: false }) else {
+    let rows0: Vec<Row> = vec![Row {
+        samples: true,
+        ..Row::default()
+    }];
+    let Ok(low0) = lower(
+        &plan0,
+        &rows0,
+        Fire {
+            captures_across_splits: false,
+        },
+    ) else {
         return;
     };
     let Some(stop) = low0.launches.iter().position(|l| {
@@ -10645,10 +11419,18 @@ fn whether_the_fused_decode_computes_the_step_its_own_operands_imply() {
         real.get("layer.0.conv_w").map(|b| bf16(b)),
         real.get("layer.0.conv_b").map(|b| bf16(b)),
         real.get("layer.0.a_log").map(|b| {
-            if b.len() == hv_n * 4 { f32s(b) } else { bf16(b) }
+            if b.len() == hv_n * 4 {
+                f32s(b)
+            } else {
+                bf16(b)
+            }
         }),
         real.get("layer.0.dt").map(|b| {
-            if b.len() == hv_n * 4 { f32s(b) } else { bf16(b) }
+            if b.len() == hv_n * 4 {
+                f32s(b)
+            } else {
+                bf16(b)
+            }
         }),
     ) else {
         println!("the gated-DeltaNet weights are not all held");
@@ -10682,60 +11464,62 @@ fn whether_the_fused_decode_computes_the_step_its_own_operands_imply() {
     println!("\n  the fused decode's step, walked on a CPU from its own operands:");
     let mut best: Option<(&str, f32, f32, f32)> = None;
     for (half, conv) in &halves {
-    let convsilu = |c: usize| -> f32 {
-        let mut acc = conv_b.get(c).copied().unwrap_or(0.0);
-        for j in 0..kc - 1 {
-            acc += conv[(j + 1) * conv_dim + c] * conv_w[c * kc + j];
-        }
-        acc += mixed[c] * conv_w[c * kc + (kc - 1)];
-        silu(acc)
-    };
-    let (mut d_got, mut d_want, mut scale) = (0.0f32, 0.0f32, 0.0f32);
-    for hv in 0..hv_n {
-        let mut qraw = vec![0.0f32; dk];
-        let mut kraw = vec![0.0f32; dk];
-        let (mut qsq, mut ksq) = (0.0f32, 0.0f32);
-        for d in 0..dk {
-            qraw[d] = convsilu(q_off + hv * dk + d);
-            kraw[d] = convsilu(k_off + hv * dk + d);
-            qsq += qraw[d] * qraw[d];
-            ksq += kraw[d] * kraw[d];
-        }
-        let qinv = inv_sqrt_dk / (qsq + eps).sqrt();
-        let kinv = 1.0 / (ksq + eps).sqrt();
-        let _ = qinv;
-        let ad = agate[hv] + dt[hv];
-        let sp = ad.max(0.0) + (1.0 + (-ad.abs()).exp()).ln();
-        let decay = (-a_log[hv].exp() * sp).exp();
-        let beta = 1.0 / (1.0 + (-bgate[hv]).exp());
-        for dvi in 0..dv {
-            let base = (hv * dv + dvi) * dk;
-            let vval = convsilu(v_off + hv * dv + dvi);
-            let mut st = vec![0.0f32; dk];
-            let mut kv = 0.0f32;
-            for d in 0..dk {
-                st[d] = s_prev[base + d] * decay;
-                kv += st[d] * (kraw[d] * kinv);
+        let convsilu = |c: usize| -> f32 {
+            let mut acc = conv_b.get(c).copied().unwrap_or(0.0);
+            for j in 0..kc - 1 {
+                acc += conv[(j + 1) * conv_dim + c] * conv_w[c * kc + j];
             }
-            let delta = (vval - kv) * beta;
+            acc += mixed[c] * conv_w[c * kc + (kc - 1)];
+            silu(acc)
+        };
+        let (mut d_got, mut d_want, mut scale) = (0.0f32, 0.0f32, 0.0f32);
+        for hv in 0..hv_n {
+            let mut qraw = vec![0.0f32; dk];
+            let mut kraw = vec![0.0f32; dk];
+            let (mut qsq, mut ksq) = (0.0f32, 0.0f32);
             for d in 0..dk {
-                st[d] += kraw[d] * kinv * delta;
-                d_got = d_got.max((st[d] - got[base + d]).abs());
-                d_want = d_want.max((st[d] - want[base + d]).abs());
-                scale = scale.max(st[d].abs());
+                qraw[d] = convsilu(q_off + hv * dk + d);
+                kraw[d] = convsilu(k_off + hv * dk + d);
+                qsq += qraw[d] * qraw[d];
+                ksq += kraw[d] * kraw[d];
+            }
+            let qinv = inv_sqrt_dk / (qsq + eps).sqrt();
+            let kinv = 1.0 / (ksq + eps).sqrt();
+            let _ = qinv;
+            let ad = agate[hv] + dt[hv];
+            let sp = ad.max(0.0) + (1.0 + (-ad.abs()).exp()).ln();
+            let decay = (-a_log[hv].exp() * sp).exp();
+            let beta = 1.0 / (1.0 + (-bgate[hv]).exp());
+            for dvi in 0..dv {
+                let base = (hv * dv + dvi) * dk;
+                let vval = convsilu(v_off + hv * dv + dvi);
+                let mut st = vec![0.0f32; dk];
+                let mut kv = 0.0f32;
+                for d in 0..dk {
+                    st[d] = s_prev[base + d] * decay;
+                    kv += st[d] * (kraw[d] * kinv);
+                }
+                let delta = (vval - kv) * beta;
+                for d in 0..dk {
+                    st[d] += kraw[d] * kinv * delta;
+                    d_got = d_got.max((st[d] - got[base + d]).abs());
+                    d_want = d_want.max((st[d] - want[base + d]).abs());
+                    scale = scale.max(st[d].abs());
+                }
             }
         }
-    }
-    let (rg0, rw0) = (d_got / scale.max(1e-30), d_want / scale.max(1e-30));
-    println!(
-        "    window `{half:<15}`: |cpu - decode| {d_got:.6} ({rg0:e}), \
+        let (rg0, rw0) = (d_got / scale.max(1e-30), d_want / scale.max(1e-30));
+        println!(
+            "    window `{half:<15}`: |cpu - decode| {d_got:.6} ({rg0:e}), \
          |cpu - prefill| {d_want:.6} ({rw0:e}), reaching {scale:.3}"
-    );
-    if best.is_none_or(|(_, g, _, _)| rg0 < g) {
-        best = Some((half, rg0, rw0, scale));
+        );
+        if best.is_none_or(|(_, g, _, _)| rg0 < g) {
+            best = Some((half, rg0, rw0, scale));
+        }
     }
-    }
-    let Some((half, rg, rw, _)) = best else { return };
+    let Some((half, rg, rw, _)) = best else {
+        return;
+    };
     println!("\n    the closer window is `{half}`");
     println!(
         "\n  {}",
@@ -10775,7 +11559,9 @@ fn whether_two_seats_given_the_same_tokens_hold_the_same_state() {
     let (one, two) = (1_300u64, 1_301u64);
     for who in [one, two] {
         if fire_row(&mut shell, who, &PERIOD[..3]).is_empty() {
-            println!("a three-token prefill was refused, so IT COULD NOT BE MEASURED");
+            driver_wgpu::skip::unmeasured(
+                "a three-token prefill was refused, so IT COULD NOT BE MEASURED",
+            );
             return;
         }
     }
@@ -10792,8 +11578,12 @@ fn whether_two_seats_given_the_same_tokens_hold_the_same_state() {
     let mut worst = 0.0f32;
     for which in ["recurrent_state", "conv_state"] {
         for layer in 0..6u16 {
-            let Some(pool) = shell.recurrent() else { return };
-            let Some(s) = pool.slab(layer, which) else { continue };
+            let Some(pool) = shell.recurrent() else {
+                return;
+            };
+            let Some(s) = pool.slab(layer, which) else {
+                continue;
+            };
             let Ok(bytes) = shell.device().read_at(s, 0, s.size()) else {
                 continue;
             };
@@ -10867,7 +11657,7 @@ fn what_carrying_the_convolution_windows_back_costs() {
     const PERIOD: [u32; 6] = [15_339, 1_723, 88_204, 6_100, 41_777, 2_930];
     let who = 1_400u64;
     if fire_row(&mut shell, who, &PERIOD).is_empty() {
-        println!("the prefill was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("the prefill was refused, so IT COULD NOT BE MEASURED");
         return;
     }
     const N: usize = 24;
@@ -11012,8 +11802,17 @@ fn whether_a_decode_costs_by_the_fire_or_by_the_launch() {
     let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
     facts.layers = 24;
     let plan = hybrid_plan_class(&facts, model_ir::trace::FireClass::Decode);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }];
-    let Ok(low) = lower(&plan, &rows, Fire { captures_across_splits: false }) else {
+    let rows: Vec<Row> = vec![Row {
+        samples: true,
+        ..Row::default()
+    }];
+    let Ok(low) = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    ) else {
         return;
     };
     let total = low.launches.len();
@@ -11021,7 +11820,7 @@ fn whether_a_decode_costs_by_the_fire_or_by_the_launch() {
     const PERIOD: [u32; 6] = [15_339, 1_723, 88_204, 6_100, 41_777, 2_930];
     let who = 1_500u64;
     if fire_row(&mut shell, who, &PERIOD).is_empty() {
-        println!("the prefill was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("the prefill was refused, so IT COULD NOT BE MEASURED");
         return;
     }
     let mut points: Vec<(f64, f64)> = Vec::new();
@@ -11167,15 +11966,24 @@ fn which_kernel_a_decode_waits_for() {
     let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
     facts.layers = 24;
     let plan = hybrid_plan_class(&facts, model_ir::trace::FireClass::Decode);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }];
-    let Ok(low) = lower(&plan, &rows, Fire { captures_across_splits: false }) else {
+    let rows: Vec<Row> = vec![Row {
+        samples: true,
+        ..Row::default()
+    }];
+    let Ok(low) = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    ) else {
         return;
     };
     let total = low.launches.len();
     const PERIOD: [u32; 6] = [15_339, 1_723, 88_204, 6_100, 41_777, 2_930];
     let who = 1_600u64;
     if fire_row(&mut shell, who, &PERIOD).is_empty() {
-        println!("the prefill was refused, so IT COULD NOT BE MEASURED");
+        driver_wgpu::skip::unmeasured("the prefill was refused, so IT COULD NOT BE MEASURED");
         return;
     }
     // PER LAYER, not per launch. A single launch is ~0.1 ms and this machine's
@@ -11189,7 +11997,10 @@ fn which_kernel_a_decode_waits_for() {
     // follows the last one.
     let mut firsts: Vec<(u16, usize)> = Vec::new();
     for (i, l) in low.launches.iter().enumerate() {
-        if firsts.last().is_none_or(|(seen, _)| *seen != l.layers.start) {
+        if firsts
+            .last()
+            .is_none_or(|(seen, _)| *seen != l.layers.start)
+        {
             firsts.push((l.layers.start, i));
         }
     }
@@ -11233,7 +12044,11 @@ fn which_kernel_a_decode_waits_for() {
             next - start,
             if full { "attention" } else { "DeltaNet" }
         );
-        if full { attn.push(cost) } else { gdn.push(cost) }
+        if full {
+            attn.push(cost)
+        } else {
+            gdn.push(cost)
+        }
     }
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
     println!(
@@ -11346,7 +12161,7 @@ fn whether_batching_conversations_amortises_a_decode() {
     let who = |i: usize| 1_700u64 + i as u64;
     for i in 0..8 {
         if fire_row(&mut shell, who(i), &PERIOD).is_empty() {
-            println!("a prefill was refused, so IT COULD NOT BE MEASURED");
+            driver_wgpu::skip::unmeasured("a prefill was refused, so IT COULD NOT BE MEASURED");
             return;
         }
     }

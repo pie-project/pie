@@ -224,7 +224,7 @@ pub fn embed_gather_scaled_mb_4bit(
     )
 }
 
-#[routine]
+#[routine(out(out = like(proj)))]
 pub fn ple_combine(
     ctx: &Ctx<'_>,
     proj: In<Tensor<bf16>>,
@@ -268,4 +268,3 @@ pub fn row_gather(
         &[input.arg(), out.arg(), rows.arg(), width.arg(), count.arg()],
     )
 }
-

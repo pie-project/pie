@@ -610,7 +610,13 @@ pub(crate) fn push_from(
     if scalars.is_empty() || scalars.len() != declared.push_offsets.len() {
         return None;
     }
-    let width = |v: &ArgValue| if matches!(v, ArgValue::Usize(_)) { 8 } else { 4 };
+    let width = |v: &ArgValue| {
+        if matches!(v, ArgValue::Usize(_)) {
+            8
+        } else {
+            4
+        }
+    };
     // From the block's own extent, not from the count: a member sitting past
     // a gap needs the gap inside the pushed range or the range does not cover
     // it, and `vkCmdPushConstants` takes a size.

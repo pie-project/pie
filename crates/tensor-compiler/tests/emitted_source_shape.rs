@@ -344,3 +344,20 @@ fn every_fault_code_is_readable_in_its_kernel_vocabulary() {
          this test is about"
     );
 }
+
+/// The corpus the loops in this file walk, counted once.
+///
+/// A test whose assertions all live inside `for x in every_emitted_kernel()` is vacuously
+/// true when the corpus is empty, and quieter still when it merely shrinks:
+/// the loop does less work and the summary line is identical. Stated here so
+/// the size is a decision rather than a drift.
+#[test]
+fn the_corpus_these_tests_walk_is_the_size_it_was_measured_at() {
+    assert_eq!(
+        every_emitted_kernel().len(),
+        909,
+        "the corpus is {} long, not the 909 these loops were measured \
+         against",
+        every_emitted_kernel().len()
+    );
+}

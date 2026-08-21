@@ -15,13 +15,27 @@ const SET_SWITCH: &str = "graph::supergraph_set_switch";
 /// Arms `handle` from `preds[slot]` on `stream` (must be capturing). `slot`
 /// indexes the predicate word, read downstream as 0/1; errors if refused.
 pub fn set_cond(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -> Result<()> {
-    arm(SET_COND, graph::supergraph_set_cond, handle, preds, slot, stream)
+    arm(
+        SET_COND,
+        graph::supergraph_set_cond,
+        handle,
+        preds,
+        slot,
+        stream,
+    )
 }
 
 /// Arms `handle` from `preds[slot]` as a body index, not a boolean. An
 /// out-of-range index selects no body — deliberately not clamped to 0.
 pub fn set_switch(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -> Result<()> {
-    arm(SET_SWITCH, graph::supergraph_set_switch, handle, preds, slot, stream)
+    arm(
+        SET_SWITCH,
+        graph::supergraph_set_switch,
+        handle,
+        preds,
+        slot,
+        stream,
+    )
 }
 
 /// Compiles and loads both arming kernels before any capture is opened. Not

@@ -211,8 +211,22 @@ mod tests {
                 .collect(),
             ops: (0..n)
                 .map(|i| Op {
-                    kind: OpKind::Embed {
-                        weight: format!("embed{i}"),
+                    // `OpKind::Embed` retired with the semantic vocabulary
+                    // (§0 of `.wiki/designs/design-no-ask.md`): a statement
+                    // now names a LAUNCHER symbol, not a meaning. The
+                    // fixture's job is to produce N launches distinguishable
+                    // by number — the kernel name is only what the walk
+                    // records in `Lowered::kernels`, so a distinct string
+                    // per op gives `plan_embeds(1)` one launch and
+                    // `plan_embeds(2)` two, which is what the shape-cache
+                    // tests below read.
+                    kind: OpKind::Launch {
+                        kernel: format!("fixture_launch_{i}"),
+                        weights: Vec::new(),
+                        state: None,
+                        params: Vec::new(),
+                        param_extents: Vec::new(),
+                        peel_slots: None,
                     },
                     inputs: Vec::new(),
                     outputs: vec![u32::try_from(i).expect("a small fixture")],
@@ -222,6 +236,7 @@ mod tests {
                 .collect(),
             depth_window: false,
             seams: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 
@@ -233,6 +248,7 @@ mod tests {
             ops: Vec::new(),
             depth_window: false,
             seams: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 
@@ -261,8 +277,16 @@ mod tests {
                 raised: None,
             }],
             ops: vec![Op {
-                kind: OpKind::Embed {
-                    weight: "embed".to_string(),
+                // `OpKind::Embed` retired: a launch symbol is the modern
+                // shape. `no-such-family` still refuses at `Backend::of_family`
+                // — this fixture's whole point is a family no backend claims.
+                kind: OpKind::Launch {
+                    kernel: "fixture_launch".to_string(),
+                    weights: Vec::new(),
+                    state: None,
+                    params: Vec::new(),
+                    param_extents: Vec::new(),
+                    peel_slots: None,
                 },
                 inputs: Vec::new(),
                 outputs: vec![0],
@@ -271,6 +295,7 @@ mod tests {
             }],
             depth_window: false,
             seams: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 

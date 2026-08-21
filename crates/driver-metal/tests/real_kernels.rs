@@ -85,7 +85,9 @@ fn splicing_brings_the_header_body_in() {
     let header = std::fs::read_to_string(dir.join("rms_reduce.h")).expect("header is readable");
     let marker = header
         .lines()
-        .find(|l| l.starts_with("struct ") || l.starts_with("typedef ") || l.contains("METAL_FUNC "))
+        .find(|l| {
+            l.starts_with("struct ") || l.starts_with("typedef ") || l.contains("METAL_FUNC ")
+        })
         .map(str::trim);
     assert!(
         marker.is_some(),

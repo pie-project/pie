@@ -104,7 +104,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so the oracle compared nothing");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let dir = tempfile::tempdir().expect("tempdir");
@@ -466,7 +469,7 @@ fn a_transcendental_costs_one_ulp_between_metal_and_rust_and_no_more() {
     // ulp of the true value; neither is wrong. Two libms rounded a
     // transcendental differently, which is what libms do.
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let (cpu, gpu) = run_both(
@@ -499,7 +502,7 @@ fn plain_arithmetic_costs_nothing_which_is_what_makes_the_transcendental_bound_m
     // sides land on the same bits. So the tolerance the `exp` case takes is a
     // statement about transcendentals specifically, not about the device.
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let (cpu, gpu) = run_both(
@@ -539,7 +542,7 @@ fn the_device_and_the_interpreter_agree_on_a_reduction() {
     // reassociates lands on different bits. If the emitter ever emits a
     // threadgroup reduction whose order differs, this is what says so.
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let (cpu, gpu) = run_both(
@@ -568,7 +571,7 @@ fn the_device_and_the_interpreter_break_an_argmax_tie_the_same_way() {
     // The tie-break is a contract, not an artefact of iteration order, and a
     // GPU argmax is the place most likely to have picked the other one.
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let (cpu, gpu) = run_both(

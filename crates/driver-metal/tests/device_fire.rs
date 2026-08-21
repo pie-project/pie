@@ -51,7 +51,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no fire was encoded");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let dir = tempfile::tempdir().expect("tempdir");
@@ -173,7 +176,7 @@ fn kernels(readiness_state: u32) -> Vec<EmittedKernel> {
 #[test]
 fn a_fire_runs_readiness_then_regions_then_commit_and_commits() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x71, false));
@@ -220,7 +223,7 @@ fn a_fire_runs_readiness_then_regions_then_commit_and_commits() {
 #[test]
 fn a_gpu_side_retry_is_reported_as_retry_not_as_a_fault() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x72, false));
@@ -263,7 +266,7 @@ fn a_gpu_side_retry_is_reported_as_retry_not_as_a_fault() {
 #[test]
 fn an_early_fire_is_refused_by_the_host_before_anything_is_allocated() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x73, true));
@@ -299,7 +302,7 @@ fn an_early_fire_is_refused_by_the_host_before_anything_is_allocated() {
 #[test]
 fn a_prepared_fire_can_be_executed_again_after_a_retry() {
     let Some(mut f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let plan = plan_of(package(0x74, false));

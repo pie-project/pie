@@ -64,6 +64,52 @@ pub(crate) fn guard<T>(what: &str, on_panic: T, body: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Settle a control op: publish the terminal outcome, THEN notify.
+///
+/// # The two halves, and what each omission costs
+///
+/// A control completion -- `copy_kv`, `copy_state`, `resize_pool`, `encode` --
+/// carries a TERMINAL CELL, unlike a frame launch, whose members each answer
+/// with their own. The engine resolves such an op by reading that cell after
+/// the wait slot publishes, so BOTH writes have to happen and in this order:
+///
+/// * Notify without publishing, and the engine sees a slot that moved with a
+///   cell still `Pending` and fails the op with `driver callback published
+///   before terminal outcome settled`. That is what `prefix-tree-kv-cache`
+///   hit on a 4090 -- the copy itself had already run and synchronized
+///   correctly, so the KV pages were right and the answer was an error
+///   anyway.
+/// * Publish without notifying, or neither, and nothing wakes: the op hangs
+///   forever. `engine/src/driver/backend.rs`'s `settle_control` records a fork
+///   that hung a real `pie run` for 850 seconds this way, with the scheduler's
+///   watchdog naming it `in_flight_control: KV copy ... settled=false`.
+///
+/// This driver had one of each. `copy_kv` and `resize_pool` notified without
+/// publishing; `copy_state` bound its target to `_completion` and did neither,
+/// which is why nothing in the tree that copies recurrent state on CUDA had
+/// ever returned. The host-side seams share
+/// `engine::driver::backend::settle_control` for exactly this; the
+/// asynchronous drivers cannot, because they settle from wherever the work
+/// finishes rather than before the call returns, so they get this instead.
+///
+/// The release fence is the caller's: every site below already places one
+/// after its stream synchronize, which is what makes the device writes
+/// visible before either of these two.
+pub(crate) fn settle_control(
+    broker: &driver_api::CompletionBroker,
+    completion: driver_api::completion::CompletionTarget,
+) {
+    if !completion.terminal_cell.is_null() {
+        // SAFETY: the broker owns this cell for the life of the completion the
+        // engine minted it with, and `publish` is a release store into an
+        // `AtomicU32` that the engine only ever reads.
+        unsafe {
+            (*completion.terminal_cell).publish(driver_api::PIE_TERMINAL_OUTCOME_SUCCESS);
+        }
+    }
+    broker.notify(completion.wait_id, completion.target_epoch);
+}
+
 impl Shell {
     /// What this device is, as it answered at create. Parsed once, here, from
     /// the JSON this crate authors.

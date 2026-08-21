@@ -710,7 +710,6 @@ pub fn traced_results(routine: &kernels_vulkan::routine::Routine) -> usize {
 // compared the MEMORY each pointed at -- and which is retired now, having
 // nothing left to compare.
 
-
 /// One crossed routine: the entrypoint stem a plan spells it with, the
 /// routine itself, and the arm that feeds it.
 ///

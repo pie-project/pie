@@ -1,7 +1,7 @@
-    //! Process-teardown fallback coverage (thrust-3), mirroring
-    //! `store::kv::working_set::tests`: an `RsWorkingSet` dropped directly
-    //! (never routed through `HostRsWorkingSet::drop`'s explicit `release()`)
-    //! must still return its slots to the pool.
+//! Process-teardown fallback coverage (thrust-3), mirroring
+//! `store::kv::working_set::tests`: an `RsWorkingSet` dropped directly
+//! (never routed through `HostRsWorkingSet::drop`'s explicit `release()`)
+//! must still return its slots to the pool.
 
 //! Thin WIT/resource handle for `rs-working-set` (kv_refact.md,
 //! `store/rs/working_set.rs`). All substantive operations delegate to the

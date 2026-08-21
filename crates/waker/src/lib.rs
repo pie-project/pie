@@ -12,6 +12,7 @@
 //!   ([`pie_wake`]/[`pie_wake_past`]), so a stale id after a channel dies is a no-op.
 //! - **B12**: `sweep` wakes every slot of a poisoned/closed/aborted channel
 //!   unconditionally, so a blocked `take().await?` resolves to `Err`, not a hang.
+//!
 //! Spurious wakes are permitted; mock and real driver share the `pie_wake*` FFI.
 
 mod ffi;

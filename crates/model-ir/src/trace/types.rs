@@ -86,7 +86,6 @@ impl FireClass {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuardPred {
     /// Explicit KV-write descriptors. Wire kind 0, payload unused.

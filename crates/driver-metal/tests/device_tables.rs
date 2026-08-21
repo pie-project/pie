@@ -34,7 +34,10 @@ struct Fixture {
 fn fixture() -> Option<Fixture> {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no argument table bound");
+            return None;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -56,7 +59,7 @@ fn read_u32s(contents: std::ptr::NonNull<std::ffi::c_void>, count: usize) -> Vec
 #[test]
 fn two_ordinals_reach_two_different_buffers() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -125,7 +128,7 @@ fn two_ordinals_reach_two_different_buffers() {
 #[test]
 fn the_same_tables_drive_every_later_step() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -178,7 +181,7 @@ fn the_same_tables_drive_every_later_step() {
 #[test]
 fn an_ordinal_nobody_bound_is_refused_rather_than_inherited() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = f.heap;
@@ -225,7 +228,7 @@ fn an_ordinal_nobody_bound_is_refused_rather_than_inherited() {
 #[test]
 fn a_binding_past_the_msl_limit_is_refused() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut tables = Tables::new();
@@ -246,7 +249,7 @@ fn a_binding_past_the_msl_limit_is_refused() {
 #[test]
 fn the_cache_knows_which_entries_were_written() {
     let Some(f) = fixture() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut tables = Tables::new();
@@ -281,7 +284,7 @@ fn the_cache_knows_which_entries_were_written() {
 #[test]
 fn a_binding_reports_the_address_it_was_given_not_just_that_it_happened() {
     let Ok(context) = Context::new() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = Heap::new(&context, 1 << 20).expect("heap");

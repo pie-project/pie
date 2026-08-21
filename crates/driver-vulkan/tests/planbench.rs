@@ -417,16 +417,15 @@ fn what_one_rectangle_costs_to_plan() {
                 requests: low.n_requests,
                 ..Default::default()
             };
-            let mut handles =
-                driver_vulkan::hold::Handles::new(
-                    &bound,
-                    &arg_widths,
-                    &ins,
-                    &outs,
-                    &weights,
-                    &params,
-                    &real,
-                );
+            let mut handles = driver_vulkan::hold::Handles::new(
+                &bound,
+                &arg_widths,
+                &ins,
+                &outs,
+                &weights,
+                &params,
+                &real,
+            );
             let r = driver_vulkan::hold::routine_for(symbol).expect("a routine");
             std::hint::black_box(
                 driver_vulkan::bind::bind(r.args, r.sources, &mut handles, facts).is_ok(),

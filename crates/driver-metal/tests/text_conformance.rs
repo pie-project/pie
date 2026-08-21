@@ -964,7 +964,8 @@ fn shader_slots(
                 .split('&')
                 .next()
                 .unwrap_or(decl)
-                .split_whitespace().rfind(|w| *w != "const" && *w != "constant" && *w != "device")
+                .split_whitespace()
+                .rfind(|w| *w != "const" && *w != "constant" && *w != "device")
                 .unwrap_or("");
             if PRIMITIVE.contains(&base) {
                 "scalar"

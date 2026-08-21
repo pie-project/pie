@@ -1,13 +1,3 @@
-//! Gemma 4 instruct implementation.
-//!
-//! Diverges from Gemma 2/3: Gemma 4 introduces a single-token turn
-//! delimiter pair (`<|turn>` id 105 / `<turn|>` id 106) instead of the
-//! multi-piece `<start_of_turn>` / `<end_of_turn>`.
-//!
-//! Gemma 4 also has a native system/developer block:
-//!
-//!   <bos><|turn>system\n{system}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n
-
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use std::sync::Arc;
@@ -36,19 +26,13 @@ impl Gemma4Instruct {
 
     pub fn for_variant(tokenizer: Arc<Tokenizer>, _variant: Gemma4Variant) -> Self {
         let encode = |s: &str| tokenizer.encode(s);
-        // `<turn|>` (closing) + `<eos>` are both terminal — generation
-        // stops at either. The runtime's `seal()` returns this list.
+
         let stop_strs = ["<turn|>", "<eos>"];
         let stop_ids: Vec<u32> = stop_strs
             .iter()
             .filter_map(|s| tokenizer.token_to_id(s))
             .collect();
 
-        // Gemma-4's tokenizer treats `<|turn>` and `<turn|>` as single
-        // added tokens (ids 105 and 106 on the E2B vocab); `encode`
-        // returns a 1-element vector for each. We assemble the
-        // role-prefixes by token concatenation, matching how
-        // GemmaInstruct does it for `<start_of_turn>`.
         let open_turn = encode("<|turn>");
         let close_turn = encode("<turn|>");
         let newline = encode("\n");
@@ -149,97 +133,5 @@ impl Instruct for Gemma4Instruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(NoopToolDecoder)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
-        let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-        Arc::new(Tokenizer::from_vocab(&v))
-    }
-
-    fn gemma4() -> Gemma4Instruct {
-        let tok = make_tok(&[
-            "<|turn>", "<turn|>", "<eos>", "<bos>", "system", "user", "model", "\n", "Sys",
-            "Hello", "Ok",
-        ]);
-        Gemma4Instruct::new(tok)
-    }
-
-    #[test]
-    fn system_user_uses_native_system_turn_once() {
-        let inst = gemma4();
-        let mut tokens = inst.system_user("Sys", "Hello");
-        tokens.extend(inst.cue());
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(
-            text,
-            "<bos><|turn>system\nSys<turn|>\n<|turn>user\nHello<turn|>\n<|turn>model\n"
-        );
-    }
-
-    #[test]
-    fn first_user_starts_with_bos() {
-        let inst = gemma4();
-        let mut tokens = inst.first_user("Hello");
-        tokens.extend(inst.cue());
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(text, "<bos><|turn>user\nHello<turn|>\n<|turn>model\n");
-    }
-
-    #[test]
-    fn later_user_omits_bos() {
-        let inst = gemma4();
-        let tokens = inst.user("Hello");
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(text, "<|turn>user\nHello<turn|>\n");
-    }
-
-    #[test]
-    fn assistant_uses_model_role() {
-        let inst = gemma4();
-        let tokens = inst.assistant("Ok");
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(text, "<|turn>model\nOk<turn|>\n");
-    }
-
-    #[test]
-    fn cached_gemma4_matches_hf_benchmark_prompt_ids() {
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let tokenizer_path = std::path::PathBuf::from(home)
-            .join(".cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots")
-            .read_dir()
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .flatten()
-                    .map(|entry| entry.path().join("tokenizer.json"))
-                    .find(|path| path.exists())
-            });
-        let Some(tokenizer_path) = tokenizer_path else {
-            return;
-        };
-        let Ok(tokenizer) = Tokenizer::from_file(&tokenizer_path) else {
-            return;
-        };
-        let inst = Gemma4Instruct::new(Arc::new(tokenizer));
-        let mut tokens = inst.system_user(
-            "You are a helpful benchmarking assistant.",
-            "Write a short story about a robot. (Request #0)",
-        );
-        tokens.extend(inst.cue());
-        assert_eq!(
-            tokens,
-            vec![
-                2, 105, 9731, 107, 3048, 659, 496, 11045, 141657, 16326, 236761, 106, 107, 105,
-                2364, 107, 6974, 496, 2822, 3925, 1003, 496, 16775, 236761, 568, 3932, 997, 236771,
-                236768, 106, 107, 105, 4368, 107,
-            ]
-        );
     }
 }

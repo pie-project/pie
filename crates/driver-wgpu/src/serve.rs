@@ -146,15 +146,30 @@ pub fn pick<M: Modules>(
     entrypoint: &str,
     tier: Capability,
 ) -> Option<(String, Capability)> {
-    if let Some(source) = modules.source(entrypoint, tier) {
-        return Some((source, tier));
+    // DOWN THE PREFERENCE LIST, NOT STRAIGHT TO BASELINE.
+    //
+    // This used to try `tier` and then jump to `Capability::Baseline`, which
+    // was indistinguishable from correct for as long as there were exactly two
+    // tiers in play. Adding `Capability::Matrix` above `Subgroup` made the
+    // difference visible and expensive: with `Matrix` at the head of the
+    // adapter's list, every symbol without a `@matrix` module -- which is all
+    // of them, so far -- skipped its `@subgroup` module and landed on
+    // baseline. The decode read 9.30 ms against 7.49 and the prefill 312.1
+    // against 285.9, both exactly their baseline numbers, which is how the bug
+    // announced itself.
+    //
+    // `PREFERENCE` is best-first and `Baseline` is always its last entry, so
+    // filtering it by `<= tier` and taking the first hit is the same answer as
+    // before wherever only two tiers exist, and the right one where more do.
+    for candidate in Capability::PREFERENCE
+        .into_iter()
+        .filter(|candidate| *candidate <= tier)
+    {
+        if let Some(source) = modules.source(entrypoint, candidate) {
+            return Some((source, candidate));
+        }
     }
-    if tier == Capability::Baseline {
-        return None;
-    }
-    modules
-        .source(entrypoint, Capability::Baseline)
-        .map(|source| (source, Capability::Baseline))
+    None
 }
 
 /// What a fire needs that the plan does not carry.
@@ -874,14 +889,17 @@ fn record(
             crate::device::Stage::Launch(at) => Unfired::Refused { at, why },
             crate::device::Stage::Submission { of } => Unfired::Undelivered { of, why },
         })?;
-    Ok((Fired {
-        dispatches: run.len(),
-        // COUNTED, not assumed. This was `1` for as long as the field existed
-        // and the queue was getting 735 for a real decode -- see
-        // `crate::device::Ran`.
-        submissions: ran.buffers,
-        shadowed: ran.shadowed,
-    }, read))
+    Ok((
+        Fired {
+            dispatches: run.len(),
+            // COUNTED, not assumed. This was `1` for as long as the field existed
+            // and the queue was getting 735 for a real decode -- see
+            // `crate::device::Ran`.
+            submissions: ran.buffers,
+            shadowed: ran.shadowed,
+        },
+        read,
+    ))
 }
 
 /// A fire's distributions, off the arena and widened.

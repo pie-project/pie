@@ -443,6 +443,17 @@ fn emit_program_metal_covers_every_family() {
 /// or deployed devices will keep serving graphs built for the old planner.
 #[test]
 fn stage_identity_is_pinned() {
+    // The corpus, before the loop that walks it. Twenty stages; the loop
+    // below holds every assertion this test makes, so an empty corpus is a
+    // silent pass and a corpus down to nineteen is a pin that stopped
+    // covering one stage without saying which.
+    assert_eq!(
+        corpus_stages().len(),
+        20,
+        "the stage corpus is {} long, not the 20 this pin was measured \
+         against",
+        corpus_stages().len()
+    );
     let mut rendered = String::new();
     for stage in corpus_stages() {
         let _ = writeln!(

@@ -159,7 +159,6 @@ impl Route {
             Self::Bound(_) | Self::Driver => None,
         }
     }
-
 }
 
 /// The parameter this routine cannot bind, if one of them cannot.
@@ -191,7 +190,7 @@ fn unstated_parameter(row: &'static kernels::KernelSig) -> Option<&'static str> 
 ///
 /// * no routine, or one outside the trace vocabulary -> [`Route::Unknown`]
 /// * the row says the driver fires it -> [`Route::Driver`]
-/// * no operand column -> [`Route::Driver`]
+/// * no operand column and nothing asked -> [`Route::Driver`]
 /// * a parameter nothing states -> [`Route::Unbound`], naming it
 /// * otherwise -> [`Route::Bound`], at the routine's own symbol
 ///
@@ -220,10 +219,21 @@ pub fn route(symbol: &str) -> Route {
         return Route::Driver;
     }
     if row.derived.is_empty() {
-        // A row with no column has nothing for the binder to bind, whatever it
-        // may have meant to say. `attn::write_kv_to_pages` is the case:
-        // `Boot::route` intercepts it before this is asked, because it names a
-        // CHOICE the boot's KV storage settles rather than a routine.
+        // A row with no column AND NO ASK LIST has nothing for the binder to
+        // bind, whatever it may have meant to say. `attn::write_kv_to_pages`
+        // is the case: `Boot::route` intercepts it before this is asked,
+        // because it names a CHOICE the boot's KV storage settles rather than
+        // a routine.
+        //
+        // An empty column means "no OPERANDS", not "no INPUT": a routine written
+        // `fn f(ctx: &Ctx<'_>)` that reads every address and every number
+        // through `ctx.ask` has a complete input and an empty column, and
+        // saying `Driver` about it sends it to a hand-written match that has
+        // no arm for it and never will -- the whole point of asking is that
+        // the driver does not have to know. Two rows are exactly this shape,
+        // `attn::dequant_kv_cache_layer_to_bf16_active` and
+        // `gemm::grouped_act_x_wt_bf16`, and the first one refused the ninth
+        // launch of every fire with "a driver op with no arm".
         return Route::Driver;
     }
     match unstated_parameter(row) {
@@ -266,7 +276,9 @@ mod agreement {
             if !matches!(route(row.symbol), Route::Bound(_)) {
                 continue;
             }
-            let Some(what) = super::unstated_parameter(row) else { continue };
+            let Some(what) = super::unstated_parameter(row) else {
+                continue;
+            };
             wrong.push(format!(
                 "  {}: `{what}` has no source and no null may land there, and \
                  `route` answers `Bound` -- a fire would reach the column and \
@@ -291,7 +303,9 @@ mod agreement {
     #[test]
     fn every_refusal_names_a_parameter() {
         for row in kernels_cuda::sigs() {
-            let Route::Unbound(what) = route(row.symbol) else { continue };
+            let Route::Unbound(what) = route(row.symbol) else {
+                continue;
+            };
             assert!(
                 row.derived.iter().any(|d| d.name == what),
                 "`{}` refuses with `{what}`, which is not one of its parameters -- \

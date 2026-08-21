@@ -198,14 +198,23 @@ mod tests {
 
     #[test]
     fn state_rows_do_not_overlap() {
-        let s = Shape { slots: 8, ..qwen35b() };
-        assert_eq!(s.state_offset(1) - s.state_offset(0), s.state_bytes_per_slot());
+        let s = Shape {
+            slots: 8,
+            ..qwen35b()
+        };
+        assert_eq!(
+            s.state_offset(1) - s.state_offset(0),
+            s.state_bytes_per_slot()
+        );
         assert_eq!(s.state_offset(8), s.state_bytes_per_layer());
     }
 
     #[test]
     fn a_stack_with_no_linear_layers_costs_nothing_and_sells_no_slots() {
-        let s = Shape { linear_layers: 0, ..qwen35b() };
+        let s = Shape {
+            linear_layers: 0,
+            ..qwen35b()
+        };
         assert_eq!(s.bytes_per_slot(), 0);
         assert_eq!(s.total_bytes(), 0);
         assert!(s.slots_within(1 << 30).is_none());

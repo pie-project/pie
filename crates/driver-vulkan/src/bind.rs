@@ -25,13 +25,14 @@
 //! This backend crosses the same kernels through the same signatures. It gets
 //! the same binder.
 
-use kernels::bind::Holds;
 use kernels::Ty;
+use kernels::bind::Holds;
+use kernels::bind::{Answer, Holds};
 use kernels::routine::Refusal;
 use kernels_vulkan::routine::ArgValue;
 
-use crate::hold::{Facts, Handles};
 use crate::binding::FireTable;
+use crate::hold::{Facts, Handles};
 
 /// A statement and a fire, together, as the shared binder asks them.
 pub struct Held<'a, 'h, 'o> {
@@ -63,9 +64,13 @@ pub fn bind(
     // same order, same slot numbering, same refusals.
     let mut out = Vec::with_capacity(args.len());
     for (at, ty) in args.iter().enumerate() {
-        let source = sources.get(at).copied().flatten().ok_or(Refusal::Unstated {
-            what: "an argument whose signature does not say where it comes from",
-        })?;
+        let source = sources
+            .get(at)
+            .copied()
+            .flatten()
+            .ok_or(Refusal::Unstated {
+                what: "an argument whose signature does not say where it comes from",
+            })?;
         if matches!(ty, Ty::Raised) {
             out.push(views.raise(source, o, f)?);
             continue;
@@ -125,7 +130,6 @@ impl Holds for Held<'_, '_, '_> {
     fn weight(&mut self, n: usize) -> Result<u32, Refusal> {
         self.o.weight(n)
     }
-
 
     fn param(&self, n: usize) -> Result<i32, Refusal> {
         self.o.param(n)

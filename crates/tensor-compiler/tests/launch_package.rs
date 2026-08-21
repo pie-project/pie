@@ -34,9 +34,17 @@ use tensor_ir::validate::bind;
 
 /// Every corpus trace's launch package, tagged with the trace it came from.
 fn packages() -> Vec<(String, Vec<LaunchStagePlan>)> {
+    bound_and_refused().0
+}
+
+/// The corpus, split the way binding splits it: what built a package, and the
+/// name of everything that did not.
+fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     let mut out = Vec::new();
+    let mut refused = Vec::new();
     let mut push = |name: &str, container, profile| {
         let Ok(bound) = bind(container, profile) else {
+            refused.push(name.to_string());
             return;
         };
         let stages = compile_bound(&bound);
@@ -49,7 +57,14 @@ fn packages() -> Vec<(String, Vec<LaunchStagePlan>)> {
     for (name, container, profile) in synthetic_traces() {
         push(name, container, profile);
     }
-    out
+    // This was `drop(push)`, to end the closure's mutable borrows of `out`
+    // and `refused` before the tuple is built. It is not needed -- NLL ends a
+    // borrow at its last use and `push` is never used again -- and it is a
+    // clippy error: `drop_non_drop`, because a closure has no `Drop` impl, so
+    // dropping one "only extends its contained lifetimes", which is the
+    // opposite of what the line was written to achieve. Removing it changes
+    // nothing about when the borrows end.
+    (out, refused)
 }
 
 /// Every bit `lower_stage_plan` is allowed to set.
@@ -64,11 +79,36 @@ const DECLARED_FLAGS: u32 = PIE_STAGE_GROUPED_VALID
 
 #[test]
 fn every_plan_the_driver_receives_is_well_formed() {
-    let packages = packages();
+    // `packages()` drops a trace that stops binding -- `let Ok(bound) = ...
+    // else { return }` -- and then every check below runs over what is left.
+    // The old guard was `>= 12` against a corpus of 24, so half the corpus
+    // could vanish without a word.
+    //
+    // Six of those 24 are *supposed* to vanish: the `neg_` traces exist to be
+    // refused, and the first version of this check read the silence as loss
+    // and failed. So the question is not how many bound, it is which. A
+    // `neg_` that binds is a refusal that stopped happening; anything else
+    // that does not bind is a trace that broke and said nothing.
+    let (packages, refused) = bound_and_refused();
+    let unexpected: Vec<&String> = refused.iter().filter(|n| !n.starts_with("neg_")).collect();
     assert!(
-        packages.len() >= 12,
-        "only {} traces built a launch package; the corpus did not load",
-        packages.len()
+        unexpected.is_empty(),
+        "these traces failed to bind and were skipped in silence: {unexpected:?}"
+    );
+    let negatives = GOLDEN_NAMES
+        .iter()
+        .filter(|n| n.starts_with("neg_"))
+        .count()
+        + synthetic_traces()
+            .iter()
+            .filter(|(n, _, _)| n.starts_with("neg_"))
+            .count();
+    assert_eq!(
+        refused.len(),
+        negatives,
+        "{negatives} traces are written to be refused and {} were; a `neg_` \
+         that binds is a refusal that stopped happening",
+        refused.len()
     );
     let mut plans = 0usize;
     for (name, stage_plans) in &packages {

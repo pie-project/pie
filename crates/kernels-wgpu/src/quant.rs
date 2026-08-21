@@ -40,9 +40,12 @@ pub fn composable() -> Vec<&'static str> {
             }
         }
     }
-    for (before, after) in
-        [("_splitk", ""), ("_splitk", "_f32"), ("_strided", ""), ("_strided", "_residual")]
-    {
+    for (before, after) in [
+        ("_splitk", ""),
+        ("_splitk", "_f32"),
+        ("_strided", ""),
+        ("_strided", "_residual"),
+    ] {
         for &bm in &[16, 32, 64] {
             keep(qmm_precast_name(before, after, bm, 32));
         }
@@ -100,11 +103,10 @@ fn qmv_name(form: &str, group: i32, bits: i32) -> Result<&'static str, Refusal> 
 }
 
 fn check(points: &[i32], v: i32, what: &'static str) -> Result<(), Refusal> {
-    points
-        .iter()
-        .any(|p| *p == v)
-        .then_some(())
-        .ok_or(Refusal::Narrow { what, at: i64::from(v) })
+    points.contains(&v).then_some(()).ok_or(Refusal::Narrow {
+        what,
+        at: i64::from(v),
+    })
 }
 
 fn qmm_grid(n: i32, bn: i32, m: i32, bm: i32, split_k: i32) -> Result<[u32; 3], Refusal> {
@@ -159,6 +161,36 @@ fn mt_groups(m: i32) -> i32 {
     }
 }
 
+/// Row-groups of four each workgroup of `quant/qmv.wgsl` walks. MUST equal
+/// that file's `PIE_ROWREP`; it is a probe knob and one is the shipped value.
+const QMV_ROWREP: u32 = 1;
+
+/// Output rows one workgroup of `quant/qmv.wgsl` covers. MUST equal that
+/// file's `PIE_ROWW`. Four is the shipped value; two doubles the grid.
+const QMV_ROWW: u32 = 4;
+
+/// The y extent one dispatch may name before `qmv_grid` spills into z. MUST
+/// equal `quant/qmv.wgsl`'s `PIE_YTILE`, and must stay at or under the 65535
+/// `maxComputeWorkgroupsPerDimension` WebGPU guarantees.
+const QMV_YTILE: u32 = 65535;
+
+/// The grid `wide_strided` wants, which is the row split this file had before
+/// `QMV_ROWW` existed: that entrypoint reads `wg.y * 4u` directly and knows
+/// nothing about either knob, so it keeps its own arithmetic rather than being
+/// dragged along by a change made for `reduce_store`.
+fn qmv_wide_grid(vecs: i32, out_vec_size: i32) -> Result<[u32; 3], Refusal> {
+    let [x, ..] = qmv_grid(vecs, out_vec_size)?;
+    let y = out_vec_size
+        .unsigned_abs()
+        .div_ceil(8)
+        .checked_mul(2)
+        .ok_or(Refusal::Grid {
+            what: "the output rows",
+            at: i64::from(out_vec_size),
+        })?;
+    Ok([x, y, 1])
+}
+
 fn qmv_grid(vecs: i32, out_vec_size: i32) -> Result<[u32; 3], Refusal> {
     if vecs <= 0 {
         return Err(Refusal::Empty {
@@ -177,12 +209,19 @@ fn qmv_grid(vecs: i32, out_vec_size: i32) -> Result<[u32; 3], Refusal> {
     })?;
     let y = out_vec_size
         .unsigned_abs()
-        .div_ceil(8)
+        .div_ceil(2 * QMV_ROWW)
         .checked_mul(2)
         .ok_or(Refusal::Grid {
             what: "the output rows",
             at: i64::from(out_vec_size),
-        })?;
+        })?
+        .div_ceil(QMV_ROWREP);
+    // Two digits in base `QMV_YTILE` where one no longer fits. The shader
+    // recombines them; a grid that still fits in one gets z = 1 and the exact
+    // y it asked for, so nothing but the lm head sees this.
+    if y > QMV_YTILE {
+        return Ok([x, QMV_YTILE, y.div_ceil(QMV_YTILE)]);
+    }
     Ok([x, y, 1])
 }
 
@@ -198,13 +237,24 @@ pub fn qmm_t(
     bits: Const<i32>,
     bm: Const<i32>,
     bn: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("", *group, *bits, *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
+        Fire::at("quant/qmm_t.wgsl", qmm_name("", *group, *bits, *bm, *bn)?)
+            .apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            m.arg(),
+        ],
     )
 }
 
@@ -221,12 +271,17 @@ pub fn qmm_t_bias(
     bits: Const<i32>,
     bm: Const<i32>,
     bn: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("_bias", *group, *bits, *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_name("_bias", *group, *bits, *bm, *bn)?,
+        )
+        .apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -254,12 +309,17 @@ pub fn qmm_t_residual(
     bits: Const<i32>,
     bm: Const<i32>,
     bn: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("_residual", *group, *bits, *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_name("_residual", *group, *bits, *bm, *bn)?,
+        )
+        .apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -284,12 +344,14 @@ pub fn qmm_t_fp16_precast(
     half_in: In<Tensor<f16>>,
     bm: Const<i32>,
     bn: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("", "", *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("", "", *bm, *bn)?)
+            .apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -314,12 +376,14 @@ pub fn qmm_t_bias_fp16_precast(
     half_in: In<Tensor<f16>>,
     bm: Const<i32>,
     bn: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_bias", "", *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_bias", "", *bm, *bn)?)
+            .apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -345,12 +409,17 @@ pub fn qmm_t_residual_fp16_precast(
     residual: In<Tensor<bf16>>,
     bm: Const<i32>,
     bn: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = residual.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_residual", "", *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_precast_name("_residual", "", *bm, *bn)?,
+        )
+        .apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -376,7 +445,8 @@ pub fn qmm_t_splitk(
     group: Const<i32>,
     bits: Const<i32>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = out.width;
 
@@ -389,7 +459,11 @@ pub fn qmm_t_splitk(
     let split_k = ctx.param(5)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("_splitk", *group, *bits, *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, split_k)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_name("_splitk", *group, *bits, *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -418,7 +492,8 @@ pub fn qmm_t_splitk_f32(
     group: Const<i32>,
     bits: Const<i32>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = out.width;
 
@@ -431,7 +506,11 @@ pub fn qmm_t_splitk_f32(
     let split_k = ctx.param(5)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("_splitk_f32", *group, *bits, *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, split_k)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_name("_splitk_f32", *group, *bits, *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -458,7 +537,8 @@ pub fn qmm_t_splitk_fp16_precast(
     out: Out<Tensor<bf16>>,
     half_in: In<Tensor<f16>>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = out.width;
 
@@ -471,7 +551,11 @@ pub fn qmm_t_splitk_fp16_precast(
     let split_k = ctx.param(5)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_splitk", "", *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, split_k)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_precast_name("_splitk", "", *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -498,7 +582,8 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     out: Out<Tensor<bf16>>,
     half_in: In<Tensor<f16>>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = out.width;
 
@@ -511,7 +596,11 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     let split_k = ctx.param(5)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_splitk", "_f32", *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, split_k)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_precast_name("_splitk", "_f32", *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -540,14 +629,19 @@ pub fn qmm_t_strided(
     group: Const<i32>,
     bits: Const<i32>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
 
     let row_stride = ctx.param(2)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("_strided", *group, *bits, *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_name("_strided", *group, *bits, *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -574,14 +668,19 @@ pub fn qmm_t_strided_residual(
     group: Const<i32>,
     bits: Const<i32>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
 
     let row_stride = ctx.param(2)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_name("_strided_residual", *group, *bits, *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_name("_strided_residual", *group, *bits, *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -606,14 +705,19 @@ pub fn qmm_t_strided_fp16_precast(
     y: Out<Tensor<bf16>>,
     half_in: In<Tensor<f16>>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = y.width;
 
     let row_stride = ctx.param(2)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_strided", "", *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_precast_name("_strided", "", *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -638,14 +742,19 @@ pub fn qmm_t_strided_fp16_precast_residual(
     half_in: In<Tensor<f16>>,
     residual: In<Tensor<bf16>>,
     bm: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = residual.width;
     let n = y.width;
 
     let row_stride = ctx.param(2)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_strided", "_residual", *bm, 32)?).apply(qmm_grid(n, 32, m, *bm, 1)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            qmm_precast_name("_strided", "_residual", *bm, 32)?,
+        )
+        .apply(qmm_grid(n, 32, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -666,7 +775,8 @@ pub fn qmm_splitk_reduce(
     ctx: &Ctx<'_>,
     y: Out<Tensor<bf16>>,
     partial: In<Tensor<bf16>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = partial.width;
     let n = y.width;
 
@@ -695,7 +805,8 @@ pub fn qmm_splitk_reduce_f32(
     ctx: &Ctx<'_>,
     y: Out<Tensor<bf16>>,
     partial: In<Tensor<f32>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = partial.width;
     let n = y.width;
 
@@ -706,7 +817,8 @@ pub fn qmm_splitk_reduce_f32(
     let split_k = ctx.param(4)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "qmm_splitk_reduce_f32_bfloat16").apply(elementwise_rows(n, m)?),
+        Fire::at("quant/qmm_t.wgsl", "qmm_splitk_reduce_f32_bfloat16")
+            .apply(elementwise_rows(n, m)?),
         &[
             y.arg(),
             partial.arg(),
@@ -723,7 +835,8 @@ pub fn qmm_splitk_reduce_f32(
 pub fn cast_qmm_input_bfloat16_to_float16(
     ctx: &Ctx<'_>,
     cast_in: In<Tensor<bf16>>,
-    half_out: Out<Tensor<f16>>) -> Result<(), Refusal> {
+    half_out: Out<Tensor<f16>>,
+) -> Result<(), Refusal> {
     let k = cast_in.width;
     let n = half_out.width;
 
@@ -731,7 +844,8 @@ pub fn cast_qmm_input_bfloat16_to_float16(
 
     let count = ctx.param(3)?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "cast_qmm_input_bfloat16_to_float16").apply(elementwise(count, 1)?),
+        Fire::at("quant/qmm_t.wgsl", "cast_qmm_input_bfloat16_to_float16")
+            .apply(elementwise(count, 1)?),
         &[
             cast_in.arg(),
             half_out.arg(),
@@ -749,11 +863,16 @@ pub fn cast_qmm_input_strided_bfloat16_to_float16(
     cast_in: In<Tensor<bf16>>,
     half_out: Out<Tensor<f16>>,
     row_stride: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let k = cast_in.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "cast_qmm_input_strided_bfloat16_to_float16").apply(elementwise_rows(k, rows)?),
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            "cast_qmm_input_strided_bfloat16_to_float16",
+        )
+        .apply(elementwise_rows(k, rows)?),
         &[cast_in.arg(), half_out.arg(), k.arg(), row_stride.arg()],
     )
 }
@@ -768,12 +887,14 @@ pub fn qmv_fast(
     y: Out<Tensor<bf16>>,
     group: Const<i32>,
     bits: Const<i32>,
-    vecs: Const<i32>) -> Result<(), Refusal> {
+    vecs: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let vecs = *vecs;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", qmv_name("fast", *group, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("fast", *group, *bits)?)
+            .apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -797,12 +918,14 @@ pub fn qmv_fast_residual(
     residual: In<Tensor<bf16>>,
     group: Const<i32>,
     bits: Const<i32>,
-    vecs: Const<i32>) -> Result<(), Refusal> {
+    vecs: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let vecs = *vecs;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", qmv_name("fast_residual", *group, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("fast_residual", *group, *bits)?)
+            .apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -825,12 +948,14 @@ pub fn qmv_tail(
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
     bits: Const<i32>,
-    vecs: Const<i32>) -> Result<(), Refusal> {
+    vecs: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let vecs = *vecs;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", qmv_name("tail", 64, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("tail", 64, *bits)?)
+            .apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -853,12 +978,14 @@ pub fn qmv_tail_bias(
     y: Out<Tensor<bf16>>,
     bias: Const<Tensor<bf16>>,
     bits: Const<i32>,
-    vecs: Const<i32>) -> Result<(), Refusal> {
+    vecs: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let vecs = *vecs;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", qmv_name("tail_bias", 64, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("tail_bias", 64, *bits)?)
+            .apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -881,14 +1008,16 @@ pub fn qmv_wide_strided(
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
     bits: Const<i32>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
 
     let row_stride = ctx.param(2)?;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", qmv_wide_strided_name(*bits)?).apply(qmv_grid(quarters(m), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_wide_strided_name(*bits)?)
+            .apply(qmv_wide_grid(quarters(m), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -911,13 +1040,27 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4").apply(qmm_grid(n, 32, m, 128, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+        )
+        .apply(qmm_grid(n, 32, m, 128, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            m.arg(),
+        ],
     )
 }
 
@@ -929,13 +1072,27 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2").apply(qmm_grid(n, 32, m, 32, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+        )
+        .apply(qmm_grid(n, 32, m, 32, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            m.arg(),
+        ],
     )
 }
 
@@ -947,13 +1104,27 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2").apply(qmm_grid(n, 32, m, 64, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+        )
+        .apply(qmm_grid(n, 32, m, 64, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            m.arg(),
+        ],
     )
 }
 
@@ -965,13 +1136,27 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1").apply(qmm_grid(n, 32, m, 64, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+        )
+        .apply(qmm_grid(n, 32, m, 64, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            m.arg(),
+        ],
     )
 }
 
@@ -983,13 +1168,27 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
     biases: Const<Tensor<bf16>>,
     x: In<Tensor<bf16>>,
     y: Out<Tensor<bf16>>,
-    m: Const<i32>) -> Result<(), Refusal> {
+    m: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let m = *m;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4").apply(qmm_grid(n, 64, m, 64, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
+        Fire::at(
+            "quant/qmm_t.wgsl",
+            "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+        )
+        .apply(qmm_grid(n, 64, m, 64, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            m.arg(),
+        ],
     )
 }
 
@@ -1001,7 +1200,8 @@ pub fn encode_u4_bf16(
     scales: Out<Tensor<bf16>>,
     biases: Out<Tensor<bf16>>,
     group_size: Const<i32>,
-    groups: Const<i32>) -> Result<(), Refusal> {
+    groups: Const<i32>,
+) -> Result<(), Refusal> {
     let groups = *groups;
     ctx.fire(
         Fire::at("quant/transcode.wgsl", "affine_encode_u4_bf16").apply(elementwise(groups, 1)?),
@@ -1024,7 +1224,8 @@ pub fn encode_u4_f32(
     scales: Out<Tensor<bf16>>,
     biases: Out<Tensor<bf16>>,
     group_size: Const<i32>,
-    groups: Const<i32>) -> Result<(), Refusal> {
+    groups: Const<i32>,
+) -> Result<(), Refusal> {
     let groups = *groups;
     ctx.fire(
         Fire::at("quant/transcode.wgsl", "affine_encode_u4_f32").apply(elementwise(groups, 1)?),
@@ -1046,7 +1247,8 @@ pub fn mxfp4_dequant_bf16(
     exponents: In<Tensor<u8>>,
     out: Out<Tensor<bf16>>,
     block_size: Const<i32>,
-    blocks: Const<i32>) -> Result<(), Refusal> {
+    blocks: Const<i32>,
+) -> Result<(), Refusal> {
     let blocks = *blocks;
     ctx.fire(
         Fire::at("quant/transcode.wgsl", "mxfp4_dequant_bf16").apply(elementwise(blocks, 1)?),
@@ -1059,4 +1261,3 @@ pub fn mxfp4_dequant_bf16(
         ],
     )
 }
-

@@ -282,7 +282,9 @@ fn the_push_ranges_are_where_the_parameter_blocks_went() {
     for &(name, code) in kernels_vulkan::MODULES {
         let d = declared(code);
         modules += 1;
-        let Some(&last) = d.push_offsets.last() else { continue };
+        let Some(&last) = d.push_offsets.last() else {
+            continue;
+        };
         with_push += 1;
         if d.push_offsets.len() > widest.0 {
             widest = (d.push_offsets.len(), last, name.to_owned());

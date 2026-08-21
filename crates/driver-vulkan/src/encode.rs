@@ -69,9 +69,9 @@ use kernels_vulkan::routine::{ArgValue, Encode, Fire};
 
 use crate::binding::params_from;
 use crate::device::Bound;
-use crate::hold::Facts;
 use crate::dispatch::Dispatch;
 use crate::geometry::Module;
+use crate::hold::Facts;
 use crate::spirv::Declared;
 
 /// What a module declares, for one entrypoint the driver has already built.
@@ -257,18 +257,15 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
         self.reflect.best()
     }
 
-    fn resolve(
-        &self,
-        ty: kernels::Ty,
-        source: kernels::Source,
-    ) -> Result<ArgValue, Refusal> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
             what: "a fact, on an encoder with no fire behind it",
         })?;
         crate::bind::one(ty, source, &mut handles.borrow_mut(), facts)
     }
 
-    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {        // A body with nothing to do should have refused already; a zero here
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+        // A body with nothing to do should have refused already; a zero here
         // would become `vkCmdDispatch(0, 1, 1)`, which is legal Vulkan that
         // runs nothing and reports success over a buffer that kept its zeros.
         // This backend has paid for that once: a shared expert's gate came
@@ -334,7 +331,10 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
             // skipped here silently: never pushed, never bound, never in a
             // descriptor set. One variant makes the same mistake a compile
             // error, which is how this line was found.
-            if let ArgValue::Buffer { handle, writes: w, .. } = *a {
+            if let ArgValue::Buffer {
+                handle, writes: w, ..
+            } = *a
+            {
                 if handle == crate::hold::BLOCK {
                     if minted.is_some() {
                         return Err(Refusal::Device {
@@ -525,9 +525,13 @@ mod tests {
             in_width: 1024,
             ..Default::default()
         };
-        let values =
-            crate::bind::bind(routine.args, routine.sources, &mut handles.borrow_mut(), facts)
-                .expect("the four operands bind");
+        let values = crate::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut handles.borrow_mut(),
+            facts,
+        )
+        .expect("the four operands bind");
         let taken = handles.borrow().bound().to_vec();
         let staged = handles.borrow().staged();
         let enc = Encoder::new(reflect, &taken, &staged, op).answering(&handles, facts);
@@ -684,4 +688,3 @@ mod tests {
         );
     }
 }
-

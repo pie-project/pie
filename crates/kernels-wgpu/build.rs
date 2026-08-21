@@ -65,7 +65,6 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
                 .strip_prefix(root)
                 .expect("walked down from root")
                 .to_string_lossy()
-
                 .replace('\\', "/");
             out.push((rel, path));
         }

@@ -7,7 +7,6 @@ use super::{Device, Error, Plan, Workspace};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-
     pub qo_indptr: &'a [i32],
     pub kv_indptr: &'a [i32],
     pub kv_len_arr: &'a [i32],
@@ -36,7 +35,6 @@ struct CtaWork {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
-
     pub same_schedule_for_all_heads: bool,
     pub total_num_works: i32,
     pub max_total_num_works: i32,
@@ -58,9 +56,16 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         });
     }
     let batch_size = req.batch_size as usize;
-    for (array, len) in [("qo_indptr", req.qo_indptr.len()), ("kv_indptr", req.kv_indptr.len())] {
+    for (array, len) in [
+        ("qo_indptr", req.qo_indptr.len()),
+        ("kv_indptr", req.kv_indptr.len()),
+    ] {
         if len < batch_size + 1 {
-            return Err(Error::IndptrTooShort { array, needed: batch_size + 1, got: len });
+            return Err(Error::IndptrTooShort {
+                array,
+                needed: batch_size + 1,
+                got: len,
+            });
         }
     }
     if req.kv_len_arr.len() < batch_size {
@@ -94,7 +99,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         idx_qo_kv_len.push((i as i32, qo_len, kv_len));
     }
 
-    sort(&mut idx_qo_kv_len, &|a: &(i32, i32, i32), b: &(i32, i32, i32)| a.2 > b.2);
+    sort(
+        &mut idx_qo_kv_len,
+        &|a: &(i32, i32, i32), b: &(i32, i32, i32)| a.2 > b.2,
+    );
 
     let cta_tile_q: i32 = if req.head_dim_vo == 64 { 192 } else { 128 };
     let num_ctas = device.num_sm;
@@ -107,7 +115,11 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         .wrapping_sub(1) as i32;
     let same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
-    let heads_scheduled = if same_schedule_for_all_heads { 1 } else { req.num_qo_heads as i32 };
+    let heads_scheduled = if same_schedule_for_all_heads {
+        1
+    } else {
+        req.num_qo_heads as i32
+    };
     for qo_head_idx in 0..heads_scheduled {
         for &(i, qo_len, kv_len) in &idx_qo_kv_len {
             let num_qo_tiles = ceil_div_i32(qo_len, cta_tile_q);
@@ -118,7 +130,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
                 } else {
                     kv_len
                 };
-                heap.insert((cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)));
+                heap.insert((
+                    cta_idx,
+                    accum_cost + cost_function(cta_tile_q, effective_kv_len),
+                ));
                 let cta = &mut ctas[cta_idx as usize];
                 cta.qo_tile_indices.push(qo_tile_idx);
                 cta.qo_indptr.push(req.qo_indptr[i as usize]);
@@ -135,7 +150,9 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     for i in 0..num_ctas as usize {
         work_indptr[i + 1] = work_indptr[i].wrapping_add(ctas[i].qo_tile_indices.len() as i32);
     }
-    let total_num_works = *work_indptr.last().expect("work_indptr has num_sm + 1 entries");
+    let total_num_works = *work_indptr
+        .last()
+        .expect("work_indptr has num_sm + 1 entries");
 
     let max_total_num_works = if req.enable_cuda_graph {
         if same_schedule_for_all_heads {
@@ -187,26 +204,65 @@ pub fn plan(
     info.kv_len_offset = int_alloc.alloc(works, 16, "batch_prefill_sm90_kv_len")? as i64;
     info.head_indices_offset =
         int_alloc.alloc(works, 16, "batch_prefill_sm90_head_indices")? as i64;
-    info.work_indptr_offset =
-        int_alloc.alloc(4 * (device.num_sm as usize + 1), 16, "batch_prefill_sm90_work_indptr")?
-            as i64;
+    info.work_indptr_offset = int_alloc.alloc(
+        4 * (device.num_sm as usize + 1),
+        16,
+        "batch_prefill_sm90_work_indptr",
+    )? as i64;
     info.batch_indices_offset =
         int_alloc.alloc(works, 16, "batch_prefill_sm90_batch_indices")? as i64;
 
     let writes: [(i64, &Vec<i32>, &str); 8] = [
-        (info.qo_tile_indices_offset, &sched.qo_tile_indices, "batch_prefill_sm90_qo_tile_indices"),
-        (info.qo_indptr_offset, &sched.qo_indptr, "batch_prefill_sm90_qo_offset"),
-        (info.kv_indptr_offset, &sched.kv_indptr, "batch_prefill_sm90_kv_offset"),
-        (info.qo_len_offset, &sched.qo_len, "batch_prefill_sm90_qo_len"),
-        (info.kv_len_offset, &sched.kv_len, "batch_prefill_sm90_kv_len"),
-        (info.head_indices_offset, &sched.head_indices, "batch_prefill_sm90_head_indices"),
-        (info.work_indptr_offset, &sched.work_indptr, "batch_prefill_sm90_work_indptr"),
-        (info.batch_indices_offset, &sched.batch_indices, "batch_prefill_sm90_batch_indices"),
+        (
+            info.qo_tile_indices_offset,
+            &sched.qo_tile_indices,
+            "batch_prefill_sm90_qo_tile_indices",
+        ),
+        (
+            info.qo_indptr_offset,
+            &sched.qo_indptr,
+            "batch_prefill_sm90_qo_offset",
+        ),
+        (
+            info.kv_indptr_offset,
+            &sched.kv_indptr,
+            "batch_prefill_sm90_kv_offset",
+        ),
+        (
+            info.qo_len_offset,
+            &sched.qo_len,
+            "batch_prefill_sm90_qo_len",
+        ),
+        (
+            info.kv_len_offset,
+            &sched.kv_len,
+            "batch_prefill_sm90_kv_len",
+        ),
+        (
+            info.head_indices_offset,
+            &sched.head_indices,
+            "batch_prefill_sm90_head_indices",
+        ),
+        (
+            info.work_indptr_offset,
+            &sched.work_indptr,
+            "batch_prefill_sm90_work_indptr",
+        ),
+        (
+            info.batch_indices_offset,
+            &sched.batch_indices,
+            "batch_prefill_sm90_batch_indices",
+        ),
     ];
     for (offset, values, what) in writes {
         staging.put_i32s(offset as usize, values, what)?;
     }
 
     let int_bytes = int_alloc.used();
-    Ok(Plan { info, int_upload: staging.into_upload(int_bytes), int_bytes, float_bytes: 0 })
+    Ok(Plan {
+        info,
+        int_upload: staging.into_upload(int_bytes),
+        int_bytes,
+        float_bytes: 0,
+    })
 }

@@ -4143,8 +4143,8 @@ mod gguf_block_tests {
         // and not n + 1: the scale is a NIBBLE, so a sixteenth sub-block
         // numbered straight through would store 16 and read back as 0 -- and
         // as a scale of zero it would agree with an undecoded block.
-        for n in 0..16 {
-            block[n] = 1 + (n as u8) % 15;
+        for (n, byte) in block[..16].iter_mut().enumerate() {
+            *byte = 1 + (n as u8) % 15;
         }
         block[16..80].fill(0b11_10_01_00);
         block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
@@ -4423,7 +4423,7 @@ mod gguf_block_tests {
             -9.343_028e-3,
             1.308_023_9e-2,
             3.737_211_2e-3,
-            8.221_864_7e-3,
+            8.221_865e-3,
             -4.858_374_6e-3,
             -2.578_675_7e-2,
         ];
@@ -4441,7 +4441,7 @@ mod gguf_block_tests {
         // the structure tests above do.
         let sum: f32 = values.iter().sum();
         let abs: f32 = values.iter().map(|v| v.abs()).sum();
-        assert!((sum - -6.562_542_9e-2).abs() < 1e-6, "block sum {sum}");
+        assert!((sum - -6.562_543e-2).abs() < 1e-6, "block sum {sum}");
         assert!((abs - 3.578_529_1).abs() < 1e-5, "block absolute sum {abs}");
     }
 
@@ -4657,9 +4657,9 @@ mod gguf_block_tests {
 
         // Scale nibble zero is still (0.5 + 0) * 0.25, never zero.
         let db = 0.125f32;
-        for bit in 0..8 {
+        for (bit, got) in values[..8].iter().enumerate() {
             let want = db * f32::from(iq_grid::IQ2XS_GRID[511 * 8 + bit]);
-            assert_eq!(values[bit], want, "element {bit} of point 511");
+            assert_eq!(*got, want, "element {bit} of point 511");
         }
         // And the test discriminates: an eight-bit mask would land on 255.
         let truncated = &iq_grid::IQ2XS_GRID[255 * 8..255 * 8 + 8];
@@ -4687,9 +4687,9 @@ mod gguf_block_tests {
         block[66] = 0b11;
         let mut values = [0.0f32; 256];
         decode_gguf_iq2_s_block_into(&block, &mut values);
-        for bit in 0..8 {
+        for (bit, got) in values[..8].iter().enumerate() {
             let want = 0.125 * f32::from(iq_grid::IQ2S_GRID[768 * 8 + bit]);
-            assert_eq!(values[bit], want, "IQ2_S element {bit} of point 768");
+            assert_eq!(*got, want, "IQ2_S element {bit} of point 768");
         }
         // Field k=1 is the *next two bits*, so it is untouched and reads point 0.
         for bit in 0..8 {
@@ -4704,9 +4704,9 @@ mod gguf_block_tests {
         block[66] = 0b11;
         let mut values = [0.0f32; 256];
         decode_gguf_iq3_s_block_into(&block, &mut values);
-        for i in 0..8 {
+        for (i, got) in values[..8].iter().enumerate() {
             let want = f32::from(iq_grid::IQ3S_GRID[256 * 4 + i % 4]);
-            assert_eq!(values[i], want, "IQ3_S element {i} of point 256");
+            assert_eq!(*got, want, "IQ3_S element {i} of point 256");
         }
     }
 
@@ -4783,14 +4783,14 @@ mod gguf_block_tests {
             "IQ2_XXS",
             &values,
             [
-                9.040_641_8e-2,
-                9.040_641_8e-2,
-                9.040_641_8e-2,
-                9.040_641_8e-2,
-                -9.040_641_8e-2,
-                -9.040_641_8e-2,
-                -9.040_641_8e-2,
-                -9.040_641_8e-2,
+                9.040_642e-2,
+                9.040_642e-2,
+                9.040_642e-2,
+                9.040_642e-2,
+                -9.040_642e-2,
+                -9.040_642e-2,
+                -9.040_642e-2,
+                -9.040_642e-2,
             ],
             -1.180_022_5,
             1.587_908_5e1,
@@ -4812,11 +4812,11 @@ mod gguf_block_tests {
             &values,
             [
                 5.220_830_4e-2,
-                9.713_172_9e-3,
+                9.713_173e-3,
                 5.220_830_4e-2,
                 3.035_366_5e-2,
-                -9.713_172_9e-3,
-                9.713_172_9e-3,
+                -9.713_173e-3,
+                9.713_173e-3,
                 -5.220_830_4e-2,
                 3.035_366_5e-2,
             ],
@@ -4868,10 +4868,10 @@ mod gguf_block_tests {
             "IQ3_XXS",
             &values,
             [
-                2.995_204_9e-2,
+                2.995_205e-2,
                 1.098_241_8e-1,
                 4.992_008_2e-2,
-                9.984_016_4e-3,
+                9.984_016e-3,
                 -4.992_008_2e-2,
                 -1.098_241_8e-1,
                 -4.992_008_2e-2,

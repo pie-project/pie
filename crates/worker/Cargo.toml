@@ -149,6 +149,14 @@ client = { path = "../client" }
 
 [dev-dependencies]
 tempfile = "3"
+# So `RUST_LOG=error` reaches the CUDA harness. `kernels-cuda`'s `said` puts
+# the whole of WHY a device instantiation would not fire behind
+# `tracing::error!` -- the returned `Refusal::Device { why }` is a
+# `&'static str` and cannot carry it -- so without a subscriber a real fault
+# reads as "the compile, the load or the launch refused; see the log" and
+# there is no log. Finding one such fault meant patching an `eprintln!` into
+# another crate; this is that, once.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tensor-ir = { path = "../tensor-ir" }
 # The same `model`, with the one row that is not a model.
 #

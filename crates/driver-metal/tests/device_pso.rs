@@ -38,7 +38,10 @@ kernel void nothing(device uint* out [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no pipeline state was built");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -54,7 +57,7 @@ fn context() -> Option<Context> {
 #[test]
 fn dropping_a_pipeline_releases_it_because_nothing_else_holds_one() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -97,7 +100,7 @@ fn dropping_a_pipeline_releases_it_because_nothing_else_holds_one() {
 #[test]
 fn a_cloned_handle_is_a_second_owner_and_not_a_second_pipeline() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -136,7 +139,7 @@ fn a_cloned_handle_is_a_second_owner_and_not_a_second_pipeline() {
 #[test]
 fn the_cache_id_names_the_gpu_and_not_the_context() {
     let Some(first) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let second = Context::new().expect("a second context");
@@ -170,7 +173,7 @@ fn the_cache_id_names_the_gpu_and_not_the_context() {
 #[test]
 fn the_math_mode_is_part_of_what_a_source_compiles_to() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");

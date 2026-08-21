@@ -1,5 +1,5 @@
+use kernels::routine::Refusal;
 use kernels_macros::routine;
-use kernels::routine::{Refusal};
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 
@@ -10,7 +10,8 @@ pub fn argmax_logits(
     next_token: Out<Tensor<u32>>,
     params: In<Tensor<bf16>>,
     eos_flag: Out<Tensor<u32>>,
-    rows: Const<u32>) -> Result<(), Refusal> {
+    rows: Const<u32>,
+) -> Result<(), Refusal> {
     let rows = *rows;
     if rows == 0 {
         return Err(Refusal::Empty { what: "rows" });

@@ -714,9 +714,14 @@ fn plan_routine<'a, S: Resolver>(
     // frame until `planner.finish()`. A recorded fire replays encoded
     // dispatches and runs no body, so no address outlives this function.
     let mut views = crate::lowering::views::Views::over(args, &ins);
-    let values =
-        crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
-            .map_err(refused)?;
+    let values = crate::lowering::bind::bind(
+        routine.args,
+        routine.sources,
+        &mut handles,
+        facts,
+        &mut views,
+    )
+    .map_err(refused)?;
     let bound = handles.bound().to_vec();
     // THE STAGED BLOCK IS COPIED OUT BEFORE THE MOVE. `Staged<'_>` borrows the
     // word run, and the cell below takes the `Handles` by value; the planner
@@ -730,7 +735,10 @@ fn plan_routine<'a, S: Resolver>(
     // list a fact only the fire can answer is no longer bound into `values`
     // before the body runs -- the body asks for it, and answering MINTS.
     let handles = core::cell::RefCell::new(handles);
-    let staged = crate::lowering::hold::Staged { block, words: &words };
+    let staged = crate::lowering::hold::Staged {
+        block,
+        words: &words,
+    };
     let planner = crate::lowering::routine::Planner::new(
         routine,
         &bound,
@@ -781,7 +789,9 @@ fn plan_routine<'a, S: Resolver>(
 /// there is nowhere to look it up: it is composed at the fire, by the routine
 /// body, and this list is the only thing that survives the body.
 #[must_use]
-pub fn pipelines_needed<'a>(dispatches: &[Dispatch<'a>]) -> Vec<(&'static str, &'a str, &'static str)> {
+pub fn pipelines_needed<'a>(
+    dispatches: &[Dispatch<'a>],
+) -> Vec<(&'static str, &'a str, &'static str)> {
     let mut out: Vec<(&'static str, &'a str, &'static str)> = Vec::new();
     for d in dispatches {
         let point = (d.file, d.symbol, d.stamp);

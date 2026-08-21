@@ -1,4 +1,3 @@
-
 pub mod abi;
 mod arg;
 
@@ -11,10 +10,10 @@ mod error;
 mod launch;
 
 #[cfg(feature = "_cuda")]
+pub(crate) mod device;
+#[cfg(feature = "_cuda")]
 pub mod nvrtc;
 mod root;
-#[cfg(feature = "_cuda")]
-pub(crate) mod device;
 
 pub mod pinned;
 

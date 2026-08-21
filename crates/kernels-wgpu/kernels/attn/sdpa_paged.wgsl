@@ -179,6 +179,47 @@ fn page_slot(req: i32, kp: i32) -> u32 {
 // not be fetched until the base came back, and the key could not be fetched
 // until the index did. Hoisting the base out of a key loop removes one load
 // per position and shortens the chain from three links to two.
+// # THE INTEGER DIVIDE IN HERE COSTS NOTHING, AND THE PROBE THAT SAID IT DID
+// # WAS READING DIFFERENT MEMORY
+//
+// The generic arm below runs `kp / params.page_size` and `kp % params.page_size`
+// once per key on all 256 lanes of the split kernel -- the kernel every decode
+// actually runs, since `attn.rs`'s `workgroups < 128` test sends it there. An
+// integer divide by a runtime value is tens of instructions where a shift is
+// one, so this looked like the obvious thing in a kernel measured at 92 us a
+// fire against 0.64 ms of traffic.
+//
+// It was priced by adding `PIE_PAGE_SIZE=32` to the split points, which takes
+// the `_p32` arm: 9.828 -> 9.463 ms, 101.8 -> 105.7 tok/s, a clean 3.8%. The
+// suite was not run, because the point of the probe was the clock.
+//
+// THAT NUMBER WAS AN ARTIFACT. This engine's page size is 16, not 32. Baking 32
+// in does not just remove a divide, it changes every address the loop computes:
+// `kp >> 5` indexes half as far into `kv_page_indices` and `phys * 32` lands
+// somewhere else entirely. The probe was faster because it read a smaller,
+// denser region of memory, and it was reading the wrong keys while it did.
+//
+// Done correctly -- a `_pow2` point taking `firstTrailingBit(page_size)` as the
+// shift and `page_size - 1` as the mask, which is correct for any power of two
+// and therefore for 16 -- the answer is **9.837 ms against a 9.828 baseline**.
+// Confirmed firing with `PIE_WGPU_PROBE=1 PIE_WGPU_DUMP=470`, which named
+// `sdpa_paged_decode_split_bfloat16_d_128_pow2` on all 28 launches. Zero. The
+// divide is hidden behind the two dependent loads that follow it, and Apple's
+// integer unit is not what this loop is waiting on.
+//
+// So the `_pow2` points were written, measured and removed, and the `_p32`
+// points above stay unfired. Two things to take from it:
+//
+//   * A WRONG-ANSWER PROBE CAN BE FASTER FOR THE WRONG REASON. Every other
+//     probe in this tree removes work while leaving the addresses alone -- half
+//     the dot's words, duplicate a fire, add a second reduction tree. This one
+//     moved the addresses, which is a different experiment than the one
+//     intended. Prefer a probe that changes the arithmetic and not the memory,
+//     and if it must change the memory, run the suite before believing it.
+//   * The reduction tree is the same story: a second full tree per block, six
+//     more barriers, measured 9.828 -> 9.964, so the whole tree is 0.14 ms and
+//     5% of this kernel. Neither the barriers nor the integer unit is where the
+//     92 us goes.
 fn page_slot_at(page_base: u32, kp: i32) -> u32 {
 //#if defined(PIE_PAGE_SIZE) && PIE_PAGE_SIZE == 32
     // The `_p32` points: a 32-entry page is a shift and a mask, and the
@@ -252,24 +293,103 @@ fn dot_row(q_base: u32, k_base: u32) -> f32 {
     // exactly two consecutive channels of one row and the halves are the even
     // and odd channel in that order.
     //
-    // The two multiply-adds below are kept as two SEPARATE `acc = acc + ...`
+    // The multiply-adds below are kept as SEPARATE `acc = acc + ...`
     // statements in the original order. Folding them into one expression
     // would associate the pair before the running sum, which is a different
     // f32 rounding, and this kernel's answers are walked against
     // `kernels-metal` and `kernels-vulkan` NUMBER BY NUMBER. The scale stays
     // per term for the same reason -- hoisting it out is also a rounding.
+    //
+    // # Two words an iteration, and two is the largest this tree can take
+    //
+    // The loop is unrolled by two: both words are LOADED, then the four
+    // multiply-adds run in the source order above. The order is untouched, so
+    // this is not a re-association at the WGSL level -- the win is that two
+    // independent loads are in flight where one was. That is worth 10.6% of a
+    // 512-row prefill (1444 -> 1597 tok/s), which says the dot was waiting on
+    // memory ISSUE, not on memory bandwidth and not on the dependent chain
+    // through `acc`.
+    //
+    // Unrolling by FOUR is worth 17% (1690 tok/s) and this tree cannot take
+    // it. It breaks `a_two_level_prefix_tree_reads_what_a_seat_that_never_
+    // forked_reads`: a forked leaf drifts 2.05% of the row's peak from an
+    // unforked seat that heard the same tokens, against a 0.79% bar. Metal
+    // compiles MSL with fast-math, so it is free to re-associate whatever the
+    // source says, and at four words wide it vectorises -- differently for
+    // different variants, so two batch shapes of the SAME prompt stop
+    // agreeing. Carrying four explicit accumulators instead measures the same
+    // 1690, which is the proof: at width four the compiler had already made
+    // the four partial sums by itself.
+    //
+    // So the limit here is not correctness in the abstract, it is that a
+    // serving system must answer a prompt the same way regardless of who else
+    // is in its batch. Two words is where that still holds. Re-check the
+    // batch-dependence guard, not just the suite, before widening it.
+    //
+    // Every instantiated `PIE_HEAD_DIM` is 64, 128, 256 or 512, so `PIE_PAIRS`
+    // is 32, 64, 128 or 256 and the step of two always divides it. A new head
+    // dimension with an odd `PIE_PAIRS` would run off the end of the row.
     let q_word = q_base >> 1u;
     let k_word = k_base >> 1u;
-    for (var w = 0u; w < PIE_PAIRS; w = w + 1u) {
-        let q = queries[q_word + w];
-        let k = k_pages[k_word + w];
-        acc = acc + params.scale
-            * pie_bf16_to_f32(q & 0xffffu) * pie_bf16_to_f32(k & 0xffffu);
-        acc = acc + params.scale
-            * pie_bf16_to_f32(q >> 16u) * pie_bf16_to_f32(k >> 16u);
+    for (var w = 0u; w < PIE_PAIRS; w = w + 2u) {
+        let q0 = queries[q_word + w]; let k0 = k_pages[k_word + w];
+        let q1 = queries[q_word + w + 1u]; let k1 = k_pages[k_word + w + 1u];
+        acc = acc + params.scale * pie_bf16_to_f32(q0 & 0xffffu) * pie_bf16_to_f32(k0 & 0xffffu);
+        acc = acc + params.scale * pie_bf16_to_f32(q0 >> 16u) * pie_bf16_to_f32(k0 >> 16u);
+        acc = acc + params.scale * pie_bf16_to_f32(q1 & 0xffffu) * pie_bf16_to_f32(k1 & 0xffffu);
+        acc = acc + params.scale * pie_bf16_to_f32(q1 >> 16u) * pie_bf16_to_f32(k1 >> 16u);
     }
     return acc;
 }
+
+// STAGING THE QUERY IN WORKGROUP MEMORY WAS TRIED AND IS A LOSS. DO NOT REDO IT.
+//
+// The loop above re-reads all `PIE_PAIRS` words of the query for every key,
+// and the query does not change across that loop -- at `d_128` with a 512-row
+// prompt that is 64 words read ~256 times per (row, lane). It reads like the
+// largest single term in the loop's traffic and like pure repetition.
+//
+// It is neither. Staging the group's 32 query rows into a `var<workgroup>`
+// array once per workgroup, filled flat and coalesced across all lanes with
+// one barrier, and reading the dot's `q` from there instead, measured on an
+// M4 Pro against the same fixture that produced the table in
+// `what_a_prefill_costs_at_length`:
+//
+// | rows | 32 | 64 | 128 | 256 | 512 |
+// | --- | --- | --- | --- | --- | --- |
+// | global Q (this file) | 40.0 | 56.5 | 94.2 | 179.3 | **356.7** |
+// | staged Q | 40.8 | 56.8 | 98.6 | 187.9 | **414.2** |
+//
+// Sixteen percent SLOWER at 512, and slower at every length. Two reasons, and
+// the second is the one to carry forward:
+//
+//  * A row's query is 256 bytes at `d_128`. Every one of those "repeated"
+//    reads was already an L1 hit, so the stage removes no memory traffic --
+//    it moves a hit from one fast path to another. This is exactly what the
+//    page-table cache above found, for exactly the same reason, and it is now
+//    twice-confirmed: NOTHING IN THIS KERNEL'S INNER LOOP IS FAR FROM THE
+//    CORE. Do not price a load in this file by counting how many times it is
+//    issued.
+//
+//  * The stage costs 8 KB of workgroup memory at `d_128`, and that is a
+//    charge with no offsetting credit. Fewer workgroups fit a core at once,
+//    so there is less to overlap the loop's latency with, and this kernel is
+//    latency-bound (see below). A staging that buys nothing still costs
+//    occupancy, so it comes out behind rather than level.
+//
+// This narrows what the attention's 13x deficit against this backend's own
+// scalar GEMM can be. It is not redundant traffic. The remaining candidate is
+// the DEPENDENCE of the loop: `acc` above is a single accumulator threaded
+// through 128 multiply-adds, and `max_score`/`sum_exp` are a serial chain
+// across every key. The GEMM in `qmm_t.wgsl` hit the same wall and cleared it
+// by carrying several accumulators at once -- see the prefill-GEMM unrolling
+// in this tree's history.
+//
+// The blocker there is not performance, it is parity. Splitting `acc` re-
+// associates the sum, and this dot is walked term by term against
+// `kernels-metal` and `kernels-vulkan`; a different association is a
+// different f32. Any attempt has to move all three backends together, which
+// is why it is written down here rather than attempted.
 
 //#if !defined(PIE_TILED)
 
@@ -326,7 +446,95 @@ fn dot_row(q_base: u32, k_base: u32) -> f32 {
 // on the head dimension, so what is left is what can go on the KEYS: 8 at
 // d_64, 4 at d_128, 2 at d_256 and 1 at d_512, where the shape degenerates to
 // the one this arm had.
+// AND 256 IS AN OPTIMUM, NOT JUST A GUARANTEE. Swept against `PIE_SPLITS` so
+// that the TOTAL invocation count is held constant -- the grid is one workgroup
+// per query head per split, so narrowing the group without widening the split
+// axis just removes threads and proves nothing. p50 means, interleaved:
+//
+// | invocations/group | 64 | 128 | **256** | 512 | 1024 |
+// | --- | --- | --- | --- | --- | --- |
+// | splits | 32 | 16 | **8** | 4 | 2 |
+// | ms | 13.40 | 10.54 | **9.49** | 10.46 | 10.82 |
+//
+// A real interior peak, 10% clear on both sides, and it lands exactly on the
+// number WebGPU guarantees -- so the portable shape and the fast shape are the
+// same shape here and no tier is wanted. (`maxComputeInvocationsPerWorkgroup`
+// is 1024 on this part; the two right-hand columns are what asking for it
+// buys, which is nothing.)
+//
+// Both sides of the peak have a reason and they are different reasons, which is
+// why it is a peak. Narrower groups put fewer keys in flight per rendezvous, so
+// the same 63-add tree is amortised over less; wider ones make every
+// `workgroupBarrier()` a rendezvous of more simdgroups and hold more of the
+// core's state per group, which is the residency finding above arriving from
+// the other direction.
+// LANES ON THE CHANNEL AXIS, AND WHY THIS IS NOT `PIE_PAIRS`.
+//
+// A row of `PIE_HEAD_DIM` channels is `PIE_PAIRS` bf16 pairs, and this kernel
+// gave each pair its own lane. At `d_128` that is 64 lanes to a row against a
+// 32-lane simdgroup, so a row's dot straddles TWO subgroups -- and a butterfly
+// cannot cross a subgroup, so the `@subgroup` arm still had to put both block
+// sums through workgroup memory and fence them, twice per key block.
+//
+// Priced before it was fixed, by the truncation probe this file now trusts:
+// delete the staging, the two `workgroupBarrier()`s and the cross-block fold,
+// take the wrong answer, and read the token. Three interleaved rounds at 200
+// samples:
+//
+// | | shipped (ms) | no cross-block fold (ms) |
+// | --- | --- | --- |
+// | | 7.789 | 7.374 |
+// | | 7.764 | 7.346 |
+// | | 7.719 | 7.305 |
+// | mean | **7.757** | **7.342** |
+//
+// **0.42 ms, 5.4%**, and the two distributions do not touch. That is the
+// price of the last rendezvous in the decode's largest kernel, and the only
+// way to collect it is to make a row FIT in a subgroup.
+//
+// So a lane owns `PIE_DP` pairs instead of one and a row is `PIE_DX` lanes.
+// 32 is the simdgroup width on every part this backend has run on, and where
+// a row is already narrower than that -- `d_64`, whose 32 pairs are exactly
+// one subgroup -- `PIE_DX` is `PIE_PAIRS` and `PIE_DP` is 1, which is the
+// shape this kernel already had. Nothing at `d_64` moves.
+//
+// The bound on `PIE_DP` is the ACCUMULATOR, exactly as it is for the tiled
+// arm's `PIE_LANE_PAIRS` below: a lane holds `PIE_DP` `vec2<f32>` live across
+// the whole key loop, and another `PIE_KR * PIE_DP` for the values it has
+// loaded but not yet scaled. At `d_512` that is 8 and 8, which is the same
+// register bill `PIE_TX = 16` already pays on the prefill.
+const PIE_DX: u32 = min(PIE_PAIRS, 32u);
+const PIE_DP: u32 = PIE_PAIRS / PIE_DX;
+// AND THE WORKGROUP DOES NOT CHANGE SHAPE, WHICH IS THE POINT.
+//
+// The obvious way to spend the saving is to declare `@workgroup_size(PIE_DX,
+// 256 / PIE_DX)` and put the freed invocations on the y axis. That would have
+// cost two invariants this tree is not willing to sell. The host computes this
+// grid a SECOND time in `kernels-wgpu::attn` and a THIRD in
+// `driver-wgpu::geometry`'s `Rule::SdpaVector`, and the rule's whole guard is
+// that TWICE a module's workgroup width is the head width it was built for --
+// which is what stops a `_d_256` module being handed a 128-wide head and
+// answering plausible nonsense. Cap the width at 32 and `d_128`, `d_256` and
+// `d_512` all declare `(32, 8)`, so the guard cannot tell them apart and two
+// host copies of the arithmetic have to move with the shader.
+//
+// So the group stays `PIE_PAIRS x PIE_KB` and the X AXIS IS REINTERPRETED
+// instead: `PIE_DX` of its lanes are the channel lanes and the remaining
+// `PIE_DP` slices of it are MORE KEYS. `lane % PIE_DX` is the channel and
+// `lane / PIE_DX` is a second key index that composes with `ky`, so a block
+// carries `PIE_KB * PIE_DP` keys where it carried `PIE_KB`. Identical
+// invocation count, identical work per invocation, identical grid, and the
+// module still declares the width the guard reads.
+//
+// It is also what makes the butterfly correct at every subgroup width without
+// an alignment argument of its own. The linear invocation index is
+// `lid.x + lid.y * PIE_PAIRS`, so a `PIE_DP` slice of x is an ALIGNED
+// `PIE_DX`-lane block of it, and a butterfly over `lim = min(PIE_DX, sg)`
+// cannot leave one -- whether the subgroup is 16 lanes, 32, or 64 straddling
+// two slices.
 const PIE_KB: u32 = 256u / PIE_PAIRS;
+// Keys a block carries: the y axis times the key slices of x.
+const PIE_KY: u32 = PIE_KB * PIE_DP;
 // Blocks of keys one tree serves, on top of the `PIE_KB` the y axis already
 // gives it. A rendezvous of every simdgroup in the workgroup is the cost this
 // kernel pays most often, and a lane can carry several keys' partials as
@@ -365,25 +573,180 @@ const PIE_KB: u32 = 256u / PIE_PAIRS;
 // This is the same occupancy wall `quant/qmv.wgsl`'s column count found from
 // the other side. Do not raise either without measuring: the arithmetic
 // argument says go up and the machine says no.
+//
+// # AND THE SPLIT ARM WANTS TWO, BECAUSE THE SWEEP ABOVE PREDATES SPLIT-K
+//
+// Read the residency argument again: "this kernel is only 32 workgroups wide
+// to begin with -- one per query head -- so a workgroup that claims more
+// memory takes away the only thing there was to run while a key load is in
+// flight". That is why eight won. It is also a statement about a grid that no
+// longer exists. `attn.rs`'s `workgroups < 128` branch sends every real decode
+// down the SPLIT arm, whose grid is `q_heads x rows x splits` -- 128
+// workgroups at this model's shapes, four times what the sweep above was
+// choosing for. With four times the workgroups there is plenty to run while a
+// load is in flight, and the 10 KiB each one claims stops buying anything and
+// starts costing residency.
+//
+// Re-swept on the split arm, qwen3-0.6b, `what_a_decode_costs_at_length`:
+//
+// | PIE_KR | 1 | 2 | 4 | 8 |
+// | --- | --- | --- | --- | --- |
+// | ms @512 keys | 9.323 | **9.077** | 9.154 | 9.828 |
+// | tok/s | 107.3 | **110.2** | 109.2 | 101.8 |
+//
+// The peak is interior again and it has moved from eight to TWO. One is too
+// few -- a barrier every four keys instead of every eight -- which is the same
+// shape of curve as before, shifted.
+//
+// THAT TABLE IS ONE RUN A POINT AND IT IS OPTIMISTIC. Taken as an interleaved
+// A/B against the tree it replaces, four runs alternating, it is 9.894 and
+// 9.851 at eight against 9.484 and 9.574 at two: **9.873 -> 9.529 ms, 101.3 ->
+// 104.9 tok/s, 3.5%**. That is the number this change ships, and the 8.3% the
+// single-run sweep implied is what a sweep taken in order looks like on a
+// machine that drifts. The sweep still chose the right point; it just could
+// not say by how much. Interleave before quoting.
+//
+// RE-CONFIRMED ON THE REPAIRED HARNESS, and this is the number to trust. The
+// 3.5% above was two pairs on a bench that took 40 samples and repeated to
+// only 3.1%, so the effect and the instrument's own noise were the same size.
+// `serving.rs` now takes 200 and repeats to ~1.7%. Three interleaved pairs:
+//
+// | pair | 1 | 2 | 3 | mean |
+// | --- | --- | --- | --- | --- |
+// | KR 2, p50 ms | 9.641 | 9.691 | 9.692 | **9.675** |
+// | KR 8, p50 ms | 9.952 | 10.042 | 9.967 | **9.987** |
+//
+// **3.1%**, and every run at two beats every run at eight with nothing
+// between the two groups -- where five pairs on the old bench could not
+// separate a 2.7% change at all. The absolute figures are higher than the
+// ones above because a 200-sample run warms the part and reports its steady
+// state; only compare within a block of this table, never across.
+//
+// At a longer context the two are level: at ~960 keys, 10.667 ms at eight
+// against 10.687 at two, one run each. Each workgroup has more keys to walk there, so the
+// block loop amortises what the barrier costs and residency stops being the
+// binding thing. Neutral long, 8% short, so two.
+//
+// # WHY THIS AND NOT ANY OF THE FIVE THINGS TRIED FIRST
+//
+// The split kernel costs 92.1 us a fire against 0.64 ms of traffic, and every
+// obvious explanation for the gap was measured and is zero:
+//
+// | probe | ms | verdict |
+// | --- | --- | --- |
+// | (baseline) | 9.828 | |
+// | a second reduction tree per block | 9.964 | the tree is 0.14 ms, 5% |
+// | the online softmax replaced by a plain add | 9.936 | the `exp` is free |
+// | every K and V load issued twice | 9.744 | load ISSUE is free |
+// | `kv_head = 0`, an 8x cut in unique traffic | 9.476 | 14%, not bandwidth |
+// | `_pow2` page walk, no integer divide | 9.837 | the divide is free |
+//
+// Nothing INSIDE the loop costs anything, and yet the kernel scales with the
+// key count -- 7.901 ms at a 128-key context against 9.828 at 512. A body
+// whose every part is free but whose total is not is a body that is waiting,
+// and what a workgroup waits on is decided by how many other workgroups the
+// core can hold. That is `PIE_KR`, and it is the only knob in this file that
+// the five probes above do not touch.
+// AND THEN 2 -> 1, ON THE REPAIRED BENCH, WHICH REVERSES THE SWEEP ABOVE.
+//
+// The single-run sweep read 1 as 9.323 against 2's 9.077 and the note below it
+// explains the loss -- "one is too few, a barrier every four keys instead of
+// every eight". That reasoning was built on a number the old 40-sample bench
+// could not produce. Three interleaved pairs at 200 samples:
+//
+// | pair | 1 | 2 | 3 | mean |
+// | --- | --- | --- | --- | --- |
+// | KR 1, p50 ms | 9.582 | 9.425 | 9.534 | **9.514** |
+// | KR 2, p50 ms | 9.898 | 9.815 | 9.858 | **9.857** |
+//
+// **3.5%**, non-overlapping, in the direction the sweep said was uphill. Every
+// interior peak this constant has ever shown was an artifact of taking one run
+// a point in order; the curve is monotone and it wants the smallest state.
+//
+// AND IT DOES NOT REVERSE LONG, which the previous retune had to be careful
+// about -- 8 against 2 was level at ~960 keys, so that change was neutral long
+// and worth taking only short. This one is not. At a 1024-key context, two
+// interleaved pairs:
+//
+// | | KR 1 | KR 2 |
+// | --- | --- | --- |
+// | p50 ms | **10.822 / 10.560** | 11.507 / 11.506 |
+//
+// **7.1%**, twice the gap at 512. The gap grows with the context because the
+// attention's share of the token grows with it, so whatever residency buys is
+// bought on more of the token. There is no length at which to prefer 2.
+//
+// # AND THE REGISTERS COUNT TOO, WHICH IS WHY 1 IS NOT A SURPRISE
+//
+// `PIE_KR` sizes two things at once and they were assumed to pull opposite
+// ways: the staging array, which decides how many of these workgroups a core
+// holds, and the depth of the load loop, which decides how many key loads are
+// in flight before a lane must wait. Residency wants it small, latency hiding
+// wants it deep, and the interior peak was read as the trade between them.
+//
+// So they were SEPARATED -- a `PIE_KL` holding `PIE_KL` keys in registers and
+// draining them through a `PIE_KR`-deep array, identical barriers, identical
+// arithmetic, identical fold order, the previous body exactly at
+// `PIE_KL == PIE_KR`. Three interleaved rounds, p50 means:
+//
+// | PIE_KL | 2 | 8 | 16 |
+// | --- | --- | --- | --- |
+// | ms | **9.858** | 10.413 | 11.478 |
+//
+// Monotone and steep the wrong way: 16% worse at 16. There is no trade. Deeper
+// flight does not help this kernel at all, and the registers it costs are
+// themselves a residency cost, the same one the workgroup array is. Both knobs
+// say the identical thing -- HOLD LESS STATE -- which is why the two of them
+// bottom out together at one.
+//
+// That also closes the "what is it waiting on" question the six probes below
+// opened. It is not waiting on memory it could have prefetched, because giving
+// it eight loads in flight instead of two made it worse. It is waiting because
+// too few of these workgroups fit on a core, and every byte of state a lane
+// holds is what stops another one fitting. The code that measured this is
+// reverted -- at `PIE_KL == PIE_KR` it is a no-op, and below that it cannot
+// exist -- and only this table is kept.
+//#if defined(PIE_SPLITK)
+const PIE_KR: u32 = 1u;
+//#else
 const PIE_KR: u32 = 8u;
-const PIE_KSPAN: u32 = PIE_KR * PIE_KB;
-var<workgroup> pie_sdpa_part: array<f32, PIE_KSPAN * PIE_PAIRS>;
+//#endif
+// NO `enable subgroups;` HERE, AND THAT IS NOT AN OVERSIGHT. naga 30 refuses
+// the enable-extension outright -- "specifies standard functionality which is
+// not yet implemented in Naga" -- while parsing and lowering the subgroup
+// builtins themselves perfectly well, gated on `wgpu::Features::SUBGROUP`
+// instead. `common/reduce.inc.wgsl` writes the enable and has therefore never
+// been compiled by anything; it is dead at this version.
+const PIE_KSPAN: u32 = PIE_KR * PIE_KY;
+var<workgroup> pie_sdpa_part: array<f32, PIE_KSPAN * PIE_DX>;
 // The per-y-lane softmax states, staged ONCE at the end of the row so the y
 // axis can be folded away. See "THE Y AXIS CARRIES ITS OWN SOFTMAX" below for
 // why the accumulator needs a slot per lane and the max and sum need one per
 // y lane: the running max and denominator are functions of the SCORES, which
 // every lane of a y row shares, while the accumulator is this lane's two head
 // elements and nobody else's.
-var<workgroup> pie_sdpa_macc: array<vec2<f32>, PIE_KB * PIE_PAIRS>;
-var<workgroup> pie_sdpa_mmax: array<f32, PIE_KB>;
-var<workgroup> pie_sdpa_msum: array<f32, PIE_KB>;
+var<workgroup> pie_sdpa_macc: array<vec2<f32>, PIE_KY * PIE_PAIRS>;
+var<workgroup> pie_sdpa_mmax: array<f32, PIE_KY>;
+var<workgroup> pie_sdpa_msum: array<f32, PIE_KY>;
 
 // `sp` and `n_splits` are the SLICE of this row's keys this workgroup owns.
 // One and zero is the whole range, which is the unsplit kernel exactly; the
 // split arm dispatches `n_splits` workgroups per (row, head) and each takes
 // its own slice, leaving the merge to `PIE_COMBINE`.
-fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32, n_splits: u32) {
-    let d_out = lane * 2u;
+fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32, n_splits: u32, sg: u32) {
+    // THE X AXIS, CUT IN TWO. `cl` is the channel lane and `kx` is the key
+    // slice; together with `ky` they name this invocation's state. The
+    // channel pairs a lane owns are strided by `PIE_DX` and not contiguous,
+    // so that for any fixed `p` the channel lanes still walk consecutive
+    // words: a coalesced load is a property of what the LANES do at one
+    // instant, not of what one lane does over time.
+    let cl = lane % PIE_DX;
+    let kx = lane / PIE_DX;
+    // This invocation's key slot inside a block, and the slot its softmax
+    // state merges from. `ky` varies fastest so that the `PIE_KB` invocations
+    // of one x slice take CONSECUTIVE keys, which is what keeps the page walk
+    // and the K/V loads contiguous across the y axis.
+    let ks = kx * PIE_KB + ky;
     let req = req_of_token[row];
     let q_pos = position_ids[row];
 //#if defined(PIE_FAST_FULL)
@@ -426,6 +789,19 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     // reads between the heads of a GQA group therefore buys nothing, which is
     // the obvious next optimisation and is dead.
     //
+    // (SAME INSTRUMENT AS THE PARAGRAPH BELOW, WHICH WAS OVERTURNED. This was
+    // llvmpipe, which has a CPU's cache hierarchy and no graphics part's
+    // bandwidth wall, so "16 MiB and 1 MiB read alike" is exactly what it
+    // would say whether or not the claim held on a GPU. Re-taken on an M4 by
+    // the probe table above: forcing `kv_head = 0` -- an EIGHT-fold cut in
+    // unique traffic -- reads 9.476 against 9.828, 14% of the kernel. So the
+    // conclusion survives its instrument this time, but only just, and the
+    // arithmetic it licenses is different: this model's `gqa_factor` is 2, so
+    // sharing K and V across a GQA group is a TWO-fold cut, not eight, and at
+    // that slope it is worth a few percent of a kernel that is itself 19% of a
+    // token. Still dead, now for a reason that was measured on the machine it
+    // is claimed about.)
+    //
     // **The barrier COUNT is not the cost.** Blocking the key loop so one tree
     // serves eight keys -- eight times fewer barriers, identical arithmetic --
     // measured 1.601 ms against 1.637 ms. llvmpipe runs a whole workgroup on
@@ -438,6 +814,159 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     // (This also corrects the reasoning in the commit that first reverted the
     // reduction, which blamed barrier synchronisation. The conclusion was
     // wrong and so was the mechanism.)
+    //
+    // # AND THE CORRECTION ABOVE IS ITSELF WRONG ON METAL
+    //
+    // Everything in the paragraph before this was measured on llvmpipe, which
+    // the text says, and the conclusion it reached -- "what the tree costs is
+    // its ADDS, 63 of them, and that is inherent" -- does not survive a real
+    // GPU's own clock.
+    //
+    // `PIE_WGPU_STAMP` prices this kernel at 98-108 us a launch and 31% of a
+    // decode, the largest single kernel in a token. Truncating the ladder from
+    // six levels to three -- which gives the WRONG ANSWER and was reverted, and
+    // which removes only 4 + 2 + 1 = 7 of the 63 adds, ELEVEN PERCENT of them
+    // -- took 18 us off the launch, a THIRD of the kernel. Eleven percent of
+    // the adds cannot buy a third of the time. **The cost is the LEVEL, not
+    // the add**: a barrier and a workgroup-memory round trip, paid six times
+    // for every four keys, and the levels with four active lanes cost the same
+    // as the level with thirty-two.
+    //
+    // llvmpipe could not have seen this. It runs a whole workgroup on one
+    // thread and vectorises across the invocations, so a `workgroupBarrier()`
+    // there is close to a loop boundary and the adds really are all that is
+    // left. On an M4 the same barrier is a rendezvous of eight simdgroups.
+    // The old measurement was sound and its conclusion was portable to exactly
+    // one machine.
+    //
+    // WHAT WAS DONE. The `@subgroup` tier replaces `log2(PIE_PAIRS)` levels
+    // with `log2(lim)` register exchanges and ONE store -- eight barriers a
+    // block become two -- and the fold walks `PIE_PAIRS / lim` block sums
+    // instead of reading one slot. (Both of those two are gone as well now;
+    // the section after next is how, and `PIE_PAIRS` there has become
+    // `PIE_DX`.) See the reduction itself for why the
+    // butterfly is confined to an aligned block and therefore correct at any
+    // subgroup width.
+    //
+    // Three interleaved rounds, 200 decodes at 512 keys, `PIE_WGPU_TIER`
+    // switching the tier inside one binary:
+    //
+    // ```text
+    //   round        1       2       3
+    //   subgroup   8.980   9.051   9.210   ms a token
+    //   baseline   9.593   9.566   9.664
+    // ```
+    //
+    // **0.54 ms a token, 5.7%, and every round wins.** By the stamp table the
+    // kernel goes 86.6/106.1/105.1 us to 76.1/91.5/96.4 across the bench's
+    // three windows and its share of a decode falls 31% to 26%.
+    //
+    // NOTE WHAT THE TRUNCATION PROBE OVERSTATED. It said three levels were
+    // worth 18 us; removing five bought about 11 us by the same instrument.
+    // A probe that deletes work measures more than a fix that reorganises it,
+    // because the fix still pays for the exchanges. The probe was right about
+    // the SHAPE -- levels, not adds -- and wrong about the size, which is the
+    // sixth rule wearing a new hat: a probe's number bounds the fix, it does
+    // not predict it.
+    //
+    // # AND THEN THE LAST TWO BARRIERS WENT TOO
+    //
+    // "Eight barriers a block become two" is the sentence the next sitting
+    // attacked, because on this finding two is still two levels and a level is
+    // what costs. The two survived for a reason that had nothing to do with
+    // the reduction: `PIE_PAIRS` is 64 at `d_128` and a simdgroup is 32, so a
+    // ROW STRADDLED TWO SUBGROUPS and a butterfly cannot cross one. The block
+    // sums had to meet in workgroup memory, with a fence on each side of the
+    // meeting.
+    //
+    // Priced first, by the same truncation probe: delete the staging, both
+    // `workgroupBarrier()`s and the cross-block fold, take the wrong answer,
+    // read the token. Then fixed, by giving a lane `PIE_DP` channel pairs so a
+    // row is `PIE_DX = 32` lanes -- see `PIE_DX` for why the workgroup keeps
+    // its declared shape and the X AXIS is reinterpreted instead. Interleaved,
+    // 200 decodes at 512 keys:
+    //
+    // ```text
+    //   shipped    7.789  7.764  7.719   7.737  7.766  7.774   mean 7.758
+    //   probe      7.374  7.346  7.305                         mean 7.342
+    //   fixed      7.484  7.497  7.488                         mean 7.490
+    // ```
+    //
+    // **0.27 ms, 3.5%**, and the nine baseline samples and the three fixed
+    // ones do not overlap. The probe said 0.42 and the fix collected 0.27,
+    // which is the sixth rule for the second time in one kernel -- and here
+    // the gap has a name: the probe kept 64 lanes each holding one pair, the
+    // fix holds two pairs and two accumulators in half as many lanes, so it
+    // pays in registers what it saved in rendezvous.
+    //
+    // The decode's largest kernel has now had its ladder folded (5.7%) and
+    // then emptied of barriers entirely (3.5%), and the token has gone 9.64 ->
+    // 7.49 ms across the two. There is no rendezvous left to remove.
+    //
+    // # WHERE THE 85 us THAT IS LEFT ACTUALLY IS, CUT AT THE LOOP
+    //
+    // The kernel is still ~33% of a token by the stamp table, ~85 us a launch
+    // against ~7 us of unique traffic, and six probes into its BODY have all
+    // come back free. So this sitting cut it somewhere else: at the loop
+    // boundary. Force `hi` below `lo` so the key loop runs ZERO iterations --
+    // wrong answers, reverted -- and everything else about the kernel stands:
+    //
+    // ```text
+    //   shipped                7.484  7.497  7.488   mean 7.490
+    //   zero key iterations    6.339  6.343  6.334   mean 6.339
+    // ```
+    //
+    // **THE ENTIRE 64-KEY LOOP IS 1.15 ms OF A TOKEN.** Everything else this
+    // kernel does -- launch, query load, the merge tail beside
+    // `pie_sdpa_macc`, the split-state writeout -- is what is left, and the
+    // rest of this note prices those one at a time. They come to about 0.25
+    // ms.
+    //
+    // # WHICH MAKES THIS KERNEL 19% OF A TOKEN AND NOT 33%, AND THE STAMP
+    // # TABLE IS WHAT WAS WRONG
+    //
+    // 1.15 + 0.25 is ~1.4 ms of a 7.490 ms decode. `PIE_WGPU_STAMP`'s `[cost]`
+    // table has this kernel at 32-35% of a window, which would be ~2.5 ms, and
+    // the two cannot both be true. The probes win, and they agree with a third
+    // measurement that was taken for another purpose: doubling the split count
+    // doubles the WORKGROUPS without changing the key work, and 8 -> 16 costs
+    // only 0.17 ms end to end. A kernel with 1.3 ms of per-workgroup fixed
+    // cost could not add 128 workgroups a layer for 0.17.
+    //
+    // The stamp table's SHARES are distorted, and this kernel is the one they
+    // distort most. Apple has no `TIMESTAMP_QUERY_INSIDE_PASSES`, so stamping
+    // forces one compute pass per launch, and the cost of a pass scales with
+    // how much state the launch establishes. This kernel has the widest grid
+    // in a decode -- 16 heads x 8 splits x 256 invocations against a `qmv`'s
+    // one-dimensional 256 -- so it collects more of that surcharge than
+    // anything else in the table and its share is inflated against kernels
+    // that collect less.
+    //
+    // The seventh rule already said a profiler's window must be cut on the
+    // work rather than the wall clock, and the standing note says the stamp
+    // table RANKS kernels while the interleaved bench PRICES changes. This is
+    // the sharper version of both: **the stamp table's ranking is sound and
+    // its shares are not a budget.** The 33% led four sittings to treat this
+    // kernel as a third of the problem. It is a fifth.
+    //
+    // AND THE PIECES OUTSIDE THE LOOP, PRICED. The merge tail is 0.215 ms and
+    // has a section of its own beside `pie_sdpa_macc`, including the two
+    // restructures that failed to collect it. The split-state writeout is
+    // FREE: let only `sp == 0` write it -- same buffer, same binding, an
+    // eighth of the traffic -- and the decode reads 7.439/7.506/7.474 against
+    // 7.490, which is a tie. 130 floats a workgroup is 1.9 MB a token written
+    // and read back, ~14 us of bandwidth, and it measures like it.
+    //
+    // The paged gather, which was the leading suspect, is inside the loop and
+    // is not much of it either.
+    // Replace `page_slot_at` with a lookup that always resolves to one page --
+    // same load, same binding, no scatter -- and the decode reads
+    // 7.326/7.363/7.388 against 7.490. **0.13 ms, 1.7%**, for deleting the
+    // indirection entirely. (The first version of this probe dropped the
+    // reference to `kv_page_indices` altogether, which drops the BINDING and
+    // the fire is refused with a module/bound mismatch. The second rule --
+    // change arithmetic, not addresses -- has a corollary in this driver: a
+    // probe may not change what a shader touches.)
     //
     // # Two loop invariants are deliberately NOT hoisted here
     //
@@ -482,7 +1011,8 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     // the restructure above, and it is still not obviously worth its load.
     var max_score = PIE_SDPA_NEG_INF;
     var sum_exp = 0.0;
-    var acc = vec2<f32>(0.0, 0.0);
+    var acc: array<vec2<f32>, PIE_DP>;
+    for (var p = 0u; p < PIE_DP; p = p + 1u) { acc[p] = vec2<f32>(0.0, 0.0); }
     // Loop-invariant, and it was the first of two dependent loads per key.
     let page_base = kv_page_indptr[u32(req)];
     // AND IT BOUGHT NOTHING MEASURABLE HERE, which is worth writing down.
@@ -505,9 +1035,25 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     // ever touches. It was re-read inside the key loop, twice -- `q_at` loads
     // `queries[i >> 1]` and selects a half, so a pair is two loads of one
     // word -- which is `2 * keys` loads of a value that does not change.
-    let q_word = queries[(q_base + d_out) >> 1u];
-    let q_lo = pie_bf16_to_f32(q_word & 0xffffu);
-    let q_hi = pie_bf16_to_f32(q_word >> 16u);
+    var q_lo: array<f32, PIE_DP>;
+    var q_hi: array<f32, PIE_DP>;
+    for (var p = 0u; p < PIE_DP; p = p + 1u) {
+        let q_word = queries[(q_base + (cl + p * PIE_DX) * 2u) >> 1u];
+        q_lo[p] = pie_bf16_to_f32(q_word & 0xffffu);
+        q_hi[p] = pie_bf16_to_f32(q_word >> 16u);
+    }
+    // HOW WIDE A SHUFFLE MAY REACH, at the `@subgroup` tier. A butterfly over
+    // `off < lim` only ever exchanges with `lane ^ off`, which stays inside the
+    // aligned `lim`-lane block, so taking the smaller of the row's width and
+    // the subgroup's makes it correct on BOTH sides of the comparison: a
+    // subgroup wider than a row never crosses into the neighbouring row, and a
+    // row wider than a subgroup never reaches outside its own subgroup. The
+    // remainder -- `PIE_DX / lim` block sums -- goes through workgroup
+    // memory exactly once, and on every part this backend has run on there is
+    // no remainder because `PIE_DX` is 32 and so is the simdgroup. `lim` is a
+    // runtime value and it is uniform across the workgroup, which is what lets
+    // the loops below carry a barrier.
+    let lim = min(PIE_DX, sg);
     // ONE TREE FOR PIE_KB KEYS.
     //
     // The note above records this as measured and rejected -- 1.601 ms against
@@ -543,38 +1089,102 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
         // V never reaches workgroup memory. The lane that loads key `q`'s
         // value pair for head elements `2*lane, 2*lane+1` is exactly the lane
         // that accumulates them, so the pair stays in registers.
-        var v_keep: array<vec2<f32>, PIE_KR>;
+        var v_keep: array<vec2<f32>, PIE_KR * PIE_DP>;
+//#if defined(PIE_SUBGROUP)
+        var p_keep: array<f32, PIE_KR>;
+//#endif
         for (var r = 0u; r < PIE_KR; r = r + 1u) {
-            let q = r * PIE_KB + ky;
+            let q = r * PIE_KY + ks;
             var part = 0.0;
-            var v_pair = vec2<f32>(0.0, 0.0);
             if (i32(q) < kn) {
                 let slot = page_slot_at(page_base, kp0 + i32(q));
                 let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
                 // ONE word each, where this was six loads for three words.
                 // The two products and their sum are associated exactly as
                 // the scalar form associated them, so no answer moves.
-                let at = (k_base + d_out) >> 1u;
-                let v_word = v_pages[at];
-                let k_word = k_pages[at];
-                v_pair = vec2<f32>(
-                    pie_bf16_to_f32(v_word & 0xffffu), pie_bf16_to_f32(v_word >> 16u));
-                part = params.scale * q_lo * pie_bf16_to_f32(k_word & 0xffffu)
-                    + params.scale * q_hi * pie_bf16_to_f32(k_word >> 16u);
+                //
+                // `PIE_DP` of them now, because a lane owns that many pairs.
+                // The partials are summed in the lane before the butterfly
+                // sees them, which is the whole saving: the pairs a lane holds
+                // are the pairs it no longer has to exchange for.
+                for (var p = 0u; p < PIE_DP; p = p + 1u) {
+                    let at = (k_base + (cl + p * PIE_DX) * 2u) >> 1u;
+                    let v_word = v_pages[at];
+                    let k_word = k_pages[at];
+                    v_keep[r * PIE_DP + p] = vec2<f32>(
+                        pie_bf16_to_f32(v_word & 0xffffu), pie_bf16_to_f32(v_word >> 16u));
+                    part = part
+                        + params.scale * q_lo[p] * pie_bf16_to_f32(k_word & 0xffffu)
+                        + params.scale * q_hi[p] * pie_bf16_to_f32(k_word >> 16u);
+                }
+            } else {
+                for (var p = 0u; p < PIE_DP; p = p + 1u) {
+                    v_keep[r * PIE_DP + p] = vec2<f32>(0.0, 0.0);
+                }
             }
-            v_keep[r] = v_pair;
-            pie_sdpa_part[q * PIE_PAIRS + lane] = part;
+//#if defined(PIE_SUBGROUP)
+            p_keep[r] = part;
+//#else
+            pie_sdpa_part[q * PIE_DX + cl] = part;
+//#endif
         }
+//#if defined(PIE_SUBGROUP)
+        // THE SCORE REDUCTION, WITHOUT THE LADDER AND WITHOUT A RENDEZVOUS.
+        // The baseline arm below folds `PIE_DX` lanes through workgroup memory
+        // in `log2(PIE_DX)` levels, which is five barriers and five shared
+        // round trips for every block of keys. This arm does the whole fold in
+        // `log2(lim)` register exchanges, and because `PIE_DX` is capped at a
+        // simdgroup width the result never has to leave the registers at all:
+        // the store and the two fences below are reached only by a part whose
+        // subgroup is NARROWER than 32.
+        //
+        // The arithmetic is NOT the same and does not claim to be: a butterfly
+        // associates the sum as a balanced tree over the whole block where the
+        // ladder associates it as a balanced tree over halves. Both are
+        // balanced trees over the same 64 f32 products, so the difference is
+        // at most a few ulps of a score that then goes through `exp`, and
+        // `arena`'s tolerance covers it. What must NOT move is the order the
+        // KEYS update the running max, and that is the fold below, untouched.
+        for (var r = 0u; r < PIE_KR; r = r + 1u) {
+            var v = p_keep[r];
+            for (var off = 1u; off < lim; off = off << 1u) {
+                v = v + subgroupShuffleXor(v, off);
+            }
+            p_keep[r] = v;
+            // ONLY IF THE SUBGROUP IS NARROWER THAN THE ROW. `PIE_DX` is 32,
+            // and every part this backend has run on is 32 lanes wide, so this
+            // branch is not taken and the block loop carries NO rendezvous at
+            // all. It is kept because `subgroup_size` is a runtime value and a
+            // 16-lane part would otherwise read a third of its dot; `lim` is
+            // workgroup-uniform, so both arms are uniform control flow and the
+            // barriers inside are legal.
+            if (lim < PIE_DX && cl % lim == 0u) {
+                pie_sdpa_part[(r * PIE_KY + ks) * PIE_DX + cl] = v;
+            }
+        }
+        if (lim < PIE_DX) {
+            workgroupBarrier();
+            for (var r = 0u; r < PIE_KR; r = r + 1u) {
+                var score = 0.0;
+                for (var g = 0u; g < PIE_DX; g = g + lim) {
+                    score = score + pie_sdpa_part[(r * PIE_KY + ks) * PIE_DX + g];
+                }
+                p_keep[r] = score;
+            }
+            workgroupBarrier();
+        }
+//#else
         workgroupBarrier();
-        for (var half = PIE_PAIRS >> 1u; half > 0u; half = half >> 1u) {
-            if (lane < half) {
+        for (var half = PIE_DX >> 1u; half > 0u; half = half >> 1u) {
+            if (cl < half) {
                 for (var r = 0u; r < PIE_KR; r = r + 1u) {
-                    let at = (r * PIE_KB + ky) * PIE_PAIRS + lane;
+                    let at = (r * PIE_KY + ks) * PIE_DX + cl;
                     pie_sdpa_part[at] = pie_sdpa_part[at] + pie_sdpa_part[at + half];
                 }
             }
             workgroupBarrier();
         }
+//#endif
         // Uniform: every lane of this workgroup has the same row and the same
         // position, so a masked key is masked for all of them. That is what
         // makes the reduction above legal, and it is why the mask is applied
@@ -591,33 +1201,92 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
         // a disjoint cover merges to the same numerator and denominator as one
         // pass over the union, which is what flash-decoding rests on.
         for (var r = 0u; r < PIE_KR; r = r + 1u) {
-            let q = r * PIE_KB + ky;
+            let q = r * PIE_KY + ks;
             let kp = kp0 + i32(q);
             if (i32(q) < kn && keeps(row, kp, q_pos, start)) {
-                let step = pie_sdpa_online_update(pie_sdpa_part[q * PIE_PAIRS], max_score, sum_exp);
+//#if defined(PIE_SUBGROUP)
+                let score = p_keep[r];
+//#else
+                let score = pie_sdpa_part[q * PIE_DX];
+//#endif
+                let step = pie_sdpa_online_update(score, max_score, sum_exp);
                 max_score = step.max_score;
                 sum_exp = step.sum_exp;
-                acc = acc * step.history_scale + step.score_scale * v_keep[r];
+                for (var p = 0u; p < PIE_DP; p = p + 1u) {
+                    acc[p] = acc[p] * step.history_scale
+                        + step.score_scale * v_keep[r * PIE_DP + p];
+                }
             }
         }
+//#if defined(PIE_SUBGROUP)
+        // NO BARRIER HERE, and that is the point of `PIE_DX`. The scores this
+        // fold read came out of registers, so the next block has nothing to
+        // overwrite. On a subgroup narrower than a row the branch above staged
+        // them and fenced them itself, on both sides of its own read.
+//#else
         // The next block's partials overwrite what this fold just read.
         workgroupBarrier();
+//#endif
         kp0 = kp0 + i32(PIE_KSPAN);
     }
-    // THE MERGE. `PIE_KB` states, each over a disjoint set of this row's keys,
+    // THE MERGE. `PIE_KY` states, each over a disjoint set of this row's keys,
     // become one. Every lane runs the same fold so every lane leaves holding
     // the answer, which is what the sink merge and the single writer below
     // already assumed.
-    pie_sdpa_macc[ky * PIE_PAIRS + lane] = acc;
-    if (lane == 0u) {
-        pie_sdpa_mmax[ky] = max_score;
-        pie_sdpa_msum[ky] = sum_exp;
+    //
+    // # WHAT THIS MERGE COSTS, AND TWO WAYS OF NOT COLLECTING IT
+    //
+    // Truncate the fold below to a SINGLE state -- wrong answers, reverted --
+    // and a 7.490 ms decode reads 7.285/7.248/7.292. **0.215 ms, 2.9% of a
+    // token**, for seven links of a loop that runs ONCE per workgroup. Set
+    // beside the key loop that runs 64 keys through the same workgroup, which
+    // the empty-loop probe below prices at 1.15 ms, this tail is a SEVENTH of
+    // the body it exists to summarise.
+    //
+    // The obvious reading is the dependence: this is `pie_sdpa_online_update`'s
+    // shape, a running max rescaling the history at every step, so it is a
+    // serial chain `PIE_KY` deep holding two `exp` and a workgroup load per
+    // link. The key loop has no choice about that shape -- it meets its scores
+    // one block at a time -- but this loop has every state in front of it
+    // before it starts, and a softmax merge over a disjoint cover is
+    // associative. So it can be written in two phases with no chain at all:
+    // take the max, then the denominator against it, then `PIE_KY`
+    // INDEPENDENT multiply-adds per pair.
+    //
+    // Both versions were written and both are slower:
+    //
+    // ```text
+    //   online fold (shipped)          7.484  7.497  7.488   mean 7.490
+    //   two phases, exp recomputed     7.537  7.538  7.496   mean 7.524
+    //   two phases, scales hoisted     7.526  7.541  7.516   mean 7.528
+    // ```
+    //
+    // So the 0.215 ms is NOT the dependence. Both shapes read the same
+    // `PIE_KY * PIE_DP` slots out of `pie_sdpa_macc` and the same `2 * PIE_KY`
+    // out of the state arrays, and that traffic is what the truncation removed
+    // -- it removes the loads along with the links. This is the same finding
+    // as the ladder's, arriving from the other side: what costs in this kernel
+    // is touching workgroup memory, and rearranging the arithmetic AROUND the
+    // touches buys nothing because the arithmetic was never the price.
+    //
+    // Which says where the remaining lever is, and it is not here: the only
+    // way to shrink this tail is to have FEWER STATES, and `PIE_KY` is
+    // `PIE_KB * PIE_DP` -- the workgroup's own shape. Narrowing it trades this
+    // 0.2 ms against the key loop's parallelism, and the invocation sweep
+    // beside `PIE_KB` says 256 is a real interior optimum. Both ends would
+    // have to move together and neither can be swept alone.
+    for (var p = 0u; p < PIE_DP; p = p + 1u) {
+        pie_sdpa_macc[ks * PIE_PAIRS + cl + p * PIE_DX] = acc[p];
+    }
+    if (cl == 0u) {
+        pie_sdpa_mmax[ks] = max_score;
+        pie_sdpa_msum[ks] = sum_exp;
     }
     workgroupBarrier();
     max_score = PIE_SDPA_NEG_INF;
     sum_exp = 0.0;
-    acc = vec2<f32>(0.0, 0.0);
-    for (var t = 0u; t < PIE_KB; t = t + 1u) {
+    for (var p = 0u; p < PIE_DP; p = p + 1u) { acc[p] = vec2<f32>(0.0, 0.0); }
+    for (var t = 0u; t < PIE_KY; t = t + 1u) {
         let other_max = pie_sdpa_mmax[t];
         let merged_max = max(max_score, other_max);
         // Both are `PIE_SDPA_NEG_INF` until a state with keys arrives, and
@@ -627,7 +1296,10 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
         let other_scale = exp(other_max - merged_max);
         max_score = merged_max;
         sum_exp = sum_exp * history_scale + pie_sdpa_msum[t] * other_scale;
-        acc = acc * history_scale + other_scale * pie_sdpa_macc[t * PIE_PAIRS + lane];
+        for (var p = 0u; p < PIE_DP; p = p + 1u) {
+            acc[p] = acc[p] * history_scale
+                + other_scale * pie_sdpa_macc[t * PIE_PAIRS + cl + p * PIE_DX];
+        }
     }
 //#if defined(PIE_SPLITK)
     // STOP HERE AND STATE THE PARTIAL. No sink and no normalization: both are
@@ -640,28 +1312,41 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     // sitting in an unwritten slot would otherwise be read as attention.
     let stride = 2u + PIE_HEAD_DIM;
     let base = ((row * n_q_heads + q_head) * n_splits + sp) * stride;
-    if (ky == 0u) {
+    // `ky == 0 && kx == 0`: one writer per channel, once. See the unsplit
+    // arm's writeout below for why the x axis now needs a guard of its own.
+    if (ky == 0u && lane < PIE_DX) {
         if (lane == 0u) {
             pie_split_state[base] = max_score;
             pie_split_state[base + 1u] = sum_exp;
         }
-        pie_split_state[base + 2u + d_out] = acc.x;
-        pie_split_state[base + 3u + d_out] = acc.y;
+        for (var p = 0u; p < PIE_DP; p = p + 1u) {
+            let d_out = (cl + p * PIE_DX) * 2u;
+            pie_split_state[base + 2u + d_out] = acc[p].x;
+            pie_split_state[base + 3u + d_out] = acc[p].y;
+        }
     }
 }
 //#else
 //#if defined(PIE_WITH_SINK)
     let merged = pie_sdpa_merge_sink(sink_at(q_head), max_score, sum_exp);
-    acc = acc * merged.output_scale;
+    for (var p = 0u; p < PIE_DP; p = p + 1u) { acc[p] = acc[p] * merged.output_scale; }
     sum_exp = merged.sum_exp;
 //#endif
 
-    var norm = acc;
-    if (sum_exp != 0.0) { norm = acc / sum_exp; }
-    let at = (o_base + d_out) >> 1u;
     // Every y lane ran the merge above, so they all hold this answer and one
     // writes it. The redundancy is `PIE_KB` fused multiply-adds, once per row.
-    if (ky == 0u && at < arrayLength(&out_)) { out_[at] = pie_pack_bf16(norm.x, norm.y); }
+    for (var p = 0u; p < PIE_DP; p = p + 1u) {
+        var norm = acc[p];
+        if (sum_exp != 0.0) { norm = acc[p] / sum_exp; }
+        let at = (o_base + (cl + p * PIE_DX) * 2u) >> 1u;
+        // `lane < PIE_DX` is `ky == 0 && kx == 0`: ONE channel lane per
+        // channel, once. Every state ran the merge above so they all hold the
+        // answer, and the x axis now holds `PIE_DP` copies of each channel
+        // lane on top of the `PIE_KB` the y axis already held.
+        if (lane < PIE_DX && ky == 0u && at < arrayLength(&out_)) {
+            out_[at] = pie_pack_bf16(norm.x, norm.y);
+        }
+    }
 }
 //#endif
 
@@ -767,6 +1452,186 @@ const PIE_LANE_PAIRS: u32 = PIE_PAIRS / PIE_TX;
 // shared atomic for the tile's largest position, rows past `n_rows` staying in
 // with `q_pos = -1`, the mask as a predicate rather than a `continue`); that is
 // a separate change with a separate proof, and this one is free of it.
+// # WHAT THE PREFILL ARM COSTS, AND THE FIRST PROBE INTO IT
+//
+// `device.rs`'s `PIE_WGPU_SKIP` prices a prefill the same way it prices a
+// decode -- by dropping a kernel's fires and re-timing. A 512-row prefill is
+// 311.7 ms, and TWO kernels are 95% of it:
+//
+// ```text
+//   skipped                       ms      saved     share
+//   (baseline)                 311.7
+//   affine_qmm_t (the GEMM)    127.4    184.3 ms    59.1%
+//   sdpa_paged_tiled_d_128     201.0    110.7 ms    35.5%
+// ```
+//
+// **The attention arm is 110.7 ms and it should not be.** A causal 512-row
+// prefill is about 30 GFLOP of QK and PV across 28 layers -- the loop below
+// runs `kp <= q_pos`, so the triangle is already the only thing computed --
+// and 30 GFLOP in 110.7 ms is 271 GFLOP/s against this part's ~7.7 TFLOP/s.
+// **3.5% of the machine.** Nothing else in either phase is that far from its
+// wall; the GEMM beside it runs at about a third of peak.
+//
+// FIRST PROBE, AND IT IS NOT THE KEY TRAFFIC. Every (row, head) lane walks the
+// paged cache itself, so a layer's 2.1 MiB of K and V is re-read by 512 rows
+// times 16 heads -- on paper about 15 GB a prefill, which at 273 GB/s would be
+// half the 110.7 ms on its own. Forcing `kv_head = 0` cuts the UNIQUE footprint
+// eightfold at an identical issue count, identical arithmetic and identical
+// bindings. Two rounds: 312.1 and 313.1 ms against baselines of 311.4 and
+// 311.7. **A tie, and if anything slower.**
+//
+// So the re-reads are absorbed -- a layer's whole K and V is 2.1 MiB and the
+// part's caches hold it -- and the paper figure was never traffic that moved.
+// Same shape of answer as `qmv.wgsl`'s activation probe and the decode arm's
+// own `kv_head = 0`: this family's loads keep looking like the cost and keep
+// measuring free.
+//
+// AND THE PER-KEY ALU IS NOT IT EITHER, SO "3.5% OF ALU PEAK" WAS THE WRONG
+// DENOMINATOR AND IS WITHDRAWN. The paragraph above used to end by naming the
+// online softmax and the bf16 unpack as the next things to cut. They were
+// priced by stripping them: the four unpacks, the four `params.scale`
+// multiplies and the four products in `dot_row`'s unrolled body were replaced
+// by two `bitcast<f32>(q ^ k)` adds, which keeps every load and every loop
+// trip and deletes about 85% of the dot's arithmetic. Two rounds: 305.7 and
+// 307.6 ms against 311.4 and 311.7. **4.9 ms -- 1.6% of a prefill and 4.4% of
+// this arm.**
+//
+// Put the three probes in one line and the currency is not in doubt:
+//
+// ```text
+//   probe                                  arm's share   what it removes
+//   kv_head = 0 (8x unique footprint)          0%        bytes
+//   dot ALU stripped (~85% of it)              4.4%      arithmetic
+//   w < PIE_PAIRS / 2 (halve the dot)         45%        loads AND trips
+//   p < PIE_LANE_PAIRS / 2 (halve the V)      40%        loads AND trips
+// ```
+//
+// **Nothing here is paid for in bytes and nothing is paid for in arithmetic.
+// It is paid for per LOAD ISSUED.** Count them: 512 rows x 16 heads x ~256
+// causal keys x `PIE_TX` = 2 lanes is 4.2M lane-keys a layer, each issuing 128
+// word loads in the dot and 32 in the V accumulate, so 671M loads a layer and
+// 18.8 G over 28 -- delivered in 110.7 ms at **170 G scalar loads/s**. Every
+// one of them is a cache hit, per the traffic paragraph above and per the
+// `kv_head` probe.
+//
+// # Which makes the `PIE_TX` redundancy the whole target, and it is reachable
+//
+// Both lanes of a `PIE_TX` pair compute the SAME dot from the SAME words, so
+// **half of the 537M dot loads a layer fetch a number the neighbouring lane is
+// fetching in the same cycle.** The note further up prices a perfect split at
+// about 8% of a prefill and then dismisses it, because splitting one dot
+// across two lanes re-associates a sum that `kernels-metal` and
+// `kernels-vulkan` are walked against number by number.
+//
+// THAT DISMISSAL IS TOO QUICK, AND SPLITTING IS WHAT SHIPPED. The re-
+// association objection is the same one the split decode arm's butterfly
+// answers a few hundred lines up: both orders are balanced trees over the same
+// products, a few ulps of a score that then goes through `exp`, inside
+// `arena`'s tolerance -- and the batch-determinism hazard recorded in
+// `dot_row` is about the COMPILER choosing different vectorisations for
+// different variants, which a stripe written out in the source cannot do.
+// `dot_row_split` below stripes the dot across the `PIE_TX` lanes and folds it
+// with a `log2(PIE_TX)` butterfly, under a new `@subgroup` tier for
+// `sdpa_paged_tiled`.
+//
+// **311.7 -> 285.9 ms. 25.8 ms, 8.3% of a prefill, 1641 -> 1791 tok/s.** Three
+// rounds at 285.8/285.9/286.2. The predicted bound was 22 ms and the measured
+// win is slightly larger, which is the butterfly costing less than the loads
+// it replaced plus the stripe halving the QUERY loads as well as the key ones.
+// 300 tests pass at both tiers; the baseline arm is untouched and still reads
+// 312.5 ms, and the decode is unmoved at 7.49 ms.
+//
+// WHAT IS LEFT ON THIS ARM. The V accumulate is 40% and is NOT redundant --
+// each lane already owns a distinct channel stripe of it -- so the same trick
+// does not apply twice. The remaining idea, unpriced, is below.
+//
+// THE DOT DOES NOT HAVE TO BE SPLIT AT ALL, EITHER.
+// Give each lane of the pair a DIFFERENT KEY instead: lane 0 runs the whole
+// serial dot for `kp`, lane 1 runs the whole serial dot for `kp + 1`, and the
+// pair exchanges the two scalars. Each dot is bit-for-bit the sum this file
+// computes today -- same terms, same order, no re-association anywhere -- and
+// the pair retires two keys for the loads of one. The online fold then applies
+// `kp` and then `kp + 1` on both lanes, which is also the order it runs in
+// now. The V accumulate is already channel-split by lane and does not change.
+//
+// That would halve the same loads WITHOUT re-associating anything, which is
+// strictly better on the numerics -- but it is now competing with a shipped
+// 8.3% rather than with nothing, so what it can still add is only the ulps,
+// and it costs a `keeps` mask and a page boundary that stop agreeing across
+// the pair. Left undone deliberately, and recorded so it is not rediscovered
+// as a fresh idea.
+//
+//#if defined(PIE_SUBGROUP)
+// THE DOT, SPLIT ACROSS THE `PIE_TX` LANES THAT USED TO DUPLICATE IT.
+//
+// `dot_row` above is called by every one of a row's `PIE_TX` lanes with the
+// same two bases, so each of them issues the same `PIE_PAIRS` query loads and
+// the same `PIE_PAIRS` key loads and arrives at the same scalar. The probe
+// table in `compute_lane` prices that: the dot is 45% of this arm, its
+// arithmetic is 4.4%, and its footprint is nothing -- so what the second lane
+// costs is purely the loads it issues for a number the first lane already has.
+//
+// Here each lane walks a `PIE_TX`-strided stripe of word PAIRS and the pair is
+// folded by a `log2(PIE_TX)` butterfly, which leaves every lane holding the
+// whole sum -- which is what they need, because each then scales its own half
+// of the value row by the same softmax weight.
+//
+// THE STRIPE IS IN PAIRS, NOT SINGLE WORDS, for the reason `dot_row` is
+// unrolled by two: two independent loads in flight is worth 10.6% here and
+// this loop is issue-bound. `PIE_PAIRS` is 32, 64, 128 or 256 and `PIE_TX` is
+// 2, 2, 4 or 8, so `PIE_TX * 2` divides `PIE_PAIRS` at every head dimension.
+//
+// THE SUM IS RE-ASSOCIATED AND THAT IS ALLOWED HERE, on exactly the ground the
+// split decode arm's butterfly already stands on a few hundred lines up: both
+// orders are balanced trees over the same products, the difference is a few
+// ulps of a score that then goes through `exp`, and `arena`'s tolerance covers
+// it. What must not move is the order the KEYS fold into the running max, and
+// that loop is untouched. This is also NOT the unroll-by-four hazard recorded
+// in `dot_row`: that one broke because the compiler chose a different
+// vectorisation for different variants of the same prompt, so two batch shapes
+// disagreed. A stripe written out in the source is the same stripe in every
+// batch.
+//
+// THE PARTNER LANES ARE ALWAYS ACTIVE TOGETHER. A row's lanes are linear
+// indices `[lid.y * PIE_TX, lid.y * PIE_TX + PIE_TX)`, so an xor by anything
+// below `PIE_TX` stays inside one row -- and every branch in the key loop
+// (`keeps`, the page walk, the loop bound) depends only on `row` and `kp`,
+// which the lanes of a row agree on. Rows diverge from each other, and that is
+// fine, because no exchange ever crosses a row.
+// AND THE QUERY STRIPE STAYS IN THE BUFFER. THIRD TIME.
+//
+// The query row is loop-invariant across every key, so each lane re-loads the
+// same `PIE_PAIRS / PIE_TX` words -- 32 at `d_128` -- once per key, a third of
+// what this function issues. Hoisting them into a `var<private>` array before
+// the key loop and reading `pie_q_stripe[j]` here measured **300.7 ms against
+// 285.9**: 5% SLOWER. A private array indexed by a loop variable is scratch
+// memory, not registers, so the "hoist" traded a coalesced buffer load that
+// hits L1 for a thread-local one that does not.
+//
+// This is the third independent time staging something in this loop has lost:
+// the page table (a tie), the query in workgroup memory (16% slower), and now
+// the query in private storage. The rule that keeps coming back is that
+// nothing here is far from the core, so REMOVING a load wins and MOVING one
+// does not -- which is exactly why the stripe below wins and this did not.
+fn dot_row_split(q_base: u32, k_base: u32, lane: u32) -> f32 {
+    var acc = 0.0;
+    let q_word = q_base >> 1u;
+    let k_word = k_base >> 1u;
+    for (var w = lane * 2u; w < PIE_PAIRS; w = w + PIE_TX * 2u) {
+        let q0 = queries[q_word + w]; let k0 = k_pages[k_word + w];
+        let q1 = queries[q_word + w + 1u]; let k1 = k_pages[k_word + w + 1u];
+        acc = acc + params.scale * pie_bf16_to_f32(q0 & 0xffffu) * pie_bf16_to_f32(k0 & 0xffffu);
+        acc = acc + params.scale * pie_bf16_to_f32(q0 >> 16u) * pie_bf16_to_f32(k0 >> 16u);
+        acc = acc + params.scale * pie_bf16_to_f32(q1 & 0xffffu) * pie_bf16_to_f32(k1 & 0xffffu);
+        acc = acc + params.scale * pie_bf16_to_f32(q1 >> 16u) * pie_bf16_to_f32(k1 >> 16u);
+    }
+    for (var off = 1u; off < PIE_TX; off = off << 1u) {
+        acc = acc + subgroupShuffleXor(acc, off);
+    }
+    return acc;
+}
+//#endif
+
 fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
     let req = req_of_token[row];
     let q_pos = position_ids[row];
@@ -815,11 +1680,81 @@ fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
     // rows of every group walks it in the same order, so it is resident after
     // the first row and the "dependent round trip" is an L1 hit.
     //
-    // The lesson is about the model of the machine, not the code. What costs
-    // in this loop is Q and K streaming from GLOBAL, 256 keys x 64 words x
-    // two lanes a row with no reuse across the 32 rows of a group that all
-    // read the SAME keys. That is a workgroup-memory change, and it is the
-    // one thing left in here that is worth an afternoon.
+    // The lesson is about the model of the machine, not the code. This note
+    // used to end by naming the fix: Q and K stream from GLOBAL, 256 keys x
+    // 64 words x two lanes a row with no reuse across the 32 rows of a group
+    // that all read the SAME keys, so stage them in workgroup memory.
+    //
+    // THAT WAS WRONG, and it was wrong for the reason the paragraph above it
+    // had already given. Staging the query was tried and measured 16% SLOWER
+    // (see `dot_row`); the reuse it removes was L1 all along, exactly like
+    // the page table, and the 8 KB of workgroup memory it costs is real. Two
+    // independent findings now say the same thing: NOTHING IN THIS LOOP IS
+    // FAR FROM THE CORE, and counting how many times a load is issued does
+    // not price it here.
+    //
+    // What did work was issuing more loads at once rather than fewer in
+    // total -- two words an iteration in `dot_row`, two values an iteration
+    // in the V accumulate below, together 1444 -> 1634 tok/s at 512 rows.
+    // The loop was short of memory-level parallelism, not of locality.
+    //
+    // # Where this loop's time actually goes, measured rather than argued
+    //
+    // The attention rectangle is 4.1 ms a layer and this model has 28 of
+    // them, so 114.8 ms of a 313.4 ms 512-row prefill is spent right here.
+    // Each term below was priced by HALVING that part of the loop and
+    // re-running `what_a_prefill_costs_at_length`. The answers are wrong
+    // while the probe is in, which is fine -- the probe is a stopwatch, not
+    // a candidate.
+    //
+    // | part | probe | prefill ms | this loop's share |
+    // | --- | --- | --- | --- |
+    // | (baseline) | | 313.4 | |
+    // | QK dot loads | `w < PIE_PAIRS / 2` | 287.5 | **45%** |
+    // | V accumulate | `p < PIE_LANE_PAIRS / 2` | 290.7 | **40%** |
+    // | everything else | by subtraction | | 15% |
+    // | per-term `params.scale` | hoisted out of the dot | 312.0 | **~1%** |
+    //
+    // Read those four rows together and the kernel stops being mysterious:
+    //
+    //  * IT IS ALL LOAD. The dot and the V accumulate are 85% of it and both
+    //    are word-at-a-time streaming; the remaining 15% covers the online
+    //    softmax, the page walk and the loop itself TOGETHER.
+    //
+    //  * IT IS NOT ARITHMETIC. Hoisting `params.scale` out of the dot turns
+    //    a multiply-and-fma per term into one fma -- half the inner loop's
+    //    ALU -- and buys 0.4% of a prefill. Anything that only makes this
+    //    loop's arithmetic cheaper, the hand-rolled bf16 unpack included, is
+    //    already priced at approximately nothing. Do not go there.
+    //
+    //  * IT IS NOT THE SOFTMAX EITHER. The serial `max`/`exp` chain across
+    //    keys is inside that 15% along with two other things, so it cannot
+    //    be worth more than a few percent of a prefill however it is
+    //    restructured.
+    //
+    // # And the loads are served by cache, not by DRAM
+    //
+    // Count the bytes this arm asks for at 512 rows: 512^2/2 causal pairs a
+    // head, 16 heads, a 256-byte K row read by each of `PIE_TX` = 2 lanes
+    // and a V row read once between them, is 1.61 GB a layer and 45 GB over
+    // 28. Delivered in 114.8 ms that is **392 GB/s**, about twice this
+    // part's DRAM bandwidth. So the working set is resident and every load
+    // in here is already a hit -- which is the same conclusion the page
+    // cache and the query staging each reached the hard way, now arrived at
+    // from the traffic side.
+    //
+    // The one real inefficiency left is that `PIE_TX` lanes each compute the
+    // WHOLE dot, so K is read `PIE_TX` times over. Splitting it and
+    // combining with a subgroup reduction is bounded above by the 45% row:
+    // at `d_128`, where `PIE_TX` is 2, a perfect free split is 25.9 ms of
+    // 313, about 8% -- before paying for the reduction, and it re-associates
+    // a sum that three backends agree on. Priced, and not worth it here. It
+    // is a different question at `d_256` and `d_512`, where `PIE_TX` is 4
+    // and 8 and the same redundancy is 4x and 8x.
+    //
+    // What WOULD change the shape is reading each K element once per several
+    // query rows instead of once per row -- which is what a matrix unit
+    // does, and `tests/cooperative.rs` is the evidence this part has one.
     var page_held = 0xffffffffu;
     var page_phys = 0u;
     for (var kp = start; kp <= q_pos; kp = kp + 1) {
@@ -840,18 +1775,33 @@ fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
         let slot = page_phys * page_len + page_off;
         let v_row = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
         // ONE dot for every pair this lane owns, which is the whole point.
+//#if defined(PIE_SUBGROUP)
+        let step = pie_sdpa_online_update(dot_row_split(q_base, v_row, lane), max_score, sum_exp);
+//#else
         let step = pie_sdpa_online_update(dot_row(q_base, v_row), max_score, sum_exp);
+//#endif
         max_score = step.max_score;
         sum_exp = step.sum_exp;
-        for (var p = 0u; p < PIE_LANE_PAIRS; p = p + 1u) {
-            let d_out = (lane + p * PIE_TX) * 2u;
-            // ONE load for the pair. `d_out` is even by construction, so both
-            // halves live in `v_pages[(v_row + d_out) >> 1]` and the two
-            // `v_at` calls this replaced fetched the same word twice.
-            let vw = v_pages[(v_row + d_out) >> 1u];
+        // ONE load for the pair. `d_out` is even by construction, so both
+        // halves live in `v_pages[(v_row + d_out) >> 1]` and the two `v_at`
+        // calls this replaced fetched the same word twice.
+        //
+        // Unrolled by two for the reason `dot_row` is: the loads are
+        // independent of each other and of the accumulate, so issuing two
+        // before either arrives is free. `PIE_LANE_PAIRS` is `PIE_PAIRS /
+        // PIE_TX`, which is 16 at `d_64` and 32 at every other head
+        // dimension, so two always divides it.
+        for (var p = 0u; p < PIE_LANE_PAIRS; p = p + 2u) {
+            let d0 = (lane + p * PIE_TX) * 2u;
+            let d1 = (lane + (p + 1u) * PIE_TX) * 2u;
+            let v0 = v_pages[(v_row + d0) >> 1u];
+            let v1 = v_pages[(v_row + d1) >> 1u];
             acc[p] = acc[p] * step.history_scale
                 + step.score_scale
-                    * vec2<f32>(pie_bf16_to_f32(vw & 0xffffu), pie_bf16_to_f32(vw >> 16u));
+                    * vec2<f32>(pie_bf16_to_f32(v0 & 0xffffu), pie_bf16_to_f32(v0 >> 16u));
+            acc[p + 1u] = acc[p + 1u] * step.history_scale
+                + step.score_scale
+                    * vec2<f32>(pie_bf16_to_f32(v1 & 0xffffu), pie_bf16_to_f32(v1 >> 16u));
         }
     }
 //#if defined(PIE_WITH_SINK)
@@ -963,15 +1913,23 @@ fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
+//#if defined(PIE_SUBGROUP)
+    @builtin(subgroup_size) sg: u32,
+//#endif
 ) {
+//#if !defined(PIE_SUBGROUP)
+    // The baseline arm never shuffles, so the width is a placeholder that
+    // makes `lim` the row width and the fold a single slot.
+    let sg = PIE_DX;
+//#endif
 //#if defined(PIE_SPLITK)
     // THE SPLIT ON Z. The x and y axes are the unsplit arm's exactly -- one
     // workgroup per query head, one per row -- so only the third axis is new,
     // and `num_workgroups.z` is where the count comes from rather than a
     // second reading of the scalar.
-    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x, wg.z, groups.z);
+    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x, wg.z, groups.z, sg);
 //#else
-    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x, 0u, 1u);
+    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x, 0u, 1u, sg);
 //#endif
 }
 
@@ -994,6 +1952,15 @@ fn main(
 // pie:instantiate sdpa_paged_decode_split_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_SPLITK=1
 // pie:instantiate sdpa_paged_decode_split_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_SPLITK=1
 // pie:instantiate sdpa_paged_decode_split_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_SPLITK=1
+// THE SAME KERNEL WITH THE LADDER TAKEN OUT, at the one width a decode of the
+// models this tree is tuned against actually reaches. `serve::pick` takes this
+// when the adapter has `SUBGROUP` and falls back to the baseline line above
+// when it does not, so nothing here is a requirement.
+//
+// Only `d_128` is minted. A tier variant costs a pipeline and seven pinned
+// counts, and the other three widths are not on any measured path -- add one
+// the day a model needs it and the bench says the same thing.
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_SPLITK=1
 // pie:instantiate sdpa_paged_decode_merge_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_SPLITK=1 PIE_COMBINE=1
 // pie:instantiate sdpa_paged_decode_merge_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_SPLITK=1 PIE_COMBINE=1
 // pie:instantiate sdpa_paged_decode_merge_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_SPLITK=1 PIE_COMBINE=1
@@ -1002,5 +1969,9 @@ fn main(
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_64 @subgroup PIE_HEAD_DIM=64 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_WITH_SINK=1
 // pie:instantiate sdpa_paged_tiled_strided_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_STRIDED=1

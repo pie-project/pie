@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// Where each SSA value's bytes live.
 #[derive(Debug, Clone)]
 pub struct Buffers {
@@ -27,6 +26,12 @@ impl Buffers {
         let n_tokens = rows.len();
         let n_requests = rows.iter().filter(|r| r.samples).count().max(1);
 
+        // Whether the correction runs at all. The adapter seam is stated by
+        // the model text and so is present on every fire of the family, but
+        // the correction is guarded on the fire's rows -- and the pin below
+        // takes a per-layer buffer out of the arena, which a fire that runs no
+        // correction should not pay for.
+        let any_lora = rows.iter().any(|r| r.lora);
         let mut pinned: Vec<ValueId> = Vec::new();
         // CUDA pins the exit seam; Metal keeps it in the arena.
         let arena_exit: Vec<ValueId> =
@@ -40,6 +45,12 @@ impl Buffers {
                 Vec::new()
             };
         for stmt in &plan.seams {
+            // BEFORE the split below, because an attachment that states its
+            // values takes the early return and the operand it does NOT state
+            // is exactly the one at issue.
+            if any_lora {
+                pinned.extend(seam_reads_beyond_inputs(plan, stmt));
+            }
             if !stmt.values.is_empty() {
                 pinned.extend(
                     stmt.values
@@ -130,7 +141,9 @@ impl Buffers {
                 // a launch's pairs are DERIVED from the row's `Source::Alias`
                 // marks now, so there is no `&'static` list to hand back.
                 let pairs = match &op.kind {
-                    OpKind::Launch { kernel, .. } => model_ir::kernels::in_place_pairs(plan, kernel),
+                    OpKind::Launch { kernel, .. } => {
+                        model_ir::kernels::in_place_pairs(plan, kernel)
+                    }
                     other => model_ir::kernels::semantic_in_place(other).to_vec(),
                 };
                 let mut aliased = false;
@@ -352,5 +365,86 @@ pub const fn dtype_bytes(d: DType) -> u32 {
 /// place for the invariant to live -- one that goes quietly wrong the first
 /// time anything else publishes one.
 fn is_raised(plan: &ForwardPlan, v: ValueId) -> bool {
-    plan.values.get(v as usize).is_some_and(model_ir::trace::ValueInfo::is_raised)
+    plan.values
+        .get(v as usize)
+        .is_some_and(model_ir::trace::ValueInfo::is_raised)
+}
+
+/// The operands an attachment reads that its STATEMENT does not name.
+///
+/// A seam statement names the values the attachment REWRITES, because that is
+/// what the seam signature is about: [`model_ir::seam::ATTN_QV`] sees `q` and
+/// `v` and its correction adds a delta into both, in place. So the correction
+/// op's `inputs` are `[q, v]` and the pinning above, which reads exactly that
+/// list, keeps exactly those two out of the recycler.
+///
+/// The correction reads a THIRD operand, and no statement anywhere mentions
+/// it: `x`, the projection input, which is what the low-rank `A` is applied
+/// to. The backend recovers it the only way it can be recovered -- off the
+/// qkv (or q) projection's own input -- and binds it as a foreign value at
+/// dispatch time, which is a place the lowering has already finished by.
+///
+/// # What that cost
+///
+/// The recycler is right about `x` on the evidence it has. Nothing in the op
+/// list reads `x` after the projection consumes it, so its block goes back on
+/// the free list at that op, and the very next op takes it: on qwen3-0.6b,
+/// `attn::split_qkv_bf16` writes the K projection into arena offset 10240,
+/// which is the block the normed projection input was still sitting in, and
+/// rope and attention write over it again after that. By the time the
+/// correction ran -- which is AFTER the split, because it needs q and v as
+/// separate buffers -- `x` was three writers stale.
+///
+/// The adapter was therefore applied to whatever the arena last held. That is
+/// not a crash and it is not even obviously wrong output: the delta is a
+/// plausible-looking matrix product of the wrong operand, and at
+/// `adapter_scale: 0.0` the `B` factor multiplies it away entirely, so every
+/// zero-adapter check passed. What it looked like from outside was that a
+/// nonzero adapter was not REPRODUCIBLE -- three runs of `lora-probe` at
+/// `adapter_scale: 0.5` on one build answered " a fictional series of novels
+/// an", " capital of capital of capital o" and " a country that is a countr"
+/// -- because attention output, unlike the forward, is not bit-stable across
+/// fires.
+///
+/// # Why pinning and not a copy
+///
+/// The backend could snapshot `x` aside before the split overwrites it, and
+/// that was the first fix drafted. It puts a per-layer memcpy in the walk, a
+/// stash buffer in the frame, and a launch-index-keyed flag in the dispatch
+/// plan, to work around a fact the lowering already has a word for. `pinned`
+/// means "a reader exists that the op list does not show", which is precisely
+/// and only what is true here. A pinned value leaves the arena and becomes a
+/// named buffer, which is per-value and so per-layer -- and that incidentally
+/// answers the other half of the symptom, that `x` arrived at the dispatch
+/// arm as the SAME address on all 28 layers.
+fn seam_reads_beyond_inputs(
+    plan: &ForwardPlan,
+    stmt: &model_ir::trace::SeamStatement,
+) -> Vec<ValueId> {
+    if stmt.seam != model_ir::seam::ATTN_QV.name {
+        return Vec::new();
+    }
+    let Some(probe) = stmt.op.map(|at| at as usize) else {
+        return Vec::new();
+    };
+    // Backwards to the projection whose input the correction re-reads. The
+    // same rule the backend harvests it by, so the two cannot disagree about
+    // which value `x` is.
+    plan.ops[..probe]
+        .iter()
+        .rev()
+        .find_map(|op| match &op.kind {
+            // The projection is a Launch now; its weight rides the
+            // positional weights list.
+            OpKind::Launch { weights, .. }
+                if weights
+                    .first()
+                    .is_some_and(|w| w.ends_with(".qkv") || w.ends_with(".q_proj")) =>
+            {
+                op.inputs.first().copied()
+            }
+            _ => None,
+        })
+        .into_iter()
+        .collect()
 }

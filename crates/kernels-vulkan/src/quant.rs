@@ -103,14 +103,10 @@ fn qmv_name(form: &str, group: i32, bits: i32) -> Result<&'static str, Refusal> 
 }
 
 fn check(points: &[i32], v: i32, what: &'static str) -> Result<(), Refusal> {
-    points
-        .iter()
-        .any(|p| *p == v)
-        .then_some(())
-        .ok_or(Refusal::Narrow {
-            what,
-            at: i64::from(v),
-        })
+    points.contains(&v).then_some(()).ok_or(Refusal::Narrow {
+        what,
+        at: i64::from(v),
+    })
 }
 
 fn qmm_grid(n: i32, bn: i32, m: i32, bm: i32, split_k: i32) -> Result<[u32; 3], Refusal> {
@@ -424,10 +420,7 @@ pub fn qmm_t_splitk(
     let m = *m;
     ctx.fire(
         Fire::at(
-            crate::routine::module_path(
-                qmm_name("_splitk", *group, *bits, *bm, 32)?,
-                ctx.best(),
-            ),
+            crate::routine::module_path(qmm_name("_splitk", *group, *bits, *bm, 32)?, ctx.best()),
             qmm_name("_splitk", *group, *bits, *bm, 32)?,
         )
         .apply(qmm_grid(n, 32, m, *bm, split_k)?),
@@ -564,10 +557,7 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     let m = *m;
     ctx.fire(
         Fire::at(
-            crate::routine::module_path(
-                qmm_precast_name("_splitk", "_f32", *bm, 32)?,
-                ctx.best(),
-            ),
+            crate::routine::module_path(qmm_precast_name("_splitk", "_f32", *bm, 32)?, ctx.best()),
             qmm_precast_name("_splitk", "_f32", *bm, 32)?,
         )
         .apply(qmm_grid(n, 32, m, *bm, split_k)?),
@@ -607,10 +597,7 @@ pub fn qmm_t_strided(
     let m = *m;
     ctx.fire(
         Fire::at(
-            crate::routine::module_path(
-                qmm_name("_strided", *group, *bits, *bm, 32)?,
-                ctx.best(),
-            ),
+            crate::routine::module_path(qmm_name("_strided", *group, *bits, *bm, 32)?, ctx.best()),
             qmm_name("_strided", *group, *bits, *bm, 32)?,
         )
         .apply(qmm_grid(n, 32, m, *bm, 1)?),
@@ -687,10 +674,7 @@ pub fn qmm_t_strided_fp16_precast(
     let m = *m;
     ctx.fire(
         Fire::at(
-            crate::routine::module_path(
-                qmm_precast_name("_strided", "", *bm, 32)?,
-                ctx.best(),
-            ),
+            crate::routine::module_path(qmm_precast_name("_strided", "", *bm, 32)?, ctx.best()),
             qmm_precast_name("_strided", "", *bm, 32)?,
         )
         .apply(qmm_grid(n, 32, m, *bm, 1)?),
@@ -1295,4 +1279,3 @@ pub fn mxfp4_dequant_bf16(
         ],
     )
 }
-

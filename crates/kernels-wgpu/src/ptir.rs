@@ -1,5 +1,5 @@
+use kernels::routine::Refusal;
 use kernels_macros::routine;
-use kernels::routine::{Refusal};
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 
@@ -9,7 +9,8 @@ pub fn copy_logits_bf16(
     source: In<Tensor<bf16>>,
     destination: Out<Tensor<bf16>>,
     records: In<Tensor<u32>>,
-    rows: Const<u32>) -> Result<(), Refusal> {
+    rows: Const<u32>,
+) -> Result<(), Refusal> {
     let vocab = source.width.unsigned_abs();
     let rows = *rows;
     if rows == 0 {

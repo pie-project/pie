@@ -96,7 +96,14 @@ const CENSUS: usize = 101;
 /// Metal crossed it, so the pair contributes one comparison and this rose --
 /// with `CENSUS` holding at 101, which is the shape a GAIN has and a drift
 /// does not.
-const COMPARED: usize = 200;
+///
+/// It rose again, to 201, WHEN WGPU CROSSED `rms_rope` as well -- *"wgpu fuses
+/// the per-head qk norm into its rope"*. A third plane on a kernel already
+/// crossed by two adds no name to `CENSUS` and one comparison here, which is
+/// the same shape a second time, and the signatures agreed with no edit. The
+/// entrypoint census states the other half of the same crossing, as
+/// `("wgpu", "rms_rope_bfloat16")` in `EXCLUSIVE`.
+const COMPARED: usize = 201;
 
 /// A kernel a backend does not have AT ALL, and the sentence saying why.
 ///
@@ -616,7 +623,6 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
 // planes now state the same source and each driver answers it. There is
 // nothing left here to read from the outside.
 
-
 /// A retired row's ENTRYPOINTS are still in the backend's census.
 ///
 /// The one thing `RETIRED` exists for, asked directly. A row's `axes`
@@ -718,7 +724,24 @@ fn retiring_a_row_does_not_shrink_a_backends_census() {
         // migration and not because of it: the three planes shared one
         // `linkme` section until their slices were given per-plane names,
         // so no shortfall between them could show.
+        //
+        // **Five of the six, since `rms_rope_bfloat16` crossed.** `wgpu fuses
+        // the per-head qk norm into its rope` gave `kernels-wgpu` the base
+        // form of this family -- one entrypoint of the six, not the decode,
+        // freqs or prop variants -- so the name needs an entry per backend,
+        // for the reason the four `_split_` names above have two: this list
+        // is keyed on (backend, name), and a name two backends have that is
+        // subtracted from only one of them walks into the shared census
+        // alone.
+        //
+        // METAL declares `norm::rms_rope` too, in `ELSEWHERE`, and still does
+        // not appear here: its entrypoint is in `DECLARED_ELSEWHERE`, so the
+        // shader is not in metal's stamped table and `entrypoints()` does not
+        // enumerate it. Two of the three planes carry the name in a census
+        // and the third carries the kernel without one, which is exactly the
+        // case this list is a subtraction rather than an exemption for.
         ("vulkan", "rms_rope_bfloat16"),
+        ("wgpu", "rms_rope_bfloat16"),
         ("vulkan", "rms_rope_decode_bfloat16"),
         ("vulkan", "rms_rope_freqs_bfloat16"),
         ("vulkan", "rms_rope_freqs_decode_bfloat16"),
@@ -975,30 +998,30 @@ const DIVERGED: &[(&str, &str)] = &[
     // so both backends need both numbers, vulkan was launching one workgroup
     // per row, and it took metal's signature rather than an excuse.
     // ── FIVE ENTRIES THE `Env` -> `Const`/`ask` MIGRATION SETTLED ────────────
-//
-// `gdn_prep_prefill`, `rms_strided_row`, `rms_strided_head_row`,
-// `sdpa_paged_decode` and `sdpa_paged_decode_sink` stood in this list and no
-// longer do. Not one of them was a device difference; every one was a
-// PARAMETER LIST difference, and each is a finding `.wiki/migration.md`
-// predicted by name:
-//
-//   * the two `rms_strided_*` forms differed over `axis` -- §9.1's *"one key
-//     under two parameter names"*, `keys::Width` twice, at fifteen sites. With
-//     the rectangle off the mark it is `x.width` on both planes, which is a
-//     grid fact and not a parameter, so the signatures are one signature.
-//   * `gdn_prep_prefill` differed over a bare `Env<i32>` that claimed no
-//     source at all, so vulkan's row could never be bound. It is the fire's
-//     token count, which its own sibling was already asking for beside it.
-//   * the two `sdpa_paged_decode` forms differed over which of twenty facts
-//     each plane spelled as a parameter -- §5.6's case exactly. Twelve of them
-//     are the page tables, the KV pool, the staged mask and the partials
-//     buffer, and they leave the signature entirely; six are the checkpoint's
-//     and stay as `Const`. What is left agrees.
-//
-// The list is shorter because the signatures are shorter, and that is the
-// point of the change rather than a side effect of it.
+    //
+    // `gdn_prep_prefill`, `rms_strided_row`, `rms_strided_head_row`,
+    // `sdpa_paged_decode` and `sdpa_paged_decode_sink` stood in this list and no
+    // longer do. Not one of them was a device difference; every one was a
+    // PARAMETER LIST difference, and each is a finding `.wiki/migration.md`
+    // predicted by name:
+    //
+    //   * the two `rms_strided_*` forms differed over `axis` -- §9.1's *"one key
+    //     under two parameter names"*, `keys::Width` twice, at fifteen sites. With
+    //     the rectangle off the mark it is `x.width` on both planes, which is a
+    //     grid fact and not a parameter, so the signatures are one signature.
+    //   * `gdn_prep_prefill` differed over a bare `Env<i32>` that claimed no
+    //     source at all, so vulkan's row could never be bound. It is the fire's
+    //     token count, which its own sibling was already asking for beside it.
+    //   * the two `sdpa_paged_decode` forms differed over which of twenty facts
+    //     each plane spelled as a parameter -- §5.6's case exactly. Twelve of them
+    //     are the page tables, the KV pool, the staged mask and the partials
+    //     buffer, and they leave the signature entirely; six are the checkpoint's
+    //     and stay as `Const`. What is left agrees.
+    //
+    // The list is shorter because the signatures are shorter, and that is the
+    // point of the change rather than a side effect of it.
 
-// `rms_strided_head_row` STOOD HERE AND IS SETTLED. Its divergence was
+    // `rms_strided_head_row` STOOD HERE AND IS SETTLED. Its divergence was
     // `axis`: metal declared it and vulkan did not, because metal sizes the
     // threadgroup on it and vulkan compiles a fixed 256-wide workgroup that
     // walks it. Both spelled the number `keys::Width` -- §9.1's finding, one
@@ -1338,4 +1361,3 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
 // unit-tested in `kernels-metal`, and `model-ir`'s load-time check, which
 // refuses any text naming a symbol no backend resolves. Both are on the
 // side that has the rows.
-

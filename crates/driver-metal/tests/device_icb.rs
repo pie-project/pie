@@ -64,6 +64,8 @@ use objc2_metal::{
 /// question is about — if a command's own bindings are used, the two write to
 /// two places; if the encoder's are, they both write to whichever was bound
 /// last.
+use driver_metal::skip::skipped;
+
 const SHADER: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -77,7 +79,7 @@ kernel void bump(device uint* out [[buffer(0)]],
 #[test]
 fn a_fire_can_be_recorded_once_and_replayed() {
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -245,7 +247,7 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
     use model_ir::trace::FireClass;
 
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -512,7 +514,7 @@ fn a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits() {
     const AT: u64 = FOUR_GIB + 64;
 
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -521,7 +523,7 @@ fn a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits() {
         .expect("the probe shader compiles");
 
     let Ok(big) = Allocation::new(&context, 5u64 << 30, "icb probe 5 GiB") else {
-        eprintln!("SKIP: no 5 GiB buffer");
+        skipped("no 5 GiB buffer");
         return;
     };
     let out = Allocation::new(&context, 16 * 4, "icb probe out").expect("a region");

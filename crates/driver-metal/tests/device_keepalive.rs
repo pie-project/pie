@@ -25,7 +25,10 @@ const SPIN_ITERS: u32 = 64;
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so nothing was kept alive");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -48,7 +51,7 @@ fn wait_for_commits(keepalive: &Keepalive, target: u64, budget: Duration) -> u64
 #[test]
 fn starting_a_keepalive_and_dropping_it_immediately_neither_hangs_nor_crashes() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let keepalive = Keepalive::start(&context, SPIN_ITERS, 1, 2).expect("keepalive starts");
@@ -61,7 +64,7 @@ fn starting_a_keepalive_and_dropping_it_immediately_neither_hangs_nor_crashes() 
 #[test]
 fn the_committed_counter_advances_past_the_in_flight_depth() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let depth = 3;
@@ -80,7 +83,7 @@ fn the_committed_counter_advances_past_the_in_flight_depth() {
 #[test]
 fn a_depth_below_two_and_a_grid_of_no_threadgroups_are_clamped_up() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     for depth in [0, 1] {
@@ -107,7 +110,7 @@ fn a_depth_below_two_and_a_grid_of_no_threadgroups_are_clamped_up() {
 #[test]
 fn two_keepalives_can_be_started_and_dropped_in_sequence() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     // This is where the C++'s half-initialised state would bite: its second
@@ -132,7 +135,7 @@ fn two_keepalives_can_be_started_and_dropped_in_sequence() {
 #[test]
 fn dropping_a_running_keepalive_joins_within_a_bounded_time() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let keepalive = Keepalive::start(&context, SPIN_ITERS, 4, 4).expect("keepalive starts");

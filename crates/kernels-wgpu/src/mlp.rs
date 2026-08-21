@@ -5,13 +5,14 @@ use crate::routine::{
 };
 use kernels::routine::Refusal;
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn silu_mul(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
@@ -20,13 +21,14 @@ pub fn silu_mul(
     )
 }
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
@@ -35,7 +37,7 @@ pub fn geglu_tanh(
     )
 }
 
-#[routine]
+#[routine(out(out = rows(gate) x const(stated_width)))]
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -46,7 +48,8 @@ pub fn geglu_tanh_strided(
     gate_pitch: Const<u32>,
     up_pitch: Const<u32>,
     out_pitch: Const<u32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
@@ -64,7 +67,7 @@ pub fn geglu_tanh_strided(
     )
 }
 
-#[routine]
+#[routine(out(out = like(gate)))]
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
@@ -73,7 +76,8 @@ pub fn gptoss_swiglu(
     _stated_elements: Const<u32>,
     limit: Const<f32>,
     alpha: Const<f32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
@@ -88,12 +92,14 @@ pub fn silu_mul_strided(
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let row_pitch = ctx.param(1)?;
     let width = gate.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("mlp/gated.wgsl", "silu_mul_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        Fire::at("mlp/gated.wgsl", "silu_mul_strided_bfloat16")
+            .apply(elementwise_rows(width, rows)?),
         &[gate.arg(), up.arg(), out.arg(), row_pitch.arg()],
     )
 }

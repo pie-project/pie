@@ -34,7 +34,10 @@ kernel void sum(device uint* out [[buffer(0)]],
 fn context() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
-        Err(Error::NoDevice) => None,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no region was mapped");
+            None
+        }
         Err(e) => panic!("context: {e}"),
     }
 }
@@ -48,7 +51,7 @@ fn read_u32(r: &impl Region) -> u32 {
 #[test]
 fn the_gpu_reads_what_the_host_wrote_and_the_zero_that_followed() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -100,7 +103,7 @@ fn the_gpu_reads_what_the_host_wrote_and_the_zero_that_followed() {
 #[test]
 fn a_copy_between_a_slot_and_a_loan_reaches_the_gpu() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -154,7 +157,7 @@ fn a_copy_between_a_slot_and_a_loan_reaches_the_gpu() {
 #[test]
 fn a_slot_bounds_the_request_and_not_the_allocation() {
     let Some(context) = context() else {
-        println!("no Metal device; skipped");
+        driver_metal::skip::skipped("no Metal device");
         return;
     };
     let mut heap = Heap::new(&context, 1 << 20).expect("heap");

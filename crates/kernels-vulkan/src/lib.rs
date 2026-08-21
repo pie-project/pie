@@ -9,7 +9,6 @@ pub mod runtime;
 #[allow(unused_imports)]
 use kernels::Axis;
 
-
 pub mod routine;
 pub mod views;
 
@@ -40,7 +39,6 @@ pub struct Registered(pub ::kernels::routine::Routine<Plane>);
 #[cfg(target_family = "wasm")]
 ::inventory::collect!(Registered);
 
-#[must_use]
 pub fn rows() -> impl Iterator<Item = &'static ::kernels::routine::Routine<Plane>> {
     #[cfg(not(target_family = "wasm"))]
     {

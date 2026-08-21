@@ -415,21 +415,20 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
 
     /// The lanes the body asked for, and the row count it will be told.
     ///
-    /// IT ANSWERS AS WELL AS RECORDS. `ple_combine` reaches its row count
-    /// through `ctx.ask::<i32, keys::Rows>()` now rather than through an
-    /// `Env` parameter, so a probe that only recorded would refuse before it
-    /// dispatched. `resolve` is the one method that answering takes.
+    /// IT RECORDS ONE THING NOW. `ple_combine` used to reach its row count
+    /// through `ctx.ask::<i32, keys::Rows>()`, and this probe answered on
+    /// that channel; the no-ask sweep retired `Source::Named` and the whole
+    /// key vocabulary, so the routine takes rows as a `Const<i32>` on the
+    /// signature and `resolve` has nothing left to answer. It still exists —
+    /// the `Encode` trait declares it — and refuses everything, because
+    /// this test is about the LANES the body asks for and not a scalar it
+    /// no longer reads through the resolver.
     #[derive(Default)]
     struct Lanes {
         seen: std::cell::RefCell<Option<[u32; 3]>>,
-        rows: i32,
     }
     impl Encode for Lanes {
-        fn fire(
-            &self,
-            fire: Fire,
-            _args: &[ArgValue],
-        ) -> Result<(), kernels::routine::Refusal> {
+        fn fire(&self, fire: Fire, _args: &[ArgValue]) -> Result<(), kernels::routine::Refusal> {
             *self.seen.borrow_mut() = Some(fire.lanes);
             Ok(())
         }
@@ -437,18 +436,15 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
         fn resolve(
             &self,
             _ty: kernels::Ty,
-            source: kernels::Source,
+            _source: kernels::Source,
         ) -> Result<ArgValue, kernels::routine::Refusal> {
-            match source {
-                kernels::Source::Named(key)
-                    if key == <kernels::keys::Rows as kernels::keys::Fact>::KEY =>
-                {
-                    Ok(ArgValue::I32(self.rows))
-                }
-                _ => Err(kernels::routine::Refusal::Unstated {
-                    what: "a fact this probe does not answer",
-                }),
-            }
+            // No routine on this backend reaches `ctx.resolve` any more —
+            // every fact a body used to ask for is a mark on the signature
+            // now. A refusal here catches a routine that regresses to the
+            // ask channel loudly, at the first argument it does.
+            Err(kernels::routine::Refusal::Unstated {
+                what: "a fact this probe does not answer",
+            })
         }
     }
 
@@ -478,25 +474,41 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
         };
         let want = groups(rule, dims, module).expect("the rule answers");
 
-        let to = Lanes {
-            rows: i32::try_from(rows).expect("fits"),
-            ..Lanes::default()
-        };
+        let to = Lanes::default();
         // THE WIDTH RIDES THE OPERAND. `In<Tensor<_>>` carries the
         // rectangle the statement placed, so the body reads `proj.width`
         // off its own argument where it used to take a separate `Env`.
         let w = i32::try_from(width).expect("fits");
+        let r = i32::try_from(rows).expect("fits");
         kernels_wgpu::layout::ple_combine(
             &to,
-            kernels::routine::In { ptr: Tensor::new(0), rows: 1, width: w },
-            kernels::routine::In { ptr: Tensor::new(1), rows: 1, width: w },
-            kernels::routine::Out { ptr: Tensor::new(2), rows: 1, width: w },
+            kernels::routine::In {
+                ptr: Tensor::new(0),
+                rows: 1,
+                width: w,
+            },
+            kernels::routine::In {
+                ptr: Tensor::new(1),
+                rows: 1,
+                width: w,
+            },
+            kernels::routine::Out {
+                ptr: Tensor::new(2),
+                rows: 1,
+                width: w,
+            },
             // THE SCALE IS A MARK NOW. It reaches no grid -- this test asserts
             // the lane rule and nothing else -- so the value is the honest one
             // rather than a placeholder: `layout/ple_combine.wgsl` divides the
             // projection by root two, and `kernels-vulkan`'s twin of this test
             // states the same constant.
             kernels::Const::new(core::f32::consts::FRAC_1_SQRT_2),
+            // AND SO IS ROWS. The no-ask sweep took `ctx.ask::<_, keys::Rows>()`
+            // off this body and put a `Const<i32>` on its signature in its
+            // place, so the row count reaches the lanes computation as an
+            // argument the caller states -- which is what a sweep of
+            // rectangles is about to do, one call per point.
+            kernels::Const::new(r),
         )
         .expect("the body dispatches");
         let lanes = to.seen.borrow().expect("it dispatched once");

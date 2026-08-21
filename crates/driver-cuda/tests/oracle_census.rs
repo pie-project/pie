@@ -59,18 +59,42 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     //
     // Fourteen of the sixteen. These compiled the driver's own C++ host layer
     // — workspace planner, KV cache, stage hooks — which is now Rust.
-    ("attn_score", Dies::Cp, "crates/driver-cuda/csrc/src/model/attn_score.cu",
-     "the attention-score observation hook"),
-    ("attn_ws", Dies::Cp, "crates/driver-cuda/csrc/src/attention_workspace.cpp",
-     "the attention workspace's size and offset arithmetic"),
-    ("caches", Dies::Cp, "crates/driver-cuda/csrc/src/store/mla_cache.cpp",
-     "MLA, DSv4-compress and swap-pool cache geometry"),
-    ("kv_cache", Dies::Cp, "crates/driver-cuda/csrc/src/store/kv_cache.cpp",
-     "paged KV cache layout"),
-    ("kv_cache_live", Dies::Cp, "crates/driver-cuda/csrc/src/store/kv_cache.cpp",
-     "KV cache behaviour under live page allocation"),
-    ("lora_stage", Dies::Cp, "crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp",
-     "LoRA staging order"),
+    (
+        "attn_score",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/model/attn_score.cu",
+        "the attention-score observation hook",
+    ),
+    (
+        "attn_ws",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/attention_workspace.cpp",
+        "the attention workspace's size and offset arithmetic",
+    ),
+    (
+        "caches",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/store/mla_cache.cpp",
+        "MLA, DSv4-compress and swap-pool cache geometry",
+    ),
+    (
+        "kv_cache",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/store/kv_cache.cpp",
+        "paged KV cache layout",
+    ),
+    (
+        "kv_cache_live",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/store/kv_cache.cpp",
+        "KV cache behaviour under live page allocation",
+    ),
+    (
+        "lora_stage",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp",
+        "LoRA staging order",
+    ),
     // `lora_stage/run.sh` names TWO missing inputs now, and this row asserts
     // only the first because the first is where `set -e` stops. The second is
     // `../llama_like_prepare/stub/`, deleted with that oracle — see
@@ -95,26 +119,57 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     //
     // Before adding a `Dies::Cp` row, check whether the input is one
     // `git show` away, as this one was.
-    ("memory_planner", Dies::GitRestores, "crates/driver-cuda/csrc/src/store/memory_planner.cpp",
-     "the memory planner's allocation decisions"),
-    ("page_mask", Dies::Cp, "crates/driver-cuda/csrc/src/model/attn_page_mask.cu",
-     "page-mask construction"),
-    ("profile_cache", Dies::Cp, "crates/driver-cuda/csrc/src/store/planner_profile_cache.cpp",
-     "the planner's profile cache"),
-    ("recurrent", Dies::Cp, "crates/driver-cuda/csrc/src/store/recurrent_state_cache.cpp",
-     "recurrent state cache geometry"),
-
-    ("sideband_arena", Dies::Cp, "crates/driver-cuda/csrc/src/model/hook_sideband_arena.cpp",
-     "the sideband arena's bump allocation"),
-    ("stage_hooks", Dies::Cp, "crates/driver-cuda/csrc/src/model/stage_hooks.hpp",
-     "stage hook firing order"),
-    ("workspace", Dies::Cp, "crates/driver-cuda/csrc/src/model/workspace.cpp",
-     "the model workspace's section offsets"),
+    (
+        "memory_planner",
+        Dies::GitRestores,
+        "crates/driver-cuda/csrc/src/store/memory_planner.cpp",
+        "the memory planner's allocation decisions",
+    ),
+    (
+        "page_mask",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/model/attn_page_mask.cu",
+        "page-mask construction",
+    ),
+    (
+        "profile_cache",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/store/planner_profile_cache.cpp",
+        "the planner's profile cache",
+    ),
+    (
+        "recurrent",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/store/recurrent_state_cache.cpp",
+        "recurrent state cache geometry",
+    ),
+    (
+        "sideband_arena",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/model/hook_sideband_arena.cpp",
+        "the sideband arena's bump allocation",
+    ),
+    (
+        "stage_hooks",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/model/stage_hooks.hpp",
+        "stage hook firing order",
+    ),
+    (
+        "workspace",
+        Dies::Cp,
+        "crates/driver-cuda/csrc/src/model/workspace.cpp",
+        "the model workspace's section offsets",
+    ),
     // The fourteenth of cause A, and the one that hides: its `cp` list is
     // clean and it dies at `g++`, so it is reached only by looking at
     // compiler inputs.
-    ("store", Dies::Compile, "crates/driver-cuda/csrc/src/store/kv_cache_format.cpp",
-     "the on-disk KV cache format"),
+    (
+        "store",
+        Dies::Compile,
+        "crates/driver-cuda/csrc/src/store/kv_cache_format.cpp",
+        "the on-disk KV cache format",
+    ),
     // ── Cause B: individual archive files retired by this migration.
     //
     // Two, and the kind that will keep happening: an oracle whose subject is a
@@ -123,10 +178,18 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     // Their path strings are the ARCHIVE crate's — `kernels-cuda` when it was
     // a CMake+nvcc crate — and are kept verbatim because they are what each
     // `run.sh` reaches for. Nothing in this tree holds either path now.
-    ("cublas_handle", Dies::Cp, "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
-     "cuBLAS handle and workspace lifetime"),
-    ("weight_view", Dies::Compile, "crates/kernels-cuda/csrc/src/tensor.cpp",
-     "weight view strides over a quantised tensor"),
+    (
+        "cublas_handle",
+        Dies::Cp,
+        "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
+        "cuBLAS handle and workspace lifetime",
+    ),
+    (
+        "weight_view",
+        Dies::Compile,
+        "crates/kernels-cuda/csrc/src/tensor.cpp",
+        "weight view strides over a quantised tensor",
+    ),
 ];
 
 /// The three that were DELETED rather than kept as descriptions, and why the
@@ -155,9 +218,18 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
 /// `llama_like_prepare/stub/`, which `lora_stage/run.sh` still copies and
 /// which is recorded at the `lora_stage` row above.
 const RETIRED: &[(&str, &str)] = &[
-    ("llama_like_cfg", "no golden; drove the deleted llama_like.cpp"),
-    ("llama_like_prepare", "no golden; drove the deleted llama_like.cpp"),
-    ("qwen35_la_ws", "no golden; drove the deleted qwen3_5_forward.cpp"),
+    (
+        "llama_like_cfg",
+        "no golden; drove the deleted llama_like.cpp",
+    ),
+    (
+        "llama_like_prepare",
+        "no golden; drove the deleted llama_like.cpp",
+    ),
+    (
+        "qwen35_la_ws",
+        "no golden; drove the deleted qwen3_5_forward.cpp",
+    ),
 ];
 
 /// The two that can still be run, and neither can be run *here*.
@@ -172,8 +244,14 @@ const RETIRED: &[(&str, &str)] = &[
 ///   nvcc`), and is the only oracle holding captured output on disk rather
 ///   than a transcribed constant, which makes that re-derivation optional.
 const ALIVE: &[(&str, &str)] = &[
-    ("dtoa", "vendored `nlohmann/json.hpp` only — reaches no repo C++"),
-    ("gemm_service", "needs `$CUDA_HOME/bin/nvcc`; a CUDA host, not this one"),
+    (
+        "dtoa",
+        "vendored `nlohmann/json.hpp` only — reaches no repo C++",
+    ),
+    (
+        "gemm_service",
+        "needs `$CUDA_HOME/bin/nvcc`; a CUDA host, not this one",
+    ),
 ];
 
 /// Directories with no `run.sh`, which are therefore not oracles at all.
@@ -223,8 +301,7 @@ fn every_oracle_is_classified() {
         "an oracle is listed twice across DEAD and ALIVE: {classified:?}"
     );
 
-    let unclassified: Vec<&String> =
-        on_disk.iter().filter(|n| !classified.contains(n)).collect();
+    let unclassified: Vec<&String> = on_disk.iter().filter(|n| !classified.contains(n)).collect();
     assert!(
         unclassified.is_empty(),
         "tests/oracle/{unclassified:?} has a `run.sh` and no row here.\n  \
@@ -234,8 +311,7 @@ fn every_oracle_is_classified() {
          infrastructure, which is the whole failure this file exists for."
     );
 
-    let vanished: Vec<&String> =
-        classified.iter().filter(|n| !on_disk.contains(n)).collect();
+    let vanished: Vec<&String> = classified.iter().filter(|n| !on_disk.contains(n)).collect();
     assert!(
         vanished.is_empty(),
         "{vanished:?} is classified here and has no `tests/oracle/<name>/run.sh`.\n  \
@@ -357,7 +433,11 @@ fn no_dead_oracle_is_advertised_as_runnable() {
             Some((name, std::fs::read_to_string(&path).ok()?))
         })
         .collect();
-    assert!(sources.len() > 20, "tests/ scan found only {} files", sources.len());
+    assert!(
+        sources.len() > 20,
+        "tests/ scan found only {} files",
+        sources.len()
+    );
 
     for (name, dies, ..) in DEAD {
         // A restoring oracle IS runnable, so telling a reader to run it is
@@ -369,7 +449,11 @@ fn no_dead_oracle_is_advertised_as_runnable() {
         // The imperative in every form it was found in. Matching the path
         // alone would forbid naming the script at all, and naming it is the
         // point — it is kept as the description of how the golden was taken.
-        for verb in ["Run `tests/oracle/", "run tests/oracle/", "Regenerate with `tests/oracle/"] {
+        for verb in [
+            "Run `tests/oracle/",
+            "run tests/oracle/",
+            "Regenerate with `tests/oracle/",
+        ] {
             let needle = format!("{verb}{name}/run.sh");
             for (file, text) in &sources {
                 assert!(

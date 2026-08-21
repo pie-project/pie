@@ -56,6 +56,51 @@
 //!   tracker (`device/queue.rs:1445`). One pass, many passes, many command
 //!   buffers and many submits are the same code path.
 //!
+//! ## On Metal that barrier is free, and the cost is somewhere else entirely
+//!
+//! Everything above is about `wgpu-core`, and it is right about `wgpu-core`.
+//! It is easy to read on from it to "the per-dispatch barrier is what a
+//! decode's 19.6 us a rectangle buys". On this backend's main target that is
+//! FALSE, and the two lines that settle it are:
+//!
+//! ```text
+//! wgpu-hal-*/src/metal/command.rs:582
+//!   unsafe fn transition_buffers<'a, T>(&mut self, _barriers: T) where ... {}
+//! ```
+//!
+//! An empty body. Metal has no buffer barrier to emit, so every barrier
+//! `wgpu-core` so carefully computes above costs exactly nothing here.
+//!
+//! The serialization is real, but it comes from the ENCODER:
+//!
+//! ```text
+//! wgpu-hal-*/src/metal/command.rs:1698
+//!   raw.computeCommandEncoder()
+//! ```
+//!
+//! Neither that call nor the descriptor path beside it (which exists only for
+//! timestamp queries) ever sets a dispatch type, so both take Metal's default
+//! of `MTLDispatchTypeSerial` -- under which the driver makes each dispatch
+//! wait for the previous one to COMPLETE. That drain is the flat ~19.6 us a
+//! rectangle `what_a_decode_costs_at_length` measures, unchanged by what the
+//! rectangle computes, and it is why a 480-rectangle decode is 9.8 ms while
+//! the same weights at the same bandwidth have a 2.0 ms floor.
+//!
+//! Two consequences, and they are the reason this is written here rather than
+//! in the notebook:
+//!
+//!  * **No arrangement of passes, command buffers or submits can help**, and
+//!    neither can anything about bindings or barriers. The cost is charged by
+//!    Metal per dispatch, inside the one pass this file already uses. The
+//!    conclusion below -- record everything into one pass -- stands, but for
+//!    the reason given there and not because it avoids this.
+//!  * **Only fewer dispatches help.** That is what makes `turns.rs`'s fusion
+//!    price list the whole of the decode programme rather than one option
+//!    among several, and it is what llama.cpp does differently: it opens its
+//!    encoder with `MTLDispatchTypeConcurrent` and places
+//!    `memoryBarrierWithScope` only where it needs one. `wgpu` exposes no way
+//!    to ask for that, so this driver cannot follow it there.
+//!
 //! **So [`Device::run_all`] records the whole plan into ONE compute pass**, and
 //! splitting it would buy no correctness and cost a command buffer per
 //! rectangle. That is the one place this shell is allowed to be simpler than
@@ -287,6 +332,7 @@ pub mod probe {
                             gpu * 1000.0 / launches as f64,
                             read_bytes as f64 / fires as f64,
                         );
+                        stamp_report();
                         report();
                     }
                 });
@@ -344,23 +390,196 @@ pub mod probe {
         )
     }
 
+    static STAMP_WINDOWS: AtomicU64 = AtomicU64::new(0);
+    static STAMP_LOST: AtomicU64 = AtomicU64::new(0);
+    static STAMP_FIRES: AtomicU64 = AtomicU64::new(0);
+    static STAMP_IN_NS: AtomicU64 = AtomicU64::new(0);
+    static STAMP_SPAN_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Fold one stamped fire's totals: how long the GPU spent INSIDE
+    /// dispatches, against the span from the first pass opening to the last
+    /// one closing.
+    ///
+    /// The difference between them is the whole of what the GPU does that is
+    /// not a kernel running -- encoder turnaround, barriers, and whatever else
+    /// Metal puts between two serial dispatches. That number has never been
+    /// measured directly on this backend; the 4.6 us a launch everything is
+    /// priced with came from a FUSION, which removes turnaround and work
+    /// together and cannot say which it removed.
+    /// Fold one stamped fire's totals.
+    pub fn stamp_fire(ticks: &[u64], period: f64) {
+        if ticks.len() < 2 {
+            return;
+        }
+        // A PAIR CAN COME BACK EMPTY, and the first run of this did not guard
+        // it and reported a span of exactly zero. Metal does not always have
+        // the last encoder's end-of-encoder counter written by the time the
+        // resolve in the same command buffer runs, so the final stamp reads 0
+        // -- which made the fire's largest kernel, the 37984-group lm head,
+        // report 0.0 ms and made `span` a `saturating_sub` of a bigger number.
+        // Dropped pairs are counted and printed rather than hidden, because a
+        // table that quietly omits its biggest row is worse than no table.
+        let mut inside = 0u64;
+        let mut lost = 0u64;
+        let (mut first, mut last) = (u64::MAX, 0u64);
+        for pair in ticks.chunks_exact(2) {
+            if pair[0] == 0 || pair[1] <= pair[0] {
+                lost += 1;
+                continue;
+            }
+            inside += pair[1] - pair[0];
+            first = first.min(pair[0]);
+            last = last.max(pair[1]);
+        }
+        let span = last.saturating_sub(if first == u64::MAX { last } else { first });
+        STAMP_LOST.fetch_add(lost, Relaxed);
+        let seen = STAMP_FIRES.fetch_add(1, Relaxed) + 1;
+        STAMP_IN_NS.fetch_add((inside as f64 * period) as u64, Relaxed);
+        STAMP_SPAN_NS.fetch_add((span as f64 * period) as u64, Relaxed);
+        if let Some(n) = stamp_window()
+            && seen.is_multiple_of(n)
+        {
+            let k = STAMP_WINDOWS.fetch_add(1, Relaxed);
+            eprintln!("[window {k}]");
+            stamp_report();
+            report();
+        }
+    }
+
+    /// Print and clear the stamped totals.
+    pub fn stamp_report() {
+        let fires = STAMP_FIRES.swap(0, Relaxed);
+        if fires == 0 {
+            return;
+        }
+        let inside = STAMP_IN_NS.swap(0, Relaxed) as f64 / 1e6;
+        let span = STAMP_SPAN_NS.swap(0, Relaxed) as f64 / 1e6;
+        let lost = STAMP_LOST.swap(0, Relaxed);
+        eprintln!(
+            "[stamp] fires={fires} lost={lost} inside={:.3}ms/fire span={:.3}ms/fire \
+             between={:.3}ms/fire ({:.0}%)",
+            inside / fires as f64,
+            span / fires as f64,
+            (span - inside) / fires as f64,
+            (span - inside) * 100.0 / span.max(1e-9),
+        );
+    }
+
     static DUMPED: AtomicU64 = AtomicU64::new(0);
 
     /// Time each launch on its own submission instead of recording the whole
-    /// fire into one command buffer. Costs a queue round trip per launch, which
-    /// is the price of knowing WHICH launch spends the fire's time -- wgpu
-    /// exposes no timestamp query here, and one submit means one number.
+    /// fire into one command buffer.
+    ///
+    /// **This instrument does not work for this question and is kept as a
+    /// record of that.** It costs a queue round trip per launch -- submit,
+    /// drain, wait -- and measured against the same decode it turns 9.6 ms
+    /// into 56, so ~110 us of round trip lands on top of every launch. The
+    /// kernels being asked about run in 5 to 20 us. The table it prints is
+    /// therefore ~95% instrument, and the ranking it gives is a ranking of
+    /// nothing. Use [`stamped`] instead, which reads the GPU's own clock and
+    /// submits once.
     pub fn per_launch() -> bool {
         on() && std::env::var_os("PIE_WGPU_PROBE_EACH").is_some()
     }
 
-    static COST: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>> =
-        std::sync::OnceLock::new();
+    /// Time each launch with a GPU TIMESTAMP QUERY, one compute pass apiece,
+    /// all in one command buffer and one submit.
+    ///
+    /// Independent of [`on`], because this one is worth running by itself.
+    ///
+    /// WHY A PASS PER LAUNCH. This adapter reports `TIMESTAMP_QUERY` but not
+    /// `TIMESTAMP_QUERY_INSIDE_PASSES`: Apple's `MTLCounterSamplingPoint`
+    /// supports `atStageBoundary` and not `atDispatchBoundary`, so the only
+    /// place a stamp can be written is where a compute encoder opens and
+    /// closes. One dispatch per encoder is the only way to get a per-dispatch
+    /// number out of it.
+    ///
+    /// WHAT THAT COSTS. An encoder per dispatch, where the shipped path opens
+    /// one per fire. The wall clock says what that is worth and the caller
+    /// should read it before trusting the table.
+    ///
+    /// WHAT IT BUYS THAT NOTHING ELSE DOES. The sum of the per-pass durations
+    /// against the fire's measured GPU time. Those are the same quantity taken
+    /// two ways: everything the GPU is doing that is not inside a dispatch is
+    /// the difference, and that difference is the dispatch turnaround the
+    /// `rms_rope` fusion priced indirectly at 4.6 us.
+    pub fn stamped() -> bool {
+        std::env::var_os("PIE_WGPU_STAMP").is_some()
+    }
+
+    /// How many fires a stamped window holds, from `PIE_WGPU_STAMP=<n>`, or
+    /// `None` for the one-second window `on`'s reporting thread uses.
+    ///
+    /// A WALL-CLOCK WINDOW CANNOT SWEEP A KNOB, and that is not a subtlety --
+    /// it produced a wrong answer that took a 200-sample end-to-end run to
+    /// catch. `serving.rs`'s decode bench grows its context from 512 to 717
+    /// keys across 205 tokens, so a fire late in the run costs more than a
+    /// fire early in it. A slower setting fits fewer fires in a second, so its
+    /// window covers a different, cheaper stretch of the run, and the two
+    /// settings' per-launch means are not the same measurement. Read across
+    /// `PIE_SPLITS` that error made four splits look 1.85 ms a token worse
+    /// than eight where the truth is 0.07 ms.
+    ///
+    /// Cut on a FIRE COUNT and both settings' window `k` covers the same
+    /// tokens, whatever each took to get there. That is the whole fix.
+    pub fn stamp_window() -> Option<u64> {
+        static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("PIE_WGPU_STAMP")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+        })
+    }
+
+    /// Entrypoint substrings whose dispatches `run_all` does NOT record, from
+    /// `PIE_WGPU_SKIP=<a>,<b>`. Empty unless the variable is set.
+    ///
+    /// **This computes wrong answers by construction and is a probe.** It
+    /// exists because the whole remaining decode plan is priced off ONE
+    /// number -- what deleting a fire is worth -- and that number has only
+    /// ever been INFERRED: from a straight-line fit through three qmv bank
+    /// sizes, from the cost of a kernel small enough to be assumed all
+    /// overhead, and from the residue of an attention kernel with its loop
+    /// gutted. Three routes to ~8 us, none of them a fire actually removed.
+    ///
+    /// A fold deletes the dispatch, its pipeline switch and its binds
+    /// together, so this skips all three rather than only the
+    /// `dispatch_workgroups` -- the question is what a FOLD saves, not what a
+    /// grid of zero costs. What it does not model is the work the absorbing
+    /// kernel takes on, which is why the answer is an upper bound and
+    /// `turns.rs` records it as one.
+    ///
+    /// Substring and not equality, so `PIE_WGPU_SKIP=rms_rope` reaches both
+    /// the 16-head and the 8-head instantiation, and `_bfloat16` never has to
+    /// be typed.
+    pub fn skipped() -> &'static [String] {
+        static V: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        V.get_or_init(|| {
+            std::env::var("PIE_WGPU_SKIP")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    static COST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    > = std::sync::OnceLock::new();
 
     /// Charge `nanos` to `entrypoint`.
-    pub fn charge(entrypoint: &str, grid: [u32; 3], nanos: u64) {
+    pub fn charge(entrypoint: &str, grid: [u32; 3], bytes: u64, nanos: u64) {
         let map = COST.get_or_init(Default::default);
-        let key = format!("{entrypoint} grid={grid:?}");
+        let key = format!(
+            "{entrypoint} grid={grid:?} {:.3}MiB",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
         let mut map = map.lock().expect("probe map");
         let slot = map.entry(key).or_insert((0, 0));
         slot.0 += 1;
@@ -395,7 +614,9 @@ pub mod probe {
         if !on() {
             return;
         }
-        let Some(min) = std::env::var("PIE_WGPU_DUMP").ok().and_then(|v| v.parse::<usize>().ok())
+        let Some(min) = std::env::var("PIE_WGPU_DUMP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
         else {
             return;
         };
@@ -1263,6 +1484,10 @@ pub struct Device {
     /// allocation landing at the same address -- which a pointer key would
     /// have allowed, silently and with correct-looking output.
     cached: Mutex<Cache>,
+    /// Whether this device was opened with `TIMESTAMP_QUERY`, which it is only
+    /// when `PIE_WGPU_STAMP` asked for it AND the adapter offered it. See
+    /// `probe::stamped`.
+    stamps: bool,
 }
 
 /// What [`Device::bind`] does not have to build twice.
@@ -1271,10 +1496,19 @@ pub struct Device {
 /// alive, so a plan whose shapes keep changing would otherwise pin every arena
 /// it ever bound. Past [`Cache::CEILING`] entries the whole map is dropped,
 /// which costs one cold token and cannot leak.
+/// One binding in a `@group(0)` key: the slot, the buffer, and the range of
+/// it that is bound. Four facts, so they get a name -- `clippy` refuses to
+/// let a reader parse the map below without one, and it is right to.
+type BoundRange = (u32, wgpu::Buffer, u64, u64);
+
+/// What a `@group(0)` bind group is keyed by: the layout, and the ranges
+/// bound to it in slot order.
+type StorageKey = (wgpu::BindGroupLayout, Vec<BoundRange>);
+
 #[derive(Default)]
 struct Cache {
     /// `@group(0)`, keyed by the layout and the ranges bound to it.
-    storage: HashMap<(wgpu::BindGroupLayout, Vec<(u32, wgpu::Buffer, u64, u64)>), wgpu::BindGroup>,
+    storage: HashMap<StorageKey, wgpu::BindGroup>,
     /// `@group(1)`, keyed by the layout and the BYTES. The block is small and
     /// its contents are the binding, so caching it by value also removes the
     /// `write_buffer` that used to follow every allocation.
@@ -1318,9 +1552,45 @@ fn widest_bindings() -> &'static [(&'static str, u32)] {
     })
 }
 
+/// THE PROCESS'S ONE `wgpu::Instance`, and it has to be one.
+///
+/// A `wgpu::Instance` is a `VkInstance`. This built a new one per [`Device`],
+/// which reads as harmless -- they are dropped with the `Device` and the
+/// adapter is queried through the one that made it -- and is not. Measured on
+/// this machine, opening and DROPPING a `Device` in a loop:
+///
+/// ```text
+/// 0..=9  NVIDIA GeForce RTX 4090 (DiscreteGpu)
+/// 10     llvmpipe (LLVM 21.1.8, 256 bits) (Cpu)
+/// 11     llvmpipe (LLVM 21.1.8, 256 bits) (Cpu)
+/// ```
+///
+/// The eleventh `VkInstance` is one too many for the NVIDIA ICD, so its
+/// physical device stops being enumerated; `request_adapter` then ranks what is
+/// left, Mesa's software adapter is left, and NOTHING RETURNS AN ERROR. Every
+/// caller past that point measures `llvmpipe` while printing the name of a
+/// device it does not have. `driver-wgpu`'s own suite is what found it:
+/// `serving.rs`'s tiled-GEMM parity timed out at *"the submission of 452
+/// launches: the device did not answer within 30s"*, and `hybrid_probe.rs`
+/// reported a three-row fire as carrying a NaN that the 4090 does not produce.
+///
+/// One instance, made once, shared by every `Device`. `with_env` is therefore
+/// read once too, which is the ordinary meaning of an environment variable and
+/// not a loss: `WGPU_BACKEND` picks the backend for a process.
+fn instance() -> wgpu::Instance {
+    static ONE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    ONE.get_or_init(|| {
+        wgpu::Instance::new(
+            // `with_env` so `WGPU_BACKEND=vulkan` selects one, which is how a
+            // machine with several is asked the same question twice.
+            wgpu::InstanceDescriptor::new_without_display_handle().with_env(),
+        )
+    })
+    .clone()
+}
+
 impl Device {
-    /// Open the best adapter this machine offers.
-    ///
+    /// Open the best adapter this machine offers.    ///
     /// `PowerPreference::HighPerformance`, which on a laptop with two adapters
     /// is the discrete one. Not `None`: a driver that silently picked the
     /// integrated GPU would report plausible numbers a great deal slower, and
@@ -1364,6 +1634,21 @@ impl Device {
         // test files that spell `PIE_WGPU_FALLBACK` themselves were the only
         // paths that could: no gate, no curated run and no server could reach
         // the second adapter at all.
+        //
+        // **On a RESTED machine.** The paragraph above is a measurement of one,
+        // and it does not hold once the card stops answering.
+        // `driver-wgpu/tests/hybrid_probe.rs` opens a 424 MB shell per test;
+        // by the sixth in one process, `Device::open` here returns
+        // `llvmpipe (LLVM 21.1.8, 256 bits)` with no error anywhere -- a
+        // ranking cannot rank an adapter the ICD declines to enumerate, and
+        // Mesa's is what is left. There is nothing for this function to check:
+        // from `wgpu`'s side it was handed one adapter and it took it.
+        //
+        // So RANKING never reaches a software adapter and EXHAUSTION does, and
+        // the two are indistinguishable from inside. A caller that needs the
+        // card has to say so against [`Self::info`]'s `device_type`, which is
+        // what that test file's `adapter()` now does; a caller that would
+        // rather be slow than dark keeps this.
         //
         // Reading it here makes the crate's own strongest claim -- a shader
         // that agrees on a discrete GPU and on `llvmpipe` "has been checked by
@@ -1415,11 +1700,7 @@ impl Device {
 
     /// Open one adapter, however it was chosen.
     fn request(power: wgpu::PowerPreference, fallback: bool) -> Result<Self, Unavailable> {
-        let instance = wgpu::Instance::new(
-            // `with_env` so `WGPU_BACKEND=vulkan` selects one, which is how a
-            // machine with several is asked the same question twice.
-            wgpu::InstanceDescriptor::new_without_display_handle().with_env(),
-        );
+        let instance = instance();
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: power,
             force_fallback_adapter: fallback,
@@ -1456,13 +1737,86 @@ impl Device {
             }
         }
 
+        // `PIE_WGPU_TIER=baseline` (or `fp16`, or `subgroup`) CAPS the list.
+        //
+        // A tier is an OPTIMISATION with a fallback, so the only way to price
+        // one is to run the same binary on both sides of it, and without this
+        // that means editing a `pie:instantiate` line between the two halves
+        // of an interleaved measurement -- which is a different binary, which
+        // rule three says does not compare. The cap is applied to the LIST and
+        // not to the requested features, so both sides open a device with the
+        // identical feature set and the only difference is which module the
+        // pick lands on.
+        if let Ok(name) = std::env::var("PIE_WGPU_TIER")
+            && let Some(cap) = Capability::from_tag(name.trim())
+        {
+            tiers.retain(|t| *t <= cap);
+        }
+
+        // The one feature this driver asks for that no kernel uses. It is a
+        // measurement, off unless `PIE_WGPU_STAMP` is set, and it is asked for
+        // HERE because a feature is a property of the opened device and cannot
+        // be added later. See `probe::stamped` for what it reads and why the
+        // adapter's refusal to sample inside a pass shapes the answer.
+        let stamps = probe::stamped() && features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        if stamps {
+            wanted |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
+        // AND THIS IS WHERE THE `unsafe` TOKEN GETS SIGNED.
+        //
+        // `EXPERIMENTAL_COOPERATIVE_MATRIX` is the only feature in this file's
+        // vocabulary that wgpu will not hand over without
+        // `ExperimentalFeatures::enabled()`, whose contract reads *"there may
+        // be UB-containing bugs in these apis"*. `tests/cooperative.rs` spent
+        // a whole file establishing what it buys -- 2.4x on this part's
+        // projections shape, every spot-checked output bit-exact against an
+        // f32 CPU dot over all 1024 terms -- and then handed the shipping
+        // decision over rather than taking it. This is the line that takes it.
+        //
+        // WHAT MAKES IT SAFE ENOUGH TO BE DEFAULT-ON is that it is a TIER and
+        // not a switch. The loop above only put `Capability::Matrix` in
+        // `tiers` if this adapter advertises the feature, `serve::pick` only
+        // lands on a `@matrix` module if the symbol has one, and every symbol
+        // still has a baseline module -- the `arena.rs` pin exists to keep
+        // that true. So an adapter without the feature, a browser, or
+        // `PIE_WGPU_TIER=baseline` all open a device that never touches the
+        // experimental path, and the blast radius is exactly the kernels that
+        // opted in.
+        //
+        // The token is signed only when a tier actually asked for the bit, so
+        // a machine that cannot offer it does not get an experimental device
+        // as a side effect of this driver being compiled with the arm.
+        let experimental = wanted.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+
+        // THE CRATE'S ONLY `unsafe`, AND WHAT IT IS AND IS NOT PROMISING.
+        //
+        // `ExperimentalFeatures::enabled()` is `unsafe` not because a caller
+        // can uphold something, but because wgpu is warning that the code
+        // behind the flag may itself contain UB. There is no invariant to
+        // check here: the token is an acknowledgement, and this comment is the
+        // acknowledgement. What bounds the risk is the tier system above --
+        // the token is only signed when an adapter advertised the bit AND a
+        // tier asked for it, every symbol keeps a baseline module, and
+        // `PIE_WGPU_TIER=baseline` turns the whole thing off in a running
+        // process without a rebuild.
+        #[expect(
+            unsafe_code,
+            reason = "wgpu offers no safe way to ask for a cooperative matrix"
+        )]
+        let token = if experimental {
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
+
         let errors: Arc<Mutex<Vec<(bool, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&errors);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("pie driver-wgpu"),
             required_features: wanted,
             required_limits: limits.clone(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            experimental_features: token,
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
@@ -1518,6 +1872,7 @@ impl Device {
             staging: Mutex::default(),
             arenas: Mutex::default(),
             cached: Mutex::default(),
+            stamps,
         })
     }
 
@@ -1800,18 +2155,21 @@ impl Device {
     pub fn arena(&self, bytes: u64) -> Result<Arena<'_>, Failed> {
         let span = bytes.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT).max(4);
         let taken = {
-            let mut pool = self.arenas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pool = self
+                .arenas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pool.iter()
                 .position(|held| held.size >= span && held.size <= span.saturating_mul(2))
                 .map(|at| pool.swap_remove(at))
         };
         let buffer = match taken {
             Some(held) => {
-                let mut work = self
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("arena/clear"),
-                    });
+                let mut work =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("arena/clear"),
+                        });
                 work.clear_buffer(&held.inner, 0, Some(span));
                 self.queue.submit([work.finish()]);
                 self.drained()?;
@@ -1827,7 +2185,10 @@ impl Device {
 
     /// Take an arena back, if the pool has room for it.
     fn shelve(&self, buffer: Buffer) {
-        let mut pool = self.arenas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pool = self
+            .arenas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Four, which is more than the one in-flight step this driver has ever
         // had and few enough that a pool of prefill arenas cannot be a leak.
         if pool.len() < 4 {
@@ -2011,7 +2372,7 @@ impl Device {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("readback"),
             });
-        encoder.copy_buffer_to_buffer(&buffer.inner, from, &staging, 0, Some(span));
+        encoder.copy_buffer_to_buffer(&buffer.inner, from, staging, 0, Some(span));
         self.queue.submit([encoder.finish()]);
         self.drained()?;
 
@@ -2414,6 +2775,7 @@ impl Device {
                 probe::charge(
                     &one.pipeline.entrypoint,
                     one.groups,
+                    one.buffers.iter().map(|b| b.len()).sum(),
                     began.elapsed().as_nanos() as u64,
                 );
             }
@@ -2464,9 +2826,166 @@ impl Device {
         // transformer they mostly are not -- which is the ~13 us a dispatch
         // that `kernels_wgpu::attn`'s split note measures in situ and that
         // `serve::record`'s M4 table turns into forty percent of a token.
+        //
+        // # AND IT IS NOT ABOUT PROOF. `wgpu` CANNOT ASK FOR THE OTHER ONE
+        //
+        // The sentence above implies a dependency analysis that could be won
+        // by handing `wgpu` independent dispatches. It cannot. In wgpu-hal 30,
+        // `metal/command.rs::begin_compute_pass` builds its encoder with
+        // `computeCommandEncoder()`, or with
+        // `computeCommandEncoderWithDescriptor:` when timestamp queries are
+        // available -- and BOTH give `MTLDispatchTypeSerial`. Nothing in that
+        // backend calls `computeCommandEncoderWithDispatchType:`, so
+        // `MTLDispatchTypeConcurrent` is not reachable through this API at any
+        // resource layout. Metal orders every dispatch in the pass against the
+        // previous one whether or not they touch the same memory.
+        //
+        // That is the single fact behind every "each part is free and the
+        // total is proportional anyway" result this backend has produced, and
+        // there are now nine of them across two kernels: the split attention's
+        // six probes, and `quant/qmv.wgsl`'s ALU, load-issue and grid knobs.
+        // q, k and v are three independent projections of the same vector and
+        // they run one after another because the encoder says so.
+        //
+        // It also names the structural half of the gap to `driver-metal`,
+        // which does not go through this API: `device/recording.rs` builds an
+        // indirect command buffer with
+        // `MTLIndirectCommandType::ConcurrentDispatch`, so the same 424
+        // rectangles are free to overlap there and are not here.
+        //
+        // WHAT THAT DOES *NOT* LEAVE, AND THIS PARAGRAPH USED TO GET IT WRONG.
+        //
+        // The serial encoder above is a real fact about this API and it is why
+        // no in-kernel probe can see past its own kernel. It was also read, for
+        // one commit, as meaning that dispatch TURNAROUND is where a decode's
+        // time goes: the `rms_rope` fusion removed 56 launches for 0.26 ms, and
+        // 424 x 4.6 us is 1.95 ms, a fifth of a token. Both halves of a token
+        // have since been measured directly and both say otherwise.
+        //
+        // `PIE_WGPU_PROBE` splits a fire at `submit`: 0.53 ms of encoding
+        // against 8.45 ms of GPU over 102 fires, so the CPU side is 6% -- which
+        // also retires the worry above this function that `uniform` allocates
+        // per dispatch, since both it and the bind group are cached and half a
+        // millisecond covers every launch's host work.
+        //
+        // `PIE_WGPU_STAMP` then splits the GPU half with the GPU's own clock,
+        // one timestamped pass per launch. Over a 424-launch decode the GPU is
+        // INSIDE a dispatch for 8.56 ms of the 8.86 ms between the first pass
+        // opening and the last one closing. Turnaround is 0.30 ms a fire, 3%,
+        // **0.71 us a launch** -- and that is measured with an encoder per
+        // dispatch, where the shipped path opens one for the whole fire, so it
+        // is an upper bound.
+        //
+        // So the 4.6 us the fusion bought was the KERNEL, not the launch:
+        // `rms_single_row` costs 7.9 us of GPU and the fusion deleted 56 of
+        // them. Fusion still pays. A fold that removes a launch while keeping
+        // its work is worth about 0.7 us and is not worth doing. The table of
+        // where the 8.3 ms actually goes -- the split attention alone is 32% --
+        // is in `serving.rs::what_a_decode_costs_at_length`.
+        // THE GPU'S OWN CLOCK, when `PIE_WGPU_STAMP` opened the device with it.
+        // One pass per launch and one query pair per pass; resolved into a
+        // buffer at the end of the same command buffer, so the whole thing is
+        // still ONE submit and the round trip that ruins `per_launch` is not
+        // paid. Read back after the wait, below.
+        let stamping = self.stamps && (run.len() + 2) * 2 <= wgpu::QUERY_SET_MAX_QUERIES as usize;
+        let stamps = stamping.then(|| {
+            // ONE PAIR MORE THAN THERE ARE LAUNCHES, for an EMPTY pass
+            // encoded after the last one. Metal has not written an encoder's
+            // end-of-encoder counter by the time a resolve in the same command
+            // buffer runs, so whichever pass is last comes back as a zero --
+            // and the last launch of a decode is the 37984-group lm head, the
+            // single most expensive dispatch in the fire. A trailing pass with
+            // no dispatch in it costs nothing to run and is a sacrifice: it
+            // takes the loss, and every real launch keeps its number.
+            //
+            // TWO of them, and each RUNS SOMETHING. Both details were found by
+            // dumping the raw pairs. An EMPTY pass writes no counters at all,
+            // so the first version of this sacrificed nothing and the lm head
+            // still came back 0/0; the sacrifice has to be a real dispatch,
+            // and the cheapest real dispatch to hand is the last launch again
+            // over ONE workgroup, which recomputes four rows it already wrote
+            // and is therefore idempotent. And the lag is two encoders deep,
+            // not one, so one spare only moved the hole onto its neighbour.
+            //
+            // With both, the 37984-group lm head reports for the first time --
+            // 666 us, which is the measurement that broke `qmv.wgsl`'s
+            // intercept fit. This is instrument-only code and runs only under
+            // `PIE_WGPU_STAMP`.
+            let set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("fire/stamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: ((run.len() + 2) * 2) as u32,
+            });
+            let bytes = ((run.len() + 2) * 2 * 8) as u64;
+            let into = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fire/stamps/resolved"),
+                size: bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let back = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fire/stamps/read"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (set, into, back, bytes)
+        });
+
         let mut submission: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut at = 0;
         let mut work = encoder("fire");
+        if let Some((set, into, back, bytes)) = &stamps {
+            for (index, one) in run.iter().enumerate() {
+                for copy in &shadows[index] {
+                    work.copy_buffer_to_buffer(
+                        &copy.from.inner,
+                        copy.at,
+                        &copy.into,
+                        0,
+                        Some(copy.bytes),
+                    );
+                }
+                {
+                    let mut pass = work.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("fire/stamped"),
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                            query_set: set,
+                            beginning_of_pass_write_index: Some((index * 2) as u32),
+                            end_of_pass_write_index: Some((index * 2 + 1) as u32),
+                        }),
+                    });
+                    pass.set_pipeline(&one.pipeline.pipeline);
+                    pass.set_bind_group(STORAGE_GROUP, &bound[index].storage, &[]);
+                    if let Some(block) = &bound[index].uniform {
+                        pass.set_bind_group(UNIFORM_GROUP, block, &[]);
+                    }
+                    let g = one.groups;
+                    pass.dispatch_workgroups(g[0], g[1], g[2]);
+                }
+            }
+            for spare in 0..2 {
+                let last = run.len() + spare;
+                let mut pass = work.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("fire/stamped/sacrifice"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: set,
+                        beginning_of_pass_write_index: Some((last * 2) as u32),
+                        end_of_pass_write_index: Some((last * 2 + 1) as u32),
+                    }),
+                });
+                let again = run.len() - 1;
+                pass.set_pipeline(&run[again].pipeline.pipeline);
+                pass.set_bind_group(STORAGE_GROUP, &bound[again].storage, &[]);
+                if let Some(block) = &bound[again].uniform {
+                    pass.set_bind_group(UNIFORM_GROUP, block, &[]);
+                }
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            work.resolve_query_set(set, 0..((run.len() + 2) * 2) as u32, into, 0);
+            work.copy_buffer_to_buffer(into, 0, back, 0, Some(*bytes));
+            at = run.len();
+        }
         while at < run.len() {
             if !shadows[at].is_empty() {
                 for one in &shadows[at] {
@@ -2485,14 +3004,23 @@ impl Device {
                     timestamp_writes: None,
                 });
                 loop {
-                    let groups = &bound[at];
-                    pass.set_pipeline(&run[at].pipeline.pipeline);
-                    pass.set_bind_group(STORAGE_GROUP, &groups.storage, &[]);
-                    if let Some(block) = &groups.uniform {
-                        pass.set_bind_group(UNIFORM_GROUP, block, &[]);
+                    // The probe knob. Unset, `skipped()` is empty and this is
+                    // a walk over nothing; see its doc comment for why a
+                    // wrong-answer switch lives on the shipped path.
+                    let skip = !probe::skipped().is_empty()
+                        && probe::skipped()
+                            .iter()
+                            .any(|s| run[at].pipeline.entrypoint.contains(s.as_str()));
+                    if !skip {
+                        let groups = &bound[at];
+                        pass.set_pipeline(&run[at].pipeline.pipeline);
+                        pass.set_bind_group(STORAGE_GROUP, &groups.storage, &[]);
+                        if let Some(block) = &groups.uniform {
+                            pass.set_bind_group(UNIFORM_GROUP, block, &[]);
+                        }
+                        let g = run[at].groups;
+                        pass.dispatch_workgroups(g[0], g[1], g[2]);
                     }
-                    let g = run[at].groups;
-                    pass.dispatch_workgroups(g[0], g[1], g[2]);
                     at += 1;
                     // The pass runs until the next dispatch that needs a copy,
                     // which cannot be encoded inside one.
@@ -2518,13 +3046,18 @@ impl Device {
             let skip = (offset - from) as usize;
             let span = ((len + (offset - from)).next_multiple_of(align)).min(buffer.size - from);
             self.grow_staging(span).map_err(|e| (whole, e))?;
-            let held = self
-                .staging
-                .lock()
-                .map_err(|_| (whole, Failed::Wgpu("the readback buffer was poisoned".into())))?;
-            let into = held
-                .as_ref()
-                .ok_or_else(|| (whole, Failed::Wgpu("the readback buffer went missing".into())))?;
+            let held = self.staging.lock().map_err(|_| {
+                (
+                    whole,
+                    Failed::Wgpu("the readback buffer was poisoned".into()),
+                )
+            })?;
+            let into = held.as_ref().ok_or_else(|| {
+                (
+                    whole,
+                    Failed::Wgpu("the readback buffer went missing".into()),
+                )
+            })?;
             work.copy_buffer_to_buffer(&buffer.inner, from, into, 0, Some(span));
             staged = Some((skip, span));
         }
@@ -2539,6 +3072,49 @@ impl Device {
         // is done with them.
         self.wait().map_err(|e| (whole, e))?;
         probe::record(run.len(), started, encoded);
+        if let Some((_, _, back, _)) = &stamps {
+            let slice = back.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(30)),
+            });
+            let ticks: Vec<u64> = {
+                let view = slice.get_mapped_range().expect("the stamps did not map");
+                view.chunks_exact(8)
+                    .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+                    .collect()
+            };
+            back.unmap();
+            // `get_timestamp_period` is nanoseconds per tick, and on Metal it
+            // is wgpu's hardcoded guess rather than a measured correlation --
+            // see `wgpu-hal/src/metal/adapter.rs`, which says so at length.
+            // Good enough for a SHARE, which is what this table is read for.
+            let period = f64::from(self.queue.get_timestamp_period());
+            for (index, one) in run.iter().enumerate() {
+                let (begin, end) = (ticks[index * 2], ticks[index * 2 + 1]);
+                if begin == 0 || end <= begin {
+                    continue;
+                }
+                // THE BYTES THE LAUNCH BINDS, alongside the grid. Two fires
+                // of the same entrypoint at the same grid can read wildly
+                // different amounts -- qwen3's `o` and `down` projections are
+                // both `affine_qmv_fast_residual` at [1,256,1] over 1.125 and
+                // 1.6875 MiB -- and a table keyed only by the grid averages
+                // them into a number that is neither. Bytes is also the axis
+                // `qmv.wgsl` found a qmv's rate to run on, so it is the column
+                // that makes the table answer questions instead of raising
+                // them.
+                let bytes: u64 = one.buffers.iter().map(|b| b.len()).sum();
+                probe::charge(
+                    &one.pipeline.entrypoint,
+                    one.groups,
+                    bytes,
+                    ((end - begin) as f64 * period) as u64,
+                );
+            }
+            probe::stamp_fire(&ticks, period);
+        }
         drop(bound);
         drop(shadows);
         // AFTER the wait, so the map finds a submission that has already run
@@ -2547,10 +3123,16 @@ impl Device {
             Some((skip, span)) => {
                 let watch = probe::now();
                 let held = self.staging.lock().map_err(|_| {
-                    (whole, Failed::Wgpu("the readback buffer was poisoned".into()))
+                    (
+                        whole,
+                        Failed::Wgpu("the readback buffer was poisoned".into()),
+                    )
                 })?;
                 let into = held.as_ref().ok_or_else(|| {
-                    (whole, Failed::Wgpu("the readback buffer went missing".into()))
+                    (
+                        whole,
+                        Failed::Wgpu("the readback buffer went missing".into()),
+                    )
                 })?;
                 let bytes = self.mapped(into, skip, span, read.map_or(0, |r| r.2 as usize));
                 probe::read(watch, bytes.as_ref().map_or(0, Vec::len));
@@ -2945,6 +3527,7 @@ fn feature(name: &str) -> Option<wgpu::Features> {
     match name {
         "SHADER_F16" => Some(wgpu::Features::SHADER_F16),
         "SUBGROUP" => Some(wgpu::Features::SUBGROUP),
+        "EXPERIMENTAL_COOPERATIVE_MATRIX" => Some(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX),
         _ => None,
     }
 }

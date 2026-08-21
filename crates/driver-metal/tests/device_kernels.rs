@@ -51,7 +51,10 @@ fn kernels_dir() -> PathBuf {
 fn every_shipped_kernel_compiles_on_this_device() {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no shipped kernel was compiled");
+            return;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let compiler = Compiler::new(&context).expect("compiler");
@@ -145,7 +148,10 @@ fn every_shipped_kernel_compiles_on_this_device() {
 fn every_declared_entrypoint_builds_a_pipeline_on_this_device() {
     let context = match Context::new() {
         Ok(c) => c,
-        Err(Error::NoDevice) => return,
+        Err(Error::NoDevice) => {
+            driver_metal::skip::skipped("no Metal 4 device, so no shipped kernel was compiled");
+            return;
+        }
         Err(e) => panic!("context: {e}"),
     };
     let compiler = Compiler::new(&context).expect("compiler");

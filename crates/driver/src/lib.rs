@@ -161,8 +161,9 @@ pub use lane::{
 pub use meta::{Inconsistent, Malformed, OpMeta, Problem, channel_effects, op_metadata};
 pub use params::{OpParams, Runtime as OpRuntime};
 pub use plan::{
-    ConstPortValue, ExecPlan, StagePlan, adopt_launch_package, bounded_mtp_row_base,
-    classify_exec_plan, const_port_value, port_consumes,
+    Boundaries, ConstPortValue, ExecPlan, StagePlan, adopt_launch_package,
+    adopt_launch_package_with, bounded_mtp_row_base, classify_exec_plan, const_port_value,
+    port_consumes,
 };
 pub use readiness::{Effect, NO_TICKET, Readiness, Reason, Ticket, Words, check, check_words};
 pub use registry::{

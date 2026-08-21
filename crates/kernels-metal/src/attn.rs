@@ -1,13 +1,13 @@
-use kernels::Grid;
 use kernels::BindMut;
-use kernels_macros::routine;
+use kernels::Grid;
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 use crate::routine::{
     Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
 };
+use crate::views::{AttnMask, AttnSplit, KvCache};
 use kernels::raises::Struct;
-use crate::views::{AttnMask, KvCache, AttnSplit};
 
 fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
     points
@@ -58,7 +58,7 @@ fn positive(v: i32, what: &'static str) -> Result<u32, Refusal> {
     Ok(v.unsigned_abs())
 }
 
-#[routine(canon = split_qkv)]
+#[routine(canon = split_qkv, out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -67,26 +67,37 @@ pub fn split_qkv_bf16(
     v: Out<Tensor<bf16>>,
     q_width: Const<u32>,
     kv_width: Const<u32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let packed_width = packed.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("attn/split_qkv.metal", "split_qkv_bf16").apply(Grid::of(elementwise_rows(packed_width, rows)?, [256, 1, 1])),
-        &[packed.arg(), q.arg(), k.arg(), v.arg(), q_width.arg(), kv_width.arg()],
+        Fire::at("attn/split_qkv.metal", "split_qkv_bf16")
+            .apply(Grid::of(elementwise_rows(packed_width, rows)?, [256, 1, 1])),
+        &[
+            packed.arg(),
+            q.arg(),
+            k.arg(),
+            v.arg(),
+            q_width.arg(),
+            kv_width.arg(),
+        ],
     )
 }
 
-#[routine(canon = sigmoid_gate_mul)]
+#[routine(canon = sigmoid_gate_mul, out(attn = like(attn)))]
 pub fn gate(
     ctx: &Ctx<'_>,
     attn: InOut<Tensor<bf16>>,
     gate: In<Tensor<bf16>>,
     row_stride: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = attn.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("attn/gate.metal", "gate_bfloat16").apply(Grid::of(elementwise_rows(width, rows)?, [256, 1, 1])),
+        Fire::at("attn/gate.metal", "gate_bfloat16")
+            .apply(Grid::of(elementwise_rows(width, rows)?, [256, 1, 1])),
         &[attn.arg(), gate.arg(), row_stride.arg()],
     )
 }
@@ -101,11 +112,13 @@ pub fn q_gate_split(
     qg_row_stride: Const<i32>,
     out_row_stride: Const<i32>,
     q_heads: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let rows = *rows;
     let lanes = head_grid(*head_dim, *q_heads, rows)?;
     ctx.fire(
-        Fire::at("attn/gate.metal", "q_gate_split_bfloat16").apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at("attn/gate.metal", "q_gate_split_bfloat16")
+            .apply(Grid::of(lanes, head_group(lanes))),
         &[
             qg.arg(),
             q_out.arg(),
@@ -125,9 +138,12 @@ pub fn kv_append(
     head_dim: Const<i32>,
     heads: Const<i32>,
     kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let k_cache = kvc.keys;
@@ -137,7 +153,8 @@ pub fn kv_append(
     let k_seq_stride = kvc.seq_stride;
     let lanes = head_grid(*head_dim, *heads, 1)?;
     ctx.fire(
-        Fire::at("attn/kv_write.metal", "kv_append_bfloat16").apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at("attn/kv_write.metal", "kv_append_bfloat16")
+            .apply(Grid::of(lanes, head_group(lanes))),
         &[
             k_new.arg(),
             v_new.arg(),
@@ -159,9 +176,12 @@ pub fn kv_append_paged(
     head_dim: Const<i32>,
     n_kv_heads: Const<i32>,
     kvc: In<Struct<KvCache>>,
-    tokens: Const<i32>) -> Result<(), Refusal> {
+    tokens: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let page_size = kvc.page_size;
@@ -179,7 +199,8 @@ pub fn kv_append_paged(
     let tokens = *tokens;
     let lanes = head_grid(*head_dim, *n_kv_heads, tokens)?;
     ctx.fire(
-        Fire::at("attn/kv_write.metal", "kv_append_paged_bfloat16").apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at("attn/kv_write.metal", "kv_append_paged_bfloat16")
+            .apply(Grid::of(lanes, head_group(lanes))),
         &[
             k_new.arg(),
             v_new.arg(),
@@ -201,20 +222,22 @@ pub fn kv_append_paged(
     )
 }
 
-#[routine]
+#[routine(out(out = like(logits)))]
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    cap: Const<f32>) -> Result<(), Refusal> {
+    cap: Const<f32>,
+) -> Result<(), Refusal> {
     let n = out.rows.saturating_mul(out.width);
     ctx.fire(
-        Fire::at("attn/logit_softcap.metal", "logit_softcap_bfloat16").apply(Grid::of(elementwise(n, 1)?, [256, 1, 1])),
+        Fire::at("attn/logit_softcap.metal", "logit_softcap_bfloat16")
+            .apply(Grid::of(elementwise(n, 1)?, [256, 1, 1])),
         &[logits.arg(), out.arg(), cap.arg()],
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_decode(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -229,15 +252,20 @@ pub fn sdpa_paged_decode(
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
     rows: Const<i32>,
-    split: In<Struct<AttnSplit>>) -> Result<(), Refusal> {
+    split: In<Struct<AttnSplit>>,
+) -> Result<(), Refusal> {
     // This plane fires unsplit; the split policy is another driver's.
     let _ = split;
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -245,7 +273,11 @@ pub fn sdpa_paged_decode(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -288,7 +320,7 @@ pub fn sdpa_paged_decode(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_decode_sink(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -304,15 +336,20 @@ pub fn sdpa_paged_decode_sink(
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
     rows: Const<i32>,
-    split: In<Struct<AttnSplit>>) -> Result<(), Refusal> {
+    split: In<Struct<AttnSplit>>,
+) -> Result<(), Refusal> {
     // This plane fires unsplit; the split policy is another driver's.
     let _ = split;
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -320,7 +357,11 @@ pub fn sdpa_paged_decode_sink(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -357,7 +398,7 @@ pub fn sdpa_paged_decode_sink(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_tiled(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -371,13 +412,18 @@ pub fn sdpa_paged_tiled(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>) -> Result<(), Refusal> {
+    n_rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -385,7 +431,11 @@ pub fn sdpa_paged_tiled(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -429,7 +479,7 @@ pub fn sdpa_paged_tiled(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_tiled_sink(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -444,13 +494,18 @@ pub fn sdpa_paged_tiled_sink(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>) -> Result<(), Refusal> {
+    n_rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -458,7 +513,11 @@ pub fn sdpa_paged_tiled_sink(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -510,13 +569,18 @@ pub fn sdpa_paged_tiled_strided(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>) -> Result<(), Refusal> {
+    n_rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -524,7 +588,11 @@ pub fn sdpa_paged_tiled_strided(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -569,7 +637,7 @@ pub fn sdpa_paged_tiled_strided(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_mma(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -583,13 +651,18 @@ pub fn sdpa_paged_mma(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>) -> Result<(), Refusal> {
+    n_rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -597,7 +670,11 @@ pub fn sdpa_paged_mma(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -636,7 +713,7 @@ pub fn sdpa_paged_mma(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_paged_mma_sink(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -651,13 +728,18 @@ pub fn sdpa_paged_mma_sink(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>) -> Result<(), Refusal> {
+    n_rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     if maskv.ptr.is_null() {
-        return Err(Refusal::Null { what: "the mask view this statement names" });
+        return Err(Refusal::Null {
+            what: "the mask view this statement names",
+        });
     }
     let maskv = unsafe { &*maskv.ptr };
     let page_size = kvc.page_size;
@@ -665,7 +747,11 @@ pub fn sdpa_paged_mma_sink(
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
 
-    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let gqa_factor = if *n_kv_heads > 0 {
+        *q_heads / *n_kv_heads
+    } else {
+        0
+    };
     let position_ids = positions.ptr;
     let req_of_token = request_of_token.ptr;
     let kv_page_indices = kvc.page_indices;
@@ -703,7 +789,7 @@ pub fn sdpa_paged_mma_sink(
     )
 }
 
-#[routine]
+#[routine(out(out = like(queries)))]
 pub fn sdpa_vector_decode(
     ctx: &Ctx<'_>,
     queries: In<Tensor<bf16>>,
@@ -713,16 +799,23 @@ pub fn sdpa_vector_decode(
     q_heads: Const<i32>,
     kvc: In<Struct<KvCache>>,
     n_kv_heads: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let keys = kvc.keys;
     let values = kvc.values;
 
     let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 { *q_heads / n_kv_heads } else { 0 };
+    let gqa_factor = if n_kv_heads > 0 {
+        *q_heads / n_kv_heads
+    } else {
+        0
+    };
     let n = out.width;
     let k_head_stride = kvc.head_stride;
     let k_seq_stride = kvc.seq_stride;
@@ -768,16 +861,23 @@ pub fn sdpa_vector_decode_swa(
     o_row_stride: Const<i32>,
     kvc: In<Struct<KvCache>>,
     n_kv_heads: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let keys = kvc.keys;
     let values = kvc.values;
 
     let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 { *q_heads / n_kv_heads } else { 0 };
+    let gqa_factor = if n_kv_heads > 0 {
+        *q_heads / n_kv_heads
+    } else {
+        0
+    };
     let n = out.width;
     let k_head_stride = kvc.head_stride;
     let k_seq_stride = kvc.seq_stride;
@@ -826,16 +926,23 @@ pub fn sdpa_vector_decode_sink(
     o_row_stride: Const<i32>,
     kvc: In<Struct<KvCache>>,
     n_kv_heads: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
-        return Err(Refusal::Null { what: "the kv view this statement names" });
+        return Err(Refusal::Null {
+            what: "the kv view this statement names",
+        });
     }
     let kvc = unsafe { &*kvc.ptr };
     let keys = kvc.keys;
     let values = kvc.values;
 
     let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 { *q_heads / n_kv_heads } else { 0 };
+    let gqa_factor = if n_kv_heads > 0 {
+        *q_heads / n_kv_heads
+    } else {
+        0
+    };
     let n = out.width;
     let k_head_stride = kvc.head_stride;
     let k_seq_stride = kvc.seq_stride;

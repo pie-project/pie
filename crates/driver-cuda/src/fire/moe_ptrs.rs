@@ -2,7 +2,6 @@
 //! kept as a driver op since the six pointer arrays must outlive normal trace
 //! liveness across both grouped GEMMs, kept alive via [`MoePtrArena`].
 
-
 use std::ffi::c_void;
 
 use crate::fire::sideband_arena::DeviceMemory;
@@ -291,21 +290,49 @@ pub unsafe fn build<M: DeviceMemory>(
     // `moe_intermediate`, `out` takes `hidden`.
     let fired = kernels_cuda::moe::build_moe_ptrs_aligned_bf16(
         &ctx,
-        kernels::routine::In { ptr: expert_ids.cast::<i32>(), rows: 0, width: 0 },
-        kernels::routine::Const { v: banks.gate_up.cast::<bf16>() },
-        kernels::routine::Const { v: banks.down.cast::<bf16>() },
-        kernels::routine::In { ptr: aligned_in.cast::<bf16>(), rows: 0, width: 0 },
-        kernels::routine::Out { ptr: stage.gate_up.cast::<bf16>(), rows: 0, width: 0 },
-        kernels::routine::Out { ptr: stage.act.cast::<bf16>(), rows: 0, width: bounds.moe_intermediate },
-        kernels::routine::Out { ptr: stage.out.cast::<bf16>(), rows: 0, width: bounds.hidden },
+        kernels::routine::In {
+            ptr: expert_ids.cast::<i32>(),
+            rows: 0,
+            width: 0,
+        },
+        kernels::routine::Const {
+            v: banks.gate_up.cast::<bf16>(),
+        },
+        kernels::routine::Const {
+            v: banks.down.cast::<bf16>(),
+        },
+        kernels::routine::In {
+            ptr: aligned_in.cast::<bf16>(),
+            rows: 0,
+            width: 0,
+        },
+        kernels::routine::Out {
+            ptr: stage.gate_up.cast::<bf16>(),
+            rows: 0,
+            width: 0,
+        },
+        kernels::routine::Out {
+            ptr: stage.act.cast::<bf16>(),
+            rows: 0,
+            width: bounds.moe_intermediate,
+        },
+        kernels::routine::Out {
+            ptr: stage.out.cast::<bf16>(),
+            rows: 0,
+            width: bounds.hidden,
+        },
         arrays.a_gu.cast::<*const bf16>(),
         arrays.b_gu.cast::<*const bf16>(),
         arrays.c_gu.cast::<*mut bf16>(),
         arrays.a_dn.cast::<*const bf16>(),
         arrays.b_dn.cast::<*const bf16>(),
         arrays.c_dn.cast::<*mut bf16>(),
-        kernels::routine::Const { v: banks.shared_gate_up.cast::<bf16>() },
-        kernels::routine::Const { v: banks.shared_down.cast::<bf16>() },
+        kernels::routine::Const {
+            v: banks.shared_gate_up.cast::<bf16>(),
+        },
+        kernels::routine::Const {
+            v: banks.shared_down.cast::<bf16>(),
+        },
         bounds.max_blocks,
         bounds.block_size,
         bounds.routed_blocks,

@@ -5,7 +5,6 @@ use super::{Device, Error, Plan, Sizes, Workspace};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-
     pub qo_indptr: &'a [i32],
     pub kv_indptr: &'a [i32],
     pub total_num_rows: u32,
@@ -52,7 +51,6 @@ impl Request<'_> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Split {
-
     pub split_kv: bool,
     pub new_batch_size: u32,
     pub padded_batch_size: u64,
@@ -70,41 +68,40 @@ pub fn split_qo_kv_indptr(
     max_batch_size_if_split: u32,
     cc_major: i32,
 ) -> Result<Split, Error> {
-
     #[must_use]
     pub fn binary_search_kv_chunk_size(
-    enable_cuda_graph: bool,
-    max_batch_size_if_split: u32,
-    packed_qo_len_arr: &[i64],
-    kv_len_arr: &[i64],
-    qo_chunk_size: u32,
-    min_kv_chunk_size: i64,
+        enable_cuda_graph: bool,
+        max_batch_size_if_split: u32,
+        packed_qo_len_arr: &[i64],
+        kv_len_arr: &[i64],
+        qo_chunk_size: u32,
+        min_kv_chunk_size: i64,
     ) -> (bool, i64) {
-    let batch_size = packed_qo_len_arr.len();
-    let mut max_kv_len: i64 = 1;
-    for &kv_len in kv_len_arr {
-    max_kv_len = max_kv_len.max(kv_len);
-    }
+        let batch_size = packed_qo_len_arr.len();
+        let mut max_kv_len: i64 = 1;
+        for &kv_len in kv_len_arr {
+            max_kv_len = max_kv_len.max(kv_len);
+        }
 
-    let mut low = min_kv_chunk_size;
-    let mut high = max_kv_len;
-    const MIN_KV_LEN: i64 = 1;
-    while low < high {
-    let mid = (low + high) / 2;
-    let mut new_batch_size: i64 = 0;
-    for i in 0..batch_size {
-    new_batch_size = new_batch_size.wrapping_add(
-    ceil_div_i64(packed_qo_len_arr[i], i64::from(qo_chunk_size))
-    .wrapping_mul(ceil_div_i64(kv_len_arr[i].max(MIN_KV_LEN), mid)),
-    );
-    }
-    if new_batch_size > i64::from(max_batch_size_if_split) {
-    low = mid + 1;
-    } else {
-    high = mid;
-    }
-    }
-    (enable_cuda_graph || low < max_kv_len, low)
+        let mut low = min_kv_chunk_size;
+        let mut high = max_kv_len;
+        const MIN_KV_LEN: i64 = 1;
+        while low < high {
+            let mid = (low + high) / 2;
+            let mut new_batch_size: i64 = 0;
+            for i in 0..batch_size {
+                new_batch_size = new_batch_size.wrapping_add(
+                    ceil_div_i64(packed_qo_len_arr[i], i64::from(qo_chunk_size))
+                        .wrapping_mul(ceil_div_i64(kv_len_arr[i].max(MIN_KV_LEN), mid)),
+                );
+            }
+            if new_batch_size > i64::from(max_batch_size_if_split) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        (enable_cuda_graph || low < max_kv_len, low)
     }
 
     let batch_size = req.batch_size as usize;
@@ -138,7 +135,10 @@ pub fn split_qo_kv_indptr(
     let cta_tile_q: u32;
     let total_num_tiles_q: u32;
     if req.enable_cuda_graph {
-        let max_seq_len = req.total_num_rows.wrapping_sub(req.batch_size).wrapping_add(1);
+        let max_seq_len = req
+            .total_num_rows
+            .wrapping_sub(req.batch_size)
+            .wrapping_add(1);
         let max_qo_len = u64::from(max_seq_len) * u64::from(gqa_group_size);
         cta_tile_q = fa2_determine_cta_tile_q(max_qo_len as i64, req.head_dim_vo, cc_major);
         total_num_tiles_q =
@@ -149,7 +149,9 @@ pub fn split_qo_kv_indptr(
         if batch_size == 0 {
             return Err(Error::EmptyBatch);
         }
-        let sum_packed_qo_len: i64 = packed_qo_len_arr.iter().fold(0i64, |a, b| a.wrapping_add(*b));
+        let sum_packed_qo_len: i64 = packed_qo_len_arr
+            .iter()
+            .fold(0i64, |a, b| a.wrapping_add(*b));
         let avg_packed_qo_len = sum_packed_qo_len / i64::from(req.batch_size);
         cta_tile_q = fa2_determine_cta_tile_q(avg_packed_qo_len, req.head_dim_vo, cc_major);
         total_num_tiles_q = packed_qo_len_arr.iter().fold(0u32, |acc, &len| {
@@ -200,8 +202,11 @@ pub fn split_qo_kv_indptr(
         let packed_qo_len = packed_qo_len_arr[request_idx];
         let num_tiles_q = ceil_div_i64(packed_qo_len, i64::from(cta_tile_q));
         let kv_len = i64::from((effective_kv_len_arr[request_idx] as i32).max(1));
-        let num_chunks_kv =
-            if req.disable_split_kv { 1 } else { ceil_div_i64(kv_len, kv_chunk_size) };
+        let num_chunks_kv = if req.disable_split_kv {
+            1
+        } else {
+            ceil_div_i64(kv_len, kv_chunk_size)
+        };
         if req.fixed_split_size > 0 && !req.disable_split_kv {
             split_kv = split_kv || num_chunks_kv > 1;
         }
@@ -216,7 +221,9 @@ pub fn split_qo_kv_indptr(
 
         let qo_len = packed_qo_len / i64::from(gqa_group_size);
         for _ in 0..qo_len {
-            let back = *merge_indptr.last().expect("merge_indptr starts with a zero");
+            let back = *merge_indptr
+                .last()
+                .expect("merge_indptr starts with a zero");
             merge_indptr.push(i64::from(back).wrapping_add(num_chunks_kv) as i32);
         }
         let back = *o_indptr.last().expect("o_indptr starts with a zero");
@@ -261,7 +268,10 @@ pub fn plan(
 
 pub fn workspace_size(req: &Request<'_>, device: &Device) -> Result<Sizes, Error> {
     let plan = plan_impl(req, device, Workspace::unbounded(), Staging::sizing())?;
-    Ok(Sizes { float_bytes: plan.float_bytes, int_bytes: plan.int_bytes })
+    Ok(Sizes {
+        float_bytes: plan.float_bytes,
+        int_bytes: plan.int_bytes,
+    })
 }
 
 fn plan_impl(
@@ -296,8 +306,11 @@ fn plan_impl(
         int_alloc.alloc(4 * padded, 16, "batch_prefill_qo_tile_indices")? as i64;
     info.kv_tile_indices_offset =
         int_alloc.alloc(4 * padded, 16, "batch_prefill_kv_tile_indices")? as i64;
-    info.o_indptr_offset =
-        int_alloc.alloc(4 * (req.batch_size as usize + 1), 16, "batch_prefill_o_indptr")? as i64;
+    info.o_indptr_offset = int_alloc.alloc(
+        4 * (req.batch_size as usize + 1),
+        16,
+        "batch_prefill_o_indptr",
+    )? as i64;
     info.kv_chunk_size_ptr_offset =
         int_alloc.alloc(4, 1, "batch_prefill_kv_chunk_size_ptr")? as i64;
 

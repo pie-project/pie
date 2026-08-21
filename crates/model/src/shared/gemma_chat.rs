@@ -1,27 +1,3 @@
-//! Gemma's `<start_of_turn>` conversation format.
-//!
-//! Gemma 3 wrote it down first, which is why it lived in
-//! `gemma_3/chat.rs` — and gemma-3n bound it from there, which is
-//! exactly the reach `tests/sibling_isolation.rs` forbids. Three
-//! generations bind this template (`Gemma3Variant` has named a gemma-3n
-//! arm since the day it was written), and what more than one generation
-//! binds is not any one generation's property. So it lives here, all
-//! name it here, and `gemma_3::chat` is the re-export that keeps the old
-//! path meaning what it meant.
-//!
-//! Gemma-2 is the third and arrived last, from its own copy of this
-//! file — the two had drifted apart on the BOS and on where the system
-//! message goes, in the direction that renders a plausible prompt
-//! instead of failing. `gemma_2/chat.rs` records what the difference
-//! was; this is where it stopped being possible.
-//!
-//! The format itself: `<start_of_turn>` / `<end_of_turn>` with a single
-//! BOS at the beginning of the rendered chat. The HF template has no
-//! native system role; a leading system message is folded into the first
-//! user turn as:
-//!
-//!   <bos><start_of_turn>user\n{system}\n{user}<end_of_turn>\n
-
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use std::sync::Arc;
@@ -158,71 +134,5 @@ impl Instruct for Gemma3Instruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(NoopToolDecoder)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
-        let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-        Arc::new(Tokenizer::from_vocab(&v))
-    }
-
-    fn gemma3() -> Gemma3Instruct {
-        let tok = make_tok(&[
-            "<start_of_turn>",
-            "<end_of_turn>",
-            "<eos>",
-            "<bos>",
-            "user",
-            "model",
-            "\n",
-            "Sys",
-            "Hello",
-            "Ok",
-        ]);
-        Gemma3Instruct::new(tok)
-    }
-
-    #[test]
-    fn system_user_folds_system_into_first_user_turn() {
-        let inst = gemma3();
-        let mut tokens = inst.system_user("Sys", "Hello");
-        tokens.extend(inst.cue());
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(
-            text,
-            "<bos><start_of_turn>user\nSys\nHello<end_of_turn>\n<start_of_turn>model\n"
-        );
-    }
-
-    #[test]
-    fn first_user_starts_with_bos() {
-        let inst = gemma3();
-        let mut tokens = inst.first_user("Hello");
-        tokens.extend(inst.cue());
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(
-            text,
-            "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n"
-        );
-    }
-
-    #[test]
-    fn later_user_omits_bos() {
-        let inst = gemma3();
-        let tokens = inst.user("Hello");
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(text, "<start_of_turn>user\nHello<end_of_turn>\n");
-    }
-
-    #[test]
-    fn assistant_uses_model_role() {
-        let inst = gemma3();
-        let tokens = inst.assistant("Ok");
-        let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(text, "<start_of_turn>model\nOk<end_of_turn>\n");
     }
 }

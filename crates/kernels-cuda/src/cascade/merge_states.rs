@@ -1,20 +1,17 @@
-
 use std::ffi::c_void;
 
 use crate::jit::Ctx;
-use kernels::Refusal;
 use crate::jit::abi::bf16;
+use kernels::Refusal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub enum Merged {
-
     Launched,
     Declined(Refusal),
 }
 
 impl Merged {
-
     pub fn expect_launched(self, what: &str) {
         if let Self::Declined(why) = self {
             panic!("{what}: the split-KV merge declined: {why}");
@@ -29,7 +26,6 @@ impl Merged {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VarLen {
-
     pub v: u64,
     pub s: u64,
     pub indptr: u64,
@@ -41,10 +37,15 @@ pub struct VarLen {
     pub head_dim: u32,
 }
 
+/// # Safety
+///
+/// Every `u64` in `job` is a DEVICE ADDRESS, not a handle -- they are cast
+/// to pointers below without a check -- and each must address the extent
+/// `job`'s `max_seq_len`, `num_heads` and `head_dim` state. `stream` must
+/// be live in the current context.
 pub unsafe fn variable_length(job: VarLen, stream: *mut c_void) -> Merged {
-
     fn ptr<T>(addr: u64) -> *mut T {
-    addr as usize as *mut T
+        addr as usize as *mut T
     }
 
     let ctx = unsafe { Ctx::on(stream) };

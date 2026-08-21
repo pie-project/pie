@@ -1,8 +1,10 @@
 use kernels::Grid;
-use kernels_macros::routine;
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
-use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows};
+use crate::routine::{
+    Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows,
+};
 
 fn affine_point(group: i32, bits: i32) -> Result<usize, Refusal> {
     let g = match group {
@@ -38,7 +40,8 @@ pub fn embed_gather_4bit(
     out: Out<Tensor<bf16>>,
     group: Const<i32>,
     bits: Const<i32>,
-    token_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    token_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     ctx.fire(
@@ -52,8 +55,16 @@ pub fn embed_gather_4bit(
                 "embed_gather_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(Grid::of(elementwise(hidden, 1)?, [256, 1, 1])),
-        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
+        )
+        .apply(Grid::of(elementwise(hidden, 1)?, [256, 1, 1])),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+        ],
     )
 }
 
@@ -67,7 +78,8 @@ pub fn embed_gather_mb_4bit(
     group: Const<i32>,
     bits: Const<i32>,
     token_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     let rows = *rows;
@@ -82,8 +94,16 @@ pub fn embed_gather_mb_4bit(
                 "embed_gather_mb_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(Grid::of(elementwise_rows(hidden, rows)?, [256, 1, 1])),
-        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
+        )
+        .apply(Grid::of(elementwise_rows(hidden, rows)?, [256, 1, 1])),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+        ],
     )
 }
 
@@ -97,7 +117,8 @@ pub fn embed_gather_scaled_4bit(
     embed_scale: Const<f32>,
     group: Const<i32>,
     bits: Const<i32>,
-    token_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    token_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     ctx.fire(
@@ -111,7 +132,8 @@ pub fn embed_gather_scaled_4bit(
                 "embed_gather_scaled_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_scaled_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(Grid::of(elementwise(hidden, 1)?, [256, 1, 1])),
+        )
+        .apply(Grid::of(elementwise(hidden, 1)?, [256, 1, 1])),
         &[
             w.arg(),
             scales.arg(),
@@ -135,7 +157,8 @@ pub fn embed_gather_scaled_mb_4bit(
     group: Const<i32>,
     bits: Const<i32>,
     token_ids: In<Tensor<i32>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let id = token_ids.ptr;
     let hidden = out.width;
     let rows = *rows;
@@ -150,7 +173,8 @@ pub fn embed_gather_scaled_mb_4bit(
                 "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_4",
                 "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_8",
             ][affine_point(*group, *bits)?],
-        ).apply(Grid::of(elementwise_rows(hidden, rows)?, [256, 1, 1])),
+        )
+        .apply(Grid::of(elementwise_rows(hidden, rows)?, [256, 1, 1])),
         &[
             w.arg(),
             scales.arg(),
@@ -163,18 +187,20 @@ pub fn embed_gather_scaled_mb_4bit(
     )
 }
 
-#[routine]
+#[routine(out(out = like(proj)))]
 pub fn ple_combine(
     ctx: &Ctx<'_>,
     proj: In<Tensor<bf16>>,
     token: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
     inv_sqrt2: Const<f32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+) -> Result<(), Refusal> {
     let width = proj.width;
     let rows = *rows;
     ctx.fire(
-        Fire::at("layout/ple_combine.metal", "ple_combine_bfloat16").apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
+        Fire::at("layout/ple_combine.metal", "ple_combine_bfloat16")
+            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
         &[proj.arg(), token.arg(), out.arg(), inv_sqrt2.arg()],
     )
 }
@@ -187,13 +213,17 @@ pub fn row_gather(
     width: Const<u32>,
     sampling_indices: In<Tensor<u32>>,
     count: Const<u32>,
-    row_count: Const<i32>) -> Result<(), Refusal> {
+    row_count: Const<i32>,
+) -> Result<(), Refusal> {
     let rows = sampling_indices.ptr;
 
     let count = *count;
     let row_count = *row_count;
     ctx.fire(
-        Fire::at("layout/row_gather.metal", "row_gather_bfloat16").apply(Grid::of(elementwise_rows(input.width, row_count)?, [256, 1, 1])),
+        Fire::at("layout/row_gather.metal", "row_gather_bfloat16").apply(Grid::of(
+            elementwise_rows(input.width, row_count)?,
+            [256, 1, 1],
+        )),
         &[input.arg(), out.arg(), rows.arg(), width.arg(), count.arg()],
     )
 }

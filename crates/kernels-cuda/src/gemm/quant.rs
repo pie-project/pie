@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -51,7 +50,6 @@ pub mod quant_kind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct WeightView {
-
     pub data: *const c_void,
     pub dtype: i32,
     pub nbytes: usize,
@@ -102,7 +100,10 @@ fn free_device_memory(ptr: *mut c_void) {
 fn stream_synchronize(stream: *mut c_void) {
     use cudarc::runtime::sys::{cudaError, cudaStreamSynchronize};
     let code = unsafe { cudaStreamSynchronize(stream.cast()) };
-    assert!(code == cudaError::cudaSuccess, "cudaStreamSynchronize failed with {code:?}");
+    assert!(
+        code == cudaError::cudaSuccess,
+        "cudaStreamSynchronize failed with {code:?}"
+    );
 }
 
 #[derive(Debug)]
@@ -115,7 +116,12 @@ struct GrowScratch {
 
 impl GrowScratch {
     const fn new(name: &'static str) -> Self {
-        Self { ptr: std::ptr::null_mut(), bytes: 0, sealed: false, name }
+        Self {
+            ptr: std::ptr::null_mut(),
+            bytes: 0,
+            sealed: false,
+            name,
+        }
     }
 
     fn reserve(&mut self, want: usize) {
@@ -194,8 +200,7 @@ impl LtCtx {
             {
                 self.compute_capability_major = prop.major;
 
-                self.fp8_native_supported =
-                    prop.major > 8 || (prop.major == 8 && prop.minor >= 9);
+                self.fp8_native_supported = prop.major > 8 || (prop.major == 8 && prop.minor >= 9);
             }
         }
     }
@@ -235,7 +240,6 @@ unsafe impl Send for DequantWeightCache {}
 
 impl DequantWeightCache {
     fn new() -> Self {
-
         let mut free_bytes: usize = 0;
         let mut total_bytes: usize = 0;
         let budget =
@@ -246,7 +250,12 @@ impl DequantWeightCache {
             } else {
                 0
             };
-        Self { entries: HashMap::new(), used: 0, budget, fill_stream: None }
+        Self {
+            entries: HashMap::new(),
+            used: 0,
+            budget,
+            fill_stream: None,
+        }
     }
 
     fn get(&mut self, key: DequantKey, bytes: usize) -> Option<(*mut c_void, bool)> {
@@ -304,8 +313,11 @@ pub fn validate_quant_weight_view(api: &str, w: &WeightView, n: i32, k: i32) {
 
     let is_nibble_packed = w.dtype == dtype::INT4_PACKED || w.dtype == dtype::MXFP4_PACKED;
     let nk = (n as usize) * (k as usize);
-    let expected_weight_bytes =
-        if is_nibble_packed { (nk + 1) / 2 } else { nk * dtype_bytes(w.dtype) };
+    let expected_weight_bytes = if is_nibble_packed {
+        (nk + 1) / 2
+    } else {
+        nk * dtype_bytes(w.dtype)
+    };
     assert!(
         w.nbytes >= expected_weight_bytes,
         "{api}: quant weight buffer is smaller than GEMM shape requires; have {} bytes, \
@@ -425,7 +437,6 @@ unsafe fn gemm_bf16(
     k: i32,
     beta: f32,
 ) {
-
     unsafe {
         super::dense::act_x_wt_bf16(handle, act, w, y, m, n, k, beta);
     }
@@ -446,16 +457,15 @@ unsafe fn dequant_then_bf16(
     stream: *mut c_void,
     group_size: i32,
 ) {
-
     fn stream_is_capturing(stream: *mut c_void) -> bool {
-    use cudarc::runtime::sys::{cudaError, cudaStreamCaptureStatus, cudaStreamIsCapturing};
-    let mut status = cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
-    let code = unsafe { cudaStreamIsCapturing(stream.cast(), &mut status) };
-    if code != cudaError::cudaSuccess {
-    let _ = unsafe { cudarc::runtime::sys::cudaGetLastError() };
-    return false;
-    }
-    status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
+        use cudarc::runtime::sys::{cudaError, cudaStreamCaptureStatus, cudaStreamIsCapturing};
+        let mut status = cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+        let code = unsafe { cudaStreamIsCapturing(stream.cast(), &mut status) };
+        if code != cudaError::cudaSuccess {
+            let _ = unsafe { cudarc::runtime::sys::cudaGetLastError() };
+            return false;
+        }
+        status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
     }
 
     let weight_elems = (n as usize) * (k as usize);
@@ -476,7 +486,6 @@ unsafe fn dequant_then_bf16(
 
     let (bf16_w, fill_stream) = match cached {
         Some((ptr, false)) => {
-
             unsafe { gemm_bf16(handle, act, ptr, y, m, n, k, beta) };
             return;
         }
@@ -489,41 +498,65 @@ unsafe fn dequant_then_bf16(
             (ptr, fs)
         }
 
-        None => (with_lt_ctx(|ctx| ctx.dequant.ensure(weight_elems * 2)), stream),
+        None => (
+            with_lt_ctx(|ctx| ctx.dequant.ensure(weight_elems * 2)),
+            stream,
+        ),
     };
 
     if scale_kind == quant_kind::PER_GROUP && group_size > 0 {
-
         empty_or_panic("quant::dequant_fp8_e4m3_to_bf16_per_group", unsafe {
             let ctx = crate::jit::Ctx::on(fill_stream);
             crate::quant::dequant_fp8_e4m3_to_bf16_per_group(
                 &ctx,
-                kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
+                kernels::routine::In {
+                    ptr: w_fp8.cast(),
+                    rows: 0,
+                    width: 0,
+                },
                 // The routine reads its column extent off this width, and the
                 // caller's weight is `n` rows of `k` -- a zero here launched
                 // nothing and left the dequant cache holding uninitialised
                 // bf16.
-                kernels::routine::Out { ptr: bf16_w.cast(), rows: n, width: k },
-                kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
+                kernels::routine::Out {
+                    ptr: bf16_w.cast(),
+                    rows: n,
+                    width: k,
+                },
+                kernels::routine::In {
+                    ptr: w_scale_fp32_dev.cast(),
+                    rows: 0,
+                    width: 0,
+                },
                 kernels::routine::Const { v: group_size },
                 kernels::routine::Const { v: n },
             )
         });
     } else if scale_kind == quant_kind::PER_CHANNEL {
-
         empty_or_panic("quant::dequant_fp8_e4m3_to_bf16_per_channel", unsafe {
             let ctx = crate::jit::Ctx::on(fill_stream);
             crate::quant::dequant_fp8_e4m3_to_bf16_per_channel(
                 &ctx,
-                kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
-                kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
+                kernels::routine::In {
+                    ptr: w_fp8.cast(),
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::Out {
+                    ptr: bf16_w.cast(),
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::In {
+                    ptr: w_scale_fp32_dev.cast(),
+                    rows: 0,
+                    width: 0,
+                },
                 kernels::routine::Const { v: n },
                 kernels::routine::Const { v: k },
             )
         });
     } else {
-
         let mut scale: f32 = 0.0;
         use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
         let code = unsafe {
@@ -545,8 +578,16 @@ unsafe fn dequant_then_bf16(
             let ctx = crate::jit::Ctx::on(fill_stream);
             crate::quant::dequant_fp8_e4m3_to::<bf16>(
                 &ctx,
-                kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                kernels::routine::In {
+                    ptr: w_fp8.cast(),
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::Out {
+                    ptr: bf16_w.cast(),
+                    rows: 0,
+                    width: 0,
+                },
                 kernels::routine::Const { v: scale },
                 kernels::routine::Const { v: n },
                 kernels::routine::Const { v: k },
@@ -603,7 +644,6 @@ unsafe fn blockwise_w8a8(
     stream: *mut c_void,
     group_size: i32,
 ) -> bool {
-
     const SCALE_MODE_VEC128_32F: i32 = 4;
 
     const SCALE_MODE_BLK128X128_32F: i32 = 5;
@@ -670,10 +710,18 @@ unsafe fn blockwise_w8a8(
         &act_scale_const,
     );
 
-    let a_layout =
-        LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
-    let b_layout =
-        LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, m as u64, k as i64);
+    let a_layout = LtMatrixLayout::new(
+        lt::cudaDataType::CUDA_R_8F_E4M3,
+        k as u64,
+        n as u64,
+        k as i64,
+    );
+    let b_layout = LtMatrixLayout::new(
+        lt::cudaDataType::CUDA_R_8F_E4M3,
+        k as u64,
+        m as u64,
+        k as i64,
+    );
     let d_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_16BF, n as u64, m as u64, n as i64);
     let pref = LtMatmulPref::new(workspace_bytes);
 
@@ -748,14 +796,30 @@ unsafe fn fp8_e4m3_w_bf16_act(
 
     if scale_kind == quant_kind::PER_GROUP
         && unsafe {
-            blockwise_w8a8(act, w_fp8, w_scale_fp32_dev, y, m, n, k, beta, stream, group_size)
+            blockwise_w8a8(
+                act,
+                w_fp8,
+                w_scale_fp32_dev,
+                y,
+                m,
+                n,
+                k,
+                beta,
+                stream,
+                group_size,
+            )
         }
     {
         return;
     }
 
     let (native, handle_lt, workspace, workspace_bytes) = with_lt_ctx(|ctx| {
-        (ctx.fp8_native_supported, ctx.handle, ctx.workspace, ctx.workspace_bytes)
+        (
+            ctx.fp8_native_supported,
+            ctx.handle,
+            ctx.workspace,
+            ctx.workspace_bytes,
+        )
     });
 
     if !native || scale_kind == quant_kind::PER_CHANNEL || scale_kind == quant_kind::PER_GROUP {
@@ -792,15 +856,22 @@ unsafe fn fp8_e4m3_w_bf16_act(
     );
 
     let fast_accum: i8 = 1;
-    desc.set(lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum);
+    desc.set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+        &fast_accum,
+    );
 
     desc.set(
         lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
         &w_scale_fp32_dev,
     );
 
-    let a_layout =
-        LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
+    let a_layout = LtMatrixLayout::new(
+        lt::cudaDataType::CUDA_R_8F_E4M3,
+        k as u64,
+        n as u64,
+        k as i64,
+    );
     let b_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_16BF, k as u64, m as u64, k as i64);
     let d_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_16BF, n as u64, m as u64, n as i64);
     let pref = LtMatmulPref::new(workspace_bytes);
@@ -825,7 +896,6 @@ unsafe fn fp8_e4m3_w_bf16_act(
         "cublasLtMatmulAlgoGetHeuristic[fp8 x bf16]",
     );
     if returned == 0 {
-
         unsafe {
             dequant_then_bf16(
                 handle,
@@ -884,7 +954,6 @@ unsafe fn int8_w_bf16_act(
     beta: f32,
     stream: *mut c_void,
 ) {
-
     if m % 4 != 0 || n % 4 != 0 || k % 4 != 0 {
         unsafe {
             int8_dequant_then_bf16(
@@ -952,7 +1021,6 @@ unsafe fn int8_w_bf16_act(
         )
     };
     if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-
         unsafe {
             int8_dequant_then_bf16(
                 handle,
@@ -1003,8 +1071,16 @@ unsafe fn int8_w_bf16_act(
             let ctx = crate::jit::Ctx::on(stream);
             crate::norm::residual_add::<bf16>(
                 &ctx,
-                InOut { ptr: y_bf16.cast::<bf16>(), rows: m, width: n },
-                In { ptr: dq_dst.cast::<bf16>().cast_const(), rows: m, width: n },
+                InOut {
+                    ptr: y_bf16.cast::<bf16>(),
+                    rows: m,
+                    width: n,
+                },
+                In {
+                    ptr: dq_dst.cast::<bf16>().cast_const(),
+                    rows: m,
+                    width: n,
+                },
             )
         });
     }
@@ -1023,43 +1099,42 @@ pub unsafe fn act_x_w(
     act_dtype: i32,
     y_dtype: i32,
 ) {
-
     #[allow(clippy::too_many_arguments)]
     unsafe fn gemm_bf16_to_fp32(
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
+        handle: *mut c_void,
+        act: *const c_void,
+        w: *const c_void,
+        y: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
     ) {
-    let alpha: f32 = 1.0;
-    let status = unsafe {
-    cublasGemmEx(
-    handle.cast::<cublasContext>(),
-    cublasOperation_t::CUBLAS_OP_T,
-    cublasOperation_t::CUBLAS_OP_N,
-    n,
-    m,
-    k,
-    (&alpha as *const f32).cast(),
-    w,
-    cudaDataType::CUDA_R_16BF,
-    k,
-    act,
-    cudaDataType::CUDA_R_16BF,
-    k,
-    (&beta as *const f32).cast(),
-    y,
-    cudaDataType::CUDA_R_32F,
-    n,
-    cublasComputeType_t::CUBLAS_COMPUTE_32F,
-    cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-    )
-    };
-    check(status, "cublasGemmEx[bf16 -> fp32]");
+        let alpha: f32 = 1.0;
+        let status = unsafe {
+            cublasGemmEx(
+                handle.cast::<cublasContext>(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n,
+                m,
+                k,
+                (&alpha as *const f32).cast(),
+                w,
+                cudaDataType::CUDA_R_16BF,
+                k,
+                act,
+                cudaDataType::CUDA_R_16BF,
+                k,
+                (&beta as *const f32).cast(),
+                y,
+                cudaDataType::CUDA_R_32F,
+                n,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        };
+        check(status, "cublasGemmEx[bf16 -> fp32]");
     }
 
     if act_dtype == dtype::BF16 && w.dtype == dtype::BF16 && y_dtype == dtype::BF16 {
@@ -1071,7 +1146,6 @@ pub unsafe fn act_x_w(
         return;
     }
     if act_dtype == dtype::BF16 && w.dtype == dtype::FP8_E4M3 && y_dtype == dtype::BF16 {
-
         let stream = stream_of(handle);
         assert!(
             w.scale_dtype == dtype::FP32,
@@ -1116,7 +1190,6 @@ pub unsafe fn act_x_w(
         return;
     }
     if act_dtype == dtype::BF16 && w.dtype == dtype::INT4_PACKED && y_dtype == dtype::BF16 {
-
         panic!(
             "act_x_w[INT4_PACKED]: GPTQ/AWQ W4A16 has no kernel here. The vendored marlin \
              tree that served it was removed once measurement showed no representation in \
@@ -1143,9 +1216,21 @@ pub unsafe fn act_x_w(
             let ctx = crate::jit::Ctx::on(stream);
             crate::quant::dequant_mxfp4_to::<bf16>(
                 &ctx,
-                kernels::routine::In { ptr: w.data.cast(), rows: 0, width: 0 },
-                kernels::routine::In { ptr: w.scale_data.cast(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                kernels::routine::In {
+                    ptr: w.data.cast(),
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::In {
+                    ptr: w.scale_data.cast(),
+                    rows: 0,
+                    width: 0,
+                },
+                kernels::routine::Out {
+                    ptr: bf16_w.cast(),
+                    rows: 0,
+                    width: 0,
+                },
                 kernels::routine::Const { v: n },
                 kernels::routine::Const { v: k },
             )
@@ -1201,7 +1286,18 @@ pub unsafe fn act_x_wt_channel_scaled(
     };
 
     unsafe {
-        act_x_w(handle, act, view, y, m, n, k, beta, dtype::BF16, dtype::BF16);
+        act_x_w(
+            handle,
+            act,
+            view,
+            y,
+            m,
+            n,
+            k,
+            beta,
+            dtype::BF16,
+            dtype::BF16,
+        );
     }
 }
 
@@ -1235,7 +1331,18 @@ pub unsafe fn act_x_wt_grouped_scaled(
     };
 
     unsafe {
-        act_x_w(handle, act, view, y, m, n, k, beta, dtype::BF16, dtype::BF16);
+        act_x_w(
+            handle,
+            act,
+            view,
+            y,
+            m,
+            n,
+            k,
+            beta,
+            dtype::BF16,
+            dtype::BF16,
+        );
     }
 }
 
@@ -1265,6 +1372,17 @@ pub unsafe fn act_x_wt_mxfp4_marlin(
     };
 
     unsafe {
-        act_x_w(handle, act, view, y, m, n, k, beta, dtype::BF16, dtype::BF16);
+        act_x_w(
+            handle,
+            act,
+            view,
+            y,
+            m,
+            n,
+            k,
+            beta,
+            dtype::BF16,
+            dtype::BF16,
+        );
     }
 }

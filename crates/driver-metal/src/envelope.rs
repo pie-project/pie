@@ -469,8 +469,8 @@ pub fn fill(
             continue;
         }
 
-        let (first, last) =
-            member_requests(&sub.program_row_indptr, member, wire_rows).ok_or_else(|| {
+        let (first, last) = member_requests(&sub.program_row_indptr, member, wire_rows)
+            .ok_or_else(|| {
                 refused(format!(
                     "step member {member} is not described by the {}-entry attribution CSR \
                      over {wire_rows} request(s)",
@@ -735,10 +735,8 @@ mod tests {
             .bind_instance(
                 id,
                 Some(7),
-                crate::channel::Geometry::from_wire(
-                    driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE,
-                )
-                .expect("a class the registry serves"),
+                crate::channel::Geometry::from_wire(driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE)
+                    .expect("a class the registry serves"),
                 &[0, 1, 2],
                 &seeds,
             )
@@ -776,10 +774,13 @@ mod tests {
     fn a_fires_pages_are_translated_to_the_ones_the_frame_placed() {
         let sub = wire();
         let frame = frame(vec![3, 2, 1, 0], sub.clone());
-        let Filled::Ready { plan } =
-            fill(&crate::channel::Registry::new(), &frame, &frame.steps[0], 16)
-                .expect("a well-formed step")
-        else {
+        let Filled::Ready { plan } = fill(
+            &crate::channel::Registry::new(),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect("a well-formed step") else {
             panic!("a host-wire step is never early: it names all of its own geometry");
         };
         assert_eq!(
@@ -796,10 +797,13 @@ mod tests {
     #[test]
     fn a_frame_that_places_no_pages_leaves_them_alone() {
         let frame = frame(Vec::new(), wire());
-        let Filled::Ready { plan } =
-            fill(&crate::channel::Registry::new(), &frame, &frame.steps[0], 16)
-                .expect("a well-formed step")
-        else {
+        let Filled::Ready { plan } = fill(
+            &crate::channel::Registry::new(),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect("a well-formed step") else {
             panic!("a host-wire step is never early");
         };
         assert_eq!(plan.kv_page_indices, vec![0, 1, 0, 1]);
@@ -811,8 +815,13 @@ mod tests {
         let mut sub = wire();
         sub.plan.kv_page_indices = vec![0, 9, 0, 1];
         let frame = frame(vec![3, 2], sub);
-        let error = fill(&crate::channel::Registry::new(), &frame, &frame.steps[0], 16)
-            .expect_err("page 9 of a two-page placement");
+        let error = fill(
+            &crate::channel::Registry::new(),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect_err("page 9 of a two-page placement");
         assert!(
             format!("{error}").contains("working-set page 9"),
             "the refusal names the page: {error}"
@@ -826,8 +835,13 @@ mod tests {
         let mut sub = wire();
         sub.sub_batch_indptr = vec![0, 0];
         let frame = frame(vec![3, 2, 1, 0], sub);
-        let error = fill(&crate::channel::Registry::new(), &frame, &frame.steps[0], 16)
-            .expect_err("a member in no sub-batch has no class to be served as");
+        let error = fill(
+            &crate::channel::Registry::new(),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect_err("a member in no sub-batch has no class to be served as");
         let said = format!("{error}");
         assert!(
             said.contains("step member 0 is in no sub-batch"),
@@ -843,10 +857,13 @@ mod tests {
         sub.sub_batch_indptr = Vec::new();
         sub.sub_batch_class = Vec::new();
         let frame = frame(vec![3, 2, 1, 0], sub);
-        let Filled::Ready { plan } =
-            fill(&crate::channel::Registry::new(), &frame, &frame.steps[0], 16)
-                .expect("an absent sub-batch table is a host step")
-        else {
+        let Filled::Ready { plan } = fill(
+            &crate::channel::Registry::new(),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect("an absent sub-batch table is a host step") else {
             panic!("a host-wire step is never early");
         };
         assert_eq!(plan.kv_page_indices, vec![3, 2, 3, 2]);
@@ -861,8 +878,13 @@ mod tests {
         sub.plan.kv_page_indptr = Vec::new();
         sub.plan.kv_page_indices = Vec::new();
         let frame = frame(vec![3, 2, 1, 0], sub);
-        let error = fill(&crate::channel::Registry::new(), &frame, &frame.steps[0], 16)
-            .expect_err("a host member states its own pages");
+        let error = fill(
+            &crate::channel::Registry::new(),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect_err("a host member states its own pages");
         let said = format!("{error}");
         assert!(
             said.contains("geometry class 0") && said.contains("state them elsewhere"),
@@ -983,8 +1005,13 @@ mod tests {
         let mut sub = envelope_step();
         sub.sub_batch_class = vec![driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY];
         let frame = frame(vec![3, 2, 1, 0], sub);
-        let error = fill(&bound(&[(0, 1), (1, 0), (2, 1)]), &frame, &frame.steps[0], 16)
-            .expect_err("this driver claims the envelope's ports and no more");
+        let error = fill(
+            &bound(&[(0, 1), (1, 0), (2, 1)]),
+            &frame,
+            &frame.steps[0],
+            16,
+        )
+        .expect_err("this driver claims the envelope's ports and no more");
         let said = format!("{error}");
         assert!(
             said.contains("device geometry") && said.contains("write descriptor"),

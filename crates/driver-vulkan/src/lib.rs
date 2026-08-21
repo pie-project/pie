@@ -2444,8 +2444,6 @@
 #![deny(clippy::print_stdout)]
 
 #[cfg(feature = "native")]
-pub mod hold;
-#[cfg(feature = "native")]
 pub mod bind;
 #[cfg(feature = "native")]
 pub mod binding;
@@ -2453,6 +2451,8 @@ pub mod binding;
 pub mod device;
 #[cfg(feature = "native")]
 pub mod dispatch;
+#[cfg(feature = "native")]
+pub mod hold;
 
 #[cfg(feature = "native")]
 pub mod encode;
@@ -2461,14 +2461,14 @@ pub mod envelope;
 // The raised views the binder builds for `In<Struct<..>>` operands, and the
 // runtime-stream map the resolver answers `Arg::Named` through. Both halves
 // of the no-ask runtime channel, native-gated with the binder they feed.
-#[cfg(feature = "native")]
-pub mod views;
-#[cfg(feature = "native")]
-pub mod runtime;
 pub mod facts;
 #[cfg(feature = "native")]
 pub mod frames;
 pub mod geometry;
+#[cfg(feature = "native")]
+pub mod runtime;
+#[cfg(feature = "native")]
+pub mod views;
 // `pub mod lowering` STOOD HERE -- 539 lines that read a `KernelSig`'s
 // operand kinds and answered which of a call's values was a descriptor and
 // which a push field, plus the `Call`, `Value` and `Mismatch` vocabulary for

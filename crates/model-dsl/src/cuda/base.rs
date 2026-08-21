@@ -3,135 +3,24 @@
 
 use super::*;
 
-
-builder! {
-    /// `kernels::mlp::sigmoid_dot_scalar_gate_add`: the shared expert's landing with its
-    /// gate logit folded in — one launch that dots `norm_x` with the `[1, H]` gate row,
-    /// sigmoids the scalar, and accumulates `shared` into the stream.
-    pub fn sigmoid_dot_scalar_gate_add(
-        x: &Val,
-        gate: &MatW,
-        shared: &Val,
-        base: &Val,
-        hidden: u32,
-    ) -> Val {
-        symbol: "mlp::sigmoid_dot_scalar_gate_add",
-        on: x,
-        weights: [gate.name],
-        layer: gate.layer,
-        inputs: [x, base, shared],
-        out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
-        made: "the shared-expert landing produces its value",
-    }
-
-
-    /// `kernels::mlp::chunked_swiglu` over routed `N * k` rows; keeps expert dim.
-    pub fn swiglu_routed(x: &Val, top_k: u32, intermediate: u32) -> Val {
-        symbol: "mlp::chunked_swiglu",
-        on: x,
-        inputs: [x],
-        out: [Dim::Tokens, Dim::Const(top_k), Dim::Const(intermediate)] as BF16,
-        made: "the routed activation produces its value",
-    }
-}
-
-/// `kernels::moe::token_batched_weighted_sum`, or the `..._add_bf16` form when the
-/// residual folds into the same launch.
+/// `kernels::moe::token_batched_weighted_sum`, or the `..._add` form when
+/// the residual folds into the same launch — a SYMBOL CHOICE, which is why
+/// this wrapper survives B4-gen step 7; each arm is the generated fn.
 pub fn weighted_sum(weights: &Val, x: &Val, hidden: u32, residual: Option<&Val>) -> Val {
-    let mut inputs = vec![x.id, weights.id];
-    if let Some(r) = residual {
-        inputs.push(r.id);
-    }
-    record(
-        &weights.t,
-        weights.layer,
-        if residual.is_some() {
-            "moe::token_batched_weighted_sum_add"
-        } else {
-            "moe::token_batched_weighted_sum"
-        },
-        vec![],
-        None,
-        inputs,
-        Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-    )
-    .expect("the combine produces its value")
-}
-
-builder! {
-    /// The MLP activation, stating which of the two swiglu kernels runs.
-    pub fn swiglu(x: &Val, intermediate: u32) -> Val {
-        symbol: "mlp::chunked_swiglu",
-        on: x,
-        inputs: [x],
-        out: [Dim::Tokens, Dim::Const(intermediate)] as BF16,
-        made: "the activation produces its value",
-    }
-
-
-    /// `kernels::mlp::chunked_swiglu_into` over the ALIGNED leg's block-major
-    /// staging: [`swiglu`](crate::cuda::swiglu)'s shape, plus the destination the
-    /// pointer build named.
-    ///
-    /// A DIFFERENT SYMBOL from [`swiglu`](crate::cuda::swiglu), and the second
-    /// operand is why: this states its destination, so the routine's result
-    /// must BE it (`InOut`), while the dense form places no destination at all
-    /// and its result is the arena's to put anywhere.
-    pub fn swiglu_aligned(x: &Val, stage: &Val, aligned: Dim, intermediate: u32) -> Val {
-        symbol: "mlp::chunked_swiglu_into",
-        on: x,
-        inputs: [x, stage],
-        out: [aligned, Dim::Const(intermediate)] as BF16,
-        made: "the aligned activation produces its value",
-    }
-
-
-    /// `kernels::mlp::swiglu` in its PAIR form: two operands, the gate and the up
-    /// projection, into one activation.
-    pub fn swiglu_pair(gate: &Val, up: &Val, intermediate: u32) -> Val {
-        symbol: "mlp::swiglu",
-        on: gate,
-        inputs: [gate, up],
-        out: [Dim::Tokens, Dim::Const(intermediate)] as BF16,
-        made: "the activation produces its value",
-    }
-}
-
-/// `kernels::rope::qk_rmsnorm_rope_bf16`: fused per-head q/k norm + Standard rope.
-///
-/// `[head_dim, theta, eps]` is the run the routine's three `Const` marks
-/// claim; the positions stream is minted by name. The head dim and epsilon
-/// ride the norm handle — `theta` is the deployment's and the caller states it.
-pub fn qk_rmsnorm_rope(
-    q: &Val,
-    k: &Val,
-    q_norm: &NormW,
-    k_norm: &NormW,
-    theta: f32,
-) -> (Val, Val) {
-    let head_dim = q_norm
-        .per_head
-        .expect("a per-head q norm carries its head dim");
-    let ids = q.t.with(q.layer, |b| {
-        let positions =
-            b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
-        let q_sh = b.value_shape(q.id);
-        let k_sh = b.value_shape(k.id);
-        b.launch_with_params(
-            "rope::qk_rmsnorm_rope_bf16",
-            vec![q_norm.name.clone(), k_norm.name.clone()],
+    match residual {
+        // The `_add` form aliases its result over the residual; the plain
+        // form's result is ruled `rows(weights) x width(src)` by nothing —
+        // the caller still states it (`Unstated`, dtype trap: the rows
+        // carrier is f32 while the result is bf16).
+        Some(r) => generated::token_batched_weighted_sum_add(x, weights, r, weights.layer, None),
+        None => generated::token_batched_weighted_sum(
+            (Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16),
+            x,
+            weights,
+            weights.layer,
             None,
-            vec![head_dim, theta.to_bits(), q_norm.eps.to_bits()],
-            vec![q.id, k.id, positions],
-            vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
-        )
-    });
-    let mk = |id| Val {
-        t: q.t.clone(),
-        id,
-        layer: q.layer,
-    };
-    (mk(ids[0]), mk(ids[1]))
+        ),
+    }
 }
 
 /// `kernels::attn::attention_xqa_decode_bf16_prepared` (whose contract includes the fire-wide
@@ -195,7 +84,10 @@ pub fn attention_xqa_decode(
 /// decode schedule, and raises one plan either way.
 pub fn decode_plan(t: &Trace, head_dim: u32, full_attention: bool) -> model_ir::trace::ValueId {
     t.with(None, |b| {
-        b.push_prep(model_ir::trace::PrepKind::DecodeAttention { head_dim, full_attention })
+        b.push_prep(model_ir::trace::PrepKind::DecodeAttention {
+            head_dim,
+            full_attention,
+        })
     })
 }
 
@@ -355,9 +247,15 @@ pub fn attention_for_lse(
     sm_scale: f32,
 ) -> (Val, Val) {
     match class {
-        model_ir::trace::FireClass::Decode => {
-            attention_flashinfer_decode_lse(q, kv, q_heads, head_dim, window_left, soft_cap, sm_scale)
-        }
+        model_ir::trace::FireClass::Decode => attention_flashinfer_decode_lse(
+            q,
+            kv,
+            q_heads,
+            head_dim,
+            window_left,
+            soft_cap,
+            sm_scale,
+        ),
         // As `attention_for`: the planless prefill raises nothing.
         _ => attention_flashinfer_prefill_lse(
             &crate::runtime::query_windows(q),
@@ -412,144 +310,6 @@ pub fn attention_flashinfer_decode_lse(
     (mk(ids[0]), mk(ids[1]))
 }
 
-/// `kernels::rope::rope_yarn_original_bf16`: the YaRN-paper rope — a dim-index ramp between
-/// interpolated and extrapolated frequencies, plus an `attention_factor` magnitude scale.
-///
-/// The eight YaRN numbers are the checkpoint's and ride the params run in
-/// the order the routine's `Const` marks claim: `[head_dim, theta, factor,
-/// beta_fast, beta_slow, attention_factor, original_max_position,
-/// interleaved]`. The positions stream is minted by name.
-#[allow(clippy::too_many_arguments)]
-pub fn rope_yarn_original(
-    q: &Val,
-    k: &Val,
-    head_dim: u32,
-    theta: f32,
-    factor: f32,
-    beta_fast: f32,
-    beta_slow: f32,
-    attention_factor: f32,
-    original_max_position: u32,
-    interleaved: bool,
-) -> (Val, Val) {
-    let (q_sh, k_sh) = {
-        let b = q.t.inner.borrow();
-        (b.value_shape(q.id), b.value_shape(k.id))
-    };
-    let ids = q.t.with(q.layer, |b| {
-        let positions =
-            b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
-        b.launch_with_params(
-            "rope::rope_yarn_original_bf16",
-            vec![],
-            None,
-            vec![
-                head_dim,
-                theta.to_bits(),
-                factor.to_bits(),
-                beta_fast.to_bits(),
-                beta_slow.to_bits(),
-                attention_factor.to_bits(),
-                original_max_position,
-                u32::from(interleaved),
-            ],
-            vec![q.id, k.id, positions],
-            vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
-        )
-    });
-    let mk = |id| Val {
-        t: q.t.clone(),
-        id,
-        layer: q.layer,
-    };
-    (mk(ids[0]), mk(ids[1]))
-}
-
-/// `kernels::rope::rope_bf16`: the full rotation, named.
-/// The semantic [`super::rope`] carries a `RopeKind` and a rotary width, and the driver's arm
-/// asked whether the width was zero to decide between two launchers.
-pub fn rope(
-    q: &Val,
-    k: &Val,
-    q_heads: u32,
-    kv_heads: u32,
-    head_dim: u32,
-    theta: f32,
-    interleaved: bool,
-) -> (Val, Val) {
-    // `[num_q_heads, num_kv_heads, head_dim, theta, interleaved]`, which is
-    // the run the routine's five `Const` marks claim, in order — the same
-    // run the tier-1 `dsl::rope` states.
-    rope_launch(
-        q,
-        k,
-        "rope::rope_bf16",
-        vec![
-            q_heads,
-            kv_heads,
-            head_dim,
-            theta.to_bits(),
-            u32::from(interleaved),
-        ],
-    )
-}
-
-/// Partial rope: `[rotary_dim, head_dim, theta]` rides `params`; q/k are
-/// full-width operands.
-pub fn rope_partial(q: &Val, k: &Val, rotary_dim: u32, head_dim: u32, theta: f32) -> (Val, Val) {
-    assert!(
-        rotary_dim > 0,
-        "a partial rotation with no channels is the full one; state \
-         `cuda::rope`"
-    );
-    rope_launch(
-        q,
-        k,
-        "rope::rope_partial_bf16",
-        vec![rotary_dim, head_dim, theta.to_bits()],
-    )
-}
-
-/// Rope launch shape: q,k inputs, then the minted positions stream; q,k
-/// outputs; both pairs alias in place.
-fn rope_launch(q: &Val, k: &Val, symbol: &str, params: Vec<u32>) -> (Val, Val) {
-    let (q_sh, k_sh) = {
-        let b = q.t.inner.borrow();
-        (b.value_shape(q.id), b.value_shape(k.id))
-    };
-    let ids = q.t.with(q.layer, |b| {
-        let positions =
-            b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
-        b.launch_with_params(
-            symbol,
-            vec![],
-            None,
-            params,
-            vec![q.id, k.id, positions],
-            vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
-        )
-    });
-    let mk = |id| Val {
-        t: q.t.clone(),
-        id,
-        layer: q.layer,
-    };
-    (mk(ids[0]), mk(ids[1]))
-}
-
-builder! {
-    /// `kernels::gemm::act_x_wt_bias_bf16`: projection with bias in the epilogue.
-    pub fn gemm_bias(x: &Val, w: &MatW, bias: &MatW) -> Val {
-        symbol: "gemm::act_x_wt_bias_bf16",
-        on: x,
-        weights: [w.name, bias.name],
-        layer: w.layer,
-        inputs: [x],
-        out: [Dim::Tokens, Dim::Const(w.width)] as BF16,
-        made: "a biased projection produces its value",
-    }
-}
-
 /// `kernels::attn::attention_flashinfer_prefill_lse` — the planless prefill over a statement
 /// that declares both of its results, and the prefill twin of
 /// [`attention_flashinfer_decode_lse`]. Operands and run as
@@ -596,137 +356,6 @@ pub fn attention_flashinfer_prefill_lse(
     (o, lse)
 }
 
-/// Attention sink rescale is in place; sink logit rides the weight slot and
-/// `[num_q_heads, head_dim]` the params run.
-pub fn attention_sink_rescale(
-    o: &Val,
-    lse: &Val,
-    sinks: &MatW,
-    num_q_heads: u32,
-    head_dim: u32,
-) -> Val {
-    let shape = o.t.inner.borrow().value_shape(o.id);
-    record_with_params(
-        &o.t,
-        sinks.layer,
-        "attn::attention_sink_rescale",
-        vec![sinks.name.clone()],
-        None,
-        vec![num_q_heads, head_dim],
-        vec![o.id, lse.id],
-        Some((shape, DType::BF16)),
-    )
-    .expect("the sink rescale produces its value")
-}
-
-/// `kernels::quant::bf16_to_fp16`: the activation cast the MXFP4 routed GEMVs want on their
-/// input.
-pub fn bf16_to_fp16(x: &Val) -> Val {
-    let shape = x.t.inner.borrow().value_shape(x.id);
-    record(
-        &x.t,
-        x.layer,
-        "quant::bf16_to_fp16",
-        vec![],
-        None,
-        vec![x.id],
-        Some((shape, DType::F16)),
-    )
-    .expect("the cast produces its value")
-}
-
-/// MXFP4 fused gate/up: weight slot names per-expert pointer bank; the
-/// resident expert-weight view is the third operand and `[glu_limit,
-/// glu_alpha]` the params run. Returns `(gate, up)`.
-pub fn mxfp4_moe_gate_up_decode(
-    x: &Val,
-    experts: &Val,
-    bank: &MatW,
-    top_k: u32,
-    intermediate: u32,
-    limit: f32,
-    alpha: f32,
-) -> (Val, Val) {
-    let shape = || {
-        (
-            Shape(vec![
-                Dim::Tokens,
-                Dim::Const(top_k),
-                Dim::Const(intermediate),
-            ]),
-            DType::BF16,
-        )
-    };
-    let ew = rt_object(&x.t, "moe.expert_weights", bank.layer);
-    let ids = x.t.with(bank.layer, |b| {
-        b.launch_with_params(
-            "quant::mxfp4_moe_gate_up_decode_bf16",
-            vec![bank.name.clone()],
-            None,
-            vec![limit.to_bits(), alpha.to_bits()],
-            vec![experts.id, x.id, ew],
-            vec![shape(), shape()],
-        )
-    });
-    let mk = |id| Val {
-        t: x.t.clone(),
-        id,
-        layer: bank.layer,
-    };
-    (mk(ids[0]), mk(ids[1]))
-}
-
-/// `kernels::quant::mxfp4_moe_down_decode_bf16`: the routed down projection, the same bank
-/// convention as [`mxfp4_moe_gate_up_decode`] — expert-weight view included.
-pub fn mxfp4_moe_down_decode(
-    x: &Val,
-    experts: &Val,
-    bank: &MatW,
-    top_k: u32,
-    hidden: u32,
-) -> Val {
-    let ew = rt_object(&x.t, "moe.expert_weights", bank.layer);
-    record(
-        &x.t,
-        bank.layer,
-        "quant::mxfp4_moe_down_decode_bf16",
-        vec![bank.name.clone()],
-        None,
-        vec![experts.id, x.id, ew],
-        Some((
-            Shape(vec![Dim::Tokens, Dim::Const(top_k), Dim::Const(hidden)]),
-            DType::BF16,
-        )),
-    )
-    .expect("the routed down projection produces its value")
-}
-
-builder! {
-    /// GPT-OSS GLU over routed `[Tokens, k, intermediate]`; `limit` and the
-    /// gate's `alpha` ride params, in the order the routine's two `Const<f32>`
-    /// marks claim them.
-    ///
-    /// `alpha` was stated nowhere and the routine takes it, so the fire read a
-    /// zero at that slot -- `x * sigmoid(0)` is `x/2`, an activation that is
-    /// finite, varied and wrong, which is the failure mode this whole check
-    /// exists to catch.
-    pub fn gpt_oss_glu(
-        gate: &Val,
-        up: &Val,
-        top_k: u32,
-        intermediate: u32,
-        limit: f32,
-        alpha: f32,
-    ) -> Val {
-        symbol: "mlp::gpt_oss_glu",
-        on: gate,
-        params: [limit.to_bits(), alpha.to_bits()],
-        inputs: [gate, up],
-        out: [Dim::Tokens, Dim::Const(top_k), Dim::Const(intermediate)] as BF16,
-        made: "the clamped GLU produces its value",
-    }
-}
-
 /// `kernels::attn::attention_naive_paged` — the fallback prefill for a head dim flashinfer's TC
 /// prefill template rejects. The KV view and qo CSR are operands; the run is
 /// `[head_dim, num_kv_heads, window_left, sm_scale, logits_soft_cap]` — the
@@ -768,35 +397,47 @@ pub fn attention_naive_paged(
     )
 }
 
-/// `kernels::attn::write_kv_explicit_bf16`: the explicit-descriptor KV write (graph-replay
-/// steering; N cells, one per query token). Stated inside the `HasWriteDesc` guard's
-/// then-region. The KV view and row validity are operands; `[num_kv_heads,
-/// head_dim]` rides the params run.
-pub fn write_kv_explicit(k: &Val, v: &Val, kv: &Kv, num_kv_heads: u32, head_dim: u32) {
-    let kvc = rt_object(&kv.t, "kv_cache", Some(kv.l));
-    let row_valid = rt_tokens(&kv.t, "row_valid");
-    record_with_params(
-        &kv.t,
-        Some(kv.l),
-        "attn::write_kv_explicit_bf16",
-        vec![],
-        kv_state(kv),
-        vec![num_kv_heads, head_dim],
-        vec![k.id, v.id, kvc, row_valid],
-        None,
-    );
-}
-
 /// `kernels::attn::write_kv_to_pages`: the page-derived append (position re-derived from the
 /// page table). The `HasWriteDesc` guard's else-region.
-pub fn write_kv_to_pages(k: &Val, v: &Val, kv: &Kv) {
-    record(
+///
+/// # Why this one is hand-written where its sibling is generated
+///
+/// `attn::write_kv_to_pages` is a declaration standing for a CHOICE. The
+/// name resolves at LOAD, through `Boot::route`, to `write_kv_to_pages_bf16`
+/// or `write_kv_to_pages_quantised` from the KV dtype the checkpoint settles
+/// — so a model text states the outer name and no text ever states either
+/// body. A generated wrapper is named for a body, which is exactly what this
+/// statement must not name.
+///
+/// # What it must still state
+///
+/// Being hand-written does not make it exempt from the column. The routine's
+/// operands are derived from its `fn` signature and bound POSITIONALLY, so
+/// this statement owes the same list the generated wrapper would write: the
+/// two token planes it is handed, then the layer's KV view, the write origin,
+/// the query CSR and the row-validity mask — and the two head numbers as
+/// launch params. Stating `[k, v]` and no params, which is what stood here,
+/// bound `kvc` off the third input slot of a two-input fire and refused
+/// every prefill that took this leg with "the fire does not carry an input
+/// operand". The refusal aborted the pass, so the epilogue that samples the
+/// first token never ran, and every device-carried decode behind it read an
+/// empty ring.
+pub fn write_kv_to_pages(k: &Val, v: &Val, kv: &Kv, num_kv_heads: u32, head_dim: u32) {
+    record_with_params(
         &kv.t,
         Some(kv.l),
         "attn::write_kv_to_pages",
         vec![],
         kv_state(kv),
-        vec![k.id, v.id],
+        vec![num_kv_heads, head_dim],
+        vec![
+            k.id,
+            v.id,
+            rt_object(&kv.t, "kv_cache", Some(kv.l)),
+            rt_requests(&kv.t, "first_token"),
+            rt_requests(&kv.t, "qo_indptr"),
+            rt_tokens(&kv.t, "row_valid"),
+        ],
         None,
     );
 }
@@ -840,88 +481,6 @@ impl GdnShape {
     #[must_use]
     fn compact(self) -> Vec<u32> {
         vec![self.v_heads, self.k_dim, self.v_dim]
-    }
-
-    /// `[conv_dim, conv_k]` -- the two conv walks'.
-    #[must_use]
-    fn conv(self) -> Vec<u32> {
-        vec![self.conv_dim, self.conv_k]
-    }
-}
-
-/// `kernels::ssm::causal_conv1d_update_batched`: the slot-indirected decode conv update (+
-/// fused SiLU) against the layer's per-request conv slab. Shape-preserving, like the semantic
-/// [`causal_conv1d`](crate::causal_conv1d) it lowers.
-pub fn gdn_conv_update_batched(x: &Val, w: &ConvW, rs: &Rs, shape: GdnShape) -> Val {
-    gdn_conv(
-        x,
-        w,
-        rs,
-        "ssm::causal_conv1d_update_batched",
-        shape.conv(),
-        vec![],
-        vec![],
-    )
-}
-
-/// `kernels::ssm::causal_conv1d_prefill_batched`: the batched prefill conv walk (each
-/// request walking its qo_indptr window and persisting the trailing K-window into the slab).
-/// The run appends `[write_state]`, the persist flag the caller's — the
-/// request count is the CSR operand's own row count.
-pub fn gdn_conv_prefill_batched(
-    x: &Val,
-    w: &ConvW,
-    rs: &Rs,
-    shape: GdnShape,
-    write_state: bool,
-) -> Val {
-    let mut params = shape.conv();
-    params.push(u32::from(write_state));
-    let qo_indptr = rt_requests(&x.t, "qo_indptr");
-    gdn_conv(
-        x,
-        w,
-        rs,
-        "ssm::causal_conv1d_prefill_batched",
-        params,
-        vec![],
-        vec![qo_indptr],
-    )
-}
-
-fn gdn_conv(
-    x: &Val,
-    w: &ConvW,
-    rs: &Rs,
-    kernel: &str,
-    params: Vec<u32>,
-    param_extents: Vec<(u8, Shape)>,
-    tail_inputs: Vec<model_ir::trace::ValueId>,
-) -> Val {
-    // The recurrent view sits between `x` and the CSR in the swept
-    // signature; the bias plane is a nullable second weight the statement
-    // places only when the checkpoint has one.
-    let rsv = rt_object(&x.t, "recurrent_state", Some(rs.l));
-    let mut weights = vec![w.name.clone()];
-    weights.extend(w.bias.clone());
-    let mut inputs = vec![x.id, rsv];
-    inputs.extend(tail_inputs);
-    let ids = x.t.with(Some(w.layer), |b| {
-        let shape = b.value_shape(x.id);
-        b.launch_with_extents(
-            kernel,
-            weights,
-            rs_state(rs),
-            params,
-            param_extents,
-            inputs,
-            vec![(shape, DType::BF16)],
-        )
-    });
-    Val {
-        t: x.t.clone(),
-        id: ids[0],
-        layer: Some(w.layer),
     }
 }
 
@@ -1069,22 +628,6 @@ fn gdn_prefill(
         vec![q.id, k.id, v.id, g.id, beta.id, rsv, qo_indptr],
         None,
     );
-}
-
-builder! {
-    /// `repeat_interleave_heads_fp32`: produces `[Tokens, value_heads, key_dim]` f32 dataflow.
-    pub fn repeat_interleave_heads(x: &Val, key_heads: u32, value_heads: u32, key_dim: u32) -> Val {
-        symbol: "ssm::repeat_interleave_heads_fp32",
-        on: x,
-        // `[k_heads, v_heads, key_dim]`, the repeat's own contract: it walks
-        // the compact K layout and writes each key head `v_heads / k_heads`
-        // times, so it needs both counts and the width. `key_dim` was already
-        // the caller's -- it states the output shape below with it.
-        params: [key_heads, value_heads, key_dim],
-        inputs: [x],
-        out: [Dim::Tokens, Dim::Const(value_heads), Dim::Const(key_dim)] as F32,
-        made: "the head repeat produces its value",
-    }
 }
 
 /// `verify_stash_load`: pseudo-symbol; no inputs, three bf16 outputs `[qkv, a, b]`.
@@ -1275,22 +818,6 @@ pub fn lora_qkv_correction(q: &Val, v: &Val, l: u32) {
     );
 }
 
-/// KV-cache dequant staging before a prefill-shaped dispatch; its own statement.
-/// The KV view is the one operand and `[num_kv_heads, head_dim]` the run.
-pub fn dequant_only(kv: &Kv, num_kv_heads: u32, head_dim: u32) {
-    let kvc = rt_object(&kv.t, "kv_cache", Some(kv.l));
-    record_with_params(
-        &kv.t,
-        Some(kv.l),
-        "attn::dequant_kv_cache_layer_to_bf16_active",
-        vec![],
-        kv_state(kv),
-        vec![num_kv_heads, head_dim],
-        vec![kvc],
-        None,
-    );
-}
-
 /// Attention dispatch shape: q input, cache state, output unless a guard/peel
 /// owns it. `params` is the run the named routine's `Const` marks declare, in
 /// their order.
@@ -1305,7 +832,6 @@ pub fn dequant_only(kv: &Kv, num_kv_heads: u32, head_dim: u32) {
 /// It could not fault and it could not be seen: one `u32` is as wide as
 /// another, the count matched for the routines that take exactly one scalar,
 /// and `check_plan`'s params rule only ever counted them.
-
 
 /// [`attn_at`], with the raise the statement names.
 ///
