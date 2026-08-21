@@ -21,7 +21,7 @@ use crate::jit::abi::{bf16, unpack_aggregate};
 use crate::jit::abi::Tensor;
 use kernels::raises::Struct;
 use crate::raises::{Fa2Decode, Fa2Prefill};
-use crate::views::{AttnMask, KvCache, KvPageIndptrHost, QoIndptrHost};
+use crate::views::{AttnMask, KvCache, KvPageIndptrHost, QoIndptrHost, AttnScore};
 use kernels::routine::{Arg, Const, In, Out};
 use kernels::{Refusal, Ty};
 use crate::routine::Fire;
@@ -1086,7 +1086,7 @@ pub fn dispatch_attention_flashinfer_decode_capture(
     sm_scale: Const<f32>,
     kvc: In<Struct<KvCache>>,
     score_out: Out<Tensor<f32>>,
-    score_indptr: In<Tensor<i32>>,
+    score: In<Struct<AttnScore>>,
     lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -1095,7 +1095,10 @@ pub fn dispatch_attention_flashinfer_decode_capture(
     let kvc = unsafe { &*kvc_ptr };
 
     let score_out = score_out.ptr;
-    let score_indptr = score_indptr.ptr;
+    if score.ptr.is_null() {
+        return Err(Refusal::Null { what: "the score view this statement names" });
+    }
+    let score_indptr = unsafe { (*score.ptr).indptr };
 
     let lse = lse.map_or(core::ptr::null_mut(), |l| l.ptr);
     let k_pages = kvc.keys;
@@ -1235,11 +1238,10 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     o: Out<Tensor<bf16>>,
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>,
-    score_window: Const<u32>,
     kvc: In<Struct<KvCache>>,
     qo_indptr: In<Tensor<i32>>,
     score_out: Out<Tensor<f32>>,
-    score_indptr: In<Tensor<i32>>,
+    score: In<Struct<AttnScore>>,
     lse: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -1247,8 +1249,11 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     let kvc = unsafe { &*kvc.ptr };
 
     let score_out = score_out.ptr;
-    let score_indptr = score_indptr.ptr;
-    let score_window = *score_window;
+    if score.ptr.is_null() {
+        return Err(Refusal::Null { what: "the score view this statement names" });
+    }
+    let score_indptr = unsafe { (*score.ptr).indptr };
+    let score_window = unsafe { (*score.ptr).window };
 
     let lse = lse.map_or(core::ptr::null_mut(), |l| l.ptr);
     let k_pages = kvc.keys;

@@ -110,7 +110,10 @@ pub struct FireViews {
     /// `"attention_mask"` — published on every fire (`HasCustomMask` is a
     /// folded predicate): the resident form is the plan's own causal mask.
     pub mask: MaskView,
-    /// `"expert_weights"` — PER STATEMENT, keyed by the trace value: the bank
+    /// `"attn.score"` — the observation the driver keeps: the fire's CSR
+    /// and the boot-configured window. Nulls/zero when nothing observes.
+    pub score: kernels_cuda::views::ScoreView,
+    /// `"moe.expert_weights"` — PER STATEMENT, keyed by the trace value: the bank
     /// differs per layer AND per projection (gate_up vs down), so the view is
     /// built from the weight each statement names, not from the fire.
     pub expert_weights: BTreeMap<ValueId, ExpertWeightsView>,
@@ -181,13 +184,20 @@ impl FireViews {
                 stride: 0,
             },
         );
-        Self { kv, recurrent, mask, expert_weights: BTreeMap::new(), streams }
+        let score = attn.map_or(
+            kernels_cuda::views::ScoreView { indptr: core::ptr::null(), window: 0 },
+            |a| kernels_cuda::views::ScoreView {
+                indptr: a.score_indptr_d,
+                window: a.score_window,
+            },
+        );
+        Self { kv, recurrent, mask, score, expert_weights: BTreeMap::new(), streams }
     }
 
     /// Fill [`Self::expert_weights`] from the statements of one lowering.
     ///
     /// Per-STATEMENT, because the bank is: every launch that takes the
-    /// `"expert_weights"` object names its own packed bank as its weight, and
+    /// `"moe.expert_weights"` object names its own packed bank as its weight, and
     /// the `_ptrs`/`_scales_ptrs`/`_bias_ptrs` arrays were carved BESIDE that
     /// bank at load (`serve::load::build_moe_expert_ptrs`). The map is keyed
     /// by the trace VALUE the statement places.
@@ -279,7 +289,8 @@ impl FireViews {
                 .get(layer? as usize)
                 .map(|v| core::ptr::from_ref(v).cast::<c_void>()),
             "attention_mask" => Some(core::ptr::from_ref(&self.mask).cast::<c_void>()),
-            "expert_weights" => self
+            "attn.score" => Some(core::ptr::from_ref(&self.score).cast::<c_void>()),
+            "moe.expert_weights" => self
                 .expert_weights
                 .get(&value)
                 .map(|v| core::ptr::from_ref(v).cast::<c_void>()),
@@ -389,3 +400,43 @@ fn recurrent_view(g: &GdnCtx, layer: usize) -> RecurrentView {
         conv_stride: g.conv_stride_elems,
     }
 }
+
+/// Every runtime name this driver ANSWERS — streams through
+/// [`FireStreams::named`], objects through [`FireViews::raised`], the fa2
+/// preps through the resolver's raise map. The rebirth of
+/// `every_plane_is_answered`: a test walks every catalogued SKU's
+/// `plan.runtime` against this list, so a text minting a name nothing
+/// answers fails the build, not the fire.
+pub const ANSWERED: &[&str] = &[
+    // streams
+    "positions",
+    "token_ids",
+    "request_of_token",
+    "qo_indptr",
+    "row_valid",
+    "sampling_indices",
+    "first_token",
+    // objects
+    "kv_cache",
+    "recurrent_state",
+    "attention_mask",
+    "attn.score",
+    "moe.expert_weights",
+    "fa2.prefill",
+    "fa2.decode",
+    "qo_indptr.host",
+    "kv_page_indptr.host",
+];
+
+/// Runtime names this driver KNOWS but deliberately refuses until their
+/// staging owners land (`RaisedUnbound`, by name): the moe/gemm pointer
+/// banks and the dsv4/mtp slabs nothing in driver-cuda allocates today.
+pub const UNSTAGED: &[&str] = &[
+    "moe.banks",
+    "gemm.groups",
+    "dsv4.state_kv",
+    "dsv4.state_score",
+    "dsv4.ape",
+    "dsv4.comp_kv_pages",
+    "mtp.pending_hidden",
+];

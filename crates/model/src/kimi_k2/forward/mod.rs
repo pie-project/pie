@@ -245,6 +245,21 @@ pub fn kimi_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&KimiFacts, &KimiCudaFacts, FireClass, f32) -> ForwardPlan;
 
+/// The shipped SKU's axes — the family's ONE spelling of its point.
+///
+/// Every consumer derives from these aliases rather than restating them:
+/// [`CATALOG`]'s turbofish, `project::trace`'s instantiation,
+/// `project::manifest`'s repr claims, and `contract`'s expert-stack pass
+/// (its group and its load check read `ShippedW2`). A second SKU adds a
+/// second row to the table, not a second spelling of the first.
+pub type ShippedW1 = Bf16Ax;
+/// The routed expert banks' axis: WNA16, the release's packing.
+pub type ShippedW2 = Wna16Ax;
+/// The activation axis of the shipped point (pinned BF16 in the text).
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The family's catalogue — every SKU this build ships, enumerated. ONE
 /// row, and its expert axis is WNA16: the checkpoint ships the routed bank
 /// both as bf16 `.weight` and as W4A16 `.weight_packed` (two ENCODINGS of
@@ -257,6 +272,6 @@ pub type TraceFn = fn(&KimiFacts, &KimiCudaFacts, FireClass, f32) -> ForwardPlan
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
     (
         "kimi-bf16-wna16-kv-bf16",
-        kimi_cuda::<Bf16Ax, Wna16Ax, Bf16Ax, NativeKv>,
+        kimi_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
     ),
 ];

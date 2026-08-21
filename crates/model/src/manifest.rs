@@ -236,6 +236,31 @@ pub struct Manifest {
     /// How many layers the per-layer rows expand to.
     pub layers: u32,
     pub tensors: Vec<TensorSpec>,
+    /// The representation the SHIPPED SKU holds the dense projection
+    /// banks in — the W1 axis of the family's catalogued point
+    /// (`model_dsl::axes`), projected into the manifest.
+    ///
+    /// NOT identity: [`Self::check`] never reads it, because
+    /// quantization is divided out of matching (see the module doc) —
+    /// what a checkpoint IS does not change with how its numbers are
+    /// stored. What reads it is LOAD: the claim says which repr the
+    /// catalogued forward's statements assume, so the authoring pass
+    /// can hold a checkpoint to it and refuse with the axis named,
+    /// and `tests/catalogue_coverage.rs` holds the claim to the axis
+    /// so the two spellings cannot drift apart.
+    ///
+    /// `None` means the manifest CLAIMS nothing — llama_like's rows,
+    /// where the repr is per-row data rather than a catalogued axis.
+    pub proj_repr: Option<model_dsl::WeightRepr>,
+    /// The W2 axis's claim: the routed expert banks' representation.
+    ///
+    /// Same rules as [`Self::proj_repr`]. This is the claim that
+    /// DISTINGUISHES today: gpt-oss ships MXFP4-Marlin experts around
+    /// a bf16 stack, kimi-k2 ships WNA16 ones, and a checkpoint
+    /// holding the same bank in bf16 is the same MODEL (it matches
+    /// this manifest) but not the shipped SKU (the load refuses it,
+    /// naming the axis).
+    pub expert_repr: Option<model_dsl::WeightRepr>,
 }
 
 impl Manifest {
@@ -245,7 +270,30 @@ impl Manifest {
         Self {
             layers,
             tensors: Vec::new(),
+            proj_repr: None,
+            expert_repr: None,
         }
+    }
+
+    /// Claim the repr the shipped SKU holds the projection banks in.
+    ///
+    /// The argument is ALWAYS a derivation — `<ShippedW1 as
+    /// DtypeAxis>::REPR` off the family's one axis spelling in
+    /// `forward` — never a literal; the coverage test is what holds a
+    /// hand-written claim to the axis it should have derived from.
+    #[must_use]
+    pub fn holds_projections_as(mut self, repr: model_dsl::WeightRepr) -> Self {
+        self.proj_repr = Some(repr);
+        self
+    }
+
+    /// Claim the repr the shipped SKU holds the routed expert banks in.
+    ///
+    /// As [`Self::holds_projections_as`], from `ShippedW2`.
+    #[must_use]
+    pub fn holds_experts_as(mut self, repr: model_dsl::WeightRepr) -> Self {
+        self.expert_repr = Some(repr);
+        self
     }
 
     /// Add a spec, returning self — so a projection reads as a list.

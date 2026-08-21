@@ -6,9 +6,10 @@
 //! sharded and `lm_head` replicated, which is a memory trade the driver
 //! makes and the checkpoint knows nothing about.
 
+use model_dsl::axes::DtypeAxis;
 use model_loader::contract::Expr;
 use model_loader::error::Error;
-use model_loader::types::{DType, Encoding};
+use model_loader::types::{BackendKind, DType, Encoding};
 
 use crate::shared::builder::{Builder, int4b8_encoding, is_raw};
 
@@ -88,7 +89,26 @@ fn mla_fused_projection_joins(b: &mut Builder<'_>) -> Result<(), Error> {
 /// to be resident, and the stacks are additive. That is what `budget` is
 /// for.
 fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
-    const GROUP: i64 = 32;
+    // The W4A16 quantisation group, read off the SHIPPED expert axis —
+    // `forward::ShippedW2`, the family's one spelling of its point. It
+    // is the same 32 the traced wna16 statements pass as a param and
+    // `int4b8_encoding` spells for the loader (`QuantScheme::Int4B8`,
+    // per-group scales, the `code - 8` bias the scheme's own — no
+    // zero-point tensor, which the pattern also holds the axis to). An
+    // axis change lands here as a compile refusal, not as a stacker
+    // quietly dequantizing at the wrong granularity.
+    const GROUP: i64 = match <super::forward::ShippedW2 as DtypeAxis>::REPR {
+        model_dsl::WeightRepr::Scaled {
+            layout: model_dsl::ScaleLayout::PerGroup,
+            group,
+            zero_point: false,
+            ..
+        } => group as i64,
+        _ => panic!(
+            "kimi-k2's catalogued expert axis moved off per-group WNA16; \
+             this stacker and int4b8_encoding both spell that axis"
+        ),
+    };
     const CODES_PER_WORD: i64 = 8;
 
     for layer in 0..b.shape().layers {
@@ -233,6 +253,28 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
         // that answer; probing for expert 0 before the walk would ask the
         // same question twice and make this line unreachable.
         if gate_up.is_empty() {
+            // THE SHIPPED AXIS'S LOAD CHECK (design-no-ask §9). A layer
+            // with no packed bank is dense — unless the same bank is here
+            // under the bf16 spelling, `experts.0.gate_proj.weight`. That
+            // upload is the same MODEL (the manifest deliberately names
+            // neither spelling), but the catalogued CUDA SKU
+            // (`forward::ShippedW2`, wna16) states only the packed GEMVs,
+            // so it refuses at the door with the axis named rather than
+            // loading happily and bind-failing at the first routed fire.
+            // CUDA-scoped: no other backend states the wna16 leg.
+            if b.target().backend == BackendKind::Cuda
+                && b.find(&b.source_name(&format!("{mlp}experts.0.gate_proj.weight")))
+                    .is_some()
+            {
+                return fail(format!(
+                    "kimi-k2's catalogued CUDA SKU ships `{}` routed experts \
+                     (axis W2: `weight_packed` + `weight_scale`, group {GROUP}), \
+                     but layer {layer} publishes a bf16 `experts.0.gate_proj.weight` \
+                     — the same model in a repr this build's CUDA text has no \
+                     routed leg for",
+                    <super::forward::ShippedW2 as DtypeAxis>::NAME,
+                ));
+            }
             continue;
         }
         let experts = gate_up.len() as i64;

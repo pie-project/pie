@@ -2720,6 +2720,17 @@ mod tests {
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Qwen35HybridFacts, &Qwen35CudaFacts, FireClass, f32, f32) -> ForwardPlan;
 
+/// The shipped SKU's axes — the family's ONE spelling of its point.
+/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claims
+/// all derive from these; a second SKU adds a row, not a respelling.
+pub type ShippedW1 = Bf16Ax;
+/// The routed expert banks' axis of the shipped point.
+pub type ShippedW2 = Bf16Ax;
+/// The activation axis of the shipped point (pinned BF16 in the text).
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The family's catalogue — every SKU this build ships, enumerated. The
 /// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
 /// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
@@ -2728,6 +2739,6 @@ pub type TraceFn = fn(&Qwen35HybridFacts, &Qwen35CudaFacts, FireClass, f32, f32)
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
     (
         "qwen3_5_hybrid-bf16-bf16-kv-bf16",
-        qwen3_5_hybrid_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>,
+        qwen3_5_hybrid_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
     ),
 ];

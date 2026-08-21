@@ -416,6 +416,33 @@ impl TraceBuilder {
         inputs: Vec<ValueId>,
         out_shapes: Vec<(Shape, DType)>,
     ) -> Vec<ValueId> {
+        self.launch_devwin(
+            kernel,
+            weights,
+            state,
+            params,
+            param_extents,
+            None,
+            inputs,
+            out_shapes,
+        )
+    }
+
+    /// [`Self::launch_with_extents`], plus the peel-window slot pair the
+    /// lowering fills with this launch's own rectangle. See
+    /// [`OpKind::Launch::peel_slots`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_devwin(
+        &mut self,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        params: Vec<u32>,
+        param_extents: Vec<(u8, Shape)>,
+        peel_slots: Option<(u8, u8)>,
+        inputs: Vec<ValueId>,
+        out_shapes: Vec<(Shape, DType)>,
+    ) -> Vec<ValueId> {
         self.push(
             OpKind::Launch {
                 kernel: kernel.to_string(),
@@ -423,6 +450,7 @@ impl TraceBuilder {
                 state,
                 params,
                 param_extents,
+                peel_slots,
             },
             inputs,
             out_shapes,

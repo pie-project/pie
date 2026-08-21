@@ -24,7 +24,7 @@
 //! shape had nowhere to put it: **a KV-shared layer names another
 //! layer's pages**, and `LayerAttention::kv_source` exists for it.
 
-use model_dsl::axes::{Bf16Ax, NativeKv};
+use model_dsl::axes::DtypeAxis;
 use std::collections::BTreeMap;
 
 use crate::catalog::Deployed;
@@ -86,6 +86,11 @@ pub fn manifest(f: &Gemma4Facts, mixture: Option<Gemma4Mixture>) -> Manifest {
     let has_ple = f.ple_dim > 0;
 
     Manifest::new(f.layers)
+        // The shipped projection repr, DERIVED from the family's one
+        // axis spelling (`forward::ShippedW1`) — plain bf16 here, so
+        // the claim is inert for matching and states only what the
+        // catalogued text assumes.
+        .holds_projections_as(<super::forward::ShippedW1 as DtypeAxis>::REPR)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
         // A tie is an ABSENCE: gemma-4 ships no `lm_head`, and the MLX
@@ -696,10 +701,15 @@ pub fn trace(
             })
             .collect(),
     };
-    // THE SHIPPED POINT. gemma-4 catalogues one SKU today; the table in
-    // `forward::CATALOG` is where a second one appears, and the coverage
-    // test is what keeps every row loadable.
-    super::forward::gemma4_cuda::<Bf16Ax, Bf16Ax, NativeKv>(f, &cuda, class, norm_eps)
+    // THE SHIPPED POINT, read off the family's one axis spelling
+    // (`forward::Shipped*`, beside its CATALOG). gemma-4 catalogues one
+    // SKU today; the table in `forward::CATALOG` is where a second one
+    // appears, and the coverage test is what keeps every row loadable.
+    super::forward::gemma4_cuda::<
+        super::forward::ShippedW1,
+        super::forward::ShippedA,
+        super::forward::ShippedKv,
+    >(f, &cuda, class, norm_eps)
 }
 
 #[cfg(test)]

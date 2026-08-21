@@ -57,6 +57,71 @@ pub enum Cap {
 /// 256-wide pointwise pass and `PerHead` both the q/k/v split and the KV
 /// append, so a new kernel that launches like an existing one costs nothing.
 /// This is data: the arithmetic each variant names stays in the driver.
+/// One RESULT's geometry, declared by the routine that writes it — the
+/// [`LaunchRule`] treatment applied to result shapes (design-no-ask §10).
+///
+/// `chunked_swiglu` is the case it exists for: `packed.width == 2 *
+/// y.width` lives only in the `.cuh`, so the wrapper takes `intermediate`
+/// and every caller states it. A rule written with names already in the
+/// signature (`out(y = rows(packed) x half(packed))`) makes the geometry
+/// DATA the consumer evaluates; the row carries it slot-indexed.
+///
+/// Two disciplines carried over from `LaunchRule`, both its own docs':
+/// [`OutRule::Unstated`] REFUSES, never guesses — a generated wrapper for
+/// an unruled routine still takes a `Shape`; and the vocabulary starts at
+/// SIX constructors and grows only when a family of routines means one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutRule {
+    /// The routine has not said; the caller supplies the `Shape`.
+    #[default]
+    Unstated,
+    /// `like(a)`: input slot `a`'s own shape and dtype.
+    Like {
+        /// The input ordinal copied.
+        of: u8,
+    },
+    /// `rows(a) x W`: input `a`'s leading (row) dims, trailing width `W`.
+    Shaped {
+        /// The input ordinal the rows come from.
+        rows_of: u8,
+        /// The trailing width.
+        width: OutWidth,
+    },
+    /// `split(a, p)`: `[.., h*d]` → `[.., h, d]` with `d` the params-run
+    /// scalar at `p`.
+    Split {
+        /// The input ordinal split.
+        of: u8,
+        /// The params-run ordinal carrying the trailing dim.
+        dim_param: u8,
+    },
+}
+
+/// The trailing width of an [`OutRule::Shaped`] result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutWidth {
+    /// `half(a)`: input `a`'s width, halved — the packed-pair activations.
+    Half {
+        /// The input ordinal halved.
+        of: u8,
+    },
+    /// `width(a)`: input `a`'s own width.
+    Of {
+        /// The input ordinal read.
+        of: u8,
+    },
+    /// `weight(n)`: the `n`-th weight's projection width.
+    Weight {
+        /// The weight ordinal read.
+        of: u8,
+    },
+    /// `const(p)`: the params-run scalar at `p`.
+    Param {
+        /// The params ordinal read.
+        of: u8,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LaunchRule {
     /// The row has not said. A backend must REFUSE rather than guess: a
@@ -1038,6 +1103,8 @@ pub struct KernelSig {
     /// The dtype point this row is instantiated at. See
     /// [`routine::Routine::point`].
     pub point: &'static [&'static str],
+    /// Each result's geometry rule. See [`routine::Routine::out_rule`].
+    pub out_rule: &'static [OutRule],
 }
 
 // `lacks` IS NOT SURPLUS -- ITS READER IS MISSING. Zero readers, fourteen

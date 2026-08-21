@@ -2663,6 +2663,10 @@ pub struct Routine<B: Backend> {
     /// route selects among same-named rows by matching this against the
     /// statement's value dtypes.
     pub point: &'static [&'static str],
+    /// Each RESULT's geometry rule, in `Out`-slot order; empty means every
+    /// out is [`crate::OutRule::Unstated`] and the caller supplies shapes.
+    /// See design-no-ask §10 (B4-gen).
+    pub out_rule: &'static [crate::OutRule],
 }
 
 /// The first path segment after the crate root, out of a `module_path!()`.
@@ -2841,6 +2845,13 @@ impl<B: Backend> Routine<B> {
         self
     }
 
+    /// This row's result-geometry rules. See [`Routine::out_rule`].
+    #[must_use]
+    pub const fn outs(mut self, rules: &'static [crate::OutRule]) -> Self {
+        self.out_rule = rules;
+        self
+    }
+
     /// This routine, with its source column STATED rather than derived.
     ///
     /// # For rows that have no signature to derive one from
@@ -3013,6 +3024,7 @@ macro_rules! untraced {
             driver: false,
             canon: None,
             point: &[],
+            out_rule: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3049,6 +3061,7 @@ macro_rules! untraced {
             driver: false,
             canon: None,
             point: &[],
+            out_rule: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3103,6 +3116,7 @@ macro_rules! routine {
             driver: false,
             canon: None,
             point: &[],
+            out_rule: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3131,6 +3145,7 @@ macro_rules! routine {
             driver: false,
             canon: None,
             point: &[],
+            out_rule: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3160,6 +3175,7 @@ macro_rules! routine {
             driver: false,
             canon: None,
             point: &[],
+            out_rule: &[],
         }
         $(.$fact($($value)?))*
     }};

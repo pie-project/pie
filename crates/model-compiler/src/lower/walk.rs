@@ -383,6 +383,7 @@ impl Lowerer<'_> {
             weights,
             params,
             param_extents,
+            peel_slots,
             ..
         } = &op.kind
         {
@@ -400,6 +401,33 @@ impl Lowerer<'_> {
                         self.buffers.n_requests as usize,
                     ))
                     .unwrap_or(u32::MAX);
+                }
+            }
+            // THE REMAPPED SPLIT'S RUN. `attn::split_qkv_bf16_devwin` is
+            // reached by the remap above, so its statement is the PLAIN
+            // split's — no params at all — while the routine reads
+            // `[n_max, win_start, win_len]`. The walk supplies the trio the
+            // way it supplies every peel window: from its own knowledge.
+            if kernel == "attn::split_qkv_bf16_devwin"
+                && self.params.len() == first_param as usize
+            {
+                let w = self.rectangle_rows(op, window);
+                self.params.push(self.rows.len() as u32);
+                self.params.push(w.start);
+                self.params.push(w.end.saturating_sub(w.start));
+            }
+            // THE PEEL WINDOW, WHICH ONLY THIS WALK CAN SAY. The launch's
+            // own rectangle IS the region window it runs under — the tail's
+            // split inside a peel, `(0, N)` on an unpeeled fire — and the
+            // statement carried zeros at these slots because no statement
+            // can state a fire's split.
+            if let Some((s_at, l_at)) = peel_slots {
+                let window = self.rectangle_rows(op, window);
+                if let Some(slot) = self.params.get_mut(first_param as usize + *s_at as usize) {
+                    *slot = window.start;
+                }
+                if let Some(slot) = self.params.get_mut(first_param as usize + *l_at as usize) {
+                    *slot = window.end.saturating_sub(window.start);
                 }
             }
         }

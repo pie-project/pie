@@ -29,6 +29,25 @@ fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
 }
 
+/// The shipped expert axis, read off the family's ONE spelling
+/// (`forward::ShippedW2`, beside its `CATALOG`).
+///
+/// Pinned at compile time to MXFP4-Marlin because this contract's
+/// expert passes — the `weight_packed`/`weight_scale` walk and its
+/// GEMV republish — are that axis's loader spelling
+/// (`QuantScheme::Mxfp4E2M1E8M0` via `mxfp4_encoding`; the 32-wide
+/// E8M0 group is the FORMAT's own number). An axis change lands here
+/// as a compile refusal, not as a contract authoring the wrong scheme.
+const _EXPERTS_ARE_MXFP4: () = {
+    match <super::forward::ShippedW2 as model_dsl::axes::DtypeAxis>::REPR {
+        model_dsl::WeightRepr::Mxfp4Marlin => (),
+        _ => panic!(
+            "kimi-k3's catalogued expert axis moved off MXFP4; \
+             the expert stacker spells that axis"
+        ),
+    }
+};
+
 /// kimi_k3. `embed_tokens` is sharded on axis 0 under TP to save per-rank
 /// memory, matching the Kimi-K2 row; the decoder lives under
 /// `language_model.model.layers.`.

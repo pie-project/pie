@@ -417,6 +417,18 @@ pub fn kimi_k3_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&KimiK3Facts, FireClass, f32) -> ForwardPlan;
 
+/// The shipped SKU's axes — the family's ONE spelling of its point.
+/// [`CATALOG`], `project::trace`, `project::manifest`'s repr claims and
+/// `contract::author_kimi_k3`'s MXFP4 pin all derive from these; a
+/// second SKU adds a row, not a respelling.
+pub type ShippedW1 = Bf16Ax;
+/// The routed expert banks' axis: MXFP4, the release's packing.
+pub type ShippedW2 = Mxfp4Ax;
+/// The activation axis of the shipped point (pinned BF16 in the text).
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The family's catalogue — every SKU this build ships, enumerated. The
 /// routed experts are MXFP4 (the module doc's `mxfp4_moe_*` leg), so W2's
 /// shipped value is the marlin axis. The coverage test
@@ -426,6 +438,6 @@ pub type TraceFn = fn(&KimiK3Facts, FireClass, f32) -> ForwardPlan;
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
     (
         "kimi_k3-bf16-mxfp4-kv-bf16",
-        kimi_k3_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>,
+        kimi_k3_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
     ),
 ];

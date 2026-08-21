@@ -137,10 +137,10 @@ pub fn qk_rmsnorm_rope(
 /// `kernels::attn::attention_xqa_decode_bf16_prepared` (whose contract includes the fire-wide
 /// XQA prepare — and which is therefore declared `whole`; see [`model_ir::kernels`]).
 ///
-/// The swept signature: `q` and the KV view as operands, and a seven-scalar
-/// run `[num_q_heads, num_kv_heads, head_dim, sm_scale, float_bytes,
-/// int_bytes, num_requests]` — the workspace byte counts are the statement's
-/// now (the carve is launch-local `ctx.scratch`), and the request count is a
+/// The swept signature: `q` and the KV view as operands, and a five-scalar
+/// run `[num_q_heads, num_kv_heads, head_dim, sm_scale, num_requests]` —
+/// the workspace carve is launch-local `ctx.scratch` at the ROUTINE's own
+/// capacities (substrate, not a model fact), and the request count is a
 /// fire extent the lowering splices.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_xqa_decode(
@@ -151,8 +151,6 @@ pub fn attention_xqa_decode(
     num_kv_heads: u32,
     head_dim: u32,
     sm_scale: f32,
-    float_bytes: u32,
-    int_bytes: u32,
 ) -> Option<Val> {
     // THE WINDOW IS A FACT NOW, NOT A SCALAR: this routine attends the whole
     // context and declares no window `Const`. It stays on the signature
@@ -168,15 +166,7 @@ pub fn attention_xqa_decode(
         "attn::attention_xqa_decode_bf16_prepared",
         vec![],
         kv_state(kv),
-        vec![
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            sm_scale.to_bits(),
-            float_bytes,
-            int_bytes,
-            0,
-        ],
+        vec![num_q_heads, num_kv_heads, head_dim, sm_scale.to_bits(), 0],
         vec![requests_extent(6)],
         vec![q.id, kvc],
         shape.map(|s| (s, DType::BF16)),
@@ -667,7 +657,7 @@ pub fn mxfp4_moe_gate_up_decode(
             DType::BF16,
         )
     };
-    let ew = rt_object(&x.t, "expert_weights", bank.layer);
+    let ew = rt_object(&x.t, "moe.expert_weights", bank.layer);
     let ids = x.t.with(bank.layer, |b| {
         b.launch_with_params(
             "quant::mxfp4_moe_gate_up_decode_bf16",
@@ -695,7 +685,7 @@ pub fn mxfp4_moe_down_decode(
     top_k: u32,
     hidden: u32,
 ) -> Val {
-    let ew = rt_object(&x.t, "expert_weights", bank.layer);
+    let ew = rt_object(&x.t, "moe.expert_weights", bank.layer);
     record(
         &x.t,
         bank.layer,
@@ -1153,7 +1143,7 @@ pub fn attention_flashinfer_decode_capture(
 ) -> Option<Val> {
     let plan = decode_plan(&q.t, head_dim, window_left == -1);
     let kvc = rt_object(&q.t, "kv_cache", Some(kv.l));
-    let score_indptr = rt_requests(&q.t, "attn.score_indptr");
+    let score = rt_object(&q.t, "attn.score", None);
     attn_at_planned(
         q,
         kv,
@@ -1166,7 +1156,7 @@ pub fn attention_flashinfer_decode_capture(
             p
         },
         Some(plan),
-        vec![kvc, score_indptr],
+        vec![kvc, score],
     )
 }
 
@@ -1180,7 +1170,6 @@ pub fn attention_flashinfer_prefill_capture(
     head_dim: u32,
     soft_cap: f32,
     sm_scale: f32,
-    score_window: u32,
 ) -> Option<Val> {
     // THE WINDOW IS A FACT NOW, NOT A SCALAR. Every routine below asks
     // for it through `keys::WindowLeft`; the statement used to carry it
@@ -1190,20 +1179,18 @@ pub fn attention_flashinfer_prefill_capture(
     let _ = window_left;
     let plan = prefill_plan(&q.data.t, head_dim);
     let kvc = rt_object(&q.data.t, "kv_cache", Some(kv.l));
-    // The score CSR stays a loose mint: its data half (`score_out`) is
-    // driver-owned, not a statement value, so there is no Val to pair.
-    let score_indptr = rt_requests(&q.data.t, "attn.score_indptr");
+    // The score observation is ONE driver-owned view (CSR + window): the
+    // window is boot policy and the CSR is the fire's, so neither is the
+    // statement's to state — the old form carried a Const zero and minted
+    // a stream no driver answered, which was the capture path dead twice.
+    let score = rt_object(&q.data.t, "attn.score", None);
     attn_at_planned(
         &q.data,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-        {
-            let mut p = cap_and_scale(soft_cap, sm_scale, head_dim);
-            p.push(score_window);
-            p
-        },
+        cap_and_scale(soft_cap, sm_scale, head_dim),
         Some(plan),
-        vec![kvc, q.indptr.id, score_indptr],
+        vec![kvc, q.indptr.id, score],
     )
 }
 

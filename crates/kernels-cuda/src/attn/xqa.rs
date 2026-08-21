@@ -514,8 +514,6 @@ pub fn attention_xqa_decode_bf16_prepared(
     head_dim: Const<i32>,
     kvc: In<Struct<KvCache>>,
     sm_scale: Const<f32>,
-    float_bytes: Const<usize>,
-    int_bytes: Const<usize>,
     num_requests: Const<i32>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -528,17 +526,20 @@ pub fn attention_xqa_decode_bf16_prepared(
     let page_size = kvc.page_size;
     let max_pages_per_seq = kvc.max_pages_per_request;
     let sm_scale = *sm_scale;
-    // The XQA carve is launch-local and its sizes are stated by the
-    // statement, so the workspace is named scratch rather than a driver
-    // answer (was `keys::AttnWorkspaceFloat` / `keys::AttnWorkspaceInt`).
-    let float_bytes = usize::try_from(*float_bytes).unwrap_or(usize::MAX);
+    // The XQA carve is launch-local SUBSTRATE: its capacities are this
+    // routine's own policy (the driver's historical 32/16 MiB), not a
+    // model fact — a statement stating them was a caller inventing what it
+    // had no basis to know (B5-2's flag).
+    const XQA_FLOAT_BYTES: usize = 32 << 20;
+    const XQA_INT_BYTES: usize = 16 << 20;
+    let float_bytes = XQA_FLOAT_BYTES;
     let float_buffer = ctx.scratch("attn::xqa_workspace_float", float_bytes)?;
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
     let kv_page_indices = kvc.page_indices as *const u32;
     let kv_page_indptr = kvc.page_indptr as *const u32;
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let int_bytes = usize::try_from(*int_bytes).unwrap_or(usize::MAX);
+    let int_bytes = XQA_INT_BYTES;
     let int_buffer = ctx.scratch("attn::xqa_workspace_int", int_bytes)?;
     let num_requests = *num_requests;
 

@@ -35,6 +35,7 @@ raise_abi!(
     crate::views::ExpertWeightsView,
     crate::views::MoeBanksView,
     crate::views::GemmGroupsView,
+    crate::views::ScoreView,
 );
 
 kernels::raise!(

@@ -237,6 +237,7 @@ mod seam_tests {
             state: None,
             params: vec![],
             param_extents: vec![],
+            peel_slots: None,
         }
     }
 

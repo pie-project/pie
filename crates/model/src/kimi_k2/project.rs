@@ -50,6 +50,17 @@ pub fn manifest(f: &KimiFacts, tied_embeddings: bool) -> Manifest {
     let all_dense = f.dense_layers >= f.layers;
 
     Manifest::new(f.layers)
+        // The shipped reprs, DERIVED from the family's one axis
+        // spelling (`forward::Shipped{W1,W2}`): a bf16 stack around
+        // WNA16 expert banks. The expert claim is the one that
+        // DISTINGUISHES — it is why the routed bank is deliberately not
+        // named below (matching stays encoding-agnostic; the bf16
+        // upload is the same MODEL) while the LOAD holds a CUDA
+        // checkpoint to the packed spelling, refusing with this axis
+        // named. `tests/catalogue_coverage.rs` holds these claims to
+        // the axes so the two spellings cannot drift.
+        .holds_projections_as(<super::forward::ShippedW1 as model_dsl::axes::DtypeAxis>::REPR)
+        .holds_experts_as(<super::forward::ShippedW2 as model_dsl::axes::DtypeAxis>::REPR)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
@@ -365,12 +376,17 @@ pub fn trace(
     class: model_ir::trace::FireClass,
     norm_eps: f32,
 ) -> model_ir::trace::ForwardPlan {
-    // THE SHIPPED POINT. kimi-k2 catalogues one SKU today — WNA16 routed
-    // experts, the only routed leg the text states; the table in
-    // `forward::CATALOG` is where a second one appears, and the coverage
-    // test is what keeps every row loadable.
-    use model_dsl::axes::{Bf16Ax, NativeKv, Wna16Ax};
-    super::forward::kimi_cuda::<Bf16Ax, Wna16Ax, Bf16Ax, NativeKv>(
+    // THE SHIPPED POINT, read off the family's one axis spelling
+    // (`forward::Shipped*`, beside its CATALOG). kimi-k2 catalogues one
+    // SKU today — WNA16 routed experts, the only routed leg the text
+    // states; the table in `forward::CATALOG` is where a second one
+    // appears, and the coverage test is what keeps every row loadable.
+    super::forward::kimi_cuda::<
+        super::forward::ShippedW1,
+        super::forward::ShippedW2,
+        super::forward::ShippedA,
+        super::forward::ShippedKv,
+    >(
         f,
         &cuda_facts(rope_yarn_original),
         class,

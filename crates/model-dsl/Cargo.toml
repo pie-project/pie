@@ -34,3 +34,19 @@ serde = { version = "1.0", features = ["derive"] }
 # the point of the split: an authoring surface reaches the IR and nothing else
 # -- not the lowering, and not a device.
 model-ir = { path = "../model-ir" }
+# `fire::<R>`'s bounds (Signature + Derivation) and, for the CUDA aliases,
+# the marker types themselves. TABLE ONLY on the plane crate — same
+# `default-features = false` rule `model-ir` already follows, so the
+# authoring surface still reaches no device.
+kernels = { path = "../kernels" }
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
+
+[dev-dependencies]
+# The wrapper GENERATOR's parser (design-no-ask §10, B4-gen). A dev-dep and
+# not a build-dep on purpose: `src/cuda/generated.rs` is CHECKED IN, and
+# `tests/wrappers_are_current.rs` is the one thing that regenerates and
+# diffs it — a build script that wrote into `src/` on every build would
+# race parallel builds and break read-only checkouts, and checked-in
+# generation needs no `rerun-if-changed` plumbing. Same version/features
+# line as `kernels-macros`, which parses the same signatures.
+syn = { version = "3.0", features = ["full"] }

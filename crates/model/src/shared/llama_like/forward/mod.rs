@@ -15,27 +15,14 @@ use model_dsl::{
 };
 use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, Shape};
 
-/// The XQA decode workspace, in bytes — the capacity the driver allocated
-/// for every deployment before the carve moved onto the statement
-/// (`driver-cuda/src/fire/launch.rs` allocated each `AttentionWorkspace`
-/// at 32 MiB float / 16 MiB int, deployment-independent). The routine
-/// carves its page table, sequence lengths and scratch out of the float
-/// half and its semaphore bank out of the int half, and refuses at fire
-/// time if the carve does not fit — so these are capacity statements, not
-/// geometry, and they restate the driver's own numbers.
-const XQA_FLOAT_WORKSPACE_BYTES: u32 = 32 << 20;
-/// See [`XQA_FLOAT_WORKSPACE_BYTES`].
-const XQA_INT_WORKSPACE_BYTES: u32 = 16 << 20;
+// The XQA workspace capacities left this file: they are the ROUTINE's own
+// substrate policy now (`kernels-cuda/src/attn/xqa.rs` carves its scratch
+// at its own 32/16 MiB), because a capacity is not a model fact and a
+// forward stating one was inventing what it had no basis to know.
 
 /// KNOWN DEFECT, stated rather than guessed: the capture dispatch's
-/// `score_window` is a PER-FIRE number (the driver answered it from
-/// `attn_ctx().score_window`, boot-configured, default 32 — a property of
-/// the fire's score-wanting programs, not of any checkpoint), and the B2
-/// sweep marked it `Const<u32>` on the routine. A trace-time constant
-/// cannot state it honestly; 0 is the routine's own "no capture" value.
-/// The design table (§3) classes `AttnScoreWindow` as a per-fire stream —
-/// the mark should move to the runtime channel at convergence.
-const SCORE_WINDOW_UNSTATED: u32 = 0;
+// `score_window` left this file: it rides the driver's `attn.score`
+// view now (boot policy + the fire's CSR, one operand).
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
 /// trace serves every fire shape, kernel choice stays with the consumer
@@ -263,6 +250,15 @@ pub fn llama_like_cuda<A: DtypeAxis, K: KvAxis>(
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&LlamaLikeFacts, &LlamaLikeCudaFacts, FireClass, f32, f32) -> ForwardPlan;
 
+/// The shipped point's axes — the shared text's ONE spelling of them.
+/// [`CATALOG`] and `project::trace` both derive from these. There is
+/// deliberately NO `ShippedW1` here and no manifest repr claim either:
+/// llama_like's weight repr is per-row DATA (`proj_repr`), not a
+/// catalogued axis — see [`CATALOG`]'s doc.
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The shared text's catalogue — ONE point, and thinner than the family
 /// tables on purpose. llama_like serves eleven architectures through
 /// per-deployment ROWS, and the row's `proj_repr` is data this point does
@@ -272,7 +268,7 @@ pub type TraceFn = fn(&LlamaLikeFacts, &LlamaLikeCudaFacts, FireClass, f32, f32)
 /// `TraceBuilder::finish`'s `check_plan` then refuses a point whose
 /// statements reach a routine row that does not exist.
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    ("llama_like-kv-bf16", llama_like_cuda::<Bf16Ax, NativeKv>),
+    ("llama_like-kv-bf16", llama_like_cuda::<ShippedA, ShippedKv>),
 ];
 
 /// The llama_like METAL text (`.wiki/tart/dsl.md` ③) — the second
@@ -2095,8 +2091,6 @@ fn llama_like_cuda_text(
                                 // `1/sqrt(head_dim)` (project.rs states no
                                 // other); 0 tells the routine to derive it.
                                 0.0,
-                                XQA_FLOAT_WORKSPACE_BYTES,
-                                XQA_INT_WORKSPACE_BYTES,
                             );
                         } else if c.force_prefill_path {
                             // The GQA ratio sits outside the decode
@@ -2151,7 +2145,6 @@ fn llama_like_cuda_text(
                                                 plan_head_dim,
                                                 0.0,
                                                 0.0,
-                                                SCORE_WINDOW_UNSTATED,
                                             );
                                         })
                                         .otherwise(|| {

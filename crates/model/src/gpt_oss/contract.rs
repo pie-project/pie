@@ -6,9 +6,12 @@
 //! triplet, and the layout the contract asks for depends on whether this
 //! device has a native MXFP4 GEMM.
 
+use model_dsl::axes::DtypeAxis;
 use model_loader::contract::{Expr, GroupContract, Scales, TensorContract};
 use model_loader::error::Error;
-use model_loader::types::{DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId};
+use model_loader::types::{
+    BackendKind, DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId,
+};
 
 use crate::shared::builder::{Builder, align_up, is_raw, mxfp4_encoding};
 use crate::shared::mlx;
@@ -18,13 +21,71 @@ fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
 }
 
+/// The shipped expert axis, read off the family's ONE spelling
+/// (`forward::ShippedW2`, beside its `CATALOG`).
+///
+/// Pinned at compile time to MXFP4-Marlin because every MXFP4 statement
+/// in this file — the `_blocks`/`_scales` walk, the Marlin repacks, the
+/// 32-wide E8M0 block-scale pairing — is that axis's loader spelling
+/// (`QuantScheme::Mxfp4E2M1E8M0` via `mxfp4_encoding`; the 32 and the
+/// E8M0 are the FORMAT's own numbers, which is why the variant carries
+/// none). An axis change lands here as a compile refusal, not as a
+/// contract quietly authoring the wrong scheme.
+const _EXPERTS_ARE_MXFP4: () = {
+    match <super::forward::ShippedW2 as DtypeAxis>::REPR {
+        model_dsl::WeightRepr::Mxfp4Marlin => (),
+        _ => panic!(
+            "gpt-oss's catalogued expert axis moved off MXFP4-Marlin; \
+             every mxfp4 arm of this contract spells that axis"
+        ),
+    }
+};
+
 /// GPT-OSS. The dense QKV join is deliberately absent: this bind path reads
 /// `q_proj`/`k_proj`/`v_proj` individually, so fusing them would consume the
 /// three and leave the bind with a missing weight.
 pub fn author_gpt_oss(b: &mut Builder<'_>) -> Result<(), Error> {
+    shipped_axis_check(b)?;
     mxfp4_groups(b)?;
     b.fused_moe_gate_up_tp_slices(false)?;
     b.publish_remaining()
+}
+
+/// THE SHIPPED AXIS'S LOAD CHECK (design-no-ask §9): a checkpoint whose
+/// expert banks are not the catalogued repr refuses at the door, with
+/// the axis named.
+///
+/// The catalogued CUDA SKU is `gpt_oss-bf16-mxfp4-kv-bf16` — W2 is
+/// [`super::forward::ShippedW2`], and the traced routed leg states
+/// `quant::mxfp4_moe_*` by name — so the dequantized release, which
+/// publishes the same bank as a plain bf16 `gate_up_proj`/`down_proj`,
+/// has no CUDA text in this build to serve it. It is the same MODEL
+/// (the manifest matches; identity is not an encoding) but not the
+/// shipped SKU, and without this check it loaded happily and died at
+/// the first routed fire with a missing-weight bind error that named no
+/// cause.
+///
+/// CUDA-scoped: Metal reads its expert repr off the binding
+/// (`moe_repr`, row-driven), and MLX checkpoints arrive through
+/// `author_gpt_oss_mlx` — neither states the packed leg by name, so
+/// neither is held to this axis.
+fn shipped_axis_check(b: &Builder<'_>) -> Result<(), Error> {
+    if b.target().backend != BackendKind::Cuda {
+        return Ok(());
+    }
+    if let Some(t) = b.tensors().iter().find(|t| {
+        t.name.ends_with("mlp.experts.gate_up_proj") || t.name.ends_with("mlp.experts.down_proj")
+    }) {
+        return fail(format!(
+            "gpt-oss's catalogued CUDA SKU ships `{}` experts (axis W2, \
+             repr Mxfp4Marlin: `_blocks`/`_scales` triplets), but '{}' is \
+             the dequantized bf16 bank — the same model in a repr this \
+             build's CUDA text has no routed leg for",
+            <super::forward::ShippedW2 as DtypeAxis>::NAME,
+            t.name,
+        ));
+    }
+    Ok(())
 }
 
 /// State that an MXFP4 scale tensor holds the block scales for `weight`.

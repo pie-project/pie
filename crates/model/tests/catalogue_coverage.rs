@@ -205,6 +205,98 @@ fn every_llama_like_sku_traces_at_both_classes() {
     }
 }
 
+// ── §9's second consumer: the manifest's repr claims derive from the axes ──
+
+/// The drift test that makes the derivation load-bearing: each family's
+/// `manifest()` claims the reprs of its projection and expert banks by
+/// READING the shipped axes (`forward::Shipped{W1,W2}`), and this holds
+/// the claim to the axis so a hand-written claim cannot drift from the
+/// catalogued point. The literal beside each real case pins TODAY's
+/// point as well, so an axis edit that means a new SKU cannot slip
+/// through as a silent re-labelling of the old one.
+#[test]
+fn the_manifest_repr_claims_are_the_shipped_axes() {
+    use model::catalog::Variant;
+    use model_dsl::axes::DtypeAxis;
+    use model_dsl::{ScaleLayout, WeightRepr};
+
+    fn manifest_of(id: &str) -> model::manifest::Manifest {
+        model::catalog::catalog()
+            .iter()
+            .find(|v| v.id() == id)
+            .unwrap_or_else(|| panic!("no catalog row named `{id}`"))
+            .manifest()
+    }
+
+    // gpt-oss: MXFP4-Marlin experts around a bf16 stack.
+    let gpt = manifest_of("gpt-oss-20b");
+    assert_eq!(
+        gpt.expert_repr,
+        Some(<model::gpt_oss::forward::ShippedW2 as DtypeAxis>::REPR),
+        "gpt-oss's manifest must claim the expert bank at the shipped axis's repr",
+    );
+    assert_eq!(gpt.expert_repr, Some(WeightRepr::Mxfp4Marlin));
+    assert_eq!(
+        gpt.proj_repr,
+        Some(<model::gpt_oss::forward::ShippedW1 as DtypeAxis>::REPR),
+    );
+    assert_eq!(gpt.proj_repr, Some(WeightRepr::Bf16));
+
+    // kimi-k2: WNA16 experts — per-group 32, no zero point — around a
+    // bf16 stack. The group here is the same number the traced wna16
+    // statements pass as a param and the load contract dequantizes by.
+    let kimi = manifest_of("kimi-k2");
+    assert_eq!(
+        kimi.expert_repr,
+        Some(<model::kimi_k2::forward::ShippedW2 as DtypeAxis>::REPR),
+        "kimi-k2's manifest must claim the expert bank at the shipped axis's repr",
+    );
+    assert_eq!(
+        kimi.expert_repr,
+        Some(WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: 32,
+            axis: 0,
+            zero_point: false,
+        }),
+    );
+    assert_eq!(
+        kimi.proj_repr,
+        Some(<model::kimi_k2::forward::ShippedW1 as DtypeAxis>::REPR),
+    );
+
+    // kimi-k3: MXFP4 experts, same rule.
+    let k3 = manifest_of("kimi-k3");
+    assert_eq!(
+        k3.expert_repr,
+        Some(<model::kimi_k3::forward::ShippedW2 as DtypeAxis>::REPR),
+    );
+    assert_eq!(k3.expert_repr, Some(WeightRepr::Mxfp4Marlin));
+    assert_eq!(
+        k3.proj_repr,
+        Some(<model::kimi_k3::forward::ShippedW1 as DtypeAxis>::REPR),
+    );
+
+    // A pure-bf16 mixture: both claims present, both the bf16 axis.
+    let glm = manifest_of("glm-5-106b-a12b");
+    assert_eq!(
+        glm.proj_repr,
+        Some(<model::glm_5::forward::ShippedW1 as DtypeAxis>::REPR),
+    );
+    assert_eq!(
+        glm.expert_repr,
+        Some(<model::glm_5::forward::ShippedW2 as DtypeAxis>::REPR),
+    );
+    assert_eq!(glm.expert_repr, Some(WeightRepr::Bf16));
+
+    // llama_like rows claim NOTHING — the repr is per-row data there,
+    // deliberately (see `shared::llama_like::forward::CATALOG`), so a
+    // claim appearing on one of its rows is a rule change, not a tidy-up.
+    let qwen = manifest_of("qwen3-0.6b");
+    assert_eq!(qwen.proj_repr, None);
+    assert_eq!(qwen.expert_repr, None);
+}
+
 #[test]
 fn every_sku_name_spells_its_instantiation() {
     // The rollout's names, pinned in one place: each spells its family's

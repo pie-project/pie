@@ -197,7 +197,7 @@ kernels::resident!(
 kernels::resident!(
     /// A layer's quantised expert-weight banks. Was `keys::WeightExpertPtrs`
     /// / `WeightExpertScalePtrs` / `WeightBias`.
-    ExpertWeights = "expert_weights" => ExpertWeightsView
+    ExpertWeights = "moe.expert_weights" => ExpertWeightsView
 );
 kernels::raise!(
     /// The MoE grouped-GEMM banks, carved per fire.
@@ -237,4 +237,24 @@ kernels::raise!(
     /// The fire's KV page indptr, staged in HOST memory for planning. Was
     /// `keys::KvPageIndptrHost`.
     KvPageIndptrHost = "kv_page_indptr.host" => u32
+);
+
+/// `In<Struct<AttnScore>>` — the attention-score observation the driver
+/// keeps: the per-request CSR of observed rows and the window each keeps.
+/// Both are the FIRE's (the CSR is staged per fire; the window is
+/// boot-configured policy), so neither is a statement's to state — the
+/// capture forms read this view where one carried a `Const` zero and the
+/// other minted a stream no driver answered.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ScoreView {
+    /// The observed-rows CSR, `[Requests + 1]`.
+    pub indptr: *const i32,
+    /// Rows each request keeps; `0` means the fire observes nothing.
+    pub window: u32,
+}
+
+kernels::resident!(
+    /// The score observation. Per-fire, driver policy.
+    AttnScore = "attn.score" => ScoreView
 );

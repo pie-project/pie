@@ -63,6 +63,11 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
     let all_dense = f.dense_layers >= f.layers;
 
     Manifest::new(f.layers)
+        // The shipped reprs, DERIVED from the family's one axis
+        // spelling (`forward::Shipped{W1,W2}`) — both plain bf16, inert
+        // for matching; they state what the catalogued text assumes.
+        .holds_projections_as(<super::forward::ShippedW1 as model_dsl::axes::DtypeAxis>::REPR)
+        .holds_experts_as(<super::forward::ShippedW2 as model_dsl::axes::DtypeAxis>::REPR)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
@@ -351,11 +356,16 @@ pub fn trace(
     norm_eps: f32,
     rope_theta: f32,
 ) -> model_ir::trace::ForwardPlan {
-    // THE SHIPPED POINT. glm-5 catalogues one SKU today; the table in
-    // `forward::CATALOG` is where a second one appears, and the coverage
-    // test is what keeps every row loadable.
-    use model_dsl::axes::{Bf16Ax, NativeKv};
-    super::forward::glm5_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>(f, class, norm_eps, rope_theta)
+    // THE SHIPPED POINT, read off the family's one axis spelling
+    // (`forward::Shipped*`, beside its CATALOG). glm-5 catalogues one
+    // SKU today; the table in `forward::CATALOG` is where a second one
+    // appears, and the coverage test is what keeps every row loadable.
+    super::forward::glm5_cuda::<
+        super::forward::ShippedW1,
+        super::forward::ShippedW2,
+        super::forward::ShippedA,
+        super::forward::ShippedKv,
+    >(f, class, norm_eps, rope_theta)
 }
 
 #[cfg(test)]

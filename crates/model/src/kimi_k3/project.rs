@@ -111,6 +111,15 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
     );
 
     Manifest::new(f.layers)
+        // The shipped reprs, DERIVED from the family's one axis
+        // spelling (`forward::Shipped{W1,W2}`): a bf16 stack around
+        // MXFP4 expert banks. Matching stays encoding-agnostic (the
+        // manifest names no `weight_packed`, see the module doc); the
+        // expert claim states what the catalogued text's `mxfp4_moe_*`
+        // leg assumes, and `tests/catalogue_coverage.rs` holds it to
+        // the axis so the two spellings cannot drift.
+        .holds_projections_as(<super::forward::ShippedW1 as model_dsl::axes::DtypeAxis>::REPR)
+        .holds_experts_as(<super::forward::ShippedW2 as model_dsl::axes::DtypeAxis>::REPR)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
@@ -536,11 +545,17 @@ pub fn trace(
              rank-3",
         ));
     }
-    // THE SHIPPED POINT. kimi-k3 catalogues one SKU today — MXFP4 routed
-    // experts; the table in `forward::CATALOG` is where a second one
-    // appears, and the coverage test is what keeps every row loadable.
-    use model_dsl::axes::{Bf16Ax, Mxfp4Ax, NativeKv};
-    Ok(super::forward::kimi_k3_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>(f, class, norm_eps))
+    // THE SHIPPED POINT, read off the family's one axis spelling
+    // (`forward::Shipped*`, beside its CATALOG). kimi-k3 catalogues one
+    // SKU today — MXFP4 routed experts; the table in `forward::CATALOG`
+    // is where a second one appears, and the coverage test is what keeps
+    // every row loadable.
+    Ok(super::forward::kimi_k3_cuda::<
+        super::forward::ShippedW1,
+        super::forward::ShippedW2,
+        super::forward::ShippedA,
+        super::forward::ShippedKv,
+    >(f, class, norm_eps))
 }
 
 #[cfg(test)]

@@ -80,7 +80,7 @@ pub fn geglu_tanh<T>(
     ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::geglu_tanh<{}>", T::CPP))).apply(elementwise(n)), &[gate.arg(), up.arg(), y.arg(), n.arg()])
 }
 
-#[routine(bf16)]
+#[routine(dtypes(bf16, f16), out(y = like(x)))]
 pub fn relu2<T>(ctx: &Ctx<'_>, x: In<Tensor<T>>, y: Out<Tensor<T>>) -> Result<(), Refusal> {
     let n = y.rows.saturating_mul(y.width);
     ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::relu2<{}>", T::CPP))).apply(elementwise(n)), &[x.arg(), y.arg(), n.arg()])
@@ -110,7 +110,7 @@ pub fn gpt_oss_glu<T>(
             ])
 }
 
-#[routine(bf16)]
+#[routine(bf16, out(y = rows(packed) x half(packed)))]
 pub fn chunked_swiglu<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,

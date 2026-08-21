@@ -153,16 +153,26 @@ builder! {
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the norm produces its value",
     }
+}
 
-
-    /// `kernels::mlp::relu2`: `relu(x)²`, nemotron_h's MLP activation.
-    pub fn relu2(x: &Val, width: u32) -> Val {
-        symbol: "mlp::relu2",
-        on: x,
-        inputs: [x],
-        out: [Dim::Tokens, Dim::Const(width)] as BF16,
-        made: "the activation produces its value",
-    }
+/// `kernels::mlp::relu2`: `relu(x)²`, nemotron_h's MLP activation.
+///
+/// THE ALIAS FORM: one line over [`crate::fire::fire`], stated by the
+/// routine's own marker — the shape every named wrapper here could take,
+/// and the proof that a routine added to the plane is a routine the DSL
+/// can state with no wrapper written.
+pub fn relu2(x: &Val, width: u32) -> Val {
+    crate::fire::fire::<kernels_cuda::mlp::relu2>(
+        &x.t,
+        crate::fire::Call {
+            inputs: vec![x.id],
+            outs: vec![(Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)],
+            layer: x.layer,
+            ..Default::default()
+        },
+    )
+    .pop()
+    .expect("the activation produces its value")
 }
 
 

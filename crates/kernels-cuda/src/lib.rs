@@ -105,6 +105,7 @@ pub fn sigs() -> &'static [KernelSig] {
                     driver: r.driver,
                     canon: r.canon,
                     point: r.point,
+                    out_rule: r.out_rule,
                     ..SIG_BASE
                 });
             }
@@ -127,11 +128,24 @@ const SIG_BASE: KernelSig = KernelSig {
     driver: false,
     canon: None,
     point: &[],
+    out_rule: &[],
 };
 
 #[must_use]
 pub fn routine(symbol: &str) -> Option<&'static jit::Routine> {
     rows().find(|r| r.answers(symbol))
+}
+
+/// The row for `symbol` AT a dtype point — how a caller that knows the
+/// statement's value dtype selects among the rows `dtypes(..)` stamped.
+/// Falls back to the first row when no row names the point (a single-point
+/// routine's row has an empty or singleton `point`), so a caller with no
+/// hint gets exactly what [`routine`] gives.
+#[must_use]
+pub fn routine_at(symbol: &str, point: &str) -> Option<&'static jit::Routine> {
+    rows()
+        .find(|r| r.answers(symbol) && r.point.contains(&point))
+        .or_else(|| routine(symbol))
 }
 
 pub unsafe fn call(

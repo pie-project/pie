@@ -327,11 +327,20 @@ pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Gemma3nFacts, FireClass, f32, f32, f32) -> ForwardPlan;
 
+/// The shipped SKU's axes — the family's ONE spelling of its point.
+/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claim
+/// all derive from these; a second SKU adds a row, not a respelling.
+pub type ShippedW1 = Bf16Ax;
+/// The activation axis of the shipped point (pinned BF16 in the text).
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The family's catalogue — every SKU this build ships, enumerated. The
 /// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
 /// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
 /// row whose statements reach a routine point that does not exist, which
 /// is how the demand set closes: checked, never hoped.
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
-    ("gemma3n-bf16-kv-bf16", gemma3n_cuda::<Bf16Ax, Bf16Ax, NativeKv>),
+    ("gemma3n-bf16-kv-bf16", gemma3n_cuda::<ShippedW1, ShippedA, ShippedKv>),
 ];

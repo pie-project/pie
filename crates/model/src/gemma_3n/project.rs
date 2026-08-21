@@ -73,6 +73,10 @@ pub fn manifest(f: &Gemma3nFacts) -> Manifest {
     let layers = u64::from(f.layers());
 
     Manifest::new(f.layers())
+        // The shipped projection repr, DERIVED from the family's one
+        // axis spelling (`forward::ShippedW1`) — plain bf16, inert for
+        // matching; it states only what the catalogued text assumes.
+        .holds_projections_as(<super::forward::ShippedW1 as model_dsl::axes::DtypeAxis>::REPR)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
         // gemma-3n ties, and a tie is an ABSENCE.
@@ -348,11 +352,15 @@ pub fn trace(
     rope_theta_local: f32,
 ) -> model_ir::trace::ForwardPlan {
     let _ = load;
-    // THE SHIPPED POINT. gemma-3n catalogues one SKU today; the table in
-    // `forward::CATALOG` is where a second one appears, and the coverage
-    // test is what keeps every row loadable.
-    use model_dsl::axes::{Bf16Ax, NativeKv};
-    super::forward::gemma3n_cuda::<Bf16Ax, Bf16Ax, NativeKv>(
+    // THE SHIPPED POINT, read off the family's one axis spelling
+    // (`forward::Shipped*`, beside its CATALOG). gemma-3n catalogues one
+    // SKU today; the table in `forward::CATALOG` is where a second one
+    // appears, and the coverage test is what keeps every row loadable.
+    super::forward::gemma3n_cuda::<
+        super::forward::ShippedW1,
+        super::forward::ShippedA,
+        super::forward::ShippedKv,
+    >(
         f,
         class,
         norm_eps,

@@ -94,6 +94,15 @@ pub enum OpKind {
         /// reads past the live data silently.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         param_extents: Vec<(u8, Shape)>,
+        /// Params the LOWERING fills with this launch's own row window:
+        /// `(start_slot, len_slot)` receive the rectangle's start and
+        /// length. For a launch inside a peel region that is the region's
+        /// split — a number no statement can state and no shape can spell,
+        /// because the split is the fire's; on an unpeeled fire the window
+        /// is `(0, N)`, which is the same reading. The statement carries
+        /// zeros at those slots and the walk overwrites them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peel_slots: Option<(u8, u8)>,
     },
     /// The one branch a lowered trace may carry: a chain of arms over
     /// per-fire runtime inputs ([`GuardPred`], a closed vocabulary). The first

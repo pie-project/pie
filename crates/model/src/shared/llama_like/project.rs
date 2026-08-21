@@ -861,12 +861,15 @@ pub fn trace(
     load: Deployed<'_>,
 ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
     match load.backend {
-        // THE SHIPPED POINT. One catalogued pair of axes; the row's own
-        // `proj_repr` stays data (see `forward::CATALOG`), and the
-        // coverage test is what keeps the point loadable.
+        // THE SHIPPED POINT, read off the shared text's one axis
+        // spelling (`forward::Shipped*`, beside its CATALOG). One
+        // catalogued pair of axes; the row's own `proj_repr` stays data
+        // (see `forward::CATALOG`) — which is also why these rows'
+        // manifests make no repr claim — and the coverage test is what
+        // keeps the point loadable.
         Backend::Cuda => Ok(super::forward::llama_like_cuda::<
-            model_dsl::axes::Bf16Ax,
-            model_dsl::axes::NativeKv,
+            super::forward::ShippedA,
+            super::forward::ShippedKv,
         >(
             f,
             &cuda_facts(f, load),

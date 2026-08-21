@@ -425,6 +425,17 @@ pub fn dsv4_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&Dsv4Facts, FireClass, f32, f32) -> ForwardPlan;
 
+/// The shipped SKU's axes — the family's ONE spelling of its point.
+/// [`CATALOG`], `project::trace` and `project::manifest`'s repr claims
+/// all derive from these; a second SKU adds a row, not a respelling.
+pub type ShippedW1 = Bf16Ax;
+/// The routed expert banks' axis of the shipped point.
+pub type ShippedW2 = Bf16Ax;
+/// The activation axis of the shipped point (pinned BF16 in the text).
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The family's catalogue — every SKU this build ships, enumerated. The
 /// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
 /// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
@@ -433,6 +444,6 @@ pub type TraceFn = fn(&Dsv4Facts, FireClass, f32, f32) -> ForwardPlan;
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
     (
         "deepseek_v4-bf16-bf16-kv-bf16",
-        dsv4_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>,
+        dsv4_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
     ),
 ];

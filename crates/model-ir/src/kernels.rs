@@ -318,6 +318,68 @@ pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
     }
 }
 
+/// Evaluate one result's [`kernels::OutRule`] against a statement's
+/// operands — the B4-gen evaluator (design-no-ask §10). `None` is
+/// [`kernels::OutRule::Unstated`]'s honest answer: the caller supplies the
+/// `Shape`, exactly as today; a rule that names a slot the statement does
+/// not fill is a `None` too, and the generated wrapper's own `Shape`
+/// fallback refuses louder than a guess would.
+#[must_use]
+pub fn out_shape(
+    rule: kernels::OutRule,
+    input_shapes: &[&crate::trace::Shape],
+    input_dtypes: &[crate::trace::DType],
+    params: &[u32],
+) -> Option<(crate::trace::Shape, crate::trace::DType)> {
+    use crate::trace::{Dim, Shape};
+    use kernels::{OutRule, OutWidth};
+    let width_of = |shape: &Shape| -> Option<u32> {
+        match shape.0.last()? {
+            Dim::Const(w) => Some(*w),
+            _ => None,
+        }
+    };
+    match rule {
+        OutRule::Unstated => None,
+        OutRule::Like { of } => {
+            let at = usize::from(of);
+            Some(((*input_shapes.get(at)?).clone(), *input_dtypes.get(at)?))
+        }
+        OutRule::Shaped { rows_of, width } => {
+            let at = usize::from(rows_of);
+            let base = *input_shapes.get(at)?;
+            let dtype = *input_dtypes.get(at)?;
+            let w = match width {
+                OutWidth::Half { of } => width_of(input_shapes.get(usize::from(of))?)? / 2,
+                OutWidth::Of { of } => width_of(input_shapes.get(usize::from(of))?)?,
+                // A weight's projection width is not readable from the
+                // statement (weights are names); a rule naming one is
+                // resolved by the GENERATED wrapper, which holds the
+                // handle. Here it is honestly unanswerable.
+                OutWidth::Weight { .. } => return None,
+                OutWidth::Param { of } => *params.get(usize::from(of))?,
+            };
+            let mut dims = base.0[..base.0.len().saturating_sub(1)].to_vec();
+            dims.push(Dim::Const(w));
+            Some((Shape(dims), dtype))
+        }
+        OutRule::Split { of, dim_param } => {
+            let at = usize::from(of);
+            let base = *input_shapes.get(at)?;
+            let dtype = *input_dtypes.get(at)?;
+            let total = width_of(base)?;
+            let d = *params.get(usize::from(dim_param))?;
+            if d == 0 || total % d != 0 {
+                return None;
+            }
+            let mut dims = base.0[..base.0.len().saturating_sub(1)].to_vec();
+            dims.push(Dim::Const(total / d));
+            dims.push(Dim::Const(d));
+            Some((Shape(dims), dtype))
+        }
+    }
+}
+
 /// The row for one CUDA symbol, for readers that want the row itself: the
 /// CUDA emitter and the table tests.
 ///
@@ -452,6 +514,22 @@ const fn plural(n: usize) -> &'static str {
 pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     let mut problems = Vec::new();
     let backend = Backend::of_family(&plan.family);
+    // THE RUNTIME VOCABULARY IS CLOSED (B3's rule, late). A tier-1 name
+    // must be one the floor declares — every backend answers those. A
+    // tier-2 name is the plane's own and not enumerable from rows, so the
+    // closure the check can hold is the SPELLING: plane keys are dotted
+    // (`fa2.prefill`, `attn.score`), floor names are not — an undotted
+    // name outside the floor's list is a typo'd tier-1, refused at load
+    // instead of surfacing as an unanswered bind at fire.
+    for b in &plan.runtime {
+        if kernels::runtime::tier1(&b.name).is_none() && !b.name.contains('.') {
+            problems.push(format!(
+                "{}: names runtime value `{}`, which is neither in the tier-1 \
+                 vocabulary nor spelled as a plane's dotted key",
+                plan.family, b.name
+            ));
+        }
+    }
     // Countdowns over the flat op list; both kinds' regions are consecutive
     // and sit immediately after the op.
     let mut peeled = 0usize;

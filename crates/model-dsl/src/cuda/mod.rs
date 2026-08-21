@@ -139,6 +139,38 @@ fn record_with_extents(
     })
 }
 
+/// [`record_with_extents`], plus the peel-window slots the walk fills.
+fn record_devwin(
+    t: &Trace,
+    layer: Option<u32>,
+    kernel: &str,
+    weights: Vec<String>,
+    state: Option<StateRef>,
+    params: Vec<u32>,
+    param_extents: Vec<(u8, Shape)>,
+    peel_slots: Option<(u8, u8)>,
+    inputs: Vec<model_ir::trace::ValueId>,
+    out: Option<(Shape, DType)>,
+) -> Option<Val> {
+    let ids = t.with(layer, |b| {
+        b.launch_devwin(
+            kernel,
+            weights,
+            state,
+            params,
+            param_extents,
+            peel_slots,
+            inputs,
+            out.into_iter().collect(),
+        )
+    });
+    ids.first().map(|&id| Val {
+        t: t.clone(),
+        id,
+        layer,
+    })
+}
+
 /// [`record_many_with_params`], plus fire-decided scalar extents.
 #[allow(clippy::too_many_arguments)]
 fn record_many_with_extents(
@@ -203,6 +235,31 @@ fn requests_extent(at: u8) -> (u8, Shape) {
 /// The extent pair for a `rows`/`n_max` scalar: the fire's token rows.
 fn tokens_extent(at: u8) -> (u8, Shape) {
     (at, Shape(vec![Dim::Tokens]))
+}
+
+/// One result's geometry, resolved from the ROUTINE's stated `out(..)` rule
+/// against the statement's own operands — the trace-time half of B4-gen
+/// (design-no-ask §10). `inputs` is the statement's operand run in slot
+/// order; the rule's ordinals index into it.
+///
+/// Panics — at trace time, which is load time — when the rule does not
+/// resolve, because a result the rule cannot shape must not become a
+/// statement. `Unstated` never reaches here: an unruled result keeps its
+/// `(Shape, DType)` parameter on the generated wrapper.
+fn ruled_out(
+    t: &Trace,
+    routine: &str,
+    rule: kernels::OutRule,
+    inputs: &[model_ir::trace::ValueId],
+    params: &[u32],
+) -> (Shape, DType) {
+    let b = t.inner.borrow();
+    let shapes: Vec<Shape> = inputs.iter().map(|&id| b.value_shape(id)).collect();
+    let dtypes: Vec<DType> = inputs.iter().map(|&id| b.value_dtype(id)).collect();
+    let refs: Vec<&Shape> = shapes.iter().collect();
+    model_ir::kernels::out_shape(rule, &refs, &dtypes, params).unwrap_or_else(|| {
+        panic!("`{routine}`'s out rule does not resolve against this statement's operands")
+    })
 }
 
 fn kv_state(kv: &Kv) -> Option<StateRef> {
@@ -428,6 +485,11 @@ mod attn;
 mod base;
 mod deepseek_v4;
 mod gemma;
+/// GENERATED named wrappers, one per traced `#[routine]` in
+/// `crates/kernels-cuda/src` — see design-no-ask §10 (B4-gen). Deliberately
+/// NOT glob-re-exported: callers opt in with `dsl::cuda::generated::`, so no
+/// generated name can shadow a hand-written one while both exist.
+pub mod generated;
 mod mla;
 mod moe;
 mod qwen_3_5;

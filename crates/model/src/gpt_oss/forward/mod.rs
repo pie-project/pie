@@ -371,6 +371,21 @@ pub fn gpt_oss_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
 /// One shipping SKU: its name and the monomorphized trace it instantiates.
 pub type TraceFn = fn(&GptOssFacts, &GptOssCudaFacts, FireClass, f32, f32, i32) -> ForwardPlan;
 
+/// The shipped SKU's axes — the family's ONE spelling of its point.
+///
+/// Every consumer derives from these aliases rather than restating them:
+/// [`CATALOG`]'s turbofish, `project::trace`'s instantiation,
+/// `project::manifest`'s repr claims, and `contract::author_gpt_oss`'s
+/// load check. A second SKU (the dequantized bf16 experts, say) adds a
+/// second row to the table, not a second spelling of the first.
+pub type ShippedW1 = Bf16Ax;
+/// The routed expert banks' axis: MXFP4-Marlin, the release's packing.
+pub type ShippedW2 = Mxfp4Ax;
+/// The activation axis of the shipped point (pinned BF16 in the text).
+pub type ShippedA = Bf16Ax;
+/// The KV axis of the shipped point.
+pub type ShippedKv = NativeKv;
+
 /// The family's catalogue — every SKU this build ships, enumerated. The
 /// expert axis is MXFP4-Marlin — the routed leg's seven rectangles read
 /// the packed nibbles directly, and `MatW::gemm_symbol` maps the repr to
@@ -381,6 +396,6 @@ pub type TraceFn = fn(&GptOssFacts, &GptOssCudaFacts, FireClass, f32, f32, i32) 
 pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
     (
         "gpt_oss-bf16-mxfp4-kv-bf16",
-        gpt_oss_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>,
+        gpt_oss_cuda::<ShippedW1, ShippedW2, ShippedA, ShippedKv>,
     ),
 ];

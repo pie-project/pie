@@ -751,6 +751,126 @@ macro_rules! catalogue {
     };
 }
 
+/// State one routine by its MARKER — the no-ask contract's auto-registration.
+///
+/// `#[routine]` emits a `Signature` (namespace, trace name) and a
+/// `Derivation` (the source column) beside every routine, so a routine
+/// added to a plane is a routine this fn can state with no wrapper
+/// written: the symbol and the argument PLACEMENT come off the marker, and
+/// the call is validated against the column at trace time — which is load
+/// time, the same moment `check_plan` re-checks the statement it records.
+///
+/// The named wrappers in [`cuda`] remain as readable forms; this is the
+/// floor they could each become one line over.
+pub mod fire {
+    use super::*;
+    use kernels::{Kind, Source};
+    use model_ir::trace::ValueId;
+
+    /// One statement's operands, in each run's own order.
+    #[derive(Default)]
+    pub struct Call {
+        /// The `In`/`InOut` slots, in signature order — activation `Val`s
+        /// and runtime mints alike.
+        pub inputs: Vec<ValueId>,
+        /// The `Const<Tensor<..>>` weight slots, by name, in order.
+        pub weights: Vec<String>,
+        /// The scalar `Const` slots, as bits, in signature order.
+        pub params: Vec<u32>,
+        /// One `(Shape, DType)` per `Out`/`InOut` slot, in order.
+        pub outs: Vec<(Shape, DType)>,
+        /// The per-layer state this statement addresses, if any.
+        pub state: Option<StateRef>,
+        /// The layer tag.
+        pub layer: Option<u32>,
+        /// Fire-extent slots, as [`OpKind::Launch::param_extents`].
+        pub extents: Vec<(u8, Shape)>,
+    }
+
+    /// What `R`'s column claims, counted: `(required, optional)` per run,
+    /// in the order in / out / weight / param.
+    ///
+    /// A NULLABLE mark (`Option<In<..>>`, `Option<Out<..>>`,
+    /// `Option<Const<Tensor<..>>>`) may be left out of its run — omission
+    /// is how a statement spells absence, exactly as the hand wrappers do
+    /// (`check_plan` re-checks the recorded statement either way).
+    /// `SOURCES` and `DERIVED` are both one entry per parameter with the
+    /// `Ctx` dropped, so the zip is aligned by construction.
+    fn counts(
+        sources: &[Option<Source>],
+        derived: &[kernels::Derived],
+    ) -> [(usize, usize); 4] {
+        let mut runs = [(0usize, 0usize); 4];
+        for (i, s) in sources.iter().enumerate() {
+            let nullable = derived.get(i).is_some_and(|d| d.nullable);
+            let mut add = |run: usize| {
+                if nullable {
+                    runs[run].1 += 1;
+                } else {
+                    runs[run].0 += 1;
+                }
+            };
+            match s {
+                Some(Source::Slot(Kind::In, _)) => add(0),
+                Some(Source::Slot(Kind::Out, _)) => add(1),
+                Some(Source::Alias(..)) => {
+                    add(0);
+                    add(1);
+                }
+                Some(Source::Slot(Kind::Weight, _)) => add(2),
+                Some(Source::Slot(Kind::Param | Kind::ParamF32, _)) => add(3),
+                _ => {}
+            }
+        }
+        runs
+    }
+
+    /// Record one launch of `R`. Panics — at trace time, which is load
+    /// time — when the call does not fill the column: a statement short of
+    /// its signature must not become a statement at all. A run with
+    /// nullable slots may be filled short by exactly the absent ones.
+    pub fn fire<R: kernels::Signature + kernels::Derivation>(
+        t: &Trace,
+        call: Call,
+    ) -> Vec<Val> {
+        let runs = counts(R::SOURCES, R::DERIVED);
+        let filled = [
+            ("operand", call.inputs.len()),
+            ("result", call.outs.len()),
+            ("weight", call.weights.len()),
+            ("param", call.params.len()),
+        ];
+        for ((run, got), (required, optional)) in filled.into_iter().zip(runs) {
+            assert!(
+                (required..=required + optional).contains(&got),
+                "`{}::{}`'s column claims {required}{} {run} slots; the call fills {got}",
+                R::NAMESPACE,
+                R::NAME,
+                if optional == 0 {
+                    String::new()
+                } else {
+                    format!("..={}", required + optional)
+                },
+            );
+        }
+        let symbol = format!("{}::{}", R::NAMESPACE, R::NAME);
+        let layer = call.layer;
+        let ids = t.with(layer, |b| {
+            b.launch_devwin(
+                &symbol,
+                call.weights,
+                call.state,
+                call.params,
+                call.extents,
+                None,
+                call.inputs,
+                call.outs,
+            )
+        });
+        ids.into_iter().map(|id| Val { t: t.clone(), id, layer }).collect()
+    }
+}
+
 pub mod cuda;
 mod guard;
 pub mod metal;

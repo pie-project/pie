@@ -163,10 +163,16 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // which requires every parameter to be an `Arg`, and the whole point of
     // `untraced` is that some are not: `lora_qkv_correction` takes a
     // `Staged<'_>`, an aggregate the arm builds and no value can carry.
+    let marker_body = if spec.dtypes.is_empty() {
+        body.clone()
+    } else {
+        let p0 = &spec.dtypes[0];
+        quote!(#base::<#p0>)
+    };
     let sources = if uncolumned {
         quote!(&[])
     } else {
-        quote!(::kernels::routine::sources::<crate::Plane, _, _>(#body))
+        quote!(::kernels::routine::sources::<crate::Plane, _, _>(#marker_body))
     };
     // THE ROW CARRIES THE COLUMN. `routine!` cannot reach it: it is handed a
     // BODY expression, and the names-and-nullability column is read off the
@@ -195,15 +201,27 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote!(.point(&[#(#point_names),*]))
     };
+    // THE OUT RULES, names resolved to slot ordinals. The attribute is
+    // written with the signature's own names; the row is index-based.
+    let with_outs = if spec.outs.is_empty() {
+        quote!()
+    } else {
+        match resolve_out_rules(&f, &spec.outs) {
+            Ok(rules) => quote!(.outs(&[#(#rules),*])),
+            Err(e) => return e.to_compile_error().into(),
+        }
+    };
     let with_column = match &spec.canon {
         Some(role) => quote!(
             .derived(<#base as ::kernels::Derivation>::DERIVED)
             .canon(#role)
             #with_point
+            #with_outs
         ),
         None => quote!(
             .derived(<#base as ::kernels::Derivation>::DERIVED)
             #with_point
+            #with_outs
         ),
     };
     // The module the `fn` is written in, unless the attribute says otherwise.
@@ -212,22 +230,51 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(ns) => quote!(#ns),
         None => quote!(::kernels::routine::namespace(::core::module_path!())),
     };
-    let row_expr = if by_path {
-        quote!(::kernels::untraced!(
-            crate::Plane,
-            #trace,
-            #body,
-            namespace = #ns
-            #(, #facts)*
-        )#with_column)
+    // ONE ROW PER POINT. With `dtypes(..)` the author states the SET and
+    // the macro stamps a row per point — one trace name, each row carrying
+    // its `point` for route-by-dtype. Without it, the single body (possibly
+    // instantiated by the bare-generic form) makes the single row.
+    let stamped: Vec<(syn::Ident, proc_macro2::TokenStream)> = if spec.dtypes.is_empty() {
+        let row_expr = if by_path {
+            quote!(::kernels::untraced!(
+                crate::Plane,
+                #trace,
+                #body,
+                namespace = #ns
+                #(, #facts)*
+            )#with_column)
+        } else {
+            quote!(::kernels::routine!(
+                crate::Plane,
+                #trace,
+                #body,
+                namespace = #ns
+                #(, #facts)*
+            )#with_column)
+        };
+        vec![(row, row_expr)]
     } else {
-        quote!(::kernels::routine!(
-            crate::Plane,
-            #trace,
-            #body,
-            namespace = #ns
-            #(, #facts)*
-        )#with_column)
+        assert!(!by_path, "`dtypes(..)` on an untraced row stamps nothing a trace can reach");
+        spec.dtypes
+            .iter()
+            .map(|point| {
+                let point_name = point.to_string().to_lowercase();
+                let point_row = syn::Ident::new(
+                    &format!("{}_{}_ROUTINE", trace.to_uppercase(), point_name.to_uppercase()),
+                    base.span(),
+                );
+                let point_body = quote!(#base::<#point>);
+                let expr = quote!(::kernels::routine!(
+                    crate::Plane,
+                    #trace,
+                    #point_body,
+                    namespace = #ns
+                    #(, #facts)*
+                )#with_column
+                .point(&[#point_name]));
+                (point_row, expr)
+            })
+            .collect()
     };
 
     // THE CALL SURFACE, ON THE MARKER. `Sig` is the parameter types in
@@ -236,6 +283,11 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // whole statement, which is what makes a routine added here a routine the
     // DSL can state with no wrapper written. An uncolumned row has no marks,
     // so it states no `Signature`.
+    let first_point_types: Vec<syn::Type> = spec
+        .dtypes
+        .first()
+        .map(|p| vec![syn::parse_quote!(#p)])
+        .unwrap_or_default();
     let signature = if uncolumned {
         quote!()
     } else {
@@ -245,7 +297,15 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
             .iter()
             .skip(1) // ctx
             .filter_map(|a| match a {
-                FnArg::Typed(t) => Some(substituted(&t.ty, &f.sig.generics, &spec.generics)),
+                FnArg::Typed(t) => Some(substituted(
+                    &t.ty,
+                    &f.sig.generics,
+                    if spec.generics.is_empty() && !spec.dtypes.is_empty() {
+                        &first_point_types
+                    } else {
+                        &spec.generics
+                    },
+                )),
                 FnArg::Receiver(_) => None,
             })
             .collect();
@@ -262,6 +322,8 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         "`{trace}`'s operands, derived by `#[routine]` from its signature.\n\n An uninhabited marker in the TYPE namespace wearing the function's name -- a unit struct would take the VALUE namespace too and collide with the `fn`."
     );
 
+    let stamped_rows: Vec<&syn::Ident> = stamped.iter().map(|(r, _)| r).collect();
+    let stamped_exprs: Vec<&proc_macro2::TokenStream> = stamped.iter().map(|(_, e)| e).collect();
     quote! {
         #f
 
@@ -301,13 +363,15 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         // a routine registers exactly once on every target. Enumerate through
         // the plane's `rows()`, which is the seam that hides which of the two
         // answered.
-        #[cfg(not(target_family = "wasm"))]
-        #[::linkme::distributed_slice(crate::ROUTINES)]
-        #[allow(non_upper_case_globals)]
-        static #row: ::kernels::routine::Routine<crate::Plane> = #row_expr;
+        #(
+            #[cfg(not(target_family = "wasm"))]
+            #[::linkme::distributed_slice(crate::ROUTINES)]
+            #[allow(non_upper_case_globals)]
+            static #stamped_rows: ::kernels::routine::Routine<crate::Plane> = #stamped_exprs;
 
-        #[cfg(target_family = "wasm")]
-        ::inventory::submit! { crate::Registered(#row_expr) }
+            #[cfg(target_family = "wasm")]
+            ::inventory::submit! { crate::Registered(#stamped_exprs) }
+        )*
     }
     .into()
 }
@@ -334,6 +398,13 @@ struct Spec {
     /// row as `.canon("rmsnorm")`, where `kernels::canon::is_role` refuses a
     /// name outside the closed list at build time.
     canon: Option<String>,
+    /// `dtypes(bf16, f16)` — the SET this routine stamps over: one row per
+    /// point, one trace name, each row carrying its `point`. The author
+    /// states the set where the plane's universe is wrong, never the point —
+    /// route-by-dtype selects among the rows.
+    dtypes: Vec<syn::Ident>,
+    /// `out(y = ..)` — result-geometry rules, by signature names.
+    outs: Vec<OutSpec>,
 }
 
 impl Spec {
@@ -341,8 +412,10 @@ impl Spec {
         let (mut generics, mut facts) = (Vec::new(), Vec::new());
         let mut namespace = None;
         let mut canon = None;
+        let mut dtypes = Vec::new();
+        let mut outs = Vec::new();
         if attr.is_empty() {
-            return Ok(Self { generics, facts, namespace, canon });
+            return Ok(Self { generics, facts, namespace, canon, dtypes, outs });
         }
         let parsed = syn::parse2::<Args>(attr)?;
         for a in parsed.0 {
@@ -360,9 +433,11 @@ impl Spec {
                 Arg::Generic(t) => generics.push(t),
                 Arg::Namespace(ns) => namespace = Some(ns),
                 Arg::Canon(role) => canon = Some(role),
+                Arg::Dtypes(list) => dtypes = list,
+                Arg::Out(spec) => outs.push(spec),
             }
         }
-        Ok(Self { generics, facts, namespace, canon })
+        Ok(Self { generics, facts, namespace, canon, dtypes, outs })
     }
 
     /// `rmsnorm` + `[bf16]` -> `rmsnorm`. THE SUFFIX IS GONE: the dtype is
@@ -408,6 +483,85 @@ enum Arg {
     Namespace(String),
     /// `canon = rmsnorm` — the tier-1 role this routine claims.
     Canon(String),
+    /// `dtypes(bf16, f16)` — the stamp set.
+    Dtypes(Vec<syn::Ident>),
+    /// `out(y = like(x))` — one result's geometry rule, by signature names.
+    Out(OutSpec),
+}
+
+/// One `out(target = rule)` as the attribute spells it: names now, slot
+/// ordinals at emission (the row is index-based; the attr is readable).
+struct OutSpec {
+    target: syn::Ident,
+    rule: RuleExpr,
+}
+
+enum RuleExpr {
+    Like(syn::Ident),
+    Split(syn::Ident, syn::Ident),
+    Shaped { rows_of: syn::Ident, width: WidthExpr },
+}
+
+enum WidthExpr {
+    Half(syn::Ident),
+    Of(syn::Ident),
+    Weight(syn::Ident),
+    Param(syn::Ident),
+}
+
+impl syn::parse::Parse for OutSpec {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let target: syn::Ident = input.parse()?;
+        let _: syn::Token![=] = input.parse()?;
+        let head: syn::Ident = input.parse()?;
+        let inner;
+        syn::parenthesized!(inner in input);
+        let rule = match head.to_string().as_str() {
+            "like" => RuleExpr::Like(inner.parse()?),
+            "split" => {
+                let a: syn::Ident = inner.parse()?;
+                let _: syn::Token![,] = inner.parse()?;
+                RuleExpr::Split(a, inner.parse()?)
+            }
+            "rows" => {
+                let rows_of: syn::Ident = inner.parse()?;
+                // the `x` separator, then the width constructor
+                let sep: syn::Ident = input.parse()?;
+                if sep != "x" {
+                    return Err(syn::Error::new(sep.span(), "expected `x` between rows(..) and the width"));
+                }
+                let width = if input.peek(syn::Token![const]) {
+                    let _: syn::Token![const] = input.parse()?;
+                    let w;
+                    syn::parenthesized!(w in input);
+                    WidthExpr::Param(w.parse()?)
+                } else {
+                    let wname: syn::Ident = input.parse()?;
+                    let w;
+                    syn::parenthesized!(w in input);
+                    match wname.to_string().as_str() {
+                        "half" => WidthExpr::Half(w.parse()?),
+                        "width" => WidthExpr::Of(w.parse()?),
+                        "weight" => WidthExpr::Weight(w.parse()?),
+                        other => {
+                            return Err(syn::Error::new(
+                                wname.span(),
+                                format!("unknown width constructor `{other}`; the vocabulary is half/width/weight/const"),
+                            ));
+                        }
+                    }
+                };
+                RuleExpr::Shaped { rows_of, width }
+            }
+            other => {
+                return Err(syn::Error::new(
+                    head.span(),
+                    format!("unknown out rule `{other}`; the vocabulary is like/rows/split"),
+                ));
+            }
+        };
+        Ok(Self { target, rule })
+    }
 }
 
 /// One `namespace = "..."`, one `canon = role` (an ident, or a string when
@@ -416,11 +570,34 @@ enum Arg {
 enum Item {
     Namespace(syn::LitStr),
     Canon(String),
+    Dtypes(Vec<syn::Ident>),
+    Out(OutSpec),
     Bare(syn::Type),
 }
 
 impl syn::parse::Parse for Item {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        if input.peek(syn::Ident) && input.peek2(syn::token::Paren) {
+            let key: syn::Ident = input.parse()?;
+            if key == "out" {
+                let inner;
+                syn::parenthesized!(inner in input);
+                return Ok(Self::Out(inner.parse()?));
+            }
+            if key != "dtypes" {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "the call-form arguments are `dtypes(..)` and `out(..)`",
+                ));
+            }
+            let inner;
+            syn::parenthesized!(inner in input);
+            let list =
+                syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(
+                    &inner,
+                )?;
+            return Ok(Self::Dtypes(list.into_iter().collect()));
+        }
         if input.peek(syn::Ident) && input.peek2(syn::Token![=]) {
             let key: syn::Ident = input.parse()?;
             let _: syn::Token![=] = input.parse()?;
@@ -454,6 +631,8 @@ impl syn::parse::Parse for Args {
             match item {
                 Item::Namespace(lit) => named.push(Arg::Namespace(lit.value())),
                 Item::Canon(claim) => named.push(Arg::Canon(claim)),
+                Item::Dtypes(list) => named.push(Arg::Dtypes(list)),
+                Item::Out(spec) => named.push(Arg::Out(spec)),
                 Item::Bare(t) => items.push(t),
             }
         }
@@ -755,4 +934,133 @@ fn substituted(ty: &Type, generics: &syn::Generics, subs: &[syn::Type]) -> Type 
         }
     }
     walk(ty, &names, subs)
+}
+
+/// The signature's names, classified into each run's ordinals — what lets
+/// an `out(..)` rule be written with names and carried as indexes.
+struct SlotNames {
+    inputs: Vec<String>,
+    outs: Vec<String>,
+    weights: Vec<String>,
+    params: Vec<String>,
+}
+
+fn slot_names(f: &ItemFn) -> SlotNames {
+    let mut n = SlotNames {
+        inputs: Vec::new(),
+        outs: Vec::new(),
+        weights: Vec::new(),
+        params: Vec::new(),
+    };
+    for arg in f.sig.inputs.iter().skip(1) {
+        let FnArg::Typed(t) = arg else { continue };
+        let Pat::Ident(pi) = t.pat.as_ref() else { continue };
+        let name = pi.ident.to_string();
+        // The type's head, through one `Option` layer.
+        fn head(ty: &Type) -> Option<(&syn::PathSegment, Option<&Type>)> {
+            let Type::Path(p) = ty else { return None };
+            let seg = p.path.segments.last()?;
+            let inner = match &seg.arguments {
+                syn::PathArguments::AngleBracketed(a) => {
+                    a.args.iter().find_map(|g| match g {
+                        syn::GenericArgument::Type(t) => Some(t),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            Some((seg, inner))
+        }
+        let Some((seg, inner)) = head(&t.ty) else { continue };
+        let (seg, inner) = if seg.ident == "Option" {
+            match inner.and_then(head) {
+                Some(x) => x,
+                None => continue,
+            }
+        } else {
+            (seg, inner)
+        };
+        match seg.ident.to_string().as_str() {
+            "In" => n.inputs.push(name),
+            "InOut" => {
+                n.inputs.push(name.clone());
+                n.outs.push(name);
+            }
+            "Out" => n.outs.push(name),
+            "Const" => {
+                let is_tensor = inner
+                    .and_then(|t| match t {
+                        Type::Path(p) => p.path.segments.last().map(|s| s.ident == "Tensor"),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                if is_tensor {
+                    n.weights.push(name);
+                } else {
+                    n.params.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Resolve `out(..)` specs against the signature, in OUT-slot order:
+/// unruled outs stay `Unstated` (the caller supplies a `Shape`).
+fn resolve_out_rules(
+    f: &ItemFn,
+    specs: &[OutSpec],
+) -> Result<Vec<proc_macro2::TokenStream>, Error> {
+    let names = slot_names(f);
+    let find = |list: &[String], id: &syn::Ident, run: &str| -> Result<u8, Error> {
+        list.iter()
+            .position(|n| id == n.as_str())
+            .map(|i| i as u8)
+            .ok_or_else(|| {
+                Error::new(
+                    id.span(),
+                    format!("`{id}` names no {run} slot of this signature"),
+                )
+            })
+    };
+    let mut rules: Vec<proc_macro2::TokenStream> =
+        vec![quote!(::kernels::OutRule::Unstated); names.outs.len()];
+    for spec in specs {
+        let at = find(&names.outs, &spec.target, "result")? as usize;
+        rules[at] = match &spec.rule {
+            RuleExpr::Like(a) => {
+                let of = find(&names.inputs, a, "input")?;
+                quote!(::kernels::OutRule::Like { of: #of })
+            }
+            RuleExpr::Split(a, p) => {
+                let of = find(&names.inputs, a, "input")?;
+                let dim = find(&names.params, p, "params-run")?;
+                quote!(::kernels::OutRule::Split { of: #of, dim_param: #dim })
+            }
+            RuleExpr::Shaped { rows_of, width } => {
+                let rof = find(&names.inputs, rows_of, "input")?;
+                let w = match width {
+                    WidthExpr::Half(a) => {
+                        let of = find(&names.inputs, a, "input")?;
+                        quote!(::kernels::OutWidth::Half { of: #of })
+                    }
+                    WidthExpr::Of(a) => {
+                        let of = find(&names.inputs, a, "input")?;
+                        quote!(::kernels::OutWidth::Of { of: #of })
+                    }
+                    WidthExpr::Weight(a) => {
+                        let of = find(&names.weights, a, "weight")?;
+                        quote!(::kernels::OutWidth::Weight { of: #of })
+                    }
+                    WidthExpr::Param(a) => {
+                        let of = find(&names.params, a, "params-run")?;
+                        quote!(::kernels::OutWidth::Param { of: #of })
+                    }
+                };
+                quote!(::kernels::OutRule::Shaped { rows_of: #rof, width: #w })
+            }
+        };
+    }
+    Ok(rules)
 }

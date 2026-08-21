@@ -26,12 +26,15 @@ pub fn qk_rmsnorm_rope_devwin(
             b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
         let q_sh = b.value_shape(q.id);
         let k_sh = b.value_shape(k.id);
-        b.launch_with_extents(
+        b.launch_devwin(
             "rope::qk_rmsnorm_rope_bf16_devwin",
             vec![q_w.to_string(), k_w.to_string()],
             None,
             vec![head_dim, theta.to_bits(), eps.to_bits(), 0, 0, 0],
             vec![(3, Shape(vec![Dim::Tokens]))],
+            // The walk fills 4/5 with this launch's own rectangle — the
+            // peel split no statement can state.
+            Some((4, 5)),
             vec![q.id, k.id, positions],
             vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
         )
@@ -53,7 +56,7 @@ pub fn qk_rmsnorm_rope_devwin(
 pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32, num_kv_heads: u32, head_dim: u32) {
     let kvc = rt_object(&k.t, "kv_cache", Some(l));
     let row_valid = rt_tokens(&k.t, "row_valid");
-    record_with_extents(
+    record_devwin(
         &k.t,
         Some(l),
         "attn::write_kv_explicit_bf16_devwin",
@@ -64,6 +67,8 @@ pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32, num_kv_heads: u32, hea
         }),
         vec![num_kv_heads, head_dim, 0, 0, 0],
         vec![tokens_extent(2)],
+        // The walk fills 3/4 with this launch's own rectangle.
+        Some((3, 4)),
         vec![k.id, v.id, kvc, row_valid],
         None,
     );
