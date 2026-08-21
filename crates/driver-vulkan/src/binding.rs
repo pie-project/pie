@@ -360,7 +360,15 @@ pub fn resolve<'a, R: Resolve>(
             }
             Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
         }
-        Arg::Raised { key, .. } => Err(Unbindable::NotOnThisPlane { key: key.clone() }),
+        // A RAISED OPERAND RESOLVES TO NO RANGE OF ITS OWN. The routine
+        // binder builds it into a HOST view (`crate::views`) and the carrier
+        // crosses as `ArgValue::Raised(address)`; what this positional list
+        // needs from it is only that the operand HOLD ITS PLACE, so the
+        // split's indices stay aligned with the trace. The arena stands in —
+        // nothing takes this entry's handle, because `crate::bind::bind`
+        // intercepts the `Ty::Raised` argument before `Handles::input` is
+        // ever asked for it.
+        Arg::Raised { .. } => Ok(Bound::whole(arena.buffer)),
         Arg::Named { value, .. } => resolver
             .named(*value)
             .map(Bound::whole)
@@ -595,7 +603,9 @@ pub(crate) fn push_from(
 
     let scalars: Vec<&ArgValue> = values
         .iter()
-        .filter(|v| !matches!(v, ArgValue::Buffer { .. }))
+        // A raised view is HOST data the body already read: it names no
+        // binding and pushes no scalar, so it belongs to neither run.
+        .filter(|v| !matches!(v, ArgValue::Buffer { .. } | ArgValue::Raised(_)))
         .collect();
     if scalars.is_empty() || scalars.len() != declared.push_offsets.len() {
         return None;
@@ -620,7 +630,7 @@ pub(crate) fn push_from(
             ArgValue::Usize(x) => {
                 bytes[at..at + 8].copy_from_slice(&(x as u64).to_le_bytes());
             }
-            ArgValue::Buffer { .. } => unreachable!("filtered above"),
+            ArgValue::Buffer { .. } | ArgValue::Raised(_) => unreachable!("filtered above"),
         }
     }
     Some(Params::Push(bytes))

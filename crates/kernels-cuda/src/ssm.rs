@@ -9,8 +9,9 @@ use crate::jit::abi::Inst;
 use crate::jit::abi::Tensor;
 use crate::jit::abi::{MaybeConst, bf16};
 use kernels::Refusal;
-use kernels::keys;
-use kernels::routine::{Asks, Const, In, Out};
+use kernels::raises::Struct;
+use kernels::routine::{Const, In, Out};
+use crate::views::{MoeBanks, RecurrentState};
 
 use core::ffi::c_void;
 
@@ -63,7 +64,7 @@ const PTRS_BLOCK: u32 = 256;
 
 const GDN_BLOCK: u32 = 128;
 
-#[routine(bf16)]
+#[routine(bf16, canon = causal_conv1d)]
 pub fn causal_conv1d_update_batched<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -143,7 +144,6 @@ pub fn causal_conv1d_prefill_batched<T>(
     c: Const<i32>,
     k: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
-    r: Const<i32>,
     write_state: Const<bool>,
     qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal>
 where
@@ -156,7 +156,9 @@ where
 
     let state_out_base = rsv.conv_slab as *mut core::ffi::c_void;
     let slot_stride_elems = rsv.conv_stride;
-    let r = *r;
+    // The request count is the CSR operand's own row count -- the pairing,
+    // not a `Const` restating it.
+    let r = qo_indptr.rows;
     let write_state = *write_state;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -324,8 +326,7 @@ pub fn kda_recurrent_step_batched(
     out: Out<Tensor<f32>>,
     h: Const<i32>,
     d: Const<i32>,
-    rsv: In<Struct<RecurrentState>>,
-    r: Const<i32>) -> Result<(), Refusal> {
+    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
         return Err(Refusal::Null { what: "the recurrent view this statement names" });
     }
@@ -333,7 +334,9 @@ pub fn kda_recurrent_step_batched(
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
-    let r = *r;
+    // One row per request: the statement's `[Requests, H, D]` result is the
+    // launch rectangle, so the count is the result's own row count.
+    let r = out.rows;
     const KDA_STEP_BLOCK: u32 = 256;
     ctx.fire(Fire::at("ssm/kda.cuh", "::pie::ssm::kda_recurrent_step_batched").apply(Launch::grid([r.unsigned_abs(), h.unsigned_abs(), 1], [KDA_STEP_BLOCK, 1, 1])
                 .smem(kda_shmem(d.unsigned_abs()))), &[
@@ -362,14 +365,14 @@ pub fn kda_prefill_batched(
     out: Out<Tensor<f32>>,
     h: Const<i32>,
     d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
         return Err(Refusal::Null { what: "the recurrent view this statement names" });
     }
     let rsv = unsafe { &*rsv.ptr };
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -547,9 +550,7 @@ pub fn nemotron_mamba_ssm_batched_bf16(
     n_groups: Const<i32>,
     conv_dim: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
-    qo_indptr: In<Tensor<i32>>,
-    r: Const<i32>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal> {
     if rsv.ptr.is_null() {
         return Err(Refusal::Null { what: "the recurrent view this statement names" });
     }
@@ -557,9 +558,11 @@ pub fn nemotron_mamba_ssm_batched_bf16(
 
     let ssm_state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
+    // The request count is the CSR operand's own row count, and the token
+    // rows are the result's rectangle; `rows != r` below is the prefill test.
+    let r = qo_indptr.rows;
+    let rows = y.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
-    let r = *r;
-    let rows = *rows;
     const SSM_PREFILL_BLOCK: u32 = 512;
 
     const SSM_DECODE_BLOCK: u32 = 256;
@@ -614,25 +617,30 @@ pub fn build_nemotron_moe_ptrs_decode_batched_bf16(
     norm_x: In<Tensor<c_void>>,
     top_k: Const<i32>,
     hidden: Const<i32>,
-    intermediate: Const<i32>) -> Result<(), Refusal> {
+    intermediate: Const<i32>,
+    banks: In<Struct<MoeBanks>>) -> Result<(), Refusal> {
+    if banks.ptr.is_null() {
+        return Err(Refusal::Null { what: "the MoE bank view this statement names" });
+    }
+    let banks = unsafe { &*banks.ptr };
     // The routed fanout is the top-k table's own width, and the row count is
     // its rows: the statement placed that operand, so neither is a fact.
     let n = topk_idx.rows;
     let top_k = *top_k;
     let hidden = *hidden;
     let intermediate = *intermediate;
-    let up_weight_ptrs = ctx.ask::<*const *const c_void, keys::MoeUpWeightPtrs>()?;
-    let down_weight_ptrs = ctx.ask::<*const *const c_void, keys::MoeDownWeightPtrs>()?;
-    let expert_up = ctx.ask::<*mut c_void, keys::MoeExpertUp>()?;
-    let expert_act = ctx.ask::<*mut c_void, keys::MoeExpertAct>()?;
-    let expert_out = ctx.ask::<*mut c_void, keys::MoeExpertOut>()?;
-    let a_up_ptrs = ctx.ask::<*mut *const c_void, keys::MoeAUpPtrs>()?;
-    let b_up_ptrs = ctx.ask::<*mut *const c_void, keys::MoeBUpPtrs>()?;
-    let c_up_ptrs = ctx.ask::<*mut *mut c_void, keys::MoeCUpPtrs>()?;
-    let a_down_ptrs = ctx.ask::<*mut *const c_void, keys::MoeADownPtrs>()?;
-    let b_down_ptrs = ctx.ask::<*mut *const c_void, keys::MoeBDownPtrs>()?;
-    let c_down_ptrs = ctx.ask::<*mut *mut c_void, keys::MoeCDownPtrs>()?;
-    let weights_out = ctx.ask::<*mut f32, keys::MoeRouteWeights>()?;
+    let up_weight_ptrs = banks.up_weight_ptrs;
+    let down_weight_ptrs = banks.down_weight_ptrs;
+    let expert_up = banks.expert_up;
+    let expert_act = banks.expert_act;
+    let expert_out = banks.expert_out;
+    let a_up_ptrs = banks.a_up_ptrs;
+    let b_up_ptrs = banks.b_up_ptrs;
+    let c_up_ptrs = banks.c_up_ptrs;
+    let a_down_ptrs = banks.a_down_ptrs;
+    let b_down_ptrs = banks.b_down_ptrs;
+    let c_down_ptrs = banks.c_down_ptrs;
+    let weights_out = banks.route_weights;
     let routes = n.saturating_mul(top_k);
     ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::build_nemotron_moe_ptrs_decode_batched").apply(Launch::grid([routes.unsigned_abs().div_ceil(PTRS_BLOCK), 1, 1], [PTRS_BLOCK, 1, 1])), &[
                 topk_idx.arg(),
@@ -665,22 +673,27 @@ pub fn build_nemotron_moe_ptrs_aligned_bf16(
     max_blocks: Const<i32>,
     block_size: Const<i32>,
     hidden: Const<i32>,
-    intermediate: Const<i32>) -> Result<(), Refusal> {
+    intermediate: Const<i32>,
+    banks: In<Struct<MoeBanks>>) -> Result<(), Refusal> {
+    if banks.ptr.is_null() {
+        return Err(Refusal::Null { what: "the MoE bank view this statement names" });
+    }
+    let banks = unsafe { &*banks.ptr };
     let max_blocks = *max_blocks;
     let block_size = *block_size;
     let hidden = *hidden;
     let intermediate = *intermediate;
-    let up_weight_ptrs = ctx.ask::<*const *const c_void, keys::MoeUpWeightPtrs>()?;
-    let down_weight_ptrs = ctx.ask::<*const *const c_void, keys::MoeDownWeightPtrs>()?;
-    let aligned_up = ctx.ask::<*mut c_void, keys::MoeAlignedUp>()?;
-    let aligned_act = ctx.ask::<*mut c_void, keys::MoeAlignedAct>()?;
-    let aligned_out = ctx.ask::<*mut c_void, keys::MoeAlignedOut>()?;
-    let a_up_ptrs = ctx.ask::<*mut *const c_void, keys::MoeAUpPtrs>()?;
-    let b_up_ptrs = ctx.ask::<*mut *const c_void, keys::MoeBUpPtrs>()?;
-    let c_up_ptrs = ctx.ask::<*mut *mut c_void, keys::MoeCUpPtrs>()?;
-    let a_down_ptrs = ctx.ask::<*mut *const c_void, keys::MoeADownPtrs>()?;
-    let b_down_ptrs = ctx.ask::<*mut *const c_void, keys::MoeBDownPtrs>()?;
-    let c_down_ptrs = ctx.ask::<*mut *mut c_void, keys::MoeCDownPtrs>()?;
+    let up_weight_ptrs = banks.up_weight_ptrs;
+    let down_weight_ptrs = banks.down_weight_ptrs;
+    let aligned_up = banks.aligned_up;
+    let aligned_act = banks.aligned_act;
+    let aligned_out = banks.aligned_out;
+    let a_up_ptrs = banks.a_up_ptrs;
+    let b_up_ptrs = banks.b_up_ptrs;
+    let c_up_ptrs = banks.c_up_ptrs;
+    let a_down_ptrs = banks.a_down_ptrs;
+    let b_down_ptrs = banks.b_down_ptrs;
+    let c_down_ptrs = banks.c_down_ptrs;
     ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::build_nemotron_moe_ptrs_aligned").apply(Launch::grid(
                 [max_blocks.unsigned_abs().div_ceil(PTRS_BLOCK), 1, 1],
                 [PTRS_BLOCK, 1, 1],
@@ -819,7 +832,6 @@ pub fn chunk_gated_delta_prefill_batched(
     v_h: Const<i32>,
     k_d: Const<i32>,
     v_d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
     write_state: Const<bool>) -> Result<(), Refusal> {
@@ -828,7 +840,8 @@ pub fn chunk_gated_delta_prefill_batched(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -868,7 +881,6 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
     v_h: Const<i32>,
     k_d: Const<i32>,
     v_d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
     write_state: Const<bool>) -> Result<(), Refusal> {
@@ -877,7 +889,8 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -916,7 +929,6 @@ pub fn chunk_gated_delta_prefill_batched_cached(
     v_h: Const<i32>,
     k_d: Const<i32>,
     v_d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
     write_state: Const<bool>) -> Result<(), Refusal> {
@@ -925,7 +937,8 @@ pub fn chunk_gated_delta_prefill_batched_cached(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -963,7 +976,6 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     v_h: Const<i32>,
     k_d: Const<i32>,
     v_d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
     write_state: Const<bool>) -> Result<(), Refusal> {
@@ -972,7 +984,8 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -1198,7 +1211,6 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     v_h: Const<i32>,
     k_d: Const<i32>,
     v_d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
     write_state: Const<bool>) -> Result<(), Refusal> {
@@ -1207,7 +1219,8 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
@@ -1249,7 +1262,6 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     v_h: Const<i32>,
     k_d: Const<i32>,
     v_d: Const<i32>,
-    r: Const<i32>,
     rsv: In<Struct<RecurrentState>>,
     qo_indptr: In<Tensor<i32>>,
     write_state: Const<bool>) -> Result<(), Refusal> {
@@ -1258,7 +1270,8 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let r = *r;
+    // The request count is the CSR operand's own row count.
+    let r = qo_indptr.rows;
     let state_base = rsv.slab as *mut core::ffi::c_void;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;

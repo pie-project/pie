@@ -3,6 +3,7 @@
 pub mod facts;
 
 use self::facts::{GptOssCudaFacts, GptOssFacts};
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, Mxfp4Ax, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, Val, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
@@ -29,7 +30,13 @@ struct GptOssLayerW {
 }
 
 impl GptOssLayerW {
-    fn new(l: u32, f: &GptOssFacts) -> Self {
+    fn new(
+        l: u32,
+        f: &GptOssFacts,
+        norm_eps: f32,
+        repr: WeightRepr,
+        expert_repr: WeightRepr,
+    ) -> Self {
         // `layer.{l}.{field}` — the tree-wide convention every executor's
         // `parse_name` reads. Naming them bare made the drive's first live
         // fire throw on the very first weight it looked up.
@@ -38,7 +45,7 @@ impl GptOssLayerW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let d = f.head_dim;
         Self {
@@ -47,6 +54,7 @@ impl GptOssLayerW {
                 variant: NormVariant::Plain,
                 per_head: None,
                 layer: Some(l),
+                eps: norm_eps,
             },
             q_proj: m("q_proj", f.q_heads * d),
             k_proj: m("k_proj", f.kv_heads * d),
@@ -62,11 +70,21 @@ impl GptOssLayerW {
                 variant: NormVariant::Plain,
                 per_head: None,
                 layer: Some(l),
+                eps: norm_eps,
             },
             router: m("router", f.experts),
             router_bias: m("router_bias", f.experts),
-            expert_gate_up: m("expert_gate_up_bank", f.intermediate),
-            expert_down: m("expert_down_bank", f.hidden),
+            // The routed BANK's repr is the expert axis's, not the dense
+            // stack's — the two MXFP4 GEMVs below read packed nibbles the
+            // dense projections never see.
+            expert_gate_up: MatW {
+                repr: expert_repr,
+                ..m("expert_gate_up_bank", f.intermediate)
+            },
+            expert_down: MatW {
+                repr: expert_repr,
+                ..m("expert_down_bank", f.hidden)
+            },
         }
     }
 }
@@ -104,7 +122,40 @@ impl GptOssLayerW {
 /// fix went to that line instead, and the fact followed it — which is the
 /// order that keeps a declaration honest about a driver bug rather than
 /// laundering one.
-pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClass) -> ForwardPlan {
+pub fn gpt_oss_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &GptOssFacts,
+    cuda: &GptOssCudaFacts,
+    class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+    sliding_window: i32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. K likewise: the kv writes state
+    // native bf16 pages. And W2 is pinned to the marlin repr because the
+    // routed leg below states `quant::mxfp4_moe_*` by name — a bf16 expert
+    // bank has no leg in this text. All three are compile refusals, not
+    // comments.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+        assert!(matches!(W2::REPR, WeightRepr::Mxfp4Marlin));
+    }
+    // The YaRN quartet, destructured from the family's own constant so a
+    // gpt-oss that stopped rescaling would fail here rather than rotate
+    // unscaled (`project::yarn_softmax_scale` makes the same argument).
+    let crate::deployment::RopeScaling::Yarn {
+        factor: yarn_factor,
+        beta_fast: yarn_beta_fast,
+        beta_slow: yarn_beta_slow,
+        attention_factor: yarn_attention_factor,
+        original_max_position: yarn_original_max_position,
+        ..
+    } = crate::gpt_oss::ROPE_SCALING
+    else {
+        unreachable!("gpt-oss rescales by YaRN; the row's constant says so")
+    };
     assert!(
         cuda.mxfp4_decode_gemv,
         "gpt_oss states the fused MXFP4 decode leg; a deployment without \
@@ -116,18 +167,26 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
         "gpt_oss states the resident bank; a streamed one reaches the same \
          kernels only after a host round-trip that decides what to page in"
     );
-    let family = format!("gpt_oss.cuda.{}", class.suffix());
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "gpt_oss-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
         // The entry boundary, where device puts and channel reads attach.
         dsl::seam(t, &dsl::seam::IN, &[], None);
-        let mut y = dsl::embed_with(t, "embed", hidden);
+        let mut y = dsl::embed_with(t, "embed", hidden, facts.vocab);
 
         for l in 0..facts.layers {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let w = GptOssLayerW::new(l, facts);
+            let w = GptOssLayerW::new(l, facts, norm_eps, W1::REPR, W2::REPR);
             let kv = dsl::Kv::at(t, l);
             let normed = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
@@ -167,7 +226,19 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // had already resolved the scaling, and `mixtral.cpp` spelled
             // a plain `kernels::rope::rope_bf16` anyway. The declaration states
             // the kernel the fixed pass fires.
-            let (q, k) = dsl::cuda::rope_yarn_original(&q, &k);
+            let (q, k) = dsl::cuda::rope_yarn_original(
+                &q,
+                &k,
+                facts.head_dim,
+                rope_theta,
+                yarn_factor,
+                yarn_beta_fast,
+                yarn_beta_slow,
+                yarn_attention_factor,
+                yarn_original_max_position,
+                // Stating nothing means NeoX; gpt-oss states nothing.
+                false,
+            );
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
 
             // The dispatch is the ONLY thing the two classes disagree
@@ -185,8 +256,35 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // rather than a kernel this text selects, which is why the
             // alternation `is_sliding` describes leaves no mark on the plan.
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let (o, lse) = dsl::cuda::attention_for_lse(class, &q, &kv, facts.q_heads, facts.head_dim);
-            let a = dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks);
+            // THIS LAYER's window — the deployment's own per-layer rule
+            // (`project::deployment`: sliding layers take the row's
+            // window, full ones the whole context).
+            let window_left = if facts.is_sliding(l) {
+                sliding_window
+            } else {
+                -1
+            };
+            let (o, lse) = dsl::cuda::attention_for_lse(
+                class,
+                &q,
+                &kv,
+                facts.q_heads,
+                facts.head_dim,
+                facts.kv_heads,
+                window_left,
+                // No cap; the scale is the derived `1/sqrt(head_dim)` —
+                // the deployment's own `sm_scale` (YaRN's attention factor
+                // rides the CUDA rope kernel, not the softmax temperature).
+                0.0,
+                0.0,
+            );
+            let a = dsl::cuda::attention_sink_rescale(
+                &o,
+                &lse,
+                &w.sinks,
+                facts.q_heads,
+                facts.head_dim,
+            );
 
             // Post-attention observation. On the sink layers this sees the
             // RESCALED output, not the raw dispatch result -- the rescale
@@ -195,7 +293,7 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
 
             // o_proj folds the RESIDUAL (beta=1) and not its bias: the
             // hand-written tp=1 arm calls the plain gemm and then
-            // `kernels::norm::add_bias_bf16`. The one place in this layer where
+            // `kernels::norm::add_bias`. The one place in this layer where
             // the split spelling is the truthful one.
             y += matmul(&a, &w.o_proj);
             y = dsl::add_bias(&y, &w.o_bias);
@@ -212,9 +310,13 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
                 &w.expert_gate_up,
                 facts.top_k,
                 facts.intermediate,
+                // The checkpoint's clamp and gate slope — the same pair
+                // `gpt_oss_glu` below states.
+                facts.swiglu_limit,
+                crate::gpt_oss::project::GATE_ALPHA,
             );
             // The clamp is the whole fork, and a checkpoint without one
-            // takes `kernels::mlp::swiglu_bf16`'s PAIR form — a spelling no
+            // takes `kernels::mlp::swiglu`'s PAIR form — a spelling no
             // statement carries yet. Refused by name rather than guessed:
             // every gpt-oss release so far clamps, so an unclamped one
             // would be the first thing this text had never seen.
@@ -260,7 +362,25 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             NormVariant::Plain,
             facts.tied_embeddings,
             facts.vocab,
-            false,
+            None,
+            norm_eps,
         );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&GptOssFacts, &GptOssCudaFacts, FireClass, f32, f32, i32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// expert axis is MXFP4-Marlin — the routed leg's seven rectangles read
+/// the packed nibbles directly, and `MatW::gemm_symbol` maps the repr to
+/// the marlin symbol wherever a bank reaches a matmul. The coverage test
+/// (`model/tests/catalogue_coverage.rs`) traces each row at both fire
+/// classes; `TraceBuilder::finish`'s `check_plan` then refuses a row whose
+/// statements reach a routine point that does not exist.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    (
+        "gpt_oss-bf16-mxfp4-kv-bf16",
+        gpt_oss_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>,
+    ),
+];

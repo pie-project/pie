@@ -4,11 +4,18 @@ use super::*;
 
 
 builder! {
-    /// `kernels::norm::residual_add_rmsnorm_bf16`.
-    pub fn residual_add_rmsnorm(x: &Val, residual: &Val, weight: &str, hidden: u32) -> Val {
-        symbol: "norm::residual_add_rmsnorm_bf16",
+    /// `kernels::norm::residual_add_rmsnorm`; the epsilon rides the run.
+    pub fn residual_add_rmsnorm(
+        x: &Val,
+        residual: &Val,
+        weight: &str,
+        hidden: u32,
+        eps: f32,
+    ) -> Val {
+        symbol: "norm::residual_add_rmsnorm",
         on: x,
         weights: [weight],
+        params: [eps.to_bits()],
         inputs: [x, residual],
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the fused norm produces its value",

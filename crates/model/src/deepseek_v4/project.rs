@@ -375,8 +375,17 @@ pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its for
 /// boundaries a fire's positions imply, and that is a per-TOKEN fact
 /// either class can state.
 #[must_use]
-pub fn trace(f: &Dsv4Facts, class: model_ir::trace::FireClass) -> model_ir::trace::ForwardPlan {
-    super::forward::dsv4_cuda(f, class)
+pub fn trace(
+    f: &Dsv4Facts,
+    class: model_ir::trace::FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> model_ir::trace::ForwardPlan {
+    // THE SHIPPED POINT. deepseek-v4 catalogues one SKU today; the table
+    // in `forward::CATALOG` is where a second one appears, and the
+    // coverage test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, NativeKv};
+    super::forward::dsv4_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>(f, class, norm_eps, rope_theta)
 }
 
 #[cfg(test)]

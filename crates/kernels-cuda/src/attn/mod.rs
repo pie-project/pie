@@ -2,13 +2,14 @@ use crate::jit::Ctx;
 use kernels::Fire;
 use crate::jit::Launch;
 use kernels::Refusal;
-use kernels::keys;
 use kernels::Bind;
 use kernels_macros::routine;
 use core::ffi::c_void;
 
 use crate::jit::abi::Tensor;
-use kernels::routine::{Asks, Const, In, Out};
+use kernels::raises::Struct;
+use kernels::routine::{Const, In, Out};
+use crate::views::{AttnMask, Dsv4CompKvPages, KvCache, MtpPendingHidden, RecurrentState};
 
 #[allow(unused_imports)]
 use crate::jit::abi::bf16;
@@ -333,7 +334,11 @@ pub fn compact_page_csr(
     keep: In<Tensor<u8>>,
     keep_stride: Const<u32>,
     kvc: In<Struct<KvCache>>,
-    num_requests: Const<i32>) -> Result<(), Refusal> {
+    num_requests: Const<i32>,
+    scratch_counts: Out<Tensor<u32>>,
+    page_indices_out: Out<Tensor<u32>>,
+    page_indptr_out: Out<Tensor<u32>>,
+    last_page_lens_out: Out<Tensor<u32>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -343,10 +348,10 @@ pub fn compact_page_csr(
     let page_indptr_in = kvc.page_indptr as *const u32;
 
     let last_page_lens_in = kvc.last_page_lens as *const u32;
-    let scratch_counts = ctx.ask::<*mut u32, keys::CompactScratchCounts>()?;
-    let page_indices_out = ctx.ask::<*mut u32, keys::CompactPageIndicesOut>()?;
-    let page_indptr_out = ctx.ask::<*mut u32, keys::CompactPageIndptrOut>()?;
-    let last_page_lens_out = ctx.ask::<*mut u32, keys::CompactLastPageLensOut>()?;
+    let scratch_counts = scratch_counts.ptr;
+    let page_indices_out = page_indices_out.ptr;
+    let page_indptr_out = page_indptr_out.ptr;
+    let last_page_lens_out = last_page_lens_out.ptr;
     let num_requests = *num_requests;
     if scratch_counts.is_null() {
         return Err(Refusal::Absent { what: "the compaction scratch buffer" });
@@ -385,7 +390,6 @@ pub fn mtp_shift_hidden<T>(
     pending_hidden: In<Tensor<T>>,
     out: Out<Tensor<T>>,
     qo_indptr: In<Tensor<i32>>,
-    num_requests: Const<i32>,
     rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal>
 where
 
@@ -396,8 +400,9 @@ where
         return Err(Refusal::Null { what: "the recurrent view this statement names" });
     }
     let rsv = unsafe { &*rsv.ptr };
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
-    let num_requests = *num_requests;
     let slot_ids = rsv.slots;
 
     if matches!(pending_hidden.ptr.arg(), crate::jit::ArgValue::Ptr(p) if p.is_null()) {
@@ -423,8 +428,8 @@ pub fn mtp_update_pending_hidden<T>(
     ctx: &Ctx<'_>,
     target_hidden: In<Tensor<T>>,
     qo_indptr: In<Tensor<i32>>,
-    num_requests: Const<i32>,
-    rsv: In<Struct<RecurrentState>>) -> Result<(), Refusal>
+    rsv: In<Struct<RecurrentState>>,
+    pending: In<Struct<MtpPendingHidden>>) -> Result<(), Refusal>
 where
 
     *const T: Abi + kernels::Bind<crate::jit::ArgValue>,
@@ -435,10 +440,11 @@ where
         return Err(Refusal::Null { what: "the recurrent view this statement names" });
     }
     let rsv = unsafe { &*rsv.ptr };
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
-    let num_requests = *num_requests;
     let slot_ids = rsv.slots;
-    let pending_hidden = ctx.ask::<*mut core::ffi::c_void, keys::MtpPendingHidden>()?.cast::<T>();
+    let pending_hidden = pending.ptr.cast_mut().cast::<T>();
     if pending_hidden.is_null() {
         return Err(Refusal::Absent { what: "the MTP pending-hidden state" });
     }
@@ -648,12 +654,12 @@ pub fn dsv4_boundary_meta_paged(
     out_rope: Out<Tensor<i32>>,
     ratio: Const<i32>,
     row_valid: In<Tensor<i32>>,
-    qo_indptr: In<Tensor<i32>>,
-    num_requests: Const<i32>) -> Result<(), Refusal> {
+    qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal> {
     let ratio = *ratio;
     let row_valid = row_valid.ptr as *const u8;
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
-    let num_requests = *num_requests;
     if ratio <= 0 {
         return Err(Refusal::Narrow { what: "ratio", at: i64::from(ratio) });
     }
@@ -683,7 +689,8 @@ pub fn attention_compressed_paged_bf16(
     kvc: In<Struct<KvCache>>,
     sm_scale: Const<f32>,
     positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>) -> Result<(), Refusal> {
+    request_of_token: In<Tensor<i32>>,
+    comp_kv: In<Struct<Dsv4CompKvPages>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -698,8 +705,7 @@ pub fn attention_compressed_paged_bf16(
     let kv_page_indices = kvc.page_indices as *const u32;
     let kv_page_indptr = kvc.page_indptr as *const u32;
     let req_of_token = request_of_token.ptr;
-    let comp_kv_pages =
-        ctx.ask::<*mut core::ffi::c_void, keys::Dsv4CompKvPages>()?.cast_const().cast::<bf16>();
+    let comp_kv_pages = comp_kv.ptr;
 
     const DSV4_ATTN_BLOCK: u32 = 128;
 
@@ -1356,7 +1362,8 @@ pub unsafe fn dispatch_attention_mla_bf16(
     kvc: In<Struct<KvCache>>,
     qo_indptr: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    num_requests: Const<i32>) -> Result<MlaDispatch, Refusal> {
+    num_requests: Const<i32>,
+    lse: Option<Out<Tensor<f32>>>) -> Result<MlaDispatch, Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -1369,7 +1376,7 @@ pub unsafe fn dispatch_attention_mla_bf16(
     let qo_indptr = qo_indptr.ptr as *const u32;
     let kv_page_indptr = kvc.page_indptr as *const u32;
 
-    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let lse = lse.map_or(core::ptr::null_mut(), |l| l.ptr);
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
     let index_mask = maskv.mask;
     let num_requests = *num_requests;
@@ -1442,8 +1449,10 @@ pub mod qkv_fused {
     use super::{Ctx, Launch, Refusal};
 
     use crate::jit::abi::Tensor;
-    use kernels::keys;
-    use kernels::routine::{Asks, Const, In, Out};
+    use crate::views::KvCache;
+    
+    use kernels::raises::Struct;
+    use kernels::routine::{Const, In, Out};
     use kernels::{Bind, Fire};
     use kernels_macros::routine;
 
@@ -1468,7 +1477,7 @@ pub mod qkv_fused {
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
     let page_size = kvc.page_size;
-    let hnd_layout = kvc.layout as bool;
+    let hnd_layout = kvc.layout != 0;
     let theta = *theta;
     let eps = *eps;
 
@@ -1645,7 +1654,9 @@ pub mod qkv_fused {
         q_out: Out<Tensor<bf16>>,
         q_weight: Const<Tensor<bf16>>,
         k_weight: Const<Tensor<bf16>>,
-        rope_table: In<Tensor<f32>>,
+        // NULLABLE: the launcher dispatches on a null table (the tableless
+        // instantiation), and the statement may omit the operand.
+        rope_table: Option<In<Tensor<f32>>>,
     num_kv_heads: Const<i32>,
     head_dim: Const<i32>,
     kvc: In<Struct<KvCache>>,
@@ -1660,7 +1671,7 @@ pub mod qkv_fused {
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
     let page_size = kvc.page_size;
-    let hnd_layout = kvc.layout as bool;
+    let hnd_layout = kvc.layout != 0;
     let theta = *theta;
     let eps = *eps;
 
@@ -1688,7 +1699,7 @@ pub mod qkv_fused {
             q_weight.v,
             k_weight.v,
             positions,
-            rope_table.ptr,
+            rope_table.map_or(core::ptr::null(), |t| t.ptr),
             kv_page_indices,
             kv_page_indptr,
             kv_last_page_lens,
@@ -1712,8 +1723,10 @@ pub mod dsv4_compress {
     use super::bf16;
     use super::{Ctx, Launch, Refusal};
     use crate::jit::abi::Tensor;
-    use kernels::keys;
-    use kernels::routine::{Asks, In, Out};
+    use crate::views::{Dsv4Ape, Dsv4CompKvPages, Dsv4StateKv, Dsv4StateScore, KvCache};
+    
+    use kernels::raises::Struct;
+    use kernels::routine::{Const, In, Out};
     use kernels::{Bind, Fire};
     use kernels_macros::routine;
 
@@ -1731,7 +1744,10 @@ pub mod dsv4_compress {
         out: Out<Tensor<bf16>>,
     ratio: Const<i32>,
     coff: Const<i32>,
-    kvc: In<Struct<KvCache>>) -> Result<(), Refusal> {
+    kvc: In<Struct<KvCache>>,
+    state_kv: In<Struct<Dsv4StateKv>>,
+    state_score: In<Struct<Dsv4StateScore>>,
+    ape: In<Struct<Dsv4Ape>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -1742,11 +1758,9 @@ pub mod dsv4_compress {
         let page_size = kvc.page_size;
         let kv_page_indices = kvc.page_indices as *const u32;
         let kv_page_indptr = kvc.page_indptr as *const u32;
-        let state_kv =
-            ctx.ask::<*const core::ffi::c_void, keys::Dsv4StateKv>()?.cast::<bf16>();
-        let state_score =
-            ctx.ask::<*const core::ffi::c_void, keys::Dsv4StateScore>()?.cast::<bf16>();
-        let ape = ctx.ask::<*const f32, keys::Dsv4Ape>()?;
+        let state_kv = state_kv.ptr;
+        let state_score = state_score.ptr;
+        let ape = ape.ptr;
         let head_dim = out.all("out_width(0)")?.width;
 
         ctx.fire(Fire::at("attn/dsv4_compress.cuh", "::pie::attn::dsv4_compress_gather_paged<::pie::bf16>").apply(route_rows(num_entries, head_dim)), &[
@@ -1771,7 +1785,8 @@ pub mod dsv4_compress {
         entries: In<Tensor<bf16>>,
         boundary_pos: In<Tensor<i32>>,
         boundary_req: In<Tensor<i32>>,
-    kvc: In<Struct<KvCache>>) -> Result<(), Refusal> {
+    kvc: In<Struct<KvCache>>,
+    comp_kv: In<Struct<Dsv4CompKvPages>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -1780,8 +1795,7 @@ pub mod dsv4_compress {
         let page_size = kvc.page_size;
         let kv_page_indices = kvc.page_indices as *const u32;
         let kv_page_indptr = kvc.page_indptr as *const u32;
-        let comp_kv_pages =
-            ctx.ask::<*mut core::ffi::c_void, keys::Dsv4CompKvPages>()?.cast::<bf16>();
+        let comp_kv_pages = comp_kv.ptr.cast_mut();
 
         let head_dim = entries.all("in_width(0)")?.width;
 
@@ -1808,8 +1822,10 @@ pub mod kv_paged {
     use super::bf16;
     use core::ffi::c_void;
     use crate::jit::abi::Tensor;
-    use kernels::keys;
-    use kernels::routine::{Asks, In, Out};
+    use crate::views::KvCache;
+    
+    use kernels::raises::Struct;
+    use kernels::routine::{Const, In, Out};
     use kernels::{Bind, Fire};
     use kernels_macros::routine;
 
@@ -1851,7 +1867,7 @@ pub mod kv_paged {
     let page_size = kvc.page_size;
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
-    let hnd = kvc.layout as bool;
+    let hnd = kvc.layout != 0;
     let has_envelopes = kvc.has_envelopes;
     let is_native_bf16 = kvc.native_bf16;
 
@@ -1860,8 +1876,8 @@ pub mod kv_paged {
     let w_page = kvc.write_page as *const u32;
     let w_off = kvc.write_offset as *const u32;
     let row_valid = row_valid.ptr as *const u8;
-    let k_env_min = kvc.env_min as *const u16;
-    let k_env_max = kvc.env_max as *const u16;
+    let k_env_min = kvc.env_min;
+    let k_env_max = kvc.env_max;
         assert!(is_native_bf16, "attn::write_kv_explicit_bf16 requires native bf16 KV cache");
 
         let instantiation =
@@ -1916,7 +1932,9 @@ pub mod kv_paged {
     num_kv_heads: Const<i32>,
     head_dim: Const<i32>,
     row_valid: In<Tensor<i32>>,
-    n_max: Const<i32>) -> Result<(), Refusal> {
+    n_max: Const<i32>,
+    win_start: Const<i32>,
+    win_len: Const<i32>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -1924,7 +1942,7 @@ pub mod kv_paged {
     let page_size = kvc.page_size;
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
-    let hnd = kvc.layout as bool;
+    let hnd = kvc.layout != 0;
     let has_envelopes = kvc.has_envelopes;
     let is_native_bf16 = kvc.native_bf16;
 
@@ -1932,7 +1950,7 @@ pub mod kv_paged {
     let v_pages = kvc.values;
     let w_page = kvc.write_page as *const u32;
     let w_off = kvc.write_offset as *const u32;
-    let win_d = ctx.ask::<*mut u32, keys::PeelWindow>()?;
+    let win_d = crate::stage_peel_window(ctx, "attn::write_kv_devwin", *win_start, *win_len)?;
     let row_valid = row_valid.ptr as *const u8;
     let n_max = *n_max;
         assert!(
@@ -1977,7 +1995,6 @@ pub mod kv_paged {
     head_dim: Const<i32>,
     qo_indptr: In<Tensor<i32>>,
     row_valid: In<Tensor<i32>>,
-    num_requests: Const<i32>,
     first_token: In<Tensor<i32>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -1986,18 +2003,19 @@ pub mod kv_paged {
     let page_size = kvc.page_size;
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
-    let hnd = kvc.layout as bool;
+    let hnd = kvc.layout != 0;
     let has_envelopes = kvc.has_envelopes;
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let kv_page_indices = kvc.page_indices as *const u32;
     let kv_page_indptr = kvc.page_indptr as *const u32;
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
     let row_valid = row_valid.ptr as *const u8;
-    let k_env_min = kvc.env_min as *const u16;
-    let k_env_max = kvc.env_max as *const u16;
-    let num_requests = *num_requests;
+    let k_env_min = kvc.env_min;
+    let k_env_max = kvc.env_max;
     let first_token = first_token.ptr as i32;
         let launch_tokens = k_curr.rows - first_token;
 
@@ -2063,8 +2081,7 @@ pub mod kv_paged {
     num_kv_heads: Const<i32>,
     head_dim: Const<i32>,
     first_token: In<Tensor<i32>>,
-    qo_indptr: In<Tensor<i32>>,
-    num_requests: Const<i32>) -> Result<(), Refusal> {
+    qo_indptr: In<Tensor<i32>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -2080,11 +2097,12 @@ pub mod kv_paged {
     let v_pages = kvc.values;
     let k_scales = kvc.key_scales as *mut core::ffi::c_void;
     let v_scales = kvc.value_scales as *mut core::ffi::c_void;
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let kv_page_indices = kvc.page_indices as *const u32;
     let kv_page_indptr = kvc.page_indptr as *const u32;
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let num_requests = *num_requests;
         if first_token != 0 {
             return Err(Refusal::Absent {
                 what: "a quantised appender that skips the first tokens",
@@ -2189,7 +2207,11 @@ pub mod kv_paged {
             "write_kv_to_pages",
             write_kv_to_pages_bf16,
             namespace = "attn"
-        );
+        )
+        // The KV-append role: `Kv::append` resolves `canon = kv_append` and
+        // this declared name is what a text states; `Boot::route` still
+        // picks the bf16/quantised body.
+        .canon("kv_append");
 
     #[cfg(not(target_family = "wasm"))]
     #[::linkme::distributed_slice(crate::ROUTINES)]
@@ -2431,8 +2453,10 @@ pub fn split_qkv_bf16_devwin(
     q_out: Out<Tensor<bf16>>,
     k_out: Out<Tensor<bf16>>,
     v_out: Out<Tensor<bf16>>,
-    n_max: Const<i32>) -> Result<(), Refusal> {
-    let win = ctx.ask::<*mut u32, keys::PeelWindow>()?;
+    n_max: Const<i32>,
+    win_start: Const<i32>,
+    win_len: Const<i32>) -> Result<(), Refusal> {
+    let win = crate::stage_peel_window(ctx, "attn::split_qkv_devwin", *win_start, *win_len)?;
     let n_max = *n_max;
 
     pub const SPLIT_BLOCK: u32 = 256;
@@ -2465,7 +2489,7 @@ pub fn attention_naive_paged(
     sm_scale: Const<f32>,
     logits_soft_cap: Const<f32>,
     qo_indptr: In<Tensor<i32>>,
-    num_requests: Const<i32>) -> Result<(), Refusal> {
+    lse_out: Option<Out<Tensor<f32>>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -2479,6 +2503,8 @@ pub fn attention_naive_paged(
     let window_left = *window_left;
     let sm_scale = *sm_scale;
     let logits_soft_cap = *logits_soft_cap;
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let kv_page_indices = kvc.page_indices as *const u32;
     let k_pages = kvc.keys;
@@ -2487,8 +2513,7 @@ pub fn attention_naive_paged(
     let v_scales = kvc.value_scales as *mut core::ffi::c_void;
     let kv_page_indptr = kvc.page_indptr as *const u32;
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let num_requests = *num_requests;
-    let lse_out = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let lse_out = lse_out.map_or(core::ptr::null_mut(), |l| l.ptr);
 
     pub const PAGED_MAX_HEAD_DIM: i32 = 1024;
 
@@ -2545,8 +2570,10 @@ pub fn attn_res_blend<T>(
     ctx: &Ctx<'_>,
     prefix: In<Tensor<T>>,
     blocks: In<Tensor<T>>,
-    norm_weight: In<Tensor<T>>,
-    proj_weight: In<Tensor<T>>,
+    // WEIGHTS, so the statement names them and the chain binds them --
+    // an `In` slot here read operands the text never places.
+    norm_weight: Const<Tensor<T>>,
+    proj_weight: Const<Tensor<T>>,
     out: Out<Tensor<T>>,
     eps: Const<f32>) -> Result<(), Refusal> {
     let eps = *eps;

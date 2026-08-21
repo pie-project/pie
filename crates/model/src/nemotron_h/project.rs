@@ -362,8 +362,16 @@ pub const NO_METAL: &str = "nemotron-h has no Metal text in this build: its forw
 pub fn trace(
     f: &NemotronHFacts,
     class: model_ir::trace::FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
 ) -> model_ir::trace::ForwardPlan {
-    super::forward::nemotron_h_cuda(f, class)
+    // THE SHIPPED POINT. nemotron-h catalogues one SKU today; the table
+    // in `forward::CATALOG` is where a second one appears, and the
+    // coverage test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, NativeKv};
+    super::forward::nemotron_h_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>(
+        f, class, norm_eps, rope_theta,
+    )
 }
 
 #[cfg(test)]

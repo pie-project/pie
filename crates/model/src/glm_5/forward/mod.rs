@@ -27,6 +27,7 @@
 pub mod facts;
 
 use self::facts::Glm5Facts;
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
@@ -60,19 +61,20 @@ struct Glm5LayerW {
 }
 
 impl Glm5LayerW {
-    fn new(l: u32, f: &Glm5Facts) -> Self {
+    fn new(l: u32, f: &Glm5Facts, norm_eps: f32, repr: WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         let a = &f.attn;
         Self {
@@ -105,14 +107,36 @@ impl Glm5LayerW {
 /// dispatch over a `qo_indptr` (see `kimi_k2`), and the DSA indexer scores
 /// whatever query rows the fire brought. Nothing here reads the class except
 /// the trace's name.
-pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
-    let family = format!("glm5.cuda.{}", class.suffix());
+pub fn glm5_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &Glm5Facts,
+    class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: MLA's latent cache is stated bf16 and
+    // nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "glm5-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
-        let mut y = dsl::embedded_prologue(t, facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
 
         for l in 0..facts.layers {
-            let w = Glm5LayerW::new(l, facts);
+            let w = Glm5LayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             // The query's own latent, normed, then expanded. `hidden`
@@ -140,16 +164,24 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             );
             let idx_k = dsl::cuda::gemm_xwt(&x, &w.idx_wk.name, facts.dsa.index_head_dim);
             let idx_w = dsl::cuda::gemm_xwt(&q_a_n, &w.idx_weights.name, facts.dsa.index_n_heads);
+            // The indexer rotates the MLA's rope width (the head's own
+            // rotary slice, `qk_rope_head_dim`), on the row's base, at
+            // the row's epsilon.
             let idx_k = dsl::cuda::dsa_index_knorm_rope(
                 &idx_k,
                 &w.idx_k_norm_weight,
                 &w.idx_k_norm_bias,
                 facts.dsa.index_head_dim,
+                a.qk_rope_head_dim,
+                rope_theta,
+                norm_eps,
             );
             let idx_q = dsl::cuda::dsa_index_q_rope(
                 &idx_q,
                 facts.dsa.index_n_heads,
                 facts.dsa.index_head_dim,
+                a.qk_rope_head_dim,
+                rope_theta,
             );
             // The mask is STATED, not threaded: `mla_absorbed_attention`
             // below takes no operand for it, and the binding is what
@@ -207,7 +239,12 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             }
 
             let logits = matmul(&m, &w.router);
-            let (experts, weights) = dsl::cuda::topk_sigmoid(&logits, facts.moe.top_k);
+            let (experts, weights) = dsl::cuda::topk_sigmoid(
+                &logits,
+                facts.moe.top_k,
+                facts.moe.norm_topk_prob,
+                facts.moe.routed_scaling,
+            );
 
             // The decode leg: one warp per output row, because at M == 1
             // the routed GEMMs are streaming reads with no weight reuse.
@@ -217,7 +254,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.gate_up"),
                     width: 2 * facts.moe.moe_intermediate,
                     layer: Some(l),
-                    repr: WeightRepr::Bf16,
+                    repr: W2::REPR,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -229,7 +266,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.down"),
                     width: facts.hidden,
                     layer: Some(l),
-                    repr: WeightRepr::Bf16,
+                    repr: W2::REPR,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -251,6 +288,26 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
+        dsl::logits_epilogue(
+            t,
+            &y,
+            NormVariant::Plain,
+            false,
+            facts.vocab,
+            None,
+            norm_eps,
+        );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&Glm5Facts, FireClass, f32, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    ("glm5-bf16-bf16-kv-bf16", glm5_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>),
+];

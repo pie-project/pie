@@ -800,9 +800,14 @@ impl Serving<'_> {
         let arena_span = crate::phase::span("step/arena");
         let arena = arena_for(device, held.arenas, low.arena_bytes)?;
         drop(arena_span);
+        // The plan's runtime streams, so a text's `positions` binds the
+        // table this step just staged rather than the seam stand-in. Per
+        // step because the decode and prefill plans each mint their own ids.
+        let streams = crate::runtime::Streams::of(plan);
         let model = Model {
             weights: held.weights,
             pool: held.pool,
+            runtime: &streams,
         };
         let fire_span = crate::phase::span("step/fire");
         // WHAT MAKES THE LAST FIRE STILL THE RIGHT ANSWER.

@@ -49,7 +49,7 @@ fn head_row_grid(threads: u32, heads: i32, rows: i32) -> Result<[u32; 3], Refusa
     Ok([threads, heads.unsigned_abs(), rows.unsigned_abs()])
 }
 
-#[routine]
+#[routine(canon = rmsnorm)]
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -187,7 +187,7 @@ pub fn vnorm_single_row(
     )
 }
 
-#[routine]
+#[routine(canon = rmsnorm_gated)]
 pub fn gated_rms(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -257,7 +257,7 @@ pub fn layer_scalar_mul(
     )
 }
 
-#[routine]
+#[routine(canon = residual_add)]
 pub fn residual_add(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -288,7 +288,7 @@ pub fn residual_add_strided(
     )
 }
 
-#[routine]
+#[routine(canon = add_bias)]
 pub fn add_bias(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<bf16>>,

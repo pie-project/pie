@@ -499,9 +499,14 @@ unsafe fn dequant_then_bf16(
             crate::quant::dequant_fp8_e4m3_to_bf16_per_group(
                 &ctx,
                 kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                // The routine reads its column extent off this width, and the
+                // caller's weight is `n` rows of `k` -- a zero here launched
+                // nothing and left the dequant cache holding uninitialised
+                // bf16.
+                kernels::routine::Out { ptr: bf16_w.cast(), rows: n, width: k },
                 kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
                 kernels::routine::Const { v: group_size },
+                kernels::routine::Const { v: n },
             )
         });
     } else if scale_kind == quant_kind::PER_CHANNEL {

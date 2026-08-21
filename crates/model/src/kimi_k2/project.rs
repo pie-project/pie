@@ -363,8 +363,19 @@ pub fn trace(
     f: &KimiFacts,
     rope_yarn_original: bool,
     class: model_ir::trace::FireClass,
+    norm_eps: f32,
 ) -> model_ir::trace::ForwardPlan {
-    super::forward::kimi_cuda(f, &cuda_facts(rope_yarn_original), class)
+    // THE SHIPPED POINT. kimi-k2 catalogues one SKU today — WNA16 routed
+    // experts, the only routed leg the text states; the table in
+    // `forward::CATALOG` is where a second one appears, and the coverage
+    // test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, NativeKv, Wna16Ax};
+    super::forward::kimi_cuda::<Bf16Ax, Wna16Ax, Bf16Ax, NativeKv>(
+        f,
+        &cuda_facts(rope_yarn_original),
+        class,
+        norm_eps,
+    )
 }
 
 #[cfg(test)]

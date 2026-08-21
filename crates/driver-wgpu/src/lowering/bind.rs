@@ -45,20 +45,20 @@
 //! arms. This deletion is 3,848, and it was cheaper because the shared
 //! reader already existed.
 
-use kernels::bind::{Answer, Holds};
+use kernels::bind::Holds;
 use kernels::routine::Refusal;
 use kernels::shader::ShaderValue;
 use kernels::{Source, Ty};
 use kernels_wgpu::routine::ArgValue;
 
-use crate::binding::{FireNumber, FireTable};
 use crate::lowering::hold::{Facts, Handles};
 
 /// Bind one launch's arguments from the row the signature derived.
 ///
-/// A thin wrapper over [`kernels::bind::bind`]: it pairs this backend's
-/// [`Handles`] with the launch's [`Facts`] so the shared reader can ask both
-/// through one trait.
+/// [`kernels::bind::one`] per argument, paired with this backend's
+/// [`Handles`] and the launch's [`Facts`] — plus the one carrier the shared
+/// reader cannot answer: a `Ty::Raised` operand becomes a driver-built view
+/// through `views`.
 ///
 /// # Errors
 ///
@@ -71,8 +71,27 @@ pub fn bind(
     sources: &[Option<Source>],
     o: &mut Handles<'_>,
     f: Facts,
+    views: &mut super::views::Views,
 ) -> Result<Vec<ArgValue>, Refusal> {
-    kernels::bind::bind::<ArgValue, _>(args, sources, &mut Held { o, f })
+    // Argument by argument rather than the shared list reader, because ONE
+    // carrier is this plane's to answer before the reader sees it: a
+    // `Ty::Raised` operand is a HOST view the driver builds
+    // (`lowering::views`), and the shared binder has no door for a value
+    // that is neither a handle nor a scalar. Everything else goes through
+    // `kernels::bind::one` exactly as the list reader would have sent it —
+    // same order, same slot numbering, same refusals.
+    let mut out = Vec::with_capacity(args.len());
+    for (at, ty) in args.iter().enumerate() {
+        let source = sources.get(at).copied().flatten().ok_or(Refusal::Unstated {
+            what: "an argument whose signature does not say where it comes from",
+        })?;
+        if matches!(ty, Ty::Raised) {
+            out.push(views.raise(source, o)?);
+            continue;
+        }
+        out.push(kernels::bind::one::<ArgValue, _>(*ty, source, &mut Held { o, f })?);
+    }
+    Ok(out)
 }
 
 /// ONE value, for a body that ASKS rather than a column that declares.
@@ -157,160 +176,13 @@ impl Holds for Held<'_, '_> {
         at(self.o.unbound()).unwrap_or_default()
     }
 
-    fn fact(&mut self, key: &'static str) -> Option<Result<Answer, Refusal>> {
-        Some(named(key, self.o, self.f))
+    fn rows(&mut self) -> i32 {
+        // The launch rectangle's — what `keys::Rows` used to answer.
+        self.f.rows.cast_signed()
     }
 }
 
-/// A fact, by the key the signature names.
-///
-/// The tables and the pool come back as handles; the geometry comes back as
-/// numbers off [`Facts`]. Both are this backend's to answer, which is what
-/// `Provenance::Env` said all along -- this says WHICH.
-fn named(key: &'static str, o: &mut Handles<'_>, f: Facts) -> Result<Answer, Refusal> {
-    use kernels::keys::{self, Fact};
 
-    if let Some(which) = table_of(key) {
-        return Ok(Answer::Handle(at(o.table(which))?));
-    }
-    if key == keys::KvKeys::KEY {
-        return Ok(Answer::Handle(at(o.kv(false))?));
-    }
-    if key == keys::KvValues::KEY {
-        return Ok(Answer::Handle(at(o.kv(true))?));
-    }
-    for slab in SLABS {
-        if key == slab {
-            return Ok(Answer::Handle(at(o.slab(slab))?));
-        }
-    }
-    // THE POOL'S NUMBERS reach a kernel as scalars rather than addresses.
-    // `Wide` rather than `Number` because a stride is a byte count and the
-    // signature says whether it fits: `Usize` takes it whole and a narrower
-    // carrier refuses a deployment large enough to overflow, which is the
-    // honest answer where a cast is a silent truncation.
-    for (k, which) in POOLED {
-        if key == k {
-            if matches!(
-                which,
-                FireNumber::KvHeadStride | FireNumber::KvSeqStride
-            ) {
-                contiguous_pool(o)?;
-            }
-            return Ok(Answer::Wide(u64::from(o.fire_number(which))));
-        }
-    }
-    let n = geometry(key, f).ok_or(Refusal::Unstated {
-        what: "a fact this backend does not answer",
-    })??;
-    Ok(Answer::Number(n))
-}
-
-/// Refuse a head or sequence stride over a PAGED pool.
-///
-/// `Handles::fire_number` answers both happily, because
-/// `resources::Shape::number` can derive them from a paged pool -- and the
-/// number it derives addresses the wrong tokens, because this driver's pool
-/// is `[page, token, head, dim]` and a stride means "walk the cache with no
-/// page table". A launch handed one succeeds and attends to the wrong
-/// context, which is the loudest kind of quiet failure there is.
-///
-/// The check lived among the arms until they were deleted, and it was never
-/// an arm: no signature can state "unless the pool is paged", because
-/// pagedness is the FIRE's and a signature is fire-invariant. So it belongs
-/// exactly here, in the half of binding that is this backend's to answer,
-/// beside the number it guards.
-///
-/// # Errors
-///
-/// [`Refusal::Absent`] when the fire's pool states a page size.
-fn contiguous_pool(o: &Handles<'_>) -> Result<(), Refusal> {
-    if o.fire_number(FireNumber::KvPageSize) != 0 {
-        return Err(Refusal::Absent {
-            what: "a contiguous KV cache: this fire's pool is paged, and a \
-                   head/sequence stride over it addresses the wrong tokens",
-        });
-    }
-    Ok(())
-}
-
-/// The slabs a key may name, which the driver holds per layer.
-const SLABS: [&str; 3] = ["conv_state", "new_conv_state", "recurrent_state"];
-
-/// The pool's numbers, which reach a kernel as scalars rather than addresses.
-const POOLED: [(&str, FireNumber); 4] = [
-    (
-        <kernels::keys::KvHeadStride as kernels::keys::Fact>::KEY,
-        FireNumber::KvHeadStride,
-    ),
-    (
-        <kernels::keys::KvSeqStride as kernels::keys::Fact>::KEY,
-        FireNumber::KvSeqStride,
-    ),
-    (
-        <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY,
-        FireNumber::KvPageSize,
-    ),
-    // NOT the KV pool's, and not guarded like one. The attention mask is a
-    // table this driver stages per fire, and its row pitch is a number the
-    // fire knows and the statement usually does not carry -- which is why
-    // this backend's sdpa rows say `ParamOr<3, AttentionMaskStride, _>`
-    // where metal's say `ParamOrLit<3, 0, _>`. Metal reaches a mask through
-    // the statement; this one reaches it through the fire, and a literal
-    // zero here is a mask that is bound and never read.
-    (
-        <kernels::keys::AttentionMaskStride as kernels::keys::Fact>::KEY,
-        FireNumber::AttentionMaskStride,
-    ),
-];
-
-/// The fire's GEOMETRY, by key. `None` for a key that is not one of the
-/// fire's numbers, which is a refusal at the caller rather than here.
-fn geometry(key: &str, f: Facts) -> Option<Result<i32, Refusal>> {
-    use kernels::keys::{self, Fact};
-
-    Some(Ok(match key {
-        _ if key == keys::Rows::KEY => f.rows.cast_signed(),
-        _ if key == keys::RequestCount::KEY => f.requests.cast_signed(),
-        _ if key == keys::Width::KEY => f.width.cast_signed(),
-        _ if key == keys::InWidth::KEY => f.in_width.cast_signed(),
-        _ if key == keys::NumQHeads::KEY => f.q_heads.cast_signed(),
-        _ if key == keys::NumKvHeads::KEY => f.kv_heads.cast_signed(),
-        _ if key == keys::HeadDim::KEY => f.head_dim.cast_signed(),
-        _ if key == keys::NumExperts::KEY => f.n_experts.cast_signed(),
-        _ if key == keys::ExpertsPerToken::KEY => f.experts_per_token.cast_signed(),
-        _ if key == keys::RotaryWidth::KEY => f.rotary_dims.cast_signed(),
-        _ if key == keys::VHeads::KEY => f.v_heads.cast_signed(),
-        _ if key == keys::VDim::KEY => f.v_dim.cast_signed(),
-        _ if key == keys::QuantGroup::KEY => f.group,
-        _ if key == keys::QuantBits::KEY => f.bits,
-        _ if key == keys::TileM::KEY => f.tile_m,
-        _ if key == keys::TileN::KEY => f.tile_n,
-        _ => return None,
-    }))
-}
-
-/// The fire table a key names, if it names one.
-fn table_of(key: &str) -> Option<FireTable> {
-    use kernels::keys::{self, Fact};
-
-    Some(match key {
-        _ if key == keys::TokenIds::KEY => FireTable::TokenIds,
-        _ if key == keys::Positions::KEY => FireTable::Positions,
-        _ if key == keys::RequestOfToken::KEY => FireTable::RequestOfToken,
-        _ if key == keys::KvPageIndices::KEY => FireTable::KvPageIndices,
-        _ if key == keys::KvPageIndptr::KEY => FireTable::KvPageIndptr,
-        _ if key == keys::AttentionMask::KEY => FireTable::AttentionMask,
-        _ if key == keys::AttentionMaskEnabled::KEY => FireTable::AttentionMaskEnabled,
-        _ if key == keys::KvWritePage::KEY => FireTable::KvWritePage,
-        _ if key == keys::KvWriteOffset::KEY => FireTable::KvWriteOffset,
-        _ if key == keys::RopeFrequencies::KEY => FireTable::RopeFrequencies,
-        _ if key == keys::SamplingIndices::KEY => FireTable::SamplingIndices,
-        _ if key == keys::RecurrentSlots::KEY => FireTable::RecurrentSlots,
-        _ if key == keys::AttnScratch::KEY => FireTable::AttnScratch,
-        _ => return None,
-    })
-}
 
 #[cfg(test)]
 // The crate denies `print_stdout` and means it -- a driver that prints is a

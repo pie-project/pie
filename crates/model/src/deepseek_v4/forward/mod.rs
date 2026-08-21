@@ -26,8 +26,23 @@
 pub mod facts;
 
 use self::facts::Dsv4Facts;
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
+
+/// The hyper-connection's OWN epsilon — the sigmoid/sinkhorn floor inside
+/// `hc_pre`/`hc_head`, NOT the RMS norm's (`dsv4_hc.cuh` norms the MIX and
+/// the two are separate numbers in the checkpoint). The hand-written pass
+/// read it as `cfg.dsv4_hc_eps` (config key `hc_eps`, default `1e-6`), and
+/// no committed V4 config states one, so this is that default — the same
+/// honest reading `rope_theta` and `norm_eps` give on the row.
+const HC_EPS: f32 = 1e-6;
+/// The post-mix blend gain. Hard-coded `2.0f` in the hand-written pass
+/// (`deepseek_v4_forward.cpp`), which is the only statement of it anywhere.
+const HC_POST_ALPHA: f32 = 2.0;
+/// Sinkhorn normalization sweeps over the comb mix. Hard-coded `20` in the
+/// hand-written pass ("from config hc_sinkhorn_iters", never read).
+const HC_SINKHORN_ITERS: u32 = 20;
 
 struct Dsv4LayerW {
     // DECLARED AND NOT APPLIED, which is a finding and not an oversight of
@@ -71,19 +86,20 @@ struct Dsv4LayerW {
 }
 
 impl Dsv4LayerW {
-    fn new(l: u32, f: &Dsv4Facts) -> Self {
+    fn new(l: u32, f: &Dsv4Facts, norm_eps: f32, repr: WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         let a = &f.attn;
         Self {
@@ -118,27 +134,63 @@ impl Dsv4LayerW {
 /// `dsv4_boundary_meta_decode` may shortcut it to the token index because a
 /// decode brings one row per request, and a prefill has to read it out of
 /// `qo_indptr`. Two launchers, one statement here.
-pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
-    let family = format!("deepseek_v4.cuda.{}", class.suffix());
+pub fn dsv4_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &Dsv4Facts,
+    class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: the compressed cache is stated bf16 and
+    // nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "deepseek_v4-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let a = facts.attn.clone();
     let k = facts.hc.mult;
     dsl::trace_named(&family, |t| {
-        let embedded = dsl::embedded_prologue(t, facts.hidden);
+        let embedded = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
         // The rank-K residual opens here and stays open to `hc_head`.
         let mut streams = dsl::cuda::hc_expand(&embedded, k, facts.hidden);
 
         // The compressed pass needs the block boundaries this fire's
         // positions imply, and they are a FIRE fact — one statement,
         // outside the layer loop, exactly as the hand-written pass has it.
-        let (boundary_pos, boundary_req, _counts) = dsl::cuda::dsv4_boundary_meta(&embedded, class);
+        // ONE ratio for a fire-wide statement, and the schedule states one
+        // PER LAYER (`ratios: &[1, 2, 4]`). The coarsest positive stride is
+        // the only single number the schedule can stand behind — its
+        // boundaries close every finer window where the ratios nest, as
+        // this row's do. A schedule whose ratios did not nest could not be
+        // served by one fire-wide meta at all; see the sweep report.
+        let fire_ratio = facts
+            .ratios
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(0)
+            .unsigned_abs();
+        let (boundary_pos, boundary_req, _counts) =
+            dsl::cuda::dsv4_boundary_meta(&embedded, class, fire_ratio);
 
         for l in 0..facts.layers {
-            let w = Dsv4LayerW::new(l, facts);
+            let w = Dsv4LayerW::new(l, facts, norm_eps, W1::REPR);
 
             // Read a mix of the streams. `hc_pre` produces the layer's
             // input and the two mixes `hc_post` will need to write back.
-            let normed_f32 =
-                dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden);
+            let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden, norm_eps);
             let (x, post_mix, comb_mix) = dsl::cuda::hc_pre(
                 &normed_f32,
                 &streams,
@@ -146,6 +198,9 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                 &w.hc_attn_base,
                 k,
                 facts.hidden,
+                HC_EPS,
+                HC_POST_ALPHA,
+                HC_SINKHORN_ITERS,
             );
 
             // Q through its latent, then a per-head norm with NO gamma —
@@ -154,25 +209,73 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             let q_a = matmul(&x, &w.wq_a);
             let q_a = dsl::cuda::rmsnorm(&q_a, &w.q_norm);
             let q = matmul(&q_a, &w.wq_b);
-            let q = dsl::cuda::per_head_rmsnorm(&q, a.heads, a.head_dim);
+            let q = dsl::cuda::per_head_rmsnorm(&q, a.heads, a.head_dim, norm_eps);
             let kv = matmul(&x, &w.wkv);
             let kv = dsl::cuda::rmsnorm(&kv, &w.kv_norm);
             // Partial rope on the LAST channels of each head.
-            let q = dsl::cuda::rope_partial_last(&q, a.heads, a.qk_rope_head_dim);
-            let kv = dsl::cuda::rope_partial_last(&kv, a.heads, a.qk_rope_head_dim);
+            let q = dsl::cuda::rope_partial_last(
+                &q,
+                a.heads,
+                a.head_dim,
+                a.qk_rope_head_dim,
+                rope_theta,
+                // GPT-J pairing — the rope kernel's own doc names
+                // DeepSeek-V4 (`is_neox_style=False` in vLLM's
+                // `build_deepseek_v4_rope`).
+                true,
+                // No rescaling: the row states `rope_scaling: None`
+                // (project.rs), and zero is the kernel's word for it.
+                0.0,
+                0.0,
+                0.0,
+                0,
+            );
+            let kv = dsl::cuda::rope_partial_last(
+                &kv,
+                a.heads,
+                a.head_dim,
+                a.qk_rope_head_dim,
+                rope_theta,
+                true,
+                0.0,
+                0.0,
+                0.0,
+                0,
+            );
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
 
             let kvh = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&kv, &kv, &kvh);
 
             // The window pass, uncompressed.
-            let (o_win, lse_win) =
-                dsl::cuda::attention_flashinfer_prefill_lse(&q, &kvh, a.q_width());
+            // The UNCOMPRESSED reach: everything older is the compressed
+            // pass's — project.rs states the same rule for the deployment.
+            let window_left = i32::try_from(a.sliding_window).unwrap_or(i32::MAX);
+            let window_left = if window_left > 0 { window_left } else { -1 };
+            let (o_win, lse_win) = dsl::cuda::attention_flashinfer_prefill_lse(
+                &dsl::runtime::query_windows(&q),
+                &kvh,
+                a.heads,
+                a.head_dim,
+                // K and V are ONE projection: every query head has its own
+                // KV head (project.rs's Geometry says the same).
+                a.heads,
+                window_left,
+                0.0,
+                0.0,
+            );
             let lse_win = dsl::cuda::lse_log2_to_ln(&lse_win, a.heads);
 
             // The compressed pass: gather this layer's block entries,
             // rope them the same way, store them, then attend.
-            let entries = dsl::cuda::dsv4_compress_gather_paged(&boundary_pos, &boundary_req, l, a.head_dim);
+            let layer_ratio = facts.compress_ratio_at(l);
+            let entries = dsl::cuda::dsv4_compress_gather_paged(
+                &boundary_pos,
+                &boundary_req,
+                l,
+                a.head_dim,
+                layer_ratio.max(0).unsigned_abs(),
+            );
             // THE ENTRIES' OWN RECTANGLE, not the query's. `rope_partial_last`
             // rotates IN PLACE -- its row aliases result 0 with operand 0 --
             // so the result it declares has to be the buffer it was handed,
@@ -180,10 +283,32 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             // token (`[Dim::Tokens, Dim::Const(head_dim)]`). Passing the
             // query's `heads * qk_rope_head_dim` here declared one buffer at
             // two sizes: the arena placed the alias outside its owner.
-            let entries = dsl::cuda::rope_partial_last(&entries, 1, a.head_dim);
+            let entries = dsl::cuda::rope_partial_last(
+                &entries,
+                1,
+                a.head_dim,
+                a.qk_rope_head_dim,
+                // The compressed pass's own base. The one committed V4
+                // config states `compress_rope_theta: 10000.0`, which the
+                // row does not carry as a separate number; at the only
+                // measurement in this tree the two bases agree.
+                rope_theta,
+                true,
+                0.0,
+                0.0,
+                0.0,
+                0,
+            );
             dsl::cuda::dsv4_store_comp_entries(&entries, &boundary_pos, &boundary_req, l);
-            let (o_comp, lse_comp) =
-                dsl::cuda::attention_compressed_paged(&q, l, a.heads, a.head_dim);
+            let (o_comp, lse_comp) = dsl::cuda::attention_compressed_paged(
+                &q,
+                l,
+                a.heads,
+                a.head_dim,
+                layer_ratio.max(0).unsigned_abs(),
+                // Over the head's own width — project.rs's sm_scale.
+                1.0 / (a.head_dim as f32).sqrt(),
+            );
 
             // One output, weighted by the two LSEs.
             let (o, lse) = dsl::cuda::combine_attn_outputs(
@@ -205,7 +330,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             streams = dsl::cuda::hc_post(&o, &streams, &post_mix, &comb_mix, k, facts.hidden);
 
             // ── MLP / MoE, over the same rank-K residual ─────────────
-            let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden);
+            let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden, norm_eps);
             let (m, post_mix, comb_mix) = dsl::cuda::hc_pre(
                 &normed_f32,
                 &streams,
@@ -213,6 +338,9 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                 &w.hc_mlp_base,
                 k,
                 facts.hidden,
+                HC_EPS,
+                HC_POST_ALPHA,
+                HC_SINKHORN_ITERS,
             );
 
             let out = if !facts.is_moe_layer(l) {
@@ -222,7 +350,11 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                     &w.dense_up,
                     &w.dense_down,
                     facts.dense_intermediate,
-                    dsl::GatedAct::SwiGluClamp,
+                    dsl::GatedAct::SwiGluClamp {
+                        // `cfg.swiglu_limit`, stored in thousandths so the
+                        // facts stay `Eq`.
+                        limit: facts.moe.swiglu_limit_milli as f32 / 1000.0,
+                    },
                 )
             } else {
                 let logits = matmul(&m, &w.router);
@@ -230,6 +362,8 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                     &logits,
                     &format!("layer.{l}.router_bias"),
                     facts.moe.top_k,
+                    facts.moe.norm_topk_prob,
+                    facts.moe.routed_scaling,
                 );
                 let gate_up = dsl::cuda::moe_gate_up_gemv(
                     &m,
@@ -237,19 +371,23 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                         name: format!("layer.{l}.expert.{{e}}.gate_up"),
                         width: 2 * facts.moe.moe_intermediate,
                         layer: Some(l),
-                        repr: WeightRepr::Bf16,
+                        repr: W2::REPR,
                     },
                     &experts,
                     facts.moe.top_k,
                 );
-                let act = dsl::cuda::swiglu_clamp(&gate_up, facts.moe.moe_intermediate);
+                let act = dsl::cuda::swiglu_clamp(
+                    &gate_up,
+                    facts.moe.moe_intermediate,
+                    facts.moe.swiglu_limit_milli as f32 / 1000.0,
+                );
                 let route_out = dsl::cuda::moe_down_gemv(
                     &act,
                     &MatW {
                         name: format!("layer.{l}.expert.{{e}}.down"),
                         width: facts.hidden,
                         layer: Some(l),
-                        repr: WeightRepr::Bf16,
+                        repr: W2::REPR,
                     },
                     &experts,
                     facts.moe.top_k,
@@ -270,7 +408,31 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             "hc_head_scale",
             "hc_head_base",
             facts.hidden,
+            HC_EPS,
         );
-        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
+        dsl::logits_epilogue(
+            t,
+            &y,
+            NormVariant::Plain,
+            false,
+            facts.vocab,
+            None,
+            norm_eps,
+        );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&Dsv4Facts, FireClass, f32, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    (
+        "deepseek_v4-bf16-bf16-kv-bf16",
+        dsv4_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>,
+    ),
+];

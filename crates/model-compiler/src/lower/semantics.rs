@@ -6,7 +6,6 @@ use super::*;
 /// What a statement without a stated kernel lowers to.
 pub(super) enum Semantic {
     Structural,
-    Kernels(&'static [&'static str]),
     /// Host work the backend raises before the fire's launches run. Carries
     /// the kind rather than a symbol: a prep is not a kernel.
     Prep(model_ir::trace::PrepKind),

@@ -6,11 +6,11 @@
 //! [`qwen3_5_hybrid`] composes their bodies per layer, so a fragment's test
 //! and the whole model's test read the same ops.
 //!
-//! # `rmsnorm_gemma_bf16` in the tables below is a RECORD, not a claim
+//! # `rmsnorm_gemma` in the tables below is a RECORD, not a claim
 //!
 //! Every op table here maps a trace op to what the legacy CUDA prototype's
 //! `qwen3_5_forward.cpp` launches for it, and for the norms that launch is
-//! `kernels::norm::rmsnorm_gemma_bf16` -- `xhat * (1 + w)`. Those rows are
+//! `kernels::norm::rmsnorm_gemma` -- `xhat * (1 + w)`. Those rows are
 //! left as written because they are an accurate transcription of that file
 //! and because that file is where this generation's whole `norm_variant`
 //! story came from. THE PROTOTYPE IS WRONG. `mlx_lm.models.qwen3_5` folds
@@ -37,6 +37,7 @@ use self::facts::{
     Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind,
     Qwen35MoeMlpFacts,
 };
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{
     self as dsl, ConvW, GdnPrepW, Kv, MatW, NormW, Rs, Trace, Val, WeightRepr, attention,
     causal_conv1d, cuda, gated_delta, gdn_prep, matmul, matmul_per_token, rmsnorm, rmsnorm_gated,
@@ -66,28 +67,28 @@ use model_ir::trace::{
 ///
 /// | trace op                       | hand-written kernel(s)                      |
 /// |--------------------------------|---------------------------------------------|
-/// | Rmsnorm(mlp_norm)              | kernels::norm::rmsnorm_gemma_bf16                   |
+/// | Rmsnorm(mlp_norm)              | kernels::norm::rmsnorm_gemma                   |
 /// | Matmul(router)                 | kernels::gemm::act_x_wt_bf16 (router logits)     |
-/// | TopK                           | kernels::moe::topk_softmax_bf16                    |
+/// | TopK                           | kernels::moe::topk_softmax                    |
 /// | Matmul(expert.{e}.gate_up, sel)| grouped GEMM (batched/aligned/CUTLASS)      |
-/// | Swiglu                         | kernels::mlp::chunked_swiglu_bf16 over N*k rows    |
+/// | Swiglu                         | kernels::mlp::chunked_swiglu over N*k rows    |
 /// | Matmul(expert.{e}.down, sel)   | grouped GEMM (batched/aligned/CUTLASS)      |
-/// | WeightedSum                    | kernels::moe::token_batched_weighted_sum_bf16      |
+/// | WeightedSum                    | kernels::moe::token_batched_weighted_sum      |
 /// | Matmul(shared_expert.gate_up)  | kernels::gemm::act_x_w                           |
-/// | Swiglu                         | kernels::mlp::chunked_swiglu_bf16                  |
+/// | Swiglu                         | kernels::mlp::chunked_swiglu                  |
 /// | Matmul(shared_expert.down)     | kernels::gemm::act_x_w                           |
 /// | Matmul(shared_expert_gate)     | kernels::gemm::act_x_w ([Tokens, 1] logit)       |
 /// | SigmoidGateAdd                 | kernels::mlp::sigmoid_scalar_gate_add_bf16         |
-/// | ResidualAdd                    | kernels::norm::residual_add_bf16                    |
+/// | ResidualAdd                    | kernels::norm::residual_add                    |
 ///
 /// The five shared-expert ops fold away when the facts say the checkpoint
 /// has none (`shared_expert_intermediate == 0`, the qwen3_moe shape), the
 /// same way llama_like's branches fold: at trace time, leaving no trace.
-pub fn qwen3_5_moe_mlp_block(facts: &Qwen35MoeMlpFacts) -> ForwardPlan {
+pub fn qwen3_5_moe_mlp_block(facts: &Qwen35MoeMlpFacts, norm_eps: f32) -> ForwardPlan {
     dsl::trace_named("qwen3_5_moe_mlp_block", |t| {
         // The fragment's parameter: the residual stream entering the block.
         let y = dsl::input(t, facts.hidden);
-        moe_mlp_body(0, facts, &y);
+        moe_mlp_body(0, facts, &y, norm_eps);
     })
 }
 
@@ -112,7 +113,13 @@ impl MoeLayerW {
     /// dense GEMM, the expert BANKS are addressed through pointer arrays
     /// by their own kernels, and the shared `gate_up` is a packed join.
     /// The semantic text passes `Bf16`.
-    fn new(l: u32, f: &Qwen35MoeMlpFacts, repr: WeightRepr) -> Self {
+    fn new(
+        l: u32,
+        f: &Qwen35MoeMlpFacts,
+        repr: WeightRepr,
+        expert_repr: WeightRepr,
+        norm_eps: f32,
+    ) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let mat = |name: &str, width: u32| MatW {
             name: w(name),
@@ -126,10 +133,20 @@ impl MoeLayerW {
                 variant: f.norm_variant,
                 per_head: None,
                 layer: Some(l),
+                eps: norm_eps,
             },
             router: mat("router", f.num_experts),
-            expert_gate_up: mat("expert.{e}.gate_up", 2 * f.moe_intermediate),
-            expert_down: mat("expert.{e}.down", f.hidden),
+            // The routed BANKS' repr is the expert axis's, not the dense
+            // stack's — their kernels index the experts through pointer
+            // arrays and never share the projections' GEMM.
+            expert_gate_up: MatW {
+                repr: expert_repr,
+                ..mat("expert.{e}.gate_up", 2 * f.moe_intermediate)
+            },
+            expert_down: MatW {
+                repr: expert_repr,
+                ..mat("expert.{e}.down", f.hidden)
+            },
             shared_gate_up: mat("shared_expert.gate_up", 2 * f.shared_expert_intermediate),
             shared_down: mat("shared_expert.down", f.hidden).with_repr(repr),
             shared_gate: mat("shared_expert_gate", 1),
@@ -163,8 +180,15 @@ impl MoeLayerW {
 /// so the text states it: a deployment that folds the residual takes the
 /// token-batched aligned form, one that does not takes the per-expert
 /// scatter-add.
-fn moe_mlp_body_aligned_cuda(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val, repr: WeightRepr) -> Val {
-    let w = MoeLayerW::new(l, facts, repr);
+fn moe_mlp_body_aligned_cuda(
+    l: u32,
+    facts: &Qwen35MoeMlpFacts,
+    y: &Val,
+    repr: WeightRepr,
+    expert_repr: WeightRepr,
+    norm_eps: f32,
+) -> Val {
+    let w = MoeLayerW::new(l, facts, repr, expert_repr, norm_eps);
     let y = y.clone();
     let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
 
@@ -262,9 +286,9 @@ fn moe_mlp_body_aligned_cuda(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val, repr: W
     }
 }
 
-fn moe_mlp_body(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val) -> Val {
+fn moe_mlp_body(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val, norm_eps: f32) -> Val {
     // Semantic: no backend, so no scaled kernel to name.
-    let w = MoeLayerW::new(l, facts, WeightRepr::Bf16);
+    let w = MoeLayerW::new(l, facts, WeightRepr::Bf16, WeightRepr::Bf16, norm_eps);
     let mut y = y.clone();
 
     let m = rmsnorm(&y, &w.mlp_norm);
@@ -301,10 +325,20 @@ fn moe_mlp_body(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val) -> Val {
 pub fn qwen3_5_moe_mlp_block_cuda(
     facts: &Qwen35MoeMlpFacts,
     cuda: &Qwen35CudaFacts,
+    norm_eps: f32,
 ) -> ForwardPlan {
     dsl::trace_named("qwen3_5_moe_mlp_block.cuda.decode", |t| {
         let y = dsl::input(t, facts.hidden);
-        moe_mlp_body_cuda(0, facts, cuda, &y, FireClass::Decode);
+        moe_mlp_body_cuda(
+            0,
+            facts,
+            cuda,
+            &y,
+            FireClass::Decode,
+            cuda.proj_repr,
+            WeightRepr::Bf16,
+            norm_eps,
+        );
     })
 }
 
@@ -347,6 +381,9 @@ fn moe_mlp_body_cuda(
     cuda: &Qwen35CudaFacts,
     y: &Val,
     class: FireClass,
+    repr: WeightRepr,
+    expert_repr: WeightRepr,
+    norm_eps: f32,
 ) -> Val {
     // The fused leg is the decode fast path's. Prefill and the service
     // classes take the host-routed path, as do a streamed expert cache
@@ -361,10 +398,10 @@ fn moe_mlp_body_cuda(
         || !cuda.moe_residual_fold
         || (facts.shared_expert_intermediate > 0 && !cuda.moe_shared_gate_dot)
     {
-        return moe_mlp_body_aligned_cuda(l, facts, y, cuda.proj_repr);
+        return moe_mlp_body_aligned_cuda(l, facts, y, repr, expert_repr, norm_eps);
     }
 
-    let w = MoeLayerW::new(l, facts, cuda.proj_repr);
+    let w = MoeLayerW::new(l, facts, repr, expert_repr, norm_eps);
     // Semantic: the lowering reads the variant and names the fold's
     // kernel, so there is nothing here for a CUDA reading to add.
     let m = dsl::cuda::rmsnorm(y, &w.mlp_norm);
@@ -426,7 +463,7 @@ fn moe_mlp_body_cuda(
 ///
 /// | trace op                | hand-written kernel(s)                          |
 /// |-------------------------|--------------------------------------------------|
-/// | Rmsnorm(attn_norm)      | kernels::norm::rmsnorm_gemma_bf16                        |
+/// | Rmsnorm(attn_norm)      | kernels::norm::rmsnorm_gemma                        |
 /// | Matmul(in_proj_qkv)     | kernels::gemm::act_x_w                                |
 /// | Matmul(in_proj_z)       | kernels::gemm::act_x_w                                |
 /// | Matmul(in_proj_a)       | kernels::gemm::act_x_w                                |
@@ -434,12 +471,12 @@ fn moe_mlp_body_cuda(
 /// | CausalConv1d            | launch_causal_conv1d_update[_batched]_bf16       |
 /// | GdnPrep                 | kernels::ssm::qwen_gdn_post_conv_prep_bf16              |
 /// | GatedDelta              | launch_recurrent_gated_delta_step_* (decode)     |
-/// | RmsnormGated            | kernels::norm::rmsnorm_gated_fp32_in_bf16                |
+/// | RmsnormGated            | kernels::norm::rmsnorm_gated_fp32_in                |
 /// | Matmul(o_proj)+res      | kernels::gemm::act_x_w beta=1                         |
 ///
 /// With the fused binding (`fused_in_proj`, `PIE_QWEN35_FUSED_GDN_PROJ`)
 /// the four projections become two matmuls + two [`SplitGdn`] launches
-/// (`kernels::layout::split_bf16_rows`, `kernels::layout::split_qwen_gdn_ba_bf16`) — same op
+/// (`kernels::layout::split_bf16_rows`, `kernels::layout::split_qwen_gdn_ba`) — same op
 /// count, different ops, resolved at trace time like llama_like's
 /// `fused_qkv`.
 ///
@@ -449,11 +486,11 @@ fn moe_mlp_body_cuda(
 /// per-request state axis" for why the state is not a traced value.
 ///
 /// [`SplitGdn`]: model_ir::trace::OpKind::SplitGdn
-pub fn qwen3_5_gdn_block(facts: &Qwen35GdnFacts) -> ForwardPlan {
+pub fn qwen3_5_gdn_block(facts: &Qwen35GdnFacts, norm_eps: f32) -> ForwardPlan {
     dsl::trace_named("qwen3_5_gdn_block", |t| {
         // The fragment's parameter: the residual stream entering the block.
         let y = dsl::input(t, facts.hidden);
-        gdn_attn_body(t, 0, facts, &y);
+        gdn_attn_body(t, 0, facts, &y, norm_eps);
     })
 }
 
@@ -477,7 +514,7 @@ struct GdnLayerW {
 }
 
 impl GdnLayerW {
-    fn new(t: &Trace, l: u32, f: &Qwen35GdnFacts) -> Self {
+    fn new(t: &Trace, l: u32, f: &Qwen35GdnFacts, norm_eps: f32) -> Self {
         let conv_dim = f.conv_dim();
         let v_dim = f.value_width();
         let w = |name: &str| format!("layer.{l}.{name}");
@@ -493,6 +530,7 @@ impl GdnLayerW {
                 variant: f.norm_variant,
                 per_head: None,
                 layer: Some(l),
+                eps: norm_eps,
             },
             in_proj_qkvz: mat("in_proj_qkvz", conv_dim + v_dim),
             in_proj_ba: mat("in_proj_ba", 2 * f.value_heads),
@@ -519,6 +557,7 @@ impl GdnLayerW {
                 variant: NormVariant::Plain,
                 per_head: None,
                 layer: Some(l),
+                eps: norm_eps,
             },
             o_proj: mat("o_proj", f.hidden),
             rs: Rs::at(t, l),
@@ -582,8 +621,8 @@ fn gdn_in_proj(
     }
 }
 
-fn gdn_attn_body(t: &Trace, l: u32, facts: &Qwen35GdnFacts, y: &Val) -> Val {
-    let w = GdnLayerW::new(t, l, facts);
+fn gdn_attn_body(t: &Trace, l: u32, facts: &Qwen35GdnFacts, y: &Val, norm_eps: f32) -> Val {
+    let w = GdnLayerW::new(t, l, facts, norm_eps);
     let mut y = y.clone();
 
     let x = rmsnorm(&y, &w.attn_norm);
@@ -603,6 +642,7 @@ fn gdn_attn_body(t: &Trace, l: u32, facts: &Qwen35GdnFacts, y: &Val) -> Val {
         facts.key_head_dim,
         facts.value_heads,
         facts.value_head_dim,
+        facts.conv_dim(),
     );
     let core = gated_delta(&w.rs, &q, &k, &v, &g, &beta);
 
@@ -624,8 +664,9 @@ fn gdn_attn_body_cuda(
     y: &Val,
     c: &Qwen35CudaFacts,
     class: FireClass,
+    norm_eps: f32,
 ) -> Val {
-    let w = GdnLayerW::new(t, l, facts);
+    let w = GdnLayerW::new(t, l, facts, norm_eps);
     let mut y = y.clone();
 
     let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
@@ -655,7 +696,10 @@ fn gdn_attn_body_cuda(
     };
     let qkv = match class {
         FireClass::Decode => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs, conv_geom),
-        FireClass::Prefill => cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs, conv_geom),
+        // Every fire class that exists advances state (a chunked
+        // prefill whose chunk is not the last would not — no such
+        // class is stated), so the persist flag is `true`.
+        FireClass::Prefill => cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs, conv_geom, true),
     };
     let (q, k, v, g, beta) = gdn_prep(
         &qkv,
@@ -666,6 +710,7 @@ fn gdn_attn_body_cuda(
         facts.key_head_dim,
         facts.value_heads,
         facts.value_head_dim,
+        facts.conv_dim(),
     );
     // The OnAttnProj site (A4): the hand-written GDN body invokes the
     // fire's programs here observing q_pre (fp32; qwen3_5's sites are
@@ -736,6 +781,7 @@ fn gdn_attn_body_cuda(
                                     &w.rs,
                                     c.state_bf16,
                                     geom,
+                                    true,
                                 );
                             },
                         );
@@ -758,14 +804,34 @@ fn gdn_attn_body_cuda(
                                 facts.value_heads,
                                 facts.key_head_dim,
                             );
-                            cuda::gdn_prefill_cached(&qr, &kr, &v, &g, &beta, &w.rs, c.state_bf16, geom);
+                            cuda::gdn_prefill_cached(
+                                &qr,
+                                &kr,
+                                &v,
+                                &g,
+                                &beta,
+                                &w.rs,
+                                c.state_bf16,
+                                geom,
+                                true,
+                            );
                         } else {
-                            cuda::gdn_prefill_cached(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16, geom);
+                            cuda::gdn_prefill_cached(
+                                &q,
+                                &k,
+                                &v,
+                                &g,
+                                &beta,
+                                &w.rs,
+                                c.state_bf16,
+                                geom,
+                                true,
+                            );
                         }
                     });
                 },
                 || {
-                    cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16, geom);
+                    cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16, geom, true);
                 },
             )
             .expect("the guarded recurrence produces its value")
@@ -799,13 +865,13 @@ fn gdn_attn_body_cuda(
 ///
 /// | trace op                  | hand-written kernel(s)                       |
 /// |---------------------------|-----------------------------------------------|
-/// | Rmsnorm(attn_norm)        | kernels::norm::rmsnorm_gemma_bf16                     |
+/// | Rmsnorm(attn_norm)        | kernels::norm::rmsnorm_gemma                     |
 /// | Matmul(q_proj) [2×-wide]  | kernels::gemm::act_x_w → [N, 2·Hq]                 |
 /// | Matmul(k_proj)            | kernels::gemm::act_x_w → [N, Hk]                   |
 /// | Matmul(v_proj)            | kernels::gemm::act_x_w → [N, Hk]                   |
 /// | SplitQGate                | kernels::layout::split_q_gate_bf16 (per-head q‖gate)    |
-/// | RmsnormPerHead(q, Plain)  | kernels::norm::rmsnorm_gemma_bf16 over N·Hq rows of d |
-/// | RmsnormPerHead(k, Plain)  | kernels::norm::rmsnorm_gemma_bf16 over N·Hkv rows of d|
+/// | RmsnormPerHead(q, Plain)  | kernels::norm::rmsnorm_gemma over N·Hq rows of d |
+/// | RmsnormPerHead(k, Plain)  | kernels::norm::rmsnorm_gemma over N·Hkv rows of d|
 /// | Rope(partial)             | kernels::rope::rope_partial_bf16 (rotary_dim chans)   |
 /// | KvAppend                  | kernels::attn::write_kv_to_pages / _explicit          |
 /// | Attention                 | dispatch_attention_flashinfer_{decode,prefill}|
@@ -824,11 +890,15 @@ fn gdn_attn_body_cuda(
 ///
 /// [`SplitQkv`]: model_ir::trace::OpKind::SplitQkv
 /// [`SplitQGate`]: model_ir::trace::OpKind::SplitQGate
-pub fn qwen3_5_full_attn_block(facts: &Qwen35FullAttnFacts) -> ForwardPlan {
+pub fn qwen3_5_full_attn_block(
+    facts: &Qwen35FullAttnFacts,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> ForwardPlan {
     dsl::trace_named("qwen3_5_full_attn_block", |t| {
         // The fragment's parameter: the residual stream entering the block.
         let y = dsl::input(t, facts.hidden);
-        full_attn_body(t, 0, facts, &y);
+        full_attn_body(t, 0, facts, &y, norm_eps, rope_theta);
     })
 }
 
@@ -858,7 +928,7 @@ impl FullAttnLayerW {
     /// dense join, and that contract declines quantized groups, so a
     /// quantized deployment binds the three separately. `mat` therefore
     /// stays the dense builder and the four say so.
-    fn new(t: &Trace, l: u32, f: &Qwen35FullAttnFacts, repr: WeightRepr) -> Self {
+    fn new(t: &Trace, l: u32, f: &Qwen35FullAttnFacts, repr: WeightRepr, norm_eps: f32) -> Self {
         let q2_w = 2 * f.q_width();
         let kv_w = f.kv_width();
         let w = |name: &str| format!("layer.{l}.{name}");
@@ -876,6 +946,7 @@ impl FullAttnLayerW {
             variant: f.norm_variant,
             per_head: Some(f.head_dim),
             layer: Some(l),
+            eps: norm_eps,
         };
         FullAttnLayerW {
             attn_norm: NormW {
@@ -883,6 +954,7 @@ impl FullAttnLayerW {
                 variant: f.norm_variant,
                 per_head: None,
                 layer: Some(l),
+                eps: norm_eps,
             },
             qgkv: mat("qgkv", q2_w + 2 * kv_w),
             q_proj: proj("q_proj", q2_w),
@@ -916,8 +988,15 @@ impl FullAttnLayerW {
 /// per-head pair), the projections and splits, the partial rope, the
 /// sigmoid output gate, the o_proj fold — is a 1:1-kernel semantic op
 /// and stays semantic in every form.
-fn full_attn_body(t: &Trace, l: u32, facts: &Qwen35FullAttnFacts, y: &Val) -> Val {
-    let w = FullAttnLayerW::new(t, l, facts, WeightRepr::Bf16);
+fn full_attn_body(
+    t: &Trace,
+    l: u32,
+    facts: &Qwen35FullAttnFacts,
+    y: &Val,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> Val {
+    let w = FullAttnLayerW::new(t, l, facts, WeightRepr::Bf16, norm_eps);
     let mut y = y.clone();
 
     let x = rmsnorm(&y, &w.attn_norm);
@@ -941,7 +1020,14 @@ fn full_attn_body(t: &Trace, l: u32, facts: &Qwen35FullAttnFacts, y: &Val) -> Va
     // partial rope: only the first rotary_dim channels of each head rotate.
     let q = rmsnorm(&q, &w.q_norm);
     let k = rmsnorm(&k, &w.k_norm);
-    let (q, k) = rope_partial(&q, &k, RopeKind::Standard, facts.rotary_dim);
+    let (q, k) = rope_partial(
+        &q,
+        &k,
+        RopeKind::Standard,
+        facts.rotary_dim,
+        facts.head_dim,
+        rope_theta,
+    );
     w.kv.append(&k, &v);
 
     // Attention stays opaque — the backend owns plan choice — then the
@@ -970,8 +1056,11 @@ fn full_attn_body_cuda(
     c: &Qwen35CudaFacts,
     y: &Val,
     class: FireClass,
+    repr: WeightRepr,
+    norm_eps: f32,
+    rope_theta: f32,
 ) -> Val {
-    let w = FullAttnLayerW::new(t, l, facts, c.proj_repr);
+    let w = FullAttnLayerW::new(t, l, facts, repr, norm_eps);
     // THIS LAYER's sliding window, `-1` for none — a load-time fact the
     // dispatch statements carry.
     let window_left = model_ir::facts::window_left_at(&c.window_left, l);
@@ -992,7 +1081,7 @@ fn full_attn_body_cuda(
 
     let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
     let k = dsl::cuda::rmsnorm(&k, &w.k_norm);
-    let (q, k) = dsl::cuda::rope_partial(&q, &k, facts.rotary_dim);
+    let (q, k) = dsl::cuda::rope_partial(&q, &k, facts.rotary_dim, facts.head_dim, rope_theta);
     // The OnAttnProj site (A4): post-rope, pre-KV-write — the
     // hand-written full-attn invoke's position, observing the roped q
     // (bf16). Observation-only, like the GDN sites.
@@ -1008,7 +1097,7 @@ fn full_attn_body_cuda(
         None,
         |c| {
             c.arm(dsl::Region::Fire(GuardPred::HasWriteDesc), || {
-                cuda::write_kv_explicit(&k, &v, &w.kv);
+                cuda::write_kv_explicit(&k, &v, &w.kv, facts.kv_heads, facts.head_dim);
             });
         },
         || {
@@ -1039,19 +1128,42 @@ fn full_attn_body_cuda(
                 Some(out_shape),
                 |c| {
                     c.arm(dsl::Region::Fire(GuardPred::TokensLE(1)), || {
-                        cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim, 0.0, 0.0);
+                        cuda::attention_flashinfer_prefill(
+                            &dsl::runtime::query_windows(&q),
+                            &w.kv,
+                            window_left,
+                            facts.head_dim,
+                            0.0,
+                            0.0,
+                        );
                     });
                 },
                 || {
-                    cuda::attention_flashinfer_decode(&q, &w.kv, window_left, facts.head_dim);
+                    cuda::attention_flashinfer_decode(
+                        &q,
+                        &w.kv,
+                        window_left,
+                        facts.head_dim,
+                        0.0,
+                        0.0,
+                    );
                 },
             )
         }
-        FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv, window_left, facts.head_dim),
+        FireClass::Decode => {
+            cuda::attention_flashinfer_decode(&q, &w.kv, window_left, facts.head_dim, 0.0, 0.0)
+        }
         FireClass::Prefill => {
             // No dequant statement beside it: qwen3_5's full-attention
             // path gates on a native-bf16 cache.
-            cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim, 0.0, 0.0)
+            cuda::attention_flashinfer_prefill(
+                &dsl::runtime::query_windows(&q),
+                &w.kv,
+                window_left,
+                facts.head_dim,
+                0.0,
+                0.0,
+            )
         }
     };
     let attn = attn.expect("a plain attention statement produces its value");
@@ -1069,13 +1181,21 @@ fn full_attn_body_cuda(
 /// fused-vs-unfused gate/up banks are emitter dispatch on the single traced
 /// `gate_up` matmul, not a fact — the same call llama_like's olmo2 comment
 /// records for its unfused gate/up binding.
-fn dense_mlp_body(l: u32, hidden: u32, intermediate: u32, variant: NormVariant, y: &Val) -> Val {
+fn dense_mlp_body(
+    l: u32,
+    hidden: u32,
+    intermediate: u32,
+    variant: NormVariant,
+    y: &Val,
+    norm_eps: f32,
+) -> Val {
     let w = |name: &str| format!("layer.{l}.{name}");
     let mlp_norm = NormW {
         name: w("mlp_norm"),
         variant,
         per_head: None,
         layer: Some(l),
+        eps: norm_eps,
     };
     let gate_up = MatW {
         name: w("gate_up"),
@@ -1113,6 +1233,7 @@ fn dense_mlp_body_cuda(
     y: &Val,
     packed: bool,
     repr: WeightRepr,
+    norm_eps: f32,
 ) -> Val {
     let w = |name: &str| format!("layer.{l}.{name}");
     let mlp_norm = NormW {
@@ -1120,6 +1241,7 @@ fn dense_mlp_body_cuda(
         variant,
         per_head: None,
         layer: Some(l),
+        eps: norm_eps,
     };
     // The PACKED bank is what the loader's dense join built, and that
     // join declines quantized groups -- so this handle is BF16 by the
@@ -1190,31 +1312,36 @@ fn dense_mlp_body_cuda(
 ///
 /// Mirrors `qwen3_5_forward.cpp::qwen3_5_forward_paged`'s walk: embed
 /// (`kernels::layout::embed_bf16`) → per layer {pre-attn norm + attention body,
-/// pre-MLP norm + MLP body} → final norm (`kernels::norm::rmsnorm_gemma_bf16`) →
+/// pre-MLP norm + MLP body} → final norm (`kernels::norm::rmsnorm_gemma`) →
 /// lm_head (`kernels::gemm::act_x_w`). The compact-logit gather, the state-only and
 /// commit-advance fires, MTP and the verify/rs-buffer services are
 /// per-fire services around this one pass, not ops of it.
-pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
+pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts, norm_eps: f32, rope_theta: f32) -> ForwardPlan {
     let hidden = hybrid_hidden(facts);
     dsl::trace_named("qwen3_5_hybrid", |t| {
         dsl::seam(t, &dsl::seam::IN, &[], None);
-        let mut y = dsl::embed_with(t, "embed", hidden);
+        let mut y = dsl::embed_with(t, "embed", hidden, facts.vocab);
 
         for l in 0..facts.layers {
             let y_attn = if facts.is_full_attn(l) {
-                full_attn_body(t, l, &facts.attn, &y)
+                full_attn_body(t, l, &facts.attn, &y, norm_eps, rope_theta)
             } else {
-                gdn_attn_body(t, l, &facts.gdn, &y)
+                gdn_attn_body(t, l, &facts.gdn, &y, norm_eps)
             };
             y = match &facts.mlp {
-                Qwen35MlpKind::Dense { intermediate } => {
-                    dense_mlp_body(l, hidden, *intermediate, facts.norm_variant, &y_attn)
-                }
-                Qwen35MlpKind::Moe(moe) => moe_mlp_body(l, moe, &y_attn),
+                Qwen35MlpKind::Dense { intermediate } => dense_mlp_body(
+                    l,
+                    hidden,
+                    *intermediate,
+                    facts.norm_variant,
+                    &y_attn,
+                    norm_eps,
+                ),
+                Qwen35MlpKind::Moe(moe) => moe_mlp_body(l, moe, &y_attn, norm_eps),
             };
         }
 
-        hybrid_epilogue(t, facts, &y, /*stated=*/ false);
+        hybrid_epilogue(t, facts, &y, /*stated=*/ false, norm_eps);
     })
 }
 
@@ -1223,19 +1350,36 @@ pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
 /// the traced form states its kernels as raw
 /// signatures ([`model_dsl::cuda`]; north-star-dsl.md rung 4c). One
 /// trace per [`FireClass`] the deployment fires; family names
-/// `qwen3_5_hybrid.cuda.decode` / `.prefill` — the [`llama_like_cuda`]
-/// naming, verbatim — plus the two SERVICE classes (rung 4c-iv):
+/// `qwen3_5_hybrid-<axes>.cuda.decode` / `.prefill` — the
+/// [`llama_like_cuda`] naming (the SKU joins the first segment) — plus
+/// the two SERVICE classes (rung 4c-iv):
 /// `.state_only` (the whole backbone, prefill-shaped, minus the
 /// final-norm/lm_head epilogue) and `.commit_advance` (the spec-decode
 /// repair: a genuinely different pass — the retired commit-advance pass).
-pub fn qwen3_5_hybrid_cuda(
+pub fn qwen3_5_hybrid_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
     facts: &Qwen35HybridFacts,
     cuda: &Qwen35CudaFacts,
     class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
 ) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: the full-attn layers' kv writes state
+    // native bf16 pages and nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
     let hidden = hybrid_hidden(facts);
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
     let family = format!(
-        "qwen3_5_hybrid.cuda.{}",
+        "qwen3_5_hybrid-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
         match class {
             FireClass::Decode => "decode",
             FireClass::Prefill => "prefill",
@@ -1243,13 +1387,23 @@ pub fn qwen3_5_hybrid_cuda(
     );
     dsl::trace_named(&family, |t| {
         dsl::seam(t, &dsl::seam::IN, &[], None);
-        let mut y = dsl::embed_with(t, "embed", hidden);
+        let mut y = dsl::embed_with(t, "embed", hidden, facts.vocab);
 
         for l in 0..facts.layers {
             let y_attn = if facts.is_full_attn(l) {
-                full_attn_body_cuda(t, l, &facts.attn, cuda, &y, class)
+                full_attn_body_cuda(
+                    t,
+                    l,
+                    &facts.attn,
+                    cuda,
+                    &y,
+                    class,
+                    W1::REPR,
+                    norm_eps,
+                    rope_theta,
+                )
             } else {
-                gdn_attn_body_cuda(t, l, &facts.gdn, &y, cuda, class)
+                gdn_attn_body_cuda(t, l, &facts.gdn, &y, cuda, class, norm_eps)
             };
             y = match &facts.mlp {
                 Qwen35MlpKind::Dense { intermediate } => dense_mlp_body_cuda(
@@ -1259,13 +1413,23 @@ pub fn qwen3_5_hybrid_cuda(
                     facts.norm_variant,
                     &y_attn,
                     cuda.gate_up_fused,
-                    cuda.proj_repr,
+                    W1::REPR,
+                    norm_eps,
                 ),
-                Qwen35MlpKind::Moe(moe) => moe_mlp_body_cuda(l, moe, cuda, &y_attn, class),
+                Qwen35MlpKind::Moe(moe) => moe_mlp_body_cuda(
+                    l,
+                    moe,
+                    cuda,
+                    &y_attn,
+                    class,
+                    W1::REPR,
+                    W2::REPR,
+                    norm_eps,
+                ),
             };
         }
 
-        hybrid_epilogue(t, facts, &y, /*stated=*/ true);
+        hybrid_epilogue(t, facts, &y, /*stated=*/ true, norm_eps);
     })
 }
 
@@ -1294,12 +1458,13 @@ fn hybrid_hidden(facts: &Qwen35HybridFacts) -> u32 {
 /// norm names its kernel. The semantic caller passes false, because a
 /// backend-independent trace has no kernel to name — the same split
 /// `dsl::rmsnorm` and `dsl::cuda::rmsnorm` are.
-fn hybrid_epilogue(t: &Trace, facts: &Qwen35HybridFacts, y: &Val, stated: bool) {
+fn hybrid_epilogue(t: &Trace, facts: &Qwen35HybridFacts, y: &Val, stated: bool, norm_eps: f32) {
     let final_norm = NormW {
         name: "final_norm".to_string(),
         variant: facts.norm_variant,
         per_head: None,
         layer: None,
+        eps: norm_eps,
     };
     let normed = if stated {
         dsl::cuda::rmsnorm(y, &final_norm)
@@ -2323,7 +2488,7 @@ mod tests {
             .collect();
         assert_eq!(
             splits,
-            vec!["layout::split_bf16_rows", "layout::split_qwen_gdn_ba_bf16"],
+            vec!["layout::split_bf16_rows", "layout::split_qwen_gdn_ba"],
             "the fused binding states one row split for qkv/z and the \
              interleaved b/a split for the gates, in that order"
         );
@@ -2341,7 +2506,7 @@ mod tests {
             .iter()
             .find(|op| {
                 matches!(&op.kind, OpKind::Launch { kernel, .. }
-                if kernel == "layout::split_qwen_gdn_ba_bf16")
+                if kernel == "layout::split_qwen_gdn_ba")
             })
             .expect("the ba split was just asserted present");
         let prep = plan
@@ -2551,3 +2716,18 @@ mod tests {
         }
     }
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&Qwen35HybridFacts, &Qwen35CudaFacts, FireClass, f32, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    (
+        "qwen3_5_hybrid-bf16-bf16-kv-bf16",
+        qwen3_5_hybrid_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>,
+    ),
+];

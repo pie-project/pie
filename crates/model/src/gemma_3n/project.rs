@@ -343,9 +343,22 @@ pub fn trace(
     f: &Gemma3nFacts,
     class: model_ir::trace::FireClass,
     load: Deployed<'_>,
+    norm_eps: f32,
+    rope_theta_global: f32,
+    rope_theta_local: f32,
 ) -> model_ir::trace::ForwardPlan {
     let _ = load;
-    super::forward::gemma3n_cuda(f, class)
+    // THE SHIPPED POINT. gemma-3n catalogues one SKU today; the table in
+    // `forward::CATALOG` is where a second one appears, and the coverage
+    // test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, NativeKv};
+    super::forward::gemma3n_cuda::<Bf16Ax, Bf16Ax, NativeKv>(
+        f,
+        class,
+        norm_eps,
+        rope_theta_global,
+        rope_theta_local,
+    )
 }
 
 #[cfg(test)]

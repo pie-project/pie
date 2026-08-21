@@ -8,8 +8,7 @@ use crate::jit::abi::bf16;
 use kernels::Refusal;
 use kernels::Region;
 
-use kernels::keys;
-use kernels::routine::{Asks, Const, In, Out};
+use kernels::routine::{Const, In, Out};
 
 const BLOCK: u32 = 256;
 
@@ -290,7 +289,7 @@ pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(weight.cast()) && aligned16(y.cast())
 }
 
-#[routine]
+#[routine(canon = embed)]
 pub fn embed_bf16(
     ctx: &Ctx<'_>,
     weight: Const<Tensor<bf16>>,

@@ -489,6 +489,7 @@ impl Variant for Gemma4 {
             self.sliding_window,
             class,
             load.layer_scalars,
+            NORM_EPS,
         ))
     }
 

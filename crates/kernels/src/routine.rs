@@ -443,22 +443,6 @@ pub trait Answers<B: Backend> {
 /// asked inside a helper. That is a real step down from a type-system
 /// guarantee to a syntactic one, and it is accepted deliberately.
 pub trait Asks<B: Backend>: Answers<B> {
-    /// The environment's answer to `K`, in the carrier `C` this plane binds.
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Unstated`] when this backend answers no such fact;
-    /// [`Refusal::Kind`] when the answer is not of `C`'s kind.
-    fn ask<C: Arg<B>, K: crate::keys::Fact>(&self) -> Result<C, Refusal> {
-        // THE KEY'S OWN SOURCE, WHICH IS NOT ALWAYS A `Named`.
-        // `keys::WindowOrNone` is `Or(Named("window_left"), Lit(-1))`, and
-        // `keys::GqaFactor` was arithmetic over two facts. Resolving the
-        // SOURCE rather than the string is what keeps a chain a chain.
-        let v = self.resolve(C::TY, <K as crate::keys::Fact>::SOURCE)?;
-        C::unpack(&v, 0)
-    }
-
-
     /// The statement's `n`-th scalar, read as an `i32`.
     ///
     /// # Why a body ever reaches past its own marks
@@ -1698,18 +1682,6 @@ const fn spelling(elem: &'static str, carrier: &'static str) -> &'static str {
 // now, and the two `_or_null` FACTS in `keys.rs` are unrelated -- they are
 // named keys a driver answers, not this.
 
-// THE TWO NAMED WEIGHT CHAINS, AS `static`s BECAUSE `Source::Or` HOLDS
-// REFERENCES. `Facts` carries `w_named` and `w_named2` and nothing else, so a
-// third weight has no NAME to be reached by -- only the positional bank. That
-// used to be a `compile_error!` in the macro; here it is the shorter arm of
-// the match below.
-static NAMED_W0: crate::Source =
-    crate::Source::Named(<crate::keys::NamedWeight as crate::keys::Fact>::KEY);
-static NAMED_W1: crate::Source =
-    crate::Source::Named(<crate::keys::NamedWeight2 as crate::keys::Fact>::KEY);
-static BANK_0: crate::Source = crate::Source::Slot(crate::Kind::Weight, 0);
-static BANK_1: crate::Source = crate::Source::Slot(crate::Kind::Weight, 1);
-
 /// The launch's rectangle at `at`, or zeros on a plane that states none.
 ///
 /// A PLANE WITH NO REGION SHAPE IS NOT A REFUSAL. `In` used to propagate
@@ -1792,13 +1764,12 @@ pub const fn resolve<const N: usize>(
             Claim::Weight => {
                 let at = weights;
                 weights += 1;
-                // The named bank first and the positional one after, in the
-                // order the binder already tried them.
-                match at {
-                    0 => Some(crate::Source::Or(&NAMED_W0, &BANK_0)),
-                    1 => Some(crate::Source::Or(&NAMED_W1, &BANK_1)),
-                    n => Some(crate::Source::Slot(crate::Kind::Weight, n)),
-                }
+                // POSITIONAL ONLY. The named half of the old chain served
+                // semantic ops, which carried a weight by NAME and nothing
+                // else; every statement is a Launch now and its weights list
+                // is positional, so the chain's first half had nothing left
+                // to answer.
+                Some(crate::Source::Slot(crate::Kind::Weight, at))
             }
         };
         i += 1;
@@ -2658,17 +2629,6 @@ pub struct Routine<B: Backend> {
     /// instead of the symbol, and nothing downstream to notice. Thirty-one
     /// routines are in that position.
     pub internal: bool,
-    /// The facts this routine's BODY asks the environment for.
-    ///
-    /// Not parameters: `ctx.ask::<f32, keys::RmsEps>()` is a call, so it has no
-    /// entry in [`Self::sources`] to be `None` and a reader walking the column
-    /// cannot see it. `#[routine]` scans the turbofishes and lists them here,
-    /// which is what lets a driver answer *"can I supply everything this
-    /// routine will ask for"* before a fire rather than during one.
-    ///
-    /// It MISSES a fact asked inside a helper — a syntactic guarantee where the
-    /// parameter run has a type-system one, accepted deliberately.
-    pub asked: &'static [&'static str],
     /// This routine refuses a statement the driver JOINED into another.
     ///
     /// See [`Self::no_join`](Routine::no_join) for why a precondition is a row
@@ -2697,6 +2657,12 @@ pub struct Routine<B: Backend> {
     /// routine's own declaration, stated as `#[routine(canon = rmsnorm)]`.
     /// `None` is tier-2 — the symbol is reached only by name.
     pub canon: Option<&'static str>,
+    /// The dtype point this row is instantiated at, by the generic idents'
+    /// lowercase names (`["bf16"]`). Empty for a non-generic routine. The
+    /// NAME no longer carries it; when a routine grows a second point, the
+    /// route selects among same-named rows by matching this against the
+    /// statement's value dtypes.
+    pub point: &'static [&'static str],
 }
 
 /// The first path segment after the crate root, out of a `module_path!()`.
@@ -2868,6 +2834,13 @@ impl<B: Backend> Routine<B> {
         self
     }
 
+    /// This row's dtype instantiation point. See [`Routine::point`].
+    #[must_use]
+    pub const fn point(mut self, point: &'static [&'static str]) -> Self {
+        self.point = point;
+        self
+    }
+
     /// This routine, with its source column STATED rather than derived.
     ///
     /// # For rows that have no signature to derive one from
@@ -2890,15 +2863,6 @@ impl<B: Backend> Routine<B> {
         self
     }
 
-    /// This routine, with the facts its body asks for listed.
-    ///
-    /// `#[routine]` is the only caller: the list is scanned off the body's
-    /// turbofishes and arrives on the same marker the derived column does.
-    #[must_use]
-    pub const fn asking(mut self, asked: &'static [&'static str]) -> Self {
-        self.asked = asked;
-        self
-    }
 }
 
 /// One routine's row with its backend forgotten.
@@ -3045,10 +3009,10 @@ macro_rules! untraced {
             depth_prefix_plan: false,
             derived: &[],
             internal: false,
-            asked: &[],
             no_join: false,
             driver: false,
             canon: None,
+            point: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3081,10 +3045,10 @@ macro_rules! untraced {
             depth_prefix_plan: false,
             derived: &[],
             internal: false,
-            asked: &[],
             no_join: false,
             driver: false,
             canon: None,
+            point: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3135,10 +3099,10 @@ macro_rules! routine {
             depth_prefix_plan: false,
             derived: &[],
             internal: false,
-            asked: &[],
             no_join: false,
             driver: false,
             canon: None,
+            point: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3163,10 +3127,10 @@ macro_rules! routine {
             depth_prefix_plan: false,
             derived: &[],
             internal: false,
-            asked: &[],
             no_join: false,
             driver: false,
             canon: None,
+            point: &[],
         }
         $(.$fact($($value)?))*
     }};
@@ -3192,10 +3156,10 @@ macro_rules! routine {
             depth_prefix_plan: false,
             derived: &[],
             internal: false,
-            asked: &[],
             no_join: false,
             driver: false,
             canon: None,
+            point: &[],
         }
         $(.$fact($($value)?))*
     }};

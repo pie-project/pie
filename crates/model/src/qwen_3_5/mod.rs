@@ -27,7 +27,7 @@
 //! [`NormVariant::Gemma`] — `xhat * (1 + w)` rather than `xhat * w` — and
 //! every one of those statements cited the SAME source: the legacy
 //! prototype's `qwen3_5_forward.cpp`, which launches
-//! `kernels::norm::rmsnorm_gemma_bf16`, and its mixture sibling's
+//! `kernels::norm::rmsnorm_gemma`, and its mixture sibling's
 //! `uses_gemma_rmsnorm`. One C++ file, read once, repeated at fourteen
 //! sites, and never compared to a checkpoint.
 //!
@@ -470,7 +470,13 @@ impl Variant for Qwen35 {
                 bind,
             ));
         }
-        Ok(project::trace(&self.shape, class, load))
+        Ok(project::trace(
+            &self.shape,
+            class,
+            load,
+            self.norm_eps,
+            self.rope_theta,
+        ))
     }
 
     /// ChatML, stated rather than fallen through to.

@@ -2493,10 +2493,16 @@ pub(crate) fn step_impl(
     let arena_ptr = state.fire_arrays.arena(&alloc, arena_bytes)?;
     let exec_frame = Frame { arena: arena_ptr, arena_bytes };
 
+    // The plan's RUNTIME values: streams and objects the driver answers
+    // itself (`bind::views`). Excluded from the seam-pin walk below — a
+    // stream the driver stages needs no pin — and mapped for the resolver.
+    let runtime_vals = crate::bind::views::runtime_values(&plan.runtime);
     let mut named_widths: std::collections::BTreeMap<ValueId, u32> =
         std::collections::BTreeMap::new();
     for a in &lowered.args {
-        if let Arg::Named { value, width, .. } = a {
+        if let Arg::Named { value, width, .. } = a
+            && !runtime_vals.contains(value)
+        {
             // Max, not last: several values can share one id (they alias in
             // place), so the buffer must fit the widest read.
             let slot = named_widths.entry(*value).or_insert(*width);
@@ -2505,12 +2511,35 @@ pub(crate) fn step_impl(
     }
     for i in 0..lowered.launches.len() {
         for a in &dplan.spec(i).outs {
-            if let Arg::Named { value, width, .. } = a {
+            if let Arg::Named { value, width, .. } = a
+                && !runtime_vals.contains(value)
+            {
                 let slot = named_widths.entry(*value).or_insert(*width);
                 *slot = (*slot).max(*width);
             }
         }
     }
+    // The `"request_of_token"` stream, staged only when the text names it:
+    // row r of request i for every r in `qo_indptr[i]..qo_indptr[i+1]`,
+    // derived here because no wire array carries it.
+    let d_req_of: *const u32 = if plan.runtime.iter().any(|b| b.name == "request_of_token") {
+        let mut req_of: Vec<u32> = vec![0; rows];
+        for (i, w) in qo_indptr.windows(2).enumerate() {
+            for r in w[0]..w[1] {
+                if let Some(slot) = req_of.get_mut(r as usize) {
+                    *slot = u32::try_from(i).unwrap_or(0);
+                }
+            }
+        }
+        state.fire_arrays.upload_u32(
+            alloc,
+            crate::fire::scratch::slot::REQ_OF_TOKEN,
+            &req_of,
+            stream.as_ref(),
+        )?
+    } else {
+        core::ptr::null()
+    };
     let SeamPins { d_scores, d_folded, d_score_indptr, d_mask, d_mask_indptr, d_attn_out } =
         publish_seam_pins(
             &mut state.fire_arrays,
@@ -2563,6 +2592,29 @@ pub(crate) fn step_impl(
         /// two entries here point at two different plans. A resolver keyed on
         /// the word could not express that: both spell `fa2.prefill`.
         raised: std::collections::BTreeMap<ValueId, *mut std::ffi::c_void>,
+        /// The plan's runtime table, value -> (vocabulary name, layer): which
+        /// trace values the DRIVER answers -- the objects the per-fire arena
+        /// holds and the streams it staged. Checked FIRST on both channels,
+        /// because a runtime value is never a seam pin and never a prep.
+        runtime: std::collections::BTreeMap<ValueId, (&'a str, Option<u32>)>,
+        /// The fire's view arena (`bind::views`), built beside `AttnCtx`.
+        views: &'a crate::bind::views::FireViews,
+        /// The peel TAIL's arena, when the fire split: the tail serves other
+        /// requests, so its KV views carry the tail's own CSRs.
+        tail_views: Option<&'a crate::bind::views::FireViews>,
+        /// Whether the launch being bound sits in the tail -- told by
+        /// `Resolver::region` before each bind, `AttnRegions::of`'s rule.
+        in_tail: bool,
+    }
+    impl LiveResolver<'_> {
+        /// The arena the CURRENT launch resolves against.
+        fn arena(&self) -> &crate::bind::views::FireViews {
+            if self.in_tail {
+                self.tail_views.unwrap_or(self.views)
+            } else {
+                self.views
+            }
+        }
     }
     impl Resolver for LiveResolver<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -2575,22 +2627,33 @@ pub(crate) fn step_impl(
             hit
         }
         fn named(&mut self, value: ValueId) -> Option<*mut std::ffi::c_void> {
+            // A runtime STREAM the driver staged answers first; a seam value
+            // the fire pinned answers after. The two sets are disjoint, so
+            // the order is cost, not correctness.
+            if let Some((name, _layer)) = self.runtime.get(&value) {
+                return self.arena().streams.named(name);
+            }
             self.named.get(&value).map(|b| b.as_ptr())
         }
         fn raised(&mut self, value: ValueId, key: &str) -> Option<*const std::ffi::c_void> {
+            // THE EDGE, RESOLVED BY NAME AND NOT BY GUESS: a prep's value
+            // points at the schedule it was raised on, prefill and decode
+            // both, so the match is an equality rather than an inference.
+            if let Some(p) = self.raised.get(&value) {
+                return Some(p.cast_const());
+            }
+            // The RESIDENT half of the channel: a runtime object out of the
+            // closed vocabulary, answered from the per-fire view arena. The
+            // key rides along for the refusal's sake; the table's name is
+            // the same word.
+            let (name, layer) = self.runtime.get(&value).copied()?;
             let _ = key;
-            // THE EDGE, RESOLVED BY NAME AND NOT BY GUESS. `bind::attn_plan`
-            // recovers which plan a statement wants from a family string and,
-            // for decode, from the window on its `LaunchSpec`; a statement
-            // that NAMES its raise needs neither. This is that half.
-            //
-            // Decode is not answered here and the omission is deliberate: two
-            // decode schedules may stand at once and which one a statement
-            // executes is still `attn_plan`'s guess. Stage 7 of
-            // `.wiki/designs/design-struct.md` is where that guess dies, and
-            // answering it now with either pointer would be the guess again,
-            // one layer down and harder to see.
-            self.raised.get(&value).copied().map(<*mut std::ffi::c_void>::cast_const)
+            self.arena().raised(name, layer, value)
+        }
+        fn region(&mut self, rows: &std::ops::Range<u32>) {
+            // `AttnRegions::of`'s rule, applied at bind: row zero starts the
+            // fire's own region, anything later is the tail's if one stands.
+            self.in_tail = rows.start != 0 && self.tail_views.is_some();
         }
     }
 
@@ -2838,6 +2901,41 @@ pub(crate) fn step_impl(
     } else {
         None
     };
+    // ── The per-fire VIEW ARENA (`bind::views`): every runtime object and
+    // stream this driver answers, built once from the contexts above. Copies,
+    // not borrows -- the arena holds no reference into `state` -- and built
+    // AFTER `tail_ctx` so the tail gets its own KV views over its own CSRs.
+    let streams = crate::bind::views::FireStreams {
+        positions: d_pos.cast_mut().cast(),
+        token_ids: d_ids.cast_mut().cast(),
+        request_of_token: d_req_of.cast_mut().cast(),
+        qo_indptr: d_qo.cast_mut().cast(),
+        row_valid: d_valid,
+        sampling_indices: d_sampled.cast_mut().cast(),
+        first_token: attn.first_token,
+        qo_indptr_host: attn.qo_indptr_h,
+        kv_page_indptr_host: attn.kv_page_indptr_h,
+        prefill_plan_cache: attn.prefill_plan,
+    };
+    let mut views = crate::bind::views::FireViews::build(Some(&attn), gdn_ctx.as_ref(), streams);
+    views.fill_expert_weights(lowered, dplan, |name| model.weight(name));
+    let tail_views = tail_ctx.as_ref().map(|t| {
+        // The fire's streams, with the region-scoped ones swapped for the
+        // tail's own -- the same split `AttnRegions` hands the arms.
+        let mut ts = streams;
+        ts.qo_indptr = t.qo_indptr_d.cast_mut().cast();
+        ts.row_valid = t.row_valid_d.cast_mut().cast();
+        ts.first_token = t.first_token;
+        ts.qo_indptr_host = t.qo_indptr_h;
+        ts.kv_page_indptr_host = t.kv_page_indptr_h;
+        ts.prefill_plan_cache = t.prefill_plan;
+        let mut tv = crate::bind::views::FireViews::build(Some(t), gdn_ctx.as_ref(), ts);
+        tv.fill_expert_weights(lowered, dplan, |name| model.weight(name));
+        tv
+    });
+    let runtime_of: std::collections::BTreeMap<ValueId, (&str, Option<u32>)> =
+        plan.runtime.iter().map(|b| (b.value, (b.name.as_str(), b.layer))).collect();
+
     let named_bufs = &state.fire_arrays.named;
     // EVERY PREFILL PREP'S VALUE, AT THE SCHEDULE THIS FIRE RAISED. Decode is
     // deliberately absent: two decode schedules may stand at once and which a
@@ -2879,7 +2977,15 @@ pub(crate) fn step_impl(
             })
             .collect()
     };
-    let mut resolver = LiveResolver { model, named: named_bufs, raised };
+    let mut resolver = LiveResolver {
+        model,
+        named: named_bufs,
+        raised,
+        runtime: runtime_of,
+        views: &views,
+        tail_views: tail_views.as_ref(),
+        in_tail: false,
+    };
     // Which prepared state each rectangle gets.
     let regions = match tail_ctx.as_ref() {
         Some(tail) => AttnRegions::split(&attn, tail),

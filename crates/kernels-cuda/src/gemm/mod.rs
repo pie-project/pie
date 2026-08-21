@@ -1,12 +1,11 @@
 
-use kernels::keys;
 use kernels_macros::routine;
 use crate::jit::Ctx;
 use crate::jit::abi::bf16;
 use crate::jit::abi::Tensor;
 use kernels::Refusal;
 use kernels::raises::Struct;
-use kernels::routine::{Asks, Const, In, InOut, Out};
+use kernels::routine::{Const, In, InOut, Out};
 use crate::views::GemmGroups;
 
 use core::ffi::c_void;
@@ -23,7 +22,7 @@ pub mod lora;
 #[cfg(feature = "_cuda")]
 pub mod quant;
 
-#[routine]
+#[routine(canon = matmul)]
 pub fn act_x_wt_bf16(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
@@ -67,7 +66,7 @@ pub fn act_x_w(
     act_x_wt_bf16_beta(ctx, act, w, y, beta)
 }
 
-#[routine]
+#[routine(canon = "matmul.acc")]
 pub fn act_x_w_acc(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,

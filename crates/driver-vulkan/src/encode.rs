@@ -234,7 +234,9 @@ fn words(args: &[ArgValue]) -> Vec<u32> {
     let mut out = Vec::with_capacity(args.len() + 1);
     for a in args {
         match *a {
-            ArgValue::Buffer { .. } => {}
+            // A raised view is HOST data the body already read; it reaches
+            // no shader and packs no word.
+            ArgValue::Buffer { .. } | ArgValue::Raised(_) => {}
             ArgValue::I32(v) => out.push(v.cast_unsigned()),
             ArgValue::U32(v) => out.push(v),
             ArgValue::F32(v) => out.push(v.to_bits()),

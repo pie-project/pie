@@ -23,6 +23,7 @@
 pub mod facts;
 
 use self::facts::{KimiCudaFacts, KimiFacts};
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv, Wna16Ax};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
@@ -45,19 +46,20 @@ struct KimiLayerW {
 }
 
 impl KimiLayerW {
-    fn new(l: u32, f: &KimiFacts) -> Self {
+    fn new(l: u32, f: &KimiFacts, norm_eps: f32, repr: WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         let a = &f.attn;
         Self {
@@ -92,14 +94,49 @@ impl KimiLayerW {
 /// It used to `panic!` on anything but Decode. That was not a statement about
 /// this text — it was the absence of one, and it made every prefill a failed
 /// request.
-pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> ForwardPlan {
-    let family = format!("kimi.cuda.{}", class.suffix());
+pub fn kimi_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &KimiFacts,
+    cuda: &KimiCudaFacts,
+    class: FireClass,
+    norm_eps: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: MLA's latent cache is stated bf16 and
+    // nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
+    // The W4A16 expert packing's quantisation group — W2's, and the ONE
+    // number the wna16 statements read. The family's own value is 32:
+    // `contract.rs` builds the scale slabs at `GROUP = 32` and the
+    // committed contract golden pins `"group_size": 32` on every expert
+    // tensor — which is what `Wna16Ax::REPR` states. A W2 that is not
+    // per-group scaled has no wna16 leg to state, and the refusal is a
+    // monomorphization error, not a fire's.
+    let wna16_group = const {
+        match W2::REPR {
+            WeightRepr::Scaled { group, .. } => group,
+            _ => panic!("kimi's routed experts are WNA16; W2 must be a Scaled axis"),
+        }
+    };
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "kimi-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
-        let mut y = dsl::embedded_prologue(t, facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
 
         for l in 0..facts.layers {
-            let w = KimiLayerW::new(l, facts);
+            let w = KimiLayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             // The two latents, fused or not. The FUSED arm norms the
@@ -152,7 +189,12 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             }
 
             let logits = matmul(&m, &w.router);
-            let (experts, weights) = dsl::cuda::topk_sigmoid(&logits, facts.moe.top_k);
+            let (experts, weights) = dsl::cuda::topk_sigmoid(
+                &logits,
+                facts.moe.top_k,
+                facts.moe.norm_topk_prob,
+                facts.moe.routed_scaling,
+            );
 
             // WNA16: the kernel reads fp16, so the cast either side is a
             // real launch. Omitting it would make the text claim a
@@ -163,6 +205,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
                 &experts,
                 facts.moe.moe_intermediate,
                 &format!("layer.{l}.experts"),
+                wna16_group,
             );
             let act = dsl::cuda::swiglu_pair(&gate, &up, facts.moe.moe_intermediate);
             let act_fp16 = dsl::cuda::bf16_to_fp16(&act);
@@ -171,6 +214,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
                 &experts,
                 facts.hidden,
                 &format!("layer.{l}.experts"),
+                wna16_group,
             );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
@@ -186,6 +230,33 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
+        dsl::logits_epilogue(
+            t,
+            &y,
+            NormVariant::Plain,
+            false,
+            facts.vocab,
+            None,
+            norm_eps,
+        );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&KimiFacts, &KimiCudaFacts, FireClass, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. ONE
+/// row, and its expert axis is WNA16: the checkpoint ships the routed bank
+/// both as bf16 `.weight` and as W4A16 `.weight_packed` (two ENCODINGS of
+/// one model — `project.rs`'s manifest deliberately names neither), but
+/// this text states exactly one routed leg, the wna16 GEMVs, so one point
+/// is what ships. The coverage test (`model/tests/catalogue_coverage.rs`)
+/// traces each row at both fire classes; `TraceBuilder::finish`'s
+/// `check_plan` then refuses a row whose statements reach a routine point
+/// that does not exist.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    (
+        "kimi-bf16-wna16-kv-bf16",
+        kimi_cuda::<Bf16Ax, Wna16Ax, Bf16Ax, NativeKv>,
+    ),
+];

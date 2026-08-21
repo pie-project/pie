@@ -26,7 +26,8 @@
 pub mod facts;
 
 use self::facts::Gemma2Facts;
-use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
+use model_dsl::{self as dsl, MatW, NormW, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G2LayerW {
@@ -44,19 +45,20 @@ struct G2LayerW {
 }
 
 impl G2LayerW {
-    fn new(l: u32, f: &Gemma2Facts) -> Self {
+    fn new(l: u32, f: &Gemma2Facts, norm_eps: f32, repr: model_dsl::WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Gemma,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         Self {
             attn_norm: n("attn_norm"),
@@ -75,7 +77,21 @@ impl G2LayerW {
 }
 
 /// gemma-2's CUDA text for one fire class.
-pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
+pub fn gemma2_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &Gemma2Facts,
+    class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: `write_kv_to_pages` states native bf16
+    // pages and nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
     // DECODE AND PREFILL, and the difference is one call.
     //
     // This family served Decode only and PANICKED on anything else — not
@@ -87,9 +103,16 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
     //
     // The MTP passes stay unstated, because those genuinely are different
     // passes and not this one under another name.
-    let family = format!("gemma_2.cuda.{}", class.suffix());
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "gemma_2-{}-{}.cuda.{}",
+        W1::NAME,
+        K::NAME,
+        class.suffix()
+    );
     dsl::trace_named(&family, |t| {
-        let embedded = dsl::embedded_prologue(t, facts.hidden);
+        let embedded = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
         // `sqrt(hidden)` on the embedding — a launch, not a fold.
         let mut y =
             dsl::cuda::scalar_mul(&embedded, "embed_scale", Some((facts.hidden as f32).sqrt()));
@@ -101,7 +124,7 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             // answers from the alternation RULE now; it used to index a
             // per-layer vector that spelled the same rule out.
             let window_left = facts.window_left_at(l);
-            let w = G2LayerW::new(l, facts);
+            let w = G2LayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             let q = matmul(&x, &w.q_proj);
@@ -114,15 +137,40 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             // The pre-attention query scale is its OWN launch, and every
             // gemma-2 applies it.
             let q = dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"), None);
-            let (q, k) = dsl::cuda::rope(&q, &k, facts.attn.heads, facts.attn.kv_heads, facts.attn.head_dim);
+            // The row's base; gemma-2 states no pairing, and stating
+            // nothing means NeoX (`interleaved: false`).
+            let (q, k) = dsl::cuda::rope(
+                &q,
+                &k,
+                facts.attn.heads,
+                facts.attn.kv_heads,
+                facts.attn.head_dim,
+                rope_theta,
+                false,
+            );
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
             // The attention logit softcap rides HERE, as a dispatch
             // parameter — see the module doc on why it is not a
             // statement of its own.
-            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim, crate::gemma_2::project::ATTN_LOGIT_SOFTCAP, 0.0)
-                .expect("a plain attention statement produces its value");
+            let o = dsl::cuda::attention_for(
+                class,
+                &q,
+                &kv,
+                window_left,
+                facts.attn.head_dim,
+                // The cap the row states, or none — the deployment's own
+                // conditional (project.rs's `attn_logit_softcap`).
+                if facts.attn.attn_logit_softcap {
+                    crate::gemma_2::project::ATTN_LOGIT_SOFTCAP
+                } else {
+                    0.0
+                },
+                0.0,
+                facts.attn.kv_heads,
+            )
+            .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             // The POST norm, then an explicit add — gemma's pair.
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
@@ -143,7 +191,22 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             NormVariant::Gemma,
             facts.tied_embeddings,
             facts.vocab,
-            facts.final_logit_softcap,
+            facts
+                .final_logit_softcap
+                .then_some(crate::gemma_2::project::FINAL_LOGIT_SOFTCAP),
+            norm_eps,
         );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&Gemma2Facts, FireClass, f32, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    ("gemma_2-bf16-kv-bf16", gemma2_cuda::<Bf16Ax, Bf16Ax, NativeKv>),
+];

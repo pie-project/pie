@@ -690,6 +690,10 @@ pub fn resolve<'a, R: Resolve>(
             }
             Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
         }
+        // A raised operand never RESOLVES: the routine binder builds it into
+        // a host view (`lowering::views`) before any handle is minted for
+        // it, so an `Asked::Operand` carrying one is a statement and a
+        // signature that disagree, and the refusal names the word.
         Arg::Raised { key, .. } => Err(Unbindable::NotOnThisPlane { key: key.clone() }),
         Arg::Named { value, .. } => {
             let held = resolver

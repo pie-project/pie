@@ -2,10 +2,9 @@
 
 use crate::routine::{
     Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
-    keys,
 };
 use kernels::raises::Struct;
-use crate::views::{AttnMask, KvCache};
+use crate::views::{AttnMask, KvCache, AttnSplit};
 use kernels::BindMut;
 use kernels::routine::Refusal;
 use kernels_macros::routine;
@@ -120,7 +119,7 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
     ])
 }
 
-#[routine]
+#[routine(canon = split_qkv)]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -150,7 +149,7 @@ pub fn split_qkv_bf16(
     )
 }
 
-#[routine]
+#[routine(canon = sigmoid_gate_mul)]
 pub fn gate(
     ctx: &Ctx<'_>,
     attn: InOut<Tensor<bf16>>,
@@ -170,7 +169,7 @@ pub fn gate(
     )
 }
 
-#[routine]
+#[routine(canon = split_q_gate)]
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
     qg: In<Tensor<bf16>>,
@@ -238,7 +237,7 @@ pub fn kv_append(
     )
 }
 
-#[routine]
+#[routine(canon = kv_append)]
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
     k_new: In<Tensor<bf16>>,
@@ -312,6 +311,7 @@ pub fn sdpa_paged_decode(
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
     rows: Const<i32>,
+    split: In<Struct<AttnSplit>>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -338,9 +338,13 @@ pub fn sdpa_paged_decode(
     let attention_mask = maskv.mask;
     let attention_mask_stride = maskv.stride;
     let attention_mask_enabled = maskv.enabled;
-    let partials = ctx.ask::<Tensor<f32>, keys::AttnPartials>()?;
+    if split.ptr.is_null() {
+        return Err(Refusal::Null { what: "the split policy this statement names" });
+    }
+    let sv = unsafe { &*split.ptr };
+    let partials = sv.partials;
     let rows = *rows;
-    let splits = ctx.ask::<i32, keys::AttnSplits>()?;
+    let splits = sv.splits;
     let at = head_point(*head_dim, &[64, 128, 256, 512])?;
     if splits <= 1 {
         return ctx.fire(
@@ -516,6 +520,7 @@ pub fn sdpa_paged_decode_sink(
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
     rows: Const<i32>,
+    split: In<Struct<AttnSplit>>,
 ) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -542,9 +547,13 @@ pub fn sdpa_paged_decode_sink(
     let attention_mask = maskv.mask;
     let attention_mask_stride = maskv.stride;
     let attention_mask_enabled = maskv.enabled;
-    let partials = ctx.ask::<Tensor<f32>, keys::AttnPartials>()?;
+    if split.ptr.is_null() {
+        return Err(Refusal::Null { what: "the split policy this statement names" });
+    }
+    let sv = unsafe { &*split.ptr };
+    let partials = sv.partials;
     let rows = *rows;
-    let splits = ctx.ask::<i32, keys::AttnSplits>()?;
+    let splits = sv.splits;
     head_point(*head_dim, &[64])?;
     if splits > 1 {
         return flash_decode(

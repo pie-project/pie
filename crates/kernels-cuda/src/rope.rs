@@ -2,14 +2,15 @@
 #![allow(clippy::too_many_arguments)]
 
 use kernels::{Bind, Fire};
-use kernels::routine::{Asks, Const, In, InOut, Out};
+use kernels::routine::{Const, In, InOut, Out};
 use kernels_macros::routine;
 use crate::jit::Abi;
 use crate::jit::abi::{MaybeConst, bf16, f16};
 use crate::jit::abi::Tensor;
 use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
-use kernels::keys;
+use kernels::raises::Struct;
+use crate::views::KvCache;
 
 use core::ptr::NonNull;
 
@@ -129,7 +130,7 @@ pub fn rope_standard_table(
     ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::standard_table<::pie::i32>").apply(Launch::per_row(table.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[positions.arg(), table.arg(), head_dim.arg(), theta.arg()])
 }
 
-#[routine]
+#[routine(canon = rope)]
 pub fn rope_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -191,7 +192,6 @@ pub fn rope_write_kv_bf16(
     theta: Const<f32>,
     qo_indptr: In<Tensor<i32>>,
     row_valid: In<Tensor<i32>>,
-    num_requests: Const<i32>,
     positions: In<Tensor<i32>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
@@ -204,12 +204,13 @@ pub fn rope_write_kv_bf16(
     let num_kv_heads = *num_kv_heads;
     let head_dim = *head_dim;
     let theta = *theta;
-    let hnd_layout = kvc.layout as bool;
+    let hnd_layout = kvc.layout != 0;
 
     let k_pages = kvc.keys as *mut bf16;
+    // The request count is the CSR operand's own row count.
+    let num_requests = qo_indptr.rows;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let row_valid = row_valid.ptr as *const u8;
-    let num_requests = *num_requests;
     let positions = positions.ptr;
     let v_pages = kvc.values as *mut bf16;
     let kv_page_indices = kvc.page_indices as *const u32;
@@ -292,13 +293,15 @@ pub fn qk_rmsnorm_rope_bf16_devwin(
     theta: Const<f32>,
     eps: Const<f32>,
     n_max: Const<i32>,
-    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+    win_start: Const<i32>,
+    win_len: Const<i32>) -> Result<(), Refusal> {
 
     let head_dim = *head_dim;
     let theta = *theta;
     let eps = *eps;
 
-    let win = ctx.ask::<*mut u32, keys::PeelWindow>()?;
+    let win = crate::stage_peel_window(ctx, "rope::qk_devwin", *win_start, *win_len)?;
     let n_max = *n_max;
     let positions = positions.ptr;
     let (num_q_heads, num_kv_heads) =
@@ -402,7 +405,11 @@ pub fn qk_rmsnorm_rope_bf16_rounded(
 pub fn q_rmsnorm_rope_bf16_rounded(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
-    q_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    q_weight: Const<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    theta: Const<f32>,
+    eps: Const<f32>,
+    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
 
     qk_rmsnorm_rope_bf16_rounded(
         ctx,
@@ -414,6 +421,10 @@ pub fn q_rmsnorm_rope_bf16_rounded(
         },
         q_weight,
         Const { v: core::ptr::null() },
+        head_dim,
+        theta,
+        eps,
+        positions,
     )
 }
 
@@ -559,7 +570,7 @@ where
             ])
 }
 
-#[routine]
+#[routine(canon = "rope.partial")]
 pub fn rope_partial_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -702,7 +713,16 @@ pub fn rope_partial_last_bf16(
 #[routine]
 pub fn rope_partial_last_q_bf16(
     ctx: &Ctx<'_>,
-    q: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
+    q: InOut<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    rotary_dim: Const<i32>,
+    theta: Const<f32>,
+    interleaved: Const<bool>,
+    yarn_factor: Const<f32>,
+    yarn_beta_fast: Const<f32>,
+    yarn_beta_slow: Const<f32>,
+    yarn_original_max_position: Const<i32>,
+    positions: In<Tensor<i32>>) -> Result<(), Refusal> {
 
     rope_partial_last_bf16(
         ctx,
@@ -712,6 +732,15 @@ pub fn rope_partial_last_q_bf16(
             rows: q.rows,
             width: 0,
         },
+        head_dim,
+        rotary_dim,
+        theta,
+        interleaved,
+        yarn_factor,
+        yarn_beta_fast,
+        yarn_beta_slow,
+        yarn_original_max_position,
+        positions,
     )
 }
 

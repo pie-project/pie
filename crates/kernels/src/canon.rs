@@ -71,13 +71,29 @@ pub const ROLES: &[&str] = &[
     "gated_delta",
 ];
 
-/// Whether `name` is a role this registry closes over.
+/// Whether `claim` names a role this registry closes over.
+///
+/// A claim may carry an AXIS POINT after the role — `"rmsnorm.gemma"`,
+/// `"rope.partial"` — and the role is the part before the first `.`: the
+/// axis names a variant of the role, and closing over every point would put
+/// each backend's variant spellings in the floor's list.
 #[must_use]
-pub const fn is_role(name: &str) -> bool {
+pub const fn is_role(claim: &str) -> bool {
+    // The role prefix, by byte scan (const context).
+    let bytes = claim.as_bytes();
+    let mut role_len = bytes.len();
+    let mut k = 0;
+    while k < bytes.len() {
+        if bytes[k] == b'.' {
+            role_len = k;
+            break;
+        }
+        k += 1;
+    }
     let mut i = 0;
     while i < ROLES.len() {
-        let (a, b) = (ROLES[i].as_bytes(), name.as_bytes());
-        if a.len() == b.len() {
+        let (a, b) = (ROLES[i].as_bytes(), claim.as_bytes());
+        if a.len() == role_len {
             let mut j = 0;
             let mut eq = true;
             while j < a.len() {

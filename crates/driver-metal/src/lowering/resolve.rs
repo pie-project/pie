@@ -111,6 +111,13 @@ pub struct Store<'a> {
     slabs: Option<&'a dyn Fn(u16, &'static str) -> Option<Slice>>,
     /// The fire's own tables, when this store has a fire behind it.
     fire: Option<&'a dyn Fn(crate::lowering::executor::FireTable) -> Option<Slice>>,
+    /// The plan's runtime streams, value id → fire table, when this store
+    /// serves a lowered plan. `Resolver::named` consults it FIRST: a text's
+    /// `positions` is a NAMED value like a seam's, and this is what tells
+    /// the two apart. Derived beside the lowering
+    /// ([`crate::lowering::cached::Planned`]) because the plan itself is
+    /// dropped once lowered.
+    runtime: Option<&'a crate::lowering::runtime::Streams>,
     /// The pool's geometry, when this store has a pool behind it.
     pool: Option<crate::layout::kv::Shape>,
     /// Every traced name this store could not answer, in ask order.
@@ -137,6 +144,7 @@ impl<'a> Store<'a> {
             slabs: None,
             fire: None,
             pool: None,
+            runtime: None,
             missed: Vec::new(),
         }
     }
@@ -176,6 +184,14 @@ impl<'a> Store<'a> {
         tables: &'a dyn Fn(crate::lowering::executor::FireTable) -> Option<Slice>,
     ) -> Self {
         self.fire = Some(tables);
+        self
+    }
+
+    /// The same store, answering the plan's runtime STREAMS through the
+    /// fire's tables.
+    #[must_use]
+    pub fn with_runtime(mut self, streams: &'a crate::lowering::runtime::Streams) -> Self {
+        self.runtime = Some(streams);
         self
     }
 
@@ -278,6 +294,14 @@ impl Resolver for Store<'_> {
     }
 
     fn named(&mut self, value: ValueId) -> Option<Slice> {
+        // A runtime STREAM binds the fire's own staged table; everything
+        // else named is a seam value and keeps its slice. The two id
+        // populations are disjoint by construction — the trace mints
+        // runtime values, the seam publishes its own — so there is no
+        // precedence to get wrong, only a lookup that misses.
+        if let Some(which) = self.runtime.and_then(|r| r.table_of(value)) {
+            return self.fire.and_then(|tables| tables(which));
+        }
         self.named.get(&value).copied()
     }
 

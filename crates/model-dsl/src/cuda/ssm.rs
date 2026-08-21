@@ -74,60 +74,90 @@ builder! {
 }
 
 
-builder! {
-    /// `kernels::ssm::nemotron_mamba_ssm_batched_bf16`: the selective scan.
-    pub fn nemotron_mamba_ssm(
-        conv_out: &Val,
-        dt: &Val,
-        dt_raw: &Val,
-        a: &Val,
-        d: &Val,
-        dt_bias: &Val,
-        da: &Val,
-        l: u32,
-        intermediate: u32,
-        num_heads: u32,
-        head_dim: u32,
-        state_size: u32,
-        n_groups: u32,
-        conv_dim: u32,
-    ) -> Val {
-        symbol: "ssm::nemotron_mamba_ssm_batched_bf16",
-        on: conv_out,
-        layer: Some(l),
-        state: Some(StateRef {
+/// `kernels::ssm::nemotron_mamba_ssm_batched_bf16`: the selective scan.
+///
+/// `[num_heads, head_dim, state_size, n_groups, conv_dim, r, rows]`, in the
+/// order the routine's marks declare: five checkpoint numbers, then the
+/// request and row counts the fire decides (spliced extents). The recurrent
+/// view and the qo CSR are the operands after `da`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn nemotron_mamba_ssm(
+    conv_out: &Val,
+    dt: &Val,
+    dt_raw: &Val,
+    a: &Val,
+    d: &Val,
+    dt_bias: &Val,
+    da: &Val,
+    l: u32,
+    intermediate: u32,
+    num_heads: u32,
+    head_dim: u32,
+    state_size: u32,
+    n_groups: u32,
+    conv_dim: u32,
+) -> Val {
+    let rsv = rt_object(&conv_out.t, "recurrent_state", Some(l));
+    let qo_indptr = rt_requests(&conv_out.t, "qo_indptr");
+    record_with_extents(
+        &conv_out.t,
+        Some(l),
+        "ssm::nemotron_mamba_ssm_batched_bf16",
+        vec![],
+        Some(StateRef {
             store: StateStore::RecurrentState,
             layer: l,
         }),
-        // `[num_heads, head_dim, state_size, n_groups, conv_dim]`, in the
-        // order the routine's marks declare. Five numbers that reached it as
-        // `keys::Gdn*` and are the checkpoint's.
-        params: [num_heads, head_dim, state_size, n_groups, conv_dim],
-        inputs: [conv_out, dt, dt_raw, a, d, dt_bias, da],
-        out: [Dim::Tokens, Dim::Const(intermediate)] as BF16,
-        made: "the scan produces its value",
-    }
+        vec![num_heads, head_dim, state_size, n_groups, conv_dim],
+        vec![],
+        vec![
+            conv_out.id,
+            dt.id,
+            dt_raw.id,
+            a.id,
+            d.id,
+            dt_bias.id,
+            da.id,
+            rsv,
+            qo_indptr,
+        ],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+            DType::BF16,
+        )),
+    )
+    .expect("the scan produces its value")
+}
 
-
-    /// `kernels::ssm::zamba_rmsnorm_gated_bf16`.
+builder! {
+    /// `kernels::ssm::zamba_rmsnorm_gated`.
     ///
-    /// `n_groups` is the routine's one `Const`: a grouped RMS norm reduces
-    /// within a group, so the count is the geometry and not a fact of the
-    /// fire. Stating it is what `check_plan`'s params rule counts.
-    pub fn zamba_rmsnorm_gated(x: &Val, gate: &Val, weight: &str, hidden: u32, n_groups: u32) -> Val {
-        symbol: "ssm::zamba_rmsnorm_gated_bf16",
+    /// `[n_groups, eps]` is the run: a grouped RMS norm reduces within a
+    /// group, so the count is the geometry and not a fact of the fire, and
+    /// the epsilon is the row's. Stating both is what `check_plan`'s params
+    /// rule counts.
+    pub fn zamba_rmsnorm_gated(
+        x: &Val,
+        gate: &Val,
+        weight: &str,
+        hidden: u32,
+        n_groups: u32,
+        eps: f32,
+    ) -> Val {
+        symbol: "ssm::zamba_rmsnorm_gated",
         on: x,
         weights: [weight],
-        params: [n_groups],
+        params: [n_groups, eps.to_bits()],
         inputs: [x, gate],
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the norm produces its value",
     }
 
 
-    /// `kernels::mlp::relu2_bf16`: `relu(x)²`, nemotron_h's MLP activation.
+    /// `kernels::mlp::relu2`: `relu(x)²`, nemotron_h's MLP activation.
     pub fn relu2(x: &Val, width: u32) -> Val {
-        symbol: "mlp::relu2_bf16",
+        symbol: "mlp::relu2",
         on: x,
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(width)] as BF16,
@@ -137,7 +167,7 @@ builder! {
 
 
 builder! {
-    /// `kernels::ssm::kda_gate_beta_bf16`.
+    /// `kernels::ssm::kda_gate_beta`.
     pub fn kda_gate_beta(
         raw_g: &Val,
         raw_beta: &Val,
@@ -146,7 +176,7 @@ builder! {
         heads: u32,
         head_dim: u32,
     ) -> (Val, Val) {
-        symbol: "ssm::kda_gate_beta_bf16",
+        symbol: "ssm::kda_gate_beta",
         on: raw_g,
         weights: [a_log, dt_bias],
         // params[0] = head_dim; the shape only carries heads * head_dim.
@@ -161,60 +191,80 @@ builder! {
 }
 
 
+/// `kernels::ssm::kda_recurrent_step_batched`.
+/// `params = [heads, head_dim]` — the request count is the `[Requests, H, D]`
+/// result's own row count. The recurrent view is the operand after `beta`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn kda_recurrent_step(
+    q: &Val,
+    k: &Val,
+    v: &Val,
+    gate: &Val,
+    beta: &Val,
+    l: u32,
+    heads: u32,
+    head_dim: u32,
+) -> Val {
+    let rsv = rt_object(&q.t, "recurrent_state", Some(l));
+    record_with_extents(
+        &q.t,
+        Some(l),
+        "ssm::kda_recurrent_step_batched",
+        vec![],
+        Some(StateRef {
+            store: StateStore::RecurrentState,
+            layer: l,
+        }),
+        vec![heads, head_dim],
+        vec![],
+        vec![q.id, k.id, v.id, gate.id, beta.id, rsv],
+        Some((
+            Shape(vec![Dim::Requests, Dim::Const(heads), Dim::Const(head_dim)]),
+            DType::F32,
+        )),
+    )
+    .expect("the recurrence produces its value")
+}
+
+/// `kernels::ssm::kda_prefill_batched`: [`kda_recurrent_step`]'s run and
+/// operands, plus the qo CSR the prefill walks.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn kda_prefill(
+    q: &Val,
+    k: &Val,
+    v: &Val,
+    gate: &Val,
+    beta: &Val,
+    l: u32,
+    heads: u32,
+    head_dim: u32,
+) -> Val {
+    let rsv = rt_object(&q.t, "recurrent_state", Some(l));
+    let qo_indptr = rt_requests(&q.t, "qo_indptr");
+    record_with_extents(
+        &q.t,
+        Some(l),
+        "ssm::kda_prefill_batched",
+        vec![],
+        Some(StateRef {
+            store: StateStore::RecurrentState,
+            layer: l,
+        }),
+        vec![heads, head_dim],
+        vec![],
+        vec![q.id, k.id, v.id, gate.id, beta.id, rsv, qo_indptr],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
+            DType::F32,
+        )),
+    )
+    .expect("the recurrence produces its value")
+}
+
 builder! {
-    /// `kernels::ssm::kda_recurrent_step_batched`.
-    pub fn kda_recurrent_step(
-        q: &Val,
-        k: &Val,
-        v: &Val,
-        gate: &Val,
-        beta: &Val,
-        l: u32,
-        heads: u32,
-        head_dim: u32,
-    ) -> Val {
-        symbol: "ssm::kda_recurrent_step_batched",
-        on: q,
-        layer: Some(l),
-        state: Some(StateRef {
-            store: StateStore::RecurrentState,
-            layer: l,
-        }),
-        // params[0] = heads, params[1] = head_dim; grid and state stride use this order.
-        params: [heads, head_dim],
-        inputs: [q, k, v, gate, beta],
-        out: [Dim::Requests, Dim::Const(heads), Dim::Const(head_dim)] as F32,
-        made: "the recurrence produces its value",
-    }
-
-
-    /// `kernels::ssm::kda_prefill_batched`.
-    pub fn kda_prefill(
-        q: &Val,
-        k: &Val,
-        v: &Val,
-        gate: &Val,
-        beta: &Val,
-        l: u32,
-        heads: u32,
-        head_dim: u32,
-    ) -> Val {
-        symbol: "ssm::kda_prefill_batched",
-        on: q,
-        layer: Some(l),
-        state: Some(StateRef {
-            store: StateStore::RecurrentState,
-            layer: l,
-        }),
-        // params[0] = heads, params[1] = head_dim; grid and state stride use this order.
-        params: [heads, head_dim],
-        inputs: [q, k, v, gate, beta],
-        out: [Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)] as F32,
-        made: "the recurrence produces its value",
-    }
-
-
-    /// `kernels::ssm::kda_o_norm_gated_bf16`: the output norm and gate.
+    /// `kernels::ssm::kda_o_norm_gated`: the output norm and gate.
     pub fn kda_o_norm_gated(
         x: &Val,
         gate: &Val,
@@ -224,7 +274,7 @@ builder! {
         head_dim: u32,
         eps: f32,
     ) -> Val {
-        symbol: "ssm::kda_o_norm_gated_bf16",
+        symbol: "ssm::kda_o_norm_gated",
         on: x,
         weights: [weight],
         // params[0] = heads, params[1] = head_dim, params[2] = eps read as
@@ -241,20 +291,23 @@ builder! {
 
 
 builder! {
-    /// `kernels::mlp::situ_bf16` / `kernels::mlp::chunked_situ_bf16`: Moonshot's
-    pub fn situ(x: &Val, intermediate: u32) -> Val {
-        symbol: "mlp::chunked_situ_bf16",
+    /// `kernels::mlp::situ` / `kernels::mlp::chunked_situ`: Moonshot's
+    /// SiTU; `[beta, linear_beta]` are the checkpoint's and ride the run.
+    pub fn situ(x: &Val, intermediate: u32, beta: f32, linear_beta: f32) -> Val {
+        symbol: "mlp::chunked_situ",
         on: x,
+        params: [beta.to_bits(), linear_beta.to_bits()],
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(intermediate)] as BF16,
         made: "the activation produces its value",
     }
 
 
-    /// `kernels::mlp::situ_bf16` with gate and up as separate operands.
-    pub fn situ_pair(gate: &Val, up: &Val, intermediate: u32) -> Val {
-        symbol: "mlp::situ_bf16",
+    /// `kernels::mlp::situ` with gate and up as separate operands.
+    pub fn situ_pair(gate: &Val, up: &Val, intermediate: u32, beta: f32, linear_beta: f32) -> Val {
+        symbol: "mlp::situ",
         on: gate,
+        params: [beta.to_bits(), linear_beta.to_bits()],
         inputs: [gate, up],
         out: [Dim::Tokens, Dim::Const(intermediate)] as BF16,
         made: "the activation produces its value",
@@ -262,9 +315,11 @@ builder! {
 
 
     /// `kernels::ssm::l2norm_scale_bf16_to_fp32`: l2-norm each row and
-    pub fn l2norm_scale_to_f32(x: &Val, width: u32) -> Val {
+    /// scale; the epsilon rides the run.
+    pub fn l2norm_scale_to_f32(x: &Val, width: u32, eps: f32) -> Val {
         symbol: "ssm::l2norm_scale_bf16_to_fp32",
         on: x,
+        params: [eps.to_bits()],
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(width)] as F32,
         made: "the norm produces its value",
@@ -291,7 +346,7 @@ builder! {
     }
 
 
-    /// `kernels::attn::attn_res_blend_bf16`: blend the prefix output with
+    /// `kernels::attn::attn_res_blend`: blend the prefix output with
     pub fn attn_res_blend(
         prefix: &Val,
         blocks: &Val,
@@ -299,7 +354,7 @@ builder! {
         proj_weight: &str,
         width: u32,
     ) -> Val {
-        symbol: "attn::attn_res_blend_bf16",
+        symbol: "attn::attn_res_blend",
         on: prefix,
         weights: [norm_weight, proj_weight],
         inputs: [prefix, blocks],

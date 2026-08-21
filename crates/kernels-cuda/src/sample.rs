@@ -1,6 +1,5 @@
 
-use kernels::routine::Asks;
-use kernels::{Bind, Fire, keys};
+use kernels::{Bind, Fire};
 use kernels_macros::routine;
 use crate::jit::{Ctx, Launch};
 use crate::jit::abi::Tensor;

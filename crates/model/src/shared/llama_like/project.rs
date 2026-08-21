@@ -861,10 +861,18 @@ pub fn trace(
     load: Deployed<'_>,
 ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
     match load.backend {
-        Backend::Cuda => Ok(super::forward::llama_like_cuda(
+        // THE SHIPPED POINT. One catalogued pair of axes; the row's own
+        // `proj_repr` stays data (see `forward::CATALOG`), and the
+        // coverage test is what keeps the point loadable.
+        Backend::Cuda => Ok(super::forward::llama_like_cuda::<
+            model_dsl::axes::Bf16Ax,
+            model_dsl::axes::NativeKv,
+        >(
             f,
             &cuda_facts(f, load),
             class,
+            row.norm_eps,
+            row.rope_theta,
         )),
         Backend::Metal(bind) => {
             let m = metal_facts(row, load, bind);
@@ -1493,7 +1501,7 @@ mod tests {
             let metal = trace(&f, qwen3_row(), class, Deployed::metal(&bind))
                 .expect("and so is the Metal one");
             assert!(
-                cuda.family.starts_with("llama_like.cuda."),
+                cuda.family.starts_with("llama_like-kv-bf16.cuda."),
                 "{}",
                 cuda.family
             );

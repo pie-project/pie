@@ -423,6 +423,31 @@ impl<'a> Handles<'a> {
         })
     }
 
+    /// The key of the raised view the statement placed as its `n`th INPUT.
+    ///
+    /// `In<Struct<T>>` claims an input slot like any other mark, so the view
+    /// operand is counted among [`Self::input`]'s — but it is never TAKEN:
+    /// no handle is minted for it, because the carrier crosses as an address
+    /// rather than a binding. `lowering::views` asks this to learn WHICH
+    /// view to build.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Empty`] when the statement has no such input, and
+    /// [`Refusal::Unstated`] when the operand there is not a raise — a
+    /// statement and a signature that disagree about what sits at `n`.
+    pub fn raised_key(&self, n: usize) -> Result<String, Refusal> {
+        let at = *self.ins.get(n).ok_or(Refusal::Empty {
+            what: "an input operand the signature marks as a raised view",
+        })?;
+        match self.args.get(at) {
+            Some(Arg::Raised { key, .. }) => Ok(key.clone()),
+            _ => Err(Refusal::Unstated {
+                what: "a raised view where the statement placed an ordinary operand",
+            }),
+        }
+    }
+
     /// The `n`th OUTPUT, as a handle.
     ///
     /// # Errors

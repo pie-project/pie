@@ -3,7 +3,7 @@ use kernels::BindMut;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 use kernels::raises::Struct;
-use crate::views::{RecurrentState};
+use crate::views::RecurrentState;
 use kernels::routine::Refusal;
 
 fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
@@ -237,7 +237,7 @@ pub fn gdn_prep(
     )
 }
 
-#[routine]
+#[routine(canon = gdn_prep)]
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
     mixed: In<Tensor<bf16>>,

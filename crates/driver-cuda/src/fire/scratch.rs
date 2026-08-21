@@ -52,6 +52,9 @@ pub(crate) mod slot {
     pub(crate) const TAIL_LENS: usize = 10;
     pub(crate) const TAIL_INDICES: usize = 11;
     pub(crate) const TAIL_QO: usize = 12;
+    /// `"request_of_token"` — the runtime stream a text may name; staged only
+    /// when the fire's plan names it.
+    pub(crate) const REQ_OF_TOKEN: usize = 13;
 }
 
 impl Scratch {

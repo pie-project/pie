@@ -1765,6 +1765,14 @@ pub struct Model<'a> {
     /// a null carry — see [`crate::binding::Resolve::slab`] for why that
     /// distinction is not fussiness.
     pub recurrent: Option<&'a RecurrentPool>,
+    /// The plan's runtime streams, value id → fire table.
+    ///
+    /// The no-ask channel's staged half: a text's `positions` is a NAMED
+    /// value like a seam's, and this is what tells the two apart at
+    /// [`Resolve::named`]. Per plan, because value ids are the plan's own
+    /// numbering — the step that builds this `Model` builds it from the plan
+    /// it is about to fire.
+    pub runtime: &'a crate::runtime::Streams,
 }
 
 #[cfg(feature = "native")]
@@ -1776,6 +1784,14 @@ impl Resolve for Model<'_> {
     }
 
     fn named(&self, value: ValueId) -> Option<&Buffer> {
+        // A runtime STREAM binds the fire's own staged table; everything
+        // else named is a seam value and keeps the stand-in the seam sized.
+        // The two id populations are disjoint by construction — the trace
+        // mints runtime values, the seam publishes its own — so there is no
+        // precedence to get wrong, only a lookup that misses.
+        if let Some(which) = self.runtime.table_of(value) {
+            return Resolve::table(self.pool, which);
+        }
         self.weights.named(value)
     }
 

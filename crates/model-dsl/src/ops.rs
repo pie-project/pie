@@ -29,13 +29,13 @@ pub fn select(x: &Val, index: u32) -> Val {
 /// (`+=`) swaps the symbol to `gemm::act_x_w_acc` — see `AddAssign`.
 pub fn matmul(x: &Val, w: &MatW) -> Val {
     let (symbol, mut weights) = match w.gemm_symbol() {
-        None => ("gemm::act_x_w", vec![w.name.clone()]),
-        Some(symbol) => (symbol, vec![w.name.clone()]),
+        None => (x.t.canon("matmul"), vec![w.name.clone()]),
+        Some(symbol) => (symbol.to_string(), vec![w.name.clone()]),
     };
     weights.extend(w.scale_names());
     let shape = Shape(vec![Dim::Tokens, Dim::Const(w.width)]);
     let id = x.t.with(w.layer, |b| {
-        b.launch(symbol, weights, None, vec![x.id], vec![(shape, DType::BF16)])[0]
+        b.launch(&symbol, weights, None, vec![x.id], vec![(shape, DType::BF16)])[0]
     });
     Val {
         t: x.t.clone(),
@@ -49,17 +49,17 @@ pub fn matmul(x: &Val, w: &MatW) -> Val {
 /// (whole-row) reading, and the epsilon is the handle's, which is the
 /// forward's, which is the checkpoint's.
 pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
-    let symbol = if w.variant.is_plain() {
-        "norm::rmsnorm_bf16"
+    let symbol = x.t.canon(if w.variant.is_plain() {
+        "rmsnorm"
     } else {
-        "norm::rmsnorm_gemma_bf16"
-    };
+        "rmsnorm.gemma"
+    });
     let params = vec![w.per_head.unwrap_or(0), w.eps.to_bits()];
     let id = x.t.with(w.layer, |b| {
         let shape = b.value_shape(x.id);
         let dtype = b.value_dtype(x.id);
         b.launch_with_params(
-            symbol,
+            &symbol,
             vec![w.name.clone()],
             None,
             params,
@@ -74,13 +74,14 @@ pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
     }
 }
 
-/// `norm::add_bias_bf16`: `x[r, :] += bias`, in place.
+/// `norm::add_bias`: `x[r, :] += bias`, in place.
 pub fn add_bias(x: &Val, w: &MatW) -> Val {
+    let symbol = x.t.canon("add_bias");
     let id = x.t.with(w.layer, |b| {
         let shape = b.value_shape(x.id);
         let dtype = b.value_dtype(x.id);
         b.launch(
-            "norm::add_bias_bf16",
+            &symbol,
             vec![w.name.clone()],
             None,
             vec![x.id],
@@ -96,9 +97,10 @@ pub fn add_bias(x: &Val, w: &MatW) -> Val {
 
 /// `attn::split_qkv_bf16`: packed `[N, q + 2kv]` into three.
 pub fn split_qkv(x: &Val, q_width: u32, kv_width: u32) -> (Val, Val, Val) {
+    let symbol = x.t.canon("split_qkv");
     let outs = x.t.with(x.layer, |b| {
         b.launch(
-            "attn::split_qkv_bf16",
+            &symbol,
             vec![],
             None,
             vec![x.id],
@@ -142,6 +144,7 @@ pub fn rope(q: &Val, k: &Val, kind: RopeKind, n: RopeShape) -> (Val, Val) {
         n.theta.to_bits(),
         u32::from(n.interleaved),
     ];
+    let symbol = q.t.canon("rope");
     let (qo, ko) = q.t.with(q.layer, |b| {
         let positions = b.runtime_tensor(
             "positions",
@@ -152,7 +155,7 @@ pub fn rope(q: &Val, k: &Val, kind: RopeKind, n: RopeShape) -> (Val, Val) {
         let q_shape = b.value_shape(q.id);
         let k_shape = b.value_shape(k.id);
         let outs = b.launch_with_params(
-            "rope::rope_bf16",
+            &symbol,
             vec![],
             None,
             params,
@@ -169,7 +172,7 @@ pub fn rope(q: &Val, k: &Val, kind: RopeKind, n: RopeShape) -> (Val, Val) {
     (mk(qo), mk(ko))
 }
 
-/// `rope::rope_partial_bf16`: params `[rotary_dim, head_dim, theta]`.
+/// `rope.partial`: params `[rotary_dim, head_dim, theta]`.
 pub fn rope_partial(
     q: &Val,
     k: &Val,
@@ -183,6 +186,7 @@ pub fn rope_partial(
         "yarn rope is a tier-2 statement; state its own symbol"
     );
     let params = vec![rotary_dim, head_dim, theta.to_bits()];
+    let symbol = q.t.canon("rope.partial");
     let (qo, ko) = q.t.with(q.layer, |b| {
         let positions = b.runtime_tensor(
             "positions",
@@ -193,7 +197,7 @@ pub fn rope_partial(
         let q_shape = b.value_shape(q.id);
         let k_shape = b.value_shape(k.id);
         let outs = b.launch_with_params(
-            "rope::rope_partial_bf16",
+            &symbol,
             vec![],
             None,
             params,
@@ -211,9 +215,9 @@ pub fn rope_partial(
 }
 
 /// Order is contract: input seam before embedding.
-pub fn embedded_prologue(t: &Trace, hidden: u32) -> Val {
+pub fn embedded_prologue(t: &Trace, hidden: u32, vocab: u32) -> Val {
     seam(t, &seam::IN, &[], None);
-    embed_with(t, "embed", hidden)
+    embed_with(t, "embed", hidden, vocab)
 }
 
 /// Order is contract: final norm, readout, optional softcap, output seam.
@@ -223,7 +227,7 @@ pub fn logits_epilogue(
     norm_variant: model_ir::trace::NormVariant,
     tied_embeddings: bool,
     vocab: u32,
-    logit_softcap: bool,
+    logit_softcap: Option<f32>,
     norm_eps: f32,
 ) {
     let normed = cuda::rmsnorm(
@@ -237,8 +241,8 @@ pub fn logits_epilogue(
         },
     );
     let logits = lm_head_tied(t, &normed, tied_embeddings, vocab);
-    let logits = if logit_softcap {
-        cuda::logit_softcap(&logits, vocab)
+    let logits = if let Some(cap) = logit_softcap {
+        cuda::logit_softcap(&logits, vocab, cap)
     } else {
         logits
     };
@@ -264,7 +268,8 @@ pub fn mla_latents(
     let (q_a_n, kv_a) = match fused {
         Some(bank) => {
             let qkv_a = matmul(x, bank);
-            let q_a_n = cuda::rmsnorm_strided(&qkv_a, &q_a_norm.name, q_lora_rank);
+            let q_a_n =
+                cuda::rmsnorm_strided(&qkv_a, &q_a_norm.name, q_lora_rank, q_a_norm.eps);
             (q_a_n, qkv_a)
         }
         None => {
@@ -312,12 +317,13 @@ pub fn mla_absorbed_attention(
     )
 }
 
-/// Dense gated-MLP activation; variants map to different kernels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Dense gated-MLP activation; variants map to different kernels, and each
+/// carries the numbers its kernel's swept signature marks `Const`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GatedAct {
     SwiGlu,
-    SwiGluClamp,
-    Situ,
+    SwiGluClamp { limit: f32 },
+    Situ { beta: f32, linear_beta: f32 },
 }
 
 /// Trace gate, up, activation, down; caller lands the residual.
@@ -334,8 +340,12 @@ pub fn dense_gated_mlp(
     let up = matmul(m, up_w);
     let activated = match act {
         GatedAct::SwiGlu => cuda::swiglu_pair(&gate, &up, intermediate),
-        GatedAct::SwiGluClamp => cuda::swiglu_clamp_pair(&gate, &up, intermediate),
-        GatedAct::Situ => cuda::situ_pair(&gate, &up, intermediate),
+        GatedAct::SwiGluClamp { limit } => {
+            cuda::swiglu_clamp_pair(&gate, &up, intermediate, limit)
+        }
+        GatedAct::Situ { beta, linear_beta } => {
+            cuda::situ_pair(&gate, &up, intermediate, beta, linear_beta)
+        }
     };
     matmul(&activated, down_w)
 }
@@ -344,9 +354,10 @@ pub fn dense_gated_mlp(
 /// as fixed behaviour, so a lowered text states its own symbol and this
 /// `canon::` form appears only in backend-less description traces.
 pub fn swiglu(x: &Val, inter: u32) -> Val {
+    let symbol = x.t.canon("swiglu");
     let id = x.t.with(x.layer, |b| {
         b.launch(
-            "canon::swiglu",
+            &symbol,
             vec![],
             None,
             vec![x.id],
@@ -364,9 +375,10 @@ pub fn swiglu(x: &Val, inter: u32) -> Val {
 /// state their attention kernel as their own launch; this `canon::` form is
 /// the backend-less description's.
 pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
+    let symbol = q.t.canon("attention");
     let id = q.t.with(Some(kv.l), |b| {
         b.launch(
-            "canon::attention",
+            &symbol,
             vec![],
             Some(StateRef { store: StateStore::KvCache, layer: kv.l }),
             vec![q.id],
@@ -380,12 +392,13 @@ pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
     }
 }
 
-/// Expert-bank matmul: `moe::moe_grouped_gemm_bf16`, the selector as the
+/// Expert-bank matmul: `moe::moe_grouped_gemm`, the selector as the
 /// LAST input — the convention the retired `Matmul::selector` recorded.
 pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
+    let symbol = x.t.canon("matmul_select");
     let id = x.t.with(w.layer, |b| {
         b.launch(
-            "moe::moe_grouped_gemm_bf16",
+            &symbol,
             vec![w.name.clone()],
             None,
             vec![x.id, selector.id],
@@ -399,12 +412,13 @@ pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
     }
 }
 
-/// Router top-k: `moe::topk_softmax_bf16`, `(indices, weights)` in that
+/// Router top-k: `moe::topk_softmax`, `(indices, weights)` in that
 /// order, `k` on the params run.
 pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
+    let symbol = logits.t.canon("topk");
     let outs = logits.t.with(logits.layer, |b| {
         b.launch_with_params(
-            "moe::topk_softmax_bf16",
+            &symbol,
             vec![],
             None,
             vec![k],
@@ -423,15 +437,16 @@ pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
     (mk(outs[0]), mk(outs[1]))
 }
 
-/// `moe::token_batched_weighted_sum_bf16`; operand order: weights, value.
+/// `moe::token_batched_weighted_sum`; operand order: weights, value.
 pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
+    let symbol = weights.t.canon("weighted_sum");
     let id = weights.t.with(weights.layer, |b| {
         let shape = match b.value_shape(x.id).0.as_slice() {
             [Dim::Tokens, _, d] => Shape(vec![Dim::Tokens, *d]),
             other => Shape(other.to_vec()),
         };
         b.launch(
-            "moe::token_batched_weighted_sum_bf16",
+            &symbol,
             vec![],
             None,
             vec![weights.id, x.id],
@@ -445,12 +460,13 @@ pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
     }
 }
 
-/// `mlp::sigmoid_dot_scalar_gate_add_bf16`; operands: value, gate, base.
+/// `mlp::sigmoid_dot_scalar_gate_add`; operands: value, gate, base.
 pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
+    let symbol = x.t.canon("sigmoid_gate_add");
     let id = x.t.with(x.layer, |b| {
         let shape = b.value_shape(base.id);
         b.launch(
-            "mlp::sigmoid_dot_scalar_gate_add_bf16",
+            &symbol,
             vec![],
             None,
             vec![x.id, gate.id, base.id],
@@ -466,10 +482,11 @@ pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
 
 /// `mlp::sigmoid_gate_inplace_bf16`: `x *= sigmoid(gate)`.
 pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
+    let symbol = x.t.canon("sigmoid_gate_mul");
     let id = x.t.with(x.layer, |b| {
         let shape = b.value_shape(x.id);
         b.launch(
-            "mlp::sigmoid_gate_inplace_bf16",
+            &symbol,
             vec![],
             None,
             vec![x.id, gate.id],
@@ -485,9 +502,10 @@ pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
 
 /// GDN two-way split at `w0`. `layout::split_gdn_bf16`.
 pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
+    let symbol = x.t.canon("split_gdn");
     let outs = x.t.with(x.layer, |b| {
         b.launch(
-            "layout::split_gdn_bf16",
+            &symbol,
             vec![],
             None,
             vec![x.id],
@@ -509,9 +527,10 @@ pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
 /// `head_dim` on the params run (the swept signature's one `Const`).
 pub fn split_q_gate(x: &Val, heads: u32, head_dim: u32) -> (Val, Val) {
     let w = heads * head_dim;
+    let symbol = x.t.canon("split_q_gate");
     let outs = x.t.with(x.layer, |b| {
         b.launch_with_params(
-            "layout::split_q_gate_bf16",
+            &symbol,
             vec![],
             None,
             vec![head_dim],
@@ -530,12 +549,13 @@ pub fn split_q_gate(x: &Val, heads: u32, head_dim: u32) -> (Val, Val) {
     (mk(outs[0]), mk(outs[1]))
 }
 
-/// Depthwise causal conv with fused SiLU: `ssm::causal_conv1d_update_batched_bf16`
+/// Depthwise causal conv with fused SiLU: `ssm::causal_conv1d_update_batched`
 /// on the decode reading; the conv-state slab is the layer's runtime object.
 /// Params `[conv_dim, kernel]` — the swept `c`/`k` Consts, in order.
 pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
     let mut weights = vec![w.name.clone()];
     weights.extend(w.bias.clone());
+    let symbol = x.t.canon("causal_conv1d");
     let id = x.t.with(Some(w.layer), |b| {
         let shape = b.value_shape(x.id);
         let conv_dim = match shape.0.as_slice() {
@@ -543,7 +563,7 @@ pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
             _ => 0,
         };
         b.launch_with_params(
-            "ssm::causal_conv1d_update_batched_bf16",
+            &symbol,
             weights,
             Some(StateRef { store: StateStore::RecurrentState, layer: w.layer }),
             vec![conv_dim, w.kernel],
@@ -570,13 +590,20 @@ pub fn gdn_prep(
     key_dim: u32,
     value_heads: u32,
     value_dim: u32,
+    conv_dim: u32,
 ) -> (Val, Val, Val, Val, Val) {
+    let symbol = qkv.t.canon("gdn_prep");
     let outs = qkv.t.with(Some(w.layer), |bld| {
         bld.launch_with_params(
-            "ssm::qwen_gdn_post_conv_prep_bf16",
+            &symbol,
             vec![w.a_log.clone(), w.dt_bias.clone()],
             None,
-            vec![key_heads, key_dim, value_heads, value_dim],
+            // THE ROUTINE'S ORDER: `[k_h, v_h, k_d, v_d, conv_dim]`. The
+            // catalogue coverage test caught this run stated four scalars
+            // in a transposed order — slot 2 carried key_dim where the
+            // routine reads v_h — which no fire could refuse: a wrong
+            // NUMBER at a bound slot is silent arithmetic.
+            vec![key_heads, value_heads, key_dim, value_dim, conv_dim],
             vec![qkv.id, a.id, b.id],
             vec![
                 (Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]), DType::F32),
@@ -598,10 +625,11 @@ pub fn gdn_prep(
 /// GDN recurrence over `rs`'s layer state. Description form (`canon::`);
 /// a lowered text states its own recurrence launch.
 pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> Val {
+    let symbol = rs.t.canon("gated_delta");
     let id = rs.t.with(Some(rs.l), |b| {
         let shape = b.value_shape(v.id);
         b.launch(
-            "canon::gated_delta",
+            &symbol,
             vec![],
             Some(StateRef { store: StateStore::RecurrentState, layer: rs.l }),
             vec![q.id, k.id, v.id, g.id, beta.id],
@@ -615,13 +643,13 @@ pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> V
     }
 }
 
-/// Gated RMSNorm: `norm::rmsnorm_gated_fp32_in_bf16`, params `[eps,
+/// Gated RMSNorm: `norm::rmsnorm_gated_fp32_in`, params `[eps,
 /// per_head_dim]` — the swept signature's order (eps first on this one).
 pub fn rmsnorm_gated(x: &Val, gate: &Val, w: &NormW) -> Val {
     let id = x.t.with(w.layer, |b| {
         let shape = b.value_shape(gate.id);
         b.launch_with_params(
-            "norm::rmsnorm_gated_fp32_in_bf16",
+            "norm::rmsnorm_gated_fp32_in",
             vec![w.name.clone()],
             None,
             vec![w.eps.to_bits(), w.per_head.unwrap_or(0)],
@@ -640,15 +668,18 @@ pub fn rmsnorm_gated(x: &Val, gate: &Val, w: &NormW) -> Val {
 impl std::ops::AddAssign<Val> for Val {
     /// Fold `y += matmul` into the GEMM's beta (`gemm::act_x_w` becomes
     /// `gemm::act_x_w_acc` and takes the residual); otherwise state
-    /// `norm::residual_add_bf16`.
+    /// `norm::residual_add`.
     fn add_assign(&mut self, rhs: Val) {
+        let plain = rhs.t.canon("matmul");
+        let acc = rhs.t.canon("matmul.acc");
+        let add = rhs.t.canon("residual_add");
         let folded_or_added = rhs.t.with(rhs.layer, |b| {
-            if b.try_fold_beta(rhs.id, self.id, "gemm::act_x_w", "gemm::act_x_w_acc") {
+            if b.try_fold_beta(rhs.id, self.id, &plain, &acc) {
                 rhs.id
             } else {
                 let shape = b.value_shape(self.id);
                 b.launch(
-                    "norm::residual_add_bf16",
+                    &add,
                     vec![],
                     None,
                     vec![rhs.id, self.id],

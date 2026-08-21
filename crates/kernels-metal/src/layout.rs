@@ -57,7 +57,7 @@ pub fn embed_gather_4bit(
     )
 }
 
-#[routine]
+#[routine(canon = embed)]
 pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
     w: Const<Tensor<u32>>,

@@ -31,7 +31,8 @@
 pub mod facts;
 
 use self::facts::Gemma3nFacts;
-use model_dsl::{self as dsl, MatW, NormW, Val, WeightRepr, matmul};
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
+use model_dsl::{self as dsl, MatW, NormW, Val, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G3nLayerW {
@@ -62,19 +63,20 @@ struct G3nLayerW {
 }
 
 impl G3nLayerW {
-    fn new(l: u32, f: &Gemma3nFacts) -> Self {
+    fn new(l: u32, f: &Gemma3nFacts, norm_eps: f32, repr: model_dsl::WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Gemma,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         let k = f.altup.num_streams;
         Self {
@@ -93,12 +95,14 @@ impl G3nLayerW {
                 variant: NormVariant::Gemma,
                 per_head: Some(f.attn.head_dim),
                 layer: Some(l),
+                eps: norm_eps,
             },
             k_norm: NormW {
                 name: w("k_norm"),
                 variant: NormVariant::Gemma,
                 per_head: Some(f.attn.head_dim),
                 layer: Some(l),
+                eps: norm_eps,
             },
             o_proj: m("o_proj", f.hidden),
             post_attn_norm: n("post_attn_norm"),
@@ -128,18 +132,40 @@ fn altup_coefs(x: &Val, norm: &NormW, router: &MatW, coefs: &MatW, scale: &str) 
 }
 
 /// gemma3n's CUDA text for one fire class.
-pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
+pub fn gemma3n_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &Gemma3nFacts,
+    class: FireClass,
+    norm_eps: f32,
+    rope_theta_global: f32,
+    rope_theta_local: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: the kv writes state native bf16 pages
+    // and nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
     // DECODE AND PREFILL, and the difference is one call. This family
     // served Decode only and PANICKED on anything else — not refused,
     // panicked, on the first prefill a serving deployment sends. The
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
-    let family = format!("gemma3n.cuda.{}", class.suffix());
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "gemma3n-{}-{}.cuda.{}",
+        W1::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let k = facts.altup.num_streams;
     let active = facts.altup.active;
     dsl::trace_named(&family, |t| {
         dsl::seam(t, &dsl::seam::IN, &[], None);
-        let embedded = dsl::embed_with(t, "embed", facts.hidden);
+        let embedded = dsl::embed_with(t, "embed", facts.hidden, facts.vocab);
         let mut streams = dsl::cuda::hc_expand(&embedded, k, facts.hidden);
 
         for l in 0..facts.layers() {
@@ -147,7 +173,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
             let window_left = model_ir::facts::window_left_at(facts.window_left, l);
-            let w = G3nLayerW::new(l, facts);
+            let w = G3nLayerW::new(l, facts, norm_eps, W1::REPR);
             let active_in = dsl::select(&streams, active);
 
             // ── AltUp.predict ────────────────────────────────────────
@@ -179,13 +205,38 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             let kk = dsl::cuda::rmsnorm(&kk, &w.k_norm);
             // The value takes the SCALE-LESS norm: gemma3n norms v too,
             // and with no gamma.
-            let v = dsl::cuda::rmsnorm_no_scale(&v);
-            let (q, kk) = dsl::cuda::rope(&q, &kk, facts.attn.heads, facts.attn.kv_heads, facts.attn.head_dim);
+            let v = dsl::cuda::rmsnorm_no_scale(&v, facts.attn.head_dim, norm_eps);
+            // Full-attention layers rotate on the global base, sliding
+            // ones on the local — project.rs states the same per-layer
+            // rule for the deployment. No pairing stated means NeoX.
+            let theta = if window_left < 0 {
+                rope_theta_global
+            } else {
+                rope_theta_local
+            };
+            let (q, kk) = dsl::cuda::rope(
+                &q,
+                &kk,
+                facts.attn.heads,
+                facts.attn.kv_heads,
+                facts.attn.head_dim,
+                theta,
+                false,
+            );
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&kk, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim, 0.0, 0.0)
-                .expect("a plain attention statement produces its value");
+            let o = dsl::cuda::attention_for(
+                class,
+                &q,
+                &kv,
+                window_left,
+                facts.attn.head_dim,
+                0.0,
+                0.0,
+                facts.attn.kv_heads,
+            )
+            .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
             let mid = dsl::cuda::residual_add(&p_active, &o, facts.hidden);
@@ -215,14 +266,26 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
                 &format!("layer.{l}.altup_correct_scale"),
             );
             let ccoefs = dsl::cuda::altup_unpack_correct_coefs(&packed, k);
-            streams = dsl::cuda::altup_correct(&predictions, &activated, &ccoefs, k, facts.hidden);
+            streams = dsl::cuda::altup_correct(
+                &predictions,
+                &activated,
+                &ccoefs,
+                k,
+                facts.hidden,
+                active,
+            );
 
             // ── PLE: gated, added into every stream but the active ───
             // K-1 in-place adds, each through its own window — the
             // driver's `for (k) if (k != act_idx) residual_add(...)`,
             // launch for launch. `in_place` is what makes each land in
             // the window it read instead of in a value nothing reads.
-            let ple = dsl::embed_with(t, &format!("layer.{l}.embed_per_layer"), facts.ple_width);
+            let ple = dsl::embed_with(
+                t,
+                &format!("layer.{l}.embed_per_layer"),
+                facts.ple_width,
+                facts.vocab,
+            );
             let g = matmul(&x, &w.ple_gate);
             let ple = dsl::sigmoid_gate_mul(&ple, &g);
             let ple = matmul(&ple, &w.ple_proj);
@@ -247,6 +310,28 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
         let target = dsl::cuda::compute_rms(&active_final);
         let y = dsl::cuda::mean_streams(&streams, facts.hidden);
         let y = dsl::cuda::magnitude_rescale(&y, &target, facts.hidden);
-        dsl::logits_epilogue(t, &y, NormVariant::Gemma, false, facts.vocab, true);
+        dsl::logits_epilogue(
+            t,
+            &y,
+            NormVariant::Gemma,
+            false,
+            facts.vocab,
+            // Every published gemma-3n caps at 30.0 — the deployment's
+            // `logit_softcap` states the same constant.
+            Some(crate::gemma_3n::project::FINAL_LOGIT_SOFTCAP),
+            norm_eps,
+        );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&Gemma3nFacts, FireClass, f32, f32, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    ("gemma3n-bf16-kv-bf16", gemma3n_cuda::<Bf16Ax, Bf16Ax, NativeKv>),
+];

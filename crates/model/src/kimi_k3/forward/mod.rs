@@ -14,11 +14,11 @@
 //!   `kernels::rope::rope_bf16` here"), because this family's positional
 //!   information rides the KDA layers instead.
 //!
-//! * **SITU, not swiglu.** Every MLP activation here is `kernels::mlp::situ_bf16`
+//! * **SITU, not swiglu.** Every MLP activation here is `kernels::mlp::situ`
 //!   / its chunked twin.
 //!
 //! * **An attention-residual BLOCK that spans layers.**
-//!   `kernels::attn::attn_res_blend_bf16` blends a block's accumulated prefix
+//!   `kernels::attn::attn_res_blend` blends a block's accumulated prefix
 //!   back in every `attn_res_block` layers. It is the one statement here
 //!   whose operands are not this layer's — and the reason the block size
 //!   is a fact rather than a loop bound.
@@ -26,8 +26,19 @@
 pub mod facts;
 
 use self::facts::KimiK3Facts;
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, Mxfp4Ax, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
+
+/// SITU's gate blend. No committed config states `activation_situ_beta`,
+/// and the hand-written pass read it with a default of `1.0`
+/// (`config.cpp`: `optional<float>(j, "activation_situ_beta", 1.f)`) —
+/// the normalizer's default, the same honest reading dsv4's theta gives.
+const SITU_BETA: f32 = 1.0;
+/// The optional tanh cap on the up half; `0` is the kernel's own word for
+/// "no cap", and the hand-written default (`activation_situ_linear_beta`,
+/// default `0.f`).
+const SITU_LINEAR_BETA: f32 = 0.0;
 
 struct K3LayerW {
     attn_norm: NormW,
@@ -59,19 +70,20 @@ struct K3LayerW {
 }
 
 impl K3LayerW {
-    fn new(l: u32, f: &KimiK3Facts) -> Self {
+    fn new(l: u32, f: &KimiK3Facts, norm_eps: f32, repr: WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         let a = &f.attn;
         let k = &f.kda;
@@ -111,15 +123,40 @@ impl K3LayerW {
 /// query row rather than a different kernel — and the KDA half is a
 /// recurrence over whatever rows the fire brought. Nothing here reads the
 /// class except the trace's name.
-pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
-    let family = format!("kimi_k3.cuda.{}", class.suffix());
+pub fn kimi_k3_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &KimiK3Facts,
+    class: FireClass,
+    norm_eps: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: MLA's latent cache and the KDA state are
+    // stated bf16 and nothing here forks on the scheme yet. And W2 is
+    // pinned to the marlin repr because the routed leg below states
+    // `quant::mxfp4_moe_*` by name — a bf16 expert bank has no leg in
+    // this text.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+        assert!(matches!(W2::REPR, WeightRepr::Mxfp4Marlin));
+    }
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "kimi_k3-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let a = facts.attn.clone();
     let kd = facts.kda.clone();
     dsl::trace_named(&family, |t| {
-        let mut y = dsl::embedded_prologue(t, facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
 
         for l in 0..facts.layers {
-            let w = K3LayerW::new(l, facts);
+            let w = K3LayerW::new(l, facts, norm_eps, W1::REPR);
             // The attention-residual block: every `attn_res_block` layers
             // the accumulated prefix blends back in. Layer 0 opens the
             // first block, so there is nothing to blend yet.
@@ -152,6 +189,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     &format!("layer.{l}.kv_a_norm"),
                     a.kv_lora_rank,
                     a.qk_rope_head_dim,
+                    norm_eps,
                 );
                 let (q_nope, q_pe) = dsl::cuda::kimi_split_q_b(
                     &q_b,
@@ -256,8 +294,8 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     kd.value_heads,
                     kd.value_head_dim,
                 );
-                let q = dsl::cuda::l2norm_scale_to_f32(&q, kd.width());
-                let k = dsl::cuda::l2norm_scale_to_f32(&k, kd.width());
+                let q = dsl::cuda::l2norm_scale_to_f32(&q, kd.width(), kd.norm_eps());
+                let k = dsl::cuda::l2norm_scale_to_f32(&k, kd.width(), kd.norm_eps());
                 let v = dsl::cuda::bf16_to_f32(&v, kd.width());
                 let core = dsl::cuda::kda_recurrent_step(
                     &q,
@@ -292,13 +330,21 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     &w.dense_up,
                     &w.dense_down,
                     facts.dense_intermediate,
-                    dsl::GatedAct::Situ,
+                    dsl::GatedAct::Situ {
+                        beta: SITU_BETA,
+                        linear_beta: SITU_LINEAR_BETA,
+                    },
                 );
                 continue;
             }
 
             let logits = matmul(&m, &w.router);
-            let (experts, weights) = dsl::cuda::topk_sigmoid(&logits, facts.moe.top_k);
+            let (experts, weights) = dsl::cuda::topk_sigmoid(
+                &logits,
+                facts.moe.top_k,
+                facts.moe.norm_topk_prob,
+                facts.moe.routed_scaling,
+            );
             let (gate_up, _up) = dsl::cuda::mxfp4_moe_gate_up_decode(
                 &m,
                 &experts,
@@ -306,12 +352,24 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.gate_up"),
                     width: 2 * facts.moe.moe_intermediate,
                     layer: Some(l),
-                    repr: WeightRepr::Bf16,
+                    repr: W2::REPR,
                 },
                 facts.moe.top_k,
                 facts.moe.moe_intermediate,
+                // The split-output form leaves the fused epilogue's clamp
+                // unread (the kernel applies `glu_limit`/`glu_alpha` only
+                // when it writes the fused fp16 activation, and this
+                // statement takes gate and up apart) — and kimi states no
+                // GLU clamp: SITU's own cap is `linear_beta` below.
+                0.0,
+                0.0,
             );
-            let act = dsl::cuda::situ(&gate_up, facts.moe.moe_intermediate);
+            let act = dsl::cuda::situ(
+                &gate_up,
+                facts.moe.moe_intermediate,
+                SITU_BETA,
+                SITU_LINEAR_BETA,
+            );
             let route_out = dsl::cuda::mxfp4_moe_down_decode(
                 &act,
                 &experts,
@@ -319,7 +377,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.down"),
                     width: facts.hidden,
                     layer: Some(l),
-                    repr: WeightRepr::Bf16,
+                    repr: W2::REPR,
                 },
                 facts.moe.top_k,
                 facts.hidden,
@@ -329,7 +387,13 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sgate = matmul(&m, &w.shared_gate);
                 let sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::situ_pair(&sgate, &sup, facts.moe.shared_intermediate);
+                let sact = dsl::cuda::situ_pair(
+                    &sgate,
+                    &sup,
+                    facts.moe.shared_intermediate,
+                    SITU_BETA,
+                    SITU_LINEAR_BETA,
+                );
                 let shared = matmul(&sact, &w.shared_down);
                 dsl::cuda::residual_add(&routed, &shared, facts.hidden)
             } else {
@@ -338,6 +402,30 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
+        dsl::logits_epilogue(
+            t,
+            &y,
+            NormVariant::Plain,
+            false,
+            facts.vocab,
+            None,
+            norm_eps,
+        );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&KimiK3Facts, FireClass, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// routed experts are MXFP4 (the module doc's `mxfp4_moe_*` leg), so W2's
+/// shipped value is the marlin axis. The coverage test
+/// (`model/tests/catalogue_coverage.rs`) traces each row at both fire
+/// classes; `TraceBuilder::finish`'s `check_plan` then refuses a row whose
+/// statements reach a routine point that does not exist.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    (
+        "kimi_k3-bf16-mxfp4-kv-bf16",
+        kimi_k3_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>,
+    ),
+];

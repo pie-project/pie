@@ -345,8 +345,17 @@ pub const NO_METAL: &str = "glm-5 has no Metal text in this build: its forward i
 /// text takes the fused `mla_prepare` unconditionally and states no rope
 /// variant, so the shape is the whole input.
 #[must_use]
-pub fn trace(f: &Glm5Facts, class: model_ir::trace::FireClass) -> model_ir::trace::ForwardPlan {
-    super::forward::glm5_cuda(f, class)
+pub fn trace(
+    f: &Glm5Facts,
+    class: model_ir::trace::FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> model_ir::trace::ForwardPlan {
+    // THE SHIPPED POINT. glm-5 catalogues one SKU today; the table in
+    // `forward::CATALOG` is where a second one appears, and the coverage
+    // test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, NativeKv};
+    super::forward::glm5_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>(f, class, norm_eps, rope_theta)
 }
 
 #[cfg(test)]
@@ -845,7 +854,7 @@ mod tests {
             (FireClass::Prefill, "prefill"),
         ] {
             let plan = trace(&f, class);
-            assert_eq!(plan.family, format!("glm5.cuda.{suffix}"));
+            assert_eq!(plan.family, format!("glm5-bf16-bf16-kv-bf16.cuda.{suffix}"));
             assert!(!plan.ops.is_empty(), "a traced plan states ops");
         }
     }

@@ -297,7 +297,7 @@ impl Variant for Dsv4 {
         // _provision.rs` holds the refusal so the day it changes is a test
         // failure naming this line rather than a silent revival.
         self.deployment(load)
-            .map(|_| project::trace(&self.shape, class))
+            .map(|_| project::trace(&self.shape, class, self.norm_eps, self.rope_theta))
     }
 
     /// DeepSeek's own template, with the FULLWIDTH role delimiters.
@@ -466,7 +466,10 @@ mod tests {
             (FireClass::Prefill, "prefill"),
         ] {
             let plan = project::trace(&v.shape, class);
-            assert_eq!(plan.family, format!("deepseek_v4.cuda.{suffix}"));
+            assert_eq!(
+                plan.family,
+                format!("deepseek_v4-bf16-bf16-kv-bf16.cuda.{suffix}")
+            );
             assert!(
                 v.trace(class, Deployed::single()).is_err(),
                 "the serving path must refuse where the door refused",

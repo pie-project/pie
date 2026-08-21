@@ -49,6 +49,7 @@ pub mod dispatch;
 pub mod facts;
 pub mod geometry;
 pub mod lowering;
+pub mod runtime;
 // Not a module of this crate: `driver::names` is the one table, and the copy
 // that stood here was byte-for-byte identical to `driver-vulkan`'s 412 lines.
 // Re-exported rather than referred to directly so `driver_wgpu::names` keeps

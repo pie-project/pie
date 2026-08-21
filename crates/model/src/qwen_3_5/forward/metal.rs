@@ -450,6 +450,7 @@ impl Ctx<'_> {
             variant: self.norm_variant,
             per_head: None,
             layer: l,
+            eps: self.metal.rms_eps,
         };
         dsl::metal::rms_norm(x, &w, row, self.metal.rms_eps)
     }
@@ -779,6 +780,7 @@ pub fn qwen3_5_hybrid_metal(
         kv_width: facts.attn.kv_width(),
         qk_norm: model_ir::facts::QkNorm::PerHead,
         norm_variant: facts.norm_variant,
+        norm_eps_micro: (metal.rms_eps * 1.0e6).round() as u32,
         tied_embeddings: facts.tied_embeddings,
         proj_repr: metal.proj_repr,
     };

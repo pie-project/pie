@@ -106,31 +106,11 @@
 //! `as_declared`'s `U32 -> I32` refuses above `i32::MAX`.
 //!
 use kernels::Refusal;
-use kernels::routine::{In, Out};
 
-use super::cx::Cx;
-
-/// The `In<N, T>` a hand arm would otherwise write out longhand.
-///
-/// A generic `fn` and not a closure: a closure cannot be generic over a const
-/// parameter, so an arm could bind slot 1's pointer with slot 0's width.
-pub fn in_region<const N: usize, E: kernels::Elem<Read = *const E>>(
-    cx: &Cx<'_>,
-    ptr: *const E,
-    rows: i32,
-) -> In<E> {
-    In { ptr, rows, width: cx.in_width(N).unwrap_or(0) }
-}
-
-/// [`in_region`]'s output half. Same argument, same reason for the const.
-pub fn out_region<const N: usize, E: kernels::Elem<Write = *mut E>>(
-    cx: &Cx<'_>,
-    ptr: *mut E,
-    rows: i32,
-) -> Out<E> {
-    Out { ptr, rows, width: cx.out_width(N).unwrap_or(0) }
-}
-
+// `in_region`/`out_region` stood here: the `In<N, T>` a HAND ARM would
+// otherwise write out longhand. The hand arms are gone -- every routine binds
+// through its derived column -- and the two helpers' widths were the last
+// `Cx` operand queries, so both retire with the ask machinery.
 
 /// What will fire one symbol, decided once at model load.
 ///

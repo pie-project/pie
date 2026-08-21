@@ -8,8 +8,6 @@
 use core::ffi::c_void;
 
 use kernels::Derived;
-use kernels::keys;
-use kernels::Lit;
 use kernels::Refusal;
 use kernels::{Kind, Source};
 use kernels_cuda::ArgValue;
@@ -20,24 +18,12 @@ use super::{BoundArg, BoundLaunch, LaunchSpec};
 
 // ── Facts ─────────────────────────────────────────────────────────────────
 
-/// `let x = f.thing()?` where the refusal is the one [`Cx`] mints — one
-/// string, in `bind/cx.rs`, so the two paths cannot name an absence twice.
-macro_rules! forward {
-    ($(#[$m:meta])* $name:ident -> $ty:ty) => {
-        $(#[$m])*
-        /// # Errors
-        #[must_use = "a fact is read to be bound"]
-        pub fn $name(self) -> Result<$ty, Refusal> {
-            self.cx.$name()
-        }
-    };
-}
-
 /// Where a launch's facts are read from, not what was found.
 ///
-/// A cursor: `cx`, plus the two answers that cannot refuse. Every other fact
-/// is a query at the ask, forwarding to `bind/cx.rs` and refusing in its own
-/// words. `cublas` must never appear here — `Cx` is query-only.
+/// A cursor: `cx`, plus the two answers that cannot refuse. This carried
+/// ~40 forwarded fact queries while bind bodies could ask; the swept
+/// signatures carry those numbers as marks, so what remains is what a COLUMN
+/// still reads — the rows, the layer, the named weights, the params run.
 #[derive(Clone, Copy, Debug)]
 pub struct Facts<'a> {
     /// Where every fact below is read from. `pub` for [`operand`]'s match.
@@ -53,129 +39,6 @@ impl<'a> Facts<'a> {
     #[must_use]
     pub fn at(cx: &'a Cx<'a>) -> Self {
         Self { cx, rows: cx.rows(), layer: cx.layer() }
-    }
-
-    forward!(
-        token_ids -> *const i32
-    );
-    forward!(
-        positions -> *const i32
-    );
-    forward!(
-        /// The rows a sampling gather collects.
-        sampling_indices -> *const i32
-    );
-    forward!(
-        vocab -> i32
-    );
-    forward!(
-        /// The per-layer-embedding width.
-        ple_dim -> i32
-    );
-    forward!(
-        head_dim -> i32
-    );
-    forward!(
-        /// How many of each head's elements rotate.
-        rotary_width -> i32
-    );
-    forward!(
-        /// How far left of a row attention may see; `-1` is unbounded.
-        window_left -> i32
-    );
-    forward!(
-        /// The rotary base for THIS STATEMENT'S LAYER.
-        theta -> f32
-    );
-    forward!(
-        /// The FIRE's rope base, which is not [`Facts::theta`]: gemma-4 splits
-        /// theta by layer kind, so the two differ on one fire.
-        rope_theta -> f32
-    );
-    forward!(
-        rms_eps -> f32
-    );
-    forward!(
-        /// The softmax scale this fire was PLANNED with. Refuses rather than
-        /// answering `1.0`, which is both the fallback and a real family's scale.
-        sm_scale -> f32
-    );
-    forward!(
-        /// How many experts one token visits. Refuses rather than answering zero.
-        experts_per_token -> i32
-    );
-    forward!(
-        moe_norm_topk -> bool
-    );
-    forward!(
-        moe_routed_scaling -> f32
-    );
-    forward!(
-        glu_alpha -> f32
-    );
-    forward!(
-        /// [`Facts::glu_alpha`]'s pair, and the half that actually varies.
-        glu_limit -> f32
-    );
-
-    // ── Four that spell a different name: `kv_layer_heads` is the CACHE's ──
-
-    /// How many query heads.
-    #[must_use = "a fact is read to be bound"]
-    pub fn q_heads(self) -> Result<i32, Refusal> {
-        self.cx.num_q_heads()
-    }
-
-    /// How many key/value heads. NOT [`Facts::kv_layer_heads`].
-    #[must_use = "a fact is read to be bound"]
-    pub fn kv_heads(self) -> Result<i32, Refusal> {
-        self.cx.num_kv_heads()
-    }
-
-    /// The statement's per-head width, or `None` for the plain kind.
-    #[must_use]
-    pub fn per_head_dim(self) -> Option<i32> {
-        self.cx.per_head_dim()
-    }
-
-    /// Whether the rotation pairs adjacent elements rather than halves.
-    #[must_use]
-    pub fn rope_interleaved(self) -> bool {
-        self.cx.rope_interleaved()
-    }
-
-    // ── Four the `Copy` bound put out of reach: `cx.kv_layer()` fields ──
-
-    /// Token rows per KV page. NOT [`Facts::head_dim`]: equal in no deployment.
-    #[must_use = "a fact is read to be bound"]
-    pub fn page_size(self) -> Result<i32, Refusal> {
-        self.cx.kv_layer().map(|l| l.page_size)
-    }
-
-    /// The CACHE's elements per head, NOT [`Facts::head_dim`] — that is the
-    /// width attention is COMPUTED at. The two agree wherever the rotary width
-    /// is the full head, so a swap reads a neighbour's row rather than faults.
-    #[must_use = "a fact is read to be bound"]
-    pub fn kv_head_dim(self) -> Result<i32, Refusal> {
-        self.cx.kv_layer().map(|l| l.head_dim)
-    }
-
-    /// The CACHE's key/value head count. NOT [`Facts::kv_heads`].
-    #[must_use = "a fact is read to be bound"]
-    pub fn kv_layer_heads(self) -> Result<i32, Refusal> {
-        self.cx.kv_layer().map(|l| l.num_kv_heads)
-    }
-
-    /// Whether this layer's pages are laid out head-major.
-    #[must_use = "a fact is read to be bound"]
-    pub fn kv_hnd(self) -> Result<bool, Refusal> {
-        self.cx.kv_layer().map(|l| l.hnd)
-    }
-
-    /// How many REQUESTS, NOT how many ROWS: equal during a one-token decode.
-    #[must_use = "a fact is read to be bound"]
-    pub fn requests(self) -> Result<i32, Refusal> {
-        self.cx.plan().map(|p| p.requests)
     }
 
     /// The `i`th named weight's address. Refuses `Absent`, being indexed.
@@ -246,6 +109,19 @@ impl<'a> Handles<'a> {
         width(self.outs.get(n), "an output's width")
     }
 
+    /// The `n`th input's OWN row count, zero where the operand has none
+    /// apart from the launch's rectangle. Nonzero only for a NAMED stream
+    /// the driver stages whole — `bind` reads it off `Lowered::arg_rows` —
+    /// which is what lets a CSR operand answer its boundary count.
+    pub fn in_rows(&self, n: usize) -> i32 {
+        own_rows(self.ins.get(n))
+    }
+
+    /// The `n`th output's OWN row count. See [`Self::in_rows`].
+    pub fn out_rows(&self, n: usize) -> i32 {
+        own_rows(self.outs.get(n))
+    }
+
     /// The addresses the body asked for, in the order it asked.
     #[must_use]
     pub fn taken(&self) -> &[*mut c_void] {
@@ -264,6 +140,13 @@ impl<'a> Handles<'a> {
 fn width(at: Option<&BoundArg>, what: &'static str) -> Result<i32, Refusal> {
     let w = at.ok_or(Refusal::Absent { what })?.width;
     i32::try_from(w).ok().filter(|w| *w > 0).ok_or(Refusal::Absent { what })
+}
+
+/// One operand's OWN row count, zero where it has none — no refusal, because
+/// zero is this crate's word for "no extent" and the reader's fallback is the
+/// launch's rectangle.
+fn own_rows(at: Option<&BoundArg>) -> i32 {
+    at.map_or(0, |a| i32::try_from(a.rows).unwrap_or(0))
 }
 
 // ── The arms ──────────────────────────────────────────────────────────────
@@ -337,10 +220,10 @@ pub fn split_qwen_gdn_ba_bf16(
 
 /// `layout::embed_bf16`, as the STATEMENT sources it.
 ///
-/// The token ids and the vocabulary left this list when they became asks: a
-/// column carries what the statement placed, and a fact the body asks for
-/// reaches the kernel through `Answering` instead. Comparing the column
-/// against a hand list that still held them compared two different questions.
+/// The token ids and the vocabulary left this list when they stopped being
+/// the statement's: a column carries what the statement placed. The token-id
+/// stream is a runtime operand the resolver answers now, and the vocabulary
+/// rides the params run.
 #[cfg(test)]
 pub fn embed_bf16(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let weight = ArgValue::Ptr(f.weight_named(0)?);
@@ -444,48 +327,33 @@ fn as_declared(t: Option<kernels::Ty>, v: ArgValue) -> ArgValue {
 
 
 
-/// One half of a [`Source::Times`] or a [`Source::Over`], as a number.
-///
-/// The arithmetic sources compose — a factor may itself be a chain or another
-/// product — so this is [`operand`] again with the answer narrowed. A POINTER
-/// is not a factor: it refuses by the parameter's name rather than being cast
-/// to one, because an address multiplied by a width is a grid nothing checks.
-fn count(o: &mut Handles<'_>, f: Facts<'_>, d: &Derived, source: Source) -> Result<i32, Refusal> {
-    let too_wide = || Refusal::Unstated { what: "a factor that fits an `i32`" };
-    match operand(o, f, d, Some(source))? {
-        ArgValue::I32(n) => Ok(n),
-        ArgValue::U32(n) => i32::try_from(n).map_err(|_| too_wide()),
-        ArgValue::Usize(n) => i32::try_from(n).map_err(|_| too_wide()),
-        ArgValue::I64(n) => i32::try_from(n).map_err(|_| too_wide()),
-        _ => Err(Refusal::Unstated { what: d.name }),
-    }
-}
-
 /// One operand, from where its [`Source`] says it comes.
 ///
-/// Handles are the statement's own, minted in the order asked. Facts go
-/// through the accessors the hand arms use and refuse in the same words. The
-/// aggregates refuse by design — they cannot be `Copy` and lifetime-free — so
-/// a symbol needing one keeps its hand arm. The binder computes nothing.
+/// Handles are the statement's own, minted in the order asked. The arm set is
+/// what a DERIVED COLUMN can spell now, and nothing more: the marks resolve
+/// to slots (`In`/`Out`/`InOut`/`Const`), the weight run to the two named
+/// chains, and the params run to its two readings. Every keyed fact this
+/// match once answered — the KV geometry, the workspaces, the state slabs,
+/// the streams — reaches a routine as a runtime OPERAND instead, resolved by
+/// the fire's resolver over `bind::views` before this binder ever runs. The
+/// catch-all refusal is the design, not a to-do.
 fn operand(
     o: &mut Handles<'_>,
     f: Facts<'_>,
     d: &Derived,
     source: Option<Source>,
 ) -> Result<ArgValue, Refusal> {
-    let ptr = |p: *const i32| ArgValue::Ptr(p.cast_mut().cast::<c_void>());
-    /// The same, for a fact whose declared pointee is not `i32`.
-    fn anyptr<T>(p: *const T) -> ArgValue {
-        ArgValue::Ptr(p.cast_mut().cast::<c_void>())
-    }
-    // Total, per the YaRN keys' declarations: absence is `NONE`'s numbers.
-    fn yarn_or_none(f: Facts<'_>) -> kernels_cuda::rope::Yarn {
-        f.cx.yarn().unwrap_or(kernels_cuda::rope::Yarn::NONE)
-    }
     // A statement places a region — address, row count, pitch — and the
-    // SIGNATURE decides how much to keep. A missing width is zero, not a refusal.
-    let region = |v: ArgValue, width: i32| match v {
-        ArgValue::Ptr(p) => ArgValue::Region { ptr: p, rows: f.rows.count, width },
+    // SIGNATURE decides how much to keep. A missing width is zero, not a
+    // refusal. The rows are the operand's OWN where it has them (a NAMED
+    // stream staged whole — a CSR carries its boundary count), the launch's
+    // rectangle everywhere else.
+    let region = |v: ArgValue, own: i32, width: i32| match v {
+        ArgValue::Ptr(p) => ArgValue::Region {
+            ptr: p,
+            rows: if own > 0 { own } else { f.rows.count },
+            width,
+        },
         other => other,
     };
     match source {
@@ -494,479 +362,25 @@ fn operand(
         // the same offset off the same `Source::Alias`.
         Some(Source::Alias(n, _)) => {
             let width = o.in_width(n as usize).unwrap_or(0);
-            o.input(n as usize).map(|v| region(v, width))
+            let own = o.in_rows(n as usize);
+            o.input(n as usize).map(|v| region(v, own, width))
         }
         // The statement's own three.
         Some(Source::Slot(Kind::In, n)) => {
             let width = o.in_width(n as usize).unwrap_or(0);
-            o.input(n as usize).map(|v| region(v, width))
+            let own = o.in_rows(n as usize);
+            o.input(n as usize).map(|v| region(v, own, width))
         }
         Some(Source::Slot(Kind::Out, n)) => {
             let width = o.out_width(n as usize).unwrap_or(0);
-            o.output(n as usize).map(|v| region(v, width))
+            let own = o.out_rows(n as usize);
+            o.output(n as usize).map(|v| region(v, own, width))
         }
         // NOT A REGION: a weight's shape is the MODEL's, not the statement's.
         Some(Source::Slot(Kind::Weight, n)) => o.weight(n as usize),
-        Some(Source::Named(<keys::NamedWeight as keys::Fact>::KEY)) => f.weight_named(0).map(ArgValue::Ptr),
-        // The second bank: `sample::lm_head_gemv_argmax_int8` names two weights.
-        Some(Source::Named(<keys::NamedWeight2 as keys::Fact>::KEY)) => f.weight_named(1).map(ArgValue::Ptr),
-
-        // THE WEIGHT CHAIN: the named bank first, the positional one after.
-        //
-        // Both halves are arms directly above, and for the five marks that was
-        // the whole of it — `Weight<N, _>` derived the named one and
-        // `Bank<N, _>` the positional one, so each reached its own arm and no
-        // chain existed to resolve. The four marks resolve ONE mark to BOTH:
-        // `Const<Tensor<E>>` derives `Or(Named("weight"), Slot(Kind::Weight,
-        // 0))` for every weight a routine takes. Without this arm that chain
-        // fell to the catch-all and EVERY weight refused "nothing states
-        // weight" — `layout::embed_bf16`, the first launch of every fire, so
-        // no model reached its second kernel.
-        //
-        // `kernels::bind` carries the same arm for the shader planes and says
-        // the same thing; this is the CUDA half of it.
-        //
-        // Order matters, and so does what each half COSTS. `Facts` accessors
-        // read and mint nothing, so a discarded first half shifts no handle;
-        // `o.weight(n)` is the one that numbers into `taken`, and it is
-        // reached only on the fallback.
-        Some(Source::Or(&Source::Named(key), fallback)) => {
-            match operand(o, f, d, Some(Source::Named(key))) {
-                Ok(v) => Ok(v),
-                Err(_) => operand(o, f, d, Some(*fallback)),
-            }
-        }
-        // THE SCALAR CHAIN: the statement's own scalar first, a fact or a
-        // literal after. ZERO IS ABSENT — a grid axis of zero launches
-        // nothing, so a statement carrying one is stating no preference.
-        //
-        // Safe for the reason the weight chain is, and the reason is the other
-        // way round: `param` reads the wire run and mints nothing at all, so
-        // it is the FALLBACK here that may number a handle, and it runs once.
-        Some(Source::Or(&Source::Slot(Kind::Param, n), fallback)) => {
-            match f.cx.param(n as usize).ok().filter(|v| *v > 0) {
-                Some(stated) => Ok(ArgValue::U32(stated)),
-                None => operand(o, f, d, Some(*fallback)),
-            }
-        }
-        // THE SLOT CHAIN: a statement's own operand first, a fact after.
-        //
-        // `arms/fa2.rs`'s `o_or` written as a source. That function read
-        // `cx.arg_out(0)` and fell back on the guard's arena slot when the
-        // text declined to declare a result, and it was called from six arms;
-        // `Or(Slot(Out, 0), Named(AttnOOut))` is the same chain said once, at
-        // the parameter, where the routine's own signature can carry it.
-        //
-        // Safe for the reason the two chains above are, and the reason must be
-        // checked rather than assumed: every `Handles` accessor refuses BEFORE
-        // it mutates `taken`, so a discarded first half numbers no handle and
-        // the fallback's is the only one that lands. An accessor that minted
-        // first would shift every handle after it.
-        //
-        // AFTER the `Param` arm and not before: that one reads the wire run
-        // and treats a stated zero as absent, which this must not do -- slot
-        // zero is a real operand.
-        Some(Source::Or(&Source::Slot(kind, n), fallback)) => {
-            match operand(o, f, d, Some(Source::Slot(kind, n))) {
-                Ok(v) => Ok(v),
-                Err(_) => operand(o, f, d, Some(*fallback)),
-            }
-        }
-        // A CHAIN WHOSE FIRST HALF IS ITSELF COMPOSITE, which the three arms
-        // above cannot spell as patterns. Recursion answers it and the same
-        // minting rule holds, because it is the accessors' and not this
-        // function's.
-        Some(Source::Or(first, fallback)) => match operand(o, f, d, Some(*first)) {
-            Ok(v) => Ok(v),
-            Err(_) => operand(o, f, d, Some(*fallback)),
-        },
-
-        // ARITHMETIC ON WHAT IS KNOWN. Both halves are themselves sources,
-        // because a factor may be a chain: `rms_strided_head_row` wants a row's
-        // width over one head's length, and a statement may carry the head
-        // length where the fire answers when it does not.
-        //
-        // `kernels::bind` carries these two for the shader planes and has
-        // since before this file had either. Their absence here was not a
-        // refusal by design -- the catch-all below said `Unstated` with the
-        // parameter's name, which reads as *"nothing states it"* about a
-        // parameter whose source is fully stated and merely unresolved.
-        Some(Source::Times(a, b)) => {
-            let (x, y) = (count(o, f, d, *a)?, count(o, f, d, *b)?);
-            Ok(ArgValue::I32(x.saturating_mul(y)))
-        }
-        Some(Source::Over(a, b)) => {
-            let divisor = count(o, f, d, *b)?;
-            if divisor == 0 {
-                return Err(Refusal::Empty { what: "a divisor" });
-            }
-            Ok(ArgValue::I32(count(o, f, d, *a)? / divisor))
-        }
-
-        // Extents the statement carries. Not arithmetic -- a width is read.
-        Some(Source::Slot(Kind::InWidth, n)) => o.in_width(n as usize).map(ArgValue::I32),
-        Some(Source::Slot(Kind::OutWidth, n)) => o.out_width(n as usize).map(ArgValue::I32),
-        Some(Source::Named(<keys::Rows as keys::Fact>::KEY)) => Ok(ArgValue::I32(f.rows.count)),
-
-        // A REGION'S OWN SIZE: only result `n` knows, so nothing can disagree.
-        Some(Source::Slot(Kind::OutElements, n)) => o
-            .out_width(n as usize)
-            .map(|w| ArgValue::I32(f.rows.count.saturating_mul(w))),
-
-        // The fire's, through the accessors the hand arms use.
-        Some(Source::Named(<keys::TokenIds as keys::Fact>::KEY)) => f.token_ids().map(ptr),
-        Some(Source::Named(<keys::Positions as keys::Fact>::KEY)) => f.positions().map(ptr),
-        Some(Source::Named(<keys::SamplingIndices as keys::Fact>::KEY)) => f.sampling_indices().map(ptr),
-        Some(Source::Named(<keys::KvPageSize as keys::Fact>::KEY)) => f.page_size().map(ArgValue::I32),
-
-        // THE THREE FIELDS OF A LAYER VIEW THAT ARE NUMBERS; dtype, scheme and
-        // page strides stay refused. `KvHeadDim` is NOT `HeadDim` — see above.
-        Some(Source::Named(<keys::KvHeadDim as keys::Fact>::KEY)) => f.kv_head_dim().map(ArgValue::I32),
-        Some(Source::Named(<keys::KvNumHeads as keys::Fact>::KEY)) => f.kv_layer_heads().map(ArgValue::I32),
-        Some(Source::Named(<keys::KvHndLayout as keys::Fact>::KEY)) => {
-            f.kv_hnd().map(ArgValue::Bool)
-        }
-
-        // Zero is the PLAIN KIND, not absence: `if per_head_dim == 0 { width }`.
-        Some(Source::Named(<keys::PerHeadDim as keys::Fact>::KEY)) => Ok(ArgValue::I32(f.per_head_dim().unwrap_or(0))),
-        Some(Source::Named(<keys::Vocab as keys::Fact>::KEY)) => f.vocab().map(ArgValue::I32),
-        Some(Source::Named(<keys::PleDim as keys::Fact>::KEY)) => f.ple_dim().map(ArgValue::I32),
-        Some(Source::Named(<keys::RmsEps as keys::Fact>::KEY)) => f.rms_eps().map(ArgValue::F32),
-        Some(Source::Named(<keys::Theta as keys::Fact>::KEY)) => f.theta().map(ArgValue::F32),
-        // NOT `Theta`: this is the fire's field, and gemma-4 makes them differ.
-        Some(Source::Named(<keys::RopeTheta as keys::Fact>::KEY)) => f.rope_theta().map(ArgValue::F32),
-
-        // TOTAL ON `DispatchCtx`, SO THE FALLBACK IS THE FACT AND NOT A GUESS:
-        // `false` and `1.0` are what a router that says nothing means.
-        Some(Source::Named(<keys::MoeNormTopk as keys::Fact>::KEY)) => {
-            Ok(ArgValue::Bool(f.moe_norm_topk().unwrap_or(false)))
-        }
-        Some(Source::Named(<keys::MoeRoutedScaling as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(f.moe_routed_scaling().unwrap_or(1.0)))
-        }
-        // The same, both from `MlpGate::SiluClamped`; the numbers are gpt-oss's.
-        Some(Source::Named(<keys::GluAlpha as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(f.glu_alpha().unwrap_or(1.702)))
-        }
-        Some(Source::Named(<keys::GluLimit as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(f.glu_limit().unwrap_or(7.0)))
-        }
-        // AND THE FOURTH REFUSES: a dense fire gets `Unstated`, not a zero.
-        Some(Source::Named(<keys::ExpertsPerToken as keys::Fact>::KEY)) => f.experts_per_token().map(ArgValue::I32),
-        // `Option` for the inverse reason: 1.0 is gemma-4's real scale.
-        Some(Source::Named(<keys::SmScale as keys::Fact>::KEY)) => f.sm_scale().map(ArgValue::F32),
-        Some(Source::Named(<keys::RotaryWidth as keys::Fact>::KEY)) => f.rotary_width().map(ArgValue::I32),
-        Some(Source::Named(<keys::WindowLeft as keys::Fact>::KEY)) => f.window_left().map(ArgValue::I32),
-        Some(Source::Named(<keys::HeadDim as keys::Fact>::KEY)) => f.head_dim().map(ArgValue::I32),
-        Some(Source::Named(<keys::NumQHeads as keys::Fact>::KEY)) => f.q_heads().map(ArgValue::I32),
-        Some(Source::Named(<keys::NumKvHeads as keys::Fact>::KEY)) => f.kv_heads().map(ArgValue::I32),
-        Some(Source::Named(<keys::RequestCount as keys::Fact>::KEY)) => f.requests().map(ArgValue::I32),
-
-        // §2 of `keys.rs`. A pointee is documentation; the key buys the name.
-        Some(Source::Named(<keys::KvKeys as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| anyptr(l.k_pages.cast_const()))
-        }
-        Some(Source::Named(<keys::KvValues as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| anyptr(l.v_pages.cast_const()))
-        }
-        Some(Source::Named(<keys::KvHasEnvelopes as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::Bool(l.has_envelopes))
-        }
-
-        // THE PLAN'S ARRAYS: `AttnCtx` carries a `Vec` and arrives borrowed.
-        Some(Source::Named(<keys::KvPageIndices as keys::Fact>::KEY)) => {
-            f.cx.plan().map(|p| anyptr(p.kv_page_indices))
-        }
-        Some(Source::Named(<keys::KvPageIndptr as keys::Fact>::KEY)) => {
-            f.cx.plan().map(|p| anyptr(p.kv_page_indptr))
-        }
-        Some(Source::Named(<keys::KvLastPageLens as keys::Fact>::KEY)) => {
-            f.cx.plan().map(|p| anyptr(p.kv_last_page_lens))
-        }
-
-        // ── The linear-attention shape, and the plan's last two. `Cx::gdn` and
-        // `Cx::plan` answered all along; a `keys::` type was the missing half.
-        Some(Source::Named(<keys::GdnKHeads as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.k_h))
-        }
-        Some(Source::Named(<keys::GdnVHeads as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.v_h))
-        }
-        Some(Source::Named(<keys::GdnKDim as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.k_d))
-        }
-        Some(Source::Named(<keys::GdnVDim as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.v_d))
-        }
-        Some(Source::Named(<keys::GdnConvDim as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.conv_dim))
-        }
-        // THE TWO STRIDES STAY 64-BIT: the product overflows `i32` at scale.
-        Some(Source::Named(<keys::GdnConvStride as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I64(g.conv_stride_elems))
-        }
-        Some(Source::Named(<keys::GdnStateStride as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I64(g.state_stride_elems))
-        }
-        Some(Source::Named(<keys::GdnSlotIds as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| anyptr(g.slot_ids_d))
-        }
-        Some(Source::Named(<keys::GdnWriteState as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::Bool(g.write_state))
-        }
-        // THE TWO `arms/norm.rs` ASKED FOR BY NAME.
-        Some(Source::Named(<keys::AltupActive as keys::Fact>::KEY)) => f
-            .cx
-            .altup_active()
-            .map(ArgValue::I32)
-            .ok_or(Refusal::Unstated { what: "which altup stream is active" }),
-        Some(Source::Named(<keys::LayerScale as keys::Fact>::KEY)) => f
-            .cx
-            .named_scale("layer_scale")
-            .map(ArgValue::F32)
-            .ok_or(Refusal::Unstated { what: "the layer's residual scale" }),
-
-        // THE PREFILL CARVE, OFF ITS OWN QUERY: a key taking a "which carve"
-        // argument would let a prefill launcher bind the decode storage.
-        Some(Source::Named(<keys::AttnPrefillWorkspaceFloat as keys::Fact>::KEY)) => {
-            f.cx.attn_prefill_workspace().map(|w| ArgValue::Ptr(w.float_buffer))
-        }
-        Some(Source::Named(<keys::AttnPrefillWorkspaceInt as keys::Fact>::KEY)) => {
-            f.cx.attn_prefill_workspace().map(|w| ArgValue::Ptr(w.int_buffer))
-        }
-        Some(Source::Named(<keys::AttnPrefillWorkspaceFloatBytes as keys::Fact>::KEY)) => {
-            f.cx.attn_prefill_workspace().map(|w| ArgValue::Usize(w.float_bytes))
-        }
-        Some(Source::Named(<keys::AttnPrefillWorkspaceIntBytes as keys::Fact>::KEY)) => {
-            f.cx.attn_prefill_workspace().map(|w| ArgValue::Usize(w.int_bytes))
-        }
-
-        // THE ATTENTION WORKSPACE; byte counts keyed beside their buffers.
-        Some(Source::Named(<keys::AttnWorkspaceFloat as keys::Fact>::KEY)) => {
-            f.cx.attn_workspace().map(|w| ArgValue::Ptr(w.float_buffer))
-        }
-        Some(Source::Named(<keys::AttnWorkspaceInt as keys::Fact>::KEY)) => {
-            f.cx.attn_workspace().map(|w| ArgValue::Ptr(w.int_buffer))
-        }
-        Some(Source::Named(<keys::AttnWorkspaceFloatBytes as keys::Fact>::KEY)) => {
-            f.cx.attn_workspace().map(|w| ArgValue::Usize(w.float_bytes))
-        }
-        Some(Source::Named(<keys::AttnWorkspaceIntBytes as keys::Fact>::KEY)) => {
-            f.cx.attn_workspace().map(|w| ArgValue::Usize(w.int_bytes))
-        }
-
-        // THE TWO STATE SLABS, two keys: an index makes a misspelling writable.
-        Some(Source::Named(<keys::GdnConvSlab as keys::Fact>::KEY)) => {
-            f.cx.slab(kernels_cuda::ssm::Slab::Conv).map(ArgValue::Ptr)
-        }
-        Some(Source::Named(<keys::GdnRecurrentSlab as keys::Fact>::KEY)) => {
-            f.cx.slab(kernels_cuda::ssm::Slab::Recurrent).map(ArgValue::Ptr)
-        }
-        Some(Source::Named(<keys::QoIndptr as keys::Fact>::KEY)) => {
-            f.cx.plan().map(|p| anyptr(p.qo_indptr))
-        }
-        Some(Source::Named(<keys::RowValid as keys::Fact>::KEY)) => {
-            f.cx.plan().map(|p| anyptr(p.row_valid))
-        }
-        Some(Source::Named(<keys::KvEnvMin as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| anyptr(l.k_env_min))
-        }
-        Some(Source::Named(<keys::KvEnvMax as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| anyptr(l.k_env_max))
-        }
-        Some(Source::Named(<keys::KvKeyScales as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::Ptr(l.k_scales))
-        }
-        Some(Source::Named(<keys::KvValueScales as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::Ptr(l.v_scales))
-        }
-        Some(Source::Named(<keys::KvBlockSize as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::I32(l.block_size))
-        }
-        Some(Source::Named(<keys::KvSchemeByte as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::I32(l.scheme as i32))
-        }
-        Some(Source::Named(<keys::KvStorageDtype as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::I32(l.storage_dtype as i32))
-        }
-        Some(Source::Named(<keys::KvBf16Keys as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::Ptr(l.k_bf16_pages))
-        }
-        Some(Source::Named(<keys::KvBf16Values as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::Ptr(l.v_bf16_pages))
-        }
-        Some(Source::Named(<keys::KvPagesInBatch as keys::Fact>::KEY)) => {
-            f.cx.num_pages_in_batch().map(ArgValue::I32)
-        }
-        Some(Source::Named(<keys::KvMaxPagesPerRequest as keys::Fact>::KEY)) => {
-            f.cx.max_pages_per_request().map(ArgValue::I32)
-        }
-        Some(Source::Named(<keys::PeelWindow as keys::Fact>::KEY)) => {
-            f.cx.peel_window().map(|p| ArgValue::Ptr(p.as_ptr().cast()))
-        }
-        Some(Source::Named(<keys::RopeInterleaved as keys::Fact>::KEY)) => {
-            Ok(ArgValue::Bool(f.cx.rope_interleaved()))
-        }
-        Some(Source::Named(<keys::FirstToken as keys::Fact>::KEY)) => {
-            f.cx.first_token().map(ArgValue::I32)
-        }
-        Some(Source::Named(<keys::YarnFactor as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(yarn_or_none(f).factor))
-        }
-        Some(Source::Named(<keys::YarnBetaFast as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(yarn_or_none(f).beta_fast))
-        }
-        Some(Source::Named(<keys::YarnBetaSlow as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(yarn_or_none(f).beta_slow))
-        }
-        Some(Source::Named(<keys::YarnAttentionFactor as keys::Fact>::KEY)) => {
-            Ok(ArgValue::F32(yarn_or_none(f).attention_factor))
-        }
-        Some(Source::Named(<keys::YarnOriginalMaxPosition as keys::Fact>::KEY)) => {
-            Ok(ArgValue::I32(yarn_or_none(f).original_max_position))
-        }
-        Some(Source::Named(<keys::AttnLseOut as keys::Fact>::KEY)) => {
-            f.cx.lse_out().map(|p| ArgValue::Ptr(p.cast()))
-        }
-        Some(Source::Named(<keys::AttnLogitsSoftCap as keys::Fact>::KEY)) => {
-            f.cx.logits_soft_cap().map(ArgValue::F32)
-        }
-        Some(Source::Named(<keys::FinalLogitSoftcap as keys::Fact>::KEY)) => {
-            f.cx.final_logit_softcap().map(ArgValue::F32)
-        }
-        Some(Source::Named(<keys::KvNativeBf16 as keys::Fact>::KEY)) => {
-            f.cx.kv_layer().map(|l| ArgValue::Bool(l.is_native_bf16))
-        }
-        Some(Source::Named(<keys::RowsTotal as keys::Fact>::KEY)) => {
-            Ok(ArgValue::I32(i32::try_from(f.cx.rows().total).unwrap_or(0)))
-        }
-        Some(Source::Named(<keys::KvWritePage as keys::Fact>::KEY)) => {
-            f.cx.w_page_d().map(|p| anyptr(p))
-        }
-        Some(Source::Named(<keys::KvWriteOffset as keys::Fact>::KEY)) => {
-            f.cx.w_off_d().map(|p| anyptr(p))
-        }
-        Some(Source::Named(<keys::KvWritePageOrNull as keys::Fact>::KEY)) => {
-            Ok(anyptr(f.cx.w_page_d().unwrap_or(core::ptr::null())))
-        }
-        Some(Source::Named(<keys::KvWriteOffsetOrNull as keys::Fact>::KEY)) => {
-            Ok(anyptr(f.cx.w_off_d().unwrap_or(core::ptr::null())))
-        }
-
-        // THE SUFFIXED WEIGHTS, refused here because an unindexed absence is
-        // `Unstated`. NOT `Fire::weight_bias` (`weight_named(1)`, the conv's
-        // stated second name) — a different fact that shared the accessor.
-        Some(Source::Named(<keys::WeightBias as keys::Fact>::KEY)) => f
-            .cx
-            .weight_suffixed("_bias")
-            .map(ArgValue::Ptr)
-            .ok_or(Refusal::Unstated { what: "the statement's bias weight" }),
-        Some(Source::Named(<keys::WeightScales as keys::Fact>::KEY)) => f
-            .cx
-            .weight_suffixed("_scales")
-            .map(ArgValue::Ptr)
-            .ok_or(Refusal::Unstated { what: "the statement's scales weight" }),
-        // THE ARRAY, NOT THE BANK. `arms/quant.rs` filled these two by hand
-        // and said why: the kernel's first act is `packed_ptrs[expert]`, and
-        // the weight chain answers the bank's own base for both of its halves.
-        Some(Source::Named(<keys::WeightExpertPtrs as keys::Fact>::KEY)) => f
-            .cx
-            .weight_suffixed("_ptrs")
-            .map(ArgValue::Ptr)
-            .ok_or(Refusal::Unstated {
-                what: "a per-expert pointer array for this bank; \
-                       `serve::load::build_moe_expert_ptrs` builds one per plane at load, \
-                       so its absence means the bank's byte count did not divide by the \
-                       row's `n_experts`",
-            }),
-        Some(Source::Named(<keys::WeightExpertScalePtrs as keys::Fact>::KEY)) => f
-            .cx
-            .weight_suffixed("_scales_ptrs")
-            .map(ArgValue::Ptr)
-            .ok_or(Refusal::Unstated {
-                what: "a per-expert scale pointer array for this bank; see `_ptrs`",
-            }),
-        Some(Source::Named(<keys::WeightUpBias as keys::Fact>::KEY)) => f
-            .cx
-            .weight_suffixed("_up_bias")
-            .map(ArgValue::Ptr)
-            .ok_or(Refusal::Unstated { what: "the statement's up-bias weight" }),
-        Some(Source::Named(<keys::WeightGateBias as keys::Fact>::KEY)) => f
-            .cx
-            .weight_suffixed("_gate_bias")
-            .map(ArgValue::Ptr)
-            .ok_or(Refusal::Unstated { what: "the statement's gate-bias weight" }),
         // Two arms: a param is a byte run, so `f32` is a different channel.
         Some(Source::Slot(Kind::Param, n)) => f.cx.param(n as usize).map(ArgValue::U32),
         Some(Source::Slot(Kind::ParamF32, n)) => f.cx.param_f32(n as usize).map(ArgValue::F32),
-
-        // WHAT A LAUNCHER THAT PLANS ITS OWN FIRE READS.
-        //
-        // This header said "THE FA2 DECODE PLAN, LEAF BY LEAF" over nineteen
-        // arms; the leaves are gone and so are `fa2_decode_leaves` and its
-        // prefill twin -- a statement names its plan as an operand now.
-        //
-        // What is left is not a leaf and never was: a leaf is read OFF a plan
-        // and this is read to BUILD one, so it comes straight off the
-        // attention context. The plan it names is not valid until the
-        // launcher has filled it, which is why no fold could have answered.
-        Some(Source::Named(<keys::Fa2PrefillPlanCache as keys::Fact>::KEY)) => {
-            let a = f.cx.attn_ctx()?;
-            // The layer index was read here and handed to `attn_plan`, which
-            // used it to pick between decode's two schedules. That choice is
-            // gone -- see `attn_plan` -- and the read went with it.
-            let raised = super::attn_plan(a);
-            if raised.is_null() {
-                return Err(Refusal::Unstated { what: "a prefill plan cache to fill" });
-            }
-            Ok(ArgValue::Ptr(raised))
-        }
-        Some(Source::Named(<keys::QoIndptrHost as keys::Fact>::KEY)) => {
-            let a = f.cx.attn_ctx()?;
-            if a.qo_indptr_h.is_null() {
-                return Err(Refusal::Absent { what: "the host QO indptr the planner walks" });
-            }
-            Ok(anyptr(a.qo_indptr_h))
-        }
-        Some(Source::Named(<keys::KvPageIndptrHost as keys::Fact>::KEY)) => {
-            let a = f.cx.attn_ctx()?;
-            if a.kv_page_indptr_h.is_null() {
-                return Err(Refusal::Absent { what: "the host KV page indptr the planner walks" });
-            }
-            Ok(anyptr(a.kv_page_indptr_h))
-        }
-        Some(Source::Named(<keys::FireRequests as keys::Fact>::KEY)) => {
-            f.requests().map(ArgValue::I32)
-        }
-        // THE TWO RAGGED SINKS, and NULL is an answer for all four: a capture
-        // that captures nothing and a mask that masks nothing are legitimate,
-        // and the launcher's own test is what decides. An `Absent` refusal
-        // here would refuse the ordinary case.
-        Some(Source::Named(<keys::AttnScoreOut as keys::Fact>::KEY)) => {
-            f.cx.attn_ctx().map(|a| anyptr(a.score_out.cast_const()))
-        }
-        Some(Source::Named(<keys::AttnScoreIndptr as keys::Fact>::KEY)) => {
-            f.cx.attn_ctx().map(|a| ptr(a.score_indptr_d))
-        }
-        Some(Source::Named(<keys::AttnMask as keys::Fact>::KEY)) => {
-            f.cx.attn_ctx().map(|a| anyptr(a.mask_d))
-        }
-        Some(Source::Named(<keys::AttnMaskIndptr as keys::Fact>::KEY)) => {
-            f.cx.attn_ctx().map(|a| ptr(a.mask_indptr_d))
-        }
-        Some(Source::Named(<keys::AttnScoreWindow as keys::Fact>::KEY)) => {
-            f.cx.attn_ctx().map(|a| ArgValue::U32(a.score_window))
-        }
-
-        // A LITERAL NEEDS NEITHER `Handles` NOR `Facts`, and is not a default:
-        // each is a number every call site passes the same.
-        Some(Source::Lit(l)) => Ok(match l {
-            Lit::Null => ArgValue::Ptr(core::ptr::null_mut()),
-            Lit::Bool(b) => ArgValue::Bool(b),
-            Lit::F32(x) => ArgValue::F32(x),
-            Lit::I32(n) => ArgValue::I32(n),
-        }),
-        // Every accessor refuses BEFORE it mutates `taken`; `.or_else` needs it.
 
         // Everything else refuses; the refusal is the design, not a to-do.
         _ => Err(Refusal::Unstated { what: d.name }),
@@ -1026,9 +440,9 @@ pub unsafe fn dispatch(
     // ARITHMETIC and not the operands, so every address below binds correctly
     // and the launch computes the wrong thing -- the one failure a refusal
     // cannot catch after the fact.
-    if row.no_join && (!spec.aux.is_empty() || spec.per_head_dim.is_some()) {
+    if row.no_join && !spec.aux.is_empty() {
         return Some(Err(Refusal::Unstated {
-            what: "a dispatch without an aux value or a per-head reading",
+            what: "a dispatch without an aux value",
         }));
     }
     let args = operands(&mut handles, Facts::at(cx), row.derived, row.sources, row.args);
@@ -1050,26 +464,15 @@ pub unsafe fn dispatch(
     // Deliberately expensive: it synchronises the stream. A diagnostic that
     // changed the schedule it is measuring would be worse than none.
     let peek = tracing("PIE_TRACE_VALUES");
-    // WHAT THE BODY MAY STILL ASK FOR. `Env` left the parameter list, so a
-    // fact only the fire can answer is no longer bound into `args` above --
-    // the body asks, and this lends it the same `Handles` and `Facts` the
-    // column was just bound from.
-    let answering = Answering {
-        handles: core::cell::RefCell::new(handles),
-        facts: Facts::at(cx),
-    };
+    // The `Answering` handoff stood here: the same `Handles` and `Facts` the
+    // column was bound from, lent to the body for `ctx.ask`. Zero routines on
+    // this plane ask now -- the signature carries all data -- so the column
+    // above IS the whole binding and the body gets no environment.
+    drop(handles);
     // SAFETY: this function's own contract, forwarded unchanged. Every pointer
     // the column bound came from `bound.args` or a `Facts` field the dispatch
     // site resolved; anything from nowhere at all is a refusal, not a null.
-    let fired = unsafe {
-        kernels_cuda::call_answering(
-            symbol,
-            &args,
-            stream,
-            cx.cublas(),
-            Some(&answering),
-        )
-    };
+    let fired = unsafe { kernels_cuda::call_with_cublas(symbol, &args, stream, cx.cublas()) };
     if peek && fired.is_ok() {
         peek_results(symbol, &args, spec.n_in, stream);
     }
@@ -1141,51 +544,6 @@ fn tracing(var: &'static str) -> bool {
 /// A bf16 bit pattern as the float it stands for.
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
-}
-
-/// THIS FIRE'S ANSWERS, for a body that asks.
-///
-/// The answering side of the `Env` -> `ask` move, and it answers with exactly
-/// what the column answered with: [`operand`], over the same [`Handles`] and
-/// the same [`Facts`]. Nothing new resolves — what changed is only that the
-/// question can now be asked from inside a body instead of having to be a
-/// parameter for the column to carry it.
-///
-/// `RefCell` because answering MINTS -- a staged fact takes a handle -- while
-/// a body holds only a `&self`. The column's own borrow has ended by the time
-/// the body runs, so the two never overlap.
-pub(crate) struct Answering<'a> {
-    handles: core::cell::RefCell<Handles<'a>>,
-    facts: Facts<'a>,
-}
-
-impl<'a> Answering<'a> {
-    // `over_facts` STOOD HERE: an `Answering` with an empty handle side, for
-    // a hand-written arm that places its own pointers and asks only for
-    // facts, so that a body reaching for a SLOT on one was refused. It had no
-    // callers left. Hand arms went to the routine path, and `route.rs` shows
-    // the same retirement from the other side -- it had stopped naming this
-    // module at all, leaving `use super::table;` behind as an unused import.
-    // Everything that answers now answers over real operands.
-}
-
-impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Answering<'_> {
-    fn resolve(&self, ty: kernels::Ty, source: Source) -> Result<ArgValue, Refusal> {
-        // A NAME THE REFUSAL CAN USE. `Derived` carries the parameter's own
-        // identifier, and an asked fact has no parameter -- so it says so
-        // rather than borrowing a neighbour's name.
-        const ASKED: Derived = Derived { name: "a fact the body asked for", nullable: false };
-        let v = operand(&mut self.handles.borrow_mut(), self.facts, &ASKED, Some(source))?;
-        let v = as_declared(Some(ty), v);
-        // WHAT A BODY ACTUALLY GOT, on request. An ask resolves silently and a
-        // wrong ANSWER is invisible where a missing one is a refusal — so the
-        // one thing that cannot be read off a failing fire is the number the
-        // kernel ran on. `PIE_TRACE_ASKS=1` prints it.
-        if tracing("PIE_TRACE_ASKS") {
-            eprintln!("[ask] {source:?} -> {v:?}");
-        }
-        Ok(v)
-    }
 }
 
 /// The arm a crossed symbol names instead of a hand-written one.
@@ -1457,7 +815,7 @@ mod tests {
     }
 
     fn operand(n: usize, width: u32) -> BoundArg {
-        BoundArg { ptr: at(n), width }
+        BoundArg { ptr: at(n), width, rows: 0 }
     }
 
     /// The crossed symbols are counted, and the count moves on purpose. A

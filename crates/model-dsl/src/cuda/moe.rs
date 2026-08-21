@@ -16,7 +16,7 @@ pub fn dequant_wna16_int4b8(
     record_with_params(
         t,
         Some(l),
-        "quant::dequant_wna16_int4b8_to_bf16",
+        "quant::dequant_wna16_int4b8_to",
         vec![w.to_string()],
         None,
         vec![group_size, out_dim, in_dim],
@@ -38,6 +38,7 @@ builder! {
         topk_idx: &Val,
         intermediate: u32,
         bank: &str,
+        group_size: u32,
     ) -> (Val, Val) {
         symbol: "quant::wna16_gate_up_decode_bf16",
         on: act,
@@ -47,6 +48,7 @@ builder! {
             format!("{bank}.up_packed"),
             format!("{bank}.up_scale"),
         ],
+        params: [group_size],
         inputs: [act, topk_idx],
         outs: [
             [Dim::Tokens, Dim::Const(intermediate)] as BF16,
@@ -58,10 +60,17 @@ builder! {
 
 builder! {
     /// `quant::wna16_down_decode_bf16`: decode down projection.
-    pub fn wna16_down_decode(act: &Val, topk_idx: &Val, hidden: u32, bank: &str) -> Val {
+    pub fn wna16_down_decode(
+        act: &Val,
+        topk_idx: &Val,
+        hidden: u32,
+        bank: &str,
+        group_size: u32,
+    ) -> Val {
         symbol: "quant::wna16_down_decode_bf16",
         on: act,
         weights: [format!("{bank}.down_packed"), format!("{bank}.down_scale")],
+        params: [group_size],
         inputs: [act, topk_idx],
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the projection produces its value",
@@ -69,10 +78,11 @@ builder! {
 
 
     /// `norm::rmsnorm_strided_bf16`: norm a prefix of wider rows; stride keeps the real row pitch.
-    pub fn rmsnorm_strided(x: &Val, weight: &str, hidden: u32) -> Val {
+    pub fn rmsnorm_strided(x: &Val, weight: &str, hidden: u32, eps: f32) -> Val {
         symbol: "norm::rmsnorm_strided_bf16",
         on: x,
         weights: [weight],
+        params: [eps.to_bits()],
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the norm produces its value",
@@ -82,13 +92,13 @@ builder! {
 // ── mixtral / gpt-oss: MXFP4 MoE ──────────────────────────────
 // Some statements are weight-shaped launches with no token extent.
 builder! {
-    /// `moe::add_moe_route_bias_bf16`: add route expert bias.
+    /// `moe::add_moe_route_bias`: add route expert bias.
     /// `whole`: `topk_idx` is route-global.
     /// `params[0]` is the destination row pitch (`out_stride`), equal to `width` at this site.
     /// It is not `param_extents`: rows come from the lowered region, pitch from the allocation.
     /// The kernel accumulates into `x`; the signature row must mark output 0 in-place with input 0.
     pub fn add_moe_route_bias(x: &Val, topk_idx: &Val, bias: &str, width: u32) -> Val {
-        symbol: "moe::add_moe_route_bias_bf16",
+        symbol: "moe::add_moe_route_bias",
         on: x,
         weights: [bias],
         params: [width],
@@ -100,10 +110,11 @@ builder! {
 
 builder! {
     /// `norm::rmsnorm_bf16_with_fp16`: publish bf16 and fp16; MXFP4 grouped GEMM consumes fp16.
-    pub fn rmsnorm_with_fp16(x: &Val, weight: &str, hidden: u32) -> (Val, Val) {
+    pub fn rmsnorm_with_fp16(x: &Val, weight: &str, hidden: u32, eps: f32) -> (Val, Val) {
         symbol: "norm::rmsnorm_bf16_with_fp16",
         on: x,
         weights: [weight],
+        params: [eps.to_bits()],
         inputs: [x],
         outs: [
             [Dim::Tokens, Dim::Const(hidden)] as BF16,
@@ -113,29 +124,99 @@ builder! {
     }
 
 
-    /// `rope::rope_write_kv_bf16`: rope q/k and commit k/v pages in one launch.
-    pub fn rope_write_kv(q: &Val, k: &Val, v: &Val, l: u32, q_width: u32) -> Val {
-        symbol: "rope::rope_write_kv_bf16",
-        on: q,
-        layer: Some(l),
-        state: Some(StateRef {
+}
+
+/// `rope::rope_write_kv_bf16`: rope q/k and commit k/v pages in one launch.
+///
+/// The KV view, qo CSR, row validity and positions are operands after the
+/// q/k/v triple; the run is `[interleaved, num_q_heads, num_kv_heads,
+/// head_dim, theta]` — the request count is the CSR operand's own row count.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn rope_write_kv(
+    q: &Val,
+    k: &Val,
+    v: &Val,
+    l: u32,
+    q_width: u32,
+    interleaved: bool,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Val {
+    let t = &q.t;
+    let inputs = vec![
+        q.id,
+        k.id,
+        v.id,
+        rt_object(t, "kv_cache", Some(l)),
+        rt_requests(t, "qo_indptr"),
+        rt_tokens(t, "row_valid"),
+        rt_tokens(t, "positions"),
+    ];
+    record_with_extents(
+        t,
+        Some(l),
+        "rope::rope_write_kv_bf16",
+        vec![],
+        Some(StateRef {
             store: StateStore::KvCache,
             layer: l,
         }),
-        inputs: [q, k, v],
-        out: [Dim::Tokens, Dim::Const(q_width)] as BF16,
-        made: "the fused rope+write produces its value",
-    }
+        vec![
+            u32::from(interleaved),
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            theta.to_bits(),
+        ],
+        vec![],
+        inputs,
+        Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+    )
+    .expect("the fused rope+write produces its value")
 }
 
 /// `quant::mxfp4_scales_to_marlin_e8m0`: repack E8M0 scales into Marlin order.
-pub fn mxfp4_scales_to_marlin(t: &Trace, l: u32, w: &str, groups: u32, rows: u32) -> Val {
-    record(
+///
+/// The eight window scalars are the repack's own geometry and ride the run
+/// in the routine's order: `[source_rows, source_row_offset, valid_rows,
+/// source_stride_groups, source_group_offset, source_groups, row_select,
+/// selected_rows]`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn mxfp4_scales_to_marlin(
+    t: &Trace,
+    l: u32,
+    w: &str,
+    groups: u32,
+    rows: u32,
+    source_rows: u32,
+    source_row_offset: u32,
+    valid_rows: u32,
+    source_stride_groups: u32,
+    source_group_offset: u32,
+    source_groups: u32,
+    row_select: u32,
+    selected_rows: u32,
+) -> Val {
+    record_with_params(
         t,
         Some(l),
         "quant::mxfp4_scales_to_marlin_e8m0",
         vec![w.to_string()],
         None,
+        vec![
+            source_rows,
+            source_row_offset,
+            valid_rows,
+            source_stride_groups,
+            source_group_offset,
+            source_groups,
+            row_select,
+            selected_rows,
+        ],
         vec![],
         Some((
             Shape(vec![Dim::Const(groups), Dim::Const(rows)]),
@@ -155,12 +236,14 @@ pub fn transpose_expert_scales(
     k_groups: u32,
     n: u32,
 ) -> Val {
-    record(
+    record_with_params(
         t,
         Some(l),
         "moe::transpose_expert_scales_u8",
         vec![w.to_string()],
         None,
+        // `[num_experts, n, k_groups]`, the routine's order.
+        vec![experts, n, k_groups],
         vec![],
         Some((
             Shape(vec![
@@ -176,10 +259,18 @@ pub fn transpose_expert_scales(
 
 builder! {
     /// `moe::topk_sigmoid_bias_fp32`: fp32 router with per-expert correction bias.
-    pub fn topk_sigmoid_bias(logits: &Val, bias: &str, top_k: u32) -> (Val, Val) {
+    /// `[normalize, routed_scaling_factor]` is the run.
+    pub fn topk_sigmoid_bias(
+        logits: &Val,
+        bias: &str,
+        top_k: u32,
+        normalize: bool,
+        routed_scaling: f32,
+    ) -> (Val, Val) {
         symbol: "moe::topk_sigmoid_bias_fp32",
         on: logits,
         weights: [bias],
+        params: [u32::from(normalize), routed_scaling.to_bits()],
         inputs: [logits],
         outs: [
             [Dim::Tokens, Dim::Const(top_k)] as I32,
@@ -207,27 +298,51 @@ builder! {
 }
 
 /// `ssm::build_nemotron_moe_ptrs_aligned_bf16`: aligned batched-GEMM pointer arrays.
-pub fn build_nemotron_moe_ptrs_aligned(expert_ids: &Val, aligned_in: &Val, l: u32) {
-    record(
+/// The raised MoE banks are the third operand; `[max_blocks, block_size,
+/// hidden, intermediate]` is the run.
+pub fn build_nemotron_moe_ptrs_aligned(
+    expert_ids: &Val,
+    aligned_in: &Val,
+    l: u32,
+    max_blocks: u32,
+    block_size: u32,
+    hidden: u32,
+    intermediate: u32,
+) {
+    let banks = rt_object(&expert_ids.t, "moe.banks", Some(l));
+    record_with_params(
         &expert_ids.t,
         Some(l),
         "ssm::build_nemotron_moe_ptrs_aligned_bf16",
         vec![],
         None,
-        vec![expert_ids.id, aligned_in.id],
+        vec![max_blocks, block_size, hidden, intermediate],
+        vec![expert_ids.id, aligned_in.id, banks],
         None,
     );
 }
 
 /// `ssm::build_nemotron_moe_ptrs_decode_batched_bf16`: decode pointer arrays.
-pub fn build_nemotron_moe_ptrs_decode(topk_idx: &Val, topk_w: &Val, x: &Val, l: u32) {
-    record(
+/// The raised MoE banks are the fourth operand; `[top_k, hidden,
+/// intermediate]` is the run.
+pub fn build_nemotron_moe_ptrs_decode(
+    topk_idx: &Val,
+    topk_w: &Val,
+    x: &Val,
+    l: u32,
+    top_k: u32,
+    hidden: u32,
+    intermediate: u32,
+) {
+    let banks = rt_object(&topk_idx.t, "moe.banks", Some(l));
+    record_with_params(
         &topk_idx.t,
         Some(l),
         "ssm::build_nemotron_moe_ptrs_decode_batched_bf16",
         vec![],
         None,
-        vec![topk_idx.id, topk_w.id, x.id],
+        vec![top_k, hidden, intermediate],
+        vec![topk_idx.id, topk_w.id, x.id, banks],
         None,
     );
 }
@@ -235,11 +350,19 @@ pub fn build_nemotron_moe_ptrs_decode(topk_idx: &Val, topk_w: &Val, x: &Val, l: 
 // ── MoE: aligned dispatch path ────────────────────────────────
 // Routes are bucketed and padded globally; whole statements use route order from the full fire.
 builder! {
-    /// `moe::topk_sigmoid_bf16`: per-token sigmoid router.
+    /// `moe::topk_sigmoid`: per-token sigmoid router.
     /// Returns `(topk_idx, topk_w)` and is not `whole`.
-    pub fn topk_sigmoid(logits: &Val, top_k: u32) -> (Val, Val) {
-        symbol: "moe::topk_sigmoid_bf16",
+    /// `[renormalize, routed_scaling_factor]` is the run; the correction
+    /// bias stays an optional weight this form does not place.
+    pub fn topk_sigmoid(
+        logits: &Val,
+        top_k: u32,
+        renormalize: bool,
+        routed_scaling: f32,
+    ) -> (Val, Val) {
+        symbol: "moe::topk_sigmoid",
         on: logits,
+        params: [u32::from(renormalize), routed_scaling.to_bits()],
         inputs: [logits],
         outs: [
             [Dim::Tokens, Dim::Const(top_k)] as I32,
@@ -272,22 +395,32 @@ builder! {
     }
 
 
-    /// `moe::gather_moe_aligned_inputs_bf16`: gather block-major operands.
-    /// `params[0]=top_k`, needed to compute `num_routes`; no operand/result carries k.
-    pub fn gather_moe_aligned_inputs(
-        x: &Val,
-        sorted_route_ids: &Val,
-        aligned: Dim,
-        hidden: u32,
-        top_k: u32,
-    ) -> Val {
-        symbol: "moe::gather_moe_aligned_inputs_bf16",
-        on: x,
-        params: [top_k],
-        inputs: [x, sorted_route_ids],
-        out: [aligned, Dim::Const(hidden)] as BF16,
-        made: "the gather produces its value",
-    }
+}
+
+/// `moe::gather_moe_aligned_inputs`: gather block-major operands.
+/// `params = [top_k, tokens]`: `top_k` because no operand/result carries k,
+/// `tokens` because the launch's rows are the STACK's — the fire's token
+/// count is spliced as an extent.
+#[must_use]
+pub fn gather_moe_aligned_inputs(
+    x: &Val,
+    sorted_route_ids: &Val,
+    aligned: Dim,
+    hidden: u32,
+    top_k: u32,
+) -> Val {
+    record_with_extents(
+        &x.t,
+        x.layer,
+        "moe::gather_moe_aligned_inputs",
+        vec![],
+        None,
+        vec![top_k, 0],
+        vec![tokens_extent(1)],
+        vec![x.id, sorted_route_ids.id],
+        Some((Shape(vec![aligned, Dim::Const(hidden)]), DType::BF16)),
+    )
+    .expect("the gather produces its value")
 }
 
 builder! {
@@ -318,17 +451,18 @@ builder! {
     }
 
 
-    /// `moe::reorder_moe_aligned_output_bf16`: undo block permutation to route order.
+    /// `moe::reorder_moe_aligned_output`: undo block permutation to route order.
     pub fn reorder_moe_aligned_output(
         aligned_out: &Val,
         sorted_route_ids: &Val,
         top_k: u32,
         hidden: u32,
     ) -> Val {
-        symbol: "moe::reorder_moe_aligned_output_bf16",
+        symbol: "moe::reorder_moe_aligned_output",
         on: aligned_out,
-        // `params[0]=top_k`; no operand here carries router width.
-        params: [top_k],
+        // No params: the routine's signature marks no Const — the swept
+        // form reads everything off its operands, and a params run the
+        // signature does not claim is a slot nothing reads.
         inputs: [aligned_out, sorted_route_ids],
         out: [Dim::Tokens, Dim::Const(top_k), Dim::Const(hidden)] as BF16,
         made: "the reorder produces its value",

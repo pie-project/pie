@@ -19,7 +19,6 @@ pub mod jit;
 // The facts a launcher can name, as types rather than as words. One fact,
 // one type, one spelling of it in the whole tree.
 pub mod canon;
-pub mod keys;
 pub mod raises;
 pub mod runtime;
 
@@ -842,17 +841,6 @@ pub trait Derivation {
     /// an index and a key in one place.
     const SOURCES: &'static [Option<Source>];
 
-    /// The facts this routine's BODY asks the runtime for, by key.
-    ///
-    /// The column's `Env` half became `ctx.ask::<_, keys::X>()`, which is a
-    /// call and not a declaration — so the driver cross-check that walks
-    /// `SOURCES` asking *"does this backend answer every fact its own kernels
-    /// name"* would have lost half its subject. `#[routine]` scans the body
-    /// for the turbofish and emits the list here instead.
-    ///
-    /// Defaults to empty for the hand-written rows, which have no body to
-    /// scan.
-    const ASKED: &'static [&'static str] = &[];
 }
 
 /// The routine's call surface, on the marker `#[routine]` emits.
@@ -871,30 +859,6 @@ pub trait Signature {
     /// The marks, in signature order, instantiated — the `Ctx` parameter
     /// dropped. A tuple of `In<..> / Out<..> / Const<..> / InOut<..>`.
     type Sig;
-}
-
-/// Is this source the named fact `key`, in a `const` context?
-///
-/// `Source::Named` CANNOT BE MATCHED IN A CONST: `matches!` on a `&str` is
-/// `E0658` and `==` fails the same way, `PartialEq` not yet being a const
-/// trait (rust-lang/rust#143874). The derived-column pins need this.
-#[must_use]
-pub const fn source_is_named(s: &Option<Source>, key: &str) -> bool {
-    let Some(Source::Named(actual)) = s else {
-        return false;
-    };
-    let (a, b) = (actual.as_bytes(), key.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
 /// Which indexed channel a [`Source::Slot`] counts within.
@@ -951,14 +915,6 @@ pub enum Source {
     /// An operand reached by INDEX: the `i`-th of its [`Kind`]. The same
     /// spelling works in expression and pattern position.
     Slot(Kind, u8),
-    /// A fact reached by NAME.
-    ///
-    /// The payload is the key's string, spelled `<keys::X as keys::Fact>::KEY`
-    /// in expression AND pattern position. Not a preference: an associated
-    /// `&'static str` const is a legal pattern, so TWO KEYS WITH THE SAME
-    /// STRING make the second arm an unreachable-pattern warning. A string
-    /// literal loses that, which is why `#[source(Named(..))]` is refused.
-    Named(&'static str),
     /// A CHAIN: the first if the statement carries one, the second
     /// otherwise.
     ///
@@ -1067,13 +1023,6 @@ pub struct KernelSig {
     /// See [`routine::Routine::internal`] for why the source column cannot
     /// carry this and what admitting such a symbol would fire.
     pub internal: bool,
-    /// The facts this routine's BODY asks the environment for.
-    ///
-    /// See [`routine::Routine::asked`]. This is the half of a routine's needs
-    /// that [`Self::sources`] structurally cannot show, and a driver that
-    /// cannot answer one of these must refuse the row at LOAD rather than let
-    /// a fire reach the `ask` and die there.
-    pub asked: &'static [&'static str],
     /// This statement may not be JOINED into another.
     ///
     /// See [`routine::Routine::no_join`]: a precondition is a row fact because
@@ -1086,6 +1035,9 @@ pub struct KernelSig {
     pub driver: bool,
     /// The tier-1 role this routine claims. See [`routine::Routine::canon`].
     pub canon: Option<&'static str>,
+    /// The dtype point this row is instantiated at. See
+    /// [`routine::Routine::point`].
+    pub point: &'static [&'static str],
 }
 
 // `lacks` IS NOT SURPLUS -- ITS READER IS MISSING. Zero readers, fourteen

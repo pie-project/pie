@@ -58,7 +58,7 @@ pub fn neox_decode(
     )
 }
 
-#[routine]
+#[routine(canon = rope)]
 pub fn neox_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,

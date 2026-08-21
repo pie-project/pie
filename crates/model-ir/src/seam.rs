@@ -68,9 +68,14 @@ pub const ATTN_QV: Def = Def {
     name: "attn.qv",
     sees: &["q", "v"],
     caps: &[Cap::Transform],
+    // CANON ROLES, not op kinds: the semantic vocabulary retired, so a
+    // producer is discriminated by what its LAUNCH claims. `after` admits
+    // the projection GEMMs (any `gemm::` symbol — the quantized rows claim
+    // no role) and the packed split; `before` refuses the transforms whose
+    // consumption would make the correction different arithmetic.
     position: Some(Position {
-        after: &["Matmul", "SplitQkv"],
-        before: &["AddBias", "Rmsnorm", "Rope", "KvAppend", "Launch"],
+        after: &["matmul", "split_qkv"],
+        before: &["add_bias", "rmsnorm", "rope", "kv_append"],
     }),
     sink: None,
 };
@@ -122,25 +127,26 @@ pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
                     plan.family, def.name
                 )),
                 Some(from) => {
-                    let producer = kind_name(&plan.ops[from].kind);
-                    if !pos.after.contains(&producer) {
+                    if !admits(plan, &plan.ops[from].kind, pos.after) {
                         problems.push(format!(
                             "{}: seam `{}` must sit after {:?}, but value {v} \
-                             comes from {producer}",
-                            plan.family, def.name, pos.after
+                             comes from {}",
+                            plan.family,
+                            def.name,
+                            pos.after,
+                            kind_name(&plan.ops[from].kind),
                         ));
                     }
                     for (i, op) in plan.ops.iter().enumerate().take(at).skip(from + 1) {
                         if !op.inputs.contains(&v) {
                             continue;
                         }
-                        let consumer = kind_name(&op.kind);
-                        if pos.before.contains(&consumer) {
+                        if admits(plan, &op.kind, pos.before) {
                             problems.push(format!(
-                                "{}: seam `{}` must sit before {consumer}, but op \
+                                "{}: seam `{}` must sit before {:?}, but op \
                                  {i} consumes value {v} first — different \
                                  arithmetic, not a reordering",
-                                plan.family, def.name
+                                plan.family, def.name, pos.before
                             ));
                         }
                     }
@@ -149,6 +155,36 @@ pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
         }
     }
     problems
+}
+
+/// Whether `kind` matches one of `roles` — canon roles, matched against
+/// what the op's launch CLAIMS.
+///
+/// Three admits per role, in order: the backend's claim for the kernel
+/// (axis points count by their role prefix — `matmul.acc` is a `matmul`),
+/// the backend-less `canon::<role>` spelling, and — for `matmul` alone —
+/// the `gemm::` namespace, because the quantized projection rows claim no
+/// role and a per-symbol list here would be the drift this file refuses.
+fn admits(plan: &crate::trace::ForwardPlan, kind: &crate::trace::OpKind, roles: &[&str]) -> bool {
+    let crate::trace::OpKind::Launch { kernel, .. } = kind else {
+        return roles.contains(&kind_name(kind));
+    };
+    let claim = crate::kernels::Backend::of_family(&plan.family)
+        .and_then(|b| crate::kernels::claim_of(b, kernel));
+    for role in roles {
+        if let Some(c) = claim
+            && (c == *role || c.split('.').next() == Some(role))
+        {
+            return true;
+        }
+        if kernel.strip_prefix("canon::") == Some(role) {
+            return true;
+        }
+        if *role == "matmul" && kernel.starts_with("gemm::") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Every seam a model text may state.
@@ -161,17 +197,12 @@ pub fn by_name(name: &str) -> Option<&'static Def> {
 fn kind_name(kind: &crate::trace::OpKind) -> &'static str {
     use crate::trace::OpKind as K;
     match kind {
-        K::Embed { .. } => "Embed",
-        K::Matmul { .. } => "Matmul",
-        K::SplitQkv { .. } => "SplitQkv",
-        K::Rope { .. } => "Rope",
-        K::Rmsnorm { .. } => "Rmsnorm",
-        K::AddBias { .. } => "AddBias",
-        K::KvAppend { .. } => "KvAppend",
         K::Launch { .. } => "Launch",
         K::Guard { .. } => "Guard",
         K::Peel { .. } => "Peel",
         K::HookSite { .. } => "HookSite",
+        K::Select { .. } => "Select",
+        K::LmHead { .. } => "LmHead",
         _ => "other",
     }
 }

@@ -312,7 +312,7 @@ impl Shell {
             // lowering — are pure functions of things that do not change
             // between the steps of a generation. The closure is why a refusal
             // is still propagated on a miss and not paid for on a hit.
-            let lowered = self
+            let planned = self
                 .lowerings
                 .for_step(class, &s, || {
                     crate::model::binding::text(row, class, &binding)
@@ -323,6 +323,7 @@ impl Shell {
                         message: format!("step did not lower: {why:?}"),
                     },
                 })?;
+            let lowered = &planned.lowered;
             // The gather's index list, in the fire's own numbering: the
             // wire's numbers are request-local and the gather's must not be.
             let sampled =
@@ -523,6 +524,9 @@ impl Shell {
                 .with_kv(&pages)
                 .with_slabs(&slabs)
                 .with_fire(&tables)
+                // The plan's runtime streams, so a text's `positions` binds
+                // the table this fire just staged rather than missing by id.
+                .with_runtime(&planned.streams)
                 // The shape the pool was allocated at, where the attention
                 // kernels' strides come from. Without it a store answers zero,
                 // and a zero seq stride is every scan step reading one token.

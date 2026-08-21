@@ -25,6 +25,8 @@ pub enum ArgValue {
     U32(u32),
     F32(f32),
     Usize(u64),
+    /// A raised host view's address (`ShaderValue::as_raised`).
+    Raised(usize),
     Shaped {
         handle: u32,
         rows: i32,
@@ -44,6 +46,7 @@ impl ArgValue {
             Self::U32(_) => "a u32",
             Self::F32(_) => "an f32",
             Self::Usize(_) => "a usize",
+            Self::Raised(_) => "a raised view",
         }
     }
 }
@@ -85,6 +88,15 @@ impl ShaderValue for ArgValue {
             Self::Usize(v) => Some(v),
             _ => None,
         }
+    }
+    fn as_raised(self) -> Option<usize> {
+        match self {
+            Self::Raised(a) => Some(a),
+            _ => None,
+        }
+    }
+    fn raised(addr: usize) -> Self {
+        Self::Raised(addr)
     }
     fn as_extent(self) -> Option<(i32, i32)> {
         match self {
@@ -149,7 +161,7 @@ impl kernels::routine::Answers<Wgpu> for Ctx<'_> {
 
 pub type Routine = kernels::routine::Routine<Wgpu>;
 
-pub use kernels::keys;
+
 pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
 pub use kernels::routine::{Answers, Asks};

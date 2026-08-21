@@ -1,9 +1,9 @@
 use kernels_macros::routine;
 use kernels::BindMut;
 
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, keys};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16};
 use kernels::raises::Struct;
-use crate::views::{AttnMask, KvCache};
+use crate::views::{AttnMask, KvCache, AttnSplit};
 use kernels::routine::Refusal;
 use kernels::shader::{elementwise, elementwise_rows};
 
@@ -196,7 +196,7 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
     ])
 }
 
-#[routine]
+#[routine(canon = split_qkv)]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -214,7 +214,7 @@ pub fn split_qkv_bf16(
     )
 }
 
-#[routine]
+#[routine(canon = sigmoid_gate_mul)]
 pub fn gate(
     ctx: &Ctx<'_>,
     attn: InOut<Tensor<bf16>>,
@@ -229,7 +229,7 @@ pub fn gate(
     )
 }
 
-#[routine]
+#[routine(canon = split_q_gate)]
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
     qg: In<Tensor<bf16>>,
@@ -287,7 +287,7 @@ pub fn kv_append(
     )
 }
 
-#[routine]
+#[routine(canon = kv_append)]
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
     k_new: In<Tensor<bf16>>,
@@ -350,7 +350,8 @@ pub fn sdpa_paged_decode(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+    split: In<Struct<AttnSplit>>) -> Result<(), Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -377,8 +378,12 @@ pub fn sdpa_paged_decode(
     let point = head_point(*head_dim, &[64, 128, 256, 512])?;
 
     let workgroups = rows.saturating_mul(*q_heads);
-    let scratch = if workgroups < 128 {
-        ctx.ask::<Tensor<f32>, keys::AttnScratch>().ok()
+    // The split policy is the DRIVER's answer now: `splits <= 1` (or a
+    // saturated device) fires the unsplit form, exactly what the optional
+    // `keys::AttnScratch` ask used to decide by presence.
+    let scratch = if workgroups < 128 && !split.ptr.is_null() {
+        let sv = unsafe { &*split.ptr };
+        (sv.splits > 1).then_some(sv.partials)
     } else {
         None
     };
@@ -500,7 +505,11 @@ pub fn sdpa_paged_decode_sink(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+    split: In<Struct<AttnSplit>>) -> Result<(), Refusal> {
+    // The sink form fires unsplit on this plane; the policy is stated
+    // for table equality and read by the decode form alone.
+    let _ = split;
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }

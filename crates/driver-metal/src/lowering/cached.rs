@@ -48,10 +48,25 @@ use model_ir::trace::FireClass;
 /// How many distinct fire shapes are kept before the map is emptied.
 pub const CAP: usize = 64;
 
+/// One fire shape's plan-derived pair: the lowering, and the runtime-stream
+/// map the resolver answers `Arg::Named` through.
+///
+/// Kept together because both are pure functions of the `ForwardPlan`, and
+/// this driver DROPS the plan once the lowering exists — the stream map is
+/// the one other thing a fire needs from it (`super::runtime`), so it is
+/// derived on the same miss and cached beside the thing it serves.
+#[derive(Debug)]
+pub struct Planned {
+    /// The flat launch list `lower` produced.
+    pub lowered: Lowered,
+    /// Value id → fire table, from the plan's runtime table.
+    pub streams: super::runtime::Streams,
+}
+
 /// Lowerings, kept by the fire shape that produced them.
 #[derive(Debug, Default)]
 pub struct Lowerings {
-    by_shape: HashMap<u64, Lowered>,
+    by_shape: HashMap<u64, Planned>,
     /// How many lowerings have been derived, for the test that asks whether
     /// the cache is a cache.
     lowered: usize,
@@ -77,7 +92,7 @@ impl Lowerings {
         class: FireClass,
         step: &Step<'_>,
         plan: impl FnOnce() -> Result<ForwardPlan, E>,
-    ) -> Result<&Lowered, Miss<E>> {
+    ) -> Result<&Planned, Miss<E>> {
         let rows = rows_of(step).map_err(|why| Miss::Lower(Unbridged::Step(why)))?;
         let key = fingerprint(class, &rows);
         if let std::collections::hash_map::Entry::Vacant(slot) = self.by_shape.entry(key) {
@@ -92,7 +107,10 @@ impl Lowerings {
                 },
             )
             .map_err(|why| Miss::Lower(Unbridged::Uncovered(format!("{why:?}"))))?;
-            slot.insert(lowered);
+            // Beside the lowering, because the plan is about to be dropped
+            // and the resolver will still need its runtime table.
+            let streams = super::runtime::Streams::of(&plan);
+            slot.insert(Planned { lowered, streams });
             self.lowered += 1;
         }
         // Emptied AFTER the insert, and never before returning: the caller is

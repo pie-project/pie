@@ -16,6 +16,8 @@ pub mod frame;
 pub mod hold;
 pub mod resolve;
 pub mod routine;
+pub mod runtime;
+pub mod views;
 
 pub use dispatch::{Dispatch, Geometry, Undispatchable, plan as plan_dispatches};
 pub use executor::{BindRefusal, BoundArg, BoundLaunch, Frame, Resolver, Slice, bind, resolve_arg};

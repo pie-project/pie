@@ -45,6 +45,24 @@ pub trait ShaderValue: Copy {
     /// The 64-bit extent this value is, if it is one.
     fn as_usize(self) -> Option<u64>;
 
+    /// The raised HOST object this value carries, if it carries one — the
+    /// address of a driver-built view (`PagedKvView`, a plan carve). Carried
+    /// as an address rather than a pointer so the value stays `Send` where a
+    /// plane needs it; the ends cast. Default `None`: a plane that never
+    /// binds a view answers honestly.
+    fn as_raised(self) -> Option<usize> {
+        None
+    }
+
+    /// A value carrying a raised host object's address. The panic default is
+    /// for planes that declare no views; a plane whose routines take
+    /// `In<Struct<..>>` overrides with its own variant.
+    #[must_use]
+    fn raised(addr: usize) -> Self {
+        let _ = addr;
+        panic!("this plane binds no raised views");
+    }
+
     /// The rectangle the statement gave this operand, if it gave one.
     ///
     /// `(rows, width)`, and both zero is the honest answer for a statement
@@ -448,6 +466,27 @@ pub struct Usize(
     /// The value.
     pub u64,
 );
+
+// A RAISED VIEW'S CARRIER. `In<Struct<T>>` holds `*const T::Value`, and the
+// blanket `In` impl requires the carrier itself to be an `Arg` -- CUDA
+// bridges raw pointers through its ABI, and this is the shader planes'
+// bridge: the address rides [`ShaderValue::as_raised`], and the spelling is
+// empty because a raised object never reaches shader text (the BODY reads
+// the view on the host and binds its fields).
+impl<B: Lang, V: 'static> Arg<B> for *const V
+where
+    B::Value: ShaderValue,
+{
+    const TY: Ty = Ty::Raised;
+    const SPELLING: &'static str = "";
+
+    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
+        value
+            .as_raised()
+            .map(|addr| addr as *const V)
+            .ok_or(Refusal::Kind { at, want: Ty::Raised })
+    }
+}
 
 impl<B: Lang> Arg<B> for Usize
 where

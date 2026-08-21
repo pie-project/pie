@@ -41,7 +41,7 @@ pub fn author_kimi_k3(b: &mut Builder<'_>) -> Result<(), Error> {
     b.shard_embed_tokens();
     a_log_bands(b)?;
     // Checkpoint order, kept -- `[gate; up]`, the order
-    // `mlp::chunked_swiglu_bf16` reads with its `gate_second` at the
+    // `mlp::chunked_swiglu` reads with its `gate_second` at the
     // default. A load that swaps the halves while the matmul does not is
     // silently wrong output rather than a load error.
     //
@@ -906,7 +906,7 @@ mod tests {
     ///
     /// It has to agree with whichever epilogue the halves reach: the
     /// CUTLASS grouped GEMM reads gate from the SECOND half of fc1
-    /// (`moe/flashinfer_moe.hpp`) and `mlp::chunked_swiglu_bf16` reads it
+    /// (`moe/flashinfer_moe.hpp`) and `mlp::chunked_swiglu` reads it
     /// from the first. A load that swaps while the matmul does not is
     /// silently wrong output, which is the whole reason the flag is passed
     /// explicitly rather than defaulted. The per-expert republish is gate

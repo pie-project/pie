@@ -1,6 +1,5 @@
 
-use kernels::routine::Asks;
-use kernels::{Bind, Fire, keys};
+use kernels::{Bind, Fire};
 use kernels_macros::routine;
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -14,7 +13,7 @@ use kernels::routine::{Const, In, InOut, Out};
 
 const BLOCK: u32 = 256;
 
-#[routine(namespace = "attn")]
+#[routine(namespace = "attn", canon = split_qkv)]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -53,7 +52,7 @@ pub fn add_bias_bf16(
     )
 }
 
-#[routine(namespace = "ssm")]
+#[routine(namespace = "ssm", canon = gdn_prep)]
 pub fn qwen_gdn_post_conv_prep_bf16(
     ctx: &Ctx<'_>,
     qkv_post: In<Tensor<bf16>>,
@@ -110,7 +109,7 @@ pub fn qwen_gdn_post_conv_prep_bf16(
             ])
 }
 
-#[routine(namespace = "layout")]
+#[routine(namespace = "layout", canon = split_q_gate)]
 pub fn split_q_gate_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -138,7 +137,7 @@ pub fn split_q_gate_bf16(
             ])
 }
 
-#[routine(namespace = "mlp")]
+#[routine(namespace = "mlp", canon = sigmoid_gate_mul)]
 pub fn sigmoid_gate_inplace_bf16(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
@@ -155,7 +154,9 @@ pub fn rmsnorm_gated_fp32_in_bf16(
     weight: *const c_void,
     y: *mut c_void,
     num_rows: i32,
-    hidden: i32) -> Result<(), Refusal> {
+    hidden: i32,
+    eps: f32,
+    per_head_dim: i32) -> Result<(), Refusal> {
 
     let shape = |p: *mut bf16| Out { ptr: p, rows: num_rows, width: hidden };
     norm::rmsnorm_gated_fp32_in::<bf16>(
@@ -164,6 +165,8 @@ pub fn rmsnorm_gated_fp32_in_bf16(
         In { ptr: gate.cast::<bf16>(), rows: num_rows, width: hidden },
         Const { v: weight.cast::<f32>() },
         shape(y.cast::<bf16>()),
+        Const { v: eps },
+        Const { v: per_head_dim },
     )
 }
 

@@ -34,6 +34,35 @@ impl Trace {
         b.set_layer(layer);
         f(&mut b)
     }
+
+    /// The backend this trace's family names, or `None` for a description
+    /// trace. What tier-1 resolution branches on.
+    #[must_use]
+    pub fn backend(&self) -> Option<model_ir::kernels::Backend> {
+        model_ir::kernels::Backend::of_family(self.inner.borrow().family())
+    }
+
+    /// The symbol this trace's backend claims for a canon point, or the
+    /// `canon::<claim>` spelling for a description trace.
+    ///
+    /// Panics — at TRACE time, which is load time, the same moment
+    /// `check_plan` refuses — when the backend claims nothing: an unclaimed
+    /// role is a missing `#[routine(canon = ..)]`, and stating a guessed
+    /// symbol instead would move the failure to the fire.
+    #[must_use]
+    pub fn canon(&self, claim: &str) -> String {
+        match self.backend() {
+            None => format!("canon::{claim}"),
+            Some(b) => model_ir::kernels::canon_symbol(b, claim)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no {b:?} routine claims `canon = {claim}`; \
+                         tier-1 resolution has nothing to state"
+                    )
+                })
+                .to_string(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -41,6 +70,26 @@ pub struct Val {
     t: Trace,
     pub(crate) id: model_ir::trace::ValueId,
     layer: Option<u32>,
+}
+
+/// A RAGGED OPERAND PAIRING: a row stream and the boundary CSR that windows
+/// it, travelling as one value at the authoring surface.
+///
+/// Raggedness is not a shape. The lowering's `Tokens`/`Requests` machinery
+/// is untouched, and a statement taking one of these still records the two
+/// halves as two operands in the order it always did — the wire and the
+/// routines see no change. What the pair closes is the seam between the
+/// halves: a wrapper that took the data stream here and minted its CSR
+/// there was free to take them inconsistently, and a routine that needed
+/// the boundary count had it restated as a spliced `Const` beside the
+/// operand that already carries it (`indptr.rows`).
+#[derive(Clone)]
+pub struct RaggedVal {
+    /// The row stream the CSR windows — attention's q, the token stream.
+    pub data: Val,
+    /// The boundary CSR, `[Requests]` i32. The driver stages the `+1` row
+    /// the CSR convention implies.
+    pub indptr: Val,
 }
 
 /// Storage representation; non-dense forms state a launch symbol and extra weights.
@@ -258,9 +307,21 @@ pub struct ModelShape {
     pub kv_width: u32,
     pub qk_norm: QkNorm,
     pub norm_variant: NormVariant,
+    /// The family's RMS epsilon in MILLIONTHS (`1e-5` is `10`), an integer
+    /// because this struct derives `Eq` and a float field would end that.
+    /// [`ModelShape::norm_eps`] gives it back as the f32 every handle takes.
+    pub norm_eps_micro: u32,
     pub tied_embeddings: bool,
     /// Uniform projection storage for handles from `M::layer`.
     pub proj_repr: WeightRepr,
+}
+
+impl ModelShape {
+    /// The stored millionths, as the f32 the handles carry.
+    #[must_use]
+    pub fn norm_eps(&self) -> f32 {
+        self.norm_eps_micro as f32 / 1.0e6
+    }
 }
 
 /// Model context: shape plus tape, no lowering state.
@@ -306,6 +367,7 @@ impl M {
 
     pub fn layer(&self, l: u32) -> Layer {
         let f = &self.f;
+        let eps = f.norm_eps();
         let w = |name: &str| format!("layer.{l}.{name}");
         let mat = |name: &str, width: u32| MatW {
             name: w(name),
@@ -318,12 +380,14 @@ impl M {
             variant: f.norm_variant,
             per_head: None,
             layer: Some(l),
+            eps,
         };
         let qk_norm = |name: &str| NormW {
             name: w(name),
             variant: f.norm_variant,
             per_head: (f.qk_norm == QkNorm::PerHead).then_some(f.head_dim),
             layer: Some(l),
+            eps,
         };
         Layer {
             qkv: mat("qkv", f.q_width + 2 * f.kv_width),
@@ -372,6 +436,7 @@ impl M {
             variant: self.f.norm_variant,
             per_head: None,
             layer: None,
+            eps: self.f.norm_eps(),
         }
     }
 
@@ -541,6 +606,20 @@ pub mod runtime {
         tensor(t, "qo_indptr", Shape(vec![Dim::Requests]), DType::I32)
     }
 
+    /// The fire's token stream WITH its request boundaries: `token_ids`
+    /// (`[Tokens]` i32) paired with the qo CSR — the ragged pair, minted
+    /// together so the halves cannot come from two different fires.
+    pub fn token_stream(t: &Trace) -> RaggedVal {
+        RaggedVal { data: token_ids(t), indptr: qo_indptr(t) }
+    }
+
+    /// Pair a token-rowed stream the caller computed — attention's q —
+    /// with the fire's query-window CSR. The statement-level spelling of
+    /// "these rows are ragged over the fire's requests".
+    pub fn query_windows(data: &Val) -> RaggedVal {
+        RaggedVal { data: data.clone(), indptr: qo_indptr(&data.t) }
+    }
+
     /// Row-validity mask, `[Tokens]` i32.
     pub fn row_valid(t: &Trace) -> Val {
         tensor(t, "row_valid", Shape(vec![Dim::Tokens]), DType::I32)
@@ -574,6 +653,102 @@ pub mod runtime {
         let id = t.with(None, |b| b.runtime_object("attention_mask", None));
         Val { t: t.clone(), id, layer: None }
     }
+}
+
+/// The dtype AXES a catalogued forward is generic over — the no-ask
+/// contract's S2c (`.wiki/designs/design-no-ask.md` §9).
+///
+/// A forward declares `<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis,
+/// K: KvAxis>` — projection repr, expert repr, activation dtype, KV
+/// scheme: the four things real deployments vary. The CATALOG enumerates
+/// the shipping points (`catalogue!`), and every consumer derives from the
+/// axes: the text's `MatW.repr`, the manifest's tensor claims, the load
+/// contract's checks. One declaration, three readers — a checkpoint that
+/// ships mxfp4 experts refuses the bf16 row and matches the mxfp4 row,
+/// which is load-time dtype dispatch as contract matching.
+///
+/// Markers, not values, so a catalog row is a TYPE INSTANTIATION the
+/// compiler monomorphizes — the closure the routine level must not make
+/// (`Routine::point` selects there; the demand set is whatever the
+/// enumerated rows reach, held by the coverage test).
+pub mod axes {
+    use super::{DType, ScaleLayout, WeightRepr};
+
+    /// One weight-bearing axis: what the checkpoint holds and the text
+    /// states for a bank of projections.
+    pub trait DtypeAxis: 'static {
+        /// The activation/storage dtype statements read and write.
+        const DTYPE: DType;
+        /// The tensor representation the manifest claims and `MatW` states.
+        const REPR: WeightRepr;
+        /// The axis's name, joined into the catalogued family string.
+        const NAME: &'static str;
+    }
+
+    /// The KV cache axis: which scheme the pages hold. Subsumes the
+    /// `kv_native_bf16` boolean and `Boot::route`'s bf16-vs-quantised
+    /// choice — a load-time fact, stated where the SKU is named.
+    pub trait KvAxis: 'static {
+        /// The pages hold the model's own bf16.
+        const NATIVE_BF16: bool;
+        /// The axis's name.
+        const NAME: &'static str;
+    }
+
+    /// Plain bf16: the repr every dense row ships today.
+    pub enum Bf16Ax {}
+    impl DtypeAxis for Bf16Ax {
+        const DTYPE: DType = DType::BF16;
+        const REPR: WeightRepr = WeightRepr::Bf16;
+        const NAME: &'static str = "bf16";
+    }
+
+    /// MXFP4 experts in Marlin layout (gpt-oss's shipped form).
+    pub enum Mxfp4Ax {}
+    impl DtypeAxis for Mxfp4Ax {
+        const DTYPE: DType = DType::BF16;
+        const REPR: WeightRepr = WeightRepr::Mxfp4Marlin;
+        const NAME: &'static str = "mxfp4";
+    }
+
+    /// W4A16 experts in kimi-k2's shipped packing: eight 4-bit codes per
+    /// i32 word, one bf16 scale per 32-code group along the input axis
+    /// (`weight_scale: [out, in/32]`), and the `code - 8` bias the
+    /// scheme's own (`QuantScheme::Int4B8`) — no zero-point tensor, so
+    /// `zero_point` is false. The group here is the ONE number the
+    /// family's wna16 statements read (`wna16_{gate_up,down}_decode`
+    /// take it as a param); the rest is the load contract's metadata.
+    pub enum Wna16Ax {}
+    impl DtypeAxis for Wna16Ax {
+        const DTYPE: DType = DType::BF16;
+        const REPR: WeightRepr = WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: 32,
+            axis: 0,
+            zero_point: false,
+        };
+        const NAME: &'static str = "wna16";
+    }
+
+    /// Native bf16 KV pages.
+    pub enum NativeKv {}
+    impl KvAxis for NativeKv {
+        const NATIVE_BF16: bool = true;
+        const NAME: &'static str = "kv-bf16";
+    }
+}
+
+/// Enumerate one shipping SKU: a name and the monomorphized forward it
+/// instantiates. The row is a `(name, fn)` pair in a plain table the
+/// family exposes; the coverage test walks every family's table, traces
+/// each point, and `TraceBuilder::finish`'s `check_plan` refuses a point
+/// whose statements reach a routine row that does not exist — the closure
+/// of the demand set, checked rather than hoped.
+#[macro_export]
+macro_rules! catalogue {
+    ($( ($name:literal, $f:path $(,)?) ),+ $(,)?) => {
+        &[ $( ($name, $f as _) ),+ ]
+    };
 }
 
 pub mod cuda;

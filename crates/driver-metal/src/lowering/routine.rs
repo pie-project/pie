@@ -291,6 +291,16 @@ fn lay_out(
                     (v >> 32) as u32,
                 ],
             ),
+            // A raised view is HOST data the body already read; it names no
+            // slot and packs no scalar, and metal's argument list is
+            // positional -- so a body that passed one back has stated a slot
+            // nothing can fill, which is a refusal and not a skip.
+            ArgValue::Raised(_) => {
+                return Err(Refusal::Unstated {
+                    what: "a raised view in a dispatch argument list: a view is \
+                           host data a body reads, not a slot it binds",
+                });
+            }
         }
         args.push(NOTHING);
     }

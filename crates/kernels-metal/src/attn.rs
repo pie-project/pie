@@ -7,7 +7,7 @@ use crate::routine::{
     Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
 };
 use kernels::raises::Struct;
-use crate::views::{AttnMask, KvCache};
+use crate::views::{AttnMask, KvCache, AttnSplit};
 
 fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
     points
@@ -58,7 +58,7 @@ fn positive(v: i32, what: &'static str) -> Result<u32, Refusal> {
     Ok(v.unsigned_abs())
 }
 
-#[routine]
+#[routine(canon = split_qkv)]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -76,7 +76,7 @@ pub fn split_qkv_bf16(
     )
 }
 
-#[routine]
+#[routine(canon = sigmoid_gate_mul)]
 pub fn gate(
     ctx: &Ctx<'_>,
     attn: InOut<Tensor<bf16>>,
@@ -91,7 +91,7 @@ pub fn gate(
     )
 }
 
-#[routine]
+#[routine(canon = split_q_gate)]
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
     qg: In<Tensor<bf16>>,
@@ -151,7 +151,7 @@ pub fn kv_append(
     )
 }
 
-#[routine]
+#[routine(canon = kv_append)]
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
     k_new: In<Tensor<bf16>>,
@@ -228,7 +228,10 @@ pub fn sdpa_paged_decode(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+    split: In<Struct<AttnSplit>>) -> Result<(), Refusal> {
+    // This plane fires unsplit; the split policy is another driver's.
+    let _ = split;
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }
@@ -300,7 +303,10 @@ pub fn sdpa_paged_decode_sink(
     positions: In<Tensor<i32>>,
     request_of_token: In<Tensor<i32>>,
     maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>) -> Result<(), Refusal> {
+    rows: Const<i32>,
+    split: In<Struct<AttnSplit>>) -> Result<(), Refusal> {
+    // This plane fires unsplit; the split policy is another driver's.
+    let _ = split;
     if kvc.ptr.is_null() {
         return Err(Refusal::Null { what: "the kv view this statement names" });
     }

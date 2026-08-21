@@ -286,7 +286,7 @@ impl Variant for KimiK2 {
         // _provision.rs` holds the refusal so the day it changes is a test
         // failure naming this line rather than a silent revival.
         self.deployment(load)
-            .map(|_| project::trace(&self.shape, self.rope_yarn, class))
+            .map(|_| project::trace(&self.shape, self.rope_yarn, class, self.norm_eps))
     }
 
     /// Kimi's own `<|im_middle|>` protocol, which reads like ChatML and
@@ -564,7 +564,11 @@ mod tests {
         for v in VARIANTS {
             for class in [FireClass::Prefill, FireClass::Decode] {
                 let plan = project::trace(&v.shape, v.rope_yarn, class);
-                assert!(plan.family.starts_with("kimi.cuda."), "{}", plan.family);
+                assert!(
+                    plan.family.starts_with("kimi-bf16-wna16-kv-bf16.cuda."),
+                    "{}",
+                    plan.family
+                );
                 assert!(!plan.ops.is_empty());
             }
         }

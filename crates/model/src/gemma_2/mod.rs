@@ -258,7 +258,13 @@ impl Variant for Gemma2 {
         if let crate::catalog::Backend::Metal(_) = load.backend {
             return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
         }
-        Ok(project::trace(&self.shape, class, load))
+        Ok(project::trace(
+            &self.shape,
+            class,
+            load,
+            NORM_EPS,
+            self.rope_theta,
+        ))
     }
 
     /// Gemma's own `<start_of_turn>` template, stated rather than fallen

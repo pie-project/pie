@@ -527,6 +527,7 @@ pub const NO_METAL: &str = "kimi-k3 has no Metal text in this build: its forward
 pub fn trace(
     f: &KimiK3Facts,
     class: model_ir::trace::FireClass,
+    norm_eps: f32,
 ) -> Result<model_ir::trace::ForwardPlan, Refusal> {
     if f.attn.output_gate {
         return Err(Refusal::Unsupported(
@@ -535,7 +536,11 @@ pub fn trace(
              rank-3",
         ));
     }
-    Ok(super::forward::kimi_k3_cuda(f, class))
+    // THE SHIPPED POINT. kimi-k3 catalogues one SKU today — MXFP4 routed
+    // experts; the table in `forward::CATALOG` is where a second one
+    // appears, and the coverage test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, Mxfp4Ax, NativeKv};
+    Ok(super::forward::kimi_k3_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>(f, class, norm_eps))
 }
 
 #[cfg(test)]
@@ -1205,7 +1210,10 @@ mod tests {
             (FireClass::Prefill, "prefill"),
         ] {
             let plan = trace(&f, class).expect("the fixture states the shape the text declares");
-            assert_eq!(plan.family, format!("kimi_k3.cuda.{suffix}"));
+            assert_eq!(
+                plan.family,
+                format!("kimi_k3-bf16-mxfp4-kv-bf16.cuda.{suffix}")
+            );
             assert!(!plan.ops.is_empty(), "a traced plan states ops");
         }
     }

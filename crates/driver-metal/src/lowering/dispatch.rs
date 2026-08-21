@@ -708,8 +708,15 @@ fn plan_routine<'a, S: Resolver>(
     let (ins, outs, weights) = crate::lowering::hold::split(args, results);
     let mut handles =
         crate::lowering::hold::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
-    let values = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts)
-        .map_err(refused)?;
+    // THE VIEWS OUTLIVE THE BODY. `bind` boxes a host view per `Ty::Raised`
+    // operand (`In<Struct<KvCache>>` and its siblings) and hands its ADDRESS
+    // into `values`; the body reads it below, so the holder sits on this
+    // frame until `planner.finish()`. A recorded fire replays encoded
+    // dispatches and runs no body, so no address outlives this function.
+    let mut views = crate::lowering::views::Views::over(args, &ins);
+    let values =
+        crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
+            .map_err(refused)?;
     let bound = handles.bound().to_vec();
     // THE STAGED BLOCK IS COPIED OUT BEFORE THE MOVE. `Staged<'_>` borrows the
     // word run, and the cell below takes the `Handles` by value; the planner

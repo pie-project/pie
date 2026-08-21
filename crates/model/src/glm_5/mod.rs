@@ -275,7 +275,7 @@ impl Variant for Glm5 {
         // _provision.rs` holds the refusal so the day it changes is a test
         // failure naming this line rather than a silent revival.
         self.deployment(load)
-            .map(|_| project::trace(&self.shape, class))
+            .map(|_| project::trace(&self.shape, class, self.norm_eps, self.rope_theta))
     }
 
     /// ChatML, with the two role markers in the stop set beside

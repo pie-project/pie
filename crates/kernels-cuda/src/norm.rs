@@ -1,6 +1,5 @@
 
-use kernels::routine::Asks;
-use kernels::{Bind, Fire, keys};
+use kernels::{Bind, Fire};
 use kernels_macros::routine;
 use crate::jit::{Ctx, Launch, aligned16};
 use crate::jit::abi::Tensor;
@@ -235,7 +234,7 @@ pub fn unstrided_bf16(
     let _eps = *_eps;
 
     let packed = In { ptr: x.ptr, rows: y.rows, width: y.width };
-    rmsnorm_strided_bf16(ctx, packed, weight, y)
+    rmsnorm_strided_bf16(ctx, packed, weight, y, Const { v: _eps })
 }
 
 #[routine]
@@ -269,7 +268,7 @@ pub fn rmsnorm_bf16_with_fp16(
                 max: i64::from(i32::MAX),
             });
         }
-        unstrided_bf16(ctx, x, weight, y)?;
+        unstrided_bf16(ctx, x, weight, y, Const { v: eps })?;
         return crate::quant::bf16_to_fp16(
             ctx,
             In { ptr: y.ptr.cast_const(), rows: y.rows, width: y.width },
@@ -288,7 +287,7 @@ pub fn rmsnorm_bf16_with_fp16(
             ])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = rmsnorm)]
 pub fn rmsnorm<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -318,7 +317,7 @@ pub fn rmsnorm<T>(
             ])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = "rmsnorm.gemma")]
 pub fn rmsnorm_gemma<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -404,7 +403,7 @@ pub fn rmsnorm_gated<T>(
     ctx.fire(Fire::at("norm/rmsnorm.cuh", crate::jit::symbol(&format!("::pie::norm::rmsnorm_gated<{}, 256>", T::CPP))).apply(launch), &[x.arg(), gate.arg(), weight.arg(), y.arg(), hidden.arg(), eps.arg()])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = rmsnorm_gated)]
 pub fn rmsnorm_gated_fp32_in<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<f32>>,
@@ -426,7 +425,7 @@ pub fn rmsnorm_gated_fp32_in<T>(
     ctx.fire(Fire::at("norm/rmsnorm.cuh", crate::jit::symbol(&format!("::pie::norm::rmsnorm_gated_f32_in<{}, 256>", T::CPP))).apply(launch), &[x.arg(), gate.arg(), weight.arg(), y.arg(), hidden.arg(), eps.arg()])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = residual_add)]
 pub fn residual_add_rmsnorm<
 
     T: crate::RoutineElem + kernels::routine::Elem<Read = *const T, Write = *mut T>,
@@ -506,7 +505,7 @@ pub fn rmsnorm_residual_add_scale_rmsnorm_bf16(
             ])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = add_bias)]
 pub fn add_bias<T>(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<T>>,

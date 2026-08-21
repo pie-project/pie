@@ -117,7 +117,7 @@ fn tile_point(tile_m: i32, tile_n: i32) -> Result<usize, Refusal> {
         + axis(tile_n, "the routed qmm's column tile")?)
 }
 
-#[routine]
+#[routine(canon = topk)]
 pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
@@ -250,7 +250,7 @@ pub fn route_gather(
     )
 }
 
-#[routine]
+#[routine(canon = weighted_sum)]
 pub fn combine_sorted(
     ctx: &Ctx<'_>,
     y: In<Tensor<bf16>>,
@@ -278,7 +278,7 @@ pub fn combine_sorted(
     )
 }
 
-#[routine]
+#[routine(canon = sigmoid_gate_add)]
 pub fn shared_expert_combine(
     ctx: &Ctx<'_>,
     routed: In<Tensor<bf16>>,

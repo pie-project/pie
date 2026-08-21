@@ -81,6 +81,12 @@ impl TraceBuilder {
         v.shape.clone()
     }
 
+    /// The family this trace is being built for — what tier-1 resolution
+    /// reads the backend off.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
     /// One value's dtype, for a statement whose result mirrors its operand.
     pub fn value_dtype(&self, id: ValueId) -> DType {
         self.values[id as usize].dtype

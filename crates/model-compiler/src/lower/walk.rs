@@ -272,12 +272,6 @@ impl Lowerer<'_> {
                                 });
                             }
                         }
-                        Semantic::Kernels(symbols) => {
-                            let live = self.depth_window(op, &window, i)?;
-                            for symbol in symbols {
-                                self.emit(i, symbol, op, &live)?;
-                            }
-                        }
                         Semantic::Unlowered(why) => self.residue.push(Unlowered {
                             at_op: i,
                             kind: kind_name(kind),

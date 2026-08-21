@@ -294,7 +294,14 @@ impl Variant for Gemma3n {
         if let crate::catalog::Backend::Metal(_) = load.backend {
             return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
         }
-        Ok(project::trace(&self.shape, class, load))
+        Ok(project::trace(
+            &self.shape,
+            class,
+            load,
+            NORM_EPS,
+            self.rope_theta_global,
+            self.rope_theta_local,
+        ))
     }
 
     /// Gemma's `<start_of_turn>` template.

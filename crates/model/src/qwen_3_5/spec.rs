@@ -138,7 +138,7 @@ impl Qwen35GdnFacts {
     /// * `driver-cuda/csrc/src/model/config.hpp:357` pins the conv window: 4.
     /// * `fused_in_proj: false` is the live default binding (see the field doc).
     /// * `norm_variant: Plain`. This said `Gemma` on the authority of
-    ///   `qwen3_5_forward.cpp` launching `kernels::norm::rmsnorm_gemma_bf16`,
+    ///   `qwen3_5_forward.cpp` launching `kernels::norm::rmsnorm_gemma`,
     ///   and no 0.8B is staged on this machine to check it against. What IS
     ///   measurable — the two Qwen3.6 checkpoints, and `mlx_lm`'s
     ///   `nn.RMSNorm` for the whole family — says plain, so the fixture

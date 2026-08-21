@@ -56,10 +56,12 @@ pub struct PagedKvView {
     pub native_bf16: bool,
     /// `keys::KvHasEnvelopes`.
     pub has_envelopes: bool,
-    /// `keys::KvEnvMin`.
-    pub env_min: f32,
-    /// `keys::KvEnvMax`.
-    pub env_max: f32,
+    /// `keys::KvEnvMin` — the dequant envelope floor PLANE, at the cache's
+    /// width; null when the cache carries no envelopes, which is what
+    /// `has_envelopes` says.
+    pub env_min: *const u16,
+    /// `keys::KvEnvMax` — the ceiling plane; see `env_min`.
+    pub env_max: *const u16,
     /// `keys::KvBlockSize`.
     pub block_size: i32,
     /// `keys::KvMaxPagesPerRequest`.

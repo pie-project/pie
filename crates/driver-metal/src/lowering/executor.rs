@@ -311,9 +311,18 @@ pub fn resolve_arg<S: Resolver>(
     resolver: &mut S,
 ) -> Result<BoundArg, BindRefusal> {
     Ok(match arg {
-        Arg::Raised { key, .. } => {
-            return Err(BindRefusal::NotOnThisPlane { key: key.clone() });
-        }
+        // A RAISED OPERAND RESOLVES TO NO REGION OF ITS OWN. The routine
+        // binder builds it into a HOST view (`crate::lowering::views`) and
+        // the carrier crosses as `ArgValue::Raised(address)`; what this
+        // positional list needs from it is only that the operand HOLD ITS
+        // PLACE, so `split`'s indices stay aligned with the trace. A
+        // zero-address region stands in — nothing takes its handle, because
+        // `lowering::bind::bind` intercepts the `Ty::Raised` argument before
+        // `Handles::input` is ever asked for it.
+        Arg::Raised { .. } => BoundArg {
+            slice: Slice { address: 0, bytes: 0 },
+            width: 0,
+        },
         Arg::Arena { at, width, bytes: stride } => {
             let at64 = *at as u64;
             let bytes = frame.arena.bytes;

@@ -161,7 +161,7 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
         let OpKind::Launch { kernel, .. } = &op.kind else {
             continue;
         };
-        if kernel != "moe::moe_grouped_gemm_bf16" {
+        if kernel != "moe::moe_grouped_gemm" {
             continue;
         }
         let selector = *op
@@ -186,7 +186,7 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
             );
         };
         assert_eq!(
-            producer_kernel, "moe::topk_softmax_bf16",
+            producer_kernel, "moe::topk_softmax",
             "{}: selector value {selector} produced by `{producer_kernel}`, not the router top-k",
             plan.family
         );

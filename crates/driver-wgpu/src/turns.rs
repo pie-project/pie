@@ -836,10 +836,15 @@ impl Serving<'_> {
             .arena(low.arena_bytes as u64)
             .map_err(Unstepped::Failed)?;
         let arena = held_arena.buffer();
+        // The plan's runtime streams, so a text's `positions` binds the
+        // table this step just staged rather than the seam stand-in. Per
+        // step because the decode and prefill plans each mint their own ids.
+        let streams = crate::runtime::Streams::of(plan);
         let model = Model {
             weights: held.weights,
             pool: held.pool,
             recurrent: held.recurrent,
+            runtime: &streams,
         };
         let ran = fire(
             device,

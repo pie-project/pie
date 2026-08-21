@@ -14,6 +14,9 @@ pub mod cx;
 pub mod facts;
 /// The derived column, and the dispatch that binds a crossed symbol from it.
 pub mod table;
+/// The per-fire view arena: the runtime objects this driver answers, built
+/// once per fire from `AttnCtx`/`GdnCtx` and the load-resident banks.
+pub mod views;
 
 use std::ffi::c_void;
 
@@ -53,6 +56,15 @@ pub trait Resolver {
         let _ = (value, key);
         None
     }
+
+    /// Which row window the NEXT launch covers, told before its operands
+    /// resolve. [`AttnRegions::of`]'s fact, moved to bind time: a peel's tail
+    /// serves different requests, so a region-scoped object — the KV view's
+    /// CSRs, the tail's own qo indptr — must answer with the tail's state.
+    /// Defaulted to a no-op because only the live resolver holds two regions.
+    fn region(&mut self, rows: &std::ops::Range<u32>) {
+        let _ = rows;
+    }
 }
 
 /// One resolved operand: where it is, and how wide one row is.
@@ -62,6 +74,13 @@ pub struct BoundArg {
     pub ptr: *mut c_void,
     /// Elements per row; zero for a weight, whose extent is the tensor's.
     pub width: u32,
+    /// The operand's OWN row count, where the value has one apart from the
+    /// launch's rectangle — a NAMED stream the driver stages whole, whose
+    /// row space is the value's (`Lowered::arg_rows`), not the rectangle's.
+    /// Zero everywhere else; readers fall back to the launch's rows. This is
+    /// what lets a CSR operand carry its boundary count instead of a spliced
+    /// `Const<i32>` restating it beside the operand.
+    pub rows: u32,
 }
 
 /// A launch with every operand resolved — what a dispatch arm consumes.
@@ -109,18 +128,12 @@ pub enum BindRefusal {
 pub struct LaunchSpec {
     /// The weight the op names. Concrete (`layer.3.q_proj`), never a template.
     pub weight: Option<String>,
-    /// `Matmul::beta_one`: the residual fold; its target is the LAST arg.
-    pub beta_one: bool,
     /// The op's OUTPUT placements — what a launch writes but its args omit.
     pub outs: Vec<Arg>,
     /// The SECOND weight an op names, when it names two.
     pub weight2: Option<String>,
     /// The per-request store this op addresses — a GDN arm's state layer.
     pub state: Option<model_ir::trace::StateRef>,
-    /// `RmsnormPerHead`'s head width; kernel rows are `tokens * width/head_dim`.
-    pub per_head_dim: Option<u32>,
-    /// `Rope`'s partial-rotary channel count, when the op states one.
-    pub rope_partial: Option<u32>,
     /// FOREIGN values: `[dt_raw, a, d, dt_bias, dt_pre, da_pre]`, when present.
     pub aux: Vec<Arg>,
     /// How many of the launch's args are INPUTS. The args are one flat run
@@ -130,20 +143,11 @@ pub struct LaunchSpec {
     /// guard-region launch is `op.dest` and not the empty `op.outputs`.
     pub n_out: usize,
     /// The wire scalars a statement carries that no operand shape gives. `i32`
-    /// sent as `u32`, so `-1` arrives as `0xFFFF_FFFF`; [`window_of`] casts it.
+    /// sent as `u32`, so `-1` arrives as `0xFFFF_FFFF`; the routine that reads
+    /// one casts it back.
     pub params: Vec<u32>,
     /// What fires this symbol, resolved at load. **No string compare at fire.**
     pub route: route::Route,
-}
-
-/// The window a launch attends over: the STATEMENT's, else the context's.
-#[cfg(feature = "_cuda")]
-fn window_of(spec: &LaunchSpec, a: &AttnCtx, layer: u32) -> i32 {
-    #[allow(clippy::cast_possible_wrap)]
-    if let Some(&stated) = spec.params.first() {
-        return stated as i32;
-    }
-    a.window_left_by_layer.get(layer as usize).copied().unwrap_or(a.window_left)
 }
 
 /// The per-launch op join over a whole lowering.
@@ -277,11 +281,16 @@ impl DispatchPlan {
         }
         // The LoRA correction's qkv_in: the statement carries only its
         // in-place [q, v], so the INPUT is taken from the layer's qkv/q_proj.
+        // A matmul is an `OpKind::Launch` now (the semantic variants are
+        // retired wire positions), so the projection is recognised by the
+        // weight its statement names, exactly as before.
         let mut lora_x: std::collections::BTreeMap<u16, Arg> = std::collections::BTreeMap::new();
         for launch in &lowered.launches {
             let op = &plan.ops[launch.op as usize];
-            if let OpKind::Matmul { weight, .. } = &op.kind
-                && (weight.ends_with(".qkv") || weight.ends_with(".q_proj"))
+            if let OpKind::Launch { weights, .. } = &op.kind
+                && weights
+                    .first()
+                    .is_some_and(|w| w.ends_with(".qkv") || w.ends_with(".q_proj"))
                 && launch.args.end > launch.args.start
             {
                 lora_x
@@ -304,8 +313,8 @@ impl DispatchPlan {
                         || seg.ends_with("_up")
                         || seg.contains("_up_"))
             };
-            if let OpKind::Matmul { weight, .. } = &op.kind
-                && names_up(weight)
+            if let OpKind::Launch { weights, .. } = &op.kind
+                && weights.first().is_some_and(|w| names_up(w))
                 && !op.outputs.is_empty()
             {
                 pair_up.entry(launch.layers.start).or_insert_with(|| out_arg(op.outputs[0]));
@@ -334,31 +343,16 @@ impl DispatchPlan {
                 };
                 let outs: Vec<Arg> = out_values.iter().map(|&v| out_arg(v)).collect();
                 let mut spec = match &op.kind {
-                    OpKind::Embed { weight }
-                    | OpKind::Rmsnorm { weight, .. }
-                    | OpKind::RmsnormPerHead { weight, .. }
-                    | OpKind::AddBias { weight }
-                    | OpKind::RmsnormGated { weight }
-                    | OpKind::LmHead { weight } => {
+                    // The one structural op that still names a weight of its
+                    // own: the epilogue's readout projection.
+                    OpKind::LmHead { weight } => {
                         LaunchSpec { weight: Some(weight.clone()), ..LaunchSpec::default() }
                     }
-                    OpKind::CausalConv1d { weight, bias, .. } => LaunchSpec {
-                        weight: Some(weight.clone()),
-                        weight2: bias.clone(),
-                        ..LaunchSpec::default()
-                    },
-                    OpKind::Matmul { weight, beta_one, .. } => LaunchSpec {
-                        weight: Some(weight.clone()),
-                        beta_one: *beta_one,
-                        ..LaunchSpec::default()
-                    },
-                    OpKind::GdnPrep { a_log, dt_bias } => LaunchSpec {
-                        weight: Some(a_log.clone()),
-                        weight2: Some(dt_bias.clone()),
-                        ..LaunchSpec::default()
-                    },
                     // The FIRST weight rides the spec too, for `scale.*` arms.
-                    // `params` does NOT: see below.
+                    // `params` does NOT: see below. The semantic variants
+                    // (`Embed`, `Matmul`, `Rmsnorm`, ...) are retired wire
+                    // positions; every tier-1 statement is a `Launch` whose
+                    // weights carry what those variants' fields carried.
                     OpKind::Launch { weights, .. } => LaunchSpec {
                         weight: weights.first().cloned(),
                         weight2: weights.get(1).cloned(),
@@ -392,14 +386,10 @@ impl DispatchPlan {
                 spec.n_out =
                     if op.outputs.is_empty() { op.dest.len() } else { op.outputs.len() };
                 spec.state = op.kind.state_ref();
-                if let OpKind::RmsnormPerHead { head_dim, .. }
-                | OpKind::SplitQGate { head_dim, .. } = op.kind
-                {
-                    spec.per_head_dim = Some(head_dim);
-                }
-                if let OpKind::Rope { partial, .. } = op.kind {
-                    spec.rope_partial = partial;
-                }
+                // `RmsnormPerHead`/`SplitQGate`'s `head_dim` and `Rope`'s
+                // `partial` rode the semantic ops; a swept routine takes each
+                // as a `Const` mark off its own statement, so nothing joins
+                // them onto the spec any more.
                 if matches!(
                     lowered.kernels[launch.kernel as usize].as_str(),
                     "mlp::swiglu_bf16" | "mlp::swiglu_clamp_bf16" | "mlp::situ_bf16"
@@ -847,10 +837,10 @@ pub struct DispatchCtx {
 
 #[cfg(feature = "_cuda")]
 impl DispatchCtx {
-    /// The theta a layer-tagged rope launch fires with.
-    pub(crate) fn theta(&self, layer: usize) -> f32 {
-        self.rope_theta_by_layer.get(layer).copied().unwrap_or(self.rope_theta)
-    }
+    // `theta` STOOD HERE — the per-layer rope base a keyed ask read. A swept
+    // rope routine takes its theta as a `Const` mark off its own statement,
+    // so the table (`rope_theta_by_layer`) keeps its one remaining reader in
+    // the launch path and this join is gone.
 
     /// gemma3n's per-layer `std_mult` for `gaussian_topk`. Zero where no sparse
     /// layer is stated, which the kernel reads as "keep everything".
@@ -1008,43 +998,13 @@ pub enum DispatchRefusal {
 
 // The FA2 dispatch arms are driver ops: each owns a mutable device-side plan
 // cache a `Cx` must never hand over, so a failed guard here is a refusal.
-
-#[cfg(feature = "_cuda")]
-/// The PREFILL schedule this fire raised.
-///
-/// A ONE-LINE SUMMARY STOOD ABOVE THE `cfg`, reading "the plan pointer a
-/// launch is handed; decode's full plan on a `-1` window" -- a description of
-/// the decode arm the prose below explains was DELETED, sitting above the
-/// prose that explains it. It brought a second `#[must_use]` with it, which is
-/// how the compiler noticed: an attribute repeated on one item, warned today
-/// and a hard error later.
-///
-/// # What this was, and what deleted it
-///
-/// It took a `family: &str` and a `LaunchSpec`, and for decode it GUESSED:
-///
-/// ```ignore
-/// "decode" => if window_of(spec, a, layer) == -1 && !a.decode_plan_full.is_null() {
-///     a.decode_plan_full
-/// } else {
-///     a.decode_plan
-/// }
-/// ```
-///
-/// Which schedule a statement executes, recovered from the window on its spec,
-/// because `OpKind::Prep` published nothing a statement could name. It
-/// publishes a value now and the resolver answers by it
-/// (`fire::launch`'s `raised` map), so the guess has no caller and the decode
-/// arm is gone with it. What is left takes no family and no spec, because
-/// there is nothing left to choose between: one prefill schedule stands, and
-/// `raise_attn_plans` refuses a text that would want two.
-///
-/// The one caller is `keys::Fa2PrefillPlanCache` — the PLANLESS leg, which
-/// walks its own schedule inside the fire and needs the cache to write into.
-#[must_use]
-pub fn attn_plan(a: &AttnCtx) -> *mut c_void {
-    a.prefill_plan
-}
+//
+// `attn_plan` STOOD HERE: the last remnant of the schedule GUESS -- it
+// answered `keys::Fa2PrefillPlanCache` with the fire's one prefill plan. A
+// statement names its schedule now: a prep's plan resolves through the
+// value the prep published, and the PLANLESS leg's cache resolves through
+// the `"fa2.prefill"` runtime object the text mints
+// (`fire::launch`'s resolver, over `bind::views`).
 
 // MLA's absorb pair stays hand-written: both take four extents as `Param`,
 // which a bind cannot carry, and both need `ctx.cublas`, which no `Cx` may
@@ -1064,11 +1024,13 @@ fn mla_absorb(
         kernels::routine::Const<kernels_cuda::routine::Tensor<c_void>>,
         kernels::routine::Out<kernels_cuda::routine::Tensor<c_void>>,
         // THE FOUR EXTENTS THE STATEMENT CARRIES, as `Const` marks now: the
-        // routine reads `.v` off each and asks its context only for the row
-        // count.
+        // routine reads `.v` off each.
         kernels::routine::Const<i32>,
         kernels::routine::Const<i32>,
         kernels::routine::Const<i32>,
+        kernels::routine::Const<i32>,
+        // And the fire's token count, which the routine used to ask its
+        // context for -- the swept signature's appended `tokens`.
         kernels::routine::Const<i32>,
     ) -> Result<(), kernels_cuda::Refusal>,
 ) -> Result<(), DispatchRefusal> {
@@ -1091,12 +1053,12 @@ fn mla_absorb(
             ),
         });
     }
-    if !spec.aux.is_empty() || spec.per_head_dim.is_some() {
+    if !spec.aux.is_empty() {
         return Err(DispatchRefusal::ShapeDeclined {
             kernel: kernel.to_string(),
-            why: "the op join carries an aux value or a per-head reading, and a strided \
-                  GEMM over the head axis has neither -- a fact about the STATEMENT that \
-                  changes the arithmetic rather than the operands"
+            why: "the op join carries an aux value, and a strided GEMM over the head \
+                  axis has none -- a fact about the STATEMENT that changes the \
+                  arithmetic rather than the operands"
                 .to_string(),
         });
     }
@@ -1115,12 +1077,15 @@ fn mla_absorb(
         kernels::routine::In { ptr: b.args[0].ptr.cast_const(), rows: 0, width: 0 },
         kernels::routine::Const { v: b.args[spec.n_in + spec.n_out].ptr.cast_const() },
         kernels::routine::Out { ptr: b.args[spec.n_in].ptr, rows: 0, width: 0 },
-        // THE FOUR EXTENTS THE STATEMENT CARRIES, and no row count: the
-        // routine asks its context for the fire's token count.
+        // THE FOUR EXTENTS THE STATEMENT CARRIES, plus the launch's own row
+        // count as the appended `tokens` mark.
         p(0),
         p(1),
         p(2),
         p(3),
+        kernels::routine::Const {
+            v: i32::try_from(b.rows.end - b.rows.start).unwrap_or(0),
+        },
     );
     // Nothing to launch is an ANSWER, so `Refusal::Empty` is `Ok` here.
     match fired {
@@ -1171,42 +1136,14 @@ pub fn dispatch<R: Resolver>(
                 .as_deref()
                 .and_then(|n| resolver.weight(n))
                 .unwrap_or(core::ptr::null());
-            // The suffix reach, resolved once for the reason `w_named` is. A
-            // fourth suffix must be added here by hand; nothing connects it.
-            let bank = spec.weight.as_deref();
-            let mut suffixed = |suffix: &str| -> *const c_void {
-                bank.and_then(|b| resolver.weight(&format!("{b}{suffix}")))
-                    .unwrap_or(core::ptr::null())
-            };
-            let w_suffixed: [(&'static str, *const c_void); 9] = [
-                ("_scales", suffixed("_scales")),
-                ("_gate_bias", suffixed("_gate_bias")),
-                ("_up_bias", suffixed("_up_bias")),
-                // Without this entry gpt-oss' routed down projection fires
-                // biasless over a bias its checkpoint ships.
-                ("_bias", suffixed("_bias")),
-                // The two MXFP4 decode kernels index their weights per EXPERT,
-                // so they take arrays of bases rather than a base.
-                // `serve::load::build_moe_expert_ptrs` carves both beside the
-                // bank at load; nothing states them, because which address an
-                // expert's slab starts at is a fact about the load.
-                ("_ptrs", suffixed("_ptrs")),
-                ("_scales_ptrs", suffixed("_scales_ptrs")),
-                ("_bias_ptrs", suffixed("_bias_ptrs")),
-                ("_gate_bias_ptrs", suffixed("_gate_bias_ptrs")),
-                ("_up_bias_ptrs", suffixed("_up_bias_ptrs")),
-            ];
-            let fire = facts::Fire {
-                bound,
-                spec,
-                ctx,
-                attn,
-                gdn,
-                rows,
-                w_named,
-                w_named2,
-                w_suffixed: &w_suffixed,
-            };
+            // The SUFFIX REACH stood here: nine per-launch lookups
+            // (`_scales`, `_bias`, `_ptrs`, ...) resolved into `w_suffixed`
+            // for the keyed weight asks. A swept routine states its extra
+            // weights as marks (`weights[1]` rides `weight2`) or takes the
+            // per-expert arrays through the `expert_weights` view the
+            // per-fire arena builds (`bind::views`), so nothing reads a
+            // suffix at dispatch any more.
+            let fire = facts::Fire { bound, spec, ctx, attn, gdn, rows, w_named, w_named2 };
             return table::derived_arm(&cx::Cx::new(&fire), ctx.stream)
                 .map_err(|r| DispatchRefusal::NoArm(format!("{}: {r}", bound.kernel)));
         }
@@ -1607,6 +1544,9 @@ pub fn run<R: Resolver>(
 ) -> Result<usize, RunRefusal> {
     for (i, launch) in lowered.launches.iter().enumerate() {
         let kernel = || lowered.kernels[launch.kernel as usize].clone();
+        // The region, told first: a tail launch's operands must resolve
+        // against the tail's own views. See `Resolver::region`.
+        resolver.region(&launch.rows);
         let bound = bind(lowered, launch, frame, resolver).map_err(|e| RunRefusal {
             launch: i,
             kernel: kernel(),
@@ -1725,6 +1665,8 @@ pub fn run_captured<R: Resolver>(
 
         ctx.stream = builder.stream().as_raw().cast::<c_void>();
 
+        // As `run`'s: the region, before the operands.
+        resolver.region(&launch.rows);
         let bound = bind(lowered, launch, frame, resolver).map_err(|e| RunRefusal {
             launch: i,
             kernel: kernel.clone(),
@@ -1795,7 +1737,7 @@ pub fn resolve_arg_windowed<R: Resolver>(
             if at >= frame.arena_bytes {
                 return Err(BindRefusal::ArenaOutOfBounds { at, arena_bytes: frame.arena_bytes });
             }
-            BoundArg { ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(), width: *width }
+            BoundArg { ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(), width: *width, rows: 0 }
         }
         Arg::Raised { value, key } => {
             // NO ROW WINDOW. `row` offsets a rectangle by its own pitch and a
@@ -1804,17 +1746,18 @@ pub fn resolve_arg_windowed<R: Resolver>(
             let ptr = resolver
                 .raised(*value, key)
                 .ok_or_else(|| BindRefusal::RaisedUnbound { key: key.clone() })?;
-            BoundArg { ptr: ptr.cast_mut(), width: 0 }
+            BoundArg { ptr: ptr.cast_mut(), width: 0, rows: 0 }
         }
         Arg::Named { value, width, bytes: _ } => BoundArg {
             ptr: resolver.named(*value).ok_or(BindRefusal::UnknownNamed(*value))?,
             width: *width,
+            rows: 0,
         },
         Arg::Weight(name) => {
             // `scale.` marks a CONSTANT riding the name slot; the value comes
             // from `DispatchCtx::scales`, and the slot binds a sentinel.
             if name.starts_with("scale.") {
-                BoundArg { ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(), width: 0 }
+                BoundArg { ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(), width: 0, rows: 0 }
             } else {
                 BoundArg {
                     ptr: resolver
@@ -1822,6 +1765,7 @@ pub fn resolve_arg_windowed<R: Resolver>(
                         .ok_or_else(|| BindRefusal::UnknownWeight(name.clone()))?
                         .cast_mut(),
                     width: 0,
+                    rows: 0,
                 }
             }
         }
@@ -1844,9 +1788,19 @@ pub fn bind<'a, R: Resolver>(
     // `[win_start, ..)` of a full-N buffer, and `outs`/`aux` resolve through the
     // same call. `_devwin` forms take BASE pointers, so they are not windowed.
     let row = if kernel.ends_with("_devwin") { 0 } else { launch.rows.start };
-    let mut args = Vec::with_capacity(launch.args.len());
-    for arg in &lowered.args[launch.args.start as usize..launch.args.end as usize] {
-        args.push(resolve_arg_windowed(arg, frame, resolver, row)?);
+    let span = launch.args.start as usize..launch.args.end as usize;
+    let mut args = Vec::with_capacity(span.len());
+    for (i, arg) in lowered.args[span.clone()].iter().enumerate() {
+        let mut a = resolve_arg_windowed(arg, frame, resolver, row)?;
+        // A NAMED stream is bound at its BASE and staged whole, so its row
+        // space is the value's own — `Lowered::arg_rows` is where the
+        // lowering says so. Arena operands keep zero: their pointer is
+        // windowed to the launch's rectangle, and that pair must stay
+        // coherent under a peel.
+        if matches!(arg, Arg::Named { .. }) {
+            a.rows = lowered.arg_rows.get(span.start + i).copied().unwrap_or(0);
+        }
+        args.push(a);
     }
     Ok(BoundLaunch { kernel, rows: launch.rows.clone(), layers: launch.layers.clone(), args })
 }

@@ -535,8 +535,20 @@ pub fn trace(
     f: &Qwen35HybridFacts,
     class: model_ir::trace::FireClass,
     load: Deployed<'_>,
+    norm_eps: f32,
+    rope_theta: f32,
 ) -> model_ir::trace::ForwardPlan {
-    super::forward::qwen3_5_hybrid_cuda(f, &cuda_facts(f, load), class)
+    // THE SHIPPED POINT. qwen-3.5 catalogues one SKU today; the table in
+    // `forward::CATALOG` is where a second one appears, and the coverage
+    // test is what keeps every row loadable.
+    use model_dsl::axes::{Bf16Ax, NativeKv};
+    super::forward::qwen3_5_hybrid_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>(
+        f,
+        &cuda_facts(f, load),
+        class,
+        norm_eps,
+        rope_theta,
+    )
 }
 
 #[cfg(test)]

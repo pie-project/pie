@@ -101,10 +101,10 @@ pub fn sigs() -> &'static [KernelSig] {
                     sources: r.sources,
                     derived: r.derived,
                     internal: r.internal,
-                    asked: r.asked,
                     no_join: r.no_join,
                     driver: r.driver,
                     canon: r.canon,
+                    point: r.point,
                     ..SIG_BASE
                 });
             }
@@ -123,10 +123,10 @@ const SIG_BASE: KernelSig = KernelSig {
     derived: &[],
     axes: &[],
     internal: false,
-    asked: &[],
     no_join: false,
     driver: false,
     canon: None,
+    point: &[],
 };
 
 #[must_use]

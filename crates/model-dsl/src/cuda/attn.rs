@@ -6,16 +6,33 @@ use super::*;
 
 /// `kernels::rope::qk_rmsnorm_rope_bf16_devwin`.
 /// `outputs[0]` = q, `outputs[1]` = k; shapes are read from inputs.
+///
+/// The run is `[head_dim, theta, eps, n_max, win_start, win_len]`: `n_max`
+/// is the fire's row count (a spliced extent), and the window pair is the
+/// peel split — lowering-spliced (design-no-ask §3 category E), so the
+/// statement carries zero placeholders at those slots.
 #[must_use]
-pub fn qk_rmsnorm_rope_devwin(q: &Val, k: &Val, q_w: &str, k_w: &str) -> (Val, Val) {
+pub fn qk_rmsnorm_rope_devwin(
+    q: &Val,
+    k: &Val,
+    q_w: &str,
+    k_w: &str,
+    head_dim: u32,
+    theta: f32,
+    eps: f32,
+) -> (Val, Val) {
     let ids = q.t.with(q.layer, |b| {
+        let positions =
+            b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
         let q_sh = b.value_shape(q.id);
         let k_sh = b.value_shape(k.id);
-        b.launch(
+        b.launch_with_extents(
             "rope::qk_rmsnorm_rope_bf16_devwin",
             vec![q_w.to_string(), k_w.to_string()],
             None,
-            vec![q.id, k.id],
+            vec![head_dim, theta.to_bits(), eps.to_bits(), 0, 0, 0],
+            vec![(3, Shape(vec![Dim::Tokens]))],
+            vec![q.id, k.id, positions],
             vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
         )
     });
@@ -29,8 +46,14 @@ pub fn qk_rmsnorm_rope_devwin(q: &Val, k: &Val, q_w: &str, k_w: &str) -> (Val, V
 
 /// `kernels::attn::write_kv_explicit_bf16_devwin`.
 /// Writes the KV cache and returns no value.
-pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32) {
-    record(
+///
+/// Run `[num_kv_heads, head_dim, n_max, win_start, win_len]`: `n_max` is a
+/// spliced extent, the window pair is the peel split the lowering writes
+/// (zero placeholders here).
+pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32, num_kv_heads: u32, head_dim: u32) {
+    let kvc = rt_object(&k.t, "kv_cache", Some(l));
+    let row_valid = rt_tokens(&k.t, "row_valid");
+    record_with_extents(
         &k.t,
         Some(l),
         "attn::write_kv_explicit_bf16_devwin",
@@ -39,27 +62,34 @@ pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32) {
             store: StateStore::KvCache,
             layer: l,
         }),
-        vec![k.id, v.id],
+        vec![num_kv_heads, head_dim, 0, 0, 0],
+        vec![tokens_extent(2)],
+        vec![k.id, v.id, kvc, row_valid],
         None,
     );
 }
 
 
 builder! {
-    /// `kernels::attn::pad_head_dim_bf16` / `kernels::attn::strip_head_dim_bf16`:
-    pub fn pad_head_dim(x: &Val, heads: u32, head_dim_padded: u32) -> Val {
-        symbol: "attn::pad_head_dim_bf16",
+    /// `kernels::attn::pad_head_dim` / `kernels::attn::strip_head_dim`:
+    /// `params[0]` is the PACKED head dim — the padded one is read off the
+    /// result's width.
+    pub fn pad_head_dim(x: &Val, heads: u32, head_dim_padded: u32, head_dim: u32) -> Val {
+        symbol: "attn::pad_head_dim",
         on: x,
+        params: [head_dim],
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim_padded)] as BF16,
         made: "the pad produces its value",
     }
 
 
-    /// The inverse of [`pad_head_dim`](crate::cuda::pad_head_dim).
+    /// The inverse of [`pad_head_dim`](crate::cuda::pad_head_dim); the same
+    /// packed-head-dim scalar.
     pub fn strip_head_dim(x: &Val, heads: u32, head_dim: u32) -> Val {
-        symbol: "attn::strip_head_dim_bf16",
+        symbol: "attn::strip_head_dim",
         on: x,
+        params: [head_dim],
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)] as BF16,
         made: "the strip produces its value",
@@ -100,15 +130,34 @@ builder! {
 
 
 
-    /// `kernels::gemm::grouped_act_x_wt_bf16`: one GEMM per group, batched.
-    pub fn gemm_grouped(act: &Val, w: &str, n: u32) -> Val {
-        symbol: "gemm::grouped_act_x_wt_bf16",
-        on: act,
-        weights: [w],
-        inputs: [act],
-        out: [Dim::Tokens, Dim::Const(n)] as BF16,
-        made: "the gemm produces its value",
-    }
+}
+
+/// `kernels::gemm::grouped_act_x_wt_bf16`: one GEMM per group, batched.
+///
+/// The swept signature reads everything through the raised
+/// `In<Struct<GemmGroups>>` view — pointer arrays and the host M array —
+/// and writes through the view's `out_ptrs`, so the statement declares no
+/// result and places no activation or weight of its own. The run is
+/// `[group_count, beta, n, k]`.
+pub fn gemm_grouped(
+    t: &Trace,
+    layer: Option<u32>,
+    group_count: u32,
+    beta: f32,
+    n: u32,
+    k: u32,
+) {
+    let groups = rt_object(t, "gemm.groups", layer);
+    record_with_params(
+        t,
+        layer,
+        "gemm::grouped_act_x_wt_bf16",
+        vec![],
+        None,
+        vec![group_count, beta.to_bits(), n, k],
+        vec![groups],
+        None,
+    );
 }
 
 
@@ -129,44 +178,59 @@ pub fn compact_page_csr(t: &Trace, l: u32, keep: &Val) {
     );
 }
 
-builder! {
-    /// `kernels::gemm::mla_absorb_q_to_latent_bf16`.
-    pub fn mla_absorb_q_to_latent(
-        q_nope: &Val,
-        w: &str,
-        heads: u32,
-        kv_lora_rank: u32,
-        v_head_dim: u32,
-        qk_nope_dim: u32,
-    ) -> Val {
-        symbol: "gemm::mla_absorb_q_to_latent_bf16",
-        on: q_nope,
-        weights: [w],
-        // params[0] = heads, [1] = qk_nope_dim, [2] = v_head_dim, [3] = kv_lora_rank.
-        params: [heads, qk_nope_dim, v_head_dim, kv_lora_rank],
-        inputs: [q_nope],
-        out: [Dim::Tokens, Dim::Const(heads), Dim::Const(kv_lora_rank)] as BF16,
-        made: "the absorb produces its value",
-    }
+/// `kernels::gemm::mla_absorb_q_to_latent_bf16`.
+/// `params[0..5] = [heads, qk_nope_dim, v_head_dim, kv_lora_rank, tokens]`;
+/// the token count is the fire's and spliced by the lowering.
+pub fn mla_absorb_q_to_latent(
+    q_nope: &Val,
+    w: &str,
+    heads: u32,
+    kv_lora_rank: u32,
+    v_head_dim: u32,
+    qk_nope_dim: u32,
+) -> Val {
+    record_with_extents(
+        &q_nope.t,
+        q_nope.layer,
+        "gemm::mla_absorb_q_to_latent_bf16",
+        vec![w.to_string()],
+        None,
+        vec![heads, qk_nope_dim, v_head_dim, kv_lora_rank, 0],
+        vec![tokens_extent(4)],
+        vec![q_nope.id],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(kv_lora_rank)]),
+            DType::BF16,
+        )),
+    )
+    .expect("the absorb produces its value")
+}
 
-    /// `kernels::gemm::mla_absorb_latent_to_v_bf16`.
-    pub fn mla_absorb_latent_to_v(
-        latent: &Val,
-        w: &str,
-        heads: u32,
-        v_head_dim: u32,
-        qk_nope_dim: u32,
-        kv_lora_rank: u32,
-    ) -> Val {
-        symbol: "gemm::mla_absorb_latent_to_v_bf16",
-        on: latent,
-        weights: [w],
-        // params[0] = heads, [1] = qk_nope_dim, [2] = v_head_dim, [3] = kv_lora_rank.
-        params: [heads, qk_nope_dim, v_head_dim, kv_lora_rank],
-        inputs: [latent],
-        out: [Dim::Tokens, Dim::Const(heads), Dim::Const(v_head_dim)] as BF16,
-        made: "the absorb produces its value",
-    }
+/// `kernels::gemm::mla_absorb_latent_to_v_bf16`; the same five-scalar run as
+/// [`mla_absorb_q_to_latent`].
+pub fn mla_absorb_latent_to_v(
+    latent: &Val,
+    w: &str,
+    heads: u32,
+    v_head_dim: u32,
+    qk_nope_dim: u32,
+    kv_lora_rank: u32,
+) -> Val {
+    record_with_extents(
+        &latent.t,
+        latent.layer,
+        "gemm::mla_absorb_latent_to_v_bf16",
+        vec![w.to_string()],
+        None,
+        vec![heads, qk_nope_dim, v_head_dim, kv_lora_rank, 0],
+        vec![tokens_extent(4)],
+        vec![latent.id],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(v_head_dim)]),
+            DType::BF16,
+        )),
+    )
+    .expect("the absorb produces its value")
 }
 
 
@@ -185,9 +249,9 @@ builder! {
     }
 
 
-    /// `kernels::layout::split_qwen_gdn_ba_bf16`.
+    /// `kernels::layout::split_qwen_gdn_ba`.
     pub fn split_qwen_gdn_ba(ba: &Val, v_h: u32) -> (Val, Val) {
-        symbol: "layout::split_qwen_gdn_ba_bf16",
+        symbol: "layout::split_qwen_gdn_ba",
         on: ba,
         inputs: [ba],
         outs: [

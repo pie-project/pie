@@ -1,12 +1,11 @@
 
 use kernels::{Bind, Fire};
-use kernels::routine::{Asks, Const, In, InOut, Out};
+use kernels::routine::{Const, In, InOut, Out};
 use kernels_macros::routine;
 use crate::jit::{Ctx, Launch};
 use crate::jit::abi::Tensor;
 use crate::jit::abi::{bf16, f16};
 use kernels::Refusal;
-use kernels::keys;
 
 const BLOCK: u32 = 256;
 
@@ -159,7 +158,7 @@ pub fn chunked_geglu_tanh<T>(
     ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::chunked_geglu_tanh<{}>", T::CPP))).apply(elementwise_rows(y.rows, y.width)), &[packed.arg(), y.arg(), y.width.arg()])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = sigmoid_gate_add)]
 pub fn sigmoid_dot_scalar_gate_add<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,

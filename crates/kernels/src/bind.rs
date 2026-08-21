@@ -21,36 +21,6 @@ use crate::routine::Refusal;
 use crate::shader::ShaderValue;
 use crate::{Kind, Lit, Source, Ty};
 
-/// What a driver answers a [`Source::Named`] with. Which kind a key is, is the
-/// driver's knowledge; what carrier it lands at is [`bind`]'s.
-///
-/// `Eq` is deliberately absent: [`Answer::Float`] carries a real number, and
-/// an epsilon compared for exact equality answers according to how it was
-/// computed rather than to what it is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Answer {
-    /// A staged buffer, by the handle the driver numbered it with.
-    Handle(u32),
-    /// One of the fire's numbers.
-    Number(i32),
-    /// A number already unsigned and possibly wider than an `i32`, which the
-    /// pool's strides are on a large deployment.
-    Wide(u64),
-    /// One of the fire's REAL numbers -- an epsilon, a rotary base, a
-    /// routing scale.
-    ///
-    /// Its own variant rather than a number, because the bits of an `f32`
-    /// read as an `i32` are a different value and nothing downstream could
-    /// tell which reading was meant.
-    Float(f32),
-    /// One of the fire's flags -- a layout, a normalisation switch.
-    ///
-    /// A flag is not a one-bit number: the three shader planes pack it into
-    /// a scalar and CUDA passes a one-byte `bool` by value, and only the
-    /// backend's own [`ShaderValue::bool`] knows which.
-    Truth(bool),
-}
-
 /// The driver's side of a binding: the handles a statement carries and the
 /// facts the fire answers.
 pub trait Holds {
@@ -151,14 +121,13 @@ pub trait Holds {
         Err(Refusal::Unstated { what: "a result's element count, which this backend does not carry" })
     }
 
-    /// What the fire answers for a fact. `None` for a key this driver does not
-    /// answer, which [`bind`] turns into [`Refusal::Unstated`].
-    ///
-    /// # Errors
-    ///
-    /// Whatever the fact's own absence means -- a tile on a device that
-    /// states none, a page size on a pool that has none.
-    fn fact(&mut self, key: &'static str) -> Option<Result<Answer, Refusal>>;
+
+    /// This launch's row count — the rectangle's, which the driver that
+    /// built the launch always has. Zero is this crate's word for "no
+    /// extent", so the default is the honest absence.
+    fn rows(&mut self) -> i32 {
+        0
+    }
 }
 
 /// Bind one launch's arguments from the row the signature derived.
@@ -246,8 +215,6 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
             let at = h.input(n.into())?;
             shaped(ty, at, rows(h), h.in_width(n.into()).unwrap_or(0))
         }
-        // A FACT the driver answers, by name.
-        Source::Named(key) => named(ty, key, h),
         // A CHAIN, and only for scalars: `param` mints nothing, while `input`
         // numbers a handle whether or not the caller keeps it, so a discarded
         // attempt at a buffer would shift every handle after it.
@@ -259,23 +226,6 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
                 None => one(ty, *fallback, h),
             }
         }
-        // THE WEIGHT CHAIN: the named bank first and the positional one after,
-        // which is what `Const<Tensor<E>>` derives for every weight a routine
-        // takes (`Or(Named("weight"), Slot(Kind::Weight, 0))`).
-        //
-        // It is safe where the scalar chain above needed a note: `named`
-        // resolves a fact and mints NOTHING when it fails, so a discarded
-        // attempt shifts no handle. `weight(n)` is the one that numbers, and
-        // it is only reached once, on the fallback.
-        //
-        // Without this arm every shader-plane weight refused. The five marks
-        // spelled the two halves apart -- `Weight<N, _>` took the named bank
-        // and `Bank<N, _>` the positional one -- so no chain reached here at
-        // all, and the four marks resolve one mark to both.
-        Source::Or(&Source::Named(key), fallback) => match named(ty, key, h) {
-            Ok(v) => Ok(v),
-            Err(_) => one(ty, *fallback, h),
-        },
         Source::Or(..) => Err(Refusal::Unstated {
             what: "a chain whose first half is neither one of the statement's \
                    scalars nor a fact the driver answers by name",
@@ -319,10 +269,7 @@ fn count<V: ShaderValue, H: Holds + ?Sized>(source: Source, h: &mut H) -> Result
 /// a plane that answers no `rows` lands on the value every reader checks
 /// rather than refusing an operand that is otherwise perfectly bound.
 fn rows<H: Holds + ?Sized>(h: &mut H) -> i32 {
-    match h.fact(<crate::keys::Rows as crate::keys::Fact>::KEY) {
-        Some(Ok(Answer::Number(n))) => n,
-        _ => 0,
-    }
+    h.rows()
 }
 
 /// A bound buffer CARRYING ITS RECTANGLE, where the value has room for one.
@@ -409,53 +356,7 @@ fn number<V: ShaderValue>(ty: Ty, n: i32) -> Result<V, Refusal> {
     })
 }
 
-/// A fact, by the key the signature names. See [`Holds::fact`].
-fn named<V: ShaderValue, H: Holds + ?Sized>(
-    ty: Ty,
-    key: &'static str,
-    h: &mut H,
-) -> Result<V, Refusal> {
-    let answer = h.fact(key).ok_or(Refusal::Unstated {
-        what: "a fact this backend does not answer",
-    })??;
-    match answer {
-        Answer::Handle(at) => handle(ty, at),
-        Answer::Number(n) => number(ty, n),
-        // NOT THROUGH `number`: an `f32`'s bits read as an `i32` are a
-        // different value, and `Ty::F32` asks for the reading, not the bits.
-        Answer::Float(x) => match ty {
-            Ty::F32 => Ok(V::f32(x)),
-            _ => Err(Refusal::Unstated {
-                what: "a real fact at a carrier this binder has not met",
-            }),
-        },
-        Answer::Truth(b) => match ty {
-            Ty::Bool => Ok(V::bool(b)),
-            _ => number(ty, i32::from(b)),
-        },
-        // ALREADY WIDE, so no sign round trip: the pool's strides fit an
-        // `i32` on every deployment in the suite and would stop on a big one.
-        Answer::Wide(n) => Ok(match ty {
-            Ty::Usize => V::usize(n),
-            Ty::U32 | Ty::InPacked => V::u32(u32::try_from(n).map_err(|_| too_wide(n, u64::from(u32::MAX)))?),
-            Ty::I32 => V::i32(i32::try_from(n).map_err(|_| too_wide(n, i32::MAX as u64))?),
-            _ => {
-                return Err(Refusal::Unstated {
-                    what: "a scalar argument at a carrier this binder has not met",
-                });
-            }
-        }),
-    }
-}
 
-/// A fact that does not fit the width its signature states.
-fn too_wide(at: u64, max: u64) -> Refusal {
-    Refusal::Wide {
-        what: "a fact at a carrier narrower than the number the fire answers",
-        at: i64::try_from(at).unwrap_or(i64::MAX),
-        max: i64::try_from(max).unwrap_or(i64::MAX),
-    }
-}
 
 /// The refusal for a slot kind no signature states.
 fn unstated(kind: Kind) -> Refusal {

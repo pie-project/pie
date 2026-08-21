@@ -32,6 +32,8 @@ pub enum ArgValue {
     U32(u32),
     F32(f32),
     Usize(u64),
+    /// A raised host view's address (`ShaderValue::as_raised`).
+    Raised(usize),
 }
 
 impl kernels::routine::Absent for ArgValue {}
@@ -45,6 +47,7 @@ impl ArgValue {
             Self::U32(_) => "a u32",
             Self::F32(_) => "an f32",
             Self::Usize(_) => "a usize",
+            Self::Raised(_) => "a raised view",
         }
     }
 }
@@ -89,6 +92,15 @@ impl ShaderValue for ArgValue {
             Self::Usize(v) => Some(v),
             _ => None,
         }
+    }
+    fn as_raised(self) -> Option<usize> {
+        match self {
+            Self::Raised(a) => Some(a),
+            _ => None,
+        }
+    }
+    fn raised(addr: usize) -> Self {
+        Self::Raised(addr)
     }
     fn as_extent(self) -> Option<(i32, i32)> {
         match self {
@@ -176,7 +188,7 @@ pub type Routine = kernels::routine::Routine<Vulkan>;
 
 pub use kernels::shader::{elementwise, elementwise_rows};
 
-pub use kernels::keys;
+
 pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
 pub use crate::module::path as module_path;

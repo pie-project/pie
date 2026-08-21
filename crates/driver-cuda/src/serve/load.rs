@@ -751,9 +751,11 @@ fn synthetic_fire(
 /// So they are built here, once, beside the bank they slice. A bank is
 /// `[E, ...]` contiguous, so expert `e` begins at `base + e * (bytes / E)` —
 /// `WeightSpan` carries both halves of that and `LoadShape::n_experts` the
-/// third. The arrays are registered under the bank's own name plus a suffix,
-/// which is how `bind::dispatch`'s suffix reach already finds `_scales`, so the
-/// arm asks for them exactly as it asks for that.
+/// third. The arrays are registered under the bank's own name plus a suffix
+/// (`_ptrs`, `_scales_ptrs`, `_bias_ptrs`), which is how the per-fire view
+/// arena finds them: `bind::views::FireViews::fill_expert_weights` resolves
+/// them beside the bank each statement names and hands the routine one
+/// `ExpertWeightsView` where the keyed asks used to be.
 ///
 /// Binding the bank's base where an array of bases belongs is what this
 /// replaces: `compute-sanitizer` measured the first eight bytes of MXFP4 weight

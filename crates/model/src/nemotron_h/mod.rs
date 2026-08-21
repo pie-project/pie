@@ -217,7 +217,7 @@ impl Variant for NemotronH {
         if let crate::catalog::Backend::Metal(_) = load.backend {
             return Err(Refusal::Unsupported(project::NO_METAL));
         }
-        Ok(project::trace(&self.shape, class))
+        Ok(project::trace(&self.shape, class, NORM_EPS, ROPE_THETA))
     }
 
     /// ChatML that OPENS the assistant turn inside a `<think>`.

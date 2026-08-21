@@ -36,6 +36,9 @@ pub mod hold;
 /// Binding a launch from the signature, through the shared reader.
 pub mod bind;
 
+/// The raised views the binder builds for `In<Struct<..>>` operands.
+pub mod views;
+
 pub mod cached;
 
 // Running a crossed body to get a dispatch: the other half of the routine

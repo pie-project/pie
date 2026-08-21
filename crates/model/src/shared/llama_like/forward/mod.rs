@@ -9,10 +9,33 @@ pub mod facts;
 use self::facts::{
     Activation, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm,
 };
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{
     self as dsl, MatW, Val, add_bias, attention, cuda, matmul, rmsnorm, rope, split_qkv, swiglu,
 };
 use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, Shape};
+
+/// The XQA decode workspace, in bytes — the capacity the driver allocated
+/// for every deployment before the carve moved onto the statement
+/// (`driver-cuda/src/fire/launch.rs` allocated each `AttentionWorkspace`
+/// at 32 MiB float / 16 MiB int, deployment-independent). The routine
+/// carves its page table, sequence lengths and scratch out of the float
+/// half and its semaphore bank out of the int half, and refuses at fire
+/// time if the carve does not fit — so these are capacity statements, not
+/// geometry, and they restate the driver's own numbers.
+const XQA_FLOAT_WORKSPACE_BYTES: u32 = 32 << 20;
+/// See [`XQA_FLOAT_WORKSPACE_BYTES`].
+const XQA_INT_WORKSPACE_BYTES: u32 = 16 << 20;
+
+/// KNOWN DEFECT, stated rather than guessed: the capture dispatch's
+/// `score_window` is a PER-FIRE number (the driver answered it from
+/// `attn_ctx().score_window`, boot-configured, default 32 — a property of
+/// the fire's score-wanting programs, not of any checkpoint), and the B2
+/// sweep marked it `Const<u32>` on the routine. A trace-time constant
+/// cannot state it honestly; 0 is the routine's own "no capture" value.
+/// The design table (§3) classes `AttnScoreWindow` as a per-fire stream —
+/// the mark should move to the runtime channel at convergence.
+const SCORE_WINDOW_UNSTATED: u32 = 0;
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
 /// trace serves every fire shape, kernel choice stays with the consumer
@@ -38,9 +61,9 @@ use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, S
 /// * `Post` (olmo2) — the sub-layer reads the stream raw, its output
 ///   projection lands in scratch (`beta=0`), the norm applies to THAT, and
 ///   a separate `ResidualAdd` lands it — the hand-written post-norm walk's
-///   gemm → `kernels::norm::rmsnorm_bf16` → `kernels::norm::residual_add_bf16` triplet.
-pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
-    dsl::trace_semantic("llama_like", &facts.shape(), |m| {
+///   gemm → `kernels::norm::rmsnorm` → `kernels::norm::residual_add` triplet.
+pub fn llama_like(facts: &LlamaLikeFacts, norm_eps: f32, rope_theta: f32) -> ForwardPlan {
+    dsl::trace_semantic("llama_like", &facts.shape(norm_eps), |m| {
         dsl::seam(m.trace(), &dsl::seam::IN, &[], None);
         let f = facts.clone();
         let q_w = f.q_width();
@@ -88,7 +111,18 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
             } else {
                 (rmsnorm(&q, &w.q_norm), rmsnorm(&k, &w.k_norm))
             };
-            let (q, k) = rope(&q, &k, f.rope);
+            let (q, k) = rope(
+                &q,
+                &k,
+                f.rope,
+                dsl::RopeShape {
+                    num_q_heads: f.q_heads,
+                    num_kv_heads: f.kv_heads,
+                    head_dim: f.head_dim,
+                    theta: rope_theta,
+                    interleaved: false,
+                },
+            );
             w.kv.append(&k, &v);
             let a = attention(&q, &w.kv, q_w);
 
@@ -187,14 +221,59 @@ fn mlp(x: &Val, w: &dsl::Layer, intermediate: u32, packed: bool) -> Val {
 
 /// and the traced form states its kernels as raw signatures
 /// ([`model_dsl::cuda`]; north-star-dsl.md). One trace per
-/// [`FireClass`]; family names `llama_like.cuda.decode` / `.prefill`.
-pub fn llama_like_cuda(
+/// [`FireClass`]; family names `llama_like-kv-bf16.cuda.decode` /
+/// `.prefill` — the SKU joins the first segment, the second stays the
+/// backend.
+///
+/// TWO axes, not four, and that is deliberate: this text is ROW-driven.
+/// `ModelShape.proj_repr` comes from each deployment row's own data
+/// (`cuda.proj_repr` — bf16 for the L40S rows, `Scaled` for the MLX
+/// ones), so hoisting the weight repr to a type axis would need a
+/// catalogued instantiation per row. The day each llama_like row becomes
+/// its own catalogue entry is the day W1 appears here; until then the
+/// repr stays a fact and only the axes every row agrees on — the
+/// activation dtype and the KV scheme, both pinnable today — are
+/// declared.
+pub fn llama_like_cuda<A: DtypeAxis, K: KvAxis>(
     facts: &LlamaLikeFacts,
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
 ) -> ForwardPlan {
-    llama_like_cuda_text(facts, cuda, class)
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: `write_kv_to_pages` states native bf16
+    // pages and nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
+    llama_like_cuda_text(
+        &format!("llama_like-{}", K::NAME),
+        facts,
+        cuda,
+        class,
+        norm_eps,
+        rope_theta,
+    )
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&LlamaLikeFacts, &LlamaLikeCudaFacts, FireClass, f32, f32) -> ForwardPlan;
+
+/// The shared text's catalogue — ONE point, and thinner than the family
+/// tables on purpose. llama_like serves eleven architectures through
+/// per-deployment ROWS, and the row's `proj_repr` is data this point does
+/// not close over (see [`llama_like_cuda`]); what the table enumerates is
+/// the pair of axes every row shares. The coverage test
+/// (`model/tests/catalogue_coverage.rs`) traces it at both fire classes;
+/// `TraceBuilder::finish`'s `check_plan` then refuses a point whose
+/// statements reach a routine row that does not exist.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    ("llama_like-kv-bf16", llama_like_cuda::<Bf16Ax, NativeKv>),
+];
 
 /// The llama_like METAL text (`.wiki/tart/dsl.md` ③) — the second
 /// backend's own model file, stating Metal's kernels.
@@ -262,7 +341,7 @@ fn llama_like_metal_text(
     // projection below spells a repr and none can spell a different one.
     let shape = dsl::ModelShape {
         proj_repr: metal.proj_repr,
-        ..facts.shape()
+        ..facts.shape(metal.rms_eps)
     };
     dsl::trace_metal("llama_like", &shape, class, |m| {
         // The depth axis, and it is stated unconditionally here where the
@@ -489,9 +568,8 @@ fn llama_like_metal_text(
         // beside them even at batch eight. The full correction is in
         // `device.rs`'s `hazards` doc under "where the batched step's extra
         // 5.04 ms actually goes".
-        let staged: std::cell::RefCell<
-            std::collections::HashMap<model_ir::trace::ValueId, Val>,
-        > = std::cell::RefCell::new(std::collections::HashMap::new());
+        let staged: std::cell::RefCell<std::collections::HashMap<model_ir::trace::ValueId, Val>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
         let stage = |x: &Val| -> Val {
             if let Some(v) = staged.borrow().get(&x.key()) {
                 return v.clone();
@@ -950,6 +1028,7 @@ fn llama_like_metal_text(
                     variant: f.norm_variant,
                     per_head: None,
                     layer: None,
+                    eps: metal.rms_eps,
                 },
                 metal.per_layer_emb_dim,
                 metal.rms_eps,
@@ -1523,9 +1602,12 @@ pub fn llama_like_metal(
 /// `declared_forward.cpp` chooses at fire time today — the migration
 /// deletes the C++ copy of these matches, not this one.
 fn llama_like_cuda_text(
+    family: &str,
     facts: &LlamaLikeFacts,
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
 ) -> ForwardPlan {
     // The namespace, with the deployment's WEIGHT REPRESENTATION on it
     // (1b). `facts.shape()` answers `Bf16` because the semantic facts
@@ -1549,9 +1631,9 @@ fn llama_like_cuda_text(
         q_width: facts.q_width() / tp,
         kv_width: facts.kv_width() / tp,
         intermediate: facts.intermediate / tp,
-        ..facts.shape()
+        ..facts.shape(norm_eps)
     };
-    dsl::trace_cuda("llama_like", &shape, class, |m| {
+    dsl::trace_cuda(family, &shape, class, |m| {
         dsl::seam(m.trace(), &dsl::seam::IN, &[], None);
         // THIS RANK's facts: the widths the shard actually computes.
         // Everything below reads them as if the model were that size,
@@ -1640,7 +1722,7 @@ fn llama_like_cuda_text(
         // once — not the hand-written `rope_table_ready` latch, and
         // hoisted where a once-per-fire launch belongs.
         let table = (fused_post && cuda_of(FireClass::Decode).is_some_and(|c| c.rope_table))
-            .then(|| cuda::rope_standard_table(m.trace(), f.head_dim));
+            .then(|| cuda::rope_standard_table(m.trace(), f.head_dim, rope_theta));
 
         for l in 0..f.layers {
             let w = m.layer(l);
@@ -1700,7 +1782,7 @@ fn llama_like_cuda_text(
                 // kernels, whose semantic ops are 1:1.
                 let per_head_fused = f.qk_norm == QkNorm::PerHead && f.rope == RopeKind::Standard;
                 let (q, k) = if per_head_fused {
-                    cuda::qk_rmsnorm_rope(&q, &k, &w.q_norm, &w.k_norm)
+                    cuda::qk_rmsnorm_rope(&q, &k, &w.q_norm, &w.k_norm, rope_theta)
                 } else {
                     let (q, k) = if f.qk_norm == QkNorm::Off {
                         (q, k)
@@ -1716,7 +1798,7 @@ fn llama_like_cuda_text(
                     // launchers -- a kernel choice from a param. This
                     // family rotates the full head, and says which
                     // kernel that is.
-                    dsl::cuda::rope(&q, &k, f.q_heads, f.kv_heads, f.head_dim)
+                    dsl::cuda::rope(&q, &k, f.q_heads, f.kv_heads, f.head_dim, rope_theta, false)
                 };
                 // The KV-write mechanism is a per-fire runtime input
                 // (explicit descriptors when the fire steers a graph
@@ -1746,9 +1828,9 @@ fn llama_like_cuda_text(
                 // other side.
                 let (q, k, v) = if pad_to > 0 {
                     (
-                        cuda::pad_head_dim(&q, f.q_heads, pad_to),
-                        cuda::pad_head_dim(&k, f.kv_heads, pad_to),
-                        cuda::pad_head_dim(&v, f.kv_heads, pad_to),
+                        cuda::pad_head_dim(&q, f.q_heads, pad_to, f.head_dim),
+                        cuda::pad_head_dim(&k, f.kv_heads, pad_to, f.head_dim),
+                        cuda::pad_head_dim(&v, f.kv_heads, pad_to, f.head_dim),
                     )
                 } else {
                     (q, k, v)
@@ -1756,7 +1838,7 @@ fn llama_like_cuda_text(
                 dsl::guard(
                     m.trace(),
                     GuardPred::HasWriteDesc,
-                    || cuda::write_kv_explicit(&k, &v, &w.kv),
+                    || cuda::write_kv_explicit(&k, &v, &w.kv, f.kv_heads, plan_head_dim),
                     || cuda::write_kv_to_pages(&k, &v, &w.kv),
                 );
                 q
@@ -1874,39 +1956,47 @@ fn llama_like_cuda_text(
                         // The peeled form: the deployment's causal
                         // dispatch over the unmasked prefix, the custom
                         // one over the masked suffix.
-                        let peeled = |q: &Val| {
-                            dsl::by_rows(m.trace(), Some(l), None, |r| {
-                                r.arm(dsl::RowPred::Unmasked, || {
-                                    // The prefix states THE DEPLOYMENT'S
-                                    // causal form: the planned decode
-                                    // dispatch on window-one fires —
-                                    // force_prefill (GQA ratio outside
-                                    // the decode kernel's set) falling
-                                    // back to the plan-free prefill
-                                    // dispatch behind its dequant
-                                    // staging — and the causal prefill
-                                    // dispatch (same staging) on ragged
-                                    // fires: any mix of prefill and
-                                    // plain-decode requests, ragged qo.
-                                    if c.force_prefill_path {
-                                        cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim, 0.0, 0.0);
-                                    } else {
-                                        dsl::guarded(m.trace())
-                                            .arm(GuardPred::WindowOne, || {
-                                                // hook×mask: the prefix decode IS
-                                                // the paged decode path and the
-                                                // hooked rows live in it (the
-                                                // seriation puts masked rows in
-                                                // the suffix, so the prefix
-                                                // starts at row 0 and the request
-                                                // ordinals are the unsplit ones).
-                                                // So the score capture rides here
-                                                // exactly as in the unsplit arm —
-                                                // the hand-written body's
-                                                // `if (score_capture.active())`
-                                                // on this same branch.
-                                                dsl::guarded(m.trace())
+                        let peeled =
+                            |q: &Val| {
+                                dsl::by_rows(m.trace(), Some(l), None, |r| {
+                                    r.arm(dsl::RowPred::Unmasked, || {
+                                        // The prefix states THE DEPLOYMENT'S
+                                        // causal form: the planned decode
+                                        // dispatch on window-one fires —
+                                        // force_prefill (GQA ratio outside
+                                        // the decode kernel's set) falling
+                                        // back to the plan-free prefill
+                                        // dispatch behind its dequant
+                                        // staging — and the causal prefill
+                                        // dispatch (same staging) on ragged
+                                        // fires: any mix of prefill and
+                                        // plain-decode requests, ragged qo.
+                                        if c.force_prefill_path {
+                                            cuda::dequant_only(&w.kv, f.kv_heads, plan_head_dim);
+                                            cuda::attention_flashinfer_prefill(
+                                                &dsl::runtime::query_windows(q),
+                                                &w.kv,
+                                                window_left,
+                                                plan_head_dim,
+                                                0.0,
+                                                0.0,
+                                            );
+                                        } else {
+                                            dsl::guarded(m.trace())
+                                                .arm(GuardPred::WindowOne, || {
+                                                    // hook×mask: the prefix decode IS
+                                                    // the paged decode path and the
+                                                    // hooked rows live in it (the
+                                                    // seriation puts masked rows in
+                                                    // the suffix, so the prefix
+                                                    // starts at row 0 and the request
+                                                    // ordinals are the unsplit ones).
+                                                    // So the score capture rides here
+                                                    // exactly as in the unsplit arm —
+                                                    // the hand-written body's
+                                                    // `if (score_capture.active())`
+                                                    // on this same branch.
+                                                    dsl::guarded(m.trace())
                                                     .arm(GuardPred::WantsAttnScore, || {
                                                         cuda::attention_flashinfer_decode_capture(
                                                             q,
@@ -1920,36 +2010,50 @@ fn llama_like_cuda_text(
                                                             q,
                                                             &w.kv,
                                                             window_left,
-                                                        plan_head_dim,
-);
+                                                        plan_head_dim, 0.0, 0.0);
                                                     });
-                                            })
-                                            .otherwise(|| {
-                                                cuda::dequant_only(&w.kv);
-                                                cuda::attention_flashinfer_prefill(
-                                                    q,
-                                                    &w.kv,
-                                                    window_left,
-                                                plan_head_dim,
- 0.0, 0.0);
-                                            });
-                                    }
+                                                })
+                                                .otherwise(|| {
+                                                    cuda::dequant_only(
+                                                        &w.kv,
+                                                        f.kv_heads,
+                                                        plan_head_dim,
+                                                    );
+                                                    cuda::attention_flashinfer_prefill(
+                                                        &dsl::runtime::query_windows(q),
+                                                        &w.kv,
+                                                        window_left,
+                                                        plan_head_dim,
+                                                        0.0,
+                                                        0.0,
+                                                    );
+                                                });
+                                        }
+                                    });
+                                    r.rest(|| {
+                                        cuda::attention_flashinfer_prefill_custom(
+                                            &dsl::runtime::query_windows(q),
+                                            &w.kv,
+                                            window_left,
+                                            plan_head_dim,
+                                            0.0,
+                                            0.0,
+                                        );
+                                    });
                                 });
-                                r.rest(|| {
-                                    cuda::attention_flashinfer_prefill_custom(
-                                        q,
-                                        &w.kv,
-                                        window_left,
-                                    plan_head_dim,
- 0.0, 0.0);
-                                });
-                            });
-                        };
+                            };
                         if c.head_dim_padded {
                             // The split's row offsets are logical-width
                             // and the padded staging is not, so this
                             // deployment keeps the fire-level word.
-                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left, plan_head_dim, 0.0, 0.0);
+                            cuda::attention_flashinfer_prefill_custom(
+                                &dsl::runtime::query_windows(q),
+                                &w.kv,
+                                window_left,
+                                plan_head_dim,
+                                0.0,
+                                0.0,
+                            );
                         } else if c.xqa_decode {
                             // XQA's prepare is fire-wide (R-shaped), so a
                             // window-one fire cannot peel; a ragged one
@@ -1959,11 +2063,13 @@ fn llama_like_cuda_text(
                                 GuardPred::WindowOne,
                                 || {
                                     cuda::attention_flashinfer_prefill_custom(
-                                        q,
+                                        &dsl::runtime::query_windows(q),
                                         &w.kv,
                                         window_left,
-                                    plan_head_dim,
- 0.0, 0.0);
+                                        plan_head_dim,
+                                        0.0,
+                                        0.0,
+                                    );
                                 },
                                 || peeled(q),
                             );
@@ -1978,14 +2084,34 @@ fn llama_like_cuda_text(
                             // form: the deployment states it or it does
                             // not, and a score-wanting program under XQA
                             // fails loudly PTIR-side.
-                            cuda::attention_xqa_decode(q, &w.kv, window_left);
+                            cuda::attention_xqa_decode(
+                                q,
+                                &w.kv,
+                                window_left,
+                                f.q_heads,
+                                f.kv_heads,
+                                plan_head_dim,
+                                // The deployment's scale is the default
+                                // `1/sqrt(head_dim)` (project.rs states no
+                                // other); 0 tells the routine to derive it.
+                                0.0,
+                                XQA_FLOAT_WORKSPACE_BYTES,
+                                XQA_INT_WORKSPACE_BYTES,
+                            );
                         } else if c.force_prefill_path {
                             // The GQA ratio sits outside the decode
                             // kernel's set, so BOTH window classes take
                             // the prefill dispatch — there is nothing
                             // left for a guard to choose between.
-                            cuda::dequant_only(&w.kv);
-                            cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim, 0.0, 0.0);
+                            cuda::dequant_only(&w.kv, f.kv_heads, plan_head_dim);
+                            cuda::attention_flashinfer_prefill(
+                                &dsl::runtime::query_windows(q),
+                                &w.kv,
+                                window_left,
+                                plan_head_dim,
+                                0.0,
+                                0.0,
+                            );
                         } else {
                             dsl::guarded(m.trace())
                                 .arm(GuardPred::WindowOne, || {
@@ -1995,39 +2121,48 @@ fn llama_like_cuda_text(
                                                 q,
                                                 &w.kv,
                                                 window_left,
-                                            plan_head_dim,
- 0.0, 0.0);
+                                                plan_head_dim,
+                                                0.0,
+                                                0.0,
+                                            );
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_decode(
                                                 q,
                                                 &w.kv,
                                                 window_left,
-                                            plan_head_dim,
-);
+                                                plan_head_dim,
+                                                0.0,
+                                                0.0,
+                                            );
                                         });
                                 })
                                 .otherwise(|| {
                                     // Ragged fires are row-uniform:
                                     // dequant, then the score-guarded
                                     // causal dispatch.
-                                    cuda::dequant_only(&w.kv);
+                                    cuda::dequant_only(&w.kv, f.kv_heads, plan_head_dim);
                                     dsl::guarded(m.trace())
                                         .arm(GuardPred::WantsAttnScore, || {
                                             cuda::attention_flashinfer_prefill_capture(
-                                                q,
+                                                &dsl::runtime::query_windows(q),
                                                 &w.kv,
                                                 window_left,
-                                            plan_head_dim,
- 0.0, 0.0);
+                                                plan_head_dim,
+                                                0.0,
+                                                0.0,
+                                                SCORE_WINDOW_UNSTATED,
+                                            );
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_prefill(
-                                                q,
+                                                &dsl::runtime::query_windows(q),
                                                 &w.kv,
                                                 window_left,
-                                            plan_head_dim,
- 0.0, 0.0);
+                                                plan_head_dim,
+                                                0.0,
+                                                0.0,
+                                            );
                                         });
                                 });
                         }
@@ -2088,17 +2223,28 @@ fn llama_like_cuda_text(
                                             &w.k_norm,
                                             &w.kv,
                                             table.as_ref(),
+                                            f.kv_heads,
+                                            rope_theta,
                                         );
                                     });
                                 },
                                 || {
                                     let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
-                                    let (_qt, kt) =
-                                        cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
+                                    let (_qt, kt) = cuda::qk_rmsnorm_rope(
+                                        &qt, &kt, &w.q_norm, &w.k_norm, rope_theta,
+                                    );
                                     dsl::guard(
                                         m.trace(),
                                         GuardPred::HasWriteDesc,
-                                        || cuda::write_kv_explicit(&kt, &vt, &w.kv),
+                                        || {
+                                            cuda::write_kv_explicit(
+                                                &kt,
+                                                &vt,
+                                                &w.kv,
+                                                f.kv_heads,
+                                                plan_head_dim,
+                                            )
+                                        },
                                         || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
                                     );
                                 },
@@ -2190,7 +2336,8 @@ fn llama_like_cuda_text(
                 // match.
                 let partial = matmul(&a, &w.o_proj);
                 let summed = all_reduce(m.trace(), &partial, f.hidden, cuda);
-                let x = cuda::residual_add_rmsnorm(&y, &summed, &w.mlp_norm.name, f.hidden);
+                let x =
+                    cuda::residual_add_rmsnorm(&y, &summed, &w.mlp_norm.name, f.hidden, norm_eps);
                 let act = mlp(&x, &w, f.intermediate, cuda.gate_up_fused);
                 // The MLP is COLUMN-parallel through `gate_up` and
                 // row-parallel through `down`, so its output is a
@@ -2292,8 +2439,7 @@ mod tests {
             // The same symbol the two BLOCK norms use, so this reads as a
             // difference and not as a count: a decode row is one row, and
             // `dsl::metal::rms_norm` states the single-row form for it.
-            runs(&separate, "rms_single_row_bfloat16")
-                - runs(&together, "rms_single_row_bfloat16"),
+            runs(&separate, "rms_single_row_bfloat16") - runs(&together, "rms_single_row_bfloat16"),
             2,
             "the fused text still norms separately: {:?}",
             metal_kernels(&together)
@@ -2311,7 +2457,10 @@ mod tests {
         let mut global = f.clone();
         global.qk_norm = QkNorm::Global;
         assert_eq!(
-            runs(&llama_like_metal(&global, &fused, FireClass::Decode), "rms_rope_bfloat16"),
+            runs(
+                &llama_like_metal(&global, &fused, FireClass::Decode),
+                "rms_rope_bfloat16"
+            ),
             0
         );
 
@@ -2322,7 +2471,10 @@ mod tests {
             ..fused.clone()
         };
         assert_eq!(
-            runs(&llama_like_metal(&f, &table, FireClass::Decode), "rms_rope_bfloat16"),
+            runs(
+                &llama_like_metal(&f, &table, FireClass::Decode),
+                "rms_rope_bfloat16"
+            ),
             0
         );
 
@@ -2760,14 +2912,14 @@ mod tests {
     ///
     /// | trace op            | hand-written kernel(s)                          |
     /// |---------------------|-------------------------------------------------|
-    /// | Rmsnorm(attn_norm)  | kernels::norm::rmsnorm_bf16                              |
+    /// | Rmsnorm(attn_norm)  | kernels::norm::rmsnorm                              |
     /// | Matmul(qkv)         | kernels::gemm::act_x_w (qkv_proj_fused)               |
     /// | SplitQkv            | kernels::attn::split_qkv_bf16                            |
     /// | RmsnormPerHead x2 + Rope | kernels::rope::qk_rmsnorm_rope_bf16 (fused pair)    |
     /// | KvAppend            | kernels::attn::write_kv_to_pages                         |
     /// | Attention           | dispatch_attention_flashinfer_{decode,prefill}   |
     /// | Matmul(o_proj)+res  | kernels::gemm::act_x_w beta=1                         |
-    /// | Rmsnorm(mlp_norm)   | kernels::norm::rmsnorm_bf16                              |
+    /// | Rmsnorm(mlp_norm)   | kernels::norm::rmsnorm                              |
     /// | Matmul(gate_up)     | kernels::gemm::act_x_w                                |
     /// | Swiglu              | (silu-and-mul kernel)                            |
     /// | Matmul(down)+res    | kernels::gemm::act_x_w beta=1                         |

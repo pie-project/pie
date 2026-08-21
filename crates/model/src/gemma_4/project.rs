@@ -24,6 +24,7 @@
 //! shape had nowhere to put it: **a KV-shared layer names another
 //! layer's pages**, and `LayerAttention::kv_source` exists for it.
 
+use model_dsl::axes::{Bf16Ax, NativeKv};
 use std::collections::BTreeMap;
 
 use crate::catalog::Deployed;
@@ -675,6 +676,7 @@ pub fn trace(
     sliding_window: i32,
     class: model_ir::trace::FireClass,
     layer_scalars: &[f32],
+    norm_eps: f32,
 ) -> model_ir::trace::ForwardPlan {
     let cuda = super::forward::facts::Gemma4CudaFacts {
         fused_qkv: true,
@@ -694,7 +696,10 @@ pub fn trace(
             })
             .collect(),
     };
-    super::forward::gemma4_cuda(f, &cuda, class)
+    // THE SHIPPED POINT. gemma-4 catalogues one SKU today; the table in
+    // `forward::CATALOG` is where a second one appears, and the coverage
+    // test is what keeps every row loadable.
+    super::forward::gemma4_cuda::<Bf16Ax, Bf16Ax, NativeKv>(f, &cuda, class, norm_eps)
 }
 
 #[cfg(test)]

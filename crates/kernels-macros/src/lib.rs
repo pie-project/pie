@@ -30,7 +30,7 @@
 //! everything in that paragraph is deleted.
 
 use proc_macro::TokenStream;
-use quote::{ToTokens, quote};
+use quote::quote;
 use syn::{
     Error, FnArg, ItemFn, Pat, PatType, Type, parse_macro_input, spanned::Spanned,
 };
@@ -146,7 +146,6 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .filter(|f| *f != "untraced" && *f != "uncolumned")
         .collect();
-    let asked = asked_facts(&f);
     // `Derivation::DERIVED` IS ALWAYS FULL, EVEN ON AN UNCOLUMNED ROW.
     //
     // It carries the parameter's own NAME and whether a null may land there,
@@ -169,25 +168,42 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote!(::kernels::routine::sources::<crate::Plane, _, _>(#body))
     };
-    let asked_list = if uncolumned {
-        quote!(&[])
-    } else {
-        quote!(&[#(<#asked as ::kernels::keys::Fact>::KEY),*])
-    };
     // THE ROW CARRIES THE COLUMN. `routine!` cannot reach it: it is handed a
     // BODY expression, and the names-and-nullability column is read off the
     // SYNTAX and hangs on the marker type this attribute also emits. So the
     // attribute, which has both in hand, attaches it -- and `Stated::derived`
     // downstream is what tells `arity_problem` which operands are optional.
+    // THE INSTANTIATION, ON THE ROW. The name no longer says it; the row
+    // does, as the point route-by-dtype selects on once a second point
+    // exists. Today every generic routine has exactly one.
+    let point_names: Vec<String> = spec
+        .generics
+        .iter()
+        .filter_map(|g| {
+            if let syn::Type::Path(p) = g
+                && let Some(seg) = p.path.segments.last()
+                && seg.arguments.is_none()
+            {
+                Some(seg.ident.to_string().to_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let with_point = if point_names.is_empty() {
+        quote!()
+    } else {
+        quote!(.point(&[#(#point_names),*]))
+    };
     let with_column = match &spec.canon {
         Some(role) => quote!(
             .derived(<#base as ::kernels::Derivation>::DERIVED)
-            .asking(<#base as ::kernels::Derivation>::ASKED)
             .canon(#role)
+            #with_point
         ),
         None => quote!(
             .derived(<#base as ::kernels::Derivation>::DERIVED)
-            .asking(<#base as ::kernels::Derivation>::ASKED)
+            #with_point
         ),
     };
     // The module the `fn` is written in, unless the attribute says otherwise.
@@ -256,22 +272,6 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl ::kernels::Derivation for #base {
             const DERIVED: &'static [::kernels::Derived] = #column;
             const SOURCES: &'static [::core::option::Option<::kernels::Source>] = #sources;
-            // THE FACTS THE BODY ASKS FOR, SCANNED OUT OF THE BODY.
-            //
-            // The derived column lost its `Env` half, and with it the check
-            // that found `rope_scale`, `rope_theta` and `mscale` unanswered on
-            // Vulkan: a driver test used to walk `SOURCES` and ask *"does this
-            // backend answer every fact its own kernels name"*. `ctx.ask::<_,
-            // K>()` is a call, not a declaration, and is not statically
-            // enumerable -- so `#[routine]`, which already parses the whole
-            // `ItemFn`, collects the turbofishes instead.
-            //
-            // Same fidelity as the parameter run for a fact asked in the body,
-            // and it cannot drift from the calls. It MISSES a fact asked inside
-            // a helper, which is a real step down from a type-system guarantee
-            // to a syntactic one, accepted deliberately rather than discovered
-            // later.
-            const ASKED: &'static [&'static str] = #asked_list;
         }
 
         #signature
@@ -365,23 +365,14 @@ impl Spec {
         Ok(Self { generics, facts, namespace, canon })
     }
 
-    /// `rmsnorm` + `[bf16]` -> `rmsnorm_bf16`.
-    ///
-    /// Const generics do not join the name: `rope::<bf16, 256>` is
-    /// `rope_bf16`, because 256 is a tuning number and not a point on the
-    /// dtype axis a trace names.
+    /// `rmsnorm` + `[bf16]` -> `rmsnorm`. THE SUFFIX IS GONE: the dtype is
+    /// the statement's (every trace value carries one), so the name saying
+    /// it again was a drift class — a statement whose values are f16 under
+    /// a `_bf16` symbol refused nowhere. The instantiation survives on the
+    /// ROW as its `point`, which is what route-by-dtype will select on when
+    /// a routine grows a second point.
     fn trace_name(&self, base: &str) -> String {
-        let mut out = base.to_string();
-        for g in &self.generics {
-            if let syn::Type::Path(p) = g
-                && let Some(seg) = p.path.segments.last()
-                && seg.arguments.is_none()
-            {
-                out.push('_');
-                out.push_str(&seg.ident.to_string().to_lowercase());
-            }
-        }
-        out
+        base.to_string()
     }
 
     /// The expression `routine!` invokes: the `fn`, instantiated if generic.
@@ -419,10 +410,12 @@ enum Arg {
     Canon(String),
 }
 
-/// One `namespace = "..."`, one `canon = role`, or a bare item.
+/// One `namespace = "..."`, one `canon = role` (an ident, or a string when
+/// the claim carries an axis point — `canon = "rmsnorm.gemma"`), or a bare
+/// item.
 enum Item {
     Namespace(syn::LitStr),
-    Canon(syn::Ident),
+    Canon(String),
     Bare(syn::Type),
 }
 
@@ -435,7 +428,12 @@ impl syn::parse::Parse for Item {
                 return Ok(Self::Namespace(input.parse()?));
             }
             if key == "canon" {
-                return Ok(Self::Canon(input.parse()?));
+                if input.peek(syn::LitStr) {
+                    let lit: syn::LitStr = input.parse()?;
+                    return Ok(Self::Canon(lit.value()));
+                }
+                let id: syn::Ident = input.parse()?;
+                return Ok(Self::Canon(id.to_string()));
             }
             return Err(syn::Error::new(
                 key.span(),
@@ -455,7 +453,7 @@ impl syn::parse::Parse for Args {
         for item in raw {
             match item {
                 Item::Namespace(lit) => named.push(Arg::Namespace(lit.value())),
-                Item::Canon(id) => named.push(Arg::Canon(id.to_string())),
+                Item::Canon(claim) => named.push(Arg::Canon(claim)),
                 Item::Bare(t) => items.push(t),
             }
         }
@@ -606,9 +604,10 @@ fn every_parameter_is_a_mark(f: &ItemFn) -> Result<(), Error> {
                      address, and `Const` is what the statement placed and the \
                      launch only reads -- a weight when its carrier is a \
                      `Tensor<E>`, a scalar of the params run when it is an `i32`, \
-                     an `f32` or a `bool`. A fact only THIS FIRE can answer is not \
-                     a parameter at all: ask for it in the body with \
-                     `ctx.ask::<carrier, keys::X>()`."
+                     an `f32` or a `bool`. A value only the driver holds is not \
+                     a bare parameter either: it is a runtime OPERAND -- \
+                     `In<Struct<X>>` for a view, `In<Tensor<E>>` for a \
+                     staged stream (`kernels::runtime` names the vocabulary)."
                 ),
             ));
         }
@@ -666,84 +665,7 @@ fn inner(seg: &syn::PathSegment) -> Option<Type> {
 }
 
 
-/// Every `keys::X` a `ctx.ask::<C, keys::X>()` in this body names.
-///
-/// A SYNTACTIC SCAN, and it says so: the turbofish is read out of the token
-/// stream, so a fact asked through a helper `fn` in another module is not
-/// found. See `Derivation::ASKED` for why that trade was taken.
-///
-/// The path is kept whole -- `keys::Rows`, `crate::keys::Rows`, whatever the
-/// body wrote -- because the emitted const resolves it in the body's own
-/// module, where it already resolves.
-fn asked_facts(f: &ItemFn) -> Vec<syn::Path> {
-    let mut out: Vec<syn::Path> = Vec::new();
-    collect_asks(f.block.to_token_stream(), &mut out);
-    out
-}
 
-/// Walk a token stream for `ask :: < .. , path >`, recursing into groups.
-fn collect_asks(ts: proc_macro2::TokenStream, out: &mut Vec<syn::Path>) {
-    use proc_macro2::TokenTree;
-    let trees: Vec<TokenTree> = ts.into_iter().collect();
-    let mut i = 0;
-    while i < trees.len() {
-        if let TokenTree::Group(g) = &trees[i] {
-            collect_asks(g.stream(), out);
-        }
-        // `ask` `::` `<` .. `>` -- the angle-bracketed run is not a `Group`,
-        // so it is gathered by scanning to the matching `>`.
-        if let TokenTree::Ident(id) = &trees[i]
-            && id == "ask"
-            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
-        {
-            let mut j = i + 2;
-            while j < trees.len() {
-                if matches!(&trees[j], TokenTree::Punct(p) if p.as_char() == '<') {
-                    break;
-                }
-                j += 1;
-            }
-            let (mut depth, mut k, mut last) = (0i32, j, Vec::new());
-            let mut piece: Vec<TokenTree> = Vec::new();
-            while k < trees.len() {
-                match &trees[k] {
-                    TokenTree::Punct(p) if p.as_char() == '<' => {
-                        depth += 1;
-                        if depth > 1 {
-                            piece.push(trees[k].clone());
-                        }
-                    }
-                    TokenTree::Punct(p) if p.as_char() == '>' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            last = piece.clone();
-                            break;
-                        }
-                        piece.push(trees[k].clone());
-                    }
-                    // THE CARRIER IS THE FIRST ARGUMENT AND THE QUESTION THE
-                    // SECOND, in the order `Env<T, K>` named them. Only the
-                    // question is a fact, so each comma at depth one starts
-                    // the run over and the LAST run is the one kept.
-                    TokenTree::Punct(p) if p.as_char() == ',' && depth == 1 => {
-                        piece.clear();
-                    }
-                    t => piece.push(t.clone()),
-                }
-                k += 1;
-            }
-            if !last.is_empty() {
-                let stream: proc_macro2::TokenStream = last.into_iter().collect();
-                if let Ok(path) = syn::parse2::<syn::Path>(stream)
-                    && !out.iter().any(|p| p == &path)
-                {
-                    out.push(path);
-                }
-            }
-        }
-        i += 1;
-    }
-}
 
 /// The parameter's own identifier, which is the fact's name.
 fn param_name(pt: &PatType) -> Result<String, Error> {

@@ -8,8 +8,9 @@ use crate::jit::{Ctx, Launch, Root};
 use crate::jit::abi::MaybeConst;
 use crate::jit::abi::Tensor;
 use kernels::Refusal;
-use kernels::keys;
-use kernels::routine::{Asks, In, Out};
+use kernels::raises::Struct;
+use kernels::routine::{Const, In, Out};
+use crate::views::KvCache;
 
 pub use crate::jit::abi::DevicePtr;
 use kernels::Ty;
@@ -527,15 +528,18 @@ pub fn attention_xqa_decode_bf16_prepared(
     let page_size = kvc.page_size;
     let max_pages_per_seq = kvc.max_pages_per_request;
     let sm_scale = *sm_scale;
-    let float_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceFloat>()?;
+    // The XQA carve is launch-local and its sizes are stated by the
+    // statement, so the workspace is named scratch rather than a driver
+    // answer (was `keys::AttnWorkspaceFloat` / `keys::AttnWorkspaceInt`).
+    let float_bytes = usize::try_from(*float_bytes).unwrap_or(usize::MAX);
+    let float_buffer = ctx.scratch("attn::xqa_workspace_float", float_bytes)?;
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
     let kv_page_indices = kvc.page_indices as *const u32;
     let kv_page_indptr = kvc.page_indptr as *const u32;
     let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let float_bytes = *float_bytes;
-    let int_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()?;
-    let int_bytes = *int_bytes;
+    let int_bytes = usize::try_from(*int_bytes).unwrap_or(usize::MAX);
+    let int_buffer = ctx.scratch("attn::xqa_workspace_int", int_bytes)?;
     let num_requests = *num_requests;
 
     let (k_pages, v_pages) = (k_pages, v_pages);

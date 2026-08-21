@@ -81,3 +81,23 @@ kernels::resident!(
     /// The custom-mask triple. Per-fire, staged by the driver.
     AttnMask = "attention_mask" => MaskView
 );
+
+/// `In<Struct<AttnSplit>>` — the driver's decode split policy: how many
+/// KV splits this fire's decode runs, and the partials plane the split
+/// form folds. `splits <= 1` is the unsplit reading and the partials
+/// handle is then never read. What `keys::AttnSplits`/`keys::AttnPartials`
+/// (vulkan) and the optional `keys::AttnScratch` (wgpu) asked; metal fires
+/// unsplit and its driver answers `splits: 1`.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitView {
+    /// The partials/scratch plane, `[splits, rows, heads, head_dim + 1]`-ish
+    /// in the plane's own layout. Handle 0 when `splits <= 1`.
+    pub partials: Tensor<f32>,
+    /// The split count; `<= 1` means unsplit.
+    pub splits: i32,
+}
+
+kernels::resident!(
+    /// The decode split policy. Driver-owned, per fire.
+    AttnSplit = "attn.split_policy" => SplitView
+);

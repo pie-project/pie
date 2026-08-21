@@ -111,7 +111,7 @@ impl LlamaLikeFacts {
     /// The toolchain cannot name `LlamaLikeFacts` -- that edge would point the
     /// wrong way -- so the projection is written here, on the family side,
     /// once per family.
-    pub fn shape(&self) -> model_dsl::ModelShape {
+    pub fn shape(&self, norm_eps: f32) -> model_dsl::ModelShape {
         model_dsl::ModelShape {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -124,6 +124,10 @@ impl LlamaLikeFacts {
             kv_width: self.kv_width(),
             qk_norm: self.qk_norm,
             norm_variant: self.norm_variant,
+            // The ROW's epsilon, in the millionths `ModelShape` stores so it
+            // can stay `Eq`; the facts hold no epsilon of their own (see
+            // `project::RowScalars`), so the caller supplies the row's.
+            norm_eps_micro: (norm_eps * 1.0e6).round() as u32,
             tied_embeddings: self.tied_embeddings,
             // DENSE, because these are the SEMANTIC facts: a trace with
             // no backend cannot name the kernel a scaled weight needs,
@@ -448,7 +452,7 @@ impl LlamaLikeFacts {
     ///   `post_attention_layernorm` + `post_feedforward_layernorm` and NO
     ///   `input_layernorm`; each sub-layer reads the residual stream raw,
     ///   norms its own output, and a separate residual add lands it
-    ///   (`kernels::norm::residual_add_bf16` in the hand-written post-norm walk).
+    ///   (`kernels::norm::residual_add` in the hand-written post-norm walk).
     /// * `qk_norm: Global` — the checkpoint's `q_norm`/`k_norm` weights
     ///   are shape `[2048]` = heads x head_dim (verified against the
     ///   safetensors header), NOT `[128]`: one RMSNorm over the flattened

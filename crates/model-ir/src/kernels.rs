@@ -161,12 +161,9 @@ impl Stated {
             // counted where a short count is allowed.
             let optional = self.derived.get(at).is_some_and(|d| d.nullable);
             match source {
-                // A WEIGHT IS A READ, and it may arrive by name or by slot:
-                // `Const<Tensor<E>>` resolves to the chain
-                // `Or(Named("weight"), Slot(Kind::Weight, 0))`, so the chain's
-                // FIRST half is what has to be recognised.
-                Some(Source::Slot(Kind::In | Kind::Weight, _))
-                | Some(Source::Or(Source::Named(_), Source::Slot(Kind::Weight, _))) => {
+                // A WEIGHT IS A READ, positional since the named half of the
+                // old chain retired with the semantic ops.
+                Some(Source::Slot(Kind::In | Kind::Weight, _)) => {
                     if optional {
                         p.optional_reads += 1;
                     } else {
@@ -266,6 +263,57 @@ pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
                     sources: &[],
                     derived: &[],
                 }))
+        }
+    }
+}
+
+/// The canon claim `backend`'s row for `symbol` makes, if any — the
+/// reverse of [`canon_symbol`], for readers that hold a symbol and want
+/// its role (the seam rules).
+#[must_use]
+pub fn claim_of(backend: Backend, symbol: &str) -> Option<&'static str> {
+    match backend {
+        Backend::Cuda => kernels::sig_in(sigs(), symbol).and_then(|k| k.canon),
+        Backend::Metal => {
+            let name = kernels_metal::kernel_of(symbol)?;
+            kernels_metal::declared()
+                .into_iter()
+                .find(|d| d.name == name)
+                .and_then(|d| d.canon)
+        }
+    }
+}
+
+/// The symbol `backend` CLAIMS for one canon point (`"rmsnorm"`,
+/// `"rmsnorm.gemma"`), or `None` when nothing claims it.
+///
+/// THE tier-1 resolution: `dsl::rmsnorm` reads the family's backend off the
+/// trace and asks here, so the symbol table lives on the routines
+/// (`#[routine(canon = ..)]`) and nowhere in the DSL. A claim shared by two
+/// routines of one backend is a bug the tables' tests refuse; first match
+/// answers here.
+#[must_use]
+pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
+    match backend {
+        Backend::Cuda => sigs()
+            .iter()
+            .find(|k| k.canon == Some(claim))
+            .map(|k| k.symbol),
+        Backend::Metal => {
+            static CLAIMS: std::sync::OnceLock<
+                std::collections::BTreeMap<String, &'static str>,
+            > = std::sync::OnceLock::new();
+            CLAIMS
+                .get_or_init(|| {
+                    kernels_metal::declared()
+                        .into_iter()
+                        .filter_map(|d| {
+                            d.canon.map(|c| (c.to_string(), d.name))
+                        })
+                        .collect()
+                })
+                .get(claim)
+                .copied()
         }
     }
 }
@@ -453,7 +501,7 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                     // A `scale.` name is a constant riding the weight slot,
                     // not a pointer: it reaches the arm through
                     // `DispatchCtx::scales`, so counting it as an operand
-                    // would make `norm::scalar_mul_bf16` look one short.
+                    // would make `norm::scalar_mul` look one short.
                     let bound = weights.iter().filter(|w| !w.starts_with("scale.")).count();
                     if let Some(why) =
                         arity_problem(&k, kernel, bound, op, inside_value_region)

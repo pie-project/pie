@@ -132,8 +132,9 @@ fn block(args: &[ArgValue]) -> Vec<u8> {
             // A HANDLE CONTRIBUTES NO BYTES, shaped or not. `Shaped` carries
             // the rectangle a statement gave the operand, which the marks read
             // and the uniform block does not — it is a `@group(0)` entry by
-            // the same rule `Buffer` is.
-            ArgValue::Buffer(_) | ArgValue::Shaped { .. } => {}
+            // the same rule `Buffer` is. A RAISED VIEW is host data the body
+            // already read; it reaches no shader and packs nothing.
+            ArgValue::Buffer(_) | ArgValue::Shaped { .. } | ArgValue::Raised(_) => {}
             ArgValue::I32(v) => out.extend_from_slice(&v.to_le_bytes()),
             ArgValue::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
             ArgValue::F32(v) => out.extend_from_slice(&v.to_le_bytes()),

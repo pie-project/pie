@@ -4,8 +4,7 @@ use core::ffi::c_void;
 
 use crate::jit::Ctx;
 use crate::jit::abi::Tensor;
-use kernels::keys;
-use kernels::routine::{Asks, Const, In, Out};
+use kernels::routine::{Const, In, Out};
 use kernels::Refusal;
 
 #[cfg(feature = "_cuda")]

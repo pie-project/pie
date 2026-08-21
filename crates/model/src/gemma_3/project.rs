@@ -794,7 +794,7 @@ mod tests {
             let cuda = trace(&f, &schedule(), NORM_EPS, class, Deployed::single())
                 .expect("and the CUDA text is the one it always was");
             assert!(
-                cuda.family.starts_with("llama_like.cuda."),
+                cuda.family.starts_with("llama_like-kv-bf16.cuda."),
                 "{}",
                 cuda.family
             );

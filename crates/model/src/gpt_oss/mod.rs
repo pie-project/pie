@@ -326,7 +326,14 @@ impl Variant for GptOss {
                 &shape, &facts, class,
             ));
         }
-        Ok(project::trace(&self.shape, class, load))
+        Ok(project::trace(
+            &self.shape,
+            class,
+            load,
+            self.norm_eps,
+            self.rope_theta,
+            self.window,
+        ))
     }
 
     /// gpt-oss's OWN template and not ChatML: the harmony format opens

@@ -495,8 +495,23 @@ pub fn trace(
     f: &GptOssFacts,
     class: model_ir::trace::FireClass,
     load: Deployed<'_>,
+    norm_eps: f32,
+    rope_theta: f32,
+    sliding_window: i32,
 ) -> model_ir::trace::ForwardPlan {
-    super::forward::gpt_oss_cuda(f, &cuda_facts(f, load), class)
+    // THE SHIPPED POINT. gpt-oss catalogues one SKU today — MXFP4-Marlin
+    // experts around a bf16 stack; the table in `forward::CATALOG` is
+    // where a second one appears, and the coverage test is what keeps
+    // every row loadable.
+    use model_dsl::axes::{Bf16Ax, Mxfp4Ax, NativeKv};
+    super::forward::gpt_oss_cuda::<Bf16Ax, Mxfp4Ax, Bf16Ax, NativeKv>(
+        f,
+        &cuda_facts(f, load),
+        class,
+        norm_eps,
+        rope_theta,
+        sliding_window,
+    )
 }
 
 #[cfg(test)]

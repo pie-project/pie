@@ -5,9 +5,8 @@ use crate::jit::{Ctx, Launch, Root, aligned16};
 use crate::jit::Abi;
 use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
-use kernels::routine::{Asks, Const, In, InOut, Out, Region, Stride};
+use kernels::routine::{Const, In, InOut, Out, Region, Stride};
 
-use kernels::keys;
 use kernels::Refusal;
 
 use core::ffi::c_void;
@@ -185,7 +184,7 @@ pub fn hash_route_lookup(
             ])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = topk)]
 pub fn topk_softmax<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -293,7 +292,7 @@ pub const fn supported(m: i32, n: i32, k: i32) -> Result<(), Refusal> {
     Ok(())
 }
 
-#[routine(bf16, driver)]
+#[routine(bf16, driver, canon = matmul_select)]
 pub fn moe_grouped_gemm<T>(
     ctx: &Ctx<'_>,
     a: In<Tensor<T>>,
@@ -620,7 +619,7 @@ pub fn gather_moe_aligned_inputs<T>(
             ])
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = weighted_sum)]
 pub fn token_batched_weighted_sum<T>(
     ctx: &Ctx<'_>,
     out: Out<Tensor<T>>,

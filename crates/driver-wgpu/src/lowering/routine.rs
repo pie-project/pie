@@ -295,6 +295,11 @@ impl Encode for Planner<'_, '_> {
                 // buffer it is.
                 ArgValue::Buffer(h) => handles.push(*h),
                 ArgValue::Shaped { handle, .. } => handles.push(*handle),
+                // A raised view is HOST data the body already read; it names
+                // no binding and packs no scalar, so it takes no place in
+                // either run. A body has no reason to pass one back, and one
+                // that does loses nothing but the no-op.
+                ArgValue::Raised(_) => {}
                 other => scalars.push(*other),
             }
         }
@@ -432,7 +437,10 @@ pub fn bind<'a, B>(
         let (width, run): (usize, [u8; 8]) = match value {
             // A BUFFER IS NOT A SCALAR and never reaches this run: the split
             // above puts every handle, shaped or plain, on the other side.
-            ArgValue::Buffer(_) | ArgValue::Shaped { .. } => continue,
+            // A RAISED VIEW is neither: host data the body already read,
+            // dropped by the same split, and skipped here for the hand-built
+            // `Stated` a test may carry.
+            ArgValue::Buffer(_) | ArgValue::Shaped { .. } | ArgValue::Raised(_) => continue,
             ArgValue::I32(v) => (4, {
                 let mut b = [0u8; 8];
                 b[..4].copy_from_slice(&v.to_le_bytes());
@@ -642,13 +650,21 @@ pub fn plan<'a, R: crate::binding::Resolve>(
         // reason the split pass would too, and the split pass is the one whose
         // refusal names the operand. So this one is swallowed and the count it
         // reached is used, which is the number of results it managed to ask
-        // for before stopping.
-        let _ = super::bind::bind(routine.args, routine.sources, &mut probe, facts);
+        // for before stopping. The scratch `Views` is dropped with the probe:
+        // nothing reads a counting pass's addresses.
+        let mut scratch = super::views::Views::default();
+        let _ = super::bind::bind(routine.args, routine.sources, &mut probe, facts, &mut scratch);
         probe.asked_results()
     };
     let mut handles = super::hold::Handles::with_numbers(args, asked, scalars, &numbers);
-    let taken_args = super::bind::bind(routine.args, routine.sources, &mut handles, facts)
-        .map_err(Unplanned::Refused)?;
+    // THE VIEWS OUTLIVE THE BODY. `bind` boxes a host view per `Ty::Raised`
+    // operand and hands its ADDRESS into `taken_args`; the body reads it in
+    // `stating` below, so the holder sits on this frame until then. Dropping
+    // it earlier would hand the body a dangling address that still binds.
+    let mut views = super::views::Views::default();
+    let taken_args =
+        super::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
+            .map_err(Unplanned::Refused)?;
     // THE BODY ANSWERS THROUGH THE SAME HANDLES IT BOUND FROM. Answering
     // mints, and the walk below reads the minted list back, so the cell hands
     // the planner a borrow and gives the `Handles` back after.

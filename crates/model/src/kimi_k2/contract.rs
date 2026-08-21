@@ -201,7 +201,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
             let up = packed(b, &parts[2].name, vec![1, inter_full, h], 1);
             let gate_s = factors(b, &parts[1].name, vec![1, inter_full, h / GROUP], 1);
             let up_s = factors(b, &parts[3].name, vec![1, inter_full, h / GROUP], 1);
-            // `[gate | up]` — the order `mlp::chunked_swiglu_bf16` reads
+            // `[gate | up]` — the order `mlp::chunked_swiglu` reads
             // when its `gate_second` argument is left at its default, which
             // is what the trace's `dsl::cuda::swiglu` records: it states no
             // params, so the launch takes the default. `y[n,i] =
@@ -799,7 +799,7 @@ mod tests {
     /// The two halves are stacked GATE FIRST, and nothing else in this file
     /// reads the order.
     ///
-    /// `mlp::chunked_swiglu_bf16` computes `y[n,i] = silu(packed[n,i]) *
+    /// `mlp::chunked_swiglu` computes `y[n,i] = silu(packed[n,i]) *
     /// packed[n,I+i]` when its `gate_second` argument is left at its
     /// default, and the trace's `dsl::cuda::swiglu` records no params, so
     /// the launch takes that default. The LEADING half is therefore the one

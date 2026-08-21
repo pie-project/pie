@@ -67,19 +67,7 @@ use super::*;
 /// a rounding error, it is the wrong matrix.
 pub const ROUTE_BLOCK_MATVEC: u32 = 1;
 
-fn record(
-    t: &Trace,
-    layer: Option<u32>,
-    kernel: &str,
-    weights: Vec<String>,
-    state: Option<StateRef>,
-    inputs: Vec<model_ir::trace::ValueId>,
-    out: Option<(Shape, DType)>,
-) -> Option<Val> {
-    with_params(t, layer, kernel, weights, state, Vec::new(), inputs, out)
-}
-
-/// [`record`], plus the scalars the symbol's row names.
+/// Record one launch, plus the scalars the symbol's row names.
 ///
 /// A kernel takes numbers no operand shape gives — a projection's two
 /// extents, a norm's epsilon, an attention's strides. The row says which
@@ -213,7 +201,10 @@ pub fn embed_gather(
     // same kernel with the row read from the grid instead of assumed.
     let _ = multi_batch;
     let stem = "embed_gather_mb_4bit";
-    with_params(
+    // The token-id stream is the routine's `In<Tensor<i32>>` now, minted by
+    // name from the runtime vocabulary; the driver stages it per fire.
+    let token_ids = runtime::token_ids(t);
+    with_extents(
         t,
         None,
         &format!("{stem}{point}"),
@@ -230,8 +221,15 @@ pub fn embed_gather(
         // above is composed from, so the string and the numbers cannot
         // disagree: `point_of` is `affine_point`'s inverse over the two
         // fields that build it.
-        point_of(repr, point),
-        vec![],
+        //
+        // The trailing zero is `rows`, a fire extent the lowering splices.
+        {
+            let mut p = point_of(repr, point);
+            p.push(0);
+            p
+        },
+        vec![(2, Shape(vec![Dim::Tokens]))],
+        vec![token_ids.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
     )
     .expect("embed produces the residual stream")
@@ -260,7 +258,7 @@ pub fn rms_norm(x: &Val, w: &NormW, row: u32, eps: f32) -> Val {
 /// how it read as "close but the argmax moved".
 pub fn rms_norm_gain(x: &Val, w: &NormW, row: u32, eps: f32, gain: f32) -> Val {
     let out = same_shape(x);
-    with_params(
+    with_extents(
         &x.t,
         w.layer,
         "rms_single_row_bfloat16",
@@ -284,13 +282,16 @@ pub fn rms_norm_gain(x: &Val, w: &NormW, row: u32, eps: f32, gain: f32) -> Val {
         //
         // `plus_one` is the `(1 + w)` reading gemma takes and this family
         // does not; the gain is unity.
+        // The sixth word is `rows`, the fire's — spliced by the lowering.
         vec![
             eps.to_bits(),
             row,
             1,
             u32::from(w.variant == model_ir::trace::NormVariant::Gemma),
             gain.to_bits(),
+            0,
         ],
+        vec![(5, Shape(vec![rows_of(x)]))],
         vec![x.id],
         Some(out),
     )
@@ -462,7 +463,7 @@ fn quant_table(name: &str, repr: WeightRepr) -> Vec<String> {
 /// `quantized_qmv.metal::affine_qmv_fast` — the projection GEMV,
 /// M=1. The driver fans every projection kind onto it.
 pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         w.layer,
         &format!("affine_qmv_fast{point}"),
@@ -472,8 +473,14 @@ pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
         // the GEMV reads and the row it writes — and the routine reads both
         // off its own marks now (`x.width`, `y.width`), while the group and
         // the bit width it used to `Ask` for are the checkpoint's constants
-        // the statement carries.
-        point_of(w.repr, point),
+        // the statement carries. `vecs` — how many rows the matvec fires —
+        // closes the run as a spliced fire extent.
+        {
+            let mut p = point_of(w.repr, point);
+            p.push(0);
+            p
+        },
+        vec![(2, Shape(vec![rows_of(x)]))],
         vec![x.id],
         region_out(
             &x.t,
@@ -487,13 +494,19 @@ pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
 /// with the block residual folded into its epilogue, which is what a
 /// `beta_one` matmul is on this backend.
 pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         w.layer,
         &format!("affine_qmv_fast_residual{point}"),
         quant_weights(w),
         None,
-        point_of(w.repr, point),
+        // As `qmv`'s: the codec pair, then `vecs` as a spliced extent.
+        {
+            let mut p = point_of(w.repr, point);
+            p.push(0);
+            p
+        },
+        vec![(2, Shape(vec![rows_of(x)]))],
         vec![x.id, residual.id],
         region_out(
             &x.t,
@@ -506,7 +519,7 @@ pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
 /// `quant/qmm_t.metal::affine_qmm_t` — MLX's steel quantized
 /// GEMM, the M>1 projection.
 pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         w.layer,
         &format!("affine_qmm_t{point}"),
@@ -514,7 +527,9 @@ pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
         None,
         // As `qmv`'s, plus the TILE: a `qmm` is stamped over
         // `(group × bits × bm × bn)` and takes all four as `Const<i32>`.
-        [point_of(w.repr, point), tile_of(point)].concat(),
+        // `m` — the fire's row count — closes the run as a spliced extent.
+        [point_of(w.repr, point), tile_of(point), vec![0]].concat(),
+        vec![(4, Shape(vec![rows_of(x)]))],
         vec![x.id],
         region_out(
             &x.t,
@@ -526,13 +541,15 @@ pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
 
 /// `quant/qmm_t.metal::affine_qmm_t_residual`.
 pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         w.layer,
         &format!("affine_qmm_t_residual{point}"),
         quant_weights(w),
         None,
-        [point_of(w.repr, point), tile_of(point)].concat(),
+        // As `qmm`'s: codec pair, tile, then `m` as a spliced extent.
+        [point_of(w.repr, point), tile_of(point), vec![0]].concat(),
+        vec![(4, Shape(vec![rows_of(x)]))],
         vec![x.id, residual.id],
         region_out(
             &x.t,
@@ -565,17 +582,19 @@ pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
 /// statement here has.
 pub fn cast_qmm_input(x: &Val) -> Val {
     let k = in_width(x);
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         x.layer,
         "cast_qmm_input_strided_bfloat16_to_float16",
         Vec::new(),
         None,
-        // THE ROW PITCH, ALONE. `k` and the unread `n` slot stood before it
-        // — the first is `cast_in.width`, which the operand carries, and the
-        // second was never read. The pitch is `k` for a packed activation,
-        // and every activation this is asked of is packed.
-        vec![k],
+        // THE ROW PITCH, then `rows`. `k` and the unread `n` slot stood
+        // before the pitch — the first is `cast_in.width`, which the operand
+        // carries, and the second was never read. The pitch is `k` for a
+        // packed activation, and every activation this is asked of is
+        // packed; the row count is the fire's, spliced.
+        vec![k, 0],
+        vec![(1, Shape(vec![rows_of(x)]))],
         vec![x.id],
         region_out(&x.t, (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::F16)),
     );
@@ -633,15 +652,17 @@ pub fn cast_qmm_input_when(x: &Val, pred: model_ir::trace::GuardPred) -> Val {
 /// argument table, which is the one way this form's binding differs from
 /// [`qmm`]'s; see `driver-metal`'s `arm::precast`.
 pub fn qmm_fp16(x: &Val, w: &MatW, point: &str) -> Val {
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         w.layer,
         &format!("affine_qmm_t_fp16_precast{point}"),
         quant_weights(w),
         None,
         // The precast pair takes the TILE alone: its operands are already
-        // half-precision, so no codec point is read at the launch.
-        tile_of(point),
+        // half-precision, so no codec point is read at the launch. `m`
+        // closes the run as a spliced fire extent.
+        [tile_of(point), vec![0]].concat(),
+        vec![(2, Shape(vec![rows_of(x)]))],
         vec![x.id],
         region_out(
             &x.t,
@@ -653,13 +674,15 @@ pub fn qmm_fp16(x: &Val, w: &MatW, point: &str) -> Val {
 
 /// `quant/qmm_t.metal::affine_qmm_t_residual_fp16_precast`.
 pub fn qmm_residual_fp16(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-    let out = with_params(
+    let out = with_extents(
         &x.t,
         w.layer,
         &format!("affine_qmm_t_residual_fp16_precast{point}"),
         quant_weights(w),
         None,
-        tile_of(point),
+        // The tile, then `m` as a spliced extent — see `qmm_fp16`.
+        [tile_of(point), vec![0]].concat(),
+        vec![(2, Shape(vec![rows_of(x)]))],
         vec![x.id, residual.id],
         region_out(
             &x.t,
@@ -686,12 +709,15 @@ pub fn qmm_residual_fp16(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val 
 /// [`residual_add`]: metal::residual_add
 pub fn add_bias(x: &Val, w: &MatW) -> Val {
     let shape = same_shape(x);
-    let out = record(
+    let out = with_extents(
         &x.t,
         w.layer,
         "add_bias_bfloat16",
         vec![w.name.clone()],
         None,
+        // The one scalar the routine takes is `rows`, the fire's — spliced.
+        vec![0],
+        vec![(0, Shape(vec![rows_of(x)]))],
         vec![x.id],
         region_out(&x.t, shape),
     );
@@ -703,12 +729,15 @@ pub fn add_bias(x: &Val, w: &MatW) -> Val {
 /// exists.
 pub fn residual_add(x: &Val, residual: &Val) -> Val {
     let shape = same_shape(x);
-    let out = record(
+    let out = with_extents(
         &x.t,
         x.layer,
         "residual_add_bfloat16",
         vec![],
         None,
+        // The one scalar the routine takes is `rows`, the fire's — spliced.
+        vec![0],
+        vec![(0, Shape(vec![rows_of(x)]))],
         vec![x.id, residual.id],
         region_out(&x.t, shape),
     );
@@ -902,14 +931,36 @@ fn rope_one(
         )
     };
     let shape = same_shape(x);
-    let out = with_params(
+    // The operands the marks claim, in order: the rotated tensor (in
+    // place), the frequency table where the ladder is rescaled, and the
+    // per-token positions. The streams are the runtime vocabulary's — the
+    // driver stages positions per fire and derives the table at load.
+    let mut inputs = vec![x.id];
+    if table {
+        let freqs = x.trace().with(None, |b| {
+            b.runtime_tensor(
+                "rope_frequencies",
+                None,
+                Shape(vec![Dim::Const(rotary_dim / 2)]),
+                DType::F32,
+            )
+        });
+        inputs.push(freqs);
+    }
+    inputs.push(runtime::positions(x.trace()).id);
+    // The run closes with `rows`, a fire extent the lowering splices.
+    let mut params = params;
+    let rows_at = params.len() as u8;
+    params.push(0);
+    let out = with_extents(
         x.trace(),
         x.layer(),
         &kernel,
         vec![],
         None,
         params,
-        vec![x.id],
+        vec![(rows_at, Shape(vec![rows_of(x)]))],
+        inputs,
         region_out(x.trace(), shape),
     );
     or_regions(out, x)
@@ -1016,11 +1067,13 @@ pub fn split_qkv(packed: &Val, q_width: u32, kv_width: u32) -> (Val, Val, Val) {
     let rows = packed.t.inner.borrow().value_shape(packed.id).0[0];
     let out = |w: u32| (Shape(vec![rows, Dim::Const(w)]), DType::BF16);
     let ids = packed.t.with(packed.layer, |b| {
-        b.launch_with_params(
+        b.launch_with_extents(
             "split_qkv_bf16",
             vec![],
             None,
-            vec![q_width, kv_width],
+            // The two widths, then `rows` as a spliced fire extent.
+            vec![q_width, kv_width, 0],
+            vec![(2, Shape(vec![rows]))],
             vec![packed.id],
             vec![out(q_width), out(kv_width), out(kv_width)],
         )
@@ -1036,28 +1089,47 @@ pub fn split_qkv(packed: &Val, q_width: u32, kv_width: u32) -> (Val, Val, Val) {
 /// `kv_append.metal::kv_append_bfloat16` (contiguous) /
 /// `kv_append_paged.metal::kv_append_paged_bfloat16` (page table).
 pub fn kv_append(k: &Val, v: &Val, kv: &Kv, paged: bool, head_dim: u32, kv_heads: u32) {
-    let kernel = if paged {
-        "kv_append_paged_bfloat16"
+    // The model's two scalars: how wide a head is and how many there are.
+    // The pool's own geometry (strides, page size, write descriptors) rides
+    // the KV VIEW — `In<Struct<KvCache>>`, resolved by name from the runtime
+    // vocabulary — because it is the shape the driver allocated, not the
+    // shape the model has. The paged form takes `tokens` as a spliced fire
+    // extent; the contiguous one reads per-token positions instead.
+    let kvv = runtime::kv_cache(&kv.t, kv.l);
+    if paged {
+        with_extents(
+            &kv.t,
+            Some(kv.l),
+            "kv_append_paged_bfloat16",
+            vec![],
+            kv_state(kv),
+            vec![head_dim, kv_heads, 0],
+            vec![(2, Shape(vec![rows_of(k)]))],
+            vec![k.id, v.id, kvv.id],
+            None,
+        );
     } else {
-        "kv_append_bfloat16"
-    };
-    with_params(
-        &kv.t,
-        Some(kv.l),
-        kernel,
-        vec![],
-        kv_state(kv),
-        // The model's two: how wide a head is and how many there are. The
-        // pool's strides come from the ROW (`KvHeadStride`, `KvSeqStride`)
-        // because they are the shape the driver allocated, not the shape
-        // the model has.
-        vec![head_dim, kv_heads],
-        vec![k.id, v.id],
-        None,
-    );
+        let positions = runtime::positions(&kv.t);
+        with_params(
+            &kv.t,
+            Some(kv.l),
+            "kv_append_bfloat16",
+            vec![],
+            kv_state(kv),
+            vec![head_dim, kv_heads],
+            vec![k.id, v.id, kvv.id, positions.id],
+            None,
+        );
+    }
 }
 
 /// `sdpa_vector.metal::sdpa_vector_decode_bfloat16_d_<head_dim>` (M=1) /
+/// The decode split-policy object, minted by name (`"attn.split_policy"`).
+fn split_policy(t: &Trace) -> Val {
+    let id = t.with(None, |b| b.runtime_object("attn.split_policy", None));
+    Val { t: t.clone(), id, layer: None }
+}
+
 /// `sdpa_paged.metal::sdpa_paged_decode_bfloat16_d_<head_dim>` (M>1).
 ///
 /// The width is the deployment's, not a literal. It used to be `_d_256`
@@ -1173,7 +1245,59 @@ pub fn sdpa(
     } else {
         1.0f32 / (head_dim as f32).sqrt()
     };
-    with_params(
+    // THE RUN THE ROUTINES DECLARE, in the order their `Const` marks claim
+    // it. The paged family reads `[n_kv_heads, scale, window, head_dim,
+    // q_heads, rows]`; the contiguous vector decode reads `[scale, head_dim,
+    // q_heads, n_kv_heads, rows]` — same numbers, its own order, and the
+    // trailing `rows` is a spliced fire extent on both.
+    //
+    // It was `[gqa_factor, kv_heads, scale, 0, window]` -- a run with a
+    // HOLE at index 3, and a `gqa_factor` the bodies now derive from the
+    // two head counts rather than being told a third time. The extents
+    // moved in the other direction: `head_dim` and `q_heads` were facts
+    // the driver recovered from the SYMBOL (`_d_128`) and they are the
+    // checkpoint's, so the statement carries them.
+    //
+    // `q_heads` is `q_width / head_dim` and not a separate number: the
+    // query's row is heads laid end to end, which is the same division
+    // the symbol's `_d_` suffix already implies.
+    let q_heads = if head_dim > 0 { q_width / head_dim } else { 0 };
+    // The driver-owned operands the marks claim, in order: the KV view,
+    // then — on the paged family — the per-token position and request
+    // streams and the custom-mask view. All are the runtime vocabulary's;
+    // the driver resolves the views once per (fire, layer) and stages the
+    // streams per fire.
+    let kvv = runtime::kv_cache(&q.t, kv.l);
+    let (params, inputs) = if paged {
+        (
+            vec![
+                kv_heads,
+                scale.to_bits(),
+                window as u32,
+                head_dim,
+                q_heads,
+                0,
+            ],
+            vec![
+                q.id,
+                kvv.id,
+                runtime::positions(&q.t).id,
+                runtime::request_of_token(&q.t).id,
+                runtime::attention_mask(&q.t).id,
+                // The decode split policy — the driver's judgement, carried
+                // as an operand: vulkan folds partials, wgpu splits on its
+                // scratch plane, metal answers one split.
+                split_policy(&q.t).id,
+            ],
+        )
+    } else {
+        (
+            vec![scale.to_bits(), head_dim, q_heads, kv_heads, 0],
+            vec![q.id, kvv.id],
+        )
+    };
+    let rows_at = (params.len() - 1) as u8;
+    with_extents(
         &q.t,
         Some(kv.l),
         kernel,
@@ -1181,27 +1305,9 @@ pub fn sdpa(
         // learned logit, and the row's `Weight(0)`.
         sinks.map(|w| vec![w.to_string()]).unwrap_or_default(),
         kv_state(kv),
-        // THE RUN THE ROUTINES DECLARE, in the order their `Const` marks
-        // claim it: `[n_kv_heads, scale, window, head_dim, q_heads]`.
-        //
-        // It was `[gqa_factor, kv_heads, scale, 0, window]` -- a run with a
-        // HOLE at index 3, and a `gqa_factor` the bodies now derive from the
-        // two head counts rather than being told a third time. The extents
-        // moved in the other direction: `head_dim` and `q_heads` were facts
-        // the driver recovered from the SYMBOL (`_d_128`) and they are the
-        // checkpoint's, so the statement carries them.
-        //
-        // `q_heads` is `q_width / head_dim` and not a separate number: the
-        // query's row is heads laid end to end, which is the same division
-        // the symbol's `_d_` suffix already implies.
-        vec![
-            kv_heads,
-            scale.to_bits(),
-            window as u32,
-            head_dim,
-            if head_dim > 0 { q_width / head_dim } else { 0 },
-        ],
-        vec![q.id],
+        params,
+        vec![(rows_at, Shape(vec![rows_of(q)]))],
+        inputs,
         // `region_out` and not `Some(..)`: a batched DECODE guards this
         // statement (`GuardPred::WindowOne`) and an arm's launches bind the
         // guard's output rather than recording one of their own. Outside a
@@ -1213,12 +1319,17 @@ pub fn sdpa(
 /// `silu_mul.metal::silu_mul_bfloat16` — the SwiGLU activation over
 /// the packed gate/up bank.
 pub fn silu_mul(gate: &Val, up: &Val, intermediate: u32) -> Val {
-    record(
+    with_extents(
         &gate.t,
         gate.layer,
         "silu_mul_bfloat16",
         vec![],
         None,
+        // The one scalar the routine takes is `rows` — the operand's own
+        // row axis, spliced by the lowering, which for the batched mixture
+        // is the sorted stack and not the fire's tokens.
+        vec![0],
+        vec![(0, Shape(vec![rows_of(gate)]))],
         vec![gate.id, up.id],
         Some((
             Shape(vec![rows_of(gate), Dim::Const(intermediate)]),
@@ -1268,26 +1379,33 @@ pub fn embed_gather_scaled(
     // unscaled twins, and it is the statement's either way.
     let _ = multi_batch;
     let stem = "embed_gather_scaled_mb_4bit";
-    with_params(
+    // The token-id stream is the routine's `In<Tensor<i32>>`, minted by
+    // name — exactly as `embed_gather`'s.
+    let token_ids = runtime::token_ids(t);
+    with_extents(
         t,
         None,
         &format!("{stem}{point}"),
         quant_table(weight, repr),
         None,
-        // THE RUN THE ROUTINE DECLARES, in the order its three `Const` marks
-        // claim it: `[embed_scale, group, bits]`. It was `[width, scale]` --
-        // a `width` at the slot the scale is read from and a scale at the
-        // slot the group is, so the gather scaled by a group size and picked
-        // its point from a bit count that was really a float's bits.
+        // THE RUN THE ROUTINE DECLARES, in the order its `Const` marks
+        // claim it: `[embed_scale, group, bits, rows]`. It was `[width,
+        // scale]` -- a `width` at the slot the scale is read from and a
+        // scale at the slot the group is, so the gather scaled by a group
+        // size and picked its point from a bit count that was really a
+        // float's bits.
         //
         // `width` is not a param at all: the body reads `out.width`, which
-        // the statement already gives as the rectangle below.
+        // the statement already gives as the rectangle below. `rows` is the
+        // fire's, spliced.
         {
             let mut p = vec![scale.to_bits()];
             p.extend(point_of(repr, point));
+            p.push(0);
             p
         },
-        vec![],
+        vec![(3, Shape(vec![Dim::Tokens]))],
+        vec![token_ids.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
     .expect("the gather produces its rows")
@@ -1298,14 +1416,16 @@ pub fn embed_gather_scaled(
 /// The scale is the JOIN's rather than a deployment's: two streams
 /// averaged in the root-mean-square sense, which is what `1/sqrt(2)` is.
 pub fn ple_combine(proj: &Val, token: &Val, width: u32) -> Val {
-    with_params(
+    with_extents(
         &proj.t,
         None,
         "ple_combine_bfloat16",
         vec![],
         None,
-        // `PleCombineParams`: inv_sqrt2 then n.
-        vec![std::f32::consts::FRAC_1_SQRT_2.to_bits(), width],
+        // The routine's two `Const`s: inv_sqrt2, then `rows` as a spliced
+        // fire extent. The width it used to state is the operand's own.
+        vec![std::f32::consts::FRAC_1_SQRT_2.to_bits(), 0],
+        vec![(1, Shape(vec![Dim::Tokens]))],
         vec![proj.id, token.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
@@ -1329,14 +1449,16 @@ pub fn ple_combine(proj: &Val, token: &Val, width: u32) -> Val {
 /// would make their guard reject every thread instead of all but the first
 /// row's.
 pub fn geglu_strided(gate: &Val, up: &Val, width: u32, gate_pitch: u32, up_pitch: u32) -> Val {
-    with_params(
+    with_extents(
         &gate.t,
         gate.layer,
         "geglu_tanh_strided_bfloat16",
         vec![],
         None,
-        // `GegluStridedParams`: width, the dead word, then the pitches.
-        vec![width, 1, gate_pitch, up_pitch, width],
+        // `GegluStridedParams`: width, the dead word, the pitches — then
+        // `rows`, the routine's appended `Const<i32>`, as a spliced extent.
+        vec![width, 1, gate_pitch, up_pitch, width, 0],
+        vec![(5, Shape(vec![rows_of(gate)]))],
         vec![gate.id, up.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
@@ -1350,14 +1472,15 @@ pub fn geglu_strided(gate: &Val, up: &Val, width: u32, gate_pitch: u32, up_pitch
 /// its own symbol rather than a norm handed a vector of ones — which would
 /// be a multiply per element to compute the identity.
 pub fn vnorm(x: &Val, row: u32, eps: f32) -> Val {
-    with_params(
+    with_extents(
         &x.t,
         x.layer,
         "vnorm_single_row_bfloat16",
         vec![],
         None,
-        // `VNormParams`: eps then axis_size.
-        vec![eps.to_bits(), row],
+        // `VNormParams`: eps, axis_size — then `rows` as a spliced extent.
+        vec![eps.to_bits(), row, 0],
+        vec![(2, Shape(vec![rows_of(x)]))],
         vec![x.id],
         Some(same_shape(x)),
     )
@@ -1369,14 +1492,17 @@ pub fn vnorm(x: &Val, row: u32, eps: f32) -> Val {
 /// Read from a BUFFER rather than stated, because which layer is running
 /// is the fire's and not the text's.
 pub fn layer_scalar(x: &Val, scalar: &str, width: u32) -> Val {
-    with_params(
+    // The width the run used to carry is the operand's own; the routine's
+    // one `Const` is `rows`, spliced by the lowering.
+    let _ = width;
+    with_extents(
         &x.t,
         x.layer,
         "layer_scalar_mul_bfloat16",
         vec![scalar.to_string()],
         None,
-        // `LayerScalarParams`: the hidden width.
-        vec![width],
+        vec![0],
+        vec![(0, Shape(vec![rows_of(x)]))],
         vec![x.id],
         Some(same_shape(x)),
     )
@@ -1402,7 +1528,7 @@ pub fn rms_norm_residual(
         }
         None => "rms_residual_bfloat16",
     };
-    with_params(
+    with_extents(
         &x.t,
         w.layer,
         kernel,
@@ -1410,13 +1536,16 @@ pub fn rms_norm_residual(
         None,
         // `RmsParams`, field for field — `w_stride` is ONE, the distance
         // between consecutive CHANNELS of the gain vector. See `rms_norm`.
+        // `rows` closes the run as a spliced fire extent.
         vec![
             eps.to_bits(),
             row,
             1,
             u32::from(w.variant == model_ir::trace::NormVariant::Gemma),
             1.0f32.to_bits(),
+            0,
         ],
+        vec![(5, Shape(vec![rows_of(x)]))],
         ins,
         Some(same_shape(x)),
     )
@@ -1436,8 +1565,9 @@ pub fn softcap(x: &Val, width: u32, cap: f32) -> Val {
         "logit_softcap_bfloat16",
         vec![],
         None,
-        // `SoftcapParams`, field for field: cap then n.
-        vec![cap.to_bits(), width],
+        // The routine's one `Const`: the cap. The element count it used to
+        // carry is the result's own rectangle, which the body reads.
+        vec![cap.to_bits()],
         vec![x.id],
         Some((Shape(vec![Dim::Requests, Dim::Const(width)]), DType::BF16)),
     )
@@ -1450,14 +1580,16 @@ pub fn softcap(x: &Val, width: u32, cap: f32) -> Val {
 /// than the erf one. A third symbol beside `silu_mul` and
 /// `gptoss_swiglu`, and which a deployment takes is a load-time fact.
 pub fn geglu(gate: &Val, up: &Val, intermediate: u32) -> Val {
-    with_params(
+    with_extents(
         &gate.t,
         gate.layer,
         "geglu_tanh_bfloat16",
         vec![],
         None,
-        // `GegluParams`: the element count.
-        vec![intermediate],
+        // The routine's one `Const` is `rows` — the operand's own row axis,
+        // spliced; the width it grids by is the operand's rectangle.
+        vec![0],
+        vec![(0, Shape(vec![rows_of(gate)]))],
         vec![gate.id, up.id],
         Some((
             Shape(vec![rows_of(gate), Dim::Const(intermediate)]),
@@ -1474,14 +1606,16 @@ pub fn geglu(gate: &Val, up: &Val, intermediate: u32) -> Val {
 /// either produces a model that runs and is wrong. So it is its own
 /// symbol, and which one a deployment takes is a load-time fact.
 pub fn swiglu(gate: &Val, up: &Val, intermediate: u32, limit: f32, alpha: f32) -> Val {
-    with_params(
+    with_extents(
         &gate.t,
         gate.layer,
         "gptoss_swiglu_bfloat16",
         vec![],
         None,
-        // `GptOssSwiGluParams`, field for field: n, limit, alpha.
-        vec![intermediate, limit.to_bits(), alpha.to_bits()],
+        // `GptOssSwiGluParams`, field for field: n, limit, alpha — then
+        // `rows`, the routine's appended `Const<i32>`, as a spliced extent.
+        vec![intermediate, limit.to_bits(), alpha.to_bits(), 0],
+        vec![(3, Shape(vec![rows_of(gate)]))],
         vec![gate.id, up.id],
         Some((
             Shape(vec![rows_of(gate), Dim::Const(intermediate)]),
@@ -1502,19 +1636,25 @@ pub fn swiglu(gate: &Val, up: &Val, intermediate: u32, limit: f32, alpha: f32) -
 /// distribution — measured against MLX, and exactly right for a question
 /// nobody asked.
 pub fn sample_rows(x: &Val, width: u32) -> Val {
-    with_params(
+    // WHICH rows is `sampling_indices`, a per-fire stream out of the
+    // runtime vocabulary — the routine's `In<Tensor<u32>>`, staged by the
+    // driver.
+    let indices = runtime::sampling_indices(&x.t);
+    with_extents(
         &x.t,
         None,
         "row_gather_bfloat16",
         vec![],
         None,
-        // `RowGatherParams`, packed: width then count. WIDTH only here --
-        // how many rows to gather is the REQUEST count, a number of the
-        // fire's that no text can state, and the row names it
-        // (`Source::Named(<keys::RequestCount as keys::Fact>::KEY)`, `Ty::InPacked`) so the driver appends
-        // it as the struct's second field.
-        vec![width],
-        vec![x.id],
+        // The routine's `Const` run: width, then `count` and `row_count` —
+        // both the fire's REQUEST count, numbers no text can state, so both
+        // ride as spliced extents.
+        vec![width, 0, 0],
+        vec![
+            (1, Shape(vec![Dim::Requests])),
+            (2, Shape(vec![Dim::Requests])),
+        ],
+        vec![x.id, indices.id],
         Some((Shape(vec![Dim::Requests, Dim::Const(width)]), DType::BF16)),
     )
     .expect("the gather produces its rows")
@@ -1523,15 +1663,21 @@ pub fn sample_rows(x: &Val, width: u32) -> Val {
 /// `quantized_qmv.metal::affine_qmv_fast` against the lm head — the
 /// readout, `[Requests, vocab]` f32 like every family's.
 pub fn lm_head(x: &Val, weight: &str, vocab: u32, repr: WeightRepr, point: &str) -> Val {
-    with_params(
+    with_extents(
         &x.t,
         None,
         &format!("affine_qmv_fast{point}"),
         quant_table(weight, repr),
         None,
         // The codec point, as `qmv` states it: the two extents this run held
-        // are the operands' own rectangles now.
-        point_of(repr, point),
+        // are the operands' own rectangles now. `vecs` — the readout's rows,
+        // one per REQUEST — closes the run as a spliced extent.
+        {
+            let mut p = point_of(repr, point);
+            p.push(0);
+            p
+        },
+        vec![(2, Shape(vec![Dim::Requests]))],
         vec![x.id],
         // BF16, because that is what the kernel WRITES. `affine_qmv_fast`
         // is instantiated at bfloat and its output is `device T*`; the
@@ -1599,7 +1745,7 @@ pub fn router_topk(
     };
     let slots = Dim::Const(experts_per_token);
     let ids = logits.t.with(logits.layer, |b| {
-        b.launch_with_params(
+        b.launch_with_extents(
             sym,
             per_expert_scale
                 .map(|w| vec![w.name.clone()])
@@ -1615,6 +1761,7 @@ pub fn router_topk(
             // routing weight, so a nonzero word in that position scales
             // the whole routed FFN down; `logits_pitch` strides the read.
             // Both produce weights, neither faults.
+            // `rows` closes the run — the fire's, spliced.
             vec![
                 n_experts,
                 experts_per_token,
@@ -1625,7 +1772,9 @@ pub fn router_topk(
                 // router's input is the gemm against `w.router`, whose
                 // Shape is `[Tokens, n_experts]`.
                 n_experts,
+                0,
             ],
+            vec![(4, Shape(vec![Dim::Tokens]))],
             vec![logits.id],
             vec![
                 (Shape(vec![Dim::Tokens, slots]), DType::I32),
@@ -1741,6 +1890,8 @@ pub fn route_gather(
         "route_gather",
         vec![],
         None,
+        // `MoeRouteParams`, then `padded_rows` — the sorted stack's height,
+        // the routine's appended `Const<i32>`, spliced like `padded` is.
         vec![
             0,
             n_experts,
@@ -1749,10 +1900,12 @@ pub fn route_gather(
             0,
             width,
             width,
+            0,
         ],
         vec![
             (0, Shape(vec![Dim::Tokens, Dim::Const(experts_per_token)])),
             (4, Shape(vec![stack])),
+            (7, Shape(vec![stack])),
         ],
         vec![x.id, perm.id],
         Some((Shape(vec![stack, Dim::Const(width)]), DType::BF16)),
@@ -1868,7 +2021,7 @@ pub fn routed_qmv(
     // because that dim is a whole token's `k` runs end to end and this
     // number is one run. The caller knows which projection it is asking
     // for; the shape cannot say.
-    with_params(
+    with_extents(
         &x.t,
         w.layer,
         sym,
@@ -1877,8 +2030,11 @@ pub fn routed_qmv(
         // THE SORTED STACK'S THREE STRIDES. `in_vec` and `w.width` stood
         // first and left: they are the operands' own widths, which the marks
         // carry. What is left is the geometry the MIXTURE has and no operand
-        // does -- a row is `k` slots wide and a slot is one.
-        vec![in_vec, in_vec * experts_per_token, experts_per_token],
+        // does -- a row is `k` slots wide and a slot is one. `rows` — the
+        // fire's token count, the matvec grid's row axis — closes the run
+        // as a spliced extent.
+        vec![in_vec, in_vec * experts_per_token, experts_per_token, 0],
+        vec![(3, Shape(vec![Dim::Tokens]))],
         vec![x.id, row_expert.id],
         // `k` results per token, end to end. The row axis of the MATVEC
         // is `w.width` alone and the row states so (`grid_param`); this
@@ -2000,28 +2156,34 @@ pub fn routed_qmm(
         experts: n_experts,
         block: bm,
     };
-    with_params(
+    // THE TILE, AND THE CODEC PAIR WHERE THE SYMBOL HAS ONE. `k` and `n`
+    // stood here -- the contraction and the output width -- and both are
+    // the operands' own rectangles now, which the marks carry.
+    //
+    // The tile is not: `_bm_32_bn_64` is a decision the compiler made
+    // about this deployment's shapes, and the routine reads it as two
+    // `Const<i32>`s. The affine form reads the group and the bit width
+    // before them; the MXFP4 one has no codec point to read, which is
+    // the same split `sym` above is chosen by. `rows` — the sorted STACK's
+    // height, the GEMM's own row axis — closes every run as a spliced
+    // extent.
+    let mut params = if matches!(w.repr, WeightRepr::Mxfp4Marlin) || staged {
+        vec![bm, bn]
+    } else {
+        let mut run = point_of(w.repr, &affine_point(w.repr, bits));
+        run.extend([bm, bn]);
+        run
+    };
+    let rows_at = params.len() as u8;
+    params.push(0);
+    with_extents(
         &rows.t,
         w.layer,
         &sym,
         weights,
         None,
-        // THE TILE, AND THE CODEC PAIR WHERE THE SYMBOL HAS ONE. `k` and `n`
-        // stood here -- the contraction and the output width -- and both are
-        // the operands' own rectangles now, which the marks carry.
-        //
-        // The tile is not: `_bm_32_bn_64` is a decision the compiler made
-        // about this deployment's shapes, and the routine reads it as two
-        // `Const<i32>`s. The affine form reads the group and the bit width
-        // before them; the MXFP4 one has no codec point to read, which is
-        // the same split `sym` above is chosen by.
-        if matches!(w.repr, WeightRepr::Mxfp4Marlin) || staged {
-            vec![bm, bn]
-        } else {
-            let mut run = point_of(w.repr, &affine_point(w.repr, bits));
-            run.extend([bm, bn]);
-            run
-        },
+        params,
+        vec![(rows_at, Shape(vec![stack]))],
         // `row_expert` rides the second slot the arm calls `pad` -- the
         // GEMM does not read it, and binding a real buffer there rather
         // than nothing keeps the operand list the same length as the
@@ -2041,7 +2203,7 @@ pub fn combine_sorted(
     experts_per_token: u32,
     width: u32,
 ) -> Val {
-    with_params(
+    with_extents(
         &y.t,
         y.layer,
         "combine_sorted",
@@ -2052,8 +2214,10 @@ pub fn combine_sorted(
         // reading the next dispatch's scalars as its own trailing
         // fields. `out_pitch` is the elements between one output row and
         // the next, and the combine's output is its own value with Shape
-        // `[Tokens, width]`, so the rows are `width` apart.
-        vec![width, experts_per_token, width],
+        // `[Tokens, width]`, so the rows are `width` apart. `tokens` —
+        // the fire's — closes the run as a spliced extent.
+        vec![width, experts_per_token, width, 0],
+        vec![(3, Shape(vec![Dim::Tokens]))],
         vec![y.id, expert_weights.id, inv.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
@@ -2063,13 +2227,16 @@ pub fn combine_sorted(
 /// `moe/route.metal::shared_expert_combine` — `routed + sigmoid(gate) *
 /// shared`, the landing for a mixture that also has a dense expert.
 pub fn shared_expert_combine(routed: &Val, shared: &Val, gate: &Val, width: u32) -> Val {
-    with_params(
+    with_extents(
         &routed.t,
         routed.layer,
         "shared_expert_combine",
         vec![],
         None,
-        vec![width],
+        // The routine's one `Const` is `rows`, the fire's — spliced. The
+        // width it grids by is the operand's own rectangle.
+        vec![0],
+        vec![(0, Shape(vec![Dim::Tokens]))],
         vec![routed.id, shared.id, gate.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
@@ -2181,14 +2348,22 @@ fn recurrent_state(layer: u32) -> Option<StateRef> {
 /// split pair against, which is a claim about the arithmetic and not a
 /// serving path.
 pub fn gdn_core(mixed: &Val, a: &Val, b: &Val, shape: GdnShape, w: &GdnW, layer: u32) -> Val {
-    with_params(
+    with_extents(
         &mixed.t,
         Some(layer),
         "gdn_core_slotted_bfloat16",
         w.names(),
         recurrent_state(layer),
-        shape.params(),
-        vec![mixed.id, a.id, b.id],
+        // `GdnCoreParams`'s eleven, then `rows` as a spliced fire extent.
+        {
+            let mut p = shape.params();
+            p.push(0);
+            p
+        },
+        vec![(11, Shape(vec![Dim::Tokens]))],
+        // The recurrent view closes the operand list: `In<Struct<
+        // RecurrentState>>`, resolved by name per (fire, layer).
+        vec![mixed.id, a.id, b.id, runtime::recurrent(&mixed.t, layer).id],
         Some((
             Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.v_dim)]),
             DType::BF16,
@@ -2213,13 +2388,20 @@ pub fn gdn_prep(
 ) -> (Val, Val, Val) {
     let per_head = Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.k_dim)]);
     let gate = Shape(vec![Dim::Tokens, Dim::Const(2 * shape.v_heads)]);
+    let rsv = runtime::recurrent(&mixed.t, layer);
     let ids = mixed.t.with(Some(layer), |t| {
-        t.launch_with_params(
+        t.launch_with_extents(
             "gdn_prep_slotted_bfloat16",
             w.names(),
             recurrent_state(layer),
-            shape.params(),
-            vec![mixed.id, a.id, b.id],
+            // The eleven shape scalars, then `rows` as a spliced extent.
+            {
+                let mut p = shape.params();
+                p.push(0);
+                p
+            },
+            vec![(11, Shape(vec![Dim::Tokens]))],
+            vec![mixed.id, a.id, b.id, rsv.id],
             vec![
                 (per_head.clone(), DType::F32),
                 (per_head, DType::F32),
@@ -2305,13 +2487,21 @@ pub fn gdn_prep_prefill(
         Dim::Tokens,
         Dim::Const(2 * shape.v_heads + shape.v_heads * shape.v_dim),
     ]);
+    let rsv = runtime::recurrent(&mixed.t, layer);
     let ids = mixed.t.with(Some(layer), |t| {
-        t.launch_with_params(
+        t.launch_with_extents(
             "gdn_prep_prefill_bfloat16",
             w.names(),
             recurrent_state(layer),
-            shape.params(),
-            vec![mixed.id, a.id, b.id],
+            // The eleven shape scalars, then `n_scan` — the prompt's token
+            // count, the fire's — as a spliced extent.
+            {
+                let mut p = shape.params();
+                p.push(0);
+                p
+            },
+            vec![(11, Shape(vec![Dim::Tokens]))],
+            vec![mixed.id, a.id, b.id, rsv.id],
             vec![
                 (per_head.clone(), DType::F32),
                 (per_head, DType::F32),
@@ -2367,18 +2557,28 @@ pub fn gdn_core_recurrent_prefill(
     // See the doc: the scan reads none of the four, and the prep beside it
     // names every one.
     let _ = w;
+    // The eleven shape scalars, the tile pair — then `n_scan`, the
+    // prompt's token count, as a spliced fire extent.
     let mut params = shape.params();
     params.push(tile.0);
     params.push(tile.1);
+    params.push(0);
     let (lanes, vrows) = tile;
-    with_params(
+    with_extents(
         &mixed.t,
         Some(layer),
         &format!("gdn_core_recurrent_prefill_bfloat16_l_{lanes}_v_{vrows}"),
         vec![],
         recurrent_state(layer),
         params,
-        vec![mixed.id, pre_q.id, pre_k.id, pre_gate.id],
+        vec![(13, Shape(vec![Dim::Tokens]))],
+        vec![
+            mixed.id,
+            pre_q.id,
+            pre_k.id,
+            pre_gate.id,
+            runtime::recurrent(&mixed.t, layer).id,
+        ],
         Some((
             Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.v_dim)]),
             DType::BF16,
@@ -2402,14 +2602,30 @@ pub fn gdn_core_recurrent(
     w: &GdnW,
     layer: u32,
 ) -> Val {
-    with_params(
+    with_extents(
         &mixed.t,
         Some(layer),
         "gdn_core_recurrent_slotted_bfloat16",
-        w.names(),
+        // The CONV PAIR alone. The routine's weight column is `conv_w` and
+        // `conv_b` — the scan convolves v itself — and neither `a_log` nor
+        // `dt_bias` appears in its signature: the prep consumed both, so a
+        // statement placing four weights was two pointers past the column.
+        vec![w.conv_w.clone(), w.conv_b.clone()],
         recurrent_state(layer),
-        shape.params(),
-        vec![mixed.id, pre_q.id, pre_k.id, pre_gate.id],
+        // The eleven shape scalars, then `rows` as a spliced extent.
+        {
+            let mut p = shape.params();
+            p.push(0);
+            p
+        },
+        vec![(11, Shape(vec![Dim::Tokens]))],
+        vec![
+            mixed.id,
+            pre_q.id,
+            pre_k.id,
+            pre_gate.id,
+            runtime::recurrent(&mixed.t, layer).id,
+        ],
         Some((
             Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.v_dim)]),
             DType::BF16,
@@ -2428,14 +2644,16 @@ pub fn gdn_core_recurrent(
 /// and a handle offering one would be offering a choice the shader does not
 /// have.
 pub fn gated_rms(x: &Val, z: &Val, weight: &str, v_heads: u32, v_dim: u32, eps: f32) -> Val {
-    with_params(
+    with_extents(
         &x.t,
         x.layer,
         "gated_rms_bfloat16",
         vec![weight.to_string()],
         None,
-        // `GatedRmsParams`: `{eps, vd}`, both words, in that order.
-        vec![eps.to_bits(), v_dim],
+        // The routine's `Const` run: eps, vd, heads — then `rows` as a
+        // spliced fire extent.
+        vec![eps.to_bits(), v_dim, v_heads, 0],
+        vec![(3, Shape(vec![Dim::Tokens]))],
         vec![x.id, z.id],
         Some((
             Shape(vec![Dim::Tokens, Dim::Const(v_heads * v_dim)]),
@@ -2457,15 +2675,17 @@ pub fn q_gate_split(qg: &Val, q_heads: u32, head_dim: u32) -> (Val, Val) {
     let width = q_heads * head_dim;
     let shape = Shape(vec![Dim::Tokens, Dim::Const(width)]);
     let ids = qg.t.with(qg.layer, |t| {
-        t.launch_with_params(
+        t.launch_with_extents(
             "q_gate_split_bfloat16",
             vec![],
             None,
-            // `[head_dim, qg_row_stride, out_row_stride, q_heads]`, which is
-            // the run the routine's four `Const` marks claim, in order. The
-            // two strides were `Param<1>`/`Param<2>` at HEAD and spent a spell
-            // as asks no driver answered; the head count closes the run.
-            vec![head_dim, 2 * width, width, q_heads],
+            // `[head_dim, qg_row_stride, out_row_stride, q_heads, rows]`,
+            // which is the run the routine's five `Const` marks claim, in
+            // order. The two strides were `Param<1>`/`Param<2>` at HEAD and
+            // spent a spell as asks no driver answered; the head count and
+            // the spliced row extent close the run.
+            vec![head_dim, 2 * width, width, q_heads, 0],
+            vec![(4, Shape(vec![Dim::Tokens]))],
             vec![qg.id],
             vec![(shape.clone(), DType::BF16), (shape, DType::BF16)],
         )
@@ -2485,13 +2705,16 @@ pub fn q_gate_split(qg: &Val, q_heads: u32, head_dim: u32) -> (Val, Val) {
 /// slot zero. `arm::gate` reads it as `o.output(0)`, so the statement
 /// declares its result and hands the shader the same rows it was given.
 pub fn sigmoid_gate(attn: &Val, gate: &Val, width: u32) -> Val {
-    with_params(
+    with_extents(
         &attn.t,
         attn.layer,
         "gate_bfloat16",
         vec![],
         None,
-        vec![width],
+        // The routine's two `Const`s: the row stride — the packed row's own
+        // width — then `rows` as a spliced fire extent.
+        vec![width, 0],
+        vec![(1, Shape(vec![Dim::Tokens]))],
         vec![attn.id, gate.id],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )

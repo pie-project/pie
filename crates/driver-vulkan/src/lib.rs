@@ -2458,6 +2458,13 @@ pub mod dispatch;
 pub mod encode;
 #[cfg(feature = "native")]
 pub mod envelope;
+// The raised views the binder builds for `In<Struct<..>>` operands, and the
+// runtime-stream map the resolver answers `Arg::Named` through. Both halves
+// of the no-ask runtime channel, native-gated with the binder they feed.
+#[cfg(feature = "native")]
+pub mod views;
+#[cfg(feature = "native")]
+pub mod runtime;
 pub mod facts;
 #[cfg(feature = "native")]
 pub mod frames;

@@ -4,16 +4,18 @@ use super::*;
 
 
 builder! {
-    /// `kernels::attn::kimi_split_kv_a_norm_bf16`.
+    /// `kernels::attn::kimi_split_kv_a_norm`; the epsilon rides the run.
     pub fn kimi_split_kv_a_norm(
         kv_a: &Val,
         norm_weight: &str,
         kv_lora_rank: u32,
         qk_rope_dim: u32,
+        eps: f32,
     ) -> (Val, Val) {
-        symbol: "attn::kimi_split_kv_a_norm_bf16",
+        symbol: "attn::kimi_split_kv_a_norm",
         on: kv_a,
         weights: [norm_weight],
+        params: [eps.to_bits()],
         inputs: [kv_a],
         outs: [
             [Dim::Tokens, Dim::Const(kv_lora_rank)] as BF16,
@@ -23,9 +25,9 @@ builder! {
     }
 
 
-    /// `kernels::attn::kimi_split_q_b_bf16`.
+    /// `kernels::attn::kimi_split_q_b`.
     pub fn kimi_split_q_b(q_b: &Val, heads: u32, qk_nope_dim: u32, qk_rope_dim: u32) -> (Val, Val) {
-        symbol: "attn::kimi_split_q_b_bf16",
+        symbol: "attn::kimi_split_q_b",
         on: q_b,
         // params[0] = heads, [1] = qk_nope_dim, [2] = qk_rope_dim.
         params: [heads, qk_nope_dim, qk_rope_dim],
@@ -39,51 +41,79 @@ builder! {
 }
 
 
+/// `kernels::attn::dsa_index_q_rope`.
+/// `[n_heads, head_dim, rope_dim, theta]` is the run; positions minted by name.
+#[must_use]
+pub fn dsa_index_q_rope(
+    idx_q: &Val,
+    heads: u32,
+    head_dim: u32,
+    rope_dim: u32,
+    theta: f32,
+) -> Val {
+    let positions = rt_tokens(&idx_q.t, "positions");
+    record_with_params(
+        &idx_q.t,
+        idx_q.layer,
+        "attn::dsa_index_q_rope",
+        vec![],
+        None,
+        vec![heads, head_dim, rope_dim, theta.to_bits()],
+        vec![idx_q.id, positions],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
+            DType::BF16,
+        )),
+    )
+    .expect("the rope produces its value")
+}
+
+/// `kernels::attn::dsa_index_knorm_rope`.
+///
+/// THE NORM IS A LAYERNORM, so it takes a weight AND a bias, and both
+/// are operands rather than facts. The kernel
+/// (`attn/dsa_indexer.cuh`'s `index_knorm_rope`) subtracts the row mean
+/// before scaling and its last statement is
+/// `row[d] = x * w[d] + b[d]` -- two banks it dereferences per element,
+/// not one bank and a constant. A statement that places neither leaves
+/// the arm binding whatever the two weight slots happen to hold.
+///
+/// They arrive by NAME because the DSA indexer's tensors have no
+/// spelling in any manifest: `glm_5/project.rs` says why, and says it
+/// about this exact group of weights -- the checkpoint's own names for
+/// the indexer are not written down anywhere in this tree, so a
+/// manifest row for one would be a guess that turns a matching
+/// checkpoint into a `Fault::Missing`. `tests/seam_names.rs` records
+/// them as names no builder can yet emit, which is where this pair
+/// goes too.
+///
+/// `[rope_dim, theta, eps]` is the run, in the routine's order; the
+/// positions stream is minted by name.
+#[must_use]
+pub fn dsa_index_knorm_rope(
+    idx_k: &Val,
+    k_norm_weight: &str,
+    k_norm_bias: &str,
+    head_dim: u32,
+    rope_dim: u32,
+    theta: f32,
+    eps: f32,
+) -> Val {
+    let positions = rt_tokens(&idx_k.t, "positions");
+    record_with_params(
+        &idx_k.t,
+        idx_k.layer,
+        "attn::dsa_index_knorm_rope",
+        vec![k_norm_weight.to_string(), k_norm_bias.to_string()],
+        None,
+        vec![rope_dim, theta.to_bits(), eps.to_bits()],
+        vec![idx_k.id, positions],
+        Some((Shape(vec![Dim::Tokens, Dim::Const(head_dim)]), DType::BF16)),
+    )
+    .expect("the norm+rope produces its value")
+}
+
 builder! {
-    /// `kernels::attn::dsa_index_q_rope_bf16`.
-    pub fn dsa_index_q_rope(idx_q: &Val, heads: u32, head_dim: u32) -> Val {
-        symbol: "attn::dsa_index_q_rope_bf16",
-        on: idx_q,
-        inputs: [idx_q],
-        out: [Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)] as BF16,
-        made: "the rope produces its value",
-    }
-
-
-    /// `kernels::attn::dsa_index_knorm_rope_bf16`.
-    ///
-    /// THE NORM IS A LAYERNORM, so it takes a weight AND a bias, and both
-    /// are operands rather than facts. The kernel
-    /// (`attn/dsa_indexer.cuh`'s `index_knorm_rope`) subtracts the row mean
-    /// before scaling and its last statement is
-    /// `row[d] = x * w[d] + b[d]` -- two banks it dereferences per element,
-    /// not one bank and a constant. A statement that places neither leaves
-    /// the arm binding whatever the two weight slots happen to hold.
-    ///
-    /// They arrive by NAME because the DSA indexer's tensors have no
-    /// spelling in any manifest: `glm_5/project.rs` says why, and says it
-    /// about this exact group of weights -- the checkpoint's own names for
-    /// the indexer are not written down anywhere in this tree, so a
-    /// manifest row for one would be a guess that turns a matching
-    /// checkpoint into a `Fault::Missing`. `tests/seam_names.rs` records
-    /// them as names no builder can yet emit, which is where this pair
-    /// goes too.
-    pub fn dsa_index_knorm_rope(
-        idx_k: &Val,
-        k_norm_weight: &str,
-        k_norm_bias: &str,
-        head_dim: u32,
-    ) -> Val {
-        symbol: "attn::dsa_index_knorm_rope_bf16",
-        on: idx_k,
-        weights: [k_norm_weight, k_norm_bias],
-        inputs: [idx_k],
-        out: [Dim::Tokens, Dim::Const(head_dim)] as BF16,
-        made: "the norm+rope produces its value",
-    }
-
-
-
     /// `kernels::attn::dsa_index_topk_mask`.
     pub fn dsa_index_topk_mask(
         idx_q: &Val,

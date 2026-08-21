@@ -5,7 +5,7 @@ use kernels::routine::Refusal;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 use kernels::raises::Struct;
-use crate::views::{RecurrentState};
+use crate::views::RecurrentState;
 
 fn head_rows(rows: i32, v_heads: i32) -> Result<u32, Refusal> {
     if rows <= 0 {
@@ -278,7 +278,7 @@ pub fn gdn_prep(
     )
 }
 
-#[routine]
+#[routine(canon = gdn_prep)]
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
     mixed: In<Tensor<bf16>>,

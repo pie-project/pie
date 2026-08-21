@@ -569,7 +569,7 @@ fn llama_like(w: &mut Wiring<'_>) {
             // added for qwen-2 and stopped there, because qwen-2's `o_proj`
             // carries none. gpt-oss's does"*. That table learned the fourth
             // name and this wiring did not, so gpt-oss loaded, reported itself
-            // healthy, and refused at `norm::add_bias_bf16` -- the fire does
+            // healthy, and refused at `norm::add_bias` -- the fire does
             // not carry a weight -- because no alias answered
             // `layer.{i}.o_bias`.
             //

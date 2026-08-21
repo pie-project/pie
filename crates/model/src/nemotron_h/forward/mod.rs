@@ -20,6 +20,7 @@
 pub mod facts;
 
 use self::facts::{NemotronHFacts, NemotronLayerKind};
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
 use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
@@ -43,19 +44,20 @@ struct NhLayerW {
 }
 
 impl NhLayerW {
-    fn new(l: u32, f: &NemotronHFacts) -> Self {
+    fn new(l: u32, f: &NemotronHFacts, norm_eps: f32, repr: WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let m = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         let n = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         Self {
             norm: n("norm"),
@@ -78,24 +80,46 @@ impl NhLayerW {
 }
 
 /// nemotron_h's CUDA text for one fire class.
-pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan {
+pub fn nemotron_h_cuda<W1: DtypeAxis, W2: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &NemotronHFacts,
+    class: FireClass,
+    norm_eps: f32,
+    rope_theta: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment. Same for K: the attention layers' kv writes state
+    // native bf16 pages and nothing here forks on the scheme yet.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+        assert!(K::NATIVE_BF16);
+    }
     // DECODE AND PREFILL, and the difference is one call. This family
     // served Decode only and PANICKED on anything else — not refused,
     // panicked, on the first prefill a serving deployment sends. The
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
-    let family = format!("nemotron_h.cuda.{}", class.suffix());
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "nemotron_h-{}-{}-{}.cuda.{}",
+        W1::NAME,
+        W2::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let mb = facts.mamba;
     let _at = facts.attn;
     dsl::trace_named(&family, |t| {
-        let mut y = dsl::embedded_prologue(t, facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden, facts.vocab);
 
         for l in 0..facts.layers() {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
             let window_left = model_ir::facts::window_left_at(facts.window_left, l);
-            let w = NhLayerW::new(l, facts);
+            let w = NhLayerW::new(l, facts, norm_eps, W1::REPR);
             let x = dsl::cuda::rmsnorm(&y, &w.norm);
 
             match facts.kind(l) {
@@ -175,6 +199,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                         &w.gate_norm.name,
                         mb.intermediate(),
                         mb.n_groups,
+                        norm_eps,
                     );
                     y += matmul(&o, &w.out_proj);
                 }
@@ -182,12 +207,32 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let q = matmul(&x, &w.q_proj);
                     let k = matmul(&x, &w.k_proj);
                     let v = matmul(&x, &w.v_proj);
-                    let (q, k) = dsl::cuda::rope(&q, &k, facts.attn.heads, facts.attn.kv_heads, facts.attn.head_dim);
+                    // The generation's base (no config states one; the
+                    // row's constant records the normalizer's default).
+                    // Stating no pairing means NeoX.
+                    let (q, k) = dsl::cuda::rope(
+                        &q,
+                        &k,
+                        facts.attn.heads,
+                        facts.attn.kv_heads,
+                        facts.attn.head_dim,
+                        rope_theta,
+                        false,
+                    );
                     let kv = dsl::Kv::at(t, l);
                     dsl::cuda::write_kv_to_pages(&k, &v, &kv);
                     dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-                    let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim, 0.0, 0.0)
-                        .expect("a plain attention statement produces its value");
+                    let o = dsl::cuda::attention_for(
+                        class,
+                        &q,
+                        &kv,
+                        window_left,
+                        facts.attn.head_dim,
+                        0.0,
+                        0.0,
+                        facts.attn.kv_heads,
+                    )
+                    .expect("a plain attention statement produces its value");
                     dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
                     y += matmul(&o, &w.o_proj);
                 }
@@ -224,6 +269,8 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                 &logits,
                 &format!("layer.{l}.router_bias"),
                 facts.moe.top_k,
+                facts.moe.norm_topk_prob,
+                facts.moe.routed_scaling,
             );
             let gate_up = dsl::cuda::moe_gate_up_gemv(
                 &m,
@@ -231,7 +278,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     name: format!("layer.{l}.expert.{{e}}.up"),
                     width: facts.moe.moe_intermediate,
                     layer: Some(l),
-                    repr: WeightRepr::Bf16,
+                    repr: W2::REPR,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -243,7 +290,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     name: format!("layer.{l}.expert.{{e}}.down"),
                     width: facts.hidden,
                     layer: Some(l),
-                    repr: WeightRepr::Bf16,
+                    repr: W2::REPR,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -261,6 +308,29 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
+        dsl::logits_epilogue(
+            t,
+            &y,
+            NormVariant::Plain,
+            false,
+            facts.vocab,
+            None,
+            norm_eps,
+        );
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&NemotronHFacts, FireClass, f32, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    (
+        "nemotron_h-bf16-bf16-kv-bf16",
+        nemotron_h_cuda::<Bf16Ax, Bf16Ax, Bf16Ax, NativeKv>,
+    ),
+];

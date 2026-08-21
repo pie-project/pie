@@ -284,7 +284,7 @@ impl Variant for KimiK3 {
         // _provision.rs` holds the refusal so the day it changes is a test
         // failure naming this line rather than a silent revival.
         self.deployment(load)
-            .and_then(|_| project::trace(&self.shape, class))
+            .and_then(|_| project::trace(&self.shape, class, self.norm_eps))
     }
 
     /// Kimi's own `<|im_middle|>` protocol, shared with kimi-k2 and

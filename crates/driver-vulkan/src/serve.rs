@@ -1632,11 +1632,19 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
     let handles = core::cell::RefCell::new(crate::hold::Handles::new(
         &bound, &arg_widths, &ins, &outs, &weights, &params, resolver,
     ));
+    // THE VIEWS OUTLIVE THE BODY. `bind` boxes a host view per `Ty::Raised`
+    // operand (`In<Struct<KvCache>>` and its siblings) and hands its ADDRESS
+    // into `values`; the body reads it below, so the holder sits on this
+    // frame until `encoder.finish()`. A replayed fire re-submits the
+    // recorded command buffer and runs no body, so no address outlives this
+    // function.
+    let mut views = crate::views::Views::over(args, &ins);
     let values = crate::bind::bind(
         &routine.args,
         &routine.sources,
         &mut handles.borrow_mut(),
         facts,
+        &mut views,
     )
     .map_err(|why| Undispatchable::Refused {
         symbol: symbol.to_owned(),

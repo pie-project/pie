@@ -3,7 +3,8 @@
 pub mod facts;
 
 use self::facts::{Gemma4CudaFacts, Gemma4Facts};
-use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
+use model_dsl::axes::{Bf16Ax, DtypeAxis, KvAxis, NativeKv};
+use model_dsl::{self as dsl, MatW, NormW, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
 
 // ── gemma-4 ──────────────────────────────────────────────────────────
@@ -33,18 +34,18 @@ struct Gemma4LayerW {
 }
 
 impl Gemma4LayerW {
-    fn new(l: u32, f: &Gemma4Facts) -> Self {
+    fn new(l: u32, f: &Gemma4Facts, norm_eps: f32, repr: model_dsl::WeightRepr) -> Self {
         let w = |name: &str| format!("layer.{l}.{name}");
         let d = f.head_dim_of(l);
         let mat = |name: &str, width: u32| MatW {
             name: w(name),
             width,
             layer: Some(l),
-            repr: WeightRepr::Bf16,
+            repr,
         };
         // PLAIN, despite the family name: `gemma4.cpp` fires
-        // `kernels::norm::rmsnorm_bf16` at all fourteen of its norm sites and
-        // `kernels::norm::rmsnorm_gemma_bf16` at none. The `(1 + w)` fold is
+        // `kernels::norm::rmsnorm` at all fourteen of its norm sites and
+        // `kernels::norm::rmsnorm_gemma` at none. The `(1 + w)` fold is
         // done to the tensors at LOAD for this family, so a declaration
         // that stated Gemma would be stating a second fold.
         let norm = |name: &str| NormW {
@@ -52,12 +53,14 @@ impl Gemma4LayerW {
             variant: NormVariant::Plain,
             per_head: None,
             layer: Some(l),
+            eps: norm_eps,
         };
         let head_norm = |name: &str| NormW {
             name: w(name),
             variant: NormVariant::Plain,
             per_head: Some(d),
             layer: Some(l),
+            eps: norm_eps,
         };
         Gemma4LayerW {
             attn_norm: norm("attn_norm"),
@@ -112,8 +115,27 @@ impl Gemma4LayerW {
 /// Prefill and the service classes are not stated yet: this is the
 /// decode reading, and the class parameter is here so the next rung adds
 /// them where llama_like's does.
-pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass) -> ForwardPlan {
-    let family = format!("gemma4.cuda.{}", class.suffix());
+pub fn gemma4_cuda<W1: DtypeAxis, A: DtypeAxis, K: KvAxis>(
+    facts: &Gemma4Facts,
+    cuda: &Gemma4CudaFacts,
+    class: FireClass,
+    norm_eps: f32,
+) -> ForwardPlan {
+    // The activation axis is DECLARED but pinned until the launch wrappers
+    // take a dtype: every statement below states BF16 outs, so a point
+    // instantiated at another A would lie. The pin is a compile refusal,
+    // not a comment.
+    const {
+        assert!(matches!(A::DTYPE, model_ir::trace::DType::BF16));
+    }
+    // The SKU joins the family's FIRST segment ('.'-separated segment two
+    // stays the backend, which `Backend::of_family` parses).
+    let family = format!(
+        "gemma4-{}-{}.cuda.{}",
+        W1::NAME,
+        K::NAME,
+        class.suffix()
+    );
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
         // The entry boundary. A `Put` attachment lands device embeds or
@@ -123,7 +145,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
         // ── Prologue ────────────────────────────────────────────────
         // The token embedding, scaled by sqrt(hidden).
         let mut y = dsl::cuda::scalar_mul(
-            &dsl::embed_with(t, "embed", hidden),
+            &dsl::embed_with(t, "embed", hidden, facts.vocab),
             "sqrt_hidden",
             Some((hidden as f32).sqrt()),
         );
@@ -134,7 +156,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
         // the entire reason for the relay.
         let ple_total = facts.layers * facts.ple_dim;
         let table = dsl::cuda::scalar_mul(
-            &dsl::embed_with(t, "embed_per_layer", ple_total),
+            &dsl::embed_with(t, "embed_per_layer", ple_total, facts.vocab),
             "sqrt_ple_dim",
             Some((facts.ple_dim as f32).sqrt()),
         );
@@ -149,7 +171,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 name: "ple_model_proj".into(),
                 width: ple_total,
                 layer: None,
-                repr: WeightRepr::Bf16,
+                repr: W1::REPR,
             },
         );
         let scaled =
@@ -161,6 +183,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 variant: NormVariant::Plain,
                 per_head: Some(facts.ple_dim),
                 layer: None,
+                eps: norm_eps,
             },
         );
         // The projection lands back on the SCALED TABLE, not on nothing:
@@ -175,14 +198,14 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
         // ── Layers ──────────────────────────────────────────────────
         // Layer 0 norms the stream itself; every other layer received
         // its input norm from the layer before (see the doc above).
-        let mut normed = dsl::cuda::rmsnorm(&y, &Gemma4LayerW::new(0, facts).attn_norm);
+        let mut normed = dsl::cuda::rmsnorm(&y, &Gemma4LayerW::new(0, facts, norm_eps, W1::REPR).attn_norm);
 
         for l in 0..facts.layers {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
             let window_left = model_ir::facts::window_left_at(&cuda.window_left, l);
-            let w = Gemma4LayerW::new(l, facts);
+            let w = Gemma4LayerW::new(l, facts, norm_eps, W1::REPR);
             let full = facts.is_full_attn(l);
             let d = facts.head_dim_of(l);
             let shared = facts.is_kv_shared(l);
@@ -194,14 +217,25 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
             // unavailable to a layer that writes none — and to the full
             // layers, whose partial rope it does not implement.
             let fused_post = cuda.fused_qkv
-                && cuda.kv_native_bf16
+                && K::NATIVE_BF16
                 && !full
                 && !shared
                 && class == FireClass::Decode;
 
             let attn_in = if fused_post {
                 let packed = matmul(&normed, &w.qkv);
-                dsl::cuda::qkv_packed_post(&packed, &w.q_norm, &w.k_norm, &kv, facts.q_heads * d)
+                dsl::cuda::qkv_packed_post(
+                    &packed,
+                    &w.q_norm,
+                    &w.k_norm,
+                    &kv,
+                    facts.q_heads * d,
+                    facts.kv_heads,
+                    // The fused post is sliding-only (its predicate reads
+                    // `!full`), and a sliding layer rotates on the local
+                    // base — project.rs's `layer_attention` rule.
+                    crate::gemma_4::project::ROPE_THETA_LOCAL,
+                )
             } else if shared {
                 // A shared layer takes only the Q leg: no k/v
                 // projection, no k/v norm, no rope on k, no write. Which
@@ -212,9 +246,18 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 let q = matmul(&normed, &w.q_proj);
                 if full {
                     let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
-                    dsl::cuda::rope_partial_q_only(&q, facts.global_rotary_dim)
+                    dsl::cuda::rope_partial_q_only(
+                        &q,
+                        facts.global_rotary_dim,
+                        d,
+                        crate::gemma_4::project::ROPE_THETA_GLOBAL,
+                    )
                 } else {
-                    dsl::cuda::qk_rmsnorm_rope_rounded_q_only(&q, &w.q_norm)
+                    dsl::cuda::qk_rmsnorm_rope_rounded_q_only(
+                        &q,
+                        &w.q_norm,
+                        crate::gemma_4::project::ROPE_THETA_LOCAL,
+                    )
                 }
             } else {
                 let (q, k, v) = if cuda.fused_qkv {
@@ -233,16 +276,29 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 // different arithmetic -- which is what
                 // `seam::check_plan` refuses.
                 dsl::seam(q.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
-                let v = dsl::cuda::rmsnorm_no_scale(&v);
+                let v = dsl::cuda::rmsnorm_no_scale(&v, d, norm_eps);
                 let (q, k) = if full {
                     // Partial rope has no fused pair, so the norms are
                     // their own statements — `can_fuse_qk_norm_rope`
                     // reads `!partial`.
                     let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
                     let k = dsl::cuda::rmsnorm(&k, &w.k_norm);
-                    dsl::rope_partial(&q, &k, RopeKind::Standard, facts.global_rotary_dim)
+                    dsl::rope_partial(
+                        &q,
+                        &k,
+                        RopeKind::Standard,
+                        facts.global_rotary_dim,
+                        d,
+                        crate::gemma_4::project::ROPE_THETA_GLOBAL,
+                    )
                 } else {
-                    dsl::cuda::qk_rmsnorm_rope_rounded(&q, &k, &w.q_norm, &w.k_norm)
+                    dsl::cuda::qk_rmsnorm_rope_rounded(
+                        &q,
+                        &k,
+                        &w.q_norm,
+                        &w.k_norm,
+                        crate::gemma_4::project::ROPE_THETA_LOCAL,
+                    )
                 };
                 dsl::cuda::write_kv_to_pages(&k, &v, &kv);
                 q
@@ -262,23 +318,40 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
             dsl::seam(attn_in.trace(), &dsl::seam::ATTN_Q, &[&attn_in], Some(l));
             let a = match class {
                 FireClass::Decode => {
-                    dsl::cuda::attention_flashinfer_decode(&attn_in, &kv, window_left, facts.head_dim_of(l))
-                }
-                FireClass::Prefill if d == 512 => {
-                    dsl::cuda::attention_naive_paged(&attn_in, &kv, window_left)
-                }
-                FireClass::Prefill => {
-                    // GEMMA-4 STATES ITS SCALE AND IT IS 1.0, not `1/sqrt(d)`:
-                    // the per-head `q_norm`/`k_norm` above have already
-                    // divided by what the derivation would divide by again,
-                    // and a second division is finite, varied and wrong.
-                    dsl::cuda::attention_flashinfer_prefill_planless(
+                    // No cap, and gemma-4 STATES ITS SCALE AND IT IS 1.0 — the
+                    // per-head norms already divided (the prefill arm below
+                    // and project.rs's per-layer table say the same).
+                    dsl::cuda::attention_flashinfer_decode(
                         &attn_in,
                         &kv,
                         window_left,
                         facts.head_dim_of(l),
                         0.0,
                         1.0,
+                    )
+                }
+                FireClass::Prefill if d == 512 => dsl::cuda::attention_naive_paged(
+                    &dsl::runtime::query_windows(&attn_in),
+                    &kv,
+                    window_left,
+                    d,
+                    facts.kv_heads_of(l),
+                    1.0,
+                    0.0,
+                ),
+                FireClass::Prefill => {
+                    // GEMMA-4 STATES ITS SCALE AND IT IS 1.0, not `1/sqrt(d)`:
+                    // the per-head `q_norm`/`k_norm` above have already
+                    // divided by what the derivation would divide by again,
+                    // and a second division is finite, varied and wrong.
+                    dsl::cuda::attention_flashinfer_prefill_planless(
+                        &dsl::runtime::query_windows(&attn_in),
+                        &kv,
+                        window_left,
+                        facts.head_dim_of(l),
+                        0.0,
+                        1.0,
+                        facts.kv_heads_of(l),
                     )
                 }
             }
@@ -299,7 +372,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 hidden,
                 // The identity, which is what gemma-4's own last layer
                 // applies: it lands through the unfused
-                // `norm::rmsnorm_residual_add_bf16`, which scales by nothing,
+                // `norm::rmsnorm_residual_add`, which scales by nothing,
                 // so the fused path must agree with it about the same
                 // landing. `rsqrt_2` was tried here and the generation stayed
                 // incoherent either way -- this row's numerics need more than
@@ -345,7 +418,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
             let gated = dsl::cuda::geglu_tanh_pair(&gate, &slice, facts.ple_dim);
             let ple_out = matmul(&gated, &w.ple_proj);
             if l + 1 < facts.layers {
-                let next = Gemma4LayerW::new(l + 1, facts);
+                let next = Gemma4LayerW::new(l + 1, facts, norm_eps, W1::REPR);
                 let (landed, next_norm) = dsl::cuda::norm_residual_scale_norm(
                     &ple_out,
                     &y,
@@ -390,11 +463,12 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 variant: NormVariant::Plain,
                 per_head: None,
                 layer: None,
+                eps: norm_eps,
             },
         );
         let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
         let logits = if facts.logit_softcap > 0.0 {
-            dsl::cuda::logit_softcap(&logits, facts.vocab)
+            dsl::cuda::logit_softcap(&logits, facts.vocab, facts.logit_softcap)
         } else {
             logits
         };
@@ -404,3 +478,15 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
         dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })
 }
+
+/// One shipping SKU: its name and the monomorphized trace it instantiates.
+pub type TraceFn = fn(&Gemma4Facts, &Gemma4CudaFacts, FireClass, f32) -> ForwardPlan;
+
+/// The family's catalogue — every SKU this build ships, enumerated. The
+/// coverage test (`model/tests/catalogue_coverage.rs`) traces each row at
+/// both fire classes; `TraceBuilder::finish`'s `check_plan` then refuses a
+/// row whose statements reach a routine point that does not exist, which
+/// is how the demand set closes: checked, never hoped.
+pub const CATALOG: &[(&str, TraceFn)] = model_dsl::catalogue![
+    ("gemma4-bf16-kv-bf16", gemma4_cuda::<Bf16Ax, Bf16Ax, NativeKv>),
+];

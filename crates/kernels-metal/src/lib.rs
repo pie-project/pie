@@ -60,10 +60,7 @@ pub const ELSEWHERE: &[kernels::routine::Declared] = &[kernels::routine::Declare
     args: &[kernels::Ty::Bf16sMut, kernels::Ty::Bf16s],
     sources: &[
         Some(kernels::Source::Alias(0, 0)),
-        Some(kernels::Source::Or(
-            &kernels::Source::Named("weight"),
-            &kernels::Source::Slot(kernels::Kind::Weight, 0),
-        )),
+        Some(kernels::Source::Slot(kernels::Kind::Weight, 0)),
     ],
     whole: false,
     depth_prefix_plan: false,
