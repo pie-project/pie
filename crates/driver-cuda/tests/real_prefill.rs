@@ -33,6 +33,25 @@ use model_ir::trace::{FireClass, ValueId};
 mod common;
 use common::{device_or_skip, gpu_guard};
 
+/// The scalars the family texts used to read off their fact structs.
+///
+/// Upstream lifted `norm_eps`, the rope bases and gpt-oss's sliding window
+/// OUT of the facts and onto the forward functions, because two SKUs of one
+/// family can differ in those and in nothing else. These tests never read a
+/// number back -- they lower, bind and count -- so any well-formed value
+/// states the same text, and these are the shipped checkpoints' own.
+#[allow(dead_code)]
+const EPS: f32 = 1e-6;
+/// The common rope base. gpt-oss's is its own.
+#[allow(dead_code)]
+const THETA: f32 = 1_000_000.0;
+/// gpt-oss: YaRN over a 150k base, alternating 128-token windows.
+#[allow(dead_code)]
+const WINDOWED_THETA: f32 = 150_000.0;
+/// The sliding leg's span. `-1` is "no window" and is NOT what gpt-oss says.
+#[allow(dead_code)]
+const WINDOW: i32 = 128;
+
 /// One tensor's slice of the safetensors payload.
 struct View<'a> {
     bytes: &'a [u8],
@@ -199,7 +218,7 @@ fn ab(spec: &Spec) {
     });
 
     // ── The fire: one request, the whole prompt, one page. ──
-    let plan = llama_like_cuda(&spec.facts, &spec.cuda, FireClass::Prefill);
+    let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(&spec.facts, &spec.cuda, FireClass::Prefill, EPS, THETA);
     // A prefill: ONE request contributing `tokens` rows, so every row is
     // multi-token. `GuardPred::WindowOne` reads that bit -- the window class
     // is a row property now (`.wiki/driver/graph.md` §4.1) -- and a fixture
@@ -240,9 +259,16 @@ fn ab(spec: &Spec) {
         arena_bytes: l.arena_bytes,
     };
 
+    // RUNTIME VALUES ARE NOT SEAMS. The lowering leaves them `Arg::Named` like
+    // any other, but the driver stages them per fire and answers them by name;
+    // `runtime_values` is the live path's own exclusion, taken verbatim, so a
+    // stream never gets a pin that could be answered instead of the object.
+    let staged = driver_cuda::bind::views::runtime_values(&plan.runtime);
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
     for a in &l.args {
-        if let Arg::Named { value, width, .. } = a {
+        if let Arg::Named { value, width, .. } = a
+            && !staged.contains(value)
+        {
             // MAX, not last: several values can now share one id (they
             // alias in place), and the buffer has to fit the widest read.
             let slot = named_widths.entry(*value).or_insert(*width);
@@ -251,7 +277,9 @@ fn ab(spec: &Spec) {
     }
     for i in 0..l.launches.len() {
         for a in &dplan.spec(i).outs {
-            if let Arg::Named { value, width, .. } = a {
+            if let Arg::Named { value, width, .. } = a
+                && !staged.contains(value)
+            {
                 let slot = named_widths.entry(*value).or_insert(*width);
                 *slot = (*slot).max(*width);
             }
@@ -402,6 +430,28 @@ fn ab(spec: &Spec) {
         logits_soft_cap: 0.0,
         sm_scale: 1.0 / (head_dim as f32).sqrt(),
     };
+
+    // The runtime channel, answered as the driver answers it: the per-layer
+    // KV views out of the arena, the fire's streams by name. `sampling_indices`
+    // stays null on purpose -- every row is sampled, so there is no index list,
+    // and a gather that named one must REFUSE rather than read an empty pin.
+    let views = driver_cuda::bind::views::FireViews::build(
+        Some(&attn),
+        None,
+        driver_cuda::bind::views::FireStreams {
+            positions: positions.as_ptr(),
+            token_ids: ids.as_ptr(),
+            request_of_token: core::ptr::null_mut(),
+            qo_indptr: qo_indptr.as_ptr(),
+            row_valid: row_valid.as_ptr(),
+            sampling_indices: core::ptr::null_mut(),
+            first_token: 0,
+            qo_indptr_host: qo_indptr_h.as_ptr(),
+            kv_page_indptr_host: page_indptr_h.as_ptr(),
+            prefill_plan_cache: core::ptr::null_mut(),
+        },
+    );
+    resolver.stage(&plan.runtime, &views);
 
     let mut cublas_ops = driver_cuda::device::cublas::LiveCublas;
     let mut cublas = driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)

@@ -302,7 +302,6 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
         q_heads: 16,
         kv_heads: 8,
         head_dim: 128,
-        rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
         // qwen3-0.6b's checkpoint point, which the affine kernels REFUSE at

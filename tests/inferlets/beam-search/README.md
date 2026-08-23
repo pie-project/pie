@@ -11,7 +11,7 @@ left-to-right beam-search recurrence used by neural sequence decoders.
 
 **Faithfulness: Exact for fixed-width cumulative-logprob beam search.** The
 inferlet's width-1 identity check is documented in
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

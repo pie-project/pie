@@ -54,7 +54,7 @@ token, advance the matcher, publish the next mask, and only then submit the next
 fire. The earlier run-ahead version silently reused a stale grammar mask, which
 meant the schema was not actually enforced on those steps; the audit documents
 that failure mode in
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 The device side is intentionally simple: `masked_argmax(intrinsics::logits(),
 allowed)` in the epilogue. All schema semantics live in the host `JsonSchema`

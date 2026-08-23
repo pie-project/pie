@@ -107,7 +107,7 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     // exact inverse of the `lora_stage` note above and the reason both are
     // written down. The path really is gone from the tree, so the assertion
     // holds -- but this oracle is not dead. `memory_planner/run.sh` now
-    // restores the `.cpp`/`.hpp` from `e7cd33cf1` and builds them against the
+    // restores the `.cpp`/`.hpp` from `7559e4cea` and builds them against the
     // surviving `stub/` tree with plain `g++` and no CUDA, and it reproduces
     // `GOLDEN_FNV1A64` exactly. Nothing about it needed the deleted tree.
     //
@@ -476,7 +476,21 @@ fn no_dead_oracle_is_advertised_as_runnable() {
 /// One constant because one oracle restores today. It is here rather than
 /// only in the script so the check below and the script cannot disagree
 /// silently -- the check reads the script and requires this string in it.
-const RESTORE_REV: &str = "e7cd33cf1";
+/// REPOINTED FROM `e7cd33cf1`, which this history no longer contains.
+///
+/// The decay this constant's own test warns about -- *"history is rewritten,
+/// branches are pruned, and it decays silently"* -- happened, and the test
+/// caught it, which is the entire reason it was written to check the blob
+/// rather than the script alone. `git cat-file -e e7cd33cf1:...` answers
+/// *"Not a valid object name"*; the commit is not reachable from any ref.
+///
+/// `7559e4cea` is the replacement, found the way the failure message says to
+/// find one: `git log --all --diff-filter=D` names `12cab376f` as the commit
+/// that deleted `store/memory_planner.cpp`, and its PARENT is the last
+/// revision that still holds the file. Measured at 1,221 lines, which is the
+/// count `memory_planner_parity.rs` names, so this is the same blob under a
+/// new hash rather than a different one that happens to compile.
+const RESTORE_REV: &str = "7559e4cea";
 
 /// A restoring oracle's source is really still fetchable.
 ///

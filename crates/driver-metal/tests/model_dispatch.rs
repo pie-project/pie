@@ -73,7 +73,6 @@ fn geometry() -> Geometry {
         q_heads: 16,
         kv_heads: 8,
         head_dim: 128,
-        rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
         // qwen3-0.6b's checkpoint is 4-bit over groups of 64.
@@ -84,6 +83,21 @@ fn geometry() -> Geometry {
         // `geometry_from_deployment` puts there for such a row.
         ..Geometry::default()
     }
+}
+
+/// The plan behind [`lowered`], for the tests that need its runtime bindings.
+///
+/// `Store::named` answers a runtime STREAM through the fire's tables and
+/// everything else out of the seam map, and it can only tell the two apart if
+/// it has been handed the plan's `Streams`. A fixture with `.with_fire` and no
+/// `.with_runtime` therefore refuses every stream it is asked for, by value id
+/// -- which reads as a missing table and is really a missing map.
+fn plan_of(class: FireClass) -> model_ir::ForwardPlan {
+    llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        class,
+    )
 }
 
 fn lowered(class: FireClass, rows: usize) -> Lowered {
@@ -771,7 +785,23 @@ mod state {
                 bytes: 64,
             })
         };
-        let mut store = Store::new(Names::mlx(), &tensors, &named).with_fire(&tables);
+        // THE TABLES ARE HALF THE ANSWER AND THE STREAM MAP IS THE OTHER.
+        // `Store::named` routes a runtime STREAM to the fire's staged table
+        // and everything else to the seam map, and it tells the two apart by
+        // asking the plan's `Streams` which value is which. This fixture had
+        // `.with_fire` and no `.with_runtime`, so the lookup fell straight
+        // through to an empty seam map and the rotation refused with
+        // `UnknownNamed(8)` -- value 8 being `positions`, the very table the
+        // closure above was written to answer.
+        //
+        // The refusal was right, and it is the shape this test exists to
+        // pin: a driver that bound a stand-in for a missing positions table
+        // would rotate at the wrong offsets and return fluent text.
+        let plan = plan_of(FireClass::Decode);
+        let streams = driver_metal::lowering::runtime::Streams::of(&plan);
+        let mut store = Store::new(Names::mlx(), &tensors, &named)
+            .with_fire(&tables)
+            .with_runtime(&streams);
         let launch = low
             .launches
             .iter()
@@ -891,9 +921,6 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         q_heads: 32,
         kv_heads: 16,
         head_dim: 256,
-        // The FIRE's number, which is the sliding layers' and which the full
-        // layers must NOT take.
-        rotary_dims: 256,
         group: 64,
         bits: 4,
         // The SECOND head width, and how often a layer takes it. Without
@@ -908,12 +935,19 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         v_dim: 0,
         ..Geometry::default()
     };
-    // The PLANNED grid, not `facts_of`. `Facts::rotary_dims` is the fire's
-    // number by construction -- it is the FALLBACK `stated` takes when a
-    // statement carries none -- so reading it back could only ever return
-    // what was put in, and this test read it and proved nothing. `rope_grid`
-    // puts the resolved count in `grid[0]` as pairs, which is where a rope
-    // told the wrong extent stops covering its channels.
+    // The PLANNED grid, not `facts_of`. This geometry used to carry a
+    // fire-wide `rotary_dims` here, set to 256 -- the sliding layers' width,
+    // the one the full layers must NOT take -- so that a rope reading the
+    // fallback instead of its statement would be caught rotating half its
+    // channels. That control is gone because what it controlled for is gone:
+    // there is no fire-wide rotary width left in the tree to take. `Facts`
+    // and `Geometry` each carried one, both filled from layer zero, and both
+    // outlived their last reader once the `ParamOr<3, ..>` sites started
+    // reading the statement. Deleting them turns this test's negative control
+    // into a structural one, which is the better kind.
+    //
+    // `rope_grid` puts the resolved count in `grid[0]` as pairs, which is
+    // where a rope told the wrong extent stops covering its channels.
     let frame = frame(&low);
     let mut store = Sentinels;
     let mut by_layer: BTreeSet<(u16, u32)> = BTreeSet::new();
@@ -995,7 +1029,6 @@ fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
         q_heads: facts.q_heads,
         kv_heads: facts.kv_heads,
         head_dim: facts.head_dim,
-        rotary_dims: facts.head_dim,
         n_experts: facts.n_experts,
         experts_per_token: facts.experts_per_token,
         // gpt-oss's MXFP4: blocks of 32, four bits.

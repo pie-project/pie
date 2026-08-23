@@ -272,3 +272,42 @@ pub async fn spawn_inferlet(name: &str, input_json: &str) -> Result<String, Stri
     let program = install_inferlet(name).await;
     spawn_input(&program, input_json).await
 }
+
+/// Refuse a completion that is not made of WORDS.
+///
+/// "Non-empty" is the assertion these forward gates used to carry, and it is
+/// worth almost nothing: a model whose weights are being read correctly and a
+/// model whose every RMSNorm reduces over the wrong axis both emit sixteen
+/// tokens. The qwen3.5 hybrid answered `"The capital of France is"` with
+///
+///     "\n\n\nqu.c.\n\n. / } )\n0\n -"
+///
+/// for as long as nothing looked, and a non-empty check passed on it every
+/// time. What separates that from a real completion is not length and not
+/// perplexity — it is that a working model emits WORDS, and a broken one emits
+/// punctuation and fragments.
+///
+/// So: at least `min_words` runs of three-or-more letters, and at least two
+/// fifths of the non-space characters alphanumeric. Both thresholds are far
+/// below anything a coherent English completion produces and far above what
+/// degenerate sampling from a scrambled residual stream produces, which is the
+/// only band where a gate like this is worth having. It says nothing about
+/// WHICH words — that claim belongs to the A/B fixtures against transformers,
+/// which compare logits.
+pub fn assert_coherent(text: &str, min_words: usize) {
+    let words = text
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| w.chars().count() >= 3)
+        .count();
+    let dense: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let alnum = dense.iter().filter(|c| c.is_alphanumeric()).count();
+    assert!(
+        words >= min_words,
+        "completion has {words} word(s) of 3+ letters, wanted {min_words}: {text:?}"
+    );
+    assert!(
+        !dense.is_empty() && alnum * 5 >= dense.len() * 2,
+        "completion is {alnum}/{} alphanumeric, wanted two fifths: {text:?}",
+        dense.len()
+    );
+}

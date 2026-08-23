@@ -388,22 +388,22 @@ jobs:
       # a driver feature and stay in the dedicated jobs below.
       #
       # RUN IN FULL for the first time on 2026-08-21, on a Mac with the pinned
-      # `slangc` installed. Everything passes except ONE target, and it is a
-      # standing known failure rather than anything this branch broke:
-      # `kernels`'s `every_plane_is_answered` reports 51 unanswerable asks,
-      # 49 of them in `keys.rs` §M and §L -- the two sections the CUDA mark
-      # migration wrote for itself, whose asking half landed in `930fee2cb`
-      # and whose answering half never did. `driver-cuda` answers NONE of the
-      # 59 keys those sections declare. A body that asks for a fact its
-      # driver cannot answer returns `Refusal::Unstated` and the routine does
-      # not fire, so the gate is right and the CUDA plane list is what is
-      # behind. The failure groups by section and names a different repair
-      # under each; read it before touching a mark.
+      # `slangc` installed. It found ONE red target, `kernels`'s
+      # `every_plane_is_answered`, reporting 51 asks no driver answered; that
+      # gate has since been deleted along with its subject, because the no-ask
+      # series removed `ctx.ask` entirely. Its epitaph and what it measured are
+      # in `kernels/tests/shader_backends_agree.rs`.
       #
-      # That plus the kernel vocabulary audit above are the two steps a first
-      # PR from a rewrite branch should expect red. Everything else in this
-      # job is green, and was green only after `slangc` was installed --
-      # before that the job could not finish its first step.
+      # WHAT THIS STEP IS ACTUALLY FOR, learned the same week: the no-ask
+      # series was verified with `cargo check --workspace` and reported zero
+      # errors, and `cargo check --workspace` DOES NOT BUILD TEST TARGETS. It
+      # left roughly 300 compile errors across five crates' tests, and a real
+      # drift behind them -- `shader.rs`'s operand census sat at 12 over a
+      # vocabulary of 13, and `kernels-metal`'s hand-written `rms_rope` row sat
+      # at 2 arguments against the wgpu twin's 13 -- neither of which anything
+      # could report while the tests did not compile. This step is the thing
+      # that would have said so. Use `--all-targets` locally for the same
+      # reason; plain `check` cannot see any of it.
       - name: cargo test (workspace + worker lib)
         run: |
           cargo test --workspace \
@@ -479,11 +479,25 @@ jobs:
       # Running the tests and asking which files never executed found it
       # in one line: three at exactly 0.00%, half the crate's uncovered
       # total. This asks that one question, not for a percentage.
+      # RETIRED, and left running so it says so. `crates/model/tests` was
+      # deleted and this audit measured `model` alone, so the step now prints
+      # one line and exits zero. The script's docstring holds what it used to
+      # catch -- `pub`, `mod`-reachable code that nothing runs, which every
+      # other gate here is blind to.
       - name: coverage audit (no file where nothing runs)
         run: python3 scripts/coverage-audit.py
 
-      - name: kernel table (every symbol carries its family)
-        run: cargo test -p model --test kernels_table
+      # `kernel table (every symbol carries its family)` STOOD HERE. It ran
+      # `cargo test -p model --test kernels_table`, and that target went with
+      # the rest of `crates/model/tests` when the suite was retired. A
+      # `--test` naming a target that does not exist is not a skip: cargo
+      # fails the step outright, so this line would have turned the whole job
+      # red for a file nobody deleted by mistake.
+      #
+      # What it asked -- that every symbol the table names carries the family
+      # it belongs to -- is not asked anywhere now. Recorded rather than
+      # quietly dropped, because the next person to want it should find out
+      # here that it once existed.
 
       # The SEAM between the two vocabularies that name the same tensors:
       # the trace names a forward pass invents, and the published names a

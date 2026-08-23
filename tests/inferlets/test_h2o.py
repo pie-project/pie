@@ -134,4 +134,5 @@ if __name__ == "__main__":
             test_h2o_keeps_what_it_scored,
         ],
         "H2O heavy-hitter accumulation + enforcement",
+        requires=("attn_score", "attn_page_mask"),
     )

@@ -646,7 +646,38 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     // binder runs once over an undivided statement purely to count the asks,
     // and once over the split that count implies. `driver-metal` reached the
     // same shape after the same defect and records it at its own call site.
+    // AND IT IS MEMOISED, because the pass produces ONE INTEGER and the
+    // paragraph above says what that integer is a function of: the ROUTINE'S
+    // SIGNATURE, read under `facts`. Nothing in the walk reads an operand's
+    // buffer, a row range or a step. Measured, it was 0.097 ms of every
+    // decoded token -- 27% of `plan` and 1.3% of a shipped token -- to
+    // recompute a constant 424 times. Keyed by the routine's name and the
+    // facts, and by the two lengths as well, so that a statement of a
+    // different shape cannot borrow another's count.
     let asked = {
+        type Key = (&'static str, super::hold::Facts, usize, usize);
+        thread_local! {
+            static COUNTED: RefCell<std::collections::HashMap<Key, usize>> =
+                RefCell::new(std::collections::HashMap::new());
+        }
+        let key: Key = (routine.name, facts, args.len(), scalars.len());
+        if let Some(n) = COUNTED.with(|c| c.borrow().get(&key).copied()) {
+            n
+        } else {
+            let n = count_asks(routine, facts, args, scalars);
+            COUNTED.with(|c| {
+                c.borrow_mut().insert(key, n);
+            });
+            n
+        }
+    };
+    #[allow(clippy::items_after_statements)]
+    fn count_asks(
+        routine: &'static Routine<Wgpu>,
+        facts: super::hold::Facts,
+        args: &[model_compiler::lower::Arg],
+        scalars: &[u32],
+    ) -> usize {
         let mut probe = super::hold::Handles::undivided(args, scalars);
         // A refusal HERE is not the answer: the counting pass may fail for a
         // reason the split pass would too, and the split pass is the one whose
@@ -663,7 +694,7 @@ pub fn plan<'a, R: crate::binding::Resolve>(
             &mut scratch,
         );
         probe.asked_results()
-    };
+    }
     let mut handles = super::hold::Handles::with_numbers(args, asked, scalars, &numbers);
     // THE VIEWS OUTLIVE THE BODY. `bind` boxes a host view per `Ty::Raised`
     // operand and hands its ADDRESS into `taken_args`; the body reads it in
@@ -803,9 +834,25 @@ pub fn armed(symbol: &str) -> Option<&'static Routine<Wgpu>> {
     // a kernel, and it is the only thing that can, because this fork answers
     // before any row is looked up.
     let stem = super::hold::crossed(symbol)?;
-    kernels_wgpu::routines()
-        .into_iter()
-        .find(|r| r.name == stem)
+    // BY MAP, AND NOT BY SCAN. `kernels_wgpu::routines()` COLLECTS the
+    // registry into a fresh `Vec` on every call and this fork ran once per
+    // dispatch per step -- 424 times a decoded token -- so the allocation and
+    // the linear name compare were both being paid 424 times to answer a
+    // question whose answer is a constant. See `dispatch::plan_all`'s note.
+    // First wins, which is what `find` did.
+    static BY_STEM: std::sync::OnceLock<
+        std::collections::HashMap<&'static str, &'static Routine<Wgpu>>,
+    > = std::sync::OnceLock::new();
+    BY_STEM
+        .get_or_init(|| {
+            let mut map = std::collections::HashMap::new();
+            for r in kernels_wgpu::rows() {
+                map.entry(r.name).or_insert(r);
+            }
+            map
+        })
+        .get(stem)
+        .copied()
 }
 
 /// How many of a statement's widthed operands are RESULTS.
@@ -1207,9 +1254,13 @@ mod tests {
             // The arm may refuse for its own reasons; what matters is that
             // when it SUCCEEDS it recorded a slab ask, so `plan` will refuse.
             let mut views = super::super::views::Views::default();
-            if let Ok(bound) =
-                crate::lowering::bind::bind(routine.args, routine.sources, &mut o, facts, &mut views)
-            {
+            if let Ok(bound) = crate::lowering::bind::bind(
+                routine.args,
+                routine.sources,
+                &mut o,
+                facts,
+                &mut views,
+            ) {
                 let asked = o.asked();
                 let slab = asked
                     .iter()
@@ -1730,3 +1781,4 @@ mod tests {
         }
     }
 }
+

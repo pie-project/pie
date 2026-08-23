@@ -118,75 +118,6 @@ const fn scheme_byte(n: i32) -> u8 {
     }
 }
 
-pub mod params {
-    use core::ffi::c_void;
-
-    use kernels::Ty;
-
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    #[repr(C)]
-    pub struct StructuredMaskParams {
-        pub kind: u32,
-        pub window: u32,
-        pub sink: u32,
-    }
-
-    const STRUCTURED_MASK_PARAMS: &str = "::pie::attn::StructuredMaskParams";
-
-    impl crate::jit::Abi for *const StructuredMaskParams {
-        const CPP: &'static str = "const ::pie::attn::StructuredMaskParams*";
-        const TY: Ty = Ty::StructuredMasks;
-        fn arg(&self) -> crate::jit::ArgValue {
-            crate::jit::ArgValue::Ptr(*self as *mut c_void)
-        }
-        fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-            match value {
-                crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<StructuredMaskParams>().cast_const()),
-                _ => Err(kernels::Refusal::Kind {
-                    at,
-                    want: Ty::StructuredMasks,
-                }),
-            }
-        }
-    }
-
-    crate::arg_via_abi!(*const StructuredMaskParams);
-
-    const _: () = assert!(
-        ::core::mem::size_of::<StructuredMaskParams>() == 12,
-        "StructuredMaskParams: sizeof disagrees with the measured \
-         pie::attn::StructuredMaskParams; re-run nvrtc-probes/attn_structured_mask.py",
-    );
-    const _: () = assert!(
-        ::core::mem::align_of::<StructuredMaskParams>() == 4,
-        "StructuredMaskParams: alignof disagrees with the measured \
-         pie::attn::StructuredMaskParams; re-run nvrtc-probes/attn_structured_mask.py",
-    );
-    const _: () = assert!(
-        ::core::mem::offset_of!(StructuredMaskParams, kind) == 0,
-        "StructuredMaskParams.kind: offset disagrees with the measured \
-         pie::attn::StructuredMaskParams::kind",
-    );
-    const _: () = assert!(
-        ::core::mem::offset_of!(StructuredMaskParams, window) == 4,
-        "StructuredMaskParams.window: offset disagrees with the measured \
-         pie::attn::StructuredMaskParams::window",
-    );
-    const _: () = assert!(
-        ::core::mem::offset_of!(StructuredMaskParams, sink) == 8,
-        "StructuredMaskParams.sink: offset disagrees with the measured \
-         pie::attn::StructuredMaskParams::sink",
-    );
-
-    pub static LAYOUTS: &[crate::jit::Layout] = &[crate::jit::Layout {
-        cpp: STRUCTURED_MASK_PARAMS,
-        size: 12,
-        align: 4,
-        fields: &[("kind", 0), ("window", 4), ("sink", 8)],
-        probe: "nvrtc-probes/attn_structured_mask.py",
-    }];
-}
-
 pub mod attention_flashinfer {
     use crate::jit::{Ctx, Launch};
     use crate::routine::Fire;
@@ -744,7 +675,7 @@ pub fn write_mla_to_pages(
 
 const DSV4_META_BLOCK: u32 = 128;
 
-#[routine(out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
+#[routine(canon = "pool_boundary.decode", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
 pub fn dsv4_boundary_meta_decode(
     ctx: &Ctx<'_>,
     positions: In<Tensor<i32>>,
@@ -781,7 +712,7 @@ pub fn dsv4_boundary_meta_decode(
     )
 }
 
-#[routine(whole, out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
+#[routine(whole, canon = "pool_boundary.prefill", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
 pub fn dsv4_boundary_meta_paged(
     ctx: &Ctx<'_>,
     positions: In<Tensor<i32>>,
@@ -824,7 +755,7 @@ pub fn dsv4_boundary_meta_paged(
     )
 }
 
-#[routine(whole)]
+#[routine(whole, canon = "attention.pooled_lse")]
 pub fn attention_compressed_paged_bf16(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -895,7 +826,7 @@ pub fn attention_compressed_paged_bf16(
     )
 }
 
-#[routine(bf16, out(idx_k = like(idx_k)))]
+#[routine(bf16, canon = index_layernorm_rope, out(idx_k = like(idx_k)))]
 pub fn dsa_index_knorm_rope<T>(
     ctx: &Ctx<'_>,
     idx_k: InOut<Tensor<T>>,
@@ -942,7 +873,7 @@ where
     )
 }
 
-#[routine(bf16, out(idx_q = split(idx_q, head_dim)))]
+#[routine(bf16, canon = index_rope, out(idx_q = split(idx_q, head_dim)))]
 pub fn dsa_index_q_rope<T>(
     ctx: &Ctx<'_>,
     idx_q: InOut<Tensor<T>>,
@@ -2046,7 +1977,7 @@ pub mod dsv4_compress {
         Launch::per_row(rows, width.div_ceil(32).max(1).saturating_mul(32).min(1024))
     }
 
-    #[routine]
+    #[routine(canon = pool_gather)]
     pub fn dsv4_compress_gather_paged_bf16(
         ctx: &Ctx<'_>,
         boundary_pos: In<Tensor<i32>>,
@@ -2099,7 +2030,7 @@ pub mod dsv4_compress {
         )
     }
 
-    #[routine(whole)]
+    #[routine(whole, canon = "kv_append.pool")]
     pub fn dsv4_store_comp_entries_bf16(
         ctx: &Ctx<'_>,
         entries: In<Tensor<bf16>>,
@@ -2865,7 +2796,7 @@ const fn per_head(rows: u32, heads: u32) -> Launch {
     Launch::grid([heads, rows, 1], [PAD_BLOCK, 1, 1])
 }
 
-#[routine(out(lse = like(lse)))]
+#[routine(canon = lse_ln, out(lse = like(lse)))]
 pub fn lse_log2_to_ln(ctx: &Ctx<'_>, lse: InOut<Tensor<f32>>) -> Result<(), Refusal> {
     let elems = lse.all("out_width(0)")?.elements();
     let Ok(elems) = u32::try_from(elems) else {
@@ -3062,7 +2993,7 @@ pub fn attention_naive_paged(
     )
 }
 
-#[routine(bf16, out(out = like(prefix)))]
+#[routine(bf16, canon = res_blend, out(out = like(prefix)))]
 pub fn attn_res_blend<T>(
     ctx: &Ctx<'_>,
     prefix: In<Tensor<T>>,
@@ -3218,7 +3149,7 @@ fn softcap_launch(cap: f32, n: usize) -> Result<Launch, Refusal> {
     Ok(elementwise(elems))
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = logit_softcap)]
 pub fn logit_softcap<T>(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<T>>,
@@ -3254,7 +3185,7 @@ pub fn logit_softcap_f16(
     )
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = split_q_b)]
 pub fn kimi_split_q_b<T>(
     ctx: &Ctx<'_>,
     q_b: In<Tensor<T>>,
@@ -3293,7 +3224,7 @@ pub fn kimi_split_q_b<T>(
     )
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = mla_latents)]
 pub fn kimi_split_kv_a_norm<T>(
     ctx: &Ctx<'_>,
     kv_a: In<Tensor<T>>,
@@ -3341,7 +3272,7 @@ pub fn kimi_split_kv_a_norm<T>(
     )
 }
 
-#[routine(bf16, out(o_out = like(o1)), out(lse_out = like(lse1)))]
+#[routine(bf16, canon = "attention.merge_lse", out(o_out = like(o1)), out(lse_out = like(lse1)))]
 pub fn combine_attn_outputs<T>(
     ctx: &Ctx<'_>,
     o1: In<Tensor<T>>,

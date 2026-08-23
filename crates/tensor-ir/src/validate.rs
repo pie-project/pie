@@ -194,7 +194,9 @@ pub enum ValidateError {
         /// The stage the offending op sits in.
         stage: Stage,
     },
-    /// Model-gated intrinsic the profile lacks.
+    /// Model-gated intrinsic the profile lacks. "Model-gated" names where the
+    /// gate is READ, not where it is decided: the profile's bit is a copy of
+    /// the serving driver's `PtirCaps`, so the checkpoint has no say in it.
     IntrinsicUnavailable {
         /// The offending intrinsic.
         intr: IntrinsicId,
@@ -290,11 +292,14 @@ impl fmt::Display for ValidateError {
                     f,
                     "`{name}` (name #{name_index}): the backend's model profile does \
                      not advertise this kernel/sink, so binding it would either \
-                     fail mid-fire or — far worse — run as a silent no-op. Either \
-                     the driver does not implement it for this model family, or it \
-                     is implemented but switched off (on the CUDA driver \
-                     `envelope_dot`, `attn_page_mask` and `attn_score` all require \
-                     PIE_CUDA_KV_ENVELOPES=1)"
+                     fail mid-fire or — far worse — run as a silent no-op. This is \
+                     the DRIVER's answer, not the checkpoint's: `ModelProfile` is \
+                     built by copying the driver's `PtirCaps` field for field, so \
+                     the bit to look at is the one that driver's `load_model` \
+                     reports (`has_kv_envelopes` for `envelope_dot`, \
+                     `has_attn_page_mask`, `has_attn_score`). No environment \
+                     variable moves it — every shader and CUDA driver in this \
+                     tree states all three as literal `false`"
                 )
             }
             NotReplayable { name_index, name } => write!(
@@ -313,7 +318,9 @@ impl fmt::Display for ValidateError {
             IntrinsicUnavailable { intr } => {
                 write!(
                     f,
-                    "model-gated intrinsic {} unavailable on this model",
+                    "intrinsic {} is not advertised by the driver serving this \
+                     model (`ModelProfile` copies the driver's `PtirCaps`, so \
+                     this says nothing about the checkpoint)",
                     intr.name()
                 )
             }

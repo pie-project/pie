@@ -210,7 +210,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 # trap found three times is not going to be remembered the fourth.
 #
 # Not `chat`: the chat templates are not in the load path.
-model = { path = "../model", default-features = false, features = ["contract"] }
+model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
 
 # NO `libc`. It was here for `flock` and `open` on the profile cache —
 # the read -> merge -> rename has to be atomic against another process
@@ -349,7 +349,7 @@ kernels = { path = "../kernels" }
 # not in the workspace.
 # The executor's binder test lowers a REAL deployment's traced form, which
 # needs no feature of its own: the family texts are ungated.
-model = { path = "../model", default-features = false, features = ["contract"] }
+model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
 # The PRODUCER, for `tests/gpu_ptir_emitted.rs` only: that test authors a
 # trace, runs the host's real bind → compile → lower → emit chain over it, and
 # compiles the result — so it proves the emitter's CUDA and this driver's NVRTC
@@ -413,6 +413,23 @@ driver-api = { path = "../driver-api" }
 # being one document and no readers: a model's numbers are `const` rows
 # in `model::catalog`, checked against the corpus by
 # `model/tests/catalog_differential.rs`.
+# THE HEIR OF `every_plane_is_answered` NEEDS THE SAME GATE ITS SIBLINGS HAVE.
+#
+# It reads `driver_cuda::bind::views::ANSWERED`, and `bind` is `#[cfg]`'d on
+# `_cuda` — so with no feature the target does not merely skip, it FAILS TO
+# COMPILE, and the job it broke is the one whose entire premise is that this
+# crate has a half that is correct without a GPU: "cargo test (driver-cuda,
+# portable half, no feature at all)". Every other `_cuda` test target in this
+# file carries the stanza; this one arrived without it, which is the cheapest
+# way for a new gate to turn a green job red.
+#
+# It still RUNS, in both ABI jobs, because `cuda-12` and `cuda-13` each imply
+# `_cuda`. What the stanza buys is that the featureless job stops trying to
+# build a module that is not there.
+[[test]]
+name = "every_runtime_name_is_answered"
+required-features = ["_cuda"]
+
 [[test]]
 name = "attn_score_parity"
 required-features = ["_cuda"]

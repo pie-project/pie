@@ -65,6 +65,25 @@ use model_ir::trace::{FireClass, ValueId};
 mod common;
 use common::{device_or_skip, gpu_guard};
 
+/// The scalars the family texts used to read off their fact structs.
+///
+/// Upstream lifted `norm_eps`, the rope bases and gpt-oss's sliding window
+/// OUT of the facts and onto the forward functions, because two SKUs of one
+/// family can differ in those and in nothing else. These tests never read a
+/// number back -- they lower, bind and count -- so any well-formed value
+/// states the same text, and these are the shipped checkpoints' own.
+#[allow(dead_code)]
+const EPS: f32 = 1e-6;
+/// The common rope base. gpt-oss's is its own.
+#[allow(dead_code)]
+const THETA: f32 = 1_000_000.0;
+/// gpt-oss: YaRN over a 150k base, alternating 128-token windows.
+#[allow(dead_code)]
+const WINDOWED_THETA: f32 = 150_000.0;
+/// The sliding leg's span. `-1` is "no window" and is NOT what gpt-oss says.
+#[allow(dead_code)]
+const WINDOW: i32 = 128;
+
 /// The checkpoint reader `real_hybrid` carries, unchanged: every tensor
 /// in this file is BF16, and the reader admits BF16|F32.
 struct Checkpoint {
@@ -293,7 +312,7 @@ fn gemma4_matches_transformers_on_real_weights() {
     // and the landing needs: with the identity every logit saturates the
     // softcap. Read the same way `serve/load.rs` reads it at load.
     cuda.layer_scalars = layer_scalars(&ckpt, facts.layers);
-    let plan = gemma4_cuda(&facts, &cuda, FireClass::Prefill);
+    let plan = gemma4_cuda::<model::gemma_4::forward::ShippedW1, model::gemma_4::forward::ShippedA, model::gemma_4::forward::ShippedKv>(&facts, &cuda, FireClass::Prefill, EPS);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
     let rows: Vec<Row> = vec![
@@ -699,8 +718,13 @@ fn gemma4_matches_transformers_on_real_weights() {
                 };
                 let norm: f32 = (0..width).map(|c| v(c).powi(2)).sum::<f32>().sqrt();
                 eprintln!(
-                    "  #{i:3} {kernel} w={width} phd={:?} wt={:?} last-row norm={norm:.3} head=[{:.3},{:.3},{:.3},{:.3}]",
-                    dplan.spec(i).per_head_dim,
+                    // `per_head_dim` STOOD HERE. The spec no longer carries a
+                    // head dim of its own: a swept routine takes it as a
+                    // `Const` mark off the statement, so it is one of the
+                    // wire scalars, and printing the whole run says more than
+                    // the one field did.
+                    "  #{i:3} {kernel} w={width} params={:?} wt={:?} last-row norm={norm:.3} head=[{:.3},{:.3},{:.3},{:.3}]",
+                    dplan.spec(i).params,
                     dplan.spec(i).weight,
                     v(0),
                     v(1),

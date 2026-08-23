@@ -11,7 +11,7 @@ llama.cpp `src/llama-sampler.cpp` and oobabooga/text-generation-webui
 `modules/sampler_hijack.py`.
 
 **Faithfulness: Exact (equivalent form).** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

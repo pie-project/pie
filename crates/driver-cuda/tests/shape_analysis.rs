@@ -37,6 +37,25 @@ use std::collections::BTreeMap;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
 use model_ir::trace::FireClass;
 
+/// The scalars the family texts used to read off their fact structs.
+///
+/// Upstream lifted `norm_eps`, the rope bases and gpt-oss's sliding window
+/// OUT of the facts and onto the forward functions, because two SKUs of one
+/// family can differ in those and in nothing else. These tests never read a
+/// number back -- they lower, bind and count -- so any well-formed value
+/// states the same text, and these are the shipped checkpoints' own.
+#[allow(dead_code)]
+const EPS: f32 = 1e-6;
+/// The common rope base. gpt-oss's is its own.
+#[allow(dead_code)]
+const THETA: f32 = 1_000_000.0;
+/// gpt-oss: YaRN over a 150k base, alternating 128-token windows.
+#[allow(dead_code)]
+const WINDOWED_THETA: f32 = 150_000.0;
+/// The sliding leg's span. `-1` is "no window" and is NOT what gpt-oss says.
+#[allow(dead_code)]
+const WINDOW: i32 = 128;
+
 fn rows(n: usize) -> Vec<Row> {
     vec![
         Row {
@@ -85,47 +104,41 @@ fn families() -> Vec<(&'static str, Lowered)> {
     vec![
         (
             "llama_like",
-            lower_plan(&model::shared::llama_like::forward::llama_like_cuda(
+            lower_plan(&model::shared::llama_like::forward::llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-                FireClass::Decode,
-            )),
+                FireClass::Decode, EPS, THETA)),
         ),
         (
             "gemma_2",
-            lower_plan(&model::gemma_2::forward::gemma2_cuda(
+            lower_plan(&model::gemma_2::forward::gemma2_cuda::<model::gemma_2::forward::ShippedW1, model::gemma_2::forward::ShippedA, model::gemma_2::forward::ShippedKv>(
                 &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
-                FireClass::Decode,
-            )),
+                FireClass::Decode, EPS, THETA)),
         ),
         (
             "glm5",
-            lower_plan(&model::glm_5::forward::glm5_cuda(
+            lower_plan(&model::glm_5::forward::glm5_cuda::<model::glm_5::forward::ShippedW1, model::glm_5::forward::ShippedW2, model::glm_5::forward::ShippedA, model::glm_5::forward::ShippedKv>(
                 &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
-                FireClass::Decode,
-            )),
+                FireClass::Decode, EPS, THETA)),
         ),
         (
             "kimi_k2",
-            lower_plan(&model::kimi_k2::forward::kimi_cuda(
+            lower_plan(&model::kimi_k2::forward::kimi_cuda::<model::kimi_k2::forward::ShippedW1, model::kimi_k2::forward::ShippedW2, model::kimi_k2::forward::ShippedA, model::kimi_k2::forward::ShippedKv>(
                 &model::kimi_k2::forward::facts::KimiFacts::kimi_k2(),
                 &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
-                FireClass::Decode,
-            )),
+                FireClass::Decode, EPS)),
         ),
         (
             "kimi_k3",
-            lower_plan(&model::kimi_k3::forward::kimi_k3_cuda(
+            lower_plan(&model::kimi_k3::forward::kimi_k3_cuda::<model::kimi_k3::forward::ShippedW1, model::kimi_k3::forward::ShippedW2, model::kimi_k3::forward::ShippedA, model::kimi_k3::forward::ShippedKv>(
                 &model::kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(),
-                FireClass::Decode,
-            )),
+                FireClass::Decode, EPS)),
         ),
         (
             "deepseek_v4",
-            lower_plan(&model::deepseek_v4::forward::dsv4_cuda(
+            lower_plan(&model::deepseek_v4::forward::dsv4_cuda::<model::deepseek_v4::forward::ShippedW1, model::deepseek_v4::forward::ShippedW2, model::deepseek_v4::forward::ShippedA, model::deepseek_v4::forward::ShippedKv>(
                 &model::deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(),
-                FireClass::Decode,
-            )),
+                FireClass::Decode, EPS, THETA)),
         ),
     ]
 }
@@ -206,7 +219,7 @@ fn facts_select_programs_not_only_numbers() {
     let mut lowered = Vec::new();
     for (name, facts) in deployments {
         let plan =
-            model::shared::llama_like::forward::llama_like_cuda(&facts, &cuda, FireClass::Decode);
+            model::shared::llama_like::forward::llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(&facts, &cuda, FireClass::Decode, EPS, THETA);
         let l = lower_plan(&plan);
         lowered.push((name, plan, l));
     }

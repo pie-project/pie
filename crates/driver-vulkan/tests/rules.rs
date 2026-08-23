@@ -165,44 +165,86 @@ fn a_module_wider_than_the_guaranteed_floor_is_a_deliberate_bet() {
 /// is the sort of defect this table exists for and is worth keeping the name
 /// of even though the rows are gone.
 ///
-/// # What is left, and why these seven kept a buffer
+/// # Then the six `rms_rope` rows left the same way
 ///
-/// `argmax_logits` at 40 bytes, and the six `rms_rope` modules at 36. Both are
-/// over the 128-byte floor no device may go under, so neither is a size
-/// question -- they are the launches whose scalars `binding::params` places in
-/// a buffer because it places a launch's scalars in a push range OR a
-/// parameter buffer and never both, and these need the buffer for what else
-/// they carry.
+/// They are the 39th through 44th, and they left after the paragraph above
+/// was written -- which is why that paragraph is kept: it said at length why
+/// the fused norm+rope KEPT a buffer, and the reason it gave has since stopped
+/// being true. `rms_rope.slang` declares `struct Push` and a
+/// `[[vk::push_constant]] ConstantBuffer<Push>` where `RmsRopeParams` on
+/// binding 2 used to be, and `position` moved up into the binding the block
+/// vacated.
 ///
-/// The fused norm+rope is the clearest: 36 bytes at binding 2, where every
-/// other norm used to have 20 at binding 3. Both differences are the fusion.
-/// The binding moves because `x` is bound once as read-write where the norm
-/// alone binds an input and an output, so everything after `w` shifts down
-/// one; the size is `RmsParams` with the rotation's four scalars appended.
-/// Six rows because the family mirrors `neox`'s and this table counts modules
-/// rather than routines -- five of the six have no routine yet and would
-/// otherwise be exactly the unchecked ABI the count exists to catch.
-const PARAM_BLOCKS: &[(&str, u32, u32)] = &[
-    ("argmax_logits_bfloat16", 2, 40),
-    ("rms_rope_bfloat16", 2, 36),
-    ("rms_rope_decode_bfloat16", 2, 36),
-    ("rms_rope_freqs_bfloat16", 2, 36),
-    ("rms_rope_freqs_decode_bfloat16", 2, 36),
-    ("rms_rope_prop_bfloat16", 2, 36),
-    ("rms_rope_prop_decode_bfloat16", 2, 36),
-];
+/// The move is recorded rather than inferred, by
+/// [`the_fused_norm_rope_moved_its_block_into_a_push_range`] below: all six
+/// declare exactly nine four-byte push fields at offsets 0 through 32 -- the
+/// nine `RmsRopeParams` scalars, in order, whole -- and no parameter block at
+/// any binding. Nine fields arriving as six blocks leave is a MOVE; a block
+/// that vanished from a walk that stopped walking would leave nothing behind
+/// it.
+///
+/// # What is left, and why it kept a buffer
+///
+/// `argmax_logits` at 40 bytes, alone. It is over the 128-byte floor no device
+/// may go under, so this is not a size question -- it is the one launch whose
+/// scalars `binding::params` places in a buffer, because it places a launch's
+/// scalars in a push range OR a parameter buffer and never both, and this one
+/// needs the buffer for what else it carries.
+///
+/// A table of one row is a table that has nearly finished being needed, and
+/// the count assertion is what makes it still worth having: it is now the
+/// claim that no module has GROWN a block, which is the direction the port is
+/// not going and therefore the direction a mistake would show up in.
+const PARAM_BLOCKS: &[(&str, u32, u32)] = &[("argmax_logits_bfloat16", 2, 40)];
+
+/// The six `rms_rope` blocks did not vanish, they became push ranges.
+///
+/// Stated as its own test because `PARAM_BLOCKS` losing six rows and the push
+/// census gaining six modules are, separately, both consistent with a walk
+/// that broke: the block sweep would find nothing and the push sweep's floor
+/// is `> 600` out of 681, which six modules do not move. Only holding the two
+/// against ONE module family tells a move from a loss.
+///
+/// Nine fields at four-byte spacing is `struct Push` in `rms_rope.slang`,
+/// field for field, and the offsets are stated rather than just the count
+/// because a struct that reordered would keep the count.
+#[test]
+fn the_fused_norm_rope_moved_its_block_into_a_push_range() {
+    modules!();
+    let mut seen = 0usize;
+    for &(name, code) in kernels_vulkan::MODULES {
+        if !name.starts_with("rms_rope") {
+            continue;
+        }
+        seen += 1;
+        let d = declared(code);
+        assert_eq!(
+            d.push_offsets,
+            vec![0, 4, 8, 12, 16, 20, 24, 28, 32],
+            "`{name}` does not carry the nine `RmsRopeParams` scalars as a \
+             push range"
+        );
+        assert!(
+            d.block_bytes.iter().all(Option::is_none),
+            "`{name}` declares a parameter block as well as its push range, \
+             and `binding::params` places a launch's scalars in one or the \
+             other and never both"
+        );
+    }
+    assert_eq!(seen, 6, "the `rms_rope` family is six modules wide");
+}
 
 /// The block sizes this crate derives are the ones an independent walk read.
 ///
 /// Two claims at once, and the second is the one that would rot. That the
-/// seven sizes agree is the arithmetic being right. That there are exactly
-/// seven -- no module has grown a parameter block this table does not know
-/// about, and none has lost one -- is what keeps a new kernel from arriving
-/// with an unchecked ABI and this file still passing.
+/// size agrees is the arithmetic being right. That there is exactly one row
+/// -- no module has grown a parameter block this table does not know about,
+/// and the one that has it has not lost it -- is what keeps a new kernel from
+/// arriving with an unchecked ABI and this file still passing.
 ///
 /// The second claim is doing MORE work than it was, not less, now that the
-/// scalars have gone to push ranges. Seven is a small enough number that the
-/// buffer is the exception, and an eighth appearing is a launch that could not
+/// scalars have gone to push ranges. One is a small enough number that the
+/// buffer is the exception, and a second appearing is a launch that could not
 /// fit a push range and nobody said so.
 #[test]
 fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {

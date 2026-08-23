@@ -125,9 +125,9 @@
 //! [`the_catalog_places_the_checkpoints_it_can`].
 //!
 //! **An unquantised checkpoint refuses the default binding.**
-//! `boot::compile_load_plan_for` with `Binding::MLX_IN_PLACE` answers `Metal
-//! llama needs quantized weights: this checkpoint carries no `.scales`
-//! tensors`, and that message names the other way in: encode the floats at
+//! `boot::compile_load_plan_for` with `Binding::MLX_IN_PLACE` answers `the MLX
+//! llama contract needs quantized weights: this checkpoint carries no
+//! `.scales` tensors`, and that message names the other way in: encode the floats at
 //! load. So [`compiled_plan_for`] takes the documented path first and falls
 //! back to the `RuntimeQuant::Int4` policy for a bf16 release, printing which
 //! it used and holding it against what the fixture says to expect. That is not

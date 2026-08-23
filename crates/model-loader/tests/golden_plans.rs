@@ -408,7 +408,8 @@ fn contract_fixture(name: &str) -> ModelContract {
             "{name}: cannot read {}: {err}\n\
              A new golden needs a contract next to it. Author one the way \
              production does — a `model::contract` author can be dumped \
-             as JSON from `model/tests/family_contracts.rs` — or write the \
+             as JSON by any caller of it; model/tests/family_contracts.rs \
+             used to be one and is gone — or write the \
              expression out by hand.",
             path.display()
         )

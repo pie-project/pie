@@ -113,7 +113,7 @@ fn tile_point(tile_m: i32, tile_n: i32) -> Result<usize, Refusal> {
         + axis(tile_n, "the routed qmm's column tile")?)
 }
 
-#[routine(canon = topk, out(expert_weights = rows(logits) x const(experts_per_token)))]
+#[routine(canon = "topk.softmax", out(expert_weights = rows(logits) x const(experts_per_token)))]
 pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,

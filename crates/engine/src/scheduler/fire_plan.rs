@@ -849,8 +849,15 @@ mod tests {
     /// traced form merge into a fire plan alongside the member-fact sites.
     #[test]
     fn derived_moe_sites_merge_into_a_fire_plan() {
-        let traced = model::qwen_3_5::forward::qwen3_5_moe_mlp_block(
+        // The epsilon is an argument of the text now, not a fact of the
+        // struct. A site derivation walks ops and weights and never reads it.
+        // The CUDA reading: `derive_sites` finds the grouped GEMM by its
+        // symbol, and a semantic text states the role instead. See
+        // `site_table::tests::moe_fragment_derives_the_expert_site`.
+        let traced = model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda(
             &model::qwen_3_5::forward::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            &model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            1e-6,
         );
         let model_sites = site_table::derive_sites(&traced);
         let members = vec![

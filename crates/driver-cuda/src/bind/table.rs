@@ -176,20 +176,31 @@ fn own_rows(at: Option<&BoundArg>) -> i32 {
 #[cfg(test)]
 pub type TableArm = fn(&mut Handles<'_>, Facts) -> Result<Vec<ArgValue>, Refusal>;
 
-/// `sample::lm_head_gemv_argmax_int8`. Head and scale are NAMED weights.
+/// `sample::lm_head_gemv_argmax_int8`. Head and scale are POSITIONAL weights.
+///
+/// They were NAMED, read through `Facts::weight_named`, because a semantic op
+/// carried its weights as strings on `LaunchSpec` and only a launch put them
+/// in the operand list. There is one shape of statement now, `Source::Named`
+/// is retired, and a `Const<Tensor<..>>` mark claims the weight run by
+/// position -- so the two reads become `o.weight(0)` and `o.weight(1)`.
+///
+/// `vocab` came back for the same reason it left `embed_bf16`'s list and
+/// returned: a vocabulary is a load-time constant, so it is a `Const<i32>`
+/// mark on the params run rather than a fact the driver lends.
 #[cfg(test)]
 pub fn lm_head_gemv_argmax_int8(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let hidden_states = o.input(0)?;
-    let lm_head_weight = ArgValue::Ptr(f.weight_named(0)?);
-    let scale_inv = ArgValue::Ptr(f.weight_named(1)?);
+    let lm_head_weight = o.weight(0)?;
+    let scale_inv = o.weight(1)?;
     let token_ids = o.output(0)?;
     let hidden = o.in_width(0)?;
+    let vocab = f.cx.param(0)?;
     Ok(vec![
         as_region(hidden_states, f.rows.count, hidden),
         lm_head_weight,
         scale_inv,
-        // `vocab` is ASKED for now, so it is not the statement's to bind.
         as_region(token_ids, f.rows.count, o.out_width(0).unwrap_or(0)),
+        ArgValue::I32(i32::try_from(vocab).unwrap_or(i32::MAX)),
     ])
 }
 
@@ -233,29 +244,48 @@ pub fn split_qwen_gdn_ba_bf16(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgVa
 
 /// `layout::embed_bf16`, as the STATEMENT sources it.
 ///
-/// The token ids and the vocabulary left this list when they stopped being
-/// the statement's: a column carries what the statement placed. The token-id
-/// stream is a runtime operand the resolver answers now, and the vocabulary
-/// rides the params run.
+/// The token ids and the vocabulary came BACK to this list, having left it
+/// once. They left when they were facts the driver's `DispatchCtx` lent and a
+/// column carried only what the statement placed; the no-ask migration made
+/// both of them marks -- `token_ids: In<Tensor<i32>>` is the statement's first
+/// input, `vocab: Const<i32>` its first param -- so all four are the
+/// statement's again and the arm binds four.
+///
+/// This arm reading two while the column read four is exactly the drift the
+/// diff below exists to catch, and it did not catch it, because the test that
+/// runs the diff had not compiled since the migration.
 #[cfg(test)]
 pub fn embed_bf16(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let weight = ArgValue::Ptr(f.weight_named(0)?);
     let y = o.output(0)?;
     let hidden = o.out_width(0)?;
-    Ok(vec![weight, as_region(y, f.rows.count, hidden)])
+    let token_ids = o.input(0)?;
+    let vocab = f.cx.param(0)?;
+    Ok(vec![
+        weight,
+        as_region(y, f.rows.count, hidden),
+        token_ids,
+        ArgValue::I32(i32::try_from(vocab).unwrap_or(i32::MAX)),
+    ])
 }
 
-/// `layout::gather_bf16_rows`. `row_indices` derives as `In(1)`, `*const i32`.
+/// `layout::gather_bf16_rows`. `sampling_indices` derives as `In(1)`.
+///
+/// It used to be ASKED for -- `keys::SamplingIndices`, a fact the driver lent
+/// -- and so was not the statement's to bind, which is why this list was two
+/// long. The no-ask migration made it the statement's SECOND INPUT, and
+/// `TraceBuilder::lm_head` mints the runtime tensor that fills it. So the list
+/// is three, and a fixture for this arm places two inputs.
 #[cfg(test)]
 pub fn gather_bf16_rows(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let src = o.input(0)?;
     let dst = o.output(0)?;
     let width = o.out_width(0)?;
-    // `row_indices` is ASKED for (`keys::SamplingIndices`), so it is not the
-    // statement's to bind.
+    let sampling_indices = o.input(1)?;
     Ok(vec![
         as_region(src, f.rows.count, o.in_width(0).unwrap_or(0)),
         as_region(dst, f.rows.count, width),
+        sampling_indices,
     ])
 }
 
@@ -265,10 +295,14 @@ pub fn transpose_bf16_nld_to_lnd(o: &mut Handles<'_>, f: Facts) -> Result<Vec<Ar
     let src = o.input(0)?;
     let dst = o.output(0)?;
     let width = o.in_width(0)?;
-    // `ple_dim` is ASKED for now, so it is not the statement's to bind.
+    // `dim` WAS `ple_dim`, ASKED for, and so not the statement's to bind. It
+    // is a `Const<i32>` mark now -- a per-deployment constant belongs in the
+    // statement -- so it rides the params run and the list is three.
+    let dim = f.cx.param(0)?;
     Ok(vec![
         as_region(src, f.rows.count, width),
         as_region(dst, f.rows.count, o.out_width(0).unwrap_or(0)),
+        ArgValue::I32(i32::try_from(dim).unwrap_or(i32::MAX)),
     ])
 }
 
@@ -358,6 +392,25 @@ fn as_declared(t: Option<kernels::Ty>, v: ArgValue) -> ArgValue {
         // answer is here rather than in the slot arm: `Ty::Raised` is
         // `kernels-cuda`'s own declaration for the parameter.
         (Ty::Raised, ArgValue::Region { ptr, .. }) => ArgValue::Ptr(ptr),
+        // A FLAG IS ONE BYTE ON THE WIRE AND ONE WORD IN THE RUN. The param
+        // channel is untyped bits and the generated wrapper writes a `bool` in
+        // as `u32::from(write_state)`, so the signature is again the only
+        // thing that knows what came back -- exactly as for `Ty::I32` above,
+        // and for the same reason: `Const<bool>` declares that the bits are a
+        // flag. `jit::abi`'s `scalar_abi!(bool, ..)` unpacks `ArgValue::Bool`
+        // ALONE, so without this every routine in the tree that states one
+        // refused, by argument NUMBER rather than name.
+        //
+        // That is sixteen routines and not a corner: every ssm recurrence and
+        // conv (`write_state`), every rope (`interleaved`), and the moe top-k
+        // pair (`renormalize`/`normalize`). `real_hybrid` is what said so --
+        // `ssm::causal_conv1d_prefill_batched: argument 7 is Bool and arrived
+        // otherwise` -- and it could only say it once the state slabs reached
+        // the raise channel, which is the fix directly before this one. The
+        // rope and moe arms are hand-written in this file and pass their own
+        // `ArgValue::Bool`, which is why the shipped gates never saw it.
+        (Ty::Bool, ArgValue::U32(n)) => ArgValue::Bool(n != 0),
+        (Ty::Bool, ArgValue::I32(n)) => ArgValue::Bool(n != 0),
         _ => v,
     }
 }
@@ -929,9 +982,9 @@ mod tests {
         assert!(crossed("rope::rope_bf16"));
         assert!(crossed("layout::embed_bf16"));
         assert!(crossed("sample::lm_head_gemv_argmax_int8"));
-        assert!(crossed("norm::add_bias_bf16"));
-        assert!(crossed("mlp::swiglu_bf16"));
-        assert!(crossed("moe::topk_softmax_bf16"));
+        assert!(crossed("norm::add_bias"));
+        assert!(crossed("mlp::swiglu"));
+        assert!(crossed("moe::topk_softmax"));
         assert!(crossed("quant::bf16_to_fp16"));
         assert!(crossed("ssm::nemotron_mamba_split_bf16"));
         assert!(crossed("attn::split_qkv_bf16"));
@@ -974,7 +1027,7 @@ mod tests {
         // AltUp correction's coefficient bank.
         assert!(crossed("rope::rope_yarn_bf16"));
         assert!(crossed("attn::attention_compressed_paged_bf16"));
-        assert!(crossed("norm::altup_correct_bf16"));
+        assert!(crossed("norm::altup_correct"));
         // And a name no backend has.
         assert!(!crossed("not_a_kernel"));
 
@@ -1047,7 +1100,7 @@ mod tests {
             .filter(|s| crossed(s.symbol))
             .count();
         assert_eq!(
-            n, 167,
+            n, 168,
             "{n} declared symbols are crossed onto the derived column. \
              Crossing one changes how a real fire is planned, so the count \
              moves only on purpose."
@@ -1077,24 +1130,35 @@ mod tests {
     // nothing and reads as though something still checks it.
 
     /// A body asks in its own order, and that order is what gets bound.
-    /// `lm_head_gemv_argmax_int8` asks an INPUT, two addresses the statement
-    /// does not carry, then an OUTPUT — five values, two operands touched.
+    /// `lm_head_gemv_argmax_int8` asks an INPUT, two WEIGHTS, then an OUTPUT,
+    /// and reads a param — five values, four operands touched.
+    ///
+    /// It used to be *"two addresses the statement does not carry"*: the head
+    /// and the scale were NAMED weights off `Fire::w_named`, and the operand
+    /// run held only the two the statement placed. Both are positional now, so
+    /// the fixture places four and `taken()` records all four.
     #[test]
     fn handles_are_minted_in_the_order_the_body_asks() {
-        // One input, one output, no positional weights.
-        let args = [operand(0, 4096), operand(1, 1)];
+        // One input, one output, TWO positional weights.
+        let args = [
+            operand(0, 4096),
+            operand(1, 1),
+            operand(8, 0),
+            operand(9, 0),
+        ];
         let mut o = Handles::over(&args, 1, 1);
         let mut p = Probe::silent();
         p.rows = 7;
         p.ctx.rows_total = 7;
         p.ctx.vocab = 128_256;
+        p.spec.params = vec![128_256];
         p.w_named = at(8);
         p.w_named2 = at(9);
         let fire = p.fire();
         let cx = Cx::new(&fire);
         let f = Facts::at(&cx);
 
-        let bound = lm_head_gemv_argmax_int8(&mut o, f).expect("the four operands");
+        let bound = lm_head_gemv_argmax_int8(&mut o, f).expect("the five values");
         assert_eq!(
             bound,
             vec![
@@ -1105,17 +1169,17 @@ mod tests {
                 },
                 ArgValue::Ptr(at(8)),
                 ArgValue::Ptr(at(9)),
-                // `vocab` is asked for, so it is not in the column.
                 ArgValue::Region {
                     ptr: at(1),
                     rows: 7,
                     width: 1
                 },
+                ArgValue::I32(128_256),
             ]
         );
         assert_eq!(
             o.taken(),
-            &[at(0), at(1)][..],
+            &[at(0), at(8), at(9), at(1)][..],
             "the body touched an operand it did not ask for, or skipped one \
              it did"
         );
@@ -1213,15 +1277,21 @@ mod tests {
         p.ctx.rows_total = 7;
         p.ctx.token_ids = at(5);
         p.ctx.vocab = 128_256;
+        // `vocab` RIDES THE PARAMS RUN NOW, not `DispatchCtx`: it is a
+        // load-time constant, so the statement carries it and the mark reads
+        // slot 0. `p.ctx.vocab` is left stated on purpose, at the same value,
+        // so this stays a fixture for a real fire rather than a proof that the
+        // old place happens to be empty.
+        p.spec.params = vec![128_256];
         p.w_named = at(8);
         p.w_named2 = at(9);
         let fire = p.fire();
         let cx = Cx::new(&fire);
         let f = Facts::at(&cx);
 
-        let hand = embed_bf16(&mut Handles::over(&args, 0, 1), f).expect("the hand arm binds");
+        let hand = embed_bf16(&mut Handles::over(&args, 1, 1), f).expect("the hand arm binds");
         let made = operands(
-            &mut Handles::over(&args, 0, 1),
+            &mut Handles::over(&args, 1, 1),
             f,
             <kernels_cuda::layout::embed_bf16 as ::kernels::Derivation>::DERIVED,
             srcs("layout::embed_bf16"),
@@ -1233,8 +1303,9 @@ mod tests {
             "`embed_bf16`'s derived column and its hand arm bind different lists"
         );
 
-        // `gather_bf16_rows`, whose indices needed `#[source(...)]`.
-        let args = [operand(0, 4096), operand(1, 4096)];
+        // `gather_bf16_rows`, whose indices are the statement's SECOND INPUT
+        // now rather than a fact the driver lends, so the fixture places two.
+        let args = [operand(0, 4096), operand(6, 0), operand(1, 4096)];
         let mut p = Probe::silent();
         p.rows = 3;
         p.ctx.rows_total = 7;
@@ -1243,9 +1314,9 @@ mod tests {
         let cx = Cx::new(&fire);
         let f = Facts::at(&cx);
         let hand =
-            gather_bf16_rows(&mut Handles::over(&args, 1, 1), f).expect("the hand arm binds");
+            gather_bf16_rows(&mut Handles::over(&args, 2, 1), f).expect("the hand arm binds");
         let made = operands(
-            &mut Handles::over(&args, 1, 1),
+            &mut Handles::over(&args, 2, 1),
             f,
             <kernels_cuda::layout::gather_bf16_rows as ::kernels::Derivation>::DERIVED,
             srcs("layout::gather_bf16_rows"),
@@ -1265,7 +1336,12 @@ mod tests {
     #[test]
     fn every_table_arm_agrees_with_its_own_column() {
         let args: Vec<BoundArg> = (0..24).map(|n| operand(n, 4096)).collect();
-        let p = stated_probe();
+        let mut p = stated_probe();
+        // THE PARAMS RUN, which `stating_everything` does not fill because it
+        // states the driver's facts and a param is the STATEMENT's. One entry
+        // is enough here: `transpose_bf16_nld_to_lnd`'s `dim` is the only mark
+        // in this batch that reads it, and it reads slot 0.
+        p.spec.params = vec![256];
         let fire = p.fire();
         let cx = Cx::new(&fire);
         let f = Facts::at(&cx);
@@ -1281,7 +1357,7 @@ mod tests {
                 2,
             ),
             (
-                "layout::split_qwen_gdn_ba_bf16",
+                "layout::split_qwen_gdn_ba",
                 split_qwen_gdn_ba_bf16,
                 <kernels_cuda::layout::split_qwen_gdn_ba as ::kernels::Derivation>::DERIVED,
                 1,

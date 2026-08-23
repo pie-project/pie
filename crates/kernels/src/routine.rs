@@ -390,12 +390,14 @@ pub trait Arg<B: Backend>: Sized {
 /// THE RUNTIME'S SIDE OF AN ASK: one value, resolved from the column's own
 /// vocabulary.
 ///
-/// The answering side of this refactor does NOT change. A driver already
-/// resolves a `(Ty, Source)` pair for every argument it binds — that is
-/// [`crate::bind::one`], and [`crate::bind::Holds::fact`] is the one method it
-/// implements to answer a [`crate::Source::Named`]. What changes is that a
-/// BODY can now ask the same question, instead of the question having to be a
-/// parameter for the column to carry it.
+/// A driver resolves a `(Ty, Source)` pair for every argument it binds — that
+/// is [`crate::bind::one`] — and this trait is the same resolution reached
+/// from a body rather than from the binder's walk over the column.
+///
+/// It once had a second job: `Holds::fact` answered a [`crate::Source::Named`]
+/// for facts a body asked for by key. Both are deleted; every `Source` a
+/// driver now sees is positional, and the surviving callers are the two on
+/// [`Asks`].
 ///
 /// Object-safe on purpose: three of the four planes reach their driver through
 /// a `dyn` trait, so the resolver crosses as a trait object too.
@@ -409,43 +411,39 @@ pub trait Answers<B: Backend> {
     fn resolve(&self, ty: Ty, source: crate::Source) -> Result<B::Value, Refusal>;
 }
 
-/// WHAT ONLY THE ENGINE'S RUNTIME CAN ANSWER, asked by the body that needs it.
+/// WHAT A BODY READS THAT IS NOT ONE OF ITS OWN MARKS — two cases, both narrow.
 ///
-/// # The rule
+/// # The name is an epitaph
 ///
-/// **`ask` is for what only the engine's runtime can answer.** A fact the
-/// checkpoint fixes at load time is a constant, and a constant belongs in the
-/// statement — as a [`Const`] parameter, positional like every other.
-/// `keys::HeadDim` is not asked, because a head dimension is not something
-/// this batch made; `keys::Rows` is, because two batches differ.
+/// This trait had a third method, `ask`, and it was the point of the trait: a
+/// body reached for a fact by key (`ctx.ask::<Tensor<i32>, keys::Positions>()`)
+/// and the driver answered it out of the runtime. The rule for what belonged
+/// there was good and is worth keeping written down — *"two fires of the same
+/// model, on the same deployment, can see different answers here"*: `Rows`
+/// passed, `KvKeys` passed because the allocator moved, `HeadDim` never did.
 ///
-/// The test for anything added later: *"two fires of the same model, on the
-/// same deployment, can see different answers here"*. `Rows` passes.
-/// `KvKeys` passes — the allocator moved. `HeadDim` does not, and no amount of
-/// the driver knowing it makes it pass.
+/// What sank it was the cost its own doc admitted: `ask` was a CALL, not a
+/// declaration, so the derived column stopped enumerating it and no test could
+/// walk that column to ask whether a backend answered every fact its kernels
+/// named. `#[routine]` scraped the keys back out of the body as a syntactic
+/// substitute, which missed anything asked inside a helper. The gate built on
+/// top of that scrape then measured what the channel had cost: 59 keys
+/// declared for the CUDA plane, `driver-cuda` answering NOT ONE, 47 of them
+/// minted in a single commit — a channel whose asking half could land without
+/// its answering half and stay that way unnoticed.
 ///
-/// # Why the carrier is written at the call
+/// So the fact went back to being a parameter, where it is positional,
+/// enumerable, and checkable by arity. `keys.rs`, `ask`, `Source::Named`, the
+/// `Answer` enum and `Holds::fact` are all gone.
 ///
-/// Because a fact's `Value` is one concrete type and a plane's carrier is not.
-/// `keys::Positions` declares `*const i32`; that IS the carrier on CUDA and is
-/// meaningless on a plane that binds a handle. So the call names both, in the
-/// order `Env<T, K>` named them — the carrier first, because it is the half
-/// that is always there:
+/// # What is left, and why it is not the same thing
 ///
-/// ```ignore
-/// let positions = ctx.ask::<Tensor<i32>, keys::Positions>()?;   // a plane's handle
-/// let rows      = ctx.ask::<i32, keys::Rows>()?;                // this batch's count
-/// ```
+/// Neither method below asks a question. [`Self::param`] reads a scalar the
+/// STATEMENT already carries, by position, for the one case where a body's
+/// marks cannot reach it; [`Self::absent`] mints a null for a cell a body
+/// deliberately leaves empty. Both are about the argument list a routine
+/// already has, not about facts living somewhere the signature cannot see.
 ///
-/// # What it costs
-///
-/// `ask` is a CALL, not a declaration, so the derived column no longer
-/// enumerates it and a driver test can no longer walk that column to ask
-/// *"does this backend answer every fact its own kernels name"*. `#[routine]`
-/// collects `ask::<_, keys::X>` out of the body instead — same fidelity as the
-/// parameter run, and it cannot drift from the calls — but it misses a fact
-/// asked inside a helper. That is a real step down from a type-system
-/// guarantee to a syntactic one, and it is accepted deliberately.
 pub trait Asks<B: Backend>: Answers<B> {
     /// The statement's `n`-th scalar, read as an `i32`.
     ///

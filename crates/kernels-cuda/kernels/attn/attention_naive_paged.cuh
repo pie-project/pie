@@ -78,8 +78,9 @@
 // from being wrong. `attention_naive_paged.cu` instead `static_assert`ed every
 // enumerator of both mirrors against the host original, so a renumbering that
 // would silently decode fp8 pages as int8 was a compile error in the one
-// translation unit that saw both spellings. That is the same bridge
-// `pack_dense_mask.cu` builds for its mirrored struct.
+// translation unit that saw both spellings. `pack_dense_mask.cu` built the
+// same bridge for its mirrored struct -- both are gone now, along with the
+// `.cu` files that were the only place two spellings ever met.
 //
 // THE CHECK MOVED AND GOT STRONGER; it did not lapse, and the difference
 // matters because the sentence above understated the problem. There were
@@ -127,8 +128,10 @@
 //
 // **Template-only.** Both `__global__`s are `template <int BLOCK>`, so no host
 // stub takes external linkage until something instantiates one and this header
-// has NO single-includer constraint. Contrast `pack_dense_mask.cuh` and the
-// `write_mla` half of `mla_paged.cuh`, which do.
+// has NO single-includer constraint. Contrast the `write_mla` half of
+// `mla_paged.cuh`, which does. `pack_dense_mask.cuh` stood beside it here
+// until its two non-template packers were deleted as unreachable -- the
+// element bitmap is packed on the host instead.
 //
 // # NVRTC
 //

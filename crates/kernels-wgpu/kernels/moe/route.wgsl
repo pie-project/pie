@@ -8,10 +8,11 @@
 //
 // **THE SCALARS ARE MARKS NOW, NOT THREE STORAGE STRUCTS.** Four of the five
 // arms below used to bind a `RouterParams`, a `MoeRouteParams` or an
-// `ExpertCombineParams` out of `moe/params.inc.wgsl` on a `@group(0)` storage
-// binding -- MLX's Metal layout, carried here through `route.metal` and
-// `route.slang` -- and read their numbers as struct FIELDS. Every one of those
-// fields is a `Const<u32>` mark in its routine's signature now, which is the
+// `ExpertCombineParams` out of a since-deleted `moe/params.inc.wgsl` on a
+// `@group(0)` storage binding -- MLX's Metal layout, carried here through
+// `route.metal` and `route.slang` -- and read their numbers as struct FIELDS.
+// Every one of those fields is a `Const<u32>` mark in its routine's signature
+// now, which is the
 // same word of the same `Lowered::params` run reached by its index instead of
 // by an offset, and `driver-wgpu::lowering::routine::bind` packs the run into
 // the `@group(1)` uniform block each arm declares for itself.

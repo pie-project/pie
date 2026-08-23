@@ -148,8 +148,6 @@ pub struct DecodeGeometry {
     pub n_layers: u32,
     /// The vocabulary width the head projects onto.
     pub vocab: u32,
-    /// The RMS-norm epsilon.
-    pub eps: f32,
     /// The embedding and the head are one tensor.
     pub tied_embeddings: bool,
     /// Attention query heads.
@@ -171,8 +169,17 @@ pub struct DecodeGeometry {
     /// weighting them wrongly. Unset ([`AffineFormat::is_set`] false) when
     /// the body format covers everything.
     pub alt_quant: AffineFormat,
-    /// How many leading dims of each head rotate.
-    pub rotary_dims: u32,
+    // `rotary_dims` WAS HERE, fire-wide, and it was the second copy of a
+    // per-layer number. It was set from `d.attention[0].rotary_dim` -- layer
+    // zero's -- and read by `Facts::rotary_dims`, which answered
+    // `keys::RotaryWidth` for seven `ParamOr<3, ..>` sites through `arm.rs`.
+    // The statements carry the width themselves now, so the last reader went
+    // and this was left declaring layer zero's answer for the whole stack.
+    // gemma-4 is the stack that makes that a wrong answer rather than a
+    // redundant one: its full-attention layers rotate a quarter of a
+    // double-wide head and its sliding layers all of a narrow one, and no
+    // fire-wide number is right for both. `d.attention[l].rotary_dim` is the
+    // live road and always was.
     /// The rope base.
     pub rope_theta: f32,
     /// How often a FULL-attention layer appears in a stack that otherwise
@@ -304,14 +311,12 @@ impl Default for DecodeGeometry {
             hidden: 1024,
             n_layers: 24,
             vocab: 248_320,
-            eps: 1e-6,
             tied_embeddings: true,
             n_q_heads: 8,
             n_kv_heads: 2,
             head_dim: 256,
             quant: AffineFormat::G64_B4,
             alt_quant: AffineFormat { bits: 0, group: 0 },
-            rotary_dims: 64,
             rope_theta: 1e7,
             full_attn_every: 0,
             sliding_window: 0,
@@ -369,6 +374,15 @@ impl DecodeGeometry {
     }
 
     /// Whether the FFN is a routed mixture.
+    ///
+    /// Ask THIS model's geometry, never a default one. Every dense width in
+    /// [`DecodeGeometry::default`] is nonzero whatever the numbers are, so a
+    /// dense question survives being asked of a default; the mixture's do
+    /// not. `n_experts`, `experts_per_token` and `moe_intermediate` are all
+    /// zero there, so a default-constructed geometry answers "not a
+    /// mixture" for every checkpoint alike -- which is how the C++ came to
+    /// skip the routed projections' K/N binding entirely and run them
+    /// against whatever the pool happened to hold at those ordinals.
     #[must_use]
     pub const fn is_moe(&self) -> bool {
         self.n_experts > 0 && self.experts_per_token > 0
@@ -989,7 +1003,6 @@ pub fn geometry_from_deployment(
         n_layers,
         hidden,
         vocab,
-        eps: d.norm_eps,
         n_q_heads,
         n_kv_heads,
         head_dim,
@@ -1005,7 +1018,6 @@ pub fn geometry_from_deployment(
         // How many leading dims of each head rotate. Zero in a
         // `LayerAttention` means "the whole head", and zero here means the
         // same, so the row's convention passes through unchanged.
-        rotary_dims: d.attention[0].rotary_dim,
         rope_theta: full_theta,
         rope_theta_sliding: sliding_theta,
         rope_rescale,

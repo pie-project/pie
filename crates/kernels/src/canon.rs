@@ -38,38 +38,69 @@ pub const ROLES: &[&str] = &[
     // claim does not promise a column, it promises an answer.
     "matmul",
     "matmul_select",
-    "gemv",
+    "lm_head",
     // Norms.
     "rmsnorm",
-    "rmsnorm_per_head",
     "rmsnorm_gated",
     "add_bias",
     "residual_add",
-    // Attention.
+    "mul_scalar",
+    "logit_softcap",
+    // Attention. The point after the `.` names the fire shape
+    // (`attention.decode`, `attention.prefill_lse`) — see `is_role`.
     "attention",
+    "attention_landing",
     "kv_append",
     "split_qkv",
-    // Rope.
     "rope",
-    "rope_partial",
-    // MLP.
+    // MLP activations; the bare spelling takes the packed `[gate | up]` row.
     "swiglu",
-    // Embedding and head.
+    "situ",
+    // Embedding.
     "embed",
-    "lm_head",
     // MoE.
     "topk",
     "weighted_sum",
     // Gating and splits.
     "sigmoid_gate_add",
     "sigmoid_gate_mul",
-    "split_gdn",
+    "split_rows",
     "split_q_gate",
     // Recurrent.
     "causal_conv1d",
     "gdn_prep",
     "gated_delta",
+    // MLA.
+    "mla_latents",
+    "mla_absorb",
+    "split_q_b",
+    // The DSA index path.
+    "index_layernorm_rope",
+    "index_rope",
+    // Pooled attention (dsv4).
+    "pool_boundary",
+    "pool_gather",
+    "lse_ln",
+    // Hyper-connections (dsv4).
+    "hc_expand",
+    "hc_rmsnorm_f32",
+    "hc_gates",
+    "hc_fold",
+    "hc_collapse",
+    // Residual blending (kimi).
+    "res_blend",
+    // Collectives.
+    "all_reduce",
 ];
+
+/// Roles that are another role wearing a purpose: a plane with no claim of
+/// its own answers with the target's. `lm_head` and `attention_landing` ARE
+/// matmuls — the role exists so a plane MAY answer specially (a fused
+/// decode gemv, a TP landing fused with its all-reduce) and so the driver
+/// can find the site; where none does, the delegation is the claim.
+pub const DEFAULTS: &[(&str, &str)] = &[("lm_head", "matmul"), ("attention_landing", "matmul")];
+
+
 
 /// Whether `claim` names a role this registry closes over.
 ///

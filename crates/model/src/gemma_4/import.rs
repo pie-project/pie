@@ -1,32 +1,92 @@
-use crate::shared::vocabulary::{Member, Vocab};
+use model_dsl::axes::{Dtype, KvDtype};
+use model_dsl::load::{copy, pack, plus_one, scalar_of, GgufBase, Import, SfBase};
 
-pub const VOCAB: Vocab = Vocab(&[
+use super::model::{AttnBanks, Model};
 
-    Member::same("model.layers.{layer}.altup.modality_router"),
-    Member::same("model.layers.{layer}.input_layernorm"),
-    Member::same("model.layers.{layer}.laurel.linear_left"),
-    Member::same("model.layers.{layer}.mlp.down_proj"),
-    Member::same("model.layers.{layer}.mlp.gate_proj"),
-    Member::same("model.layers.{layer}.mlp.up_proj"),
-    Member::same("model.layers.{layer}.per_layer_input_gate"),
-    Member::same("model.layers.{layer}.per_layer_projection"),
-    Member::same("model.layers.{layer}.post_attention_layernorm"),
-    Member::same("model.layers.{layer}.post_feedforward_layernorm"),
-    Member::same("model.layers.{layer}.post_per_layer_input_norm"),
-    Member::same("model.layers.{layer}.pre_feedforward_layernorm"),
-    Member::same("model.layers.{layer}.router.scale"),
-    Member::same("model.layers.{layer}.self_attn.k_norm"),
-    Member::same("model.layers.{layer}.self_attn.k_proj"),
-    Member::same("model.layers.{layer}.self_attn.o_proj"),
-    Member::same("model.layers.{layer}.self_attn.q_norm"),
-    Member::same("model.layers.{layer}.self_attn.q_proj"),
-    Member::same("model.layers.{layer}.self_attn.v_norm"),
-    Member::same("model.layers.{layer}.self_attn.v_proj"),
+pub fn import_hf<B: SfBase, W1: Dtype, K: KvDtype>(m: &Model<W1, K>) -> Import {
+    let mut i = Import::new::<B>();
+    i.write("embed", copy("embed_tokens"));
+    i.write("final_norm", plus_one("norm"));
+    for (l, w) in m.layers.iter().enumerate() {
+        i.write(format!("layer.{l}.attn_norm"), plus_one(format!("layer.{l}.input_layernorm")));
+        i.write(format!("layer.{l}.post_attn_norm"), plus_one(format!("layer.{l}.post_attention_layernorm")));
+        i.write(format!("layer.{l}.pre_ffw_norm"), plus_one(format!("layer.{l}.pre_feedforward_layernorm")));
+        i.write(format!("layer.{l}.post_ffw_norm"), plus_one(format!("layer.{l}.post_feedforward_layernorm")));
+        i.write(format!("layer.{l}.q_norm"), plus_one(format!("layer.{l}.self_attn.q_norm")));
+        match &w.attn.banks {
+            AttnBanks::Owned { .. } => {
+                i.write(format!("layer.{l}.k_norm"), plus_one(format!("layer.{l}.self_attn.k_norm")));
+                i.write(format!("layer.{l}.qkv"), pack([
+                    format!("layer.{l}.self_attn.q_proj"),
+                    format!("layer.{l}.self_attn.k_proj"),
+                    format!("layer.{l}.self_attn.v_proj"),
+                ]));
+            }
+            AttnBanks::Shared { .. } => {
+                i.write(format!("layer.{l}.q_proj"), copy(format!("layer.{l}.self_attn.q_proj")));
+            }
+        }
+        i.write(format!("layer.{l}.o_proj"), copy(format!("layer.{l}.self_attn.o_proj")));
+        i.write(format!("layer.{l}.gate_up"), pack([
+            format!("layer.{l}.mlp.gate_proj"),
+            format!("layer.{l}.mlp.up_proj"),
+        ]));
+        i.write(format!("layer.{l}.down"), copy(format!("layer.{l}.mlp.down_proj")));
+    }
+    if m.ple.is_some() {
+        i.write("ple.table", copy("embed_tokens_per_layer"));
+        i.write("ple.model_proj", copy("per_layer_model_projection"));
+        i.write("ple.model_norm", plus_one("per_layer_projection_norm"));
+        for l in 0..m.layers.len() {
+            i.write(format!("layer.{l}.ple_gate"), copy(format!("layer.{l}.per_layer_input_gate")));
+            i.write(format!("layer.{l}.ple_proj"), copy(format!("layer.{l}.per_layer_projection")));
+            i.write(format!("layer.{l}.ple_norm"), plus_one(format!("layer.{l}.post_per_layer_input_norm")));
+            i.write(format!("layer.{l}.ple_scalar"), scalar_of(format!("layer.{l}.post_per_layer_input_norm")));
+        }
+    }
+    i
+}
 
-    Member::same("model.embed_tokens"),
-    Member::same("model.embed_tokens_per_layer"),
-    Member::same("lm_head"),
-    Member::same("model.norm"),
-    Member::same("model.per_layer_model_projection"),
-    Member::same("model.per_layer_projection_norm"),
-]);
+pub fn import_gguf<B: GgufBase, W1: Dtype, K: KvDtype>(m: &Model<W1, K>) -> Import {
+    let mut i = Import::new::<B>();
+    i.write("embed", copy("token_embd.weight"));
+    i.write("final_norm", copy("output_norm.weight"));
+    for (l, w) in m.layers.iter().enumerate() {
+        i.write(format!("layer.{l}.attn_norm"), copy(format!("blk.{l}.attn_norm.weight")));
+        i.write(format!("layer.{l}.post_attn_norm"), copy(format!("blk.{l}.post_attention_norm.weight")));
+        i.write(format!("layer.{l}.pre_ffw_norm"), copy(format!("blk.{l}.ffn_norm.weight")));
+        i.write(format!("layer.{l}.post_ffw_norm"), copy(format!("blk.{l}.post_ffw_norm.weight")));
+        i.write(format!("layer.{l}.q_norm"), copy(format!("blk.{l}.attn_q_norm.weight")));
+        match &w.attn.banks {
+            AttnBanks::Owned { .. } => {
+                i.write(format!("layer.{l}.k_norm"), copy(format!("blk.{l}.attn_k_norm.weight")));
+                i.write(format!("layer.{l}.qkv"), pack([
+                    format!("blk.{l}.attn_q.weight"),
+                    format!("blk.{l}.attn_k.weight"),
+                    format!("blk.{l}.attn_v.weight"),
+                ]));
+            }
+            AttnBanks::Shared { .. } => {
+                i.write(format!("layer.{l}.q_proj"), copy(format!("blk.{l}.attn_q.weight")));
+            }
+        }
+        i.write(format!("layer.{l}.o_proj"), copy(format!("blk.{l}.attn_output.weight")));
+        i.write(format!("layer.{l}.gate_up"), pack([
+            format!("blk.{l}.ffn_gate.weight"),
+            format!("blk.{l}.ffn_up.weight"),
+        ]));
+        i.write(format!("layer.{l}.down"), copy(format!("blk.{l}.ffn_down.weight")));
+    }
+    if m.ple.is_some() {
+        i.write("ple.table", copy("per_layer_token_embd.weight"));
+        i.write("ple.model_proj", copy("per_layer_model_proj.weight"));
+        i.write("ple.model_norm", copy("per_layer_proj_norm.weight"));
+        for l in 0..m.layers.len() {
+            i.write(format!("layer.{l}.ple_gate"), copy(format!("blk.{l}.per_layer_inp_gate.weight")));
+            i.write(format!("layer.{l}.ple_proj"), copy(format!("blk.{l}.per_layer_proj.weight")));
+            i.write(format!("layer.{l}.ple_norm"), copy(format!("blk.{l}.post_per_layer_norm.weight")));
+            i.write(format!("layer.{l}.ple_scalar"), scalar_of(format!("blk.{l}.post_per_layer_norm.weight")));
+        }
+    }
+    i
+}

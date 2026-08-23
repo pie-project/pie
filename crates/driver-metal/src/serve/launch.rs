@@ -172,7 +172,6 @@ impl Shell {
                 q_heads: d.shape.q_heads,
                 kv_heads: d.shape.kv_heads,
                 head_dim: d.shape.head_dim_alloc(),
-                rotary_dims: d.shape.head_dim_alloc(),
                 n_experts: row.load_shape().n_experts,
                 experts_per_token: d.shape.experts_per_token,
                 // What the BYTES arrived in, the one pair a catalog row

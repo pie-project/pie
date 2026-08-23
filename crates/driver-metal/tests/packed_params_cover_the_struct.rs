@@ -88,7 +88,6 @@ fn geometry(f: &LlamaLikeFacts) -> Geometry {
         q_heads: f.q_heads,
         kv_heads: f.kv_heads,
         head_dim: f.head_dim,
-        rotary_dims: f.head_dim,
         n_experts: f.n_experts,
         experts_per_token: f.experts_per_token,
         ..Geometry::default()

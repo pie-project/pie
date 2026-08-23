@@ -916,7 +916,8 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             stem: "silu_mul",
             routine: Some(of("silu_mul")),
         },
-        // layout -- layout/embed.slang, layout/ple.slang, layout/gather.slang
+        // layout -- layout/embed_gather.slang, layout/ple_combine.slang,
+        // layout/row_gather.slang
         Crossed {
             stem: "embed_gather_4bit",
             routine: Some(of("embed_gather_4bit")),

@@ -140,7 +140,7 @@ pub fn cast_fp32_to<T>(
             what: "the cast's element count",
         },
     )?;
-    let launch = elementwise(extent("quant::cast_fp32_to_bf16", n));
+    let launch = elementwise(extent("quant::cast_fp32_to", n));
     ctx.fire(
         Fire::at(
             "quant/dtype_cast.cuh",

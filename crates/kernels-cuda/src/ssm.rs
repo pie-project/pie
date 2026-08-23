@@ -90,7 +90,7 @@ where
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let state_base = rsv.conv_slab as *mut core::ffi::c_void;
+    let state_base = rsv.conv_slab;
     let slot_stride_elems = rsv.conv_stride;
     let slot_ids = rsv.slot_ids;
 
@@ -163,7 +163,7 @@ where
     )
 }
 
-#[routine(bf16, out(y = like(x)))]
+#[routine(bf16, canon = "causal_conv1d.chunked", out(y = like(x)))]
 pub fn causal_conv1d_prefill_batched<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -186,7 +186,7 @@ where
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let state_out_base = rsv.conv_slab as *mut core::ffi::c_void;
+    let state_out_base = rsv.conv_slab;
     let slot_stride_elems = rsv.conv_stride;
     // The request count is the CSR operand's own row count -- the pairing,
     // not a `Const` restating it.
@@ -382,7 +382,7 @@ pub fn kda_gate_beta<T>(
     )
 }
 
-#[routine(bf16, out(out = like(g)))]
+#[routine(bf16, canon = "rmsnorm_gated.by", out(out = like(g)))]
 pub fn kda_o_norm_gated<T>(
     ctx: &Ctx<'_>,
     o: In<Tensor<f32>>,
@@ -436,7 +436,7 @@ pub fn kda_recurrent_step_batched(
         });
     }
     let rsv = unsafe { &*rsv.ptr };
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
     // One row per request: the statement's `[Requests, H, D]` result is the
@@ -489,7 +489,7 @@ pub fn kda_prefill_batched(
     let rsv = unsafe { &*rsv.ptr };
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
@@ -714,7 +714,7 @@ pub fn nemotron_mamba_ssm_batched_bf16(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    let ssm_state_base = rsv.slab as *mut core::ffi::c_void;
+    let ssm_state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     // The request count is the CSR operand's own row count, and the token
     // rows are the result's rectangle; `rows != r` below is the prefill test.
@@ -1057,7 +1057,7 @@ pub fn chunk_gated_delta_prefill_batched(
 
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
@@ -1115,7 +1115,7 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
 
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
@@ -1172,7 +1172,7 @@ pub fn chunk_gated_delta_prefill_batched_cached(
 
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
@@ -1228,7 +1228,7 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
 
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
@@ -1259,7 +1259,7 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     )
 }
 
-#[routine]
+#[routine(canon = gated_delta)]
 pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
     ctx: &Ctx<'_>,
     q_norm_kh: In<Tensor<f32>>,
@@ -1283,7 +1283,7 @@ pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
     let rsv = unsafe { &*rsv.ptr };
 
     let r = *r;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
     const SMEM_BV: u32 = 128;
@@ -1360,7 +1360,7 @@ pub fn recurrent_gated_delta_step_batched(
     let rsv = unsafe { &*rsv.ptr };
 
     let r = *r;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
     ctx.fire(
@@ -1413,7 +1413,7 @@ pub fn recurrent_gated_delta_step_batched_state_bf16(
     let rsv = unsafe { &*rsv.ptr };
 
     let r = *r;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
     ctx.fire(
@@ -1467,7 +1467,7 @@ pub fn recurrent_gated_delta_step_batched_gqa(
     let rsv = unsafe { &*rsv.ptr };
 
     let r = *r;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
     if *v_h % *k_h != 0 {
@@ -1530,7 +1530,7 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
 
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;
@@ -1598,7 +1598,7 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
 
     // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
-    let state_base = rsv.slab as *mut core::ffi::c_void;
+    let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let qo_indptr = qo_indptr.ptr as *const u32;
     let slot_stride_elems = rsv.slot_stride_elems;

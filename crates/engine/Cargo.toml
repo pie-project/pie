@@ -118,7 +118,7 @@ tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
 # `forward` for the site table, which traces a real declaration to work out
 # where a fire's hook sites are.
-model = { path = "../model" }
+model = { path = "../model-legacy", package = "model-legacy" }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
@@ -266,7 +266,7 @@ tensor-ir = { path = "../tensor-ir" }
 # The same `model`, with the one row that is not a model. The mock harness
 # has to name a row because `model::register` resolves one; see
 # `tests/common/env.rs`'s `MOCK_MODEL_ID` and `model::test_rows`.
-model = { path = "../model", features = ["test-rows"] }
+model = { path = "../model-legacy", package = "model-legacy" }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Benchmarks must allocate the way production does. Every engine entry point
 # links `worker`, which sets mimalloc as the global allocator; a bench that

@@ -25,8 +25,13 @@
 //! and the fire are unwritten, so nothing is launched — and a test that
 //! launched a kernel without them would be asserting against uninitialised
 //! device memory.
+//!
+//! Adoption goes through `Boundaries::CUDA`, the vocabulary `serve/load.rs`
+//! registers under, and not the bare `adopt_launch_package`'s Metal one. See
+//! `gpu_ptir_fire`'s header for what the difference costs and for why a test
+//! whose programs name neither vocabulary can hold the wrong one for years.
 
-use driver::{Versions, adopt_launch_package};
+use driver::{Boundaries, Versions, adopt_launch_package_with};
 use driver_cuda::program::{Disk, Runtime, Target};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
@@ -178,7 +183,7 @@ fn the_hosts_own_emitted_cuda_compiles_in_this_driver() {
         kernels.iter().map(|k| k.source.len()).max().unwrap_or(0)
     );
 
-    let plan = adopt_launch_package(package).expect("the driver adopts the package");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("the driver adopts the package");
     assert!(
         plan.executable,
         "a greedy epilogue must be executable: {}",
@@ -244,7 +249,7 @@ fn a_second_registration_of_one_program_compiles_nothing() {
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
     let emitted = emit_program(Backend::Cuda, &stages, &bound);
     let kernels = as_abi(&emitted);
-    let plan = adopt_launch_package(package).expect("adopts");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("adopts");
 
     let (disk, directory) = scratch_disk("dedup");
     let mut runtime = Runtime::new(disk);
@@ -291,7 +296,7 @@ fn a_fresh_runtime_answers_from_the_disk_the_last_one_wrote() {
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
     let emitted = emit_program(Backend::Cuda, &stages, &bound);
     let kernels = as_abi(&emitted);
-    let plan = adopt_launch_package(package).expect("adopts");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("adopts");
 
     let (_, directory) = scratch_disk("restart");
     let versions = Versions::from_compiler(Backend::Cuda.emitter_version());
@@ -344,7 +349,7 @@ fn a_host_side_emitter_bump_recompiles_rather_than_reusing() {
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
     let emitted = emit_program(Backend::Cuda, &stages, &bound);
     let kernels = as_abi(&emitted);
-    let plan = adopt_launch_package(package).expect("adopts");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("adopts");
 
     let (_, directory) = scratch_disk("emitter");
     let target = target(&device);

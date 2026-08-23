@@ -383,7 +383,7 @@ impl CudaArena {
     // are all `&mut self` methods and the arena is therefore alive at
     // each call.
 
-    /// `quant::cast_fp32_to_bf16`: elementwise over a flat byte run,
+    /// `quant::cast_fp32_to`, at `bf16`: elementwise over a flat byte run,
     /// addressed by element count `n` rather than the plan's 2-D shape
     /// (a `Cast` is not indexed by rows/cols). `x::quant::elementwise`
     /// turns `n` into `Launch::flat(n, 256)` internally.
@@ -424,7 +424,7 @@ impl CudaArena {
         declined(CUDA_CAST_FP32_TO_BF16, fired)
     }
 
-    /// `quant::scale_rows_bf16`, the per-row multiply, in place. `rows`
+    /// `quant::scale_rows`, at `bf16`, the per-row multiply, in place. `rows`
     /// picks the block (`grid.x`) and `width` is read by the kernel's
     /// own loop over columns; both now live inside
     /// `x::quant::route_rows`, next to the `<<<>>>` they size.
@@ -432,7 +432,7 @@ impl CudaArena {
         let (rows, cols) = self.extent_2d(op)?;
         let factors = op
             .factors
-            .ok_or_else(|| plan_disagrees("scale_rows_bf16 reads per-group factors"))?;
+            .ok_or_else(|| plan_disagrees("scale_rows reads per-group factors"))?;
         self.bounds(op.dst.offset, op.dst.len)?;
         self.bounds(factors.offset, factors.len)?;
         // SAFETY: both spans are in bounds; the kernel writes `dst` in place,

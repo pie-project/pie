@@ -138,29 +138,25 @@ impl Facts {
         self.geometry.recurrent_at().0
     }
 
-    /// See [`Self::v_heads`].
-    #[must_use]
-    pub const fn v_dim(&self) -> u32 {
-        self.geometry.recurrent_at().1
-    }
-
-    /// Channels a rope rotates.
-    #[must_use]
-    pub const fn rotary_dims(&self) -> u32 {
-        self.geometry.rotary_dims
-    }
-
-    /// Experts a mixture holds.
-    #[must_use]
-    pub const fn n_experts(&self) -> u32 {
-        self.geometry.n_experts
-    }
-
-    /// Experts a token is routed to.
-    #[must_use]
-    pub const fn experts_per_token(&self) -> u32 {
-        self.geometry.experts_per_token
-    }
+    // FOUR ACCESSORS LEFT HERE, and they are the shape of the no-ask series
+    // seen from the driver's side: `v_dim`, `rotary_dims`, `n_experts` and
+    // `experts_per_token`.
+    //
+    // `Facts` exists so a lowering can ASK the driver a question about the
+    // deployment. Every one of these four is a question a statement now
+    // answers for itself -- the rotary width, the value-head width and the
+    // mixture's two counts all ride the params run as `Const` scalars, placed
+    // by the text that knows them, because a driver that supplies a number the
+    // trace did not state is a second opinion about one fact.
+    //
+    // The FIELDS behind them are all still read. `geometry.n_experts` sizes
+    // the router's constant in `lowering/consts.rs` and gates the routed path
+    // in `batch/geometry.rs`; `experts_per_token` is checked against
+    // `ROUTER_MAX_TOP_K` there too. What went is only the `Facts`-shaped door
+    // onto them, which nothing walked through. `v_heads` and `head_dim` are
+    // kept beside their deleted siblings because they ARE asked: which kernel
+    // a gemma-4 layer composes depends on the layer's own head geometry, and
+    // that is a driver question.
 
     /// This statement's affine group size. See [`Self::point`].
     #[must_use]

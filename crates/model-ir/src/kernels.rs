@@ -22,10 +22,26 @@ pub use kernels_metal::entrypoints as metal_entrypoints;
 /// Two variants, four execution shells: this names the surface a text was
 /// written against, not the device that runs it. Vulkan and WGPU execute
 /// plans traced by `llama_like_metal`, so they are checked against Metal's
-/// statements — sound only while the three tables stay equal, which
-/// `kernels/tests/shader_backends_agree.rs` holds. Hence no `Backend::Vulkan`:
-/// no family name could construct one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// statements. Hence no `Backend::Vulkan`: no family name could construct
+/// one.
+///
+/// # What makes reading a shader plan through Metal sound
+///
+/// It used to be that the three shader backends each published a `KERNELS`
+/// table and `kernels/tests/shader_backends_agree.rs` held those three tables
+/// equal, so Metal's row could stand in for Vulkan's. That is no longer where
+/// the soundness comes from, and a reader who goes looking for those tables
+/// finds three EMPTY SLICES: all three backends crossed to routines, wgpu
+/// last, and `930fee2cb` deleted the leftovers.
+///
+/// What holds the claim up now is one plane comparing directly against
+/// another, with no table in the middle —
+/// `two_backends_that_crossed_the_same_kernel_agree_on_its_signature` for the
+/// signatures, and the census check that the three backends still name the
+/// same 481 firable points. Both live in the same file, which is why the file
+/// name here is still the right pointer even though the claim it holds is a
+/// different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Backend {
     /// `kernels-cuda`'s table.
     Cuda,
@@ -294,7 +310,7 @@ pub fn claim_of(backend: Backend, symbol: &str) -> Option<&'static str> {
 /// answers here.
 #[must_use]
 pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
-    match backend {
+    let direct = match backend {
         Backend::Cuda => sigs()
             .iter()
             .find(|k| k.canon == Some(claim))
@@ -312,7 +328,13 @@ pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
                 .get(claim)
                 .copied()
         }
-    }
+    };
+    direct.or_else(|| {
+        kernels::canon::DEFAULTS
+            .iter()
+            .find(|(role, _)| *role == claim)
+            .and_then(|(_, target)| canon_symbol(backend, target))
+    })
 }
 
 /// Evaluate one result's [`kernels::OutRule`] against a statement's
@@ -563,6 +585,53 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                 params,
                 ..
             } => match backend.and_then(|b| stated_in(b, kernel)) {
+                // A SEMANTIC TEXT NAMES CANON ROLES, and a canon role has no
+                // signature to check against -- that is what makes it
+                // semantic. `canon::matmul` is the reading every backend's
+                // projection is a reading OF; `seam::admits` matches producers
+                // by exactly this spelling, and `lower::walk` refuses a
+                // semantic family outright (`Uncovered::UnknownBackend`), so
+                // nothing downstream ever tries to fire one.
+                //
+                // This arm refused all thirteen of `qwen3_5_moe_mlp_block`'s,
+                // which made every SEMANTIC text unbuildable: `finish` runs
+                // this check and panics. Two callers in `engine` and four
+                // gates could not construct the fragment they exist to walk.
+                // It went unnoticed because their targets did not compile
+                // either -- see the commits either side of this one.
+                //
+                // A backend-less family stating a BACKEND symbol is still a
+                // defect, and still refused, because a text that names
+                // `attn::…` has picked a backend without saying so.
+                // A BACKEND-LESS FAMILY IS CHECKED AGAINST EVERY TABLE.
+                //
+                // `Backend::of_family` answers `None` when the family names no
+                // backend, and this arm then refused every statement in the
+                // text -- so `finish`, which runs this check and panics, made
+                // every semantic text unconstructable. `qwen3_5_moe_mlp_block`
+                // lost thirteen statements, `llama_like` and `qwen3_5_hybrid`
+                // their whole bodies. Two callers in `engine` and four gates
+                // could not build the fragment they exist to walk; it went
+                // unnoticed because their targets did not compile either.
+                //
+                // The doc on `of_family` says a semantic trace "states no
+                // kernels at all", and that is no longer true of any of them:
+                // the semantic op variants retired, so a semantic text states
+                // the same `layout::embed_bf16` and `attn::write_kv_to_pages`
+                // its CUDA reading does, plus the `canon::*` roles that ARE
+                // backend-less (`seam::admits` reads producers by exactly that
+                // spelling and nothing fires one -- `lower::walk` refuses a
+                // backend-less family outright).
+                //
+                // So a text that names no backend is held to the UNION: a
+                // symbol some table declares is a symbol, and a typo is still
+                // a typo. What is lost is the per-backend arity check, which
+                // needs a table to be against, and that is exactly the check
+                // the family's own reading gets when it is compiled.
+                None if backend.is_none()
+                    && (kernel.starts_with("canon::")
+                        || stated_in(Backend::Cuda, kernel).is_some()
+                        || stated_in(Backend::Metal, kernel).is_some()) => {}
                 None => problems.push(format!(
                     "{}: launches `{kernel}`, which no {} kernel declares",
                     plan.family,

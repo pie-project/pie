@@ -432,7 +432,7 @@ pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
 /// Router top-k: `moe::topk_softmax`, `(indices, weights)` in that
 /// order, `k` on the params run.
 pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
-    let symbol = logits.t.canon("topk");
+    let symbol = logits.t.canon("topk.softmax");
     let outs = logits.t.with(logits.layer, |b| {
         b.launch_with_params(
             &symbol,
@@ -517,7 +517,9 @@ pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
     }
 }
 
-/// GDN two-way split at `w0`. `layout::split_gdn_bf16`.
+/// GDN two-way split at `w0`. Description form (`canon::`); no plane
+/// declares a split routine, and a lowered text states its own — CUDA's
+/// `layout::split_bf16_rows` and `layout::split_qwen_gdn_ba`.
 pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
     let symbol = x.t.canon("split_gdn");
     let outs = x.t.with(x.layer, |b| {

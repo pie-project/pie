@@ -22,12 +22,25 @@
 //! # The chain under test
 //!
 //! Author a `TraceContainer` → `bind` → `compile_bound` → `codegen::launch::build`
-//! → `emit_program(Backend::Cuda)` → `driver::adopt_launch_package`
+//! → `emit_program(Backend::Cuda)` → `driver::adopt_launch_package_with`
 //! → `ptir::Runtime::compile` (NVRTC) → `ptir::Prepared::build` → launch.
 //! That is every step the engine takes, with nothing stubbed.
+//!
+//! Including the BOUNDARY VOCABULARY, which is a step it is easy to take
+//! differently here than in production and which this file used to. The bare
+//! `adopt_launch_package` adopts under `Boundaries::METAL` — the step
+//! interpreter's `metal.identity`/`metal.discard` — and `serve/load.rs` says
+//! at length what calling it on this backend costs: every `lora`,
+//! `attn_page_mask` and `envelope_dot` program marked non-executable, never
+//! compiled, never found by the fire, so a guest waits on a token that will
+//! not come. These tests pass either way today, because their programs name
+//! neither vocabulary's calls. That is precisely why the wrong one could sit
+//! here: a chain-under-test that diverges from the engine at a step nothing
+//! in it exercises is a chain that will agree with the engine until the day
+//! it matters.
 
 use driver::tensor_ir::DType;
-use driver::{Extents, Versions, adopt_launch_package};
+use driver::{Boundaries, Extents, Versions, adopt_launch_package_with};
 use driver_cuda::device::{Allocator, OwnedStream};
 use driver_cuda::program::run::Lane;
 use driver_cuda::program::{
@@ -113,7 +126,7 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
             error: k.error.clone(),
         })
         .collect();
-    let plan = adopt_launch_package(package).expect("the driver adopts the package");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("the driver adopts the package");
     assert!(
         plan.executable,
         "the plan must be executable: {}",
@@ -465,7 +478,7 @@ fn every_lane_binds_its_own_row_of_the_logits() {
     let bound = bind(container, profile()).expect("the container binds");
     let stages = compile_bound(&bound);
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let plan = adopt_launch_package(package).expect("adopt");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("adopt");
     let stage_plan = plan.package.plans.first().expect("one stage");
 
     let shapes = [
@@ -629,7 +642,7 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
             error: k.error.clone(),
         })
         .collect();
-    let plan = adopt_launch_package(package).expect("adopts");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("adopts");
     assert!(plan.executable, "the plan must be executable");
 
     let directory = std::env::temp_dir().join(format!("pie-ptir-session-{}", std::process::id()));
@@ -730,7 +743,10 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
             .fire(
                 &mut rings,
                 &compiled,
-                stage_plan,
+                // `stage_plan` STOOD HERE. `Session::fire` derives the
+                // per-stage plans from the compiled program itself now, so a
+                // caller that hands one in is stating what the session
+                // already knows.
                 &control,
                 &mut host,
                 // This program reads no intrinsic, so a null base is

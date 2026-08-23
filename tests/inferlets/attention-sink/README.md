@@ -56,7 +56,7 @@ The page CSR has to track the logical KV length exactly. The CUDA driver derives
 from the `KvLen` port, so the inferlet uses `page_count = ceil(kv_len / page_size)`
 instead of declaring the whole page pool. Over-declaring pages makes attention
 read uninitialised KV and produces fluent garbage; this is contract 3 in
-[`11-ptir-limits.md`](../../../inference-time-algorithms/11-ptir-limits.md).
+`inference-time-algorithms/11-ptir-limits.md`.
 
 ## Run
 

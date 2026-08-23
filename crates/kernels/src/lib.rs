@@ -602,11 +602,6 @@ pub enum Ty {
     /// Original-YaRN scaling, by `const*`. POD, and a pointer rather than a
     /// reference because it is optional: see `nullable`.
     YarnOriginalParams,
-    /// A read-only device array of `pie::attn::StructuredMaskParams` —
-    /// the per-lane structured-mask descriptors `attn::pack_structured_mask`
-    /// reads. POD (three `u32`s), so Rust mirrors it and the array crosses
-    /// as `*const StructuredMaskParams`.
-    StructuredMasks,
     /// ONE OBJECT THE FIRE RAISED, by reference — `crate::raises::Struct<T>`.
     ///
     /// The generic kind the three plan-cache tags above are special cases of.
@@ -692,7 +687,6 @@ impl Ty {
             Ty::MlaPlanCache => "const ::pie::attn::MlaPlanCache&",
             Ty::HopperPrefillPlan => "const ::pie::attn::HopperPrefillPlan&",
             Ty::YarnOriginalParams => "const ::pie::attn::YarnOriginalParams*",
-            Ty::StructuredMasks => "const ::pie::attn::StructuredMaskParams*",
             // NOTHING, and the emptiness is the claim: a raised object is the
             // host's and reaches no `__global__`, so there is no declaration for
             // a spelling to be checked against.
@@ -761,7 +755,6 @@ impl Ty {
             }
             Ty::HopperPrefillPlan => "*const HopperPrefillPlan",
             Ty::YarnOriginalParams => "*const YarnOriginalParams",
-            Ty::StructuredMasks => "*const StructuredMaskParams",
             // As the plan caches, and for a nearer reason: the honest type is a
             // pointer to the PLANE's own aggregate, which this crate has no
             // dependency with which to name. It appears in no generated
@@ -836,8 +829,7 @@ impl Ty {
             | Ty::PrefillPlanCache
             | Ty::MlaPlanCache
             | Ty::HopperPrefillPlan
-            | Ty::YarnOriginalParams
-            | Ty::StructuredMasks => Binds::Nothing,
+            | Ty::YarnOriginalParams => Binds::Nothing,
             // `Reads` AND NOT `Nothing`, which is the whole point of the kind.
             // The three plan-cache tags answer `Nothing` because the DRIVER
             // hands those over and no statement names one. A raise is an
@@ -861,7 +853,6 @@ impl Ty {
                 | Ty::MlaCacheLayerView
                 | Ty::HopperPrefillPlan
                 | Ty::YarnOriginalParams
-                | Ty::StructuredMasks
         )
     }
 }
@@ -1214,9 +1205,11 @@ mod tests {
         derived: &[],
         axes: &[],
         internal: false,
-        asked: &[],
         no_join: false,
         driver: false,
+        canon: None,
+        point: &[],
+        out_rule: &[],
     };
 
     static TABLE: &[KernelSig] = &[

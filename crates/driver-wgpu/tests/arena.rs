@@ -418,6 +418,26 @@ impl Resolve for Everything {
     fn table(&self, _: FireTable) -> Option<&Placeholder> {
         Some(&self.0)
     }
+    // THE POOL'S NUMBERS, WHICH "EVERYTHING" DID NOT ANSWER. This resolver's
+    // whole premise is that every ask is granted, and every one was except
+    // this one: `number` was left to its default `None`, which
+    // `lowering::views::kv` reads as zero.
+    //
+    // Zero is not nothing here. `views.rs` gives it a MEANING -- it selects
+    // the contiguous stride path -- so every paged plan these sweeps built
+    // carried `PagedKvView { page_size: 0, .. }` and nothing objected, because
+    // `attn/kv_write.wgsl` computes `slot = w_page[i] * page_size + w_off[i]`
+    // and a zero there annihilates the page index silently rather than
+    // failing. Every token in every page collapses onto `w_off[i]`.
+    //
+    // `kernels_wgpu::kv_append_paged` refuses that now, which is what turned
+    // a generous default into a visible one. The answer is the driver's own
+    // constant, not a sentinel: `Sentinels` below owns the recognisable
+    // values, and a magic number here would be searched for in the scalar
+    // blocks these same sweeps walk.
+    fn number(&self, _: FireNumber) -> Option<u32> {
+        Some(driver_wgpu::facts::PAGE_SIZE)
+    }
 }
 
 /// The same, with three recognisable answers where a pool's numbers go.
@@ -525,7 +545,8 @@ fn stated_by(
     );
     let mut views = driver_wgpu::lowering::views::Views::default();
     let taken =
-        driver_wgpu::lowering::bind::bind(body.args, body.sources, &mut handles, facts, &mut views).ok()?;
+        driver_wgpu::lowering::bind::bind(body.args, body.sources, &mut handles, facts, &mut views)
+            .ok()?;
     // ON A PLANNER THAT CAN ANSWER. `state`'s has no fire behind it, so every
     // body that reaches for a fact -- which after the marks migration is most
     // of them -- refuses `Unstated` and this helper returns `None`. A walk
@@ -652,17 +673,29 @@ fn is_live_raise(key: &str) -> bool {
 /// exactly like `bind` did; and a raise whose key is not in [`is_live_raise`]
 /// stays a refusal, so a plan that stops speaking one of the tier-1/plane
 /// vocabulary words this driver understands still fails here.
+/// What [`bind_arena_operands`] answers: what bound, how many raises went
+/// past, and what refused -- each of the latter two indexed into the launch's
+/// own arg span so a caller can name the operand rather than the position.
+///
+/// Named because the tuple is three deep and `clippy::type_complexity` is a
+/// gate here, but the name earns its place separately: the three are read
+/// together at every call site and none of them means anything alone.
+type BoundOperands<'a, R> = (
+    Vec<(
+        usize,
+        driver_wgpu::binding::Bound<'a, <R as Resolve>::Buffer>,
+    )>,
+    usize,
+    Vec<(usize, Unbindable)>,
+);
+
 fn bind_arena_operands<'a, R: Resolve>(
     lowered: &Lowered,
     launch: &Launch,
     arena: Arena<'a, R::Buffer>,
     resolver: &'a R,
     min_offset: u64,
-) -> (
-    Vec<(usize, driver_wgpu::binding::Bound<'a, R::Buffer>)>,
-    usize,
-    Vec<(usize, Unbindable)>,
-) {
+) -> BoundOperands<'a, R> {
     let span = launch.args.start as usize..launch.args.end as usize;
     let mut bound = Vec::with_capacity(span.len());
     let mut raised = 0usize;
@@ -1291,7 +1324,10 @@ const REACHES: &[(&str, Reaches)] = &[
         "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
         Reaches::BlockDeclines(2),
     ),
-    ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::BlockDeclines(1)),
+    (
+        "affine_qmv_fast_bfloat16_gs_64_b_8",
+        Reaches::BlockDeclines(1),
+    ),
     // THE DENSE PROJECTIONS MOVED TO THE PRECAST PATH. Upstream's "metal: run
     // the GEMM in half where the device has no bfloat matrix unit" points the
     // qwen3.5 and qwen3.6 texts at `_fp16_precast`, so these two are REPLACED
@@ -1332,7 +1368,10 @@ const REACHES: &[(&str, Reaches)] = &[
         "cast_qmm_input_strided_bfloat16_to_float16",
         Reaches::Uniform,
     ),
-    ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::BlockDeclines(1)),
+    (
+        "affine_qmv_fast_bfloat16_gs_64_b_4",
+        Reaches::BlockDeclines(1),
+    ),
     (
         "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
         Reaches::BlockDeclines(1),
@@ -1850,9 +1889,8 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
             // a plan that grew an unbindable name still fails the sweep
             // below; the same fact `NotOnThisPlane { key }` states, kept
             // rather than filtered.
-            let (bounds, raises, this_refused) = bind_arena_operands(
-                &low, launch, arena, &store, STRICTEST_ALIGNMENT,
-            );
+            let (bounds, raises, this_refused) =
+                bind_arena_operands(&low, launch, arena, &store, STRICTEST_ALIGNMENT);
             operands += bounds.len() as u64 + raises as u64;
             for (i, why) in this_refused {
                 refused.push(format!(
@@ -2002,9 +2040,8 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
             // (they never touch the arena bound), and every arena/named
             // resolve still runs. A `PastArena` from any of them is the
             // finding.
-            let (_, _, this_refused) = bind_arena_operands(
-                &low, launch, arena, &store, STRICTEST_ALIGNMENT,
-            );
+            let (_, _, this_refused) =
+                bind_arena_operands(&low, launch, arena, &store, STRICTEST_ALIGNMENT);
             for (_, why) in this_refused {
                 assert!(
                     matches!(why, Unbindable::PastArena { .. }),
@@ -2100,7 +2137,14 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     let all = geometric();
     let mods = modules(all.iter().map(|(_, low, _)| low));
     let store = Everything(Placeholder(GENEROUS));
-    let numbers = BTreeMap::new();
+    // THE SAME PAGE SIZE THE RESOLVER ANSWERS, AND FOR THE SAME REASON. This
+    // map is the pool's numbers on the `stated_by` side, and it was empty --
+    // so a body that reached for the KV page size got zero, and every paged
+    // append refused. `stated_by` reports a refusal as `None`, the zip below
+    // pairs passes with states, and a zip over an empty state list drops the
+    // pass. 352 dispatches of `kv_append_paged_bfloat16` left the count that
+    // way without leaving anything in `owed`.
+    let numbers = BTreeMap::from([(FireNumber::KvPageSize, driver_wgpu::facts::PAGE_SIZE)]);
     let mut uniform = 0u64;
     let mut storage = 0u64;
     let mut bare = 0u64;
@@ -2499,9 +2543,8 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
             // a driver-bound RESOURCE whose buffer is the arena's is one of
             // the statement's own operands, at exactly the range the plan
             // placed it, and a raise cannot be one of those on this plane.
-            let (plain_bounds, _raises, plain_refused) = bind_arena_operands(
-                low, launch, arena, &store, STRICTEST_ALIGNMENT,
-            );
+            let (plain_bounds, _raises, plain_refused) =
+                bind_arena_operands(low, launch, arena, &store, STRICTEST_ALIGNMENT);
             assert!(
                 plain_refused.is_empty(),
                 "{text}: the statement's operands bind against the arena that \
@@ -3171,7 +3214,11 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
             // `queries`, `kvc`, `positions`, `request_of_token`, `maskv`,
             // `split`: six inputs, three raised. `_sink` shares the same
             // input surface -- the sink table is a `Const<Tensor<..>>`.
-            &[(1, "kv_cache"), (4, "attention_mask"), (5, "attn.split_policy")]
+            &[
+                (1, "kv_cache"),
+                (4, "attention_mask"),
+                (5, "attn.split_policy"),
+            ]
         } else if symbol.starts_with("sdpa_vector_decode") {
             &[(1, "kv_cache")]
         } else if symbol.starts_with("kv_append") {
@@ -3303,17 +3350,27 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
         // `ArgValue::Raised`; the two passes below are independent binds
         // over different `Handles`, so they mint independent views too.
         let mut free_views = driver_wgpu::lowering::views::Views::default();
-        let free =
-            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut open, facts, &mut free_views)
-                .ok()
-                .map(|taken| fired_scalars(taken, open));
+        let free = driver_wgpu::lowering::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut open,
+            facts,
+            &mut free_views,
+        )
+        .ok()
+        .map(|taken| fired_scalars(taken, open));
         let mut walled =
             driver_wgpu::lowering::hold::Handles::with_numbers(&args, results, &scalars, &paged);
         let mut walled_views = driver_wgpu::lowering::views::Views::default();
-        let held =
-            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut walled, facts, &mut walled_views)
-                .ok()
-                .map(|taken| fired_scalars(taken, walled));
+        let held = driver_wgpu::lowering::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut walled,
+            facts,
+            &mut walled_views,
+        )
+        .ok()
+        .map(|taken| fired_scalars(taken, walled));
         if free.is_none() && held.is_none() {
             continue;
         }
@@ -3439,10 +3496,9 @@ fn position(args: &[ArgValue], word: u32) -> Option<usize> {
         // with its rectangle beside it. A RAISED VIEW is not either: it
         // carries a HOST address, and a host address matching a sentinel
         // is a coincidence rather than a resolver's answer.
-        ArgValue::Buffer(_)
-        | ArgValue::Shaped { .. }
-        | ArgValue::F32(_)
-        | ArgValue::Raised(_) => false,
+        ArgValue::Buffer(_) | ArgValue::Shaped { .. } | ArgValue::F32(_) | ArgValue::Raised(_) => {
+            false
+        }
     })
 }
 

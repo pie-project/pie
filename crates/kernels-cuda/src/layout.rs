@@ -48,7 +48,7 @@ const fn this_family(refusal: Refusal) -> Refusal {
     }
 }
 
-#[routine]
+#[routine(canon = split_rows)]
 pub fn split_bf16_rows(
     ctx: &Ctx<'_>,
     src: In<Tensor<bf16>>,

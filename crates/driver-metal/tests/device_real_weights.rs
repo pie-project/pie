@@ -1291,7 +1291,6 @@ fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry, binding: &MetalBi
         q_heads: dg.n_q_heads,
         kv_heads: dg.n_kv_heads,
         head_dim: dg.head_dim,
-        rotary_dims: dg.head_dim,
         n_experts: dg.n_experts,
         experts_per_token: dg.experts_per_token,
         // The quantization axes come from the BINDING, not the pool: they are
@@ -6418,9 +6417,13 @@ fn what_a_decode_costs_at_length() {
                 regions,
                 recordings: (replay && count == 1).then_some(recordings),
             };
-            let submitted =
-                driver_metal::fire::run::submit(&mut machine, lowered, geometry, &mut live)
-                    .expect("the fire commits");
+            let submitted = driver_metal::fire::run::submit(
+                &mut machine,
+                &lowered.lowered,
+                geometry,
+                &mut live,
+            )
+            .expect("the fire commits");
             let encoded = started.elapsed().as_secs_f64() * 1e3;
             machine
                 .stepper
@@ -6773,15 +6776,16 @@ fn tier_one_prefill_then_decode() {
             println!(
                 "  arena {:.1} MiB for {count} rows, {} launches; \
                  device holds {:.2} GiB of {:.2} GiB working set, {} resident allocations",
-                lowered.arena_bytes as f64 / (1024.0 * 1024.0),
-                lowered.launches.len(),
+                lowered.lowered.arena_bytes as f64 / (1024.0 * 1024.0),
+                lowered.lowered.launches.len(),
                 gib(held),
                 gib(context.working_set_bytes()),
                 context.residency().allocationCount(),
             );
         }
-        let submitted = driver_metal::fire::run::submit(&mut machine, lowered, geometry, &mut live)
-            .expect("the fire commits");
+        let submitted =
+            driver_metal::fire::run::submit(&mut machine, &lowered.lowered, geometry, &mut live)
+                .expect("the fire commits");
         machine
             .stepper
             .wait_for(submitted.value)

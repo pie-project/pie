@@ -131,7 +131,6 @@ fn geometry() -> Geometry {
         q_heads: 16,
         kv_heads: 8,
         head_dim: 128,
-        rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
         // The checkpoint's affine point. Zero is not "unquantised" -- the
@@ -256,7 +255,6 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
             q_heads: 32,
             kv_heads: 4,
             head_dim: 128,
-            rotary_dims: 128,
             n_experts: 128,
             experts_per_token: 8,
             group: 64,
@@ -360,7 +358,6 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
             q_heads: 64,
             kv_heads: 8,
             head_dim: 64,
-            rotary_dims: 64,
             n_experts: 32,
             experts_per_token: 4,
             group: 64,

@@ -262,4 +262,8 @@ def tests():
 
 
 if __name__ == "__main__":
-    run_tests(tests(), "envelope_dot page-slice resolution")
+    run_tests(
+        tests(),
+        "envelope_dot page-slice resolution",
+        requires=("envelope_dot",),
+    )

@@ -457,11 +457,11 @@ pub fn write_kv_to_pages(k: &Val, v: &Val, kv: &Kv, num_kv_heads: u32, head_dim:
 pub struct GdnShape {
     /// Key heads (compact, pre-GQA-repeat).
     pub k_heads: u32,
-    /// Value heads.
+    /// Val heads.
     pub v_heads: u32,
     /// Key head width.
     pub k_dim: u32,
-    /// Value head width.
+    /// Val head width.
     pub v_dim: u32,
     /// Channels the causal convolution carries: `2*Hk*Dk + Hv*Dv`.
     pub conv_dim: u32,
@@ -832,8 +832,18 @@ pub fn lora_qkv_correction(q: &Val, v: &Val, l: u32) {
 /// It could not fault and it could not be seen: one `u32` is as wide as
 /// another, the count matched for the routines that take exactly one scalar,
 /// and `check_plan`'s params rule only ever counted them.
-
-/// [`attn_at`], with the raise the statement names.
+///
+/// # One function where there were two
+///
+/// This paragraph and the one below it used to document `attn_at`, which no
+/// longer exists: the planned form absorbed it and the unplanned callers pass
+/// `None`. The doc stayed where it was, separated from its heir by a blank
+/// line, which is how a doc comment stops documenting anything -- and the
+/// link below still names the function that went. Both are folded here
+/// because the epitaph is about THIS function's params, not the vanished
+/// wrapper's.
+///
+/// With the raise the statement names.
 ///
 /// `plan` is placed as input 1, after `q`. The order is the routine's: `q`
 /// keeps `In(0)`, which half this family's comments and every one of its

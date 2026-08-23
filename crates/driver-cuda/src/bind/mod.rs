@@ -1590,6 +1590,23 @@ pub struct MapResolver {
     /// different head dim both spell `fa2.prefill`; a caller that has two
     /// wants `fire::launch`'s resolver, not this one.
     raised: std::collections::BTreeMap<String, *const c_void>,
+    /// What the RUNTIME channel answers, by the trace value the text minted.
+    ///
+    /// Filled wholesale by [`Self::stage`] rather than by hand, because these
+    /// are the objects a caller cannot key by word: `"kv_cache"` and
+    /// `"recurrent_state"` are one name over every layer, and which layer is
+    /// meant is carried by the VALUE alone.
+    staged: std::collections::BTreeMap<ValueId, StagedRuntime>,
+}
+
+/// One runtime value's answer: a resident object for `raised`, a device stream
+/// for `named`. Which of the two a name is comes from the driver's own tables
+/// ([`views::FireViews::raised`] and [`views::FireStreams::named`]), so a
+/// fixture never has to classify a name itself.
+#[derive(Debug, Clone, Copy)]
+enum StagedRuntime {
+    Object(*const c_void),
+    Stream(*mut c_void),
 }
 
 impl MapResolver {
@@ -1618,6 +1635,42 @@ impl MapResolver {
     pub fn insert_raised(&mut self, key: impl Into<String>, ptr: *const c_void) {
         self.raised.insert(key.into(), ptr);
     }
+
+    /// Answer the whole RUNTIME channel from a built view arena.
+    ///
+    /// # What this is for
+    ///
+    /// A text names its driver-owned objects and per-fire streams out of
+    /// `kernels::runtime`'s closed vocabulary, and the lowering leaves each
+    /// one `Arg::Named`/`Arg::Raised` against a trace value. A fixture that
+    /// pins those values like ordinary seams gets ZEROED BUFFERS where the
+    /// fire wanted its KV pool, its recurrent slabs and its CSRs -- and the
+    /// worst of them is silent: `"first_token"` is a scalar smuggled through
+    /// the pointer channel, so a pin hands the appender a device ADDRESS as
+    /// its write origin and the write walks off the pool with an illegal
+    /// address several launches later.
+    ///
+    /// So a fixture builds the same [`views::FireViews`] the live path builds,
+    /// calls this once, and excludes [`views::runtime_values`] from its pin
+    /// pool. What is left in that pool is exactly the seams.
+    ///
+    /// # Lifetime
+    ///
+    /// The object answers are pointers INTO `views` -- that is what makes them
+    /// one object with one lifetime -- so `views` must outlive the walk. It is
+    /// borrowed here and not held so that the arena can stay a plain local.
+    pub fn stage(&mut self, runtime: &[model_ir::trace::RuntimeBinding], views: &views::FireViews) {
+        for b in runtime {
+            // A NAME IS ONE OR THE OTHER, and the driver's own tables decide
+            // which. A name neither answers is left out, so it refuses at the
+            // bind under its own word rather than binding null.
+            if let Some(p) = views.raised(&b.name, b.layer, b.value) {
+                self.staged.insert(b.value, StagedRuntime::Object(p));
+            } else if let Some(p) = views.streams.named(&b.name) {
+                self.staged.insert(b.value, StagedRuntime::Stream(p));
+            }
+        }
+    }
 }
 
 impl Resolver for MapResolver {
@@ -1632,12 +1685,23 @@ impl Resolver for MapResolver {
         hit
     }
     fn named(&mut self, value: ValueId) -> Option<*mut c_void> {
+        // A staged STREAM first, a pinned seam after: the two sets are
+        // disjoint once the caller excludes `runtime_values` from its pins,
+        // so the order is only what makes a caller that forgot fail loudly.
+        if let Some(StagedRuntime::Stream(p)) = self.staged.get(&value) {
+            return Some(*p);
+        }
         self.named.get(&value).copied()
     }
-    fn raised(&mut self, _value: ValueId, key: &str) -> Option<*const c_void> {
-        // BY THE KEY. See the field: this map holds one object per kind, so
-        // the value adds nothing it could tell apart. An unheld key is `None`
-        // and therefore a refusal.
+    fn raised(&mut self, value: ValueId, key: &str) -> Option<*const c_void> {
+        // BY THE VALUE where a fire arena was staged, because `"kv_cache"` is
+        // one word over every layer and the value is what tells them apart.
+        if let Some(StagedRuntime::Object(p)) = self.staged.get(&value) {
+            return Some(*p);
+        }
+        // BY THE KEY otherwise. See the field: this map holds one object per
+        // kind, so the value adds nothing it could tell apart. An unheld key
+        // is `None` and therefore a refusal.
         self.raised.get(key).copied()
     }
 }
@@ -1720,6 +1784,7 @@ pub fn run<R: Resolver>(
 ) -> Result<usize, RunRefusal> {
     for (i, launch) in lowered.launches.iter().enumerate() {
         let kernel = || lowered.kernels[launch.kernel as usize].clone();
+        let began = launch_census::armed().then(std::time::Instant::now);
         // The region, told first: a tail launch's operands must resolve
         // against the tail's own views. See `Resolver::region`.
         resolver.region(&launch.rows);
@@ -1742,8 +1807,70 @@ pub fn run<R: Resolver>(
             kernel: kernel(),
             why: RunRefusalKind::Dispatch(e),
         })?;
+        if let Some(began) = began {
+            launch_census::charge(&lowered.kernels[launch.kernel as usize], began.elapsed());
+        }
     }
     Ok(lowered.launches.len())
+}
+
+/// Per-kernel host cost of a bind-and-dispatch, summed across every fire.
+///
+/// Opt-in through `PIE_CUDA_LAUNCH_CENSUS=1`, which also prints the table at
+/// process exit. It exists because the interpreter's per-launch host cost is
+/// invisible from outside: a fire is 535 launches, and a whole-fire figure
+/// cannot say whether every launch is equally slow or one of them is a
+/// thousand times the rest. The measurement it was written for: a Qwen3-0.6B
+/// decode spending ~1 ms of HOST time per launch, against a ~5 µs
+/// `cudaLaunchKernel`, with the GPU at 0 % the whole time.
+pub mod launch_census {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    /// `(calls, total)` per kernel name.
+    static TALLY: OnceLock<Mutex<BTreeMap<String, (u64, Duration)>>> = OnceLock::new();
+
+    /// Whether the census is on. Read once; an env var that changed mid-run
+    /// would make the totals mean two different things.
+    #[must_use]
+    pub fn armed() -> bool {
+        static ARMED: OnceLock<bool> = OnceLock::new();
+        *ARMED.get_or_init(|| std::env::var_os("PIE_CUDA_LAUNCH_CENSUS").is_some())
+    }
+
+    /// Add one bind-and-dispatch to `kernel`'s row.
+    pub fn charge(kernel: &str, cost: Duration) {
+        let tally = TALLY.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let Ok(mut tally) = tally.lock() else {
+            return;
+        };
+        let row = tally.entry(kernel.to_string()).or_insert((0, Duration::ZERO));
+        row.0 += 1;
+        row.1 += cost;
+    }
+
+    /// The table, dearest total first. Printed by the caller, so a test can
+    /// read it without a process exit.
+    #[must_use]
+    pub fn report() -> String {
+        let Some(tally) = TALLY.get() else {
+            return String::new();
+        };
+        let Ok(tally) = tally.lock() else {
+            return String::new();
+        };
+        let mut rows: Vec<_> = tally.iter().collect();
+        rows.sort_by_key(|(_, (_, total))| std::cmp::Reverse(*total));
+        let mut out = String::from("[launch-census] host cost of bind+dispatch, by kernel\n");
+        for (kernel, (calls, total)) in rows.iter().take(20) {
+            out.push_str(&format!(
+                "[launch-census] {total:>10.1?} over {calls:>6} calls  {:>8.1?}/call  {kernel}\n",
+                *total / u32::try_from(*calls).unwrap_or(1),
+            ));
+        }
+        out
+    }
 }
 
 /// One open conditional on the capture stack, and the arm being captured.
@@ -1858,6 +1985,7 @@ pub fn run_captured<R: Resolver>(
         ctx.stream = builder.stream().as_raw().cast::<c_void>();
         bind_cublas_stream(&ctx);
 
+        let began = launch_census::armed().then(std::time::Instant::now);
         // As `run`'s: the region, before the operands.
         resolver.region(&launch.rows);
         let bound = bind(lowered, launch, frame, resolver).map_err(|e| RunRefusal {
@@ -1882,6 +2010,9 @@ pub fn run_captured<R: Resolver>(
         // Retain the node by INDEX, so a same-topology fire differing only in
         // row count updates instead of recapturing; a no-kernel dispatch gaps.
         builder.retain_node(i);
+        if let Some(began) = began {
+            launch_census::charge(&kernel, began.elapsed());
+        }
     }
 
     // Unwind whatever the last launch left open.

@@ -103,4 +103,8 @@ async def test_mask_is_enforced(client, args):
 if __name__ == "__main__":
     from conftest import run_tests
 
-    run_tests([test_mask_is_enforced], "attn_page_mask enforcement")
+    run_tests(
+        [test_mask_is_enforced],
+        "attn_page_mask enforcement",
+        requires=("envelope_dot", "attn_page_mask"),
+    )

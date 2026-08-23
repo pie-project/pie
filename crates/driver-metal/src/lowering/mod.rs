@@ -9,7 +9,6 @@
 pub mod abi;
 pub mod bind;
 pub mod cached;
-pub mod consts;
 pub mod dispatch;
 pub mod executor;
 pub mod frame;

@@ -3,6 +3,7 @@
 
 pub mod facts;
 pub mod kernels;
+pub mod plan;
 pub mod seam;
 pub mod trace;
 

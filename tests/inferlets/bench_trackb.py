@@ -186,4 +186,8 @@ async def test_trackb_crossover(client, args):
 
 
 if __name__ == "__main__":
-    run_tests([test_trackb_crossover], "Track B crossover benchmark")
+    run_tests(
+        [test_trackb_crossover],
+        "Track B crossover benchmark",
+        requires=("attn_score", "attn_page_mask"),
+    )

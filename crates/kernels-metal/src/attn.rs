@@ -185,6 +185,25 @@ pub fn kv_append_paged(
     }
     let kvc = unsafe { &*kvc.ptr };
     let page_size = kvc.page_size;
+    // ZERO IS NOT A PAGE SIZE, and here it is not a harmless one either.
+    // `lowering::views::kv` builds this view with `pooled(..).unwrap_or(0)`
+    // and its doc says a paged access at page size zero "refuses at its
+    // grid" -- true of the paged READ, whose grid is built from the page
+    // count, and never true of this write, whose grid is heads by tokens and
+    // does not consult the number at all. So a store with no pool behind it
+    // planned a full write in which every token divides to page zero, offset
+    // zero: twenty-eight layers of keys and values landing on one row and
+    // overwriting each other, with no refusal anywhere.
+    //
+    // The refusal `model_dispatch`'s `a_paged_write_with_no_page_size_...`
+    // asserts is this one. It had been asserting it against a routine that
+    // could not make it since the write was ported, in a test target the
+    // no-ask series never built.
+    if page_size <= 0 {
+        return Err(Refusal::Empty {
+            what: "the KV page size",
+        });
+    }
 
     let k_pages = kvc.keys;
     let v_pages = kvc.values;

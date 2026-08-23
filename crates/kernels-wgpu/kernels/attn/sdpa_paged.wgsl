@@ -706,6 +706,164 @@ const PIE_KY: u32 = PIE_KB * PIE_DP;
 // holds is what stops another one fitting. The code that measured this is
 // reverted -- at `PIE_KL == PIE_KR` it is a no-op, and below that it cannot
 // exist -- and only this table is kept.
+//
+// # WHAT THE DECODE ARM ACTUALLY COSTS, TAKEN APART WITHOUT AN INSTRUMENT
+//
+// Everything above prices this arm against the OTHER knob settings, which is
+// what a sweep can do and no more. It never said how much of the 1.838 ms this
+// pair of kernels spends in a token is work and how much is the launch, and
+// the numbers that claimed to -- the `[cost]` shares from `PIE_WGPU_STAMP` --
+// are taken on a token the instrument itself inflates from 7.4 ms to 13.8. So
+// it was re-taken with the trick `quant/qmv.wgsl` uses: a uniform-false early
+// return at the top of `decode_row`,
+//
+// ```wgsl
+//   if params.page_size >= 0 { return; }
+// ```
+//
+// which keeps every binding live (naga drops a binding whose last use goes,
+// and the fire comes back `Unfired(Refused { Bindings { .. } })`), keeps all
+// 128 workgroups launching and all 256 threads of each starting, and deletes
+// the entire body. Plain wall-clock medians, three rounds, no instrument:
+//
+// ```text
+//   configuration                             decode p50 (512 keys)
+//   shipped                                        7.451 ms
+//   `decode_row` body deleted, merge intact        5.993
+//   PIE_WGPU_SKIP=sdpa_paged                       5.613
+//   PIE_WGPU_SKIP=sdpa_paged_decode_merge          7.390
+// ```
+//
+// Which decomposes the whole of the attention in a decode:
+//
+// ```text
+//   split body       1.458 ms   19.6% of the token   28 fires   52.1 us each
+//   split launch     0.270       3.6%                28          9.6 us each
+//   merge, all of it 0.110       1.5%                28          3.9 us each
+//   -------------------------------------------------------------------
+//   sdpa_paged       1.838      24.7%
+// ```
+//
+// Three things follow and none of them was known.
+//
+// **The merge is not worth looking at.** It is 1.5% of a token and 6% of the
+// attention. `PIE_SPLITS` has now been swept four times and lands on 8 every
+// time; this is why the eight-way fold it forces is affordable.
+//
+// **The launch is 9.6 us a fire, and that is the most expensive dispatch in
+// the decode by a factor of three.** `qmv` fires 196 times for 1.085 ms of
+// launch; `silu_mul` returns 1.4 us a fire and `kv_append` 2.6. The ordering
+// is not by kernel, it is by GRID: this arm dispatches 128 workgroups of 256
+// threads, the largest launch in the token, and `qmv.wgsl`'s three-mechanism
+// table established that the ramp is charged PER WORKGROUP. 9.6 us for 128
+// workgroups is 75 ns each, which is the same rate `qmv` pays. There is
+// nothing anomalous here and nothing to reclaim without shrinking the grid --
+// and the grid is `PIE_SPLITS` x `q_heads`, both of which are swept shut.
+//
+// **So the target is 1.458 ms of body and it is the second-largest single
+// thing in the token, after `qmv`'s 2.80.** Priced in bytes it is not obviously
+// bad: 16 q heads x 512 keys x 128 channels x 2 (K and V) x 2 B is 4.19 MB a
+// layer and 117 MB a token, so 1.458 ms is **80 GB/s** against a 273 GB/s
+// part. But the traffic is a fiction -- the UNIQUE footprint is 2.1 MB a
+// layer, `gqa_factor` = 2 means every KV byte is read by two query heads, and
+// the `kv_head = 0` probe (an 8x cut in unique bytes) buys nothing at all. All
+// of it is a cache hit. The 80 GB/s is a LOAD-ISSUE rate wearing a byte
+// costume, exactly as the prefill arm's table below concludes, and the only
+// lever that has ever moved this kernel is issuing fewer, wider loads.
+//
+// That lever is `PIE_DP`, the channel pairs a lane owns, and it is not free:
+// `PIE_DX`, `PIE_DP`, `PIE_KB` and `PIE_KY` are all derived from `PIE_PAIRS`,
+// `PIE_PAIRS` is half the head width, and `driver-wgpu::geometry`'s
+// `Rule::SdpaVector` guards that twice the module's workgroup width IS the
+// head width -- with a third copy of the arithmetic in `kernels-wgpu::attn`.
+// The x axis has to be REINTERPRETED, not reshaped. Nothing here has been
+// tried; this section exists so the next attempt starts from 1.458 and not
+// from a stamped share.
+//
+// # SIX PROBES INTO THAT LOOP AND FIVE OF THEM ARE FREE
+//
+// The 1.458 ms was then cut apart the same way, one deletion at a time. Every
+// probe below gives the WRONG ANSWER, every one is reverted, and every one
+// keeps the loop trips, the grid and the bindings intact so that only the
+// named thing goes. Plain medians, three rounds each, no instrument; the
+// baseline cluster that day was 7.429-7.525 with a mean of 7.446.
+//
+// ```text
+//   probe                                          decode p50   delta
+//   shipped                                          7.446         --
+//   the V load deleted -- HALF of every load          7.458       0
+//   channel map contiguous instead of strided         7.442       0
+//   the butterfly deleted -- 5 shuffles a key         7.556       0
+//   both `exp()` deleted from the online softmax      7.521       0
+//   the page-table load deleted                       7.249     -0.197
+//   `PIE_DX` 16 / `PIE_DP` 4 -- a lane owns 16 B      8.001     +0.55
+// ```
+//
+// **THIS ARM IS NOT PAID PER LOAD ISSUED, AND THAT IS THE OPPOSITE OF WHAT THE
+// PREFILL ARM'S TABLE SAYS.** `v_pages` and `k_pages` are read at the same
+// index in the same loop body, so deleting the V fetch removes exactly half of
+// the kernel's scalar loads -- and it returns NOTHING. The two arms are the
+// same file and they are not the same kernel: the prefill arm has 512 rows of
+// work per fire and saturates the issue port, and the decode arm has one.
+//
+// **Nor is it paid per load ADDRESS.** A lane's `PIE_DP` words are strided by
+// `PIE_DX` and so are 128 B apart; remapping all six sites to `cl * PIE_DP + p`
+// makes them adjacent, which is what a `vec4` load would need. Three
+// INTERLEAVED rounds -- strided 7.429/7.454/7.456, contiguous
+// 7.483/7.404/7.439 -- and the two means are 7.446 and 7.442. The pattern is
+// free, so the "fewer, wider loads" idea has nothing to buy even if naga
+// emitted the wide load.
+//
+// **And a lane cannot own more anyway.** `PIE_DX = 16` is the shape in which a
+// lane holds four CONTIGUOUS words, one 16-byte vector. It self-derives --
+// `PIE_DP` 4, `ks` still covers `PIE_KY`, `lim` 16 is still inside a subgroup,
+// `@workgroup_size` unchanged -- and it costs 0.55 ms. The reason is two lines
+// away: `PIE_KY = PIE_KB * PIE_DP` doubles, so `pie_sdpa_macc` doubles to 8
+// KiB, and this is the identical residency cliff `quant/qmv.wgsl` fell off
+// when its `qmv_partials` grew. Every kernel in this tree that has been asked
+// to hold more state has said no.
+//
+// # THE PAGE WALK IS THE ONLY THING THAT ANSWERS, AND IT CANNOT BE COLLECTED
+//
+// 0.197 ms is 2.6% of a token and 17% of the loop, and all three readings sit
+// below every baseline reading, so it is real. It is also the only DEPENDENT
+// load in the body: `kv_page_indices` must return before the K and V addresses
+// exist. That is why it prices and the other four loads do not -- it is not
+// bytes and not issue slots, it is a serial chain of two loads per key.
+//
+// Four ways of shortening that chain, all measured, all reverted:
+//
+// ```text
+//   fix                                            decode p50
+//   shipped                                          7.446
+//   cache the entry in a register across a page      7.561
+//   stage the split's slice into workgroup memory    7.714
+//   the same, with the fallback branch removed       7.637
+//   prefetch the entry one block ahead               7.567
+// ```
+//
+// The register cache is right about the redundancy -- this lane's keys advance
+// by `PIE_KSPAN` a block, so at `page_size` 16 it re-reads the same entry four
+// times -- and the `if` that skips the re-read costs more than the read. The
+// staged version says the thing worth remembering: **workgroup memory is
+// SLOWER here than the storage load it replaces**, by 0.19 ms, with the
+// fallback branch removed so nothing else is in the way. And the prefetch says
+// the chain was already being hidden by whatever the compiler does.
+//
+// So the probe bounds the fix at 0.197 and four fixes collect zero, which is
+// this file's sixth rule for the third time.
+//
+// # WHAT THAT LEAVES
+//
+// Nothing in the body prices. Deleting half the loads, all the shuffles, all
+// the transcendentals or the address arithmetic each returns zero, and the
+// loop is still 1.15 ms. A kernel whose parts are all free and whose whole is
+// not is bound at the LOOP, not at any instruction in it: 64 keys of a serial
+// online-softmax dependence with one row of work to hide it behind, at an
+// occupancy the `PIE_KR` and `PIE_DX` sweeps have both already pinned to the
+// smallest state a lane can hold. The next idea has to change how many
+// independent things are in flight -- and `PIE_SPLITS`, which is exactly that
+// knob, has been swept four times and says eight.
 //#if defined(PIE_SPLITK)
 const PIE_KR: u32 = 1u;
 //#else

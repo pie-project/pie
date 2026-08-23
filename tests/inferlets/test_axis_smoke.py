@@ -86,4 +86,4 @@ async def test_axis_smoke(client, args):
 if __name__ == "__main__":
     from conftest import run_tests
 
-    run_tests([test_axis_smoke], "axis smoke")
+    run_tests([test_axis_smoke], "axis smoke", requires=("attn_score",))

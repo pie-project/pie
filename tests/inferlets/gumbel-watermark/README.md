@@ -16,7 +16,7 @@ The greenlist scheme this is contrasted with is Kirchenbauer et al. —
 
 **Faithfulness: Exact (equivalent form)**, with one bounded deviation (below).
 See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

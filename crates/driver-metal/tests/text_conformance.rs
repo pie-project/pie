@@ -57,7 +57,6 @@ const QUANTISED: Geometry = Geometry {
     q_heads: 0,
     kv_heads: 0,
     head_dim: 0,
-    rotary_dims: 0,
     n_experts: 0,
     experts_per_token: 0,
     group: 64,
@@ -97,7 +96,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 16,
                 kv_heads: 8,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
                 ..QUANTISED
@@ -126,7 +124,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 32,
                 kv_heads: 8,
                 head_dim: 64,
-                rotary_dims: 64,
                 n_experts: 0,
                 experts_per_token: 0,
                 ..QUANTISED
@@ -153,7 +150,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 32,
                 kv_heads: 4,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 128,
                 experts_per_token: 8,
                 ..QUANTISED
@@ -193,7 +189,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 32,
                 kv_heads: 4,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 128,
                 experts_per_token: 8,
                 ..QUANTISED
@@ -237,12 +232,10 @@ fn texts() -> Vec<Text> {
                 )
             },
             // Qwen2.5-1.5B as measured: 12 q heads, 2 kv, hidden 1536 / 12.
-            // Standard rope over the whole head, so `rotary_dims == head_dim`.
             geometry: Geometry {
                 q_heads: 12,
                 kv_heads: 2,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
                 ..QUANTISED
@@ -267,7 +260,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 64,
                 kv_heads: 8,
                 head_dim: 64,
-                rotary_dims: 64,
                 n_experts: 32,
                 experts_per_token: 4,
                 // The SECOND affine point, which is the whole reason this
@@ -305,7 +297,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 16,
                 kv_heads: 8,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
                 // The SECOND attention shape, which is the whole reason this
@@ -351,7 +342,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 16,
                 kv_heads: 8,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
                 bits: 8,
@@ -390,7 +380,6 @@ fn texts() -> Vec<Text> {
                 q_heads: 16,
                 kv_heads: 8,
                 head_dim: 128,
-                rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
                 // The SECOND attention shape, which is the whole reason this

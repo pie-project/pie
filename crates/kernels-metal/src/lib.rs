@@ -161,19 +161,58 @@ pub const ELSEWHERE: &[kernels::routine::Declared] = &[kernels::routine::Declare
     whole: false,
     depth_prefix_plan: false,
     derived: &[
-        kernels::Derived { name: "x", nullable: false },
-        kernels::Derived { name: "w", nullable: false },
-        kernels::Derived { name: "eps", nullable: false },
-        kernels::Derived { name: "axis", nullable: false },
-        kernels::Derived { name: "w_stride", nullable: false },
-        kernels::Derived { name: "plus_one", nullable: false },
-        kernels::Derived { name: "gain", nullable: false },
-        kernels::Derived { name: "row_pitch", nullable: false },
-        kernels::Derived { name: "rotary", nullable: false },
-        kernels::Derived { name: "scale", nullable: false },
-        kernels::Derived { name: "base_or_mscale", nullable: false },
-        kernels::Derived { name: "positions", nullable: false },
-        kernels::Derived { name: "rows", nullable: false },
+        kernels::Derived {
+            name: "x",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "w",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "eps",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "axis",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "w_stride",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "plus_one",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "gain",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "row_pitch",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "rotary",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "scale",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "base_or_mscale",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "positions",
+            nullable: false,
+        },
+        kernels::Derived {
+            name: "rows",
+            nullable: false,
+        },
     ],
     canon: None,
 }];

@@ -30,7 +30,7 @@
 // crate's tree, so any one regeneration may leave part of it unused.
 #![allow(unused_imports)]
 
-use kernels::{OutRule, OutWidth};
+use ::kernels::{OutRule, OutWidth};
 use model_ir::trace::{DType, Shape, StateRef, ValueId};
 
 use super::{ruled_out, rows_of};

@@ -316,6 +316,16 @@ impl Lowerer<'_> {
     // `emit_bound` directly; a helper that takes two of the three overrides is
     // no shorter than the call it wraps. RETIRED.
 
+    // EIGHT, AND THE EIGHTH IS THE POINT. Three of these are overrides that
+    // exist so the two wrappers above can be one-liners, and folding them into
+    // a struct would move the same three names to a different line without
+    // removing a caller's obligation to say them. The note directly above is
+    // the measurement: the last attempt to shorten this list produced a helper
+    // no shorter than the call.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "three of the eight are the overrides the wrappers above exist to elide"
+    )]
     fn emit_bound(
         &mut self,
         at: usize,
@@ -332,11 +342,33 @@ impl Lowerer<'_> {
         let backend = self
             .backend
             .ok_or_else(|| Uncovered::UnknownBackend(self.plan.family.clone()))?;
+        // WHAT THE BACKEND SAYS ABOUT THIS SYMBOL, and the case where it
+        // says nothing. This used to read `if let Some(sig) = ..` and fall
+        // through on `None`, treating "the backend has never heard of this
+        // name" as "no `whole` constraint to enforce". Those are not the same
+        // sentence. `stated_in` answers `None` only when the symbol is absent
+        // from the backend's catalogue entirely -- Metal's arm has a fallback
+        // for a catalogued entrypoint with no routine, so `None` there means
+        // `kernel_of` did not resolve -- so every `None` was a launch naming a
+        // kernel that cannot be looked up, lowered without a word.
+        //
+        // It was found from the other end: the nineteen semantic arms spoke
+        // CUDA's `module::name` namespace while Metal's census holds bare
+        // entrypoints, so no arm could ever have resolved against Metal, and
+        // the reason nobody noticed for as long as that lasted is this
+        // fall-through. A plan that cannot run should not lower.
+        let Some(sig) = kernels::stated_in(backend, kernel) else {
+            return Err(Uncovered::UndeclaredSymbol {
+                at_op: at,
+                kernel: kernel.to_string(),
+                backend: match backend {
+                    kernels::Backend::Cuda => "cuda",
+                    kernels::Backend::Metal => "metal",
+                },
+            });
+        };
         // `whole` kernels may only cover the full fire.
-        if let Some(sig) = kernels::stated_in(backend, kernel)
-            && sig.whole
-            && (window.start != 0 || window.end != self.rows.len() as u32)
-        {
+        if sig.whole && (window.start != 0 || window.end != self.rows.len() as u32) {
             return Err(Uncovered::WholeKernelSplit {
                 at_op: at,
                 kernel: kernel.to_string(),

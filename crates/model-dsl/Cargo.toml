@@ -26,6 +26,7 @@ name = "model_dsl"
 path = "src/lib.rs"
 
 [dependencies]
+model-dsl-macros = { path = "../model-dsl-macros" }
 # Only for the two `derive`s on `WeightRepr` / `ScaleLayout`: a weight's
 # representation is a deployment fact that crosses to the loader, so it
 # serializes even though nothing else on this surface does.

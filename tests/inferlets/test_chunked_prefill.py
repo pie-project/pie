@@ -346,4 +346,5 @@ run_tests(
         test_policies_agree_with_the_baseline_past_the_ceiling,
     ],
     description="Chunked prefill (Track A + Track B)",
+    requires=("envelope_dot", "attn_score"),
 )

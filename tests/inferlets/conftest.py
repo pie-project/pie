@@ -4,15 +4,16 @@ Provides:
   - `run_inferlet()` to install + launch + collect output from an inferlet.
   - `run_tests()` entrypoint that spins up a Pie server once and runs caller-
     supplied test coroutines against it.
-  - Standard CLI options (--model, --device, --dummy, --timeout, --verbose).
+  - Standard CLI options (--model, --device, --driver, --timeout, --verbose).
 
 Each ``test_<name>.py`` file defines one or more async test functions and a
 ``tests()`` list, then calls ``run_tests(tests())`` from its ``__main__`` block.
 
 Usage from project root::
 
-    uv run python tests/inferlets/test_curated.py --dummy
-    uv run python tests/inferlets/test_curated.py --model Qwen/Qwen3-0.6B
+    uv run python tests/inferlets/test_curated.py
+    uv run python tests/inferlets/test_curated.py --driver vulkan \
+        --model mlx-community/Qwen3-0.6B-4bit
 """
 
 from __future__ import annotations
@@ -41,6 +42,18 @@ INFERLETS_DIR = Path(__file__).resolve().parent
 def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.addoption = parser.add_argument  # convenience alias
+    # A store name, a HuggingFace repo id, or a path to a `.zt` artifact --
+    # whatever `[model] model` accepts, since that is where this lands.
+    #
+    # THE DEFAULT DOES NOT BOOT THE SHADER BACKENDS. `Qwen/Qwen3-0.6B` is an
+    # unquantised release, and `metal`, `vulkan` and `wgpu` all load through
+    # the MLX contract, which binds every projection on its affine-U4 path and
+    # refuses a checkpoint carrying no `.scales`. The refusal is clear about
+    # what to do -- a pre-quantised repo (`mlx-community/*-4bit`) or a `.zt`
+    # built with `--quant int4` -- but it arrives at server construction, so a
+    # `--driver vulkan` run with the default stops before the first inferlet
+    # rather than reporting thirty-nine failures. The CUDA drivers take the
+    # unquantised release as it is, which is why this default is what it is.
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
     parser.add_argument("--device", default=None,
                         help="Device(s), comma-separated. Default: 'metal:0' for --driver metal, "
@@ -55,28 +68,37 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--kv-pages", type=int, default=None,
                         help="KV pages the backend opens with (default: the backend's own)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
-    driver_group = parser.add_mutually_exclusive_group()
-    # `wgpu` and `vulkan` are the two pure-Rust backends. They were missing
-    # here for as long as the embedded wheel could not host them -- it pinned
-    # `worker/driver-cuda` -- so naming one produced a server with no driver.
-    # The wheel takes a feature now (`maturin build --no-default-features
-    # --features driver-wgpu`), and a build that did not select the named
-    # backend fails at boot saying so, which is a better answer than a choice
-    # list that pretends the option does not exist.
-    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native", "metal", "vulkan", "wgpu"],
-                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', 'cuda_native', 'metal', 'vulkan' or 'wgpu'")
-    driver_group.add_argument("--dummy", action="store_true",
-                              help="Alias for --driver dummy")
-    parser.add_argument("--vllm-attention-backend", default=None,
-                        help="vLLM attention backend (FLASH_ATTN / FLASHINFER / TRITON_ATTN / FLEX_ATTENTION). Default: vllm auto-picks")
-    parser.add_argument("--sglang-attention-backend", default="triton",
-                        help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Default: triton (cleanest custom-mask support)")
+    # THE FOUR THE CONFIG ACCEPTS, AND NOT ONE MORE.
+    #
+    # This list is `worker::config::DriverKind`, whose serde is
+    # `rename_all = "snake_case"` over four variants. A name outside it does
+    # not degrade or fall back -- `Server(cfg)` raises before the first
+    # inferlet runs:
+    #
+    #     unknown variant `dev`, expected one of `cuda_native`, `metal`,
+    #     `vulkan`, `wgpu`
+    #
+    # It offered nine for a while, five of which were the pre-rewrite Python
+    # engine's out-of-process drivers (`dev`, `vllm`, `sglang`,
+    # `tensorrt_llm`, `dummy`). Those went with that engine, and no Python
+    # driver tree is left in this repository to host them. `dev` was the
+    # DEFAULT and `--dummy` the invocation this module's own docstring gave,
+    # so the harness's two most-typed commands both died at the door, in a
+    # message about TOML.
+    #
+    # `wgpu` and `vulkan` really do work: the wheel takes a feature
+    # (`maturin build --no-default-features --features driver-vulkan`), and a
+    # build that did not select the named backend fails at boot saying so,
+    # which is a better answer than a choice list that pretends the option
+    # does not exist.
+    parser.add_argument("--driver", default="cuda_native",
+                        choices=["cuda_native", "metal", "vulkan", "wgpu"],
+                        help="Embedded driver: 'cuda_native', 'metal', 'vulkan' or 'wgpu'")
     parser.add_argument("--cpu-mem-gb", type=int, default=0,
                         help="Pinned host KV pool size in GiB. 0 = swap disabled. "
-                             "Native and sglang both honor this; vllm doesn't yet.")
+                             "Only cuda_native serves a host swap pool.")
     parser.add_argument("--spec-ngram", action="store_true",
-                        help="Enable driver-supplied NGRAM speculative-decoding drafts "
-                             "(sglang and vllm drivers).")
+                        help="Enable driver-supplied NGRAM speculative-decoding drafts.")
     parser.add_argument("--spec-num-drafts", type=int, default=4,
                         help="Number of NGRAM draft tokens proposed per iteration.")
     parser.add_argument("--output-dir", default=None,
@@ -280,13 +302,9 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
 
     # Build the [model.driver.options] subsection content.
     driver_subsection: dict = {}
-    if args.driver == "vllm" and args.vllm_attention_backend is not None:
-        driver_subsection["attention_backend"] = args.vllm_attention_backend
-    if args.driver == "sglang":
-        driver_subsection["attention_backend"] = args.sglang_attention_backend
-    if args.cpu_mem_gb > 0 and args.driver in ("dev", "sglang", "dummy"):
+    if args.cpu_mem_gb > 0 and args.driver == "cuda_native":
         driver_subsection["cpu_mem_budget_in_gb"] = args.cpu_mem_gb
-    if args.driver in ("sglang", "vllm") and args.spec_ngram:
+    if args.spec_ngram:
         driver_subsection["spec_ngram_enabled"] = True
         driver_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
 
@@ -355,12 +373,60 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         return 0 if passed >= total else 1
 
 
-def run_tests(tests: list[TestFn], description: str = "Inferlet E2E Test") -> None:
-    """Parse CLI args, start server, run tests, exit."""
+#: Driver capabilities that NO driver in this repository advertises.
+#:
+#: `PtirCaps` (`crates/driver-api/src/capabilities.rs`) declares
+#: `has_kv_envelopes`, `has_attn_score` and `has_attn_page_mask`, and every
+#: driver that fills one in states it as a literal `false`: `driver-cuda/src/
+#: serve/load.rs`, `driver-vulkan/src/shell.rs`, `driver-metal/src/serve/
+#: load.rs`, and the engine-side `vulkan.rs` and `wgpu.rs` adapters. All five,
+#: all three fields, no condition and no environment variable.
+#:
+#: So a suite whose inferlets bind `envelope_dot`, `attn_score` or
+#: `attn_page_mask` cannot pass anywhere, on any backend, on any checkpoint.
+#: That is not a bug in the suite -- these are the repo-side regression floor
+#: for a feature that is partly built and not finished -- but running one
+#: without knowing it costs a model boot and produces a screen of identical
+#: bind refusals, which is exactly the shape of output that teaches nothing.
+#:
+#: `crates/driver-api/tests/nothing_advertises_the_attention_taps.rs` holds
+#: the other end: when someone flips a literal, that gate fails and names this
+#: constant, so the skip below cannot outlive the gap it describes.
+UNADVERTISED = {
+    "envelope_dot": "has_kv_envelopes",
+    "attn_score": "has_attn_score",
+    "attn_page_mask": "has_attn_page_mask",
+}
+
+
+def run_tests(
+    tests: list[TestFn],
+    description: str = "Inferlet E2E Test",
+    requires: tuple[str, ...] = (),
+) -> None:
+    """Parse CLI args, start server, run tests, exit.
+
+    `requires` names the driver-advertised kernels and intrinsics this suite's
+    inferlets bind. Any entry in `UNADVERTISED` makes the suite skip before the
+    server starts, because no backend here can serve it.
+    """
     parser = make_parser(description)
     args = parser.parse_args()
-    if args.dummy:
-        args.driver = "dummy"
+    blocked = [name for name in requires if name in UNADVERTISED]
+    if blocked:
+        bits = ", ".join(f"`{UNADVERTISED[name]}` (for `{name}`)" for name in blocked)
+        print(f"\n=== {description}")
+        print(
+            f"SKIPPED: this suite binds {', '.join(f'`{n}`' for n in blocked)}, and "
+            f"no driver in this repository advertises {bits}.\n"
+            "Every such field is a literal `false` in driver-cuda, driver-vulkan, "
+            "driver-metal and the two engine-side adapters, so the suite would boot "
+            "a model and then fail every case at bind with the same message.\n"
+            "See `conftest.UNADVERTISED`; when the capability lands, "
+            "`crates/driver-api/tests/nothing_advertises_the_attention_taps.rs` "
+            "fails and points back here."
+        )
+        sys.exit(0)
     try:
         rc = asyncio.run(_run(tests, args))
     except KeyboardInterrupt:

@@ -181,6 +181,7 @@ mod tests {
             ops: Vec::new(),
             depth_window: false,
             seams: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 
@@ -230,7 +231,10 @@ mod tests {
                     Ok::<_, ()>(empty_plan())
                 })
                 .expect("an empty plan lowers");
-            assert_eq!(lowered.launches.len(), 0);
+            // THROUGH `lowered`. The cache hands back a `Planned`, which
+            // holds the flat launch list beside the runtime streams the
+            // plan named; the launches were never its own field.
+            assert_eq!(lowered.lowered.launches.len(), 0);
         }
         assert_eq!(plans, 1, "the plan is built on a miss and only on a miss");
         assert_eq!(cache.lowered(), 1);

@@ -10,7 +10,7 @@ Entropy-based Dynamic Temperature Sampling*** —
 <https://arxiv.org/abs/2403.14541>. Implements Eq. 7.
 
 **Faithfulness: Exact.** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

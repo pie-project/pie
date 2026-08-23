@@ -27,11 +27,9 @@
 
 use kernels::Ty;
 use kernels::bind::Holds;
-use kernels::bind::{Answer, Holds};
 use kernels::routine::Refusal;
 use kernels_vulkan::routine::ArgValue;
 
-use crate::binding::FireTable;
 use crate::hold::{Facts, Handles};
 
 /// A statement and a fire, together, as the shared binder asks them.

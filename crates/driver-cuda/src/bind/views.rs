@@ -413,6 +413,10 @@ fn recurrent_view(g: &GdnCtx, layer: usize) -> RecurrentView {
 /// `every_plane_is_answered`: a test walks every catalogued SKU's
 /// `plan.runtime` against this list, so a text minting a name nothing
 /// answers fails the build, not the fire.
+///
+/// The gate walks it BOTH WAYS. A name here that no catalogued text mints is
+/// a claim nothing exercises, and it fails the same test — see the note where
+/// `"fa2.decode"` used to sit for what an unexercised entry costs.
 pub const ANSWERED: &[&str] = &[
     // streams
     "positions",
@@ -429,9 +433,25 @@ pub const ANSWERED: &[&str] = &[
     "attn.score",
     "moe.expert_weights",
     "fa2.prefill",
-    "fa2.decode",
     "qo_indptr.host",
     "kv_page_indptr.host",
+    // `"fa2.decode"` STOOD HERE, and it was the only entry in this list that
+    // no arm of `raised()` could answer -- a text minting it would have
+    // passed `every_runtime_name_is_answered` and then refused at the fire,
+    // which is the exact failure this list exists to move earlier.
+    //
+    // It is not an oversight and it is not unstaged either: the driver owns
+    // the object (`FireScratch::decode_plan`, and a second one in
+    // `decode_plan_full`), it just does not deliver it by name. There are TWO
+    // decode schedules whenever a stack keeps one per layer kind, and picking
+    // between them needs the WINDOW on the statement's `LaunchSpec`, which
+    // `bind::attn_plan` reads and a raise key does not carry. A one-valued
+    // answer here would hand half the launches the other kind's schedule --
+    // silently, and only on the stacks that keep two.
+    //
+    // So the decode plan travels the attn-plan channel, and this list does
+    // not claim otherwise. If a text ever does mint `"fa2.decode"`, the gate
+    // now fails by name and this note is the answer to why.
 ];
 
 /// Runtime names this driver KNOWS but deliberately refuses until their

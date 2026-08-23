@@ -792,6 +792,70 @@ mod tests {
     use kernels::Grid;
     use kernels_metal::routine::{Bind, Ctx, In, Out, Tensor, Usize, bf16};
 
+    /// The statement a synthetic fire would have made, for one routine.
+    ///
+    /// The censuses below bind every live routine against one made-up fire.
+    /// Most operands need nothing from the statement -- the binder reads them
+    /// off `ins`/`outs`/`weights` -- but a `Ty::Raised` operand is a HOST
+    /// object the driver builds, and `views::raise` finds it by looking up the
+    /// statement's arg at the input slot the signature names and reading the
+    /// KEY off it. With no statement there is no key, so every such operand
+    /// refuses identically and says nothing about the routine.
+    ///
+    /// Which key belongs at which slot is not guessed. Measured from the
+    /// signatures themselves, the twenty-nine raised operands in the table
+    /// fall into three families and five slots:
+    ///
+    /// - `sdpa_*` raises its cache at `In(1)`, its mask at `In(4)` and its
+    ///   split policy at `In(5)`.
+    /// - `kv_append*` raises its cache at `In(2)`.
+    /// - `gdn_*` raises its recurrent state at `In(3)` or `In(4)`, which is
+    ///   why the slot alone cannot decide: `In(4)` is a mask to one family and
+    ///   a recurrent state to the other.
+    ///
+    /// So the family picks, and the slot picks within it. If a routine ever
+    /// moves a raise to a slot not listed here it gets no raise, refuses, and
+    /// is named -- which is the census working, on a question it can now
+    /// answer.
+    ///
+    /// # What this does NOT check, measured
+    ///
+    /// The mapping above. Swapping `recurrent_state` for `kv_cache` on the
+    /// whole `gdn` family leaves all 321 tests green, because `Ty::Raised` is
+    /// one opaque word for all four views and `fits` can only ask that the
+    /// binder raised SOMETHING. The census's subject is the argument list, and
+    /// it is honest about that; the keys here are stated from the signatures
+    /// and are not held against anything. A wrong one would surface on a
+    /// device, in the routine that reads the view, and nowhere earlier.
+    fn raises_of(stem: &str, width: usize) -> Vec<model_compiler::lower::Arg> {
+        let key = |slot: usize| -> Option<&'static str> {
+            if stem.starts_with("gdn") {
+                (slot == 3 || slot == 4).then_some("recurrent_state")
+            } else if stem.starts_with("kv_append") {
+                (slot == 2).then_some("kv_cache")
+            } else {
+                match slot {
+                    1 => Some("kv_cache"),
+                    4 => Some("attention_mask"),
+                    5 => Some("attn.split_policy"),
+                    _ => None,
+                }
+            }
+        };
+        (0..width)
+            .map(|slot| match key(slot) {
+                Some(key) => model_compiler::lower::Arg::Raised {
+                    value: 0,
+                    key: key.to_owned(),
+                },
+                // An ordinary operand, which the view plane never reads: only
+                // `raise` consults this list, and only at a slot a signature
+                // marked raised.
+                None => model_compiler::lower::Arg::Weight(String::new()),
+            })
+            .collect()
+    }
+
     fn handle(address: u64, width: u32) -> BoundArg {
         BoundArg {
             slice: Slice {
@@ -1223,6 +1287,14 @@ mod tests {
             Ty::U32 | Ty::InPacked => matches!(v, ArgValue::U32(_)),
             Ty::F32 => matches!(v, ArgValue::F32(_)),
             Ty::Usize => matches!(v, ArgValue::Usize(_)),
+            // A raised operand is an ADDRESS of a host view the driver built,
+            // and the signature does not say which view: `Ty::Raised` is one
+            // opaque word for all four of them. So this is the whole question
+            // that can be asked here -- that the binder raised something
+            // rather than binding a buffer or a scalar into the slot. WHICH
+            // view belongs there is `raises_of`'s claim, and the routines that
+            // read it are the ones that would fault on a wrong one.
+            Ty::Raised => matches!(v, ArgValue::Raised(_)),
             other => panic!("no metal routine took `{other:?}` when this was written"),
         };
 
@@ -1230,6 +1302,19 @@ mod tests {
             .map(|i: u64| handle(0x1_0000 + i * 0x1000, 64))
             .collect();
         let ins: Vec<usize> = (0..8).collect();
+        // The operand list the binder's VIEW plane reads, stated per routine
+        // by [`raises_of`]. IT WAS `Vec::new()`, and the comment that stood
+        // here said an empty list makes a `Ty::Raised` operand refuse, which
+        // is what a census wants to hear about rather than to paper over.
+        //
+        // The first half was true and the second was the wrong conclusion.
+        // Twenty-nine raised operands across sixteen routines refused, every
+        // one of them with the same sentence -- "nothing states a raised view
+        // where the statement placed an ordinary operand" -- which is not a
+        // fact about any routine. It is the fixture saying it declined to
+        // state one. A census that hands nothing where the fire hands a
+        // runtime object has not asked a harder question; it has asked an
+        // unanswerable one, and then failed every routine for not answering.
         let outs: Vec<usize> = (8..16).collect();
         let weights: Vec<usize> = (16..24).collect();
         // Non-zero, because arms divide by these: a group size of zero is
@@ -1240,7 +1325,6 @@ mod tests {
                 q_heads: 8,
                 kv_heads: 2,
                 head_dim: 64,
-                rotary_dims: 64,
                 n_experts: 8,
                 experts_per_token: 2,
                 ..Geometry::default()
@@ -1277,6 +1361,7 @@ mod tests {
                     routine.sources,
                     &mut handles,
                     facts,
+                    &mut crate::lowering::views::Views::over(&raises_of(stem, ins.len()), &ins),
                 ) {
                     Ok(built) => built,
                     Err(why) => {
@@ -1398,9 +1483,11 @@ mod tests {
     /// several. `Refusal::Unstated` is the binder saying it has NO CASE, and
     /// that is the failure -- a source in the column no code path answers.
     ///
-    /// It found one on landing. `keys::RotaryWidth` is the fallback of seven
+    /// It found one on landing. `keys::RotaryWidth` was the fallback of seven
     /// `ParamOr<3, ..>` sites, `arm.rs` answered it from `Facts::rotary_dims`,
-    /// and `bind::named` had no case for it.
+    /// and `bind::named` had no case for it. All three are gone now -- those
+    /// sites read the width off the statement -- so this paragraph is the
+    /// record of what the gate caught, not of a case it still guards.
     #[test]
     fn every_source_in_the_column_is_one_the_binder_answers() {
         use crate::lowering::dispatch::Geometry;
@@ -1439,6 +1526,19 @@ mod tests {
             .map(|i: u64| handle(0x1_0000 + i * 0x1000, 64))
             .collect();
         let ins: Vec<usize> = (0..8).collect();
+        // The operand list the binder's VIEW plane reads, stated per routine
+        // by [`raises_of`]. IT WAS `Vec::new()`, and the comment that stood
+        // here said an empty list makes a `Ty::Raised` operand refuse, which
+        // is what a census wants to hear about rather than to paper over.
+        //
+        // The first half was true and the second was the wrong conclusion.
+        // Twenty-nine raised operands across sixteen routines refused, every
+        // one of them with the same sentence -- "nothing states a raised view
+        // where the statement placed an ordinary operand" -- which is not a
+        // fact about any routine. It is the fixture saying it declined to
+        // state one. A census that hands nothing where the fire hands a
+        // runtime object has not asked a harder question; it has asked an
+        // unanswerable one, and then failed every routine for not answering.
         let outs: Vec<usize> = (8..16).collect();
         let weights: Vec<usize> = (16..24).collect();
         // THE POINT OF THE TEST: no scalars, so every chain falls through to
@@ -1451,7 +1551,6 @@ mod tests {
                 head_dim: 64,
                 v_heads: 2,
                 v_dim: 64,
-                rotary_dims: 32,
                 n_experts: 8,
                 experts_per_token: 2,
                 ..Geometry::default()
@@ -1470,7 +1569,7 @@ mod tests {
         let mut unanswered: Vec<String> = Vec::new();
         let mut asked = 0usize;
         {
-            for (name, _stem) in LIVE {
+            for (name, stem) in LIVE {
                 let Some(routine) = row(name) else {
                     continue;
                 };
@@ -1484,6 +1583,7 @@ mod tests {
                         &routine.sources[at..=at],
                         &mut handles,
                         facts,
+                        &mut crate::lowering::views::Views::over(&raises_of(stem, ins.len()), &ins),
                     );
                     if let Err(Refusal::Unstated { what }) = one {
                         unanswered.push(format!("  {name} argument {at}: {what}"));

@@ -47,6 +47,14 @@ use crate::binding::{FireNumber, FireTable};
 /// `Default` is the empty holder `plan` starts each launch with; the probe
 /// pass gets a scratch one whose views are dropped with it.
 #[derive(Debug, Default)]
+// `clippy::vec_box` reads `Vec<Box<T>>` as `T` moved twice for no reason, and
+// usually it is -- but `raise` hands out `std::ptr::from_ref` of each boxed
+// view BEFORE pushing it, and that address must survive every later push.
+// A `Vec<T>` reallocates and slides every element when it grows, which would
+// move the view out from under an address a body is still holding; a
+// `Vec<Box<T>>` only ever moves the (interior) pointers, never the pointee.
+// The field comment already says this; the lint just does not read English.
+#[allow(clippy::vec_box)]
 pub struct Views {
     /// Boxed so every address is stable however the vectors grow.
     kv: Vec<Box<PagedKvView>>,

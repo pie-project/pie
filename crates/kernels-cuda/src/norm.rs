@@ -408,7 +408,7 @@ pub fn rmsnorm_gemma<T>(
     )
 }
 
-#[routine(bf16, out(y = like(x)))]
+#[routine(bf16, canon = "rmsnorm.no_scale", out(y = like(x)))]
 pub fn rmsnorm_no_scale<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -548,7 +548,26 @@ pub fn rmsnorm_gated_fp32_in<T>(
     )
 }
 
-#[routine(bf16, canon = residual_add, out(norm_out = like(hidden)))]
+// THE `canon = residual_add` CLAIM STOOD HERE, AND WAS WRONG.
+//
+// This routine is the FUSED form: it adds the residual and then normalises,
+// reading three pointers and a weight. The canon point `residual_add` is the
+// PLAIN elementwise add -- metal, vulkan and wgpu all claim it with a routine
+// that takes two operands and no weight, and `Val`'s `+=` is what states it,
+// through `Trace::canon`.
+//
+// So on CUDA, and only on CUDA, every `y += rhs` that did not fold into a
+// GEMM's beta stated this symbol with two inputs, no weight and no epsilon.
+// `canon_symbol` answers the FIRST row claiming a point and this was the only
+// one, so there was no ambiguity to trip over -- the wrong answer was the only
+// answer. `check_plan`'s arity guard catches it (`reads 3 pointers but the
+// statement places 2`), which is what it is for, and `catalog_coverage` is
+// where it says so. That gate had been dark, along with most of the tree's.
+//
+// The claim now sits on `norm::residual_add` below, which is the routine that
+// does what the point names. This one is stated by name, by the one text that
+// wants the fusion (`llama_like`'s tensor-parallel MLP prologue).
+#[routine(bf16, out(norm_out = like(hidden)))]
 pub fn residual_add_rmsnorm<
     T: crate::RoutineElem + kernels::routine::Elem<Read = *const T, Write = *mut T>,
 >(
@@ -868,7 +887,12 @@ pub fn tanh_f16(ctx: &Ctx<'_>, x: InOut<Tensor<f16>>) -> Result<(), Refusal> {
     )
 }
 
-#[routine(bf16, out(y = like(y)))]
+/// The canon point `residual_add`: add a residual into an accumulator.
+///
+/// The claim was on `norm::residual_add_rmsnorm` -- the FUSED form -- for as
+/// long as the gate that would have said so could not compile. See the note
+/// there for what that cost.
+#[routine(bf16, canon = residual_add, out(y = like(y)))]
 pub fn residual_add<T>(
     ctx: &Ctx<'_>,
     y: InOut<Tensor<T>>,
@@ -914,7 +938,7 @@ pub fn residual_add_f16(
     )
 }
 
-#[routine(bf16, out(x = like(x)))]
+#[routine(bf16, canon = mul_scalar, out(x = like(x)))]
 pub fn scalar_mul<T>(ctx: &Ctx<'_>, x: InOut<Tensor<T>>, s: Const<f32>) -> Result<(), Refusal> {
     let rect = x.all("the rectangle's row width")?;
     let Ok(n) = usize::try_from(rect.elements()) else {
@@ -933,7 +957,7 @@ pub fn scalar_mul<T>(ctx: &Ctx<'_>, x: InOut<Tensor<T>>, s: Const<f32>) -> Resul
     )
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = hc_gates)]
 pub fn hc_pre_postprocess<T>(
     ctx: &Ctx<'_>,
     mixes: In<Tensor<f32>>,
@@ -981,7 +1005,7 @@ pub fn hc_pre_postprocess<T>(
     )
 }
 
-#[routine(bf16, out(out_residual = like(residual)))]
+#[routine(bf16, canon = hc_fold, out(out_residual = like(residual)))]
 pub fn hc_post<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -1012,7 +1036,7 @@ pub fn hc_post<T>(
     )
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = hc_collapse)]
 pub fn hc_head_postprocess<T>(
     ctx: &Ctx<'_>,
     mixes: In<Tensor<f32>>,
@@ -1049,7 +1073,7 @@ pub fn hc_head_postprocess<T>(
     )
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = hc_expand)]
 pub fn hc_expand<T>(
     ctx: &Ctx<'_>,
     input: In<Tensor<T>>,
@@ -1074,7 +1098,7 @@ pub fn hc_expand<T>(
     )
 }
 
-#[routine]
+#[routine(canon = hc_rmsnorm_f32)]
 pub fn hc_rmsnorm_to_f32(
     ctx: &Ctx<'_>,
     input: In<Tensor<bf16>>,
@@ -1094,7 +1118,7 @@ pub fn hc_rmsnorm_to_f32(
     )
 }
 
-#[routine(bf16, out(out = like(out)))]
+#[routine(bf16, canon = "attention.sink", out(out = like(out)))]
 pub fn attn_sink_correction<T>(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<T>>,
@@ -1122,7 +1146,7 @@ pub fn attn_sink_correction<T>(
     )
 }
 
-#[routine(bf16, out(q = split(q, head_dim)))]
+#[routine(bf16, canon = "rmsnorm.per_head", out(q = split(q, head_dim)))]
 pub fn per_head_rmsnorm<T>(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<T>>,

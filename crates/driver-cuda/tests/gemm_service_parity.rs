@@ -72,52 +72,29 @@ use cudarc::runtime::sys::{
 use driver_cuda::bind::DispatchCtx;
 use kernels::routine::{Const, In, Out};
 
-/// The facts the launchers in this file ask their context for.
+/// The two widths the launchers in this file still ask their context for.
 ///
-/// Three of them were parameters — `Rows::env(tokens)`, `Env<i32,
-/// keys::OutWidth0>`, `Env<i32, keys::InWidth0>` — and are a `ctx.ask` now,
-/// so a bare `Ctx` has nothing behind it to answer with and every call
-/// refuses `Unstated`. This file knows all three numbers; it had no way to
-/// say so, because the target has not compiled for as long as the marks have
-/// existed and nothing ran to report it.
+/// It was three, then ten, and it is two. `Rows::env(tokens)`,
+/// `Env<i32, keys::OutWidth0>` and `Env<i32, keys::InWidth0>` were
+/// parameters, became `ctx.ask`s, and `grouped_act_x_wt_bf16` then turned
+/// its WHOLE argument list into asks -- the group count, the bias, three
+/// device pointer arrays and a host row-count array, all by name, carried
+/// here in a `grouped: Option<Grouped>` payload.
 ///
-/// AND THE PROMISE BELOW CAME DUE. This block used to end *"a launcher that
-/// grows a fourth `ask` fails here naming it rather than running on a
-/// silently invented number"*, and `grouped_act_x_wt_bf16` then grew six:
-/// its whole argument list became asks, so the wrapper takes `&Ctx` alone
-/// and every one of the group count, the bias, the three device pointer
-/// arrays and the host row-count array arrives through `resolve`. That is
-/// the `grouped` field — a payload the fixture stages per row of `GROUPED`
-/// and hands over by name.
-///
-/// It is an `Option` rather than six more bare fields because the MLA half
-/// of this file builds a `Facts` too and holds none of them, and answering
-/// a grouped key with a null pointer there would be exactly the silently
-/// invented number this fixture exists not to produce. `None` refuses.
+/// The no-ask migration reversed all of it. A routine's operands are
+/// DERIVED from its own signature and bound positionally: the scalars are
+/// `Const` marks the statement carries, the four pointer arrays are one
+/// raised `GemmGroups` view the caller stages, and the row count rides the
+/// operand's rectangle or a `Const`. So `Grouped` STOOD HERE and is gone
+/// with the eight `Source::Named` arms it fed, and what is left is the two
+/// widths the shared binder derives from an operand's shape -- which this
+/// fixture builds by hand, so it has to say them.
 ///
 /// Deliberately exhaustive in the other direction still: an unrecognised
 /// source is a refusal, not a zero.
 struct Facts {
-    rows: i32,
     n: i32,
     k: i32,
-    grouped: Option<Grouped>,
-}
-
-/// One row of `GROUPED`, staged where `resolve` can name it.
-///
-/// The three pointer arrays are DEVICE addresses and the row-count array is
-/// a HOST one, which is the split cuBLAS's grouped form draws and the reason
-/// the fixture stages them separately rather than as one bag: `Aarray`,
-/// `Barray` and `Carray` are dereferenced on the device, `m` is read by the
-/// host as it builds the descriptor.
-struct Grouped {
-    act_ptrs_dev: *const *const c_void,
-    w_ptrs_dev: *const *const c_void,
-    y_ptrs_dev: *const *mut c_void,
-    m_array_host: *const i32,
-    groups: i32,
-    beta: f32,
 }
 
 impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Facts {
@@ -126,7 +103,14 @@ impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Facts {
         _ty: kernels::Ty,
         source: kernels::Source,
     ) -> Result<kernels_cuda::jit::ArgValue, kernels_cuda::Refusal> {
-        use kernels::keys::Fact as _;
+        // `Source::Named` STOOD HERE, eight arms of it: the row count and
+        // the grouped GEMM's six-pointer argument list, each fetched by a
+        // `keys::*` type. The no-ask migration retired the whole vocabulary
+        // -- an operand is DERIVED from the routine's own signature and bound
+        // positionally -- so the row count rides the operand's rectangle and
+        // the grouped list rides one raised view the caller stages. Both are
+        // now handed to the call directly, below, which is why this plane is
+        // two arms rather than ten.
         match source {
             kernels::Source::Slot(kernels::Kind::OutWidth, 0) => {
                 Ok(kernels_cuda::jit::ArgValue::I32(self.n))
@@ -134,44 +118,8 @@ impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Facts {
             kernels::Source::Slot(kernels::Kind::InWidth, 0) => {
                 Ok(kernels_cuda::jit::ArgValue::I32(self.k))
             }
-            kernels::Source::Named(key) if key == kernels::keys::Rows::KEY => {
-                Ok(kernels_cuda::jit::ArgValue::I32(self.rows))
-            }
-            // The grouped GEMM's whole argument list, by name. `as_ref()`
-            // first so that a fixture holding no grouped row refuses the
-            // key instead of answering a null.
-            kernels::Source::Named(key)
-                if self.grouped.is_some()
-                    && matches!(
-                        key,
-                        kernels::keys::GemmActPtrs::KEY
-                            | kernels::keys::GemmWeightPtrs::KEY
-                            | kernels::keys::GemmOutPtrs::KEY
-                            | kernels::keys::GemmMArrayHost::KEY
-                            | kernels::keys::GemmGroupCount::KEY
-                            | kernels::keys::GemmBeta::KEY
-                    ) =>
-            {
-                let g = self.grouped.as_ref().expect("guarded by `is_some` above");
-                Ok(match key {
-                    kernels::keys::GemmActPtrs::KEY => {
-                        kernels_cuda::jit::ArgValue::Ptr(g.act_ptrs_dev.cast_mut().cast())
-                    }
-                    kernels::keys::GemmWeightPtrs::KEY => {
-                        kernels_cuda::jit::ArgValue::Ptr(g.w_ptrs_dev.cast_mut().cast())
-                    }
-                    kernels::keys::GemmOutPtrs::KEY => {
-                        kernels_cuda::jit::ArgValue::Ptr(g.y_ptrs_dev.cast_mut().cast())
-                    }
-                    kernels::keys::GemmMArrayHost::KEY => {
-                        kernels_cuda::jit::ArgValue::Ptr(g.m_array_host.cast_mut().cast())
-                    }
-                    kernels::keys::GemmGroupCount::KEY => {
-                        kernels_cuda::jit::ArgValue::I32(g.groups)
-                    }
-                    _ => kernels_cuda::jit::ArgValue::F32(g.beta),
-                })
-            }
+            // Deliberately exhaustive in the other direction still: an
+            // unrecognised source is a refusal, not a zero.
             _ => Err(kernels_cuda::Refusal::Unstated {
                 what: "a fact this fixture does not hold; see `Facts`",
             }),
@@ -586,27 +534,36 @@ fn transcript() -> Vec<String> {
         // SAFETY: the three device arrays are `groups` long and outlive the
         // call; `ms` is the host row-count array the row declares.
         unsafe {
-            let widths = Facts {
-                rows: 0,
-                n,
-                k,
-                grouped: Some(Grouped {
-                    act_ptrs_dev: dactp.0.cast::<*const c_void>().cast_const(),
-                    w_ptrs_dev: dwp.0.cast::<*const c_void>().cast_const(),
-                    y_ptrs_dev: dyp.0.cast::<*mut c_void>().cast_const(),
-                    m_array_host: ms.as_ptr(),
-                    groups,
-                    beta,
-                }),
-            };
+            let widths = Facts { n, k };
             let gctx = kernels_cuda::jit::Ctx::on(std::ptr::null_mut())
                 .with_cublas(handle.cast())
                 .with_env(&widths);
-            // ONE ARGUMENT, and the other six went into `widths` above.
-            // Every number this call needs is a fact now, so the context
-            // IS the call: a fixture that stages the wrong pointer array
-            // no longer fails to compile, it fails the hash.
-            let fired = kernels_cuda::gemm::grouped_act_x_wt_bf16(&gctx);
+            // AND BACK TO SIX, but not the six it started with. The whole
+            // argument list was `ctx.ask`s for one release; the no-ask
+            // migration derives a routine's operands from its OWN signature,
+            // so the four scalars are `Const` marks the statement carries and
+            // the four pointer arrays are ONE raised view -- `GemmGroups`,
+            // "gemm.groups" -- which the caller stages and hands over as the
+            // single input. A fixture that stages the wrong pointer array
+            // fails to compile again, which is the point of the shape.
+            let view = kernels_cuda::views::GemmGroupsView {
+                act_ptrs: dactp.0.cast::<*const c_void>().cast_const(),
+                weight_ptrs: dwp.0.cast::<*const c_void>().cast_const(),
+                out_ptrs: dyp.0.cast::<*mut c_void>().cast_const(),
+                m_array_host: ms.as_ptr(),
+            };
+            let fired = kernels_cuda::gemm::grouped_act_x_wt_bf16(
+                &gctx,
+                Const { v: groups },
+                Const { v: beta },
+                Const { v: n },
+                Const { v: k },
+                In {
+                    ptr: std::ptr::from_ref(&view),
+                    rows: 0,
+                    width: 0,
+                },
+            );
             // The last `GROUPED` row is `&[]`, and the golden records it as
             // a hash of zero bytes: the archive's `if (group_count <= 0)
             // return;`, which launched nothing and reported nothing.
@@ -658,12 +615,7 @@ fn transcript() -> Vec<String> {
     for &(tokens, heads, nope, vhead, lora) in MLA {
         // Both absorptions ask for `keys::Rows`, and it varies per row of the
         // table, so the plane is rebuilt here rather than shared with `jit`.
-        let facts = Facts {
-            rows: tokens,
-            n: 0,
-            k: 0,
-            grouped: None,
-        };
+        let facts = Facts { n: 0, k: 0 };
         // SAFETY: `handle` is live for the whole function, as `jit`'s is.
         let mla =
             unsafe { kernels_cuda::jit::Ctx::on(std::ptr::null_mut()).with_cublas(handle.cast()) }
@@ -717,6 +669,12 @@ fn transcript() -> Vec<String> {
                 Const { v: nope },
                 Const { v: vhead },
                 Const { v: lora },
+                // AND THE ROW COUNT CAME BACK, as a `Const` this time. It was
+                // an argument, then a `Rows::env` ask, and it is a mark the
+                // statement carries now -- the operand's `rows` is the same
+                // number, but a `Const` is what the signature declares and a
+                // signature is the only thing that binds.
+                Const { v: tokens },
             );
             // The `MLA` table's `t=0` and `h=0` rows are the degenerate
             // ones and the golden records both as a hash of zero bytes, so
@@ -783,6 +741,12 @@ fn transcript() -> Vec<String> {
                 Const { v: nope },
                 Const { v: vhead },
                 Const { v: lora },
+                // AND THE ROW COUNT CAME BACK, as a `Const` this time. It was
+                // an argument, then a `Rows::env` ask, and it is a mark the
+                // statement carries now -- the operand's `rows` is the same
+                // number, but a `Const` is what the signature declares and a
+                // signature is the only thing that binds.
+                Const { v: tokens },
             );
             // The `MLA` table's `t=0` and `h=0` rows are the degenerate
             // ones and the golden records both as a hash of zero bytes, so

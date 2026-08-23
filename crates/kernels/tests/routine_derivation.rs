@@ -17,7 +17,7 @@
 use kernels::routine::{
     Answers, Arg, Asks, Backend, Const, Extent, In, InOut, Out, Refusal, Routine,
 };
-use kernels::{Kind, Source, Ty, keys};
+use kernels::{Kind, Source, Ty};
 
 /// The stand-in backend: an argument is one of three kinds, and the context
 /// records what a body launched instead of launching it.
@@ -61,14 +61,21 @@ impl Ctx {
     }
 }
 
-// THIS FIRE'S ANSWERS, for a body that asks. A stand-in for what a driver
-// lends: `keys::Rows` is the fire's token count and nothing else is answered,
-// so a body that reaches for a fact this backend does not hold is refused with
-// `Unstated` rather than handed a zero.
+// THIS FIRE'S ANSWERS, for a body that reaches past its own marks. A stand-in
+// for what a driver lends.
+//
+// `Source::Named` STOOD HERE, and with it the arm that answered
+// `keys::Rows`. Both are RETIRED: there is no key vocabulary and no ask, and
+// the fire's row count is not a fact a backend lends any more -- it is the
+// rectangle the statement placed, read off the mark's own `.rows`, which is
+// what `rope_apply` below does. What is left for a resolver to answer is the
+// params run, for the one case a body cannot mark: see [`Asks::param`].
+//
+// Everything else is refused with `Unstated` rather than handed a zero.
 impl Answers<Test> for Ctx {
     fn resolve(&self, _ty: Ty, source: Source) -> Result<Value, Refusal> {
         match source {
-            Source::Named(k) if k == <keys::Rows as keys::Fact>::KEY => Ok(Value::I32(4)),
+            Source::Slot(Kind::Param, 0) => Ok(Value::I32(4)),
             _ => Err(Refusal::Unstated {
                 what: "a fact this backend does not answer",
             }),
@@ -239,8 +246,11 @@ fn rope_apply(
     if q.ptr.is_null() {
         return Err(Refusal::Null { what: "q" });
     }
-    // THE ONE FACT A FIRE DECIDES, asked for rather than declared.
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    // THE ONE FACT A FIRE DECIDES, read off the rectangle the statement
+    // placed rather than asked for. `ctx.ask::<i32, keys::Rows>()` STOOD
+    // HERE; a mark carries its own extent now, so the row count cannot
+    // disagree with the buffer it counts.
+    let rows = q.rows;
     if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
@@ -393,25 +403,21 @@ fn the_marks_hand_out_the_slots_in_signature_order() {
     );
 }
 
-/// A `Const` OVER A TENSOR IS A WEIGHT, AND KEEPS THE NAMED CHAIN.
+/// A `Const` OVER A TENSOR IS A WEIGHT, AND POSITIONAL LIKE EVERY OTHER MARK.
 ///
-/// An `OpKind::Launch` puts a weight in the operand list where it is
-/// positional, while a semantic op carries only a NAME — so the weight slot is
-/// a chain, *"the named bank first and the positional one after"*, and `Const`
-/// inherits it unchanged from the mark it replaced.
+/// The chain `Or(Named("weight"), Slot(Weight, 0))` STOOD HERE, because a
+/// semantic op used to carry its weight as a NAME on `LaunchSpec::weight`
+/// while an `OpKind::Launch` put it in the operand list. There is one shape
+/// of op now and `Source::Named` is retired, so the named half of the chain
+/// has nothing left to read and the weight run is simply the weight run.
 #[test]
 fn a_const_over_a_tensor_claims_the_weight_run() {
     let row = find("rmsnorm");
     assert_eq!(row.args, &[Ty::Bf16sMut, Ty::Bf16s, Ty::F32]);
-    assert!(
-        matches!(
-            row.sources[1],
-            Some(Source::Or(
-                Source::Named("weight"),
-                Source::Slot(Kind::Weight, 0)
-            ))
-        ),
-        "the named bank first and the positional one after: {:?}",
+    assert_eq!(
+        row.sources[1],
+        Some(Source::Slot(Kind::Weight, 0)),
+        "a weight claims its own run by position: {:?}",
         row.sources[1]
     );
     assert_eq!(
@@ -430,23 +436,40 @@ fn the_stated_facts_are_the_ones_stated() {
     assert!(!tanh.depth_prefix_plan);
 }
 
-/// The facts the BODY asks for are enumerated, syntactically.
+/// A BODY READS ITS OWN RECTANGLE, and an empty one refuses the fire.
 ///
-/// The derived column lost its `Env` half, and with it the check that walks a
-/// row asking *"does this backend answer every fact its own kernels name"*.
-/// `#[routine]` scans the body for `ask::<_, keys::X>` and emits the list
-/// instead — same fidelity as the parameter run for a fact asked in the body,
-/// and it cannot drift from the calls.
+/// `the_facts_a_body_asks_for_are_enumerated` STOOD HERE. It asserted
+/// `Derivation::ASKED`, the column `#[routine]` filled by scanning a body for
+/// `ask::<_, keys::X>` so that a plane could be walked asking *"does this
+/// backend answer every fact its own kernels name"*. The column is RETIRED
+/// with the key vocabulary: there is no fact left for a body to name, because
+/// the one it used to name -- the fire's row count -- now arrives on the mark.
+///
+/// So the property worth holding is the one that replaced it: a mark's
+/// `.rows` is the statement's, and a body that guards on it guards on
+/// something the caller actually placed. Firing `rope_apply` over a region of
+/// zero rows must reach `Refusal::Empty` and launch nothing, which no amount
+/// of a backend answering `4` could have shown.
 #[test]
-fn the_facts_a_body_asks_for_are_enumerated() {
+fn a_body_guards_on_the_rectangle_the_statement_placed() {
+    let ctx = Ctx::default();
+    let empty = [
+        Value::Region {
+            ptr: 0x1000,
+            rows: 0,
+            width: 64,
+        },
+        Value::I32(64),
+        Value::I32(64),
+        Value::F32(10_000.0),
+    ];
     assert_eq!(
-        <rope_apply as kernels::Derivation>::ASKED,
-        &[<keys::Rows as keys::Fact>::KEY],
+        (find("rope_apply").body)(&ctx, &empty),
+        Err(Refusal::Empty { what: "rows" })
     );
-    assert_eq!(
-        <residual_add as kernels::Derivation>::ASKED,
-        &[] as &[&str],
-        "a body that asks for nothing enumerates nothing"
+    assert!(
+        ctx.fired.borrow().is_empty(),
+        "a refused fire launches nothing"
     );
 }
 
@@ -510,7 +533,7 @@ fn an_unanswered_fact_refuses_the_fire() {
     // The `Ctx` a body launches through is this backend's own, so the deaf
     // resolver is exercised directly: what matters is the shape of the answer.
     assert_eq!(
-        Asks::<Test>::ask::<i32, keys::Rows>(&Deaf),
+        <Deaf as Asks<Test>>::param(&Deaf, 0),
         Err(Refusal::Unstated {
             what: "nothing at all"
         })

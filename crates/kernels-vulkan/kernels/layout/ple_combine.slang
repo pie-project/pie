@@ -2,8 +2,9 @@
 //
 // THE SCALE IS A PUSH CONSTANT, NOT A STORAGE STRUCT. `PleCombineParams
 // { inv_sqrt2, n }` was Metal's buffer-3 layout carried over whole, second word
-// and all, and it lived in `norm/rms_params.slang` beside the RMS family's
-// blocks so the two trees could be deleted together. The count field was
+// and all, and it lived in norm/rms_params.slang beside the RMS family's
+// blocks so the two trees could be deleted together. They were: that header is
+// gone, its last reader having moved its scalars into a push range. The count field was
 // already dead here: it was stated as ONE ROW's element count while the
 // elementwise launch dispatches the whole `[n_layers, ple_dim]` rectangle, so
 // the driver had already expressed the true extent in the grid -- multi-row

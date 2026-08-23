@@ -569,7 +569,10 @@ mod raises {
     fn a_raise_round_trips_through_the_serialized_plan() {
         let mut b = TraceBuilder::new("fixture.cuda");
         let plan = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
-        let tensor = b.embed("tok_embeddings", 1024);
+        // `b.embed(...)` STOOD HERE. `embed` retired with the semantic
+        // variants; what these two tests want is any ORDINARY tensor value
+        // to hold beside the raise, and `input` mints one.
+        let tensor = b.input(Shape(vec![Dim::Tokens, Dim::Const(1024)]), DType::BF16);
 
         let before = b.finish();
         let json = serde_json::to_string(&before).expect("a plan serializes");
@@ -602,7 +605,7 @@ mod raises {
     fn a_tensor_still_has_one() {
         let mut b = TraceBuilder::new("fixture.cuda");
         let _ = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
-        let x = b.embed("tok_embeddings", 1024);
+        let x = b.input(Shape(vec![Dim::Tokens, Dim::Const(1024)]), DType::BF16);
         assert_eq!(
             b.value_shape(x),
             Shape(vec![Dim::Tokens, Dim::Const(1024)]),

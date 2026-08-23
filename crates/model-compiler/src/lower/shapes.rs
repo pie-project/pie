@@ -130,6 +130,18 @@ pub enum Uncovered {
         axis: &'static str,
     },
     UnknownBackend(String),
+    /// The backend states nothing at all about this symbol.
+    ///
+    /// Distinct from [`Self::UnknownBackend`], which is the FAMILY having no
+    /// backend. This is a family that has one, lowering to a name that
+    /// backend does not declare -- a plan that cannot possibly run, and which
+    /// until this variant existed lowered clean and failed, if it failed at
+    /// all, somewhere much later and with much less to say.
+    UndeclaredSymbol {
+        at_op: usize,
+        kernel: String,
+        backend: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -139,7 +139,7 @@ model-loader = { path = "../model-loader", default-features = false }
 # out of an artifact under the same name `convert` writes it under. It
 # used to ask for `config`, a feature that carried an 845-line normalizer
 # whose whole output the catalog now states as a `const`.
-model = { path = "../model", features = ["contract"] }
+model = { path = "../model-legacy", package = "model-legacy", features = ["contract"] }
 tokenizer = { path = "../tokenizer" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
@@ -165,7 +165,7 @@ tensor-ir = { path = "../tensor-ir" }
 # a model. Identity is a manifest match now, so the dummy driver has to name
 # a row it can be held to, and the smallest real one is half a gigabyte of
 # embedding. See `model::test_rows`.
-model = { path = "../model", features = ["contract", "test-rows"] }
+model = { path = "../model-legacy", package = "model-legacy", features = ["contract"] }
 
 [build-dependencies]
 # `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a

@@ -11,12 +11,23 @@ through the *identical* code path. This crate is that case: same skeleton, same
 prefill, same channel wiring, same decode loop as every sampler inferlet. The
 epilogue does only temperature scaling and a Gumbel-max draw.
 
-The repo's two existing completion inferlets could not serve this role, both
-for reasons predating this work:
+The repo's two existing completion inferlets do not serve this role. When this
+crate was written the reason given was that neither one ran — `text-completion-
+bench` was said to stall the driver on `ResizePool`, and `chat-completion` to
+fail with `EmbedTokens is not host-derivable: channel 0 has no host-known
+value`. **Both of those failures are gone, and neither was ever the real
+reason.** `cuda_forward` drives `text-completion-bench` to a coherent sixteen
+tokens on `cuda_native` in about two and a half seconds, and `chat-completion`
+passes the curated suite on `cuda_native` and on `vulkan` alike.
 
-- `text-completion-bench` stalls the driver on `ResizePool`.
-- `chat-completion` fails with `EmbedTokens is not host-derivable: channel 0
-  has no host-known value`.
+The reason that survives is the one this control actually needs, and it is a
+structural one that no bug fix can change: a baseline is only a baseline if it
+is measured through the *identical* code path. `chat-completion` builds a chat
+template and drains through the client edge; `text-completion-bench` is a
+throughput harness with its own budget loop. This crate has the algorithm
+inferlets' exact skeleton — one N-wide prefill fire, a `ptir::run_ahead` decode
+loop, the same channel wiring — and differs from them in the epilogue and
+nowhere else. Subtracting it therefore leaves the algorithm and nothing else.
 
 ## The `stats` flag
 
@@ -90,7 +101,7 @@ Three conclusions, spelled out in the audit's `## Runtime cost` section:
 - **Overhead is entirely marginal, never fixed.** Intercepts land at 87–165 ms
   for every configuration including the baseline. No inferlet has heavy
   one-time setup.
-- **The 5× `top_k` cliff was a kernel defect, and it is fixed.**
+- **The 5× `top_k` cliff was a kernel defect, and it is fixed on Metal.**
   `tail-free-sampling` and `locally-typical-sampling` compute completely
   unrelated statistics yet cost the same, which identified `top_k` rather than
   the algorithms as the cause. The kernel rescanned the row once per pick —
@@ -99,6 +110,18 @@ Three conclusions, spelled out in the audit's `## Runtime cost` section:
   brings them to 1.49× and 1.54× and makes the cost flat in `k`. What remains
   is the schedule barrier; `top-a-sampling`, which needs no ranking at all,
   sits at 1.15×.
+
+  **The two rows in the table above are the PRE-fix numbers**, and they are
+  the last ones anyone can quote, because the fix is
+  `codegen/metal/topk.rs::emit_grouped_topk` — one backend's grouped library
+  kernel. `codegen/cuda` has written no library kernels at all, so on the
+  `cuda_native` driver the `## Run` line below invokes, these two inferlets do
+  not run slowly: they do not run. A single-op `top_k` lift reaches the CUDA
+  emitter, which declines it with `generated region contains a non-generated
+  boundary (top_k)`, and the driver refuses the program (`crates/worker/tests/
+  cuda_canaries.rs` records the same three fixtures under the same class).
+  Re-measuring the pair against this baseline needs either that CUDA kernel or
+  a re-run of the whole table on a backend that has one.
 - **The 4× on the contrastive pair is two effects.** Two forward passes by
   construction, *plus* loss of run-ahead because the next input depends on both
   passes' combined output.

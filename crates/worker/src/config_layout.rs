@@ -143,12 +143,14 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
     if file.contains_key("worker") {
         bail!("[worker] is no longer a section: its contents are the file.");
     }
-    if file
-        .get("model")
-        .and_then(|m| m.as_table())
-        .is_some_and(|t| t.contains_key("driver") || t.contains_key("scheduler"))
-    {
+    if model_tables(&file).any(|t| t.contains_key("driver") || t.contains_key("scheduler")) {
         bail!("[model.driver] / [model.scheduler] are now [driver] and [runtime].");
+    }
+    if file.get("model").is_some_and(toml::Value::is_array) {
+        bail!(
+            "[[model]] is no longer an array: one config serves one model, and \
+             [model] is a plain section."
+        );
     }
 
     let mut leaves = Vec::new();
@@ -180,6 +182,29 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
         driver.insert("options".to_string(), toml::Value::Table(options));
     }
     Ok(out)
+}
+
+/// Every table a file's `model` key holds, whether it is spelled `[model]` or
+/// `[[model]]`.
+///
+/// BOTH SPELLINGS, and that is the whole point of this helper. The retired
+/// format's `model` was an ARRAY of tables -- that is how it carried a second
+/// model, and its own generated comment said to "append another [[model]]
+/// block" -- so a guard that reached for `as_table()` looked straight past
+/// every real old config and fired only on a hand-written hybrid nobody has.
+/// What the operator got instead was `insert_at` failing several steps later
+/// with `model.scheduler.allow_fs: model is not a table`: an INTERNAL path,
+/// naming a section they never wrote, from the one module whose stated job is
+/// that the file and the structs are not the same shape.
+fn model_tables(file: &toml::Table) -> impl Iterator<Item = &toml::Table> {
+    file.get("model")
+        .into_iter()
+        .flat_map(|m| match m {
+            toml::Value::Table(t) => vec![t],
+            toml::Value::Array(a) => a.iter().filter_map(toml::Value::as_table).collect(),
+            _ => vec![],
+        })
+        .into_iter()
 }
 
 /// The internal path for one full file path, longest file prefix first.
@@ -301,6 +326,39 @@ mod tests {
         let err = reshape(file).unwrap_err().to_string();
         // Names what to do instead, not only what is wrong.
         assert!(err.contains("[cluster]"), "got: {err}");
+    }
+
+    /// The retired format's `model` was an ARRAY, and the guard read a table.
+    ///
+    /// This is the shape every config `pie config init` wrote before the
+    /// reshape actually had -- `[[model]]`, then `[model.scheduler]` and
+    /// `[model.driver]` under it -- so it is the shape the migration message
+    /// exists for. It reached `insert_at` instead, which failed on an
+    /// internal path the operator never typed.
+    #[test]
+    fn the_retired_model_array_gets_the_migration_message_too() {
+        let file: toml::Table = toml::from_str(
+            "[[model]]\nname = \"default\"\n\n[model.scheduler]\nbatch_policy = \"adaptive\"\n",
+        )
+        .unwrap();
+        let err = reshape(file).unwrap_err().to_string();
+        assert!(err.contains("[runtime]"), "got: {err}");
+        assert!(
+            !err.contains("is not a table"),
+            "the operator is told where the keys went, not how the walk \
+             failed: {err}"
+        );
+    }
+
+    /// An array with nothing retired under it is still an array, and one
+    /// config serves one model.
+    #[test]
+    fn a_bare_model_array_says_what_replaced_it() {
+        let file: toml::Table =
+            toml::from_str("[[model]]\nname = \"default\"\nmodel = \"Qwen/Qwen3-0.6B\"\n")
+                .unwrap();
+        let err = reshape(file).unwrap_err().to_string();
+        assert!(err.contains("[model]"), "got: {err}");
     }
 
     #[test]

@@ -1,35 +1,62 @@
-use crate::shared::vocabulary::{Member, Vocab};
+use model_dsl::axes::{Dtype, KvDtype};
+use model_dsl::load::{copy, pack, stack, Import, SfBase};
 
-pub const VOCAB: Vocab = Vocab(&[
+use super::model::{Head, Mixer, Mlp, Model};
 
-    Member::same("model.layers.{layer}.input_layernorm"),
-    Member::same("model.layers.{layer}.linear_attn.A_log"),
-    Member::same("model.layers.{layer}.linear_attn.conv1d"),
-    Member::same("model.layers.{layer}.linear_attn.dt_bias"),
-    Member::same("model.layers.{layer}.linear_attn.in_proj_a"),
-    Member::same("model.layers.{layer}.linear_attn.in_proj_b"),
-    Member::same("model.layers.{layer}.linear_attn.in_proj_qkv"),
-    Member::same("model.layers.{layer}.linear_attn.in_proj_z"),
-    Member::same("model.layers.{layer}.linear_attn.norm"),
-    Member::same("model.layers.{layer}.linear_attn.out_proj"),
-    Member::same("model.layers.{layer}.mlp.down_proj"),
-    Member::same("model.layers.{layer}.mlp.experts.{expert}.down_proj"),
-    Member::same("model.layers.{layer}.mlp.experts.{expert}.gate_proj"),
-    Member::same("model.layers.{layer}.mlp.gate"),
-    Member::same("model.layers.{layer}.mlp.gate_proj"),
-    Member::same("model.layers.{layer}.mlp.shared_expert.gate_proj"),
-    Member::same("model.layers.{layer}.mlp.switch_mlp.down_proj"),
-    Member::same("model.layers.{layer}.mlp.switch_mlp.gate_proj"),
-    Member::same("model.layers.{layer}.mlp.up_proj"),
-    Member::same("model.layers.{layer}.post_attention_layernorm"),
-    Member::same("model.layers.{layer}.self_attn.k_norm"),
-    Member::same("model.layers.{layer}.self_attn.k_proj"),
-    Member::same("model.layers.{layer}.self_attn.o_proj"),
-    Member::same("model.layers.{layer}.self_attn.q_norm"),
-    Member::same("model.layers.{layer}.self_attn.q_proj"),
-    Member::same("model.layers.{layer}.self_attn.v_proj"),
-
-    Member::same("model.embed_tokens"),
-    Member::same("lm_head"),
-    Member::same("model.norm"),
-]);
+pub fn import_hf<B: SfBase, W1: Dtype, K: KvDtype>(m: &Model<W1, K>) -> Import {
+    let mut i = Import::new::<B>();
+    i.write("embed", copy("embed_tokens"));
+    i.write("final_norm", copy("norm"));
+    if let Head::Bank(_) = &m.head {
+        i.write("lm_head", copy("lm_head"));
+    }
+    for (l, w) in m.layers.iter().enumerate() {
+        i.write(format!("layer.{l}.mixer_norm"), copy(format!("layer.{l}.input_layernorm")));
+        i.write(format!("layer.{l}.mlp_norm"), copy(format!("layer.{l}.post_attention_layernorm")));
+        match &w.mixer {
+            Mixer::Attn(_) => {
+                i.write(format!("layer.{l}.qg_proj"), copy(format!("layer.{l}.self_attn.q_proj")));
+                i.write(format!("layer.{l}.k_proj"), copy(format!("layer.{l}.self_attn.k_proj")));
+                i.write(format!("layer.{l}.v_proj"), copy(format!("layer.{l}.self_attn.v_proj")));
+                i.write(format!("layer.{l}.o_proj"), copy(format!("layer.{l}.self_attn.o_proj")));
+                i.write(format!("layer.{l}.q_norm"), copy(format!("layer.{l}.self_attn.q_norm")));
+                i.write(format!("layer.{l}.k_norm"), copy(format!("layer.{l}.self_attn.k_norm")));
+            }
+            Mixer::Gdn(_) => {
+                i.write(format!("layer.{l}.in_qkvz"), copy(format!("layer.{l}.linear_attn.in_proj_qkvz")));
+                i.write(format!("layer.{l}.in_ba"), copy(format!("layer.{l}.linear_attn.in_proj_ba")));
+                i.write(format!("layer.{l}.conv"), copy(format!("layer.{l}.linear_attn.conv1d")));
+                i.write(format!("layer.{l}.dt_bias"), copy(format!("layer.{l}.linear_attn.dt_bias")));
+                i.write(format!("layer.{l}.a_log"), copy(format!("layer.{l}.linear_attn.A_log")));
+                i.write(format!("layer.{l}.gdn_norm"), copy(format!("layer.{l}.linear_attn.norm")));
+                i.write(format!("layer.{l}.out_proj"), copy(format!("layer.{l}.linear_attn.out_proj")));
+            }
+        }
+        match &w.mlp {
+            Mlp::Dense { .. } => {
+                i.write(format!("layer.{l}.gate_up"), pack([
+                    format!("layer.{l}.mlp.gate_proj"),
+                    format!("layer.{l}.mlp.up_proj"),
+                ]));
+                i.write(format!("layer.{l}.down"), copy(format!("layer.{l}.mlp.down_proj")));
+            }
+            Mlp::Routed { experts, .. } => {
+                i.write(format!("layer.{l}.router"), copy(format!("layer.{l}.mlp.gate")));
+                i.write(format!("layer.{l}.experts_gate_up"), stack((0..*experts).map(|e| pack([
+                    format!("layer.{l}.mlp.experts.{e}.gate_proj"),
+                    format!("layer.{l}.mlp.experts.{e}.up_proj"),
+                ]))));
+                i.write(format!("layer.{l}.experts_down"), stack((0..*experts).map(|e| {
+                    copy(format!("layer.{l}.mlp.experts.{e}.down_proj"))
+                })));
+                i.write(format!("layer.{l}.shared_gate_up"), pack([
+                    format!("layer.{l}.mlp.shared_expert.gate_proj"),
+                    format!("layer.{l}.mlp.shared_expert.up_proj"),
+                ]));
+                i.write(format!("layer.{l}.shared_down"), copy(format!("layer.{l}.mlp.shared_expert.down_proj")));
+                i.write(format!("layer.{l}.shared_gate"), copy(format!("layer.{l}.mlp.shared_expert_gate")));
+            }
+        }
+    }
+    i
+}

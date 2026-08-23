@@ -275,4 +275,8 @@ def tests():
 if __name__ == "__main__":
     from conftest import run_tests
 
-    run_tests(tests(), "SnapKV prefill-window observation + enforcement")
+    run_tests(
+        tests(),
+        "SnapKV prefill-window observation + enforcement",
+        requires=("attn_score", "attn_page_mask"),
+    )

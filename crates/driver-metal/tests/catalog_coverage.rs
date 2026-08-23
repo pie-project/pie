@@ -143,8 +143,8 @@ fn an_ordinary_row_projects_a_geometry_and_an_extraordinary_one_may_refuse() {
             Ok(g) => {
                 served += 1;
                 // The projection is not allowed to invent. Every number below
-                // is one `lowering/consts.rs` binds into a kernel argument
-                // buffer, and a mismatch here is a kernel reading the wrong
+                // is one a fire's lowered program binds into a kernel
+                // argument, and a mismatch here is a kernel reading the wrong
                 // extent off the right pointer — which does not fault, it
                 // returns fluent nonsense.
                 assert_eq!(g.n_layers, d.layers, "{id}: layers");
@@ -152,7 +152,6 @@ fn an_ordinary_row_projects_a_geometry_and_an_extraordinary_one_may_refuse() {
                 assert_eq!(g.n_q_heads, d.shape.q_heads, "{id}: q_heads");
                 assert_eq!(g.n_kv_heads, d.shape.kv_heads, "{id}: kv_heads");
                 assert_eq!(g.vocab, d.shape.vocab, "{id}: vocab");
-                assert_eq!(g.eps, d.norm_eps, "{id}: norm eps");
                 assert!(g.head_dim > 0, "{id}: a served geometry with no head dim");
                 assert_eq!(
                     g.quant, AT,

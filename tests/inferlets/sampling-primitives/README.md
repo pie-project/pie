@@ -19,7 +19,7 @@ This crate pins that fix by publishing the nucleus keep-mask as a standalone
 value in a shape that **cannot** match the library nucleus pattern, forcing the
 generated `pivot_threshold` path. See "A GPU hang in the generated sampler path"
 in
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it validates
 

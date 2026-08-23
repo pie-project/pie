@@ -20,7 +20,7 @@
 // crate's tree, so any one regeneration may leave part of it unused.
 #![allow(unused_imports)]
 
-use kernels::{OutRule, OutWidth};
+use ::kernels::{OutRule, OutWidth};
 use model_ir::trace::{DType, Shape, StateRef, ValueId};
 
 use super::ruled_out;
@@ -3519,6 +3519,12 @@ pub fn tanh(
     made.into_iter().next().expect("`norm::tanh` states `x`")
 }
 
+/// The canon point `residual_add`: add a residual into an accumulator.
+///
+/// The claim was on `norm::residual_add_rmsnorm` -- the FUSED form -- for as
+/// long as the gate that would have said so could not compile. See the note
+/// there for what that cost.
+///
 /// Generated for `norm::residual_add` from the routine's own signature
 /// (`kernels_cuda::norm::residual_add`); the statement records through
 /// [`crate::fire::fire`], one argument per mark.

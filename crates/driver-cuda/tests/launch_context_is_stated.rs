@@ -115,46 +115,6 @@ use std::collections::{BTreeMap, BTreeSet};
 /// wrong is silent, so each carries the reason it is not a measurement.
 const CONSTANT_BY_ARGUMENT: &[(&str, &str)] = &[
     (
-        "altup_streams",
-        "gemma-3n's AltUp width, and this entry has been wrong in both \
-         directions. It first said the family has no CUDA text -- it has \
-         `gemma3n_cuda` -- and was then rewritten to say nothing could \
-         deliver the field, which held only while the AltUp `norm` arms \
-         were `unbound`. `Facts::altup_active` reads `ctx.altup_streams`, \
-         so the name IS deliverable and the honest claim is this one: NO \
-         CHECKPOINT VARIES IT. `Gemma3nAltUpFacts::num_streams` is 4 on \
-         the one gemma-3n row this tree carries, and 4 is what every \
-         published gemma-3n states -- the four-way hidden bundle is the \
-         architecture, not a size. A fifth stream would be a different \
-         model, and it would arrive as a new row here.",
-    ),
-    (
-        "altup_active",
-        "Which AltUp stream was run through the real layer, and it is 0 \
-         for the same reason `altup_streams` is 4: gemma-3n predicts from \
-         stream zero and corrects the rest against it, which is the \
-         block's definition rather than a tunable. `Facts::altup_active` \
-         can hand it over -- it is a live accessor -- so the claim is \
-         constancy and not unreachability.",
-    ),
-    (
-        "write_state",
-        "whether the fire advances recurrent state, and every class that \
-         still exists does. `FireClass` says THE REPAIR CLASSES ARE GONE: \
-         `FrozenVerify`, `CommitAdvance` and `StateOnly` were retired when \
-         the driver accepted PIE_RS_FLAG_FOLD, because a speculative \
-         decode writes to a buffer and folds only the accepted prefix, so \
-         nothing is ever wrong and nothing needs freezing. Decode and \
-         Prefill remain and both advance. THIS ENTRY MOVED HERE FROM \
-         `NOTHING_DELIVERS_IT`, and the move is what that list being \
-         COMPUTED is for: it sat there arguing that the ssm arms' \
-         `cx.gdn()?` was a constant `None` because the `GdnCtx`-to-`Gdn` \
-         conversion was never written. The conversion is written, so an \
-         arm can be handed this now — and the reason it stays a literal \
-         is the one above, which never depended on that plumbing. A false \
-         here would need a class to come back.",
-    ),
-    (
         "first_token",
         "`attn::write_kv_to_pages`' write origin, and `0` is a fact about \
          the REGION rather than about a checkpoint: a fire's rows begin at \
@@ -163,18 +123,6 @@ const CONSTANT_BY_ARGUMENT: &[(&str, &str)] = &[
          `i32::try_from(split)`, the boundary the fire already computed \
          for its device peel word — so the two fills are the two answers \
          and a model states neither.",
-    ),
-    (
-        "window_left",
-        "the FIRE-WIDE fallback beneath a per-layer table that IS read off \
-         the deployment. `window_of` prefers the statement's own param, \
-         then `window_left_by_layer` — `dep.windows()`, one entry per \
-         attention layer — and only then this. `-1` is how this driver \
-         spells UNBOUNDED: `attn_plan` picks a family's full-attention \
-         decode plan on `window_of(..) == -1`. So what this answers is a \
-         layer past the end of that table, which is a stack stating no \
-         attention at all. The value that could be wrong is the table, and \
-         it is filled on the line below this literal.",
     ),
 ];
 
@@ -191,35 +139,7 @@ const CONSTANT_BY_ARGUMENT: &[(&str, &str)] = &[
 /// day someone writes that text, the fact leaves
 /// `model/tests/facts_are_read.rs`'s `DECLARED_BUT_UNREAD` and
 /// [`the_deferred_names_are_still_out_of_reach`] fails here.
-const VARIED_BY_A_ROW_WITH_NO_TEXT: &[(&str, &str, &str, &str)] = &[(
-    "rope_interleaved",
-    "kimi_k2",
-    "rope_yarn_original",
-    "the rotation pairs adjacent elements rather than halves, and NOTHING \
-     ON `Deployment` STATES IT — this is not a name that came loose from a \
-     statement, it is one the model side does not carry, which is what \
-     makes the entry a debt rather than a fix. Three arms read it: \
-     `rope::rope_bf16`, `rope::rope_partial_last_bf16` and \
-     `rope::rope_yarn_original_bf16`. (This entry claimed only the last \
-     one did — true of the row world, and never re-measured against the \
-     arms.) The dispatchers are llama_like's `cuda::rope`, admitted only \
-     for `RopeKind::Standard`, plus gemma-2, gemma-3n and nemotron-h, and \
-     gpt-oss through `rope_yarn_original`; HF's shared \
-     `apply_rotary_pos_emb` is the half-split `rotate_half`, and a family \
-     that differs overrides it in its own `modeling_*.py`. \
-     `rope_partial_last` is deepseek-v4's alone, and that row refuses at \
-     the door — `deployment()` answers `Refusal::Unsupported` because no \
-     build here provisions its compressed store — so it dispatches \
-     nothing. kimi-k2 is the row that overrides, measured against the \
-     modeling code `moonshotai/Kimi-K2-Instruct` publishes rather than \
-     assumed from the shared kernel name: its `rotate_half` is the \
-     ordinary half-split, but `apply_rotary_pos_emb` first does \
-     `q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)` on \
-     both `q_pe` and `k_pe` — a DE-INTERLEAVE — so with respect to the \
-     tensor as stored the ladder is interleaved and gpt-oss's is not. A \
-     literal here would rotate every K2 position against the wrong pair. \
-     It cannot today: no MLA text reads `rope_yarn_original`.",
-)];
+const VARIED_BY_A_ROW_WITH_NO_TEXT: &[(&str, &str, &str, &str)] = &[];
 
 /// Literals no arm can be handed, and the reason each field exists.
 ///
@@ -234,6 +154,95 @@ const VARIED_BY_A_ROW_WITH_NO_TEXT: &[(&str, &str, &str, &str)] = &[(
 /// day that `None` becomes a read of the context, the name has to move
 /// to one of the two lists above and someone has to write the argument.
 const NOTHING_DELIVERS_IT: &[(&str, &str)] = &[
+    // ── FIVE THAT CAME BACK FROM THE OTHER TWO LISTS ─────────────────────
+    //
+    // Each of these argued about DELIVERABILITY on a premise the no-ask sweep
+    // took away: an accessor on `bind/facts.rs` that read the field off its
+    // context, or -- for the whole of `AttnCtx` -- `Cx::attn_ctx` handing the
+    // struct over entire. Every one of those accessors is gone and nothing in
+    // the crate reads `Fire::attn` any more, so the fields are written into a
+    // context and read by nobody.
+    //
+    // The constancy arguments they carried are kept, because they are still
+    // true and they are what the next person needs the day a mark or a query
+    // makes one of these reachable again -- at which point this test says so,
+    // as `too_weak`, and the entry moves back. `write_state` has now made that
+    // round trip twice, which is what a COMPUTED list is for.
+    (
+        "altup_streams",
+        "gemma-3n's AltUp width. `Facts::altup_active` read `ctx.altup_streams` \
+         and delivered this; the accessor went with the ask vocabulary and no \
+         `Const` mark replaced it, so nothing can be handed the field. Were it \
+         reachable the literal would still be right: NO CHECKPOINT VARIES IT. \
+         `Gemma3nAltUpFacts::num_streams` is 4 on the one gemma-3n row this \
+         tree carries, and 4 is what every published gemma-3n states -- the \
+         four-way hidden bundle is the architecture, not a size. A fifth \
+         stream would be a different model, and it would arrive as a new row.",
+    ),
+    (
+        "altup_active",
+        "which AltUp stream was run through the real layer, delivered by the \
+         same retired accessor as `altup_streams`. It is 0 for the same reason \
+         that one is 4: gemma-3n predicts from stream zero and corrects the \
+         rest against it, which is the block's definition rather than a \
+         tunable.",
+    ),
+    (
+        "write_state",
+        "whether the fire advances recurrent state. THIS ENTRY HAS NOW MADE \
+         THE ROUND TRIP TWICE. It sat here first, arguing that the ssm arms' \
+         `cx.gdn()?` was a constant `None` because the `GdnCtx`-to-`Gdn` \
+         conversion was unwritten; the conversion was written and it moved to \
+         `CONSTANT_BY_ARGUMENT`; the no-ask sweep then took every `GdnCtx` \
+         accessor off `bind/facts.rs` and nothing reads `Fire::gdn`, so it is \
+         unreachable again by a different route. The constancy argument is \
+         unchanged and never depended on either piece of plumbing: `FireClass` \
+         says THE REPAIR CLASSES ARE GONE -- `FrozenVerify`, `CommitAdvance` \
+         and `StateOnly` were retired when the driver accepted \
+         PIE_RS_FLAG_FOLD, because a speculative decode writes to a buffer and \
+         folds only the accepted prefix. Decode and Prefill remain and both \
+         advance. A false here would need a class to come back.",
+    ),
+    (
+        "window_left",
+        "the FIRE-WIDE fallback beneath a per-layer table that IS read off the \
+         deployment. It reached arms through `Cx::attn_ctx`, which handed the \
+         whole `AttnCtx` over; that query is gone and `Fire::attn` has no \
+         reader left, so the sliding-window span crosses as the statement's \
+         own `Const` param or not at all. The argument for the literal stands: \
+         `window_of` prefers the statement's param, then \
+         `window_left_by_layer` (`dep.windows()`, one entry per attention \
+         layer), and only then this, so what it answers is a layer past the \
+         end of that table -- a stack stating no attention at all. `-1` is how \
+         this driver spells UNBOUNDED. The value that could be wrong is the \
+         table, and it is filled on the line below this literal.",
+    ),
+    (
+        "rope_interleaved",
+        "whether the rotation pairs adjacent elements rather than halves. \
+         THIS WAS THE WHOLE OF `VARIED_BY_A_ROW_WITH_NO_TEXT`, which is now \
+         empty. That list made the weaker claim -- a checkpoint varies it and \
+         merely cannot dispatch yet -- and the premise held while `AttnCtx` \
+         crossed whole. It does not: three arms read the field \
+         (`rope::rope_bf16`, `rope::rope_partial_last_bf16`, \
+         `rope::rope_yarn_original_bf16`) and none of them can be handed it. \
+         \
+         The debt behind the old entry is unchanged and is why this reason is \
+         long: NOTHING ON `Deployment` STATES IT. kimi-k2 is the row that \
+         would vary it, measured against the modeling code \
+         `moonshotai/Kimi-K2-Instruct` publishes rather than assumed from the \
+         shared kernel name: its `rotate_half` is the ordinary half-split, but \
+         `apply_rotary_pos_emb` first does \
+         `q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)` on \
+         both `q_pe` and `k_pe` -- a DE-INTERLEAVE -- so with respect to the \
+         tensor as stored the ladder is interleaved and gpt-oss's is not. A \
+         literal `false` would rotate every K2 position against the wrong \
+         pair. It cannot today: no MLA text reads `rope_yarn_original`, and \
+         `KimiCudaFacts::rope_yarn_original` is declared and read by nothing \
+         in `kimi_k2/forward`. The person writing an MLA rope pass is the \
+         person who must decide what this is, and by then it will need a mark \
+         to cross on.",
+    ),
     (
         "gate_second",
         "the ORDER of the two halves in a fused gate/up tensor. \
@@ -562,32 +571,49 @@ fn accessor_fields(binds: &str) -> BTreeMap<String, BTreeSet<String>> {
 
 /// Whether a bind arm can be handed this field.
 ///
-/// Three answers, and they are not the same question asked three ways:
+/// One answer for all three contexts now, and it is `bind/facts.rs`: a field
+/// is deliverable if that file NAMES it, directly or through one of the
+/// context's own accessors, since it is the only thing that turns this state
+/// into an answer. Names it, not reads it — this asks whether the token
+/// appears there, so a local sharing a field's name would call that field
+/// delivered. The error is toward demanding the stronger argument, which is
+/// the direction to make it in.
 ///
-/// - An `AttnCtx` field always can. `Cx::attn_ctx` hands the struct over
-///   WHOLE — the FA2 arms read a dozen of its fields together and the
-///   query's own doc argues why — so every field of it is one `.` away
-///   from an arm whether or not anything names it today. The test asserts
-///   that `Cx` does the same for neither of the other two.
-/// - A `DispatchCtx` or `GdnCtx` field can if `bind/facts.rs` names it,
-///   directly or through one of the context's own accessors, since that
-///   file is the only thing that turns this state into an answer. NAMES
-///   it, not reads it: this asks whether the token appears there, so a
-///   local sharing a field's name would call that field delivered. The
-///   error is toward demanding the stronger argument, which is the
-///   direction to make it in.
-/// - Except that a method answering a constant `None` delivers nothing,
-///   however loudly it is asked for.
+/// Except that a method answering a constant `None` delivers nothing, however
+/// loudly it is asked for.
+///
+/// # The `AttnCtx` blanket STOOD HERE
+///
+/// It returned `true` for every field of that struct, on the premise that
+/// `Cx::attn_ctx` handed the struct over WHOLE — the FA2 arms read a dozen of
+/// its fields together — so every field was one `.` away from an arm whether
+/// or not anything named it.
+///
+/// The no-ask sweep took the accessor. `Fire` still carries
+/// `attn: Option<&AttnCtx>`, and its own doc says the field is "kept for the
+/// driver ops that read it whole", but nothing in the crate reads it: the only
+/// `.attn` left is `bind/table.rs`'s test probe assembling a `Fire`. So the
+/// blanket excused a crossing that no longer happens, which is the more
+/// generous of the two errors and the one this file's header warns about.
+///
+/// An `AttnCtx` field is now held to the same standard as the other two.
 fn delivered(fill: &Fill, facts: &str, named: &BTreeSet<String>) -> bool {
-    if fill.owner == "AttnCtx" {
-        return true;
-    }
     named.contains(&fill.name) && !answers_a_constant_none(facts, &fill.name)
 }
 
-/// Every name `bind/facts.rs` can put in front of an arm.
-fn deliverable_names(facts: &str, binds: &str) -> BTreeSet<String> {
+/// Every name the binder can put in front of an arm.
+///
+/// TWO SEAMS NOW, NOT ONE. `bind/facts.rs` is the query seam and was the only
+/// one when this was written. The no-ask sweep opened a second: fire-scoped
+/// state crosses as a RUNTIME OPERAND through `bind/views.rs`, addressed by
+/// the resolver at bind rather than queried from a body -- `cx.rs`'s own
+/// header says so in as many words. `first_token` is the clearest case: it is
+/// a scalar smuggled through the pointer channel, named in `views.rs`'s
+/// `ANSWERED` list and nowhere in `facts.rs`, and a census reading only the
+/// query seam calls it undeliverable while a real fire delivers it.
+fn deliverable_names(facts: &str, views: &str, binds: &str) -> BTreeSet<String> {
     let mut named = idents(facts);
+    named.extend(idents(views));
     for (accessor, reads) in accessor_fields(binds) {
         if named.contains(&accessor) {
             named.extend(reads);
@@ -602,27 +628,24 @@ fn every_context_scalar_is_read_off_the_model_or_argued_for() {
     let facts = strip_line_comments(&read("src/bind/facts.rs"));
     let binds = strip_line_comments(&read("src/bind/mod.rs"));
     let cx = strip_line_comments(&read("src/bind/cx.rs"));
+    let views = strip_line_comments(&read("src/bind/views.rs"));
 
-    // [`delivered`]'s premise, checked rather than assumed: the whole
-    // struct crosses to an arm for exactly one of the three, and a `Cx`
-    // that learned to hand over another would make half this test's
-    // reasoning silently too generous.
-    assert!(
-        cx.contains("AttnCtx"),
-        "`Cx` no longer hands an `AttnCtx` over, so `delivered` is \
-         excusing that struct's literals for a reason that has expired",
-    );
-    for whole in ["DispatchCtx", "GdnCtx"] {
+    // [`delivered`]'s premise, checked rather than assumed: NO context struct
+    // crosses to an arm whole any more, so `bind/facts.rs` is the only seam
+    // and every field is held to it. A `Cx` that learned to hand one over
+    // would make this test's reasoning silently too STRICT for that struct --
+    // the opposite of the error the blanket used to make, and just as wrong.
+    for whole in ["AttnCtx", "DispatchCtx", "GdnCtx"] {
         assert!(
             !cx.contains(whole),
-            "`Cx` names `{whole}`. If it hands the struct over the way it \
-             hands over `AttnCtx`, then every field of it is reachable and \
-             `delivered` must say so — it currently asks `bind/facts.rs` \
-             instead, which would be reading the wrong seam.",
+            "`Cx` names `{whole}`. If it hands the struct over whole, then \
+             every field of it is one `.` from an arm and `delivered` must \
+             say so — it currently asks `bind/facts.rs` for all three, which \
+             would be reading the wrong seam for this one.",
         );
     }
 
-    let named = deliverable_names(&facts, &binds);
+    let named = deliverable_names(&facts, &views, &binds);
     let argued: BTreeSet<&str> = CONSTANT_BY_ARGUMENT.iter().map(|(n, _)| *n).collect();
     let deferred: BTreeSet<&str> = VARIED_BY_A_ROW_WITH_NO_TEXT
         .iter()
@@ -732,39 +755,57 @@ fn nothing_is_argued_for_that_the_launch_no_longer_invents() {
 /// A deferred literal stops being excused the day its row gets a text.
 ///
 /// The premise is not restated here, it is READ: `model`'s own
-/// `facts_are_read` keeps `DECLARED_BUT_UNREAD`, the list of per-backend
-/// facts a family declares and no text consumes. While `kimi_k2`'s
-/// `rope_yarn_original` sits on it, nothing dispatches the kernel that
-/// reads `rope_interleaved` with a K2 ladder. Writing that text means
-/// deleting the entry there, which fails this test HERE — which is the
-/// point, because the person writing an MLA rope pass is exactly the
-/// person who must decide what `rope_interleaved` is.
+/// A family may DECLARE a per-backend fact that no text consumes. While
+/// `kimi_k2`'s `rope_yarn_original` is declared on `KimiCudaFacts` and read
+/// by nothing in `kimi_k2/forward`, nothing dispatches the kernel that reads
+/// `rope_interleaved` with a K2 ladder. Writing that text means reading the
+/// fact there, which fails this test HERE — which is the point, because the
+/// person writing an MLA rope pass is exactly the person who must decide what
+/// `rope_interleaved` is.
+///
+/// # It used to ask a sibling, and the sibling is gone
+///
+/// The premise was `model/tests/facts_are_read.rs`'s `DECLARED_BUT_UNREAD`
+/// list, read as text. That entire test directory was deleted, so this test
+/// panicked on a missing FILE -- which reads as infrastructure rot and not as
+/// the claim expiring, and is the weaker of the two failures it can have.
+///
+/// It measures the claim at the source now: the fact is declared in the
+/// family's `forward/facts.rs` and absent from its `forward/mod.rs`. That is
+/// the same statement `DECLARED_BUT_UNREAD` was a hand-maintained index of,
+/// and it cannot be deleted out from under this one.
+///
+/// # The list is EMPTY today, and the machinery stays
+///
+/// Its one entry was `rope_interleaved`, which made the claim *"a checkpoint
+/// varies this and merely cannot dispatch yet"* -- a claim that presumes the
+/// field could be handed to an arm at all. It cannot: the crossing it used was
+/// `Cx::attn_ctx`, and that went with the ask vocabulary. So the entry moved to
+/// [`NOTHING_DELIVERS_IT`], which is the weaker and now the true statement, and
+/// this list is the shape waiting for the next field that really is only a
+/// missing text away.
 ///
 /// The excuses this crate's siblings deleted named a future reader their
 /// own layering ruled out, so they could never expire. This one names a
 /// line someone has to delete to finish the work it defers.
 #[test]
 fn the_deferred_names_are_still_out_of_reach() {
-    let unread = read("../model/tests/facts_are_read.rs");
-    let table = unread
-        .find("DECLARED_BUT_UNREAD")
-        .map(|i| &unread[i..])
-        .expect("`model` still keeps a `DECLARED_BUT_UNREAD` list");
-
     for (name, family, fact, _) in VARIED_BY_A_ROW_WITH_NO_TEXT {
-        let entry = table
-            .find(&format!("(\"{family}\""))
-            .map(|i| &table[i..])
-            .and_then(|e| e.find("])").map(|j| &e[..j]));
+        let text = read(&format!("../model/src/{family}/forward/mod.rs"));
         assert!(
-            entry.is_some_and(|e| e.contains(&format!("\"{fact}\""))),
+            !strip_line_comments(&text).contains(fact),
             "`{name}` is a literal in `fire::launch` because {family} \
              cannot dispatch the kernel that reads it, and the proof of \
-             that was `{fact}` sitting in `DECLARED_BUT_UNREAD`. It is \
-             not there now. Either a text reads it — in which case fill \
-             `{name}` off the model, because that text's checkpoint \
-             varies it — or the fact was deleted, in which case say so \
-             here.",
+             that is that {family}'s forward text never reads `{fact}`. It \
+             reads it now. Fill `{name}` off the model, because that text's \
+             checkpoint varies it.",
+        );
+        let facts = read(&format!("../model/src/{family}/forward/facts.rs"));
+        assert!(
+            facts.contains(fact),
+            "`{family}` no longer declares `{fact}` at all, so the premise \
+             behind the `{name}` literal has gone away rather than expired. \
+             Say what replaced it here, or delete the entry.",
         );
     }
 }

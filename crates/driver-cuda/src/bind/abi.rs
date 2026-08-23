@@ -182,11 +182,6 @@ pub struct YarnOriginalParams {
     pub original_max_position: c_int,
 }
 
-/// One lane's structured-mask descriptor, for `attn::pack_structured_mask`.
-/// **Re-exported, not defined here**: `kernels-cuda` owns `attn`'s device
-/// text, and `Ty::StructuredMasks` spells the name unqualified.
-pub use kernels_cuda::attn::params::StructuredMaskParams;
-
 /// The activation the fused CUTLASS MoE runs between its two grouped GEMMs.
 /// Mirror of `moe::MoeActivation` (`enum class`, default `int`), by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

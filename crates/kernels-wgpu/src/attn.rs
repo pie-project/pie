@@ -323,6 +323,19 @@ pub fn kv_append_paged(
     }
     let kvc = unsafe { &*kvc.ptr };
     let page_size = kvc.page_size;
+    // The metal twin's guard, for the metal twin's reason: this grid is heads
+    // by tokens and never consults the page size, so a view built over a store
+    // with no pool -- where the pooled numbers come back as zero -- plans a
+    // full write in which every token divides to page zero, offset zero, and
+    // every layer overwrites the one before it on a single row. See
+    // `kernels_metal::attn::kv_append_paged`, where the same hole was found by
+    // a driver test that had been asserting this refusal against a routine
+    // unable to make it.
+    if page_size <= 0 {
+        return Err(Refusal::Empty {
+            what: "the KV page size",
+        });
+    }
 
     let k_pages = kvc.keys;
     let v_pages = kvc.values;
@@ -634,6 +647,21 @@ pub fn sdpa_paged_decode(
     // up to whole blocks is a bigger fraction of it than it was. The knob has
     // not moved in three sweeps and its optimum is now the sharpest it has
     // been, which is the more useful half of the result.
+    //
+    // FOURTH SWEEP, on a token a third smaller than any of the three above and
+    // with the stamping OFF -- a sweep run under `PIE_WGPU_PROBE` +
+    // `PIE_WGPU_STAMP` read 13.03 / 13.56 / 13.98 / 14.07 ms at 4 / 8 / 16 /
+    // 32 against a 7.5 ms baseline, monotone the wrong way and ~75% inflated,
+    // and was discarded. Plain medians, three interleaved rounds:
+    //
+    // | PIE_SPLITS | round 1 | round 2 | round 3 | mean | cost |
+    // | --- | --- | --- | --- | --- | --- |
+    // | 4 | 7.509 | 7.498 | 7.472 | 7.493 | +0.7% |
+    // | 8 | 7.453 | 7.442 | 7.415 | 7.437 | |
+    // | 16 | 7.644 | 7.688 | 7.642 | 7.658 | +3.0% |
+    //
+    // Eight wins all three rounds with no overlap. Four sweeps, four times the
+    // same answer, on tokens from 9.8 ms to 7.4 ms. This knob is closed.
     //
     // A PROBE KNOB, and eight is the shipped value. Read from the environment
     // rather than compiled in because `splits` is a runtime argument to the

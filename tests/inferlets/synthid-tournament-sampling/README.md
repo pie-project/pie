@@ -10,7 +10,7 @@ outputs***, *Nature* **634**, 818–823 (2024) —
 <https://doi.org/10.1038/s41586-024-08025-4>.
 
 **Faithfulness: Exact (equivalent form).** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

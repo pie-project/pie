@@ -15,7 +15,7 @@ covered by `tests/gpu/tests/cuda_chat_completion_e2e.rs`, which asserts on outpu
 content — the continuation of "The capital of France is" must contain "Paris" —
 not just liveness. That ignored e2e was the test that exposed a silent decode
 KV-corruption bug affecting six inferlets; see
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it validates
 

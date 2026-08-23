@@ -197,6 +197,9 @@ mod tests {
     ///
     /// `Backend::of_family` reads the segment after the first `.`, so the
     /// family ends `.metal`.
+    /// Two routines Metal declares, cycled so any `n` names only real ones.
+    const FIXTURE_KERNELS: [&str; 2] = ["row_gather", "gate"];
+
     fn plan_embeds(n: usize) -> ForwardPlan {
         use model_ir::trace::{DType, Op, OpKind, Shape as VShape, ValueInfo};
         ForwardPlan {
@@ -215,13 +218,24 @@ mod tests {
                     // (§0 of `.wiki/designs/design-no-ask.md`): a statement
                     // now names a LAUNCHER symbol, not a meaning. The
                     // fixture's job is to produce N launches distinguishable
-                    // by number — the kernel name is only what the walk
-                    // records in `Lowered::kernels`, so a distinct string
-                    // per op gives `plan_embeds(1)` one launch and
-                    // `plan_embeds(2)` two, which is what the shape-cache
+                    // by number, so that `plan_embeds(1)` gives one launch
+                    // and `plan_embeds(2)` two, which is what the shape-cache
                     // tests below read.
+                    //
+                    // REAL SYMBOLS, not `format!("fixture_launch_{i}")`. That
+                    // spelling was fine while the kernel name was only what
+                    // the walk records in `Lowered::kernels`; `lower::walk`
+                    // now refuses a launch naming a symbol its backend does
+                    // not declare (`Uncovered::UndeclaredSymbol`), which is
+                    // that check doing its job and not something a fixture
+                    // should route around. Neither of these is `whole` and
+                    // neither takes a weight, and nothing here gives either
+                    // one the operands a real launch would need -- which does
+                    // not matter, because `lower` never inspects an op's
+                    // operands past resolving them to slots, and what this
+                    // measures is launch count and cache identity.
                     kind: OpKind::Launch {
-                        kernel: format!("fixture_launch_{i}"),
+                        kernel: FIXTURE_KERNELS[i % FIXTURE_KERNELS.len()].to_string(),
                         weights: Vec::new(),
                         state: None,
                         params: Vec::new(),

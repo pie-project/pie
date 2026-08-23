@@ -7,7 +7,8 @@
 //
 // ALL THREE SCALARS RIDE THERE NOW, WHERE TWO OF THEM USED TO BE A STRUCT.
 // `eps` and `vd` were `GatedRmsParams` on a storage binding -- Metal's
-// buffer-4 layout, carried over whole through `norm/rms_params.slang` -- so
+// buffer-4 layout, carried over whole through a shared norm/rms_params.slang
+// header, since deleted along with the last module that included it -- so
 // this module declared a descriptor for eight live bytes AND a push range
 // beside it, which is the one arrangement `binding::params` cannot serve from
 // a row: it asks push first, and a module answering with the right push size

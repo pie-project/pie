@@ -59,8 +59,8 @@
 //! quantity's own extents, and at no others.
 //!
 //! **An unquantised checkpoint cannot reach this path at all.** The contract
-//! answers `Metal llama needs quantized weights: this checkpoint carries no
-//! `.scales` tensors`. So the artifact these two tests want is a
+//! answers `the MLX llama contract needs quantized weights: this checkpoint
+//! carries no `.scales` tensors`. So the artifact these two tests want is a
 //! pre-quantised one; the numbers above were measured against
 //! `mlx-community/Qwen3-0.6B-4bit`, whose `model.embed_tokens.weight` is
 //! `[151936, 128]` -- 1024 four-bit values packed eight to a word.

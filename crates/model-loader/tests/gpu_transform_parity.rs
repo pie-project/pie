@@ -34,7 +34,7 @@
 //!
 //! # The one row no plan can name
 //!
-//! `quant::scale_rows_bf16` is unreachable from any compiled plan, and that is
+//! `quant::scale_rows` is unreachable from any compiled plan, and that is
 //! a fact about the compiler rather than an omission here:
 //! `passes::tile::cuda_kernel` requires `in_place`, `rewrites_in_place`
 //! requires `dest.buffer == inputs[0]`, and `build.rs::transform_with` always
@@ -103,7 +103,7 @@ fn bf16_bits(v: f32) -> u16 {
 /// per-block scale has to track and the range FP8-E4M3's per-channel absmax
 /// has to find, so a kernel that ignored either would not survive the
 /// comparison; and the F32 block is built from BF16-representable values plus
-/// a deliberate low-mantissa perturbation, so `cast_fp32_to_bf16` is asked to
+/// a deliberate low-mantissa perturbation, so `cast_fp32_to` is asked to
 /// round rather than to truncate.
 fn checkpoint() -> &'static Path {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -479,7 +479,7 @@ fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
     let cases: Vec<(&str, &str, ModelContract)> = vec![
         (
             "Cast f32 -> bf16",
-            "quant::cast_fp32_to_bf16",
+            "quant::cast_fp32_to",
             ModelContract {
                 alignment: 256,
                 tensors: vec![TensorContract::new(
@@ -569,7 +569,7 @@ fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
     println!("{compared} bytes compared, all identical");
 }
 
-/// `quant::scale_rows_bf16`, which no compiled plan can reach.
+/// `quant::scale_rows`, which no compiled plan can reach.
 ///
 /// The op is hand-built to state exactly what `passes::tile` would state if
 /// `rewrites_in_place` could ever hold: a `Scale` whose destination IS its

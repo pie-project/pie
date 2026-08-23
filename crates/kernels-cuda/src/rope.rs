@@ -556,7 +556,7 @@ pub fn rope_yarn_bf16(
     )
 }
 
-#[routine(out(q = like(q)), out(k = like(k)))]
+#[routine(canon = "rope.yarn", out(q = like(q)), out(k = like(k)))]
 pub fn rope_yarn_original_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -694,7 +694,7 @@ pub fn rope_partial_bf16(
     )
 }
 
-#[routine(out(q = like(q)))]
+#[routine(canon = "rope.partial_q", out(q = like(q)))]
 pub fn rope_partial_q_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
@@ -811,11 +811,12 @@ pub fn rope_partial_last_bf16(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "D1: a routine takes fields, never a struct"
-)]
-#[routine(out(q = split(q, head_dim)))]
+// AN `#[expect(clippy::too_many_arguments)]` STOOD HERE and clippy reported
+// it UNFULFILLED: this routine is under the threshold now. The `expect` was
+// load-bearing when the signature carried more; the no-ask series moved
+// several of its scalars into the fact bag and never came back for the
+// attribute.
+#[routine(canon = "rope.partial_last", out(q = split(q, head_dim)))]
 pub fn rope_partial_last_q_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,

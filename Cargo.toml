@@ -102,7 +102,9 @@ members = [
     # those share, and the `pie.model/1` descriptor (`config`, ex
     # `model-config`) that every one of them is parameterized by -- one crate,
     # module per generation, feature per aspect.
+    "crates/model-legacy",
     "crates/model",
+    "crates/model-dsl-macros",
     # The forward-pass toolchain, in the three layers `tensor-*` is already in
     # and for the same reason. It was ONE crate (`model-compiler`, all five
     # modules) until the consumer sets were read off the tree and found to be
@@ -125,6 +127,7 @@ members = [
     # the tracer fingerprint (`compiler_version()`), whose hash covers this
     # tree and `model-ir`'s, because the tracer is both of them.
     "crates/model-dsl",
+    "crates/model-dsl-macros",
     # Lowering alone now: traced form + the engine's rows + one fire ->
     # rectangles, operands, buffers. Keeps the name because a compiler is what
     # turns a representation into what a machine runs, which is what is left
@@ -249,7 +252,7 @@ default-members = [
     # build it or to run the tests that are not gated on `native`, so a sweep
     # should carry it where it does not carry `driver-vulkan` or `driver-metal`.
     "crates/driver-wgpu",
-    "crates/model",
+    "crates/model-legacy",
     "crates/model-ir",
     "crates/model-dsl",
     "crates/model-compiler",
@@ -371,7 +374,7 @@ tokenizer = { path = "crates/tokenizer" }
 # the same websocket path a deployment is reached by, because measuring an
 # in-process shortcut would measure something nobody runs.
 client = { path = "crates/client" }
-model = { path = "crates/model", features = ["contract"] }
+model = { path = "crates/model-legacy", package = "model-legacy", features = ["contract"] }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
@@ -414,7 +417,7 @@ client = { path = "crates/client" }
 # Cargo unifies this with the `[dependencies]` entry above, which is why the
 # guarantee cannot be "the binary does not enable it": it is
 # `a_shipped_catalog_has_no_test_rows`, in `model` itself.
-model = { path = "crates/model", features = ["contract", "test-rows"] }
+model = { path = "crates/model-legacy", package = "model-legacy", features = ["contract"] }
 
 # SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
 [target.'cfg(unix)'.dependencies]

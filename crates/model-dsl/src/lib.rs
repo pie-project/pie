@@ -840,7 +840,7 @@ pub mod axes {
 
     /// One weight-bearing axis: what the checkpoint holds and the text
     /// states for a bank of projections.
-    pub trait DtypeAxis: 'static {
+    pub trait Dtype: 'static {
         /// The activation/storage dtype statements read and write.
         const DTYPE: DType;
         /// The tensor representation the manifest claims and `MatW` states.
@@ -852,7 +852,7 @@ pub mod axes {
     /// The KV cache axis: which scheme the pages hold. Subsumes the
     /// `kv_native_bf16` boolean and `Boot::route`'s bf16-vs-quantised
     /// choice — a load-time fact, stated where the SKU is named.
-    pub trait KvAxis: 'static {
+    pub trait KvDtype: 'static {
         /// The pages hold the model's own bf16.
         const NATIVE_BF16: bool;
         /// The axis's name.
@@ -860,16 +860,16 @@ pub mod axes {
     }
 
     /// Plain bf16: the repr every dense row ships today.
-    pub enum Bf16Ax {}
-    impl DtypeAxis for Bf16Ax {
+    pub enum Bf16 {}
+    impl Dtype for Bf16 {
         const DTYPE: DType = DType::BF16;
         const REPR: WeightRepr = WeightRepr::Bf16;
         const NAME: &'static str = "bf16";
     }
 
     /// MXFP4 experts in Marlin layout (gpt-oss's shipped form).
-    pub enum Mxfp4Ax {}
-    impl DtypeAxis for Mxfp4Ax {
+    pub enum Mxfp4 {}
+    impl Dtype for Mxfp4 {
         const DTYPE: DType = DType::BF16;
         const REPR: WeightRepr = WeightRepr::Mxfp4Marlin;
         const NAME: &'static str = "mxfp4";
@@ -882,8 +882,8 @@ pub mod axes {
     /// `zero_point` is false. The group here is the ONE number the
     /// family's wna16 statements read (`wna16_{gate_up,down}_decode`
     /// take it as a param); the rest is the load contract's metadata.
-    pub enum Wna16Ax {}
-    impl DtypeAxis for Wna16Ax {
+    pub enum Wna16 {}
+    impl Dtype for Wna16 {
         const DTYPE: DType = DType::BF16;
         const REPR: WeightRepr = WeightRepr::Scaled {
             layout: ScaleLayout::PerGroup,
@@ -894,9 +894,15 @@ pub mod axes {
         const NAME: &'static str = "wna16";
     }
 
+    pub use Bf16 as Bf16Ax;
+    pub use Dtype as DtypeAxis;
+    pub use KvDtype as KvAxis;
+    pub use Mxfp4 as Mxfp4Ax;
+    pub use Wna16 as Wna16Ax;
+
     /// Native bf16 KV pages.
     pub enum NativeKv {}
-    impl KvAxis for NativeKv {
+    impl KvDtype for NativeKv {
         const NATIVE_BF16: bool = true;
         const NAME: &'static str = "kv-bf16";
     }
@@ -908,6 +914,13 @@ pub mod axes {
 /// each point, and `TraceBuilder::finish`'s `check_plan` refuses a point
 /// whose statements reach a routine row that does not exist — the closure
 /// of the demand set, checked rather than hoped.
+#[macro_export]
+macro_rules! catalog {
+    ($( ($name:literal, $trace:path, $m:expr $(,)?) ),+ $(,)?) => {
+        &[ $( ($name, (|plane| $trace($name, &$m, plane)) as _) ),+ ]
+    };
+}
+
 #[macro_export]
 macro_rules! catalogue {
     ($( ($name:literal, $f:path $(,)?) ),+ $(,)?) => {
@@ -928,7 +941,7 @@ macro_rules! catalogue {
 /// floor they could each become one line over.
 pub mod fire {
     use super::*;
-    use kernels::{Kind, Source};
+    use ::kernels::{Kind, Source};
     use model_ir::trace::ValueId;
 
     /// One statement's operands, in each run's own order.
@@ -960,7 +973,7 @@ pub mod fire {
     /// (`check_plan` re-checks the recorded statement either way).
     /// `SOURCES` and `DERIVED` are both one entry per parameter with the
     /// `Ctx` dropped, so the zip is aligned by construction.
-    fn counts(sources: &[Option<Source>], derived: &[kernels::Derived]) -> [(usize, usize); 4] {
+    fn counts(sources: &[Option<Source>], derived: &[::kernels::Derived]) -> [(usize, usize); 4] {
         let mut runs = [(0usize, 0usize); 4];
         for (i, s) in sources.iter().enumerate() {
             let nullable = derived.get(i).is_some_and(|d| d.nullable);
@@ -990,7 +1003,7 @@ pub mod fire {
     /// time — when the call does not fill the column: a statement short of
     /// its signature must not become a statement at all. A run with
     /// nullable slots may be filled short by exactly the absent ones.
-    pub fn fire<R: kernels::Signature + kernels::Derivation>(t: &Trace, call: Call) -> Vec<Val> {
+    pub fn fire<R: ::kernels::Signature + ::kernels::Derivation>(t: &Trace, call: Call) -> Vec<Val> {
         let symbol = format!("{}::{}", R::NAMESPACE, R::NAME);
         checked::<R>(t, &symbol, call)
     }
@@ -1007,7 +1020,7 @@ pub mod fire {
     /// The column validation is [`fire()`]'s, and one check is added: the
     /// symbol must resolve to `R`'s own name, so a wrapper cannot fire one
     /// routine's marker under another routine's entrypoint.
-    pub fn fire_at<R: kernels::Signature + kernels::Derivation>(
+    pub fn fire_at<R: ::kernels::Signature + ::kernels::Derivation>(
         t: &Trace,
         symbol: &str,
         call: Call,
@@ -1025,7 +1038,7 @@ pub mod fire {
 
     /// The shared half of [`fire()`]/[`fire_at`]: the column check and the
     /// recording.
-    fn checked<R: kernels::Signature + kernels::Derivation>(
+    fn checked<R: ::kernels::Signature + ::kernels::Derivation>(
         t: &Trace,
         symbol: &str,
         call: Call,
@@ -1086,7 +1099,7 @@ pub mod fire {
 pub(crate) fn ruled_out(
     t: &Trace,
     routine: &str,
-    rule: kernels::OutRule,
+    rule: ::kernels::OutRule,
     inputs: &[model_ir::trace::ValueId],
     params: &[u32],
 ) -> (Shape, DType) {
@@ -1112,17 +1125,60 @@ pub(crate) fn ruled_out(
 }
 
 pub mod cuda;
+pub mod declare;
+pub mod facts;
+pub mod forward;
+pub mod kernels;
+pub mod load;
 mod guard;
+mod record;
 pub mod metal;
 mod ops;
 mod rows;
 
+pub use model_dsl_macros::Facts;
+
+pub use declare::*;
+pub use record::{Value, Windows};
+pub use model_ir::plan::Plan;
+pub use facts::*;
+pub use forward::*;
 pub use guard::*;
 pub use ops::*;
 pub use rows::*;
 
-/// Re-exported so declarations spell the seam vocabulary from this surface.
-pub use model_ir::seam;
+/// The plane a trace is bound to; vulkan and wgpu consume the metal-shaped
+/// table, so two tables is two planes.
+pub use model_ir::kernels::Backend as Plane;
+
+
+/// The seam vocabulary plus the one per-layer tap statement.
+pub mod seam {
+    pub use model_ir::seam::*;
+
+    use crate::record::Value;
+
+    pub trait Sees {
+        fn values(&self) -> Vec<&Value>;
+    }
+
+    impl Sees for (&Value,) {
+        fn values(&self) -> Vec<&Value> {
+            vec![self.0]
+        }
+    }
+
+    impl Sees for (&Value, &Value) {
+        fn values(&self) -> Vec<&Value> {
+            vec![self.0, self.1]
+        }
+    }
+
+    pub fn at<S: Sees>(def: Def, sees: S, layer: u32) {
+        let values = sees.values();
+        values[0].rec.seam(def.name, &values, Some(layer));
+    }
+}
 
 /// Record a seam statement; `sees` order must match `def.sees`.
 pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {

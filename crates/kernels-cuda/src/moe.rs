@@ -79,7 +79,7 @@ fn routed_rows<P>(out_rows: i32, out_width: i32, aligned: Region<P>) -> Result<i
     Ok(routes)
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = "topk.sigmoid")]
 pub fn topk_sigmoid<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -121,7 +121,7 @@ pub fn topk_sigmoid<T>(
     )
 }
 
-#[routine(bf16)]
+#[routine(bf16, canon = "topk.sqrt_softplus")]
 pub fn topk_sqrtsoftplus<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -206,7 +206,7 @@ pub fn hash_route_lookup(
     )
 }
 
-#[routine(bf16, canon = topk)]
+#[routine(bf16, canon = "topk.softmax")]
 pub fn topk_softmax<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,

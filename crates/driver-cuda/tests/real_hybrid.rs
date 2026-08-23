@@ -49,6 +49,7 @@ use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
 use driver_cuda::bind::{
     AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
 };
+use driver_cuda::bind::views::{FireStreams, FireViews};
 use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
 use driver_cuda::dtype::DType;
 use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
@@ -59,6 +60,25 @@ use model_ir::trace::{FireClass, ValueId};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
+
+/// The scalars the family texts used to read off their fact structs.
+///
+/// Upstream lifted `norm_eps`, the rope bases and gpt-oss's sliding window
+/// OUT of the facts and onto the forward functions, because two SKUs of one
+/// family can differ in those and in nothing else. These tests never read a
+/// number back -- they lower, bind and count -- so any well-formed value
+/// states the same text, and these are the shipped checkpoints' own.
+#[allow(dead_code)]
+const EPS: f32 = 1e-6;
+/// The common rope base. gpt-oss's is its own.
+#[allow(dead_code)]
+const THETA: f32 = 1_000_000.0;
+/// gpt-oss: YaRN over a 150k base, alternating 128-token windows.
+#[allow(dead_code)]
+const WINDOWED_THETA: f32 = 150_000.0;
+/// The sliding leg's span. `-1` is "no window" and is NOT what gpt-oss says.
+#[allow(dead_code)]
+const WINDOW: i32 = 128;
 
 /// The checkpoint, header-parsed — `real_prefill`'s reader with the one
 /// difference this family needs: F32 tensors are admitted (A_log, the
@@ -197,19 +217,67 @@ struct Live<'a> {
     /// `LiveResolver` states: two prefills of different head dim both spell
     /// `fa2.prefill`. That cannot arise here.
     prefill_plan: *const std::ffi::c_void,
+    /// The RESIDENT half of the raise channel, built exactly as the live path
+    /// builds it (`FireViews::build`).
+    ///
+    /// # Why a fixture needs it now
+    ///
+    /// The GDN arms used to take their conv and recurrent slabs off the fire's
+    /// [`GdnCtx`], so filling that struct was the whole of staging state. The
+    /// no-ask sweep moved every per-layer OBJECT onto the operand channel:
+    /// `ssm::causal_conv1d_prefill_batched` and its recurrence siblings now
+    /// name `"recurrent_state"` in the text, the lowering leaves the operand
+    /// `Arg::Raised`, and a resolver that answers only weights, names and
+    /// `fa2.prefill` refuses at `RaisedUnbound { key: "recurrent_state" }` on
+    /// the first linear layer. Filling `GdnCtx` is still necessary -- it is
+    /// where the slabs come FROM -- but it is no longer sufficient.
+    ///
+    /// `FireViews::build` is the same call the live path makes, over the same
+    /// two contexts, so this fixture publishes the slabs by the driver's own
+    /// rule rather than by a second one written here. The streams half is
+    /// [`FireStreams::default`]: every stream this hybrid names is a seam the
+    /// fixture pinned itself and answers through `named`, and a default
+    /// `FireStreams` is all-null, which is a refusal and not a wrong pointer
+    /// if that ever stops being true.
+    views: &'a FireViews,
+    /// `plan.runtime`, inverted: which name and which layer each raised value
+    /// stands for. The live path keeps the same map for the same reason --
+    /// the key on the wire is the vocabulary word, and the LAYER is what
+    /// picks one of eighteen slabs.
+    runtime: BTreeMap<ValueId, (String, Option<u32>)>,
 }
 impl Resolver for Live<'_> {
     fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
         self.weights.get(name).map(|b| b.as_ptr().cast_const())
     }
     fn named(&mut self, value: ValueId) -> Option<*mut std::ffi::c_void> {
+        // A runtime STREAM the fixture staged answers first, a seam value it
+        // pinned answers after -- `fire::launch`'s `LiveResolver` in the same
+        // order, and here it is CORRECTNESS and not cost. The two sets are
+        // disjoint only because the pin pool excludes `runtime_values`; before
+        // it did, every stream resolved to a zeroed pin, and the loudest of
+        // those was `"first_token"`: the swept routines read that answer as
+        // `ptr as i32`, so a pin handed `write_kv_to_pages` a DEVICE ADDRESS
+        // as its write origin and the append walked off the pool.
+        if let Some((name, _)) = self.runtime.get(&value) {
+            return self.views.streams.named(name);
+        }
         self.named.get(&value).map(|b| b.as_ptr())
     }
-    fn raised(&mut self, _value: ValueId, key: &str) -> Option<*const std::ffi::c_void> {
-        // BY THE KEY, because this fixture holds exactly one -- which is the
-        // case the trait's doc names as the key's own. An unrecognised key is
-        // `None` and therefore a refusal, not this plan under another name.
-        (key == "fa2.prefill").then_some(self.prefill_plan)
+    fn raised(&mut self, value: ValueId, key: &str) -> Option<*const std::ffi::c_void> {
+        // BY THE KEY for the one prep this fixture publishes itself -- which
+        // is the case the trait's doc names as the key's own, and it must be
+        // tried first because a default `FireStreams` answers the same word
+        // with a null it would refuse on.
+        if key == "fa2.prefill" {
+            return Some(self.prefill_plan);
+        }
+        // Everything else is a RESIDENT object out of the closed vocabulary,
+        // answered from the view arena by the value's own name and layer. An
+        // unrecognised value is `None` and therefore a refusal, not some other
+        // layer's slab.
+        let (name, layer) = self.runtime.get(&value)?;
+        self.views.raised(name, *layer, value)
     }
 }
 
@@ -279,7 +347,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         proj_repr: model_dsl::WeightRepr::Bf16,
         window_left: Vec::new(),
     };
-    let plan = qwen3_5_hybrid_cuda(&hybrid, &cuda, FireClass::Prefill);
+    let plan = qwen3_5_hybrid_cuda::<model::qwen_3_5::forward::ShippedW1, model::qwen_3_5::forward::ShippedW2, model::qwen_3_5::forward::ShippedA, model::qwen_3_5::forward::ShippedKv>(&hybrid, &cuda, FireClass::Prefill, EPS, THETA);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
     let rows: Vec<Row> = vec![
@@ -332,9 +400,17 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     });
 
     // ── The seam-value pool. ──
+    //
+    // RUNTIME VALUES ARE NOT SEAMS. The lowering leaves them `Arg::Named` like
+    // any other, but the driver stages them per fire and answers them by name;
+    // `runtime_values` is the live path's own exclusion and this fixture takes
+    // it verbatim, so a stream never gets a pin to be answered from.
+    let staged = driver_cuda::bind::views::runtime_values(&plan.runtime);
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
     for a in &l.args {
-        if let Arg::Named { value, width, .. } = a {
+        if let Arg::Named { value, width, .. } = a
+            && !staged.contains(value)
+        {
             named_widths.insert(*value, *width);
         }
     }
@@ -587,11 +663,159 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         }
     }
 
+    // The streams this fixture staged, under the names the text mints them
+    // by. `sampling_indices` stays null on purpose: every row is sampled, so
+    // there is no index list, and a gather that named one must REFUSE rather
+    // than read an empty pin.
+    let views = FireViews::build(
+        Some(&attn),
+        Some(&gdn),
+        FireStreams {
+            positions: positions.as_ptr(),
+            token_ids: ids.as_ptr(),
+            request_of_token: core::ptr::null_mut(),
+            qo_indptr: qo_indptr.as_ptr(),
+            row_valid: row_valid.as_ptr(),
+            sampling_indices: core::ptr::null_mut(),
+            first_token: 0,
+            qo_indptr_host: qo_indptr_h.as_ptr(),
+            kv_page_indptr_host: page_indptr_h.as_ptr(),
+            prefill_plan_cache: core::ptr::null_mut(),
+        },
+    );
     let mut resolver = Live {
         weights: &weights,
         named: &named_bufs,
         prefill_plan: pplan.as_ptr().cast_const(),
+        views: &views,
+        runtime: plan
+            .runtime
+            .iter()
+            .map(|b| (b.value, (b.name.clone(), b.layer)))
+            .collect(),
     };
+    // ── The step census, when asked for. ──
+    //
+    // `real_prefill`'s bisection, over this walk: one launch at a time, the
+    // out's rectangle back to the host, and a mean/max/non-finite line per
+    // step. It is how a hybrid disagreement is localised to a LAYER and a
+    // KERNEL rather than to "the logits are wrong".
+    if std::env::var("HYBRID_AB_STEPS").is_ok() {
+        let mut host = vec![0u8; TOKENS * 8192 * 2];
+        for i in 0..l.launches.len() {
+            let launch = &l.launches[i];
+            let bound = driver_cuda::bind::bind(&l, launch, frame, &mut resolver)
+                .unwrap_or_else(|e| panic!("bind {i}: {e:?}"));
+            driver_cuda::bind::dispatch(
+                &bound,
+                dplan.spec(i),
+                frame,
+                &mut resolver,
+                &ctx,
+                AttnRegions::whole(Some(&attn)).of(&launch.rows),
+                Some(&gdn),
+            )
+            .unwrap_or_else(|e| panic!("dispatch {i}: {e:?}"));
+            stream.as_ref().synchronize().expect("step sync");
+            let Some(out) = dplan.spec(i).outs.first() else {
+                continue;
+            };
+            // THE ELEMENT WIDTH IS ON THE ARG, and reading it is not optional
+            // here: a hybrid's recurrence carries fp32 intermediates (hence
+            // `norm::rmsnorm_gated_fp32_in` reading them), so a census that
+            // assumes bf16 reports `qwen_gdn_post_conv_prep` at 1e36 with a
+            // third of its rows non-finite and sends the reader after a
+            // kernel that is fine.
+            let (base, width, elem) = match out {
+                Arg::Named {
+                    value,
+                    width,
+                    bytes,
+                } => (
+                    named_bufs[value].as_ptr().cast_const().cast::<u8>(),
+                    *width,
+                    *bytes as usize,
+                ),
+                // SAFETY: `at` is an offset the lowering assigned inside the
+                // arena this frame was built from.
+                Arg::Arena { at, width, bytes } => (
+                    unsafe { arena.as_ptr().cast_const().cast::<u8>().add(*at) },
+                    *width,
+                    *bytes as usize,
+                ),
+                Arg::Weight(_) | Arg::Raised { .. } => continue,
+            };
+            let n = TOKENS * width as usize;
+            let bytes = n * elem;
+            if bytes > host.len() || !matches!(elem, 2 | 4) {
+                continue;
+            }
+            // SAFETY: `base` addresses `bytes` live device bytes -- the
+            // rectangle the launch just wrote -- and `host` is that long.
+            let rc = unsafe {
+                cudarc::runtime::sys::cudaMemcpy(
+                    host.as_mut_ptr().cast(),
+                    base.cast(),
+                    bytes,
+                    cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            assert_eq!(
+                rc,
+                cudarc::runtime::sys::cudaError::cudaSuccess,
+                "step d2h {i}"
+            );
+            let (mut sum, mut max, mut bad) = (0f64, 0f32, 0usize);
+            for k in 0..n {
+                let x = if elem == 4 {
+                    f32::from_le_bytes([
+                        host[k * 4],
+                        host[k * 4 + 1],
+                        host[k * 4 + 2],
+                        host[k * 4 + 3],
+                    ])
+                } else {
+                    let bits = u16::from_le_bytes([host[k * 2], host[k * 2 + 1]]);
+                    f32::from_bits(u32::from(bits) << 16)
+                };
+                if x.is_finite() {
+                    sum += f64::from(x.abs());
+                    max = max.max(x.abs());
+                } else {
+                    bad += 1;
+                }
+            }
+            // The last row's first few elements, when a step is under
+            // suspicion: an aggregate says THAT two implementations differ
+            // and an element says HOW.
+            if std::env::var("HYBRID_AB_HEAD").as_deref() == Ok(&i.to_string()) {
+                let at = (TOKENS - 1) * width as usize;
+                let head: Vec<f32> = (at..at + 8)
+                    .map(|k| {
+                        if elem == 4 {
+                            f32::from_le_bytes([
+                                host[k * 4],
+                                host[k * 4 + 1],
+                                host[k * 4 + 2],
+                                host[k * 4 + 3],
+                            ])
+                        } else {
+                            let b = u16::from_le_bytes([host[k * 2], host[k * 2 + 1]]);
+                            f32::from_bits(u32::from(b) << 16)
+                        }
+                    })
+                    .collect();
+                println!("HEAD [{i:4}] {head:?}");
+            }
+            println!(
+                "STEP [{i:4}] {:<46} w={:<26} width={width:5} e{elem} mean|x|={:>10.5} max={max:>9.3} bad={bad}",
+                l.kernels[l.launches[i].kernel as usize],
+                dplan.spec(i).weight.as_deref().unwrap_or("-"),
+                sum / n.max(1) as f64,
+            );
+        }
+    }
+
     let ran = run(
         &l,
         &dplan,
@@ -608,20 +832,31 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     if std::env::var("HYBRID_AB_DEBUG").is_ok() {
         // The residual lives where the embed wrote it; dump the last
         // row's head for the bisection against HF hidden states.
-        let e_at = l
-            .launches
-            .iter()
-            .find_map(|x| {
-                (l.kernels[x.kernel as usize] == "layout::embed_bf16").then(|| {
-                    match &l.args[x.args.start as usize] {
-                        Arg::Arena { at, .. } => *at,
-                        other => panic!("embed writes the arena, got {other:?}"),
-                    }
-                })
+        // THE OUT, not `args.start` -- a launch's argument run begins with
+        // its INPUTS, so the old reading picked up `token_ids` and panicked
+        // that "embed writes the arena". Where the residual lives is the
+        // allocator's choice and not the text's, so both channels are read.
+        let e_out = (0..l.launches.len())
+            .find_map(|i| {
+                (l.kernels[l.launches[i].kernel as usize] == "layout::embed_bf16")
+                    .then(|| dplan.spec(i).outs.first().cloned())
+                    .flatten()
             })
             .expect("embed ran");
-        let mut back = vec![0u8; l.arena_bytes];
-        arena.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
+        let (back, e_at) = match e_out {
+            Arg::Arena { at, .. } => {
+                let mut back = vec![0u8; l.arena_bytes];
+                arena.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
+                (back, at)
+            }
+            Arg::Named { value, .. } => {
+                let b = &named_bufs[&value];
+                let mut back = vec![0u8; b.len()];
+                b.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
+                (back, 0)
+            }
+            other => panic!("embed writes somewhere this dump cannot read: {other:?}"),
+        };
         stream.as_ref().synchronize().expect("sync");
         let h = |r: usize, c: usize| {
             let off = e_at + (r * 1024 + c) * 2;

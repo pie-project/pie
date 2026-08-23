@@ -33,10 +33,10 @@ fn cuda_native_text_and_device_geometry_decode() {
         // (3) Real cuda forward: prefill -> multi-token decode -> coherent text.
         eprintln!("[cuda_forward] RESULT = {result:?}");
         let text = result.expect("inferlet errored on cuda");
-        assert!(
-            !text.trim().is_empty(),
-            "cuda forward must decode non-empty text, got empty"
-        );
+        // "Non-empty" STOOD HERE, and a scrambled residual stream clears it
+        // every time — see `assert_coherent`'s note and the sibling gate
+        // `cuda_gdn_forward`, which exists because that is not hypothetical.
+        common::assert_coherent(&text, 3);
 
         // (4) STOOD HERE: a second spawn that drove `windowed-attention` and
         // matched its `WINDOWED_ATTENTION...` verdict, to exercise the PTIR

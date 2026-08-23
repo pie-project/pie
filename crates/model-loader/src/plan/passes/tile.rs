@@ -48,12 +48,22 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 /// and these strings are the LOADER's own vocabulary — the word a plan
 /// carries from `tile` to `executor::cuda`'s dispatch, and nothing wider.
 ///
+/// THE FIRST TWO CARRY NO DTYPE, and the constants' own names do. That is
+/// not a mismatch: both routines are GENERIC (`cast_fp32_to<T>`,
+/// `scale_rows<T>`), so the registry symbol is the generic one and the
+/// instantiation is chosen where the routine is called, which for this
+/// loader is `bf16` and always has been. The constant is named for the
+/// instantiation the loader pins; the string is named for the row it must
+/// resolve against. They were both spelled `..._bf16` while the routines
+/// were monomorphic, and the string is what had to change when they stopped
+/// being.
+///
 /// The typed call and the string are two halves of one claim, and only
 /// together: the call is checked by the compiler and does not know what this
 /// constant says; the constant is what a plan carries and the compiler cannot
 /// read it. `executor::cuda`'s test is where the two meet.
-pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to_bf16";
-pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows_bf16";
+pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to";
+pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows";
 pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";
 pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_per_channel";
 
@@ -480,7 +490,7 @@ fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
         TileMapKind::Cast => (facts.source_dtype == Some(DType::F32)
             && facts.dest_dtype == Some(DType::BF16))
         .then_some(CUDA_CAST_FP32_TO_BF16),
-        // `scale_rows_bf16` multiplies IN PLACE and reads its factors from an
+        // `scale_rows` multiplies IN PLACE and reads its factors from an
         // operand. A uniform factor has no operand to read and the table has no
         // scalar-multiply row; a destination that is not the source is not what
         // the kernel does.

@@ -58,13 +58,20 @@
 //! a claim a program binds against, so a false one is a silent no-op. Five
 //! fixtures, one cause. Nobody needs to go looking in the checkpoint.
 //!
-//! `PIE_CUDA_KV_ENVELOPES=1` does not change it, which is worth writing down
-//! because the refusal text names that variable and invites the attempt. It was
-//! tried: all four of `quest-attention`, `trackb-h2o`, `trackb-snapkv` and
-//! `tova-attention` refuse identically with it set and unset. The knob is read
-//! by `pools/kv_cache.rs::envelopes_requested`, where it decides whether the
+//! Both refusals SAY that now -- `tensor_ir::validate`'s `IntrinsicUnavailable`
+//! and `KernelUnavailable` name the driver's `PtirCaps` and add, of the
+//! intrinsic one, that it "says nothing about the checkpoint". The census
+//! quotes the old wording above because that is what the run printed when it
+//! was taken.
+//!
+//! `PIE_CUDA_KV_ENVELOPES=1` does not change it. The refusal text used to name
+//! that variable and invite the attempt, which is why this was tried: all four
+//! of `quest-attention`, `trackb-h2o`, `trackb-snapkv` and `tova-attention`
+//! refuse identically with it set and unset. The knob is read by
+//! `pools/kv_cache.rs::envelopes_requested`, where it decides whether the
 //! memory planner RESERVES envelope bytes; it never reaches the advertised
-//! capability, and it could not, because the capability is a literal.
+//! capability, and it could not, because the capability is a literal. The
+//! invitation is gone from the message -- that measurement is what removed it.
 //!
 //! How much stands behind the bit, for whoever picks this up: envelope
 //! MAINTENANCE is real, in `kernels-cuda/src/attn/mod.rs`, where the write-KV
@@ -311,6 +318,52 @@
 //!    above the elastic pool was rejected instead of growing it -- the exact
 //!    defect `driver-vulkan/tests/device.rs` and `driver-wgpu/tests/serving.rs`
 //!    each carry a device test for, arrived at from the third backend.
+//!
+//! # The test surface was dark, and that is why the migration stayed half done
+//!
+//! `cargo test -p <crate>` reports a build error, not a failure count, when a
+//! `#[cfg(test)]` module or a `tests/*.rs` target fails to COMPILE. In a
+//! workspace sweep that reads as noise. Entire crates' worth of gates had been
+//! un-run for a long time on exactly that reading: `model-ir`, `model-compiler`,
+//! `driver-metal`, six of `driver-cuda`'s seven test targets, both of
+//! `kernels`', and `driver-vulkan` outright (a merge left two imports behind,
+//! one of them naming a type that no longer exists).
+//!
+//! **`cargo check --workspace --all-targets` is the knob that surfaces this.**
+//! Run it. It is not the same question as `cargo test`, and it is the one that
+//! was not being asked.
+//!
+//! What the dark surface COST is the point. The no-ask migration -- which
+//! deleted the `keys::*` / `ctx.ask` vocabulary and made every routine's
+//! operands derive from its own `fn` signature, bound positionally through
+//! `Source::Slot` -- was landed in six places and not in six others, and every
+//! one of the six omissions had a test that would have named it:
+//!
+//! * `TraceBuilder::finish` runs `model_ir::kernels::check_plan`, whose
+//!   `OpKind::Launch` arm refused every statement of a family with no backend
+//!   segment. Semantic texts state kernels now (`canon::*`, `layout::embed_bf16`),
+//!   so EVERY semantic family text panicked out of its own constructor. Nothing
+//!   in the tree could call one.
+//! * `site_table::derive_sites` anchored on the expert-indexed grouped GEMM.
+//!   The CUDA reading of a MoE block does not state one -- `moe::
+//!   flashinfer_cutlass_moe_bf16` fuses the whole leg -- so a repaired walk
+//!   still derived an EMPTY site table for a mixture-of-experts model. Not a
+//!   panic; a fire plan quietly missing a divergence. It anchors on
+//!   `moe::topk_softmax` now, which both legs state.
+//! * `bind::table`'s `#[cfg(test)]` hand arms -- the second opinion the derived
+//!   column is diffed against -- still bound the pre-migration lists, and four
+//!   `crossed()` assertions named symbols whose dtype suffix went away with
+//!   their generic instantiation. A stale symbol asserts `crossed` and gets
+//!   `false`, silently.
+//! * `kernels`' own `routine_derivation` fixture, the file that PROVES a table
+//!   row derives from a `fn` signature, spoke the ask contract throughout.
+//! * `shader::COUNT` -- a vocabulary size asserted rather than narrated,
+//!   precisely so it could not drift -- had drifted, because a test that does
+//!   not compile does not assert.
+//!
+//! The pattern to carry: a gate that cannot compile is worse than a gate that
+//! does not exist, because the absence of one is visible and the silence of the
+//! other is not.
 
 mod common;
 

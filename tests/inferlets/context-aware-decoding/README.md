@@ -11,7 +11,7 @@ Hallucinate Less with Context-aware Decoding*** —
 <https://arxiv.org/abs/2305.14739>. Implements §2.2.
 
 **Faithfulness: Exact (equivalent form).** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

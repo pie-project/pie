@@ -646,7 +646,7 @@ pub fn qmm_residual_fp16(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val 
     or_regions(out, x)
 }
 
-/// `rope/rope.metal::neox_decode_bfloat16` (M=1) /
+/// `rope/neox.metal::neox_decode_bfloat16` (M=1) /
 /// `neox_mb_bfloat16` (M>1). One dispatch for q and k together,
 /// as the plan states it (`declared_dag.hpp`'s `Kind::Rope`).
 ///
@@ -1139,7 +1139,7 @@ pub fn sdpa(
     // `q_heads` is `q_width / head_dim` and not a separate number: the
     // query's row is heads laid end to end, which is the same division
     // the symbol's `_d_` suffix already implies.
-    let q_heads = if head_dim > 0 { q_width / head_dim } else { 0 };
+    let q_heads = q_width.checked_div(head_dim).unwrap_or(0);
     // The driver-owned operands the marks claim, in order: the KV view,
     // then — on the paged family — the per-token position and request
     // streams and the custom-mask view. All are the runtime vocabulary's;
@@ -1858,24 +1858,28 @@ pub fn combine_sorted(
 
 // ------------------------------------------------------------------ gdn ---
 
-/// The shape a gated-DeltaNet block runs at, as `GdnCoreParams` orders it.
+/// The shape a gated-DeltaNet block runs at, as `GdnCoreParams` ordered it.
 ///
-/// One struct rather than eleven arguments because the shader reads it as one
-/// struct: `ssm/gdn_params.h` declares `{Dk, Dv, Hk, Hv, conv_dim, Kc, q_off,
-/// k_off, v_off, eps, inv_sqrt_dk}` and `Handles::params_block` packs the
-/// statement's scalars in the order they were stated. A text that stated ten
-/// of them would not fail -- it would leave `inv_sqrt_dk` reading whatever
+/// One struct rather than eleven arguments because the ORDER is load-bearing,
+/// not because anything still reads a block. `ssm/gdn_params.h` declared
+/// `{Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off, eps, inv_sqrt_dk}` and
+/// three planes carried a copy of that layout; the header is gone and
+/// `ssm/gdn_core.metal` says so at the top -- every entrypoint names the
+/// eleven as its own `const constant` scalar now. What survives is that those
+/// scalars are words 0..10 of the run [`GdnShape::params`] states, in the
+/// struct's order, because that was always the statement's. A text that stated
+/// ten of them would not fail -- it would leave `inv_sqrt_dk` reading whatever
 /// word followed, which is a prescale and so a wrong answer rather than a
 /// fault.
 #[derive(Debug, Clone, Copy)]
 pub struct GdnShape {
     /// Key head width.
     pub k_dim: u32,
-    /// Value head width.
+    /// Val head width.
     pub v_dim: u32,
     /// Key heads.
     pub k_heads: u32,
-    /// Value heads.
+    /// Val heads.
     pub v_heads: u32,
     /// Channels the causal convolution carries: `2*Hk*Dk + Hv*Dv`.
     pub conv_dim: u32,

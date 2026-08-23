@@ -9,12 +9,20 @@
 //     impact on the byte-identical-CB / encode-overlap invariant (decode_abi I1).
 //   * bfloat is native on Metal 4 (macOS 26) -> MLX's bf16.h emulation is dropped.
 //   * Output is RMSNorm(x) * w, matching MLX semantics (weight always applied here).
-//   * qwen3.5/qwen36 uses the Gemma `(1 + weight)` convention for EVERY RMSNorm
-//     (attn_norm, q_norm, k_norm, ffn_norm, final_norm — all plus_one=true; see
-//     model/qwen36.cpp + ops/norm.cpp). MLX folds the +1 by materializing
-//     `mx::add(weight, 1.0f)` (float) before fast::rms_norm, so the effective gain
-//     is float (1.0f + weight); we apply it in float here when plus_one != 0.
-//     The gated-RMSNorm (gated_rms.metal) does NOT use +1 (raw gate_norm weight).
+//   * The gemma `(1 + weight)` convention is PER MODEL and per norm, read off
+//     the deployment row rather than assumed: `norm_unit_offset` is `true` for
+//     gemma_3 and `false` for qwen_3_5 and everything llama-like (see
+//     `model/src/*/project.rs`), and `batch/geometry.rs` states it from the row
+//     instead of letting `DecodeGeometry::default`'s `true` fall through. The
+//     C++ port note this replaces claimed qwen3.5/qwen36 folded the +1 into
+//     EVERY RMSNorm, citing a `model/qwen36.cpp` that no longer exists; its
+//     weights are absolute (input_layernorm averages 1.24, `model.norm` 4.31 on
+//     the 0.8B checkpoint), so a `1 + w` gain there is finite and quiet --
+//     a ~80% per-norm error the residual stream compounds. MLX folds the +1 by
+//     materializing `mx::add(weight, 1.0f)` (float) before fast::rms_norm, so
+//     the effective gain is float (1.0f + weight); we apply it in float here
+//     when plus_one != 0. The gated-RMSNorm (gated_rms.metal) never folds
+//     (raw gate_norm weight).
 //
 // THE FIVE SCALARS ARE FIVE SCALARS, NOT A STRUCT.
 //

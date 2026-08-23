@@ -58,8 +58,18 @@ pub struct Geometry {
     pub kv_heads: u32,
     /// Elements per head.
     pub head_dim: u32,
-    /// Channels a partial rope rotates.
-    pub rotary_dims: u32,
+    // `rotary_dims` WAS HERE TOO. `DecodeGeometry` in `batch/geometry.rs`
+    // carried one and this carried the other, both fire-wide, both filled
+    // from layer zero's attention row and offered to every layer as though a
+    // stack could only rotate one width. gemma-4 is the counter-example, and
+    // it is not an exotic one.
+    //
+    // The reason both could go is that the consumer went first: `RotaryWidth`
+    // was the fallback of seven `ParamOr<3, ..>` sites, answered through
+    // `arm.rs` off `Facts::rotary_dims`, and the key does not exist in the
+    // tree any more -- those sites read the width the statement carries. Two
+    // fields survived their reader by long enough that only a public-door
+    // census noticed, and only after somebody built the test target.
     /// Experts the router scores.
     pub n_experts: u32,
     /// Experts each token routes to.
@@ -1127,7 +1137,10 @@ mod tests {
                 bytes: 4,
             },
         ];
-        let lowered = one("argmax_logits_bfloat16", 3, args);
+        let mut lowered = one("argmax_logits_bfloat16", 3, args);
+        // `rows` is the statement's now, not a fact the tables answer.
+        lowered.launches[0].params = 0..1;
+        lowered.params = vec![3];
 
         assert!(
             crate::lowering::routine::crossed(&lowered.kernels[0]).is_some(),
@@ -1157,7 +1170,7 @@ mod tests {
     /// nothing.
     #[test]
     fn a_routine_refusing_the_rectangle_refuses_the_walk() {
-        let lowered = one(
+        let mut lowered = one(
             "argmax_logits_bfloat16",
             0,
             vec![
@@ -1183,6 +1196,11 @@ mod tests {
                 },
             ],
         );
+        // An empty rectangle is now something the STATEMENT says, and the
+        // routine refuses on reading it rather than on the launch's range.
+        lowered.launches[0].params = 0..1;
+        lowered.params = vec![0];
+
         let why = plan(&lowered, frame(), Geometry::default(), &mut Anything)
             .expect_err("no row to sample");
         assert!(
@@ -1231,7 +1249,6 @@ mod tests {
             q_heads: 4,
             kv_heads: 4,
             head_dim: 64,
-            rotary_dims: 32,
             group: 64,
             bits: 4,
             ..Geometry::default()
@@ -1267,11 +1284,20 @@ mod tests {
             width: 256,
             bytes: 2,
         };
-        let arena = vec![cell.clone(), cell];
+        // POSITIONS IS AN OPERAND NOW. It was `ctx.ask::<_, keys::Positions>()`
+        // -- a fact the driver's tables answered -- until the no-ask series
+        // put it in the signature, so the statement lists it between the
+        // input and output halves that `Handles` splits `args` into.
+        let positions = Arg::Arena {
+            at: 2048,
+            width: 5,
+            bytes: 4,
+        };
+        let arena = vec![cell.clone(), positions, cell];
 
         let mut prop = one("neox_prop_mb_bfloat16", 5, arena.clone());
-        prop.launches[0].params = 0..4;
-        prop.params = vec![scale, base, 64, 32];
+        prop.launches[0].params = 0..5;
+        prop.params = vec![scale, base, 64, 32, 5];
         let plan =
             plan(&prop, frame(), geom(), &mut Tables).expect("the routine states its own bindings");
         assert_eq!(
@@ -1284,6 +1310,9 @@ mod tests {
         let mut strided = one("neox_strided_bfloat16", 5, arena.clone());
         strided.launches[0].params = 0..4;
         strided.params = vec![scale, base, 64, 32];
+        // Four words where the signature wants six: the pitch is the fifth and
+        // `rows` the sixth, and a run that stops short of the pitch is exactly
+        // the statement this test says cannot dispatch.
         let why =
             super::plan(&strided, frame(), geom(), &mut Tables).expect_err("no pitch, no dispatch");
         assert!(
@@ -1293,8 +1322,8 @@ mod tests {
         );
 
         // The stride, stated, and narrower than the row it strides over.
-        strided.launches[0].params = 0..5;
-        strided.params = vec![scale, base, 64, 32, 128];
+        strided.launches[0].params = 0..6;
+        strided.params = vec![scale, base, 64, 32, 128, 5];
         let why = super::plan(&strided, frame(), geom(), &mut Tables)
             .expect_err("a pitch narrower than the row makes consecutive rows overlap");
         assert!(
@@ -1308,7 +1337,7 @@ mod tests {
             "{why:?}"
         );
 
-        strided.params = vec![scale, base, 64, 32, 512];
+        strided.params = vec![scale, base, 64, 32, 512, 5];
         let plan = super::plan(&strided, frame(), geom(), &mut Tables)
             .expect("a pitch wider than the row tiles");
         assert_eq!(plan[0].grid, [16, 4, 5]);
@@ -1332,13 +1361,21 @@ mod tests {
             bytes: 2,
         };
         // Four 64-wide reductions inside each 256-wide row, five rows.
-        let block = vec![eps, 64, 1, 0, 1.0f32.to_bits()];
+        //
+        // ONE BLOCK NO LONGER SERVES ALL FIVE. It did while `heads` and `rows`
+        // were facts the routines asked the driver's tables for; the no-ask
+        // series made both positional, so the run a statement carries is now
+        // the signature's own and the two gated norms take a different one
+        // (`eps, vd, heads, rows`) from the two rms rows
+        // (`eps, axis, w_stride, plus_one, gain, rows`).
+        let rms = vec![eps, 64, 1, 0, 1.0f32.to_bits(), 5];
+        let gated = vec![eps, 64, 4, 5];
 
         for (symbol, args, params, grid, tg) in [
             (
                 "rms_strided_row",
                 vec![arena(0), Arg::Weight("norm".into()), arena(2048)],
-                block.clone(),
+                rms.clone(),
                 // One threadgroup per ROW: the base is `gid * row_pitch`, so
                 // a row holds one norm and the axis only sizes the group.
                 [16 * 5, 1, 1],
@@ -1347,7 +1384,7 @@ mod tests {
             (
                 "rms_strided_head_row",
                 vec![arena(0), Arg::Weight("norm".into()), arena(2048)],
-                block.clone(),
+                rms.clone(),
                 // Four heads on their own axis, five rows on a third.
                 [16, 4, 5],
                 [16, 1, 1],
@@ -1360,7 +1397,7 @@ mod tests {
                     Arg::Weight("norm".into()),
                     arena(2048),
                 ],
-                block.clone(),
+                gated.clone(),
                 // The pool's shape, not the statement's: four 64-wide value
                 // heads. The old rule had no row axis at all.
                 [64, 4, 5],
@@ -1374,15 +1411,16 @@ mod tests {
                     Arg::Weight("norm".into()),
                     arena(2048),
                 ],
-                block.clone(),
+                gated.clone(),
                 [64, 4, 5],
                 [64, 1, 1],
             ),
             (
                 "residual_add_strided",
                 vec![arena(0), arena(1024), arena(2048)],
-                // The pitch, which nothing else can supply.
-                vec![512],
+                // The pitch and the row count, neither of which anything else
+                // can supply now that both are the signature's.
+                vec![512, 5],
                 [256, 5, 1],
                 [256, 1, 1],
             ),
@@ -1416,6 +1454,13 @@ mod tests {
                 Arg::Weight("embed".into()),
                 Arg::Weight("embed_scales".into()),
                 Arg::Weight("embed_biases".into()),
+                // The tokens to gather, which the routine used to ask for and
+                // now takes as an operand.
+                Arg::Arena {
+                    at: 2048,
+                    width: 3,
+                    bytes: 4,
+                },
                 Arg::Arena {
                     at: 0,
                     width: 64,
@@ -1429,8 +1474,14 @@ mod tests {
         // is about can be composed at all. 64 and 4 are what the geometry
         // below says, so the composed name is `_gs_64_b_4` against the traced
         // `_gs_128_b_8`, which is the disagreement.
-        lowered.launches[0].params = 0..2;
-        lowered.params = vec![64, 4];
+        //
+        // TWICE NOW, and the second time the same sentence explains it: the
+        // no-ask series added `token_ids` and `rows` to this signature, so the
+        // run is three words and the operand list carries the tokens. A
+        // statement short of either is refused before the spelling can be
+        // composed, which would make this case pass for the wrong reason.
+        lowered.launches[0].params = 0..3;
+        lowered.params = vec![64, 4, 3];
 
         let why = plan(
             &lowered,

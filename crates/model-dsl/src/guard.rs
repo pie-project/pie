@@ -50,7 +50,7 @@ pub fn guarded(t: &Trace) -> GuardCtx {
     }
 }
 
-/// Value-producing guard; region launches lower the guard output buffers.
+/// Val-producing guard; region launches lower the guard output buffers.
 pub fn guarded_value(t: &Trace, layer: Option<u32>, shape: (Shape, DType)) -> (GuardCtx, Val) {
     let (idx, outs) = {
         let mut b = t.inner.borrow_mut();

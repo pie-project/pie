@@ -15,7 +15,7 @@ presence read the output only — follows
 [vLLM](https://github.com/vllm-project/vllm)'s sampler.
 
 **Faithfulness: Exact.** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

@@ -13,34 +13,54 @@
 //!
 //! # What the walk recognizes
 //!
-//! One pattern today: an op with a per-token weight selector —
-//! `OpKind::Matmul { selector: Some(_) }`, the expert-indexed grouped GEMM
-//! whose weight is a template (`layer.{l}.expert.{e}.gate_up`) resolved per
-//! token by a `TopK` value. That is `Div::Weight` at token granularity
-//! ([`expert_weights_site`](super::expert_weights_site)), and its
-//! parameters are derived as follows:
+//! One pattern today: a mixture-of-experts router, recognized by the fire
+//! that chooses the experts — `moe::topk_softmax`. The weights it routes to
+//! are templates (`layer.{l}.expert.{e}.gate_up`) resolved per token by the
+//! indices that fire produces, which is `Div::Weight` at token granularity
+//! ([`expert_weights_site`](super::expert_weights_site)). Its parameters are
+//! derived as follows:
 //!
-//! * `top_k` — from the `TopK { k }` op producing the selector. The
-//!   `TraceBuilder::matmul_per_token` invariant (the selector must be a
-//!   `dyn PerToken` value, which only `topk` creates) guarantees that
-//!   producer exists in every in-vocabulary trace; a plan violating it is a
-//!   tracer bug and panics here rather than mis-planning silently.
-//! * `experts` — from the trailing `Dim::Const` of the `TopK` op's input
-//!   (the router logits): the selector's indices index exactly that axis.
-//!   Note what is NOT the source: the weight template itself. The string
+//! * `top_k` — the trailing `Dim::Const` of the chosen-expert rows the top-k
+//!   PRODUCES, which are `[Tokens, Const(k)]`. Not a param on the wire: the
+//!   routine reads `k` off the width of the buffer it is handed.
+//! * `experts` — the trailing `Dim::Const` of the router logits the top-k
+//!   CONSUMES: the indices index exactly that axis. Note what is NOT the
+//!   source: the weight template itself. The string
 //!   `layer.{l}.expert.{e}.gate_up` does not bound `{e}` — template
 //!   cardinality is a *binding* fact the driver's weight resolver knows and
-//!   the plan alone does not — so the router logits width is the only
-//!   honest in-plan derivation. (For a hypothetical fragment taking the
-//!   selector itself as a producer-less parameter, both `top_k` and
-//!   `experts` would be underivable from the plan alone; no family traces
-//!   such a fragment, and the builder invariant above rules it out.)
+//!   the plan alone does not — so the router logits width is the only honest
+//!   in-plan derivation.
 //!
-//! Per-layer repetition dedups: an MoE model traces one `TopK` + two
-//! selector-carrying matmuls per layer, all with the same `(experts, k)`,
-//! and the site is a fact about the MODEL, so the table emits one site per
-//! distinct parameterization, in first-appearance order — not one per
-//! layer.
+//! # Why the top-k and not the grouped GEMM
+//!
+//! This walk used to anchor on the consumer: `OpKind::Matmul { selector:
+//! Some(_) }`, the expert-indexed grouped GEMM, reading `(experts, k)` back
+//! through the selector operand to its producing `TopK`. Two things retired
+//! that reading, and both of them retired it SILENTLY, which is the part
+//! worth remembering.
+//!
+//! First, the no-ask contract collapsed every tier-1 statement into
+//! `OpKind::Launch { kernel, .. }`. There is no `selector` field left to
+//! match on, and no `TopK` variant either.
+//!
+//! Second — and this is the one that would have kept biting after a
+//! mechanical repair — the CUDA reading of a MoE block does not state a
+//! grouped GEMM at all. `moe::flashinfer_cutlass_moe_bf16` fuses the gather,
+//! both projections and the activation into a single fire. A walk anchored
+//! on `moe::moe_grouped_gemm` therefore finds nothing whatsoever in the
+//! reading the driver actually validates and plans against, and derives an
+//! EMPTY site table for a model that is unambiguously an MoE. The aligned
+//! decode leg that does state a grouped GEMM hands it a per-BLOCK expert id
+//! from `moe::moe_align_decode`, one hop further from the router still.
+//!
+//! The top-k is the invariant across both legs: aligned or fused, every MoE
+//! block routes through exactly one, and it is the only fire in either
+//! reading where both numbers are legible without following operands.
+//!
+//! Per-layer repetition dedups: an MoE model traces one router per layer,
+//! all with the same `(experts, k)`, and the site is a fact about the MODEL,
+//! so the table emits one site per distinct parameterization, in
+//! first-appearance order — not one per layer.
 //!
 //! # What is deliberately NOT a site: per-request recurrent state
 //!
@@ -155,53 +175,53 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
     let mut expert_params: Vec<(u32, u32)> = Vec::new();
 
     for op in &plan.ops {
-        // The expert-indexed grouped GEMM, by ITS SYMBOL: the semantic
-        // `Matmul { selector }` retired with the no-ask contract, and the
-        // selector convention survives as the statement's LAST input.
+        // THE ROUTER TOP-K, by its symbol, and nothing downstream of it.
+        //
+        // This walk used to start at the expert-indexed grouped GEMM and read
+        // its selector operand, because the semantic `OpKind::Matmul {
+        // selector }` named one. Two things retired that: the no-ask contract
+        // turned every tier-1 statement into `OpKind::Launch`, so there is no
+        // `selector` field left to read; and the CUDA reading of a MoE block
+        // no longer states a grouped GEMM at all -- `moe::flashinfer_cutlass_moe_bf16`
+        // fuses the gather, both projections and the activation into one fire.
+        // A walk anchored on the GEMM therefore found NOTHING in the reading
+        // the driver actually validates, which is the only one that matters.
+        //
+        // The top-k is the invariant. Every MoE leg, aligned or fused, routes
+        // through exactly one `moe::topk_softmax`, and that fire is where BOTH
+        // numbers the site needs are legible: the expert count is the width of
+        // the logits it consumes, and `k` is the width of the indices it
+        // produces. Anchoring here also gives the dedup for free -- a gate_up
+        // and a down that share a router share their one top-k.
         let OpKind::Launch { kernel, .. } = &op.kind else {
             continue;
         };
-        if kernel != "moe::moe_grouped_gemm" {
+        if kernel != "moe::topk_softmax" {
             continue;
         }
-        let selector = *op
-            .inputs
-            .last()
-            .unwrap_or_else(|| panic!("{}: a grouped GEMM states a selector", plan.family));
-        let producer = plan
-            .ops
-            .iter()
-            .find(|candidate| candidate.outputs.contains(&selector))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{}: selector value {selector} has no producing op; \
-                     matmul_per_token requires a dyn PerToken selector, which only topk creates",
-                    plan.family
-                )
-            });
-        let OpKind::Launch {
-            kernel: producer_kernel,
-            params,
-            ..
-        } = &producer.kind
-        else {
+        // BOTH NUMBERS OFF SHAPES, not off params. `moe::topk_softmax`
+        // carries no `k` on the wire -- its rows are `[Tokens, Const(k)]` and
+        // the routine reads the width -- and the expert count is the router
+        // logits' trailing dim, which is the axis the indices index.
+        let chosen = *op.outputs.first().unwrap_or_else(|| {
             panic!(
-                "{}: selector value {selector} produced by {:?}, not the router top-k",
-                plan.family, producer.kind
-            );
+                "{}: the router top-k states its chosen experts",
+                plan.family
+            )
+        });
+        let k = match plan.values[chosen as usize].shape.0.last() {
+            Some(&Dim::Const(k)) => k,
+            other => panic!(
+                "{}: the chosen-expert rows must be `[.., Const(top_k)]`, got {other:?}",
+                plan.family
+            ),
         };
-        assert_eq!(
-            producer_kernel, "moe::topk_softmax",
-            "{}: selector value {selector} produced by `{producer_kernel}`, not the router top-k",
-            plan.family
-        );
-        let k = *params
-            .first()
-            .unwrap_or_else(|| panic!("{}: the top-k statement carries k", plan.family));
-        let logits = *producer
-            .inputs
-            .first()
-            .unwrap_or_else(|| panic!("{}: TopK op consumes the router logits", plan.family));
+        let logits = *op.inputs.first().unwrap_or_else(|| {
+            panic!(
+                "{}: the router top-k consumes the router logits",
+                plan.family
+            )
+        });
         let experts = match plan.values[logits as usize].shape.0.last() {
             Some(&Dim::Const(experts)) => experts,
             other => panic!(
@@ -223,6 +243,12 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The scalars the family texts used to read off their fact structs.
+    /// A site derivation walks ops and weights; it never reads an epsilon or
+    /// a rope base, so any well-formed value states the same text.
+    const EPS: f32 = 1e-6;
+    const THETA: f32 = 1_000_000.0;
     use super::super::{DivClass, Granularity, Lowering, SITE_EXPERT_WEIGHTS};
     use super::*;
     use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts};
@@ -230,15 +256,25 @@ mod tests {
     use model_ir::StateStore;
 
     /// The qwen3_5_moe MLP fragment (256 experts, top-8): the walk finds
-    /// the selector-carrying matmuls, resolves k off the TopK op and the
+    /// the router top-k, resolves k off the chosen-expert rows and the
     /// expert count off the router logits width, and dedups the gate_up /
     /// down pair into ONE model-level site of the pinned vocabulary shape.
     #[test]
     fn moe_fragment_derives_the_expert_site() {
-        let plan =
-            model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        // THE CUDA READING, not the semantic one. `derive_sites` finds the
+        // expert-indexed grouped GEMM by its SYMBOL now
+        // (`moe::topk_softmax`), because `OpKind::Matmul { selector }`
+        // retired with the no-ask contract -- and a semantic text states
+        // `canon::matmul_select`, which is the role, not the statement. The
+        // production walk runs driver-side over the validated plan, which is
+        // always a backend reading, so this is the plan it sees.
+        let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda(
+            &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            &model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            EPS,
+        );
         let sites = derive_sites(&plan);
-        assert_eq!(sites.len(), 1, "gate_up + down share one selector group");
+        assert_eq!(sites.len(), 1, "gate_up + down share one router");
         let site = &sites[0];
         assert_eq!(site.name, SITE_EXPERT_WEIGHTS);
         assert_eq!(site.class, DivClass::Weight);
@@ -257,7 +293,7 @@ mod tests {
             LlamaLikeFacts::mistral_7b_v03(),
             LlamaLikeFacts::olmo2_1b(),
         ] {
-            let plan = model::shared::llama_like::forward::llama_like(&facts);
+            let plan = model::shared::llama_like::forward::llama_like(&facts, EPS, THETA);
             assert!(
                 derive_sites(&plan).is_empty(),
                 "no model-structural sites in a dense trace ({})",
@@ -273,7 +309,11 @@ mod tests {
     /// only prose.
     #[test]
     fn dense_hybrid_touches_recurrent_state_but_derives_no_site() {
-        let plan = model::qwen_3_5::forward::qwen3_5_hybrid(&Qwen35HybridFacts::qwen3_5_0_8b());
+        let plan = model::qwen_3_5::forward::qwen3_5_hybrid(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            EPS,
+            THETA,
+        );
         assert!(
             plan.ops.iter().any(|op| op
                 .kind
@@ -321,8 +361,18 @@ mod tests {
     /// same plan on this side — the handshake loses nothing.
     #[test]
     fn summary_of_a_moe_trace_round_trips_through_the_vocabulary() {
-        let plan =
-            model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        // THE CUDA READING, not the semantic one. `derive_sites` finds the
+        // expert-indexed grouped GEMM by its SYMBOL now
+        // (`moe::topk_softmax`), because `OpKind::Matmul { selector }`
+        // retired with the no-ask contract -- and a semantic text states
+        // `canon::matmul_select`, which is the role, not the statement. The
+        // production walk runs driver-side over the validated plan, which is
+        // always a backend reading, so this is the plan it sees.
+        let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda(
+            &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            &model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            EPS,
+        );
         let derived = derive_sites(&plan);
         let summary = ::driver_api::ModelSiteSummary {
             expert_sites: vec![::driver_api::ExpertSiteSummary {
@@ -351,7 +401,19 @@ mod tests {
             hidden: facts.hidden(),
             ..Qwen35MoeMlpFacts::qwen3_5_35b_a3b()
         });
-        let plan = model::qwen_3_5::forward::qwen3_5_hybrid(&facts);
+        // The CUDA reading, for the reason `moe_fragment_derives_the_expert_site` states.
+        let plan = model::qwen_3_5::forward::qwen3_5_hybrid_cuda::<
+            model::qwen_3_5::forward::ShippedW1,
+            model::qwen_3_5::forward::ShippedW2,
+            model::qwen_3_5::forward::ShippedA,
+            model::qwen_3_5::forward::ShippedKv,
+        >(
+            &facts,
+            &model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            model_ir::FireClass::Decode,
+            EPS,
+            THETA,
+        );
         let sites = derive_sites(&plan);
         assert_eq!(sites.len(), 1, "per-layer repetition dedups to one site");
         assert_eq!(sites[0].name, SITE_EXPERT_WEIGHTS);

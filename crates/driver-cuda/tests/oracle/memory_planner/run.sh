@@ -32,12 +32,12 @@ trap 'rm -rf "$WORK"' EXIT
 # that reason and it is not: the file is two `git show`s away, the stub tree
 # survived, and the whole thing builds with plain `g++` and no CUDA.
 #
-# `e7cd33cf1` is the last revision whose includes match the stub tree, which
+# `7559e4cea` is the last revision whose includes match the stub tree, which
 # is what makes it the right one rather than the newest one: `bb7c2231a` adds
 # `#include "attention_workspace.hpp"`, a header the stubs do not have, and
 # the build stops there. It is also the 1,221 lines this file's header claims.
 # Confirmed by reproducing `GOLDEN_FNV1A64` exactly.
-CPP_REV="${MP_ORACLE_REV:-e7cd33cf1}"
+CPP_REV="${MP_ORACLE_REV:-7559e4cea}"
 CPP_DIR="crates/driver-cuda/csrc/src/store"
 
 mkdir -p "$WORK/store"

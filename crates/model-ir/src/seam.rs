@@ -80,6 +80,15 @@ pub const ATTN_QV: Def = Def {
     sink: None,
 };
 
+/// Recurrent-state tap over the mixed in-projection; recurrent layers only.
+pub const RECURRENT: Def = Def {
+    name: "recurrent",
+    sees: &["mixed"],
+    caps: &[Cap::Observe],
+    position: None,
+    sink: None,
+};
+
 /// Entry boundary seam; boundary attachments do not enter row signatures.
 pub const IN: Def = Def {
     name: "in",
@@ -134,7 +143,7 @@ pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
                             plan.family,
                             def.name,
                             pos.after,
-                            kind_name(&plan.ops[from].kind),
+                            producer_name(&plan.ops[from].kind),
                         ));
                     }
                     for (i, op) in plan.ops.iter().enumerate().take(at).skip(from + 1) {
@@ -188,10 +197,23 @@ fn admits(plan: &crate::trace::ForwardPlan, kind: &crate::trace::OpKind, roles: 
 }
 
 /// Every seam a model text may state.
-pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &OUT];
+pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &RECURRENT, &OUT];
 
 pub fn by_name(name: &str) -> Option<&'static Def> {
     ALL.iter().copied().find(|d| d.name == name)
+}
+
+/// What to CALL the op that produced a value, in a refusal.
+///
+/// [`kind_name`] answers `"Launch"` for every stated kernel, which is the
+/// one thing the reader already knows -- the semantic variants retired, so
+/// nearly every producer is a `Launch` and the message named none of them.
+/// A launch is named by its kernel; everything else keeps its variant.
+fn producer_name(kind: &crate::trace::OpKind) -> String {
+    match kind {
+        crate::trace::OpKind::Launch { kernel, .. } => kernel.clone(),
+        other => kind_name(other).to_string(),
+    }
 }
 
 fn kind_name(kind: &crate::trace::OpKind) -> &'static str {
@@ -222,23 +244,28 @@ mod seam_tests {
         }
     }
 
+    /// A projection. `OpKind::Matmul` STOOD HERE: the semantic variants
+    /// retired and a projection is a `gemm::` launch, which is exactly the
+    /// third admit in [`super::admits`] -- the quantized rows claim no role,
+    /// so the namespace is the role.
     fn matmul() -> OpKind {
-        OpKind::Matmul {
-            weight: "layer.0.q_proj".to_string(),
-            beta_one: false,
-            selector: None,
-        }
+        launch("gemm::act_x_w")
     }
 
-    fn lora() -> OpKind {
+    /// Any stated kernel, with the empty run every field of a test op wants.
+    fn launch(kernel: &str) -> OpKind {
         OpKind::Launch {
-            kernel: "gemm::lora_qkv_correction".to_string(),
+            kernel: kernel.to_string(),
             weights: vec![],
             state: None,
             params: vec![],
             param_extents: vec![],
             peel_slots: None,
         }
+    }
+
+    fn lora() -> OpKind {
+        launch("gemm::lora_qkv_correction")
     }
 
     fn guard() -> OpKind {
@@ -274,6 +301,7 @@ mod seam_tests {
                 // The adapter position rule ignores this exposed set.
                 values: vec![],
             }],
+            runtime: vec![],
         }
     }
 
@@ -284,34 +312,18 @@ mod seam_tests {
 
         // Bias consumes q before the seam: delta would land on base + bias.
         let mut ops = well_placed();
-        ops.insert(
-            2,
-            op(
-                OpKind::AddBias {
-                    weight: "layer.0.q_bias".to_string(),
-                },
-                vec![1],
-                vec![3],
-            ),
-        );
+        ops.insert(2, op(launch("canon::add_bias"), vec![1], vec![3]));
         let mut p = plan(ops);
         p.seams[0].op = Some(3);
         let problems = seam::check_plan(&p);
         assert_eq!(problems.len(), 1, "{problems:#?}");
-        assert!(problems[0].contains("AddBias"), "{}", problems[0]);
+        assert!(problems[0].contains("add_bias"), "{}", problems[0]);
 
         // After rope is different arithmetic and a different producer.
         let ops = vec![
             op(matmul(), vec![], vec![1]),
             op(matmul(), vec![], vec![2]),
-            op(
-                OpKind::Rope {
-                    kind: crate::trace::RopeKind::Standard,
-                    partial: None,
-                },
-                vec![1],
-                vec![3],
-            ),
+            op(launch("canon::rope"), vec![1], vec![3]),
             op(guard(), vec![], vec![]),
             op(lora(), vec![3, 2], vec![]),
         ];
@@ -319,7 +331,7 @@ mod seam_tests {
         p.seams[0].op = Some(3);
         let problems = seam::check_plan(&p);
         assert_eq!(problems.len(), 1, "{problems:#?}");
-        assert!(problems[0].contains("Rope"), "{}", problems[0]);
+        assert!(problems[0].contains("canon::rope"), "{}", problems[0]);
     }
 
     /// Stated seams are declared with the expected arity.

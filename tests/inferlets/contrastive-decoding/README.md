@@ -56,7 +56,7 @@ logits are passed through a host `Writer` channel into the expert epilogue, wher
 the contrastive argmax runs in PTIR.
 
 This loop is structurally depth-1, as noted in
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md):
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`:
 the amateur input for step `k + 1` is the expert's just-selected output token from
 step `k`, so the decode loop cannot run ahead. That is an algorithmic dependency,
 not a missing optimization.

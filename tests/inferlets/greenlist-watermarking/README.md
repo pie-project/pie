@@ -51,7 +51,7 @@ so the decode loop is structurally **depth-1**. It cannot submit
 `DEFAULT_RUNAHEAD_DEPTH` fires ahead: fire `k + 1` needs the token produced by
 fire `k` before the host can publish its green mask. This is one of the depth-1
 cases called out in
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 The PTIR epilogue itself is small: take the host-provided boolean mask, select a
 `delta` or zero bias for every vocabulary entry, add it to `intrinsics::logits()`,

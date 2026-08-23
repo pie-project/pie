@@ -1209,7 +1209,7 @@ const CAPTURE_SINK: Refusal = Refusal::Absent {
     what: "the score sink",
 };
 
-#[routine(depth_prefix_plan, no_join)]
+#[routine(depth_prefix_plan, no_join, canon = "attention.decode")]
 pub fn dispatch_attention_flashinfer_decode(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -1293,7 +1293,7 @@ pub fn dispatch_attention_flashinfer_decode(
     }
 }
 
-#[routine(depth_prefix_plan, no_join)]
+#[routine(depth_prefix_plan, no_join, canon = "attention.decode_lse")]
 pub fn dispatch_attention_flashinfer_decode_lse(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -1608,7 +1608,7 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     }
 }
 
-#[routine(no_join)]
+#[routine(no_join, canon = "attention.masked")]
 pub fn dispatch_attention_flashinfer_prefill_custom(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -1699,6 +1699,17 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
     }
 }
 
+// ELEVEN ARGUMENTS, and no `expect` had been needed before: `window_left`
+// and the two host row arrays arrived with the no-ask series, which took them
+// out of a fact bag and put them in signatures. This is a private planner and
+// not a `#[routine]`, so D1's *"a routine takes fields, never a struct"* is
+// not what justifies it -- what does is that every one of the eleven is read
+// by a different branch of the plan below, and a struct built to carry them
+// would have exactly eleven fields and one caller.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "eleven independent plan inputs, one caller; a struct would only rename them"
+)]
 fn plan_own_prefill(
     ctx: &Ctx<'_>,
     q_width: i32,
@@ -1782,7 +1793,7 @@ fn plan_own_prefill(
     Ok(dispatch::prefill_plan_of(cache, plan::fa_device()))
 }
 
-#[routine(whole, no_join)]
+#[routine(whole, no_join, canon = "attention.prefill")]
 pub fn attention_flashinfer_prefill(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -1856,7 +1867,7 @@ pub fn attention_flashinfer_prefill(
     prefill_paged(ctx, &bufs, &plan, *logits_soft_cap, *sm_scale)
 }
 
-#[routine(whole, no_join)]
+#[routine(whole, no_join, canon = "attention.prefill_lse")]
 pub fn attention_flashinfer_prefill_lse(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,

@@ -10,7 +10,7 @@ Meister, Pimentel, Wiher and Cotterell, ***Locally Typical Sampling*** (TACL) โ€
 <https://arxiv.org/abs/2202.00666>. Implements ยง3, Eq. 6.
 
 **Faithfulness: Exact.** See the per-line reduction in
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

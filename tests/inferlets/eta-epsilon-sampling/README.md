@@ -10,7 +10,7 @@ Desmoothing*** (Findings of EMNLP) —
 <https://arxiv.org/abs/2210.15191>. Implements §3.
 
 **Faithfulness: Exact.** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

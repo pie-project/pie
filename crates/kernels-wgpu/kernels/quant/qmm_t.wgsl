@@ -565,6 +565,44 @@ var<workgroup> ma: array<f16, 32u * PIE_MK>;
 var<workgroup> mb: array<f16, 64u * PIE_MK>;
 var<workgroup> mc: array<f32, 32u * 64u>;
 
+// THE EPILOGUE WRITES A PAIR AT A TIME.
+//
+// `write_out` ends in `store_half`, and `store_half` is a device-scoped
+// compare-exchange LOOP, because two bf16 share one `u32` of an
+// `array<atomic<u32>>` and the two lanes that own them may sit in different
+// workgroups when the output pitch is odd. Deleting the loop entirely (an
+// `atomicStore` that corrupts its neighbour) took a 512-row prefill from
+// 271.3 ms to 264.0 -- 7.3 ms of pure retry-and-read-modify-write.
+//
+// None of that is needed when ONE lane owns BOTH halves of the word. This
+// arm's results are already sitting in `mc`, so the epilogue hands a lane an
+// even column and its odd neighbour, packs them itself, and stores the word
+// once with no read and no retry. The fallback is the old path, taken
+// whenever the pair is not whole: the row or column overhang, an odd flat
+// index (an odd `n`, where the pairing shifts by one every row), or the
+// variants whose output is not this buffer.
+fn write_pair(row: u32, col: u32, v0: f32, v1: f32) {
+//#if defined(PIE_RESIDUAL) || defined(PIE_SPLITK) || defined(PIE_CAST_INPUT) || defined(PIE_REDUCE)
+    write_out(row, col, v0, 0u);
+    write_out(row, col + 1u, v1, 0u);
+//#else
+    let at = row * output_stride() + col;
+    if row >= u32(params.m) || col + 1u >= u32(params.n) || (at & 1u) != 0u {
+        write_out(row, col, v0, 0u);
+        write_out(row, col + 1u, v1, 0u);
+        return;
+    }
+    var a = v0;
+    var b = v1;
+//#if defined(PIE_BIAS)
+    a = a + qmm_bf16(extra[col >> 1u], col);
+    b = b + qmm_bf16(extra[(col + 1u) >> 1u], col + 1u);
+//#endif
+    atomicStore(&out_[at >> 1u],
+                pie_f32_to_bf16(a) | (pie_f32_to_bf16(b) << 16u));
+//#endif
+}
+
 @compute @workgroup_size(32, 2, 2)
 fn main(
     @builtin(local_invocation_index) local: u32,
@@ -659,10 +697,11 @@ fn main(
     coopStoreT(a3_0, &mc[24u * 64u + sg_col + 0u], 64u);
     coopStoreT(a3_1, &mc[24u * 64u + sg_col + 8u], 64u);
     workgroupBarrier();
-    for (var e = local; e < 32u * 64u; e = e + 128u) {
-        let r = e / 64u;
-        let c = e % 64u;
-        write_out(tile_row + r, tile_col + c, mc[e], 0u);
+    for (var e = local; e < 32u * 32u; e = e + 128u) {
+        let r = e / 32u;
+        let c = (e % 32u) * 2u;
+        let b = r * 64u + c;
+        write_pair(tile_row + r, tile_col + c, mc[b], mc[b + 1u]);
     }
 }
 //#endif
@@ -1009,7 +1048,99 @@ fn main(
 // 5.1%, interleaved in one sitting. That is the first time the matrix unit
 // has paid for itself anywhere in this tree.
 //
-// What is left in the arm is ~66 ms of multiply-accumulate and epilogue. The
+// THEN THE EPILOGUE, which was the third of the three and the cheapest to
+// fix. A probe that replaced `store_half`'s compare-exchange loop with a
+// corrupting `atomicStore` read 264.0 / 263.8 ms, so the retry-and-
+// read-modify-write was 7.3 ms. `write_pair` recovers all of it CORRECTLY by
+// giving one lane both halves of the word -- see its comment. The epilogue
+// loop now runs 1024 steps instead of 2048.
+//
+//     matrix, paired epilogue .............. 264.2 / 263.7 / 263.3 ms
+//
+// 7.8% against the scalar arm, and the whole of the probe's bound.
+//
+// ─── WHERE THE 98.7 ms GOES, AND TWO THINGS THAT DID NOT HELP ─────────────
+//
+// `PIE_WGPU_SKIP=affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64` prices the arm
+// absolutely: 165.0 / 165.0 ms without it against 263.7 with. So the arm is
+// 98.7 ms and 37.4% of the prefill, down from the scalar arm's 122.0 and
+// 42.6%. Deletion probes then split it (each leaves one live reference behind
+// so naga keeps the binding):
+//
+//     activation staging ..... 249.5 ms  ->  14.2 ms   (was 36.2)
+//     weight staging ......... 239.4 ms  ->  24.3 ms   (was 27.2)
+//     the rest ............................  60.2 ms
+//
+// and three more probes split the weight staging, each keeping the layer
+// above it:
+//
+//     the `w` word load ...............  12.2 ms
+//     `pie_affine_dequant4` + s/b .....   7.0 ms
+//     the `mb` f16 writes .............   5.1 ms
+//
+// THE LARGEST SINGLE PIECE IS RE-READING THE WEIGHT. At BM = 32 a 512-row
+// prefill covers 16 row tiles, so every weight byte is fetched sixteen times:
+// about 4.8 GB against a 273 GB/s bus is 17.6 ms, and 12.2 is what the cache
+// leaves of it. Nothing in the staging code can fix that; only a taller tile
+// can, and BM is a HOST-side choice -- `bm_64_bn_64` is already instantiated
+// for the scalar arm, but the shape chooser picks `bm_32_bn_64` and the
+// matrix arm's eight named accumulators and 32-row `mc` are written for it.
+//
+// TWO THINGS THAT DID NOT HELP, so that nobody tries them again:
+//
+//  1. HOISTING THE SCALE AND BIAS. `affine_quad` re-reads both for every quad,
+//     and PIE_GROUP is 64 and PIE_MK is 64, so a column's sixteen quads share
+//     one scale and one bias -- 3072 loads where 1280 do. Restructuring the
+//     loop to two lanes a column with both hoisted read 264.2 / 264.3 / 265.4
+//     against 263.7. The redundant loads were already free: they are the same
+//     two words, and they hit.
+//
+//  2. A COLUMN-MAJOR WORKGROUP SWIZZLE. `wg.x` is the fast axis and runs over
+//     column tiles, so the resident workgroups share the ACTIVATION tile and
+//     each brings its own weight slice. Renaming the flat id to walk down the
+//     column instead -- same tiles, same grid -- was meant to make the
+//     resident set share the WEIGHT tile. 265.3 / 265.1 / 265.5 against
+//     263.7. Whatever the 12.2 ms is, it is not a residency pattern this
+//     kernel can name.
+//
+//  3. A TALLER TILE, WHICH IS THE ONE THE EVIDENCE ASKED FOR AND STILL LOST.
+//     Everything above points at BM: the weight re-read is 16x at BM = 32, and
+//     the inner loop spends six cooperative loads on eight multiply-adds
+//     because 32 rows and 16 columns is only four row tiles by two column
+//     tiles. BM is a per-BACKEND choice -- `engine::driver::backend::wgpu`
+//     states `qmm_tile: Some((32, 64))` and metal is not affected -- and
+//     `affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64` is already instantiated,
+//     so the scalar arm prices the tile on its own with no new kernel:
+//
+//                    scalar (32,64)   scalar (64,64)   matrix (32,64)
+//          32 rows       35.2 ms         36.3 ms          35.5 ms
+//          64 rows       46.0            57.2             46.0
+//         128 rows       77.4            76.8             72.0
+//         256 rows      145.7           133.2            133.0
+//         512 rows      286.2           269.2            263.8
+//
+//     The tall tile does buy 17 ms at 512 rows, and it costs 24% at 64 and
+//     spends the whole win by 128. A serving mix is not 512-row prefills.
+//     `GuardPred::TokensMultipleOf(bm)` is why: at BM = 64 every prompt that
+//     is not a multiple of 64 rows falls to the matvec.
+//
+//     So a BM = 64 matrix arm -- sixteen accumulators a simdgroup, an `mc`
+//     halved to 32 rows and an epilogue in two phases to stay under 32 KB --
+//     is not obviously worth writing. It would have to beat 263.8 by more
+//     than the tile costs everything shorter. Written down so the next reader
+//     starts from the numbers and not from the argument.
+//
+// WHAT THE ARM IS WORTH, over the scalar one it replaces at every length:
+//
+//          32 rows   35.2 -> 35.5     (nothing; the GEMM is not the cost)
+//          64 rows   46.0 -> 46.0
+//         128 rows   77.4 -> 72.0     -7.0%
+//         256 rows  145.7 -> 133.0    -8.7%
+//         512 rows  286.2 -> 263.8    -7.8%
+//
+// What is left in the arm is ~60 ms of multiply-accumulate and epilogue, and
+// the probes say almost none of it is anywhere else: the epilogue's 1024
+// paired stores are 1.2 ms and the two barriers a k-block are 2.6. The
 // standing suspicion is arithmetic intensity: BM = 32 means each staged
 // weight element is reused only 32 times, 42 flops per staged element. The
 // cooperative harness reaches 0.638 ms at rows = 128. Raising BM needs a new

@@ -34,6 +34,38 @@ fn every_catalogued_runtime_name_is_answered_or_deliberately_unstaged() {
         seen.contains("kv_cache") && seen.contains("positions"),
         "the walk saw no attention text at all — the harness is broken, not the tree"
     );
+
+    // AND THE CONVERSE, which is the half this gate was missing.
+    //
+    // A name in `ANSWERED` that no catalogued text mints is a claim nothing
+    // exercises, and the claim rots the way every unexercised claim in this
+    // tree rots: `"fa2.decode"` sat in that list with no arm behind it in
+    // `raised()` at all, so the union check above would have waved through
+    // the one text that finally minted it and let the fire do the refusing.
+    //
+    // There is no excuse list here on purpose. The invariant is exact today —
+    // every one of the sixteen entries is minted by some catalogued SKU — and
+    // an exception list is how it would stop being exact. An arm written
+    // ahead of the text that needs it fails here, which is a conversation
+    // worth having at the time rather than a year later.
+    let unminted: Vec<&str> = driver_cuda::bind::views::ANSWERED
+        .iter()
+        .copied()
+        .filter(|n| !seen.contains(*n))
+        .collect();
+    assert!(
+        unminted.is_empty(),
+        "ANSWERED claims names no catalogued text mints (dead claims, or an \
+         arm that landed ahead of its text): {unminted:?}"
+    );
+
+    // The two lists are about opposite things — answered, and knowingly
+    // refused — so a name in both makes the union check unfalsifiable.
+    let both: Vec<&&str> = answered.intersection(&unstaged).collect();
+    assert!(
+        both.is_empty(),
+        "a name cannot be both answered and deliberately unstaged: {both:?}"
+    );
 }
 
 /// Every catalogued SKU's plans, both classes, by family fixture —

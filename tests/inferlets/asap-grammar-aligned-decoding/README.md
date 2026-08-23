@@ -11,7 +11,7 @@ Decoding*** (NeurIPS 2024) — <https://arxiv.org/abs/2405.21047>. Implements
 Eq. 3–4 and Algorithm 1.
 
 **Faithfulness: Exact (equivalent form).** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

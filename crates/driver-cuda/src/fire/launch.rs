@@ -232,6 +232,8 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     // capture to ask for a buffer nobody had allocated yet, inside an open
     // capture, which is the one allocation CUDA will not do.
     let lora = rows_desc.iter().any(|r| r.lora);
+    let warm_began = std::time::Instant::now();
+    let mut lower_cost = std::time::Duration::ZERO;
     for marks in [
         model_compiler::lower::Row {
             samples: true,
@@ -246,14 +248,17 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         },
     ] {
         let warm_rows = vec![marks; rows];
-        let Ok(warm) = model_compiler::lower::lower_with(
+        let lower_began = std::time::Instant::now();
+        let lowered_warm = model_compiler::lower::lower_with(
             plan,
             &warm_rows,
             model_compiler::lower::Fire {
                 captures_across_splits: false,
             },
             model_compiler::lower::GuardMode::Resolve,
-        ) else {
+        );
+        lower_cost += lower_began.elapsed();
+        let Ok(warm) = lowered_warm else {
             return run_resolved(
                 plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
             );
@@ -265,6 +270,7 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         run(&warm, &warm_dplan, frame, resolver, ctx, regions, gdn)?;
         let _ = stream.synchronize();
     }
+    let warm_cost = warm_began.elapsed();
 
     let captured = {
         // Open on the fire's own allocator: a `cudaFree` defers only on the
@@ -277,8 +283,10 @@ fn capture_or_replay<R: crate::bind::Resolver>(
             );
         };
         let mut b = crate::device::SupergraphBuilder::new(scope.stream(), preds);
+        let record_began = std::time::Instant::now();
         let ran =
             crate::bind::run_captured(lowered, dplan, frame, resolver, ctx, regions, gdn, &mut b);
+        let record_cost = record_began.elapsed();
         // The retained nodes, taken before the builder is dropped: one per
         // launch, letting a later fire of a different row count retune this
         // exec's rectangles instead of recapturing.
@@ -287,8 +295,23 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         // A refused capture is not a refused fire: some arms cannot be
         // recorded because their prepared state is something the fire declined
         // to build, so the capture is abandoned and the fire runs eager.
+        let end_began = std::time::Instant::now();
         let ended = scope.end();
-        sg_trace(|| format!("capture ran={ran:?} ended_ok={}", ended.is_ok()));
+        let end_cost = end_began.elapsed();
+        // The four costs separately, because they have four different fixes:
+        // the warm-up is the driver's own choice to run the fire twice before
+        // recording it, `lower` is the compiler re-lowering a plan it has
+        // lowered before, `record` is the stream capture proper, and `end` is
+        // `cudaStreamEndCapture`. A capture measured in seconds is a defect,
+        // and the line has to say which of the four it is.
+        sg_trace(|| {
+            format!(
+                "capture ran={ran:?} ended_ok={} warm={:.1?} (lower={:.1?}) record={record_cost:.1?} end={end_cost:.1?}",
+                ended.is_ok(),
+                warm_cost,
+                lower_cost,
+            )
+        });
         match (ran, ended) {
             (Ok(n), Ok(g)) => Some((n, g, nodes)),
             (Err(_), Ok(g)) => {
@@ -307,11 +330,16 @@ fn capture_or_replay<R: crate::bind::Resolver>(
             plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
         );
     };
+    let inst_began = std::time::Instant::now();
     let Ok(exec) = graph.instantiate() else {
         return run_resolved(
             plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,
         );
     };
+    sg_trace(|| format!("instantiate {:.1?}", inst_began.elapsed()));
+    if crate::bind::launch_census::armed() {
+        eprint!("{}", crate::bind::launch_census::report());
+    }
     if exec.launch(stream).is_err() {
         return run_resolved(
             plan, rows_desc, lowered, dplan, frame, resolver, ctx, regions, gdn,

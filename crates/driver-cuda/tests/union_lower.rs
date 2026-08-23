@@ -27,12 +27,30 @@ use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{CondRegion, Fire, GuardMode, Launch, Lowered, Row, lower_with};
 use model_ir::trace::FireClass;
 
+/// The scalars the family texts used to read off their fact structs.
+///
+/// Upstream lifted `norm_eps`, the rope bases and gpt-oss's sliding window
+/// OUT of the facts and onto the forward functions, because two SKUs of one
+/// family can differ in those and in nothing else. These tests never read a
+/// number back -- they lower, bind and count -- so any well-formed value
+/// states the same text, and these are the shipped checkpoints' own.
+#[allow(dead_code)]
+const EPS: f32 = 1e-6;
+/// The common rope base. gpt-oss's is its own.
+#[allow(dead_code)]
+const THETA: f32 = 1_000_000.0;
+/// gpt-oss: YaRN over a 150k base, alternating 128-token windows.
+#[allow(dead_code)]
+const WINDOWED_THETA: f32 = 150_000.0;
+/// The sliding leg's span. `-1` is "no window" and is NOT what gpt-oss says.
+#[allow(dead_code)]
+const WINDOW: i32 = 128;
+
 fn lowered(class: FireClass, rows: usize, guards: GuardMode) -> Lowered {
-    let plan = llama_like_cuda(
+    let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-        class,
-    );
+        class, EPS, THETA);
     // `lora` on, so the family's `HasLora` guard has something to be
     // undecided ABOUT — under `Resolve` this is what picks the arm, and
     // under `Union` it must stop mattering.
@@ -202,11 +220,10 @@ fn the_union_filtered_by_its_predicates_is_the_resolved_form() {
     // result to be exactly what `Resolve` emitted.
     for lora in [false, true] {
         for hooked in [false, true] {
-            let plan = llama_like_cuda(
+            let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-                FireClass::Decode,
-            );
+                FireClass::Decode, EPS, THETA);
             let fire = Fire {
                 captures_across_splits: false,
             };
@@ -269,11 +286,10 @@ fn a_lora_free_fire_unions_to_the_same_program() {
     // adapters and one that does not. Under `Resolve` these two are
     // different launch lists; under `Union` they must not be, because the
     // predicate moved to device memory.
-    let plan = llama_like_cuda(
+    let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let fire = Fire {
         captures_across_splits: false,
     };

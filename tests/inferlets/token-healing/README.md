@@ -12,7 +12,7 @@ No paper. Reference implementations:
 `--token-healing`.
 
 **Faithfulness: Exact.** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

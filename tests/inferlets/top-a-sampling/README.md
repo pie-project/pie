@@ -10,7 +10,7 @@ No canonical paper. Reference implementations:
 oobabooga/text-generation-webui.
 
 **Faithfulness: Exact.** See
-[`10-implementation-faithfulness-audit.md`](../../../inference-time-algorithms/10-implementation-faithfulness-audit.md).
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

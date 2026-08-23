@@ -116,7 +116,7 @@ model-loader = { path = "../model-loader" }
 # `the_loader_states_the_names_this_driver_binds`, and it cannot be measured
 # without compiling a real contract. Still dev-only: nothing in `src/` reads
 # a checkpoint.
-model = { path = "../model", default-features = false, features = [
+model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = [
     "contract",
 ] }
 

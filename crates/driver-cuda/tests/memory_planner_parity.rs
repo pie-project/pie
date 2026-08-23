@@ -10,7 +10,7 @@
 //! # The oracle can be re-run, and this file used to say it could not
 //!
 //! `tests/oracle/memory_planner/run.sh` **works.** It restores the C++ from
-//! git (`e7cd33cf1`), builds it against the `stub/` tree with plain `g++`,
+//! git (`7559e4cea`), builds it against the `stub/` tree with plain `g++`,
 //! and needs no CUDA and no GPU. It reproduces [`GOLDEN_FNV1A64`] exactly.
 //!
 //! This file previously stated the opposite -- "its inputs were deleted, see
@@ -51,7 +51,7 @@ use std::fmt::Write as _;
 /// It is kept because it is the checksum `run.sh` prints, so it is how a
 /// re-run is confirmed to have rebuilt the *same* C++ rather than some other
 /// revision of it. Re-deriving it: restore the 1,221-line
-/// `store/memory_planner.cpp` from `e7cd33cf1` (the last revision whose
+/// `store/memory_planner.cpp` from `7559e4cea` (the last revision whose
 /// includes match the stub tree; the later `bb7c2231a` adds
 /// `attention_workspace.hpp`, which the stubs do not have) and run
 /// `tests/oracle/memory_planner/run.sh`.

@@ -279,4 +279,8 @@ async def test_quest_crossover(client, args):
 
 
 if __name__ == "__main__":
-    run_tests([test_quest_crossover], "Quest cost/benefit crossover")
+    run_tests(
+        [test_quest_crossover],
+        "Quest cost/benefit crossover",
+        requires=("envelope_dot",),
+    )

@@ -150,7 +150,7 @@ model-dsl = { path = "../model-dsl" }
 # feature to ask for any more -- it was deleted, and the forward texts are
 # ungated. Dev-only, so `tests/pure.rs` (which drops dev kinds) is untouched by
 # it, and nothing in `src/` reads a checkpoint.
-model = { path = "../model", default-features = false, features = ["contract"] }
+model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
 
 # `tests/checkpoint.rs` only: the tensor names and extents a real snapshot
 # states, which is the one place a weight's SIZE exists -- `Arg::Weight`

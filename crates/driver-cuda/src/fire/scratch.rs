@@ -59,10 +59,72 @@ pub(crate) mod slot {
     pub(crate) const REQ_OF_TOKEN: usize = 13;
 }
 
+/// The granularity every pooled slot is rounded up to. Small enough that the
+/// tiny descriptor arrays (`kv_indices` is four bytes per page) do not carry a
+/// meaningful pool cost, large enough that a slot which grows by one entry per
+/// page does not reallocate for sixty-four of them.
+const GROW_ALIGN: usize = 256;
+
+/// How big a slot that held `held` bytes should be made when it is asked for
+/// `bytes`: at least what was asked, at least double what it had, rounded up to
+/// [`GROW_ALIGN`].
+///
+/// Split out from the two callers so the arithmetic is testable without a
+/// device, and so both the device slot and its pinned staging round the same
+/// way — a staging buffer that grew on a different schedule from the slot it
+/// feeds would reallocate on the fires the slot did not.
+const fn headroom(held: usize, bytes: usize) -> usize {
+    let doubled = match held.checked_mul(2) {
+        Some(n) => n,
+        None => usize::MAX,
+    };
+    let want = if bytes > doubled { bytes } else { doubled };
+    match want.checked_next_multiple_of(GROW_ALIGN) {
+        Some(n) => n,
+        // Rounding up overflowed, so `want` is within `GROW_ALIGN` of the
+        // address space; the ask itself is what has to be honoured.
+        None => bytes,
+    }
+}
+
 impl Scratch {
     /// Grow a pooled slot if it is too small, bumping `epoch` if it moved. The
     /// only place `epoch` is incremented, so a capture can never replay against
     /// a freed address without going stale first.
+    ///
+    /// # Why a slot is given more than it asked for
+    ///
+    /// The epoch is the graph cache's staleness key, and a bump invalidates
+    /// EVERY captured exec, not just the one that touched this slot. Recapture
+    /// is not cheap: a Qwen3-0.6B decode records 535 launches, measured at
+    /// **3.0–4.8 seconds** per capture on a 4090, against **12 ms** for the
+    /// replay it replaces.
+    ///
+    /// Sizing a slot to exactly what this fire asked for makes that bump
+    /// happen on a schedule set by the context length. `kv_indices` is one u32
+    /// per KV page, so it needs four more bytes every time the sequence
+    /// crosses a page boundary; at an exact fit, those four bytes are a fresh
+    /// allocation, a moved base and a stale cache. Measured on `pie run` with
+    /// the naive-baseline inferlet: a recapture every three or four decode
+    /// steps, GPU utilisation at 0 %, and **~1.25 s per token** on a model
+    /// whose replay costs twelve milliseconds.
+    ///
+    /// So growth is geometric with a floor: at least double what the slot
+    /// already held, rounded up to [`GROW_ALIGN`]. A slot that grows by one
+    /// entry per page now bumps the epoch a logarithmic number of times over a
+    /// whole sequence instead of once per page, and the steady state — the
+    /// state the cache exists for — is reached and stays reached.
+    ///
+    /// Over-allocating is safe at every use: `copy_from_host` bounds-checks
+    /// against the buffer and copies the SOURCE's length, `memset` zeroes the
+    /// whole buffer (so the extra bytes are never stale), and no caller reads
+    /// a pooled slot's `len()` as a count of anything.
+    ///
+    /// The doubled ask is an optimisation, not a requirement, so exhaustion on
+    /// it falls back to the exact figure. The arena can be hundreds of
+    /// megabytes and doubling it may genuinely not fit; refusing a fire that
+    /// the driver could have run, because the headroom did not fit, would
+    /// trade a latency defect for a correctness one.
     fn grow(
         slot: &mut Option<crate::device::DeviceBuffer>,
         epoch: &mut crate::fire::recordings::PlanEpoch,
@@ -71,11 +133,14 @@ impl Scratch {
         bytes: usize,
     ) -> crate::Result<()> {
         if slot.as_ref().is_none_or(|b| b.len() < bytes) {
+            let want = headroom(slot.as_ref().map_or(0, crate::device::DeviceBuffer::len), bytes);
             // `Exhausted` carries the byte figure the engine needs to choose
-            // between evicting, shrinking the batch and refusing.
+            // between evicting, shrinking the batch and refusing — the exact
+            // one, since that is what the fire could not have without.
             *slot = Some(
                 alloc
-                    .alloc(bytes)
+                    .alloc(want)
+                    .or_else(|_| alloc.alloc(bytes))
                     .map_err(|_| crate::Error::exhausted(what, bytes))?,
             );
             epoch.bump();
@@ -254,9 +319,14 @@ impl Scratch {
         let need = live.max(4);
         if self.staging[slot].as_ref().is_none_or(|p| p.len() < need) {
             // Pinned host memory: no graph bakes its address, so it grows
-            // without an epoch bump and does not go through `grow`.
+            // without an epoch bump and does not go through `grow`. It gets
+            // the same headroom anyway, for its own reason: `cudaHostAlloc`
+            // synchronizes the device, so reallocating it once per page is a
+            // stall on the fire's critical path even where nothing goes stale.
+            let want = headroom(self.staging[slot].as_ref().map_or(0, |p| p.len()), need);
             self.staging[slot] = Some(
-                crate::device::PinnedBuf::new(need)
+                crate::device::PinnedBuf::new(want)
+                    .or_else(|_| crate::device::PinnedBuf::new(need))
                     .map_err(|_| crate::Error::exhausted("fire staging", need))?,
             );
         }
@@ -303,5 +373,73 @@ impl Scratch {
         grown?;
         let b = self.named.get_mut(&v).expect("just grown");
         b.memset(0, stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GROW_ALIGN, headroom};
+
+    /// Whatever the headroom does, it cannot hand back less than the fire
+    /// asked for: the ask is the width a kernel is about to write.
+    #[test]
+    fn a_slot_is_never_given_less_than_it_asked_for() {
+        for held in [0, 1, 4, 255, 256, 4096, usize::MAX / 2] {
+            for bytes in [1, 4, 255, 256, 257, 1 << 20] {
+                assert!(
+                    headroom(held, bytes) >= bytes,
+                    "held={held} bytes={bytes} came back short"
+                );
+            }
+        }
+        assert_eq!(headroom(usize::MAX, usize::MAX), usize::MAX, "no room to round");
+    }
+
+    /// The defect this exists for: `kv_indices` is four bytes per KV page, so
+    /// an exactly-fitted slot reallocated — and bumped the epoch, and stranded
+    /// every captured graph — once per page. Growing one entry at a time from
+    /// cold must now cross the allocator a handful of times, not sixty-four.
+    #[test]
+    fn a_slot_that_grows_one_entry_per_page_stops_reallocating() {
+        let mut have = 0usize;
+        let mut moves = 0;
+        for pages in 1..=64usize {
+            let need = (pages * 4).max(4);
+            if have < need {
+                have = headroom(have, need);
+                moves += 1;
+            }
+        }
+        assert_eq!(
+            moves, 1,
+            "sixty-four pages should fit in one {GROW_ALIGN}-byte slot, took {moves} allocations"
+        );
+        assert_eq!(have, GROW_ALIGN);
+    }
+
+    /// Past the first block the growth has to stay geometric, or a long
+    /// context walks back into a reallocation per page.
+    #[test]
+    fn growth_past_the_first_block_at_least_doubles() {
+        assert_eq!(headroom(GROW_ALIGN, GROW_ALIGN + 4), GROW_ALIGN * 2);
+        assert_eq!(headroom(GROW_ALIGN * 2, GROW_ALIGN * 2 + 4), GROW_ALIGN * 4);
+        // A step bigger than the doubling is honoured as asked, rounded up.
+        assert_eq!(headroom(GROW_ALIGN, 10 * GROW_ALIGN + 1), 11 * GROW_ALIGN);
+    }
+
+    /// One buffer holding twenty thousand pages must be reached in a
+    /// logarithmic number of moves, since each one strands the graph cache.
+    #[test]
+    fn a_long_context_costs_a_logarithmic_number_of_epoch_bumps() {
+        let mut have = 0usize;
+        let mut moves = 0;
+        for pages in 1..=20_000usize {
+            let need = (pages * 4).max(4);
+            if have < need {
+                have = headroom(have, need);
+                moves += 1;
+            }
+        }
+        assert!(moves <= 10, "twenty thousand pages took {moves} allocations");
     }
 }

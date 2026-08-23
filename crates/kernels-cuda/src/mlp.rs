@@ -101,7 +101,7 @@ pub fn situ<T>(
     )
 }
 
-#[routine(bf16, out(y = like(gate)))]
+#[routine(bf16, canon = "swiglu.geglu_tanh", out(y = like(gate)))]
 pub fn geglu_tanh<T>(
     ctx: &Ctx<'_>,
     gate: In<Tensor<T>>,
@@ -163,7 +163,7 @@ pub fn gpt_oss_glu<T>(
     )
 }
 
-#[routine(bf16, out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = swiglu, out(y = rows(packed) x half(packed)))]
 pub fn chunked_swiglu<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -195,7 +195,7 @@ pub fn chunked_swiglu_into<T>(
     )
 }
 
-#[routine(bf16, out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = "swiglu.clamp", out(y = rows(packed) x half(packed)))]
 pub fn chunked_swiglu_clamp<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -214,7 +214,7 @@ pub fn chunked_swiglu_clamp<T>(
     )
 }
 
-#[routine(bf16, out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = situ, out(y = rows(packed) x half(packed)))]
 pub fn chunked_situ<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -240,7 +240,7 @@ pub fn chunked_situ<T>(
     )
 }
 
-#[routine(bf16, out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = "swiglu.geglu_tanh_packed", out(y = rows(packed) x half(packed)))]
 pub fn chunked_geglu_tanh<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,

@@ -81,10 +81,17 @@
 //
 // **Template-only.** All three are templates, so no host stub takes external
 // linkage until something instantiates one, and this header has NO
-// single-includer constraint -- unlike `pack_dense_mask.cuh` and
-// `mla_paged.cuh`, which each hold a non-template `__global__` and may be
-// included by exactly one translation unit (§21.6). Nothing was templated here
-// to get that; all three arrived as templates.
+// single-includer constraint -- unlike the `write_mla` half of
+// `mla_paged.cuh`, which holds a non-template `__global__` and may be included
+// by exactly one translation unit (§21.6). Nothing was templated here to get
+// that; all three arrived as templates.
+//
+// This list used to open with `pack_dense_mask.cuh`, which held two more
+// non-template `__global__`s under the same constraint. It is gone: the driver
+// packs the element bitmap on the HOST (`driver-cuda/src/fire/page_mask.rs`,
+// `mask[base + (index >> 3)] |= 1 << (index & 7)`, with tests that read it
+// back the way the kernels index it), so the device packers were never fired
+// and nothing included them.
 //
 // # NVRTC
 //

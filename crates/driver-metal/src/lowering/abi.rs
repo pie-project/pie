@@ -220,9 +220,18 @@ kernels! {
         QmvIn = "qmv_in",
         /// GDN in-projection, 4-bit z gate.
         QmvInZ = "qmv_in_z",
-        /// GDN `a` projection, dense bf16.
+        /// GDN `a` projection.
+        ///
+        /// QUANTIZED, like every other projection in the layer. It and its
+        /// `b` sibling were once staged as dense bf16 -- what a Qwen3-Next
+        /// preview repack shipped, and what no released checkpoint ships.
+        /// Reading `in_proj_a.weight` as bf16 reads packed nibbles as
+        /// floats: NaN in the first four output channels, small plausible
+        /// wrong numbers in the other twelve, and the model produces token
+        /// 0 forever. `model/src/qwen_3_5/forward/mod.rs` states both as
+        /// an ordinary `MatW`, the same type every dense projection gets.
         GdnInA = "gdn_in_a",
-        /// GDN `b` projection, dense bf16.
+        /// GDN `b` projection; quantized, see [`Kernel::GdnInA`].
         GdnInB = "gdn_in_b",
         /// The hoisted GDN q/k prologue (one dispatch per head).
         GdnPrep = "gdn_prep",

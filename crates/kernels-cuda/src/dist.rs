@@ -15,7 +15,7 @@ fn no_nccl(what: &'static str) -> Refusal {
     }
 }
 
-#[routine(whole, out(buf = like(buf)))]
+#[routine(whole, canon = all_reduce, out(buf = like(buf)))]
 pub fn all_reduce_bf16(ctx: &Ctx<'_>, buf: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
     let r = buf.all("out_width(0)")?;
     all_reduce_in_place(ctx, r.ptr.cast(), i64::from(r.elements()))

@@ -47,7 +47,7 @@ use crate::dispatch::Geometry;
 /// which is what `Provenance::Env` means: the kernel never reads them and
 /// they size the grid. A body asks for the ones it needs by name and this is
 /// where they come from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Facts {
     /// How many rows this launch covers — its rectangle's height.
     pub rows: u32,

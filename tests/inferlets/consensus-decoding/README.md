@@ -67,7 +67,7 @@ really `[B, vocab]`, with independent per-lane Gumbel noise.
 The prefill deliberately samples a single `[1, vocab]` read-out row and starts
 all `B` candidates from that same first token. Broadcasting the prefill row to
 `[B, vocab]` would trigger the nucleus-sampler scratch-elision bug documented in
-[`11-ptir-limits.md`](../../../inference-time-algorithms/11-ptir-limits.md)
+`inference-time-algorithms/11-ptir-limits.md`
 under "Four unchecked contracts that fail silently", contract 4. The verified
 behaviour is that at `temperature = 1.2` candidates diverge by the second
 sentence; at `0.6` they are identical because the nucleus keep-set is a single

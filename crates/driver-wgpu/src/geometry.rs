@@ -985,7 +985,11 @@ mod tests {
             // `split`: six inputs, three of them raised. The `_sink` form
             // has the same input surface -- the sink table is a
             // `Const<Tensor<..>>`, which is a weight, not an input.
-            &[(1, "kv_cache"), (4, "attention_mask"), (5, "attn.split_policy")]
+            &[
+                (1, "kv_cache"),
+                (4, "attention_mask"),
+                (5, "attn.split_policy"),
+            ]
         } else if symbol.starts_with("sdpa_vector_decode") {
             // `queries`, `kvc`: two inputs, one raised, for every vector
             // decode form (plain, swa, sink). The kv view is the only
@@ -1055,7 +1059,12 @@ mod tests {
 
     /// [`fired_wide`], with the fixture that names the raised inputs its
     /// signature marks. See [`statement_for`] for how the mapping is stated.
-    fn fired_for(symbol: &str, facts: Facts, scalars: &[u32], width: u32) -> Result<Vec<Stated>, String> {
+    fn fired_for(
+        symbol: &str,
+        facts: Facts,
+        scalars: &[u32],
+        width: u32,
+    ) -> Result<Vec<Stated>, String> {
         let routine = crate::lowering::routine::armed(symbol)
             .ok_or_else(|| format!("`{symbol}` is claimed by no armed stem"))?;
         let args = statement_for(symbol, width);
@@ -1065,8 +1074,14 @@ mod tests {
             scalars,
         );
         let mut views = crate::lowering::views::Views::default();
-        let taken = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
-            .map_err(|why| format!("the binder refused: {why:?}"))?;
+        let taken = crate::lowering::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut handles,
+            facts,
+            &mut views,
+        )
+        .map_err(|why| format!("the binder refused: {why:?}"))?;
         let handles = core::cell::RefCell::new(handles);
         crate::lowering::routine::stating(routine, &taken, &handles, facts)
             .map_err(|why| why.to_string())
@@ -1088,8 +1103,14 @@ mod tests {
             scalars,
         );
         let mut views = crate::lowering::views::Views::default();
-        let taken = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts, &mut views)
-            .map_err(|why| format!("the binder refused: {why:?}"))?;
+        let taken = crate::lowering::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut handles,
+            facts,
+            &mut views,
+        )
+        .map_err(|why| format!("the binder refused: {why:?}"))?;
         // ON A PLANNER THAT CAN ANSWER, because these bodies ask. A fact only
         // the fire can answer is no longer bound into `args` before the body
         // runs -- that is the whole of the marks migration -- so `state`'s

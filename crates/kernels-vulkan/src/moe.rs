@@ -89,7 +89,7 @@ fn affine_qmm_point(group: i32, bits: i32, tile_m: i32, tile_n: i32) -> Result<u
     Ok((g * 2 + b) * 9 + tile_point(tile_m, tile_n)?)
 }
 
-#[routine(canon = topk, out(expert_weights = rows(logits) x const(experts_per_token)))]
+#[routine(canon = "topk.softmax", out(expert_weights = rows(logits) x const(experts_per_token)))]
 pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,

@@ -13,6 +13,47 @@
 //! `refactor-plan-followup.md` §0 named once and generally: *a hand-transcribed
 //! fact outlived the test that checked it.*
 //!
+//! # `every_plane_is_answered` STOOD BESIDE THIS AND IS DELETED
+//!
+//! It held the fourth plane, which this file cannot: the kernel sets are
+//! almost disjoint, so CUDA could not be compared by signature and was
+//! compared by MACHINERY instead. Every plane's bodies reached for facts with
+//! `ctx.ask::<C, keys::K>()`, and a body that asked for one its driver did not
+//! answer returned `Refusal::Unstated` and could not fire at all, so the scan
+//! held each plane's asks against its driver's answers.
+//!
+//! There are no asks. `9c1ed0e6e` deleted `keys.rs`, `Asks::ask`,
+//! `Source::Named`, the `Answer` enum, `Holds::fact` and `Derivation::ASKED`
+//! — *"Zero ctx.ask sites remain in the tree"* — and every fact a body used to
+//! reach for is a parameter now. The question the test asked cannot be put:
+//! a missing parameter is an arity refusal the binder sees, not an unanswered
+//! question the body discovers.
+//!
+//! What it found before it went is worth keeping, because it is the argument
+//! FOR the deletion rather than against it: `driver-cuda` answered NOT ONE of
+//! the 59 keys `keys.rs` §M and §L declared, 47 of which were declared and
+//! first asked for in a single commit whose subject was about the three shader
+//! planes and which carried the CUDA half as a rider. A channel where the
+//! asking half can land without the answering half, and stay that way
+//! unnoticed across 51 live call sites, is the defect the no-ask series
+//! removed at the root.
+//!
+//! It also left one lesson, and the shape of the successor is the lesson's
+//! answer. A scan of source TEXT counts comments: that test believed
+//! `driver-cuda` answered `MoeMaxBlocks` because the crate named it once, in a
+//! sentence reading *"the signature takes as `Const` because no driver answers
+//! `keys::MoeMaxBlocks`"*. It read a denial as a confirmation, and stripping
+//! comments moved the count 50 → 51 on that one line alone.
+//!
+//! `driver-cuda/tests/every_runtime_name_is_answered.rs` is the same question
+//! reborn on the operand channel, and it greps nothing. It holds
+//! `plan.runtime` — every name a catalogued text mints — against
+//! `bind::views::ANSWERED`, two lists of objects the compiler maintains. The
+//! original could be fooled by a sentence because it was reading prose; its
+//! heir cannot be, because there is no prose in what it reads. That is the
+//! upgrade, and it is why this file records the death rather than the test
+//! being kept on life support.
+//!
 //! # Why it is here and not later
 //!
 //! The bigplan's §3 gate compares `ROUTINES` — derived argument lists — and

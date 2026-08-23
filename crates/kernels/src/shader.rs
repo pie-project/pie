@@ -24,9 +24,14 @@ use crate::routine::{Arg, Backend, Refusal};
 /// `mod tests` below kept this file's tests from compiling, so `12` sat here
 /// over a vocabulary of TEN -- `BufMut`, `F32sMut`, `I32sMut` and `U32sMut`
 /// were deleted when the direction moved to the mark and this did not follow.
-/// The two half-width elements bring it back to twelve, which is now a
+/// The two half-width elements brought it back to twelve, which is now a
 /// measured number rather than a coincidence.
-pub const COUNT: usize = 12;
+///
+/// Thirteen since `InPacked` was written out by hand: the packed mask plane
+/// unpacks to a buffer AND a bit stride, which is neither shape a macro
+/// stamps. The census caught it the first time the lib tests could run again,
+/// which is the whole point of asserting a number instead of narrating it.
+pub const COUNT: usize = 13;
 
 /// The little a shared operand type needs to know about a backend's value.
 ///

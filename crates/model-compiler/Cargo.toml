@@ -28,3 +28,4 @@ path = "src/lib.rs"
 # and `sig_in` at lowering time must agree about what a symbol's contract is,
 # and they agree by being the same table.
 model-ir = { path = "../model-ir" }
+serde_json = "1"

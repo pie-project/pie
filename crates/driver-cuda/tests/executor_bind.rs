@@ -27,6 +27,25 @@ use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{Arg, Fire, Lowered, Row, lower};
 use model_ir::trace::{FireClass, ValueId};
 
+/// The scalars the family texts used to read off their fact structs.
+///
+/// Upstream lifted `norm_eps`, the rope bases and gpt-oss's sliding window
+/// OUT of the facts and onto the forward functions, because two SKUs of one
+/// family can differ in those and in nothing else. These tests never read a
+/// number back -- they lower, bind and count -- so any well-formed value
+/// states the same text, and these are the shipped checkpoints' own.
+#[allow(dead_code)]
+const EPS: f32 = 1e-6;
+/// The common rope base. gpt-oss's is its own.
+#[allow(dead_code)]
+const THETA: f32 = 1_000_000.0;
+/// gpt-oss: YaRN over a 150k base, alternating 128-token windows.
+#[allow(dead_code)]
+const WINDOWED_THETA: f32 = 150_000.0;
+/// The sliding leg's span. `-1` is "no window" and is NOT what gpt-oss says.
+#[allow(dead_code)]
+const WINDOW: i32 = 128;
+
 /// Answers every name with a distinct sentinel and records what was asked.
 #[derive(Default)]
 struct Sentinels {
@@ -62,19 +81,17 @@ impl Resolver for Sentinels {
 }
 
 fn plan_of(class: FireClass) -> model_ir::trace::ForwardPlan {
-    llama_like_cuda(
+    llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-        class,
-    )
+        class, EPS, THETA)
 }
 
 fn lowered(class: FireClass, rows: usize) -> Lowered {
-    let plan = llama_like_cuda(
+    let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-        class,
-    );
+        class, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -118,11 +135,10 @@ fn qwen35_live_cuda() -> Qwen35CudaFacts {
 }
 
 fn qwen35_lowered(class: FireClass, rows: usize) -> Lowered {
-    let plan = qwen3_5_hybrid_cuda(
+    let plan = qwen3_5_hybrid_cuda::<model::qwen_3_5::forward::ShippedW1, model::qwen_3_5::forward::ShippedW2, model::qwen_3_5::forward::ShippedA, model::qwen_3_5::forward::ShippedKv>(
         &Qwen35HybridFacts::qwen3_5_0_8b(),
         &qwen35_live_cuda(),
-        class,
-    );
+        class, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -143,10 +159,9 @@ fn qwen35_lowered(class: FireClass, rows: usize) -> Lowered {
 /// gemma-2 (E-gate family #2): the 9b facts, DECODE class — the only
 /// class the family states today.
 fn gemma2_lowered(rows: usize) -> Lowered {
-    let plan = model::gemma_2::forward::gemma2_cuda(
+    let plan = model::gemma_2::forward::gemma2_cuda::<model::gemma_2::forward::ShippedW1, model::gemma_2::forward::ShippedA, model::gemma_2::forward::ShippedKv>(
         &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -183,10 +198,9 @@ fn every_launch_of_the_gemma2_deployment_binds() {
     }
     // gemma2's ARG-level weights are all `scale.*` constants (which bind
     // without the resolver); the tensor weights ride the op join.
-    let plan = model::gemma_2::forward::gemma2_cuda(
+    let plan = model::gemma_2::forward::gemma2_cuda::<model::gemma_2::forward::ShippedW1, model::gemma_2::forward::ShippedA, model::gemma_2::forward::ShippedKv>(
         &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let dp = driver_cuda::bind::DispatchPlan::new(&plan, &l);
     assert!(
         (0..l.launches.len()).any(|i| {
@@ -239,11 +253,10 @@ fn print_the_gemma2_vocabulary() {
 /// gemma-4 (the gemma anchor WITH a cached checkpoint — E2B; gemma-2's
 /// 2b-it is gated upstream): both stated classes, the synthetic cuda set.
 fn gemma4_lowered(class: FireClass, rows: usize) -> Lowered {
-    let plan = model::gemma_4::forward::gemma4_cuda(
+    let plan = model::gemma_4::forward::gemma4_cuda::<model::gemma_4::forward::ShippedW1, model::gemma_4::forward::ShippedA, model::gemma_4::forward::ShippedKv>(
         &model::gemma_4::forward::facts::Gemma4Facts::gemma_4_e2b(),
         &model::gemma_4::forward::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic(),
-        class,
-    );
+        class, EPS);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -287,10 +300,9 @@ fn every_launch_of_the_gemma4_deployment_binds() {
 /// the coverage anchor and the real-weight A/B is a recorded blocker.
 /// DECODE only: the family states no other class yet.
 fn nemotron_lowered(rows: usize) -> Lowered {
-    let plan = model::nemotron_h::forward::nemotron_h_cuda(
+    let plan = model::nemotron_h::forward::nemotron_h_cuda::<model::nemotron_h::forward::ShippedW1, model::nemotron_h::forward::ShippedW2, model::nemotron_h::forward::ShippedA, model::nemotron_h::forward::ShippedKv>(
         &model::nemotron_h::forward::facts::NemotronHFacts::nemotron_h_synthetic(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -794,7 +806,7 @@ fn print_all_deployment_vocabularies() {
     let bridged = bridged_symbols();
     for (name, facts, cuda) in &deployments {
         for class in [FireClass::Decode, FireClass::Prefill] {
-            let plan = llama_like_cuda(facts, cuda, class);
+            let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(facts, cuda, class, EPS, THETA);
             let rows: Vec<Row> = vec![
                 Row {
                     samples: true,
@@ -930,11 +942,10 @@ fn print_the_anchor_vocabulary() {
 #[test]
 #[ignore = "enumeration aid, not a claim"]
 fn print_the_lora_vocabulary() {
-    let plan = llama_like_cuda(
+    let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -970,10 +981,9 @@ fn print_the_lora_vocabulary() {
 /// new vocabulary: predict from the active stream, run the body on the
 /// prediction, correct every stream from the result.
 fn gemma3n_lowered(rows: usize) -> Lowered {
-    let plan = model::gemma_3n::forward::gemma3n_cuda(
+    let plan = model::gemma_3n::forward::gemma3n_cuda::<model::gemma_3n::forward::ShippedW1, model::gemma_3n::forward::ShippedA, model::gemma_3n::forward::ShippedKv>(
         &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -1063,11 +1073,10 @@ fn print_the_gemma3n_vocabulary() {
 /// declaration for both model types. A 20b checkpoint IS cached here, so
 /// this family's facts are the real ones.
 fn gpt_oss_lowered(class: FireClass, rows: usize) -> Lowered {
-    let plan = model::gpt_oss::forward::gpt_oss_cuda(
+    let plan = model::gpt_oss::forward::gpt_oss_cuda::<model::gpt_oss::forward::ShippedW1, model::gpt_oss::forward::ShippedW2, model::gpt_oss::forward::ShippedA, model::gpt_oss::forward::ShippedKv>(
         &model::gpt_oss::forward::facts::GptOssFacts::gpt_oss_20b(),
         &model::gpt_oss::forward::facts::GptOssCudaFacts::gpt_oss_20b_synthetic(),
-        class,
-    );
+        class, EPS, WINDOWED_THETA, WINDOW);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -1152,10 +1161,9 @@ fn print_the_gpt_oss_vocabulary() {
 /// claims over all four — every launch binds, every kernel has a stated
 /// bridge row — which is what makes the arms writable at all.
 fn glm5_lowered(rows: usize) -> Lowered {
-    let plan = model::glm_5::forward::glm5_cuda(
+    let plan = model::glm_5::forward::glm5_cuda::<model::glm_5::forward::ShippedW1, model::glm_5::forward::ShippedW2, model::glm_5::forward::ShippedA, model::glm_5::forward::ShippedKv>(
         &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -1174,11 +1182,10 @@ fn glm5_lowered(rows: usize) -> Lowered {
 }
 
 fn kimi_k2_lowered(rows: usize) -> Lowered {
-    let plan = model::kimi_k2::forward::kimi_cuda(
+    let plan = model::kimi_k2::forward::kimi_cuda::<model::kimi_k2::forward::ShippedW1, model::kimi_k2::forward::ShippedW2, model::kimi_k2::forward::ShippedA, model::kimi_k2::forward::ShippedKv>(
         &model::kimi_k2::forward::facts::KimiFacts::kimi_k2(),
         &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -1197,10 +1204,9 @@ fn kimi_k2_lowered(rows: usize) -> Lowered {
 }
 
 fn kimi_k3_lowered(rows: usize) -> Lowered {
-    let plan = model::kimi_k3::forward::kimi_k3_cuda(
+    let plan = model::kimi_k3::forward::kimi_k3_cuda::<model::kimi_k3::forward::ShippedW1, model::kimi_k3::forward::ShippedW2, model::kimi_k3::forward::ShippedA, model::kimi_k3::forward::ShippedKv>(
         &model::kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -1219,10 +1225,9 @@ fn kimi_k3_lowered(rows: usize) -> Lowered {
 }
 
 fn dsv4_lowered(rows: usize) -> Lowered {
-    let plan = model::deepseek_v4::forward::dsv4_cuda(
+    let plan = model::deepseek_v4::forward::dsv4_cuda::<model::deepseek_v4::forward::ShippedW1, model::deepseek_v4::forward::ShippedW2, model::deepseek_v4::forward::ShippedA, model::deepseek_v4::forward::ShippedKv>(
         &model::deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(),
-        FireClass::Decode,
-    );
+        FireClass::Decode, EPS, THETA);
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
@@ -1644,7 +1649,7 @@ fn a_named_operand_names_its_alias_owner() {
     ];
     for (name, facts, cuda) in &corpus {
         for class in [FireClass::Decode, FireClass::Prefill] {
-            let plan = llama_like_cuda(facts, cuda, class);
+            let plan = llama_like_cuda::<model::shared::llama_like::forward::ShippedA, model::shared::llama_like::forward::ShippedKv>(facts, cuda, class, EPS, THETA);
             let rows: Vec<Row> = vec![
                 Row {
                     samples: true,

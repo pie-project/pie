@@ -47,10 +47,23 @@ pub struct Views<'a> {
     args: &'a [Arg],
     /// Which of them are the INPUTS, in slot order.
     ins: &'a [usize],
-    /// Boxed so every address is stable however the vectors grow.
+    /// Boxed so every address is stable however the vectors grow. clippy's
+    /// `vec_box` reads this as a redundant indirection over a heap that is
+    /// already a heap, and on the usual `Vec<Box<T>>` it would be right. It
+    /// is wrong here for a reason two lines of this file make plain: `raise`
+    /// takes each view's address with `from_ref` and stores it as a bare
+    /// `usize` BEFORE pushing it, and the routine dereferences that number
+    /// later. Unboxed, the number would point into the vector's buffer and
+    /// the next push past a capacity boundary would move the buffer out from
+    /// under it -- a use-after-free that no test would reproduce until a
+    /// launch happened to raise more views than the vector was born with.
+    #[allow(clippy::vec_box, reason = "the addresses are taken before the push")]
     kv: Vec<Box<PagedKvView>>,
+    #[allow(clippy::vec_box, reason = "as above")]
     rs: Vec<Box<RecurrentView>>,
+    #[allow(clippy::vec_box, reason = "as above")]
     mask: Vec<Box<MaskView>>,
+    #[allow(clippy::vec_box, reason = "as above")]
     split: Vec<Box<SplitView>>,
 }
 

@@ -20,7 +20,8 @@
 // IT USED TO BE BOTH AT ONCE, and this was the shader the rule was written
 // against. `eps`, `axis_size`, `w_stride`, `plus_one` and `gain` were
 // `RmsParams` on a storage binding -- Metal's buffer-3 layout, carried over
-// whole through `norm/rms_params.slang` -- while `row_pitch` was a push
+// whole through a shared norm/rms_params.slang header, since deleted along
+// with the last module that included it -- while `row_pitch` was a push
 // constant, so the module declared a descriptor for twenty live bytes AND a
 // push range beside it. That is the one arrangement `binding::params` cannot
 // serve: it asks push first, and a module answering with the right push size

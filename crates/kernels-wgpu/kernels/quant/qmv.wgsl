@@ -134,6 +134,13 @@ struct Params {
 // a prediction for the other is the mistake this file made twice in one
 // afternoon -- once with the GB/s table and once with this one.
 //
+// AND THE "WITHIN A PERCENT" WAS THE SPREAD. Re-measured on a 7.43 ms token,
+// `PIE_ROWW = 2` reads 8.168 -- doubling the grid costs 0.74 ms, 10%. It was
+// always there; a 9.8 ms token with this harness's old sample count could not
+// see it. The knee is real and the shipped grid does sit on it, but the curve
+// is not flat above the operating point. See the launch section above, which
+// prices the ramp directly and then fails three times to buy it.
+//
 // It also retires a suspicion. Six probes have now said this kernel's inner
 // loop is free -- ALU 2.4%, load issue 0.7%, wider workgroups worse twice --
 // and this is the first one that moved the number. The kernel is fine. The
@@ -171,6 +178,156 @@ struct Params {
 // reduction-tree count costs something. If it regresses, the row width wants
 // to be a compile-time variant selected by the launcher on `vecs`, which the
 // `PIE_MT` arms already show how to do.
+//
+// # AND THE INTERCEPT IS NOT THE KERNEL AT ALL. 1.085 ms BEFORE A BYTE IS READ
+//
+// Every table above prices a change to what the kernel DOES. This one prices
+// doing nothing, and it is the largest single number in the file.
+//
+// Three configurations, three interleaved rounds each, plain
+// `what_a_decode_costs_at_length`, NO `PIE_WGPU_PROBE` and NO
+// `PIE_WGPU_STAMP` -- both inflate a decode median from ~7.4 ms to ~13.8 ms
+// and every earlier per-fire figure quoted from a `[cost]` table carries that
+// tax:
+//
+// | build | round 1 | round 2 | round 3 | mean |
+// | --- | --- | --- | --- | --- |
+// | shipped | 7.411 | 7.454 | 7.411 | 7.425 |
+// | `main` returns on a uniform-false test of `params.in_vec_size` | 4.628 | 4.605 | 4.644 | 4.626 |
+// | `PIE_WGPU_SKIP=affine_qmv`, the fires never encoded | 3.556 | 3.525 | 3.541 | 3.541 |
+//
+// Non-overlapping at every round. The middle build still binds every buffer,
+// still launches every workgroup of every one of the decode's 196 qmv fires,
+// and does no arithmetic and no loads -- the early return is uniform, so it is
+// legal in front of the barriers, and the bindings stay live because the
+// condition reads the uniform block. (A deletion probe that removes a
+// binding's LAST use is refused before it runs: naga drops the binding and the
+// module declares fewer than the fire bound.)
+//
+// So qmv costs 3.88 ms of a 7.43 ms token, of which the body is 2.80 ms and
+// **1.085 ms is paid before a byte is read.** That is 28% of qmv and 14.6% of
+// the whole token, and it retires the phrase "the intercept" everywhere it
+// appears above: the two- and three-shape fits kept landing on a 7-9 us
+// constant and kept blaming a prologue -- an activation load, a tail ladder --
+// and it is neither. It is what the LAUNCH costs.
+//
+// One consequence is immediate and it holds: every intra-kernel idea in this
+// file is capped at 72% of qmv. The six probes that found the inner loop free
+// were right, and the seventh -- `PIE_ROWREP`, the one that "moved the
+// number" -- moved it by lengthening a workgroup's serial chain, not by fixing
+// anything.
+//
+// # BUT IT IS NOT A PER-DISPATCH FEE, AND THAT KILLS THE JOIN
+//
+// The obvious next sentence -- 1.085 ms over 196 fires is 5.54 us a dispatch,
+// so delete fires -- was written here, committed, and is WRONG. Three further
+// measurements, same sitting, same harness, no instrumentation:
+//
+// | what | mean | per fire |
+// | --- | --- | --- |
+// | `PIE_WGPU_SKIP=silu_mul`, 28 tiny-grid fires deleted | 7.395 | **1.4 us** |
+// | `PIE_WGPU_SKIP=kv_append`, 28 fires deleted | 7.363 | **2.6 us** |
+// | the empty build again, with `QMV_ROWREP = 8` | 4.220 | |
+//
+// A dispatch is not billed a flat fee. Delete 28 fires whose grids are small
+// and 1.4 us each comes back, not 5.54. And the third row says where the rest
+// of the 1.085 ms is: cutting the empty fires' WORKGROUP COUNT by eight --
+// same 196 fires, same bindings, still no arithmetic -- returns 0.406 ms of
+// it. Most of what an empty qmv fire costs is the grid walking, and the fixed
+// residue is ~2-3 us, in the range the two skip probes measured directly.
+//
+// A join does not change the grid. Three fires of 512, 256 and 256 workgroups
+// become one of 1024, and every workgroup that was going to be launched still
+// is. So a join can only collect the FIXED residue, and it does not even
+// collect all of that, because `dsl::ops::split_qkv` is a launch too -- see
+// `kernels_wgpu::attn::split_qkv_bf16`, which fires `attn/split_qkv.wgsl`.
+// q||k||v is three qmv fires in and one qmv plus one split out: net ONE fire a
+// layer, 28 in all, at ~2-3 us, **0.06-0.08 ms, under 1% of the token**, minus
+// whatever the split's own copy costs. gate||up is another net one a layer and
+// only if `silu_mul` learns to read two halves of one bank, which it cannot
+// today (`llama_like`'s Metal text asserts on exactly this).
+//
+// So the join is worth about 1%, not the 6.3% the paragraph this one replaces
+// claimed and not the ~8% `turns.rs` estimated from a stamped fit. It needs
+// changes in `model`, `model-dsl` and three kernel crates. It is not worth it,
+// and this is the measurement that says so rather than a guess that it is
+// hard.
+//
+// Two grid experiments kept, because they bound the same question from above.
+// An empty fire costs ~10.5 us of STAMPED GPU time at 32, 64 and 96 workgroups
+// alike -- that flat part is mostly the timestamp, which is why the plain
+// medians above are the only numbers quoted as durations. Far above it the
+// ramp dominates and is plainly proportional: the lm head's 37984 workgroups
+// cost ~452 us empty, 11.9 ns each, and widening `main` to
+// `@workgroup_size(32, 8, 1)` -- which makes the `Fire` divide the grid by
+// eight at identical thread count -- cuts that to ~93 us. It buys nothing,
+// because the real lm head is memory-bound at 194 GB/s and reads 452 us either
+// way. Do not read the lm head's flatness as evidence about the small fires,
+// or the small fires' floor as evidence about the lm head.
+//
+// # THE GRID RAMP IS 0.4 ms AND IT IS NOT BUYABLE. THREE MECHANISMS, ALL LOSE
+//
+// The section above says most of a launch is the grid walking. The obvious
+// next move is to walk less of it, and there are exactly three ways to cut a
+// grid without changing the work. All three were written and measured. All
+// three lose, and they lose for three different reasons, which is why this
+// table is worth its length.
+//
+// First, how much is actually there. Plain interleaved decode medians:
+//
+// | build | mean |
+// | --- | --- |
+// | shipped | 7.425 |
+// | `PIE_ROWW = 2`, the grid DOUBLED at fixed work | 8.168 |
+// | empty body | 4.626 |
+// | empty body, `QMV_ROWREP = 8` -- grid/8 by serial depth | 4.220 |
+// | empty body, `@workgroup_size(32, 8, 1)` -- grid/8 by width | 4.263 |
+//
+// So the ramp is charged PER WORKGROUP, not per subgroup: eight 32-lane
+// row-groups packed into one 256-lane workgroup return 0.363 ms, within noise
+// of what eight serial reps return. And it is worth going after -- doubling
+// the grid costs 0.74 ms, which also retires this file's older claim that
+// doubling it "buys nothing within a percent". That was measured on a 9.8 ms
+// token, where 0.74 ms fits inside the spread.
+//
+// Now the three mechanisms, on the REAL kernel:
+//
+//   * `PIE_ROWREP = 8`. Grid/8 by making one row-group's lanes walk eight
+//     groups in series. Loses: the table further down reads +7% at two and
+//     +30% at four. The workgroup's dependency chain is what got eight times
+//     longer.
+//   * `@workgroup_size(32, 8, 1)`, `qmv_partials` sized `PIE_WGY * 4 * PIE_MT
+//     * 32`. Grid/8 at identical thread count and identical per-thread work.
+//     **9.87 ms.** Sizing the shared array per row-group is 8 KiB a workgroup,
+//     and shrinking it back to 1 KiB alone recovers 1.5 ms of that -- shared
+//     memory is an occupancy budget on this part and the kernel spends it on
+//     nothing. Even at 1 KiB it is **7.98**, and 4 and 2 wide are 7.77 and
+//     7.82. Every width loses.
+//   * The barrier, removed, to see if it was the reason. Under `PIE_SUBGROUP`
+//     with a 32-wide subgroup the butterfly leaves EVERY lane holding the
+//     block sum, so the four `qmv_partials` stores, the `workgroupBarrier`
+//     and the strided read after it are a round trip to shared memory for a
+//     value already in a register. Deleting them and storing `t{mi}[r]`
+//     directly is bit-identical -- the gemm-vs-qmv harness reports the same
+//     0.140625 and 0.265625 disagreements to the digit. At eight wide it
+//     reads **9.48**, so the barrier was not what widening cost. And at one
+//     wide it reads **7.507**, about 1% WORSE than shipping: indexing
+//     `array<vec4<f32>, 4>` by a loop variable is a dynamic index into a
+//     value array, which naga spills, and the spill costs more than the
+//     barrier it deletes. At `@workgroup_size(32, 1, 1)` a workgroup is one
+//     subgroup and its barrier was already free.
+//
+// What is left is the reason the widening loses, and it is not a knob. This
+// kernel is memory-LATENCY bound, and latency is hidden by having many
+// workgroups resident per core. A 256-lane workgroup needs eight times the
+// registers and eight times the shared memory in one contiguous allocation,
+// so fewer of them fit, so less is hidden. The 0.36 ms of ramp is real and it
+// is recoverable, and the occupancy it costs to recover it is worth more.
+//
+// That closes the grid. Nine probes have now said this kernel's interior is
+// free and three say its launch cannot be made cheaper; the remaining 2.80 ms
+// of body against ~1.5 MiB a fire is the weights, and the weights are the
+// floor.
 const PIE_ROWREP = 1u;
 
 // Output rows a workgroup covers, and THE KNOB THAT PROVED THE GRID IS DONE.
@@ -921,6 +1078,54 @@ fn block_dot1(rows: vec4<u32>, vec_: u32, k0: u32) -> vec4<f32> {
 // adapter the second is dearer. The first attempt at this is recorded in the
 // list above; it is repeated here with numbers so the third attempt does not
 // happen.
+//
+// # THE SHAPE THE gate||up JOIN SHOULD TAKE HERE, AND WHY IT IS NOT A BANK
+//
+// `turns.rs` prices the join at 0.26-0.39 ms, 3.5-5.3% of a decoded token,
+// from a per-fire intercept measured four independent ways. The obvious
+// implementation is the one the model crate already has -- concatenate the two
+// bf16 weights at load into `mlp.gate_up_proj.fused.weight`, quantize the
+// fused tensor, fire one 6144-row qmv, and split with `silu_mul_strided`,
+// which EXISTS in `mlp/gated.wgsl` and whose `row_pitch` addressing is exactly
+// right for a packed bank. Three of the four pieces are already written.
+//
+// **AND IT IS STILL THE WRONG SHAPE, BECAUSE OF THE PIECE THAT IS NOT.**
+// Splitting the packed result needs `up` bound into the SAME buffer as `gate`
+// at a column offset, and nothing in the trace, the lowering or
+// `binding::resolve` carries a column offset -- rows and whole buffers are all
+// an `Arg` can name. `split_qkv` on the metal side is a LAUNCH and not a view
+// for this reason, and a launch here gives the intercept straight back.
+//
+// The shape that avoids it is a fire that reads BOTH BANKS AND ACTIVATES:
+//
+//     affine_qmv_swiglu:  w, scales, biases,        (gate's bank)
+//                         w2, scales2, biases2,     (up's bank)
+//                         x, y                      = EIGHT storage bindings
+//
+// which is exactly `DOWNLEVEL_STORAGE_BUFFERS`, with nothing left over -- so
+// this variant can never also be residual, which gate and up are not. It
+// writes `silu(g) * u` directly, so it deletes the `silu_mul` launch as well:
+// 56 qmv fires and 28 silu fires become 28 fires. No packed bank, no loader
+// change, no model change, no new binding capability.
+//
+// **AND THE COST ARGUMENT FOR IT IS ALREADY IN THIS FILE, MEASURED.** The
+// fused fire keeps the grid at 768 workgroups and doubles the work each one
+// does. That is `PIE_ROWREP`'s transformation with the sign flipped, and the
+// `PIE_ROWW` note above records the result of running it: holding the work
+// fixed and doubling the grid MOVES NOTHING. So doubling the work at a fixed
+// grid costs the byte term twice and the intercept once --
+//
+//     13.8 us + 2 x 8.6 = 31.0 us   against 2 x 22.4 = 44.8 today
+//
+// -- 13.8 us a layer, 0.386 ms, plus the 28 silu fires at 1.4 us. The two
+// estimates that bracket it, from the tail fit and from the measured
+// 2048->3072 step, are in `turns.rs`.
+//
+// The work is in `reduce_store` and `block_dot`, which thread one bank's
+// `w`/`scales`/`biases` through the whole `//#if` matrix. A second set has to
+// ride beside them under `PIE_SWIGLU` without widening the register footprint
+// of any arm that does not enter it -- the lesson two sections down, where a
+// fat arm taxed every fire that never used it and cost 114.0 -> 109.8 GB/s.
 //
 // # THE LEFT COLUMN OF THAT TABLE IS THE ANSWER TO THE WHOLE KERNEL
 //
