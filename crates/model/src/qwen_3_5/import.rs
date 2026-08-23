@@ -1,5 +1,5 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::load::{copy, pack, stack, Import, SfBase};
+use model_dsl::load::{copy, pack, squeeze, stack, Import, SfBase};
 
 use super::model::{Head, Mixer, Mlp, Model};
 
@@ -23,9 +23,15 @@ pub fn import_hf<B: SfBase, W1: Dtype, K: KvDtype>(m: &Model<W1, K>) -> Import {
                 i.write(format!("layer.{l}.k_norm"), copy(format!("layer.{l}.self_attn.k_norm")));
             }
             Mixer::Gdn(_) => {
-                i.write(format!("layer.{l}.in_qkvz"), copy(format!("layer.{l}.linear_attn.in_proj_qkvz")));
-                i.write(format!("layer.{l}.in_ba"), copy(format!("layer.{l}.linear_attn.in_proj_ba")));
-                i.write(format!("layer.{l}.conv"), copy(format!("layer.{l}.linear_attn.conv1d")));
+                i.write(format!("layer.{l}.in_qkvz"), pack([
+                    format!("layer.{l}.linear_attn.in_proj_qkv"),
+                    format!("layer.{l}.linear_attn.in_proj_z"),
+                ]));
+                i.write(format!("layer.{l}.in_ba"), pack([
+                    format!("layer.{l}.linear_attn.in_proj_b"),
+                    format!("layer.{l}.linear_attn.in_proj_a"),
+                ]));
+                i.write(format!("layer.{l}.conv"), squeeze(format!("layer.{l}.linear_attn.conv1d"), 1));
                 i.write(format!("layer.{l}.dt_bias"), copy(format!("layer.{l}.linear_attn.dt_bias")));
                 i.write(format!("layer.{l}.a_log"), copy(format!("layer.{l}.linear_attn.A_log")));
                 i.write(format!("layer.{l}.gdn_norm"), copy(format!("layer.{l}.linear_attn.norm")));

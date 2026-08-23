@@ -29,3 +29,14 @@ path = "src/lib.rs"
 # and they agree by being the same table.
 model-ir = { path = "../model-ir" }
 serde_json = "1"
+
+[dev-dependencies]
+# THE REAL CATALOGUE, and nothing smaller. The width table's whole claim is
+# that it reproduces the shapes six model texts state, so pinning it against a
+# fixture would pin it against this crate's own idea of a plan; `tests/` traces
+# the shipping row and measures what comes out of it.
+#
+# A DEV EDGE ONLY, and it does not cycle: `model` reads `model-dsl` and
+# `model-ir` and knows nothing of lowering.
+model = { path = "../model" }
+model-dsl = { path = "../model-dsl" }

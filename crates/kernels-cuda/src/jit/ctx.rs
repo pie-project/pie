@@ -23,6 +23,18 @@ impl Backend for Cuda {
     }
 }
 
+/// What this plane is to a `points` declaration: a family method's operand
+/// marks carry a JIT region, one per element type the point quantifies over,
+/// and a `Cache` mark carries the raise this plane's ssm routines already
+/// take — `In<Struct<RecurrentState>>`, whose payload is named here once.
+impl kernels::points::Plane for Ctx<'_> {
+    type Tensor<T: kernels::points::Scalar> = crate::jit::abi::Tensor<T>;
+
+    type Recurrent = kernels::raises::Struct<crate::views::RecurrentState>;
+
+    type Pages = kernels::raises::Struct<crate::views::KvCache>;
+}
+
 impl kernels::routine::Answers<Cuda> for Ctx<'_> {
     fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         self.env

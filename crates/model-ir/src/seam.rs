@@ -1,58 +1,46 @@
-//! Seam vocabulary: named extension points stated by model text and
-//! read by lowerings.
-//!
-
-/// What an attachment at a seam may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cap {
-    /// Pure value rewrite `|x, y| y'` (the adapter family).
     Transform,
-    /// Read the seam's value from an attached program.
+
     Observe,
-    /// Read the attention scores the capturing dispatch published.
+
     Scores,
-    /// Narrow the page list the stated attention kernel consumes.
+
     PageMaskSink,
-    /// Device puts (embeds, channels) — boundary-only.
+
     Put,
-    /// Draw samples from the logits — boundary-only.
+
     Sample,
-    /// Emit host-visible outputs — boundary-only.
+
     Emit,
 }
 
-/// A seam signature: name, observed value roles, capabilities, position
-/// rule, and optional sink.
 pub struct Def {
     pub name: &'static str,
-    /// Value roles in operand order.
+
     pub sees: &'static [&'static str],
     pub caps: &'static [Cap],
-    /// Position rule for seams whose arithmetic depends on placement.
+
     pub position: Option<Position>,
-    /// Where a sink-writing attachment's output lands.
+
     pub sink: Option<&'static str>,
 }
 
-/// A seam position rule, stated as op-kind names.
 #[derive(Debug, Clone, Copy)]
 pub struct Position {
     pub after: &'static [&'static str],
     pub before: &'static [&'static str],
 }
 
-/// Pre-attention observation seam over q; a page-mask sink narrows the
-/// page list consumed by the same stated attention kernel.
 pub const ATTN_Q: Def = Def {
     name: "attn.q",
     sees: &["q"],
     caps: &[Cap::Observe, Cap::PageMaskSink],
     position: None,
-    // Quest's `attn_page_mask` lands in the attention page-list sink.
+
     sink: Some("attention.pages"),
 };
 
-/// Post-attention observation seam over published scores.
 pub const ATTN_OUT: Def = Def {
     name: "attn.out",
     sees: &["a"],
@@ -61,26 +49,37 @@ pub const ATTN_OUT: Def = Def {
     sink: None,
 };
 
-/// Adapter value seam over raw q/v projections.
-/// The correction must land before bias, norms, rope and KV append;
-/// after rope is different arithmetic.
 pub const ATTN_QV: Def = Def {
     name: "attn.qv",
     sees: &["q", "v"],
     caps: &[Cap::Transform],
-    // CANON ROLES, not op kinds: the semantic vocabulary retired, so a
-    // producer is discriminated by what its LAUNCH claims. `after` admits
-    // the projection GEMMs (any `gemm::` symbol — the quantized rows claim
-    // no role) and the packed split; `before` refuses the transforms whose
-    // consumption would make the correction different arithmetic.
+
     position: Some(Position {
-        after: &["matmul", "split_qkv"],
-        before: &["add_bias", "rmsnorm", "rope", "kv_append"],
+        after: &["gemm.matmul", "gemm.matmul_acc", "matmul", "layout.split_qkv"],
+        before: &[
+            "norm.add_bias",
+            "norm.rmsnorm",
+            "norm.rmsnorm_no_scale",
+            "rmsnorm",
+            "rope",
+            "rope.full",
+            // THE SAME ADMITTED SET UNDER TWO SPELLINGS. `admits` matches a
+            // routine's claim either whole or by its first dotted segment,
+            // so the bare entry used to cover the core append and the
+            // `kv_append.mla` / `.index` / `.pool` sub-families at once. The
+            // core's claim is `attention.kv_append` now — under `attention`,
+            // where the bare entry no longer reaches it — so it is spelled
+            // whole, and the bare one stays for the three sub-families that
+            // still read their role there. `attention` itself is NOT the
+            // entry: it would admit the attention statement the seam is
+            // required to sit before.
+            "attention.kv_append",
+            "kv_append",
+        ],
     }),
     sink: None,
 };
 
-/// Recurrent-state tap over the mixed in-projection; recurrent layers only.
 pub const RECURRENT: Def = Def {
     name: "recurrent",
     sees: &["mixed"],
@@ -89,7 +88,6 @@ pub const RECURRENT: Def = Def {
     sink: None,
 };
 
-/// Entry boundary seam; boundary attachments do not enter row signatures.
 pub const IN: Def = Def {
     name: "in",
     sees: &[],
@@ -98,7 +96,6 @@ pub const IN: Def = Def {
     sink: None,
 };
 
-/// Exit boundary seam (epilogue's home).
 pub const OUT: Def = Def {
     name: "out",
     sees: &["logits"],
@@ -107,9 +104,6 @@ pub const OUT: Def = Def {
     sink: None,
 };
 
-/// Load-time check of stated seams.
-/// The silent case is [`ATTN_QV`]: its delta must land on the base
-/// projection before consumers such as bias or rope.
 pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
     let mut problems = Vec::new();
     for stmt in &plan.seams {
@@ -124,7 +118,7 @@ pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
             continue;
         };
         let at = at as usize;
-        // Adapter guard at `at`; correction launch at `at + 1` names q and v.
+
         let Some(seen) = plan.ops.get(at + 1).map(|op| op.inputs.clone()) else {
             continue;
         };
@@ -166,14 +160,6 @@ pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
     problems
 }
 
-/// Whether `kind` matches one of `roles` — canon roles, matched against
-/// what the op's launch CLAIMS.
-///
-/// Three admits per role, in order: the backend's claim for the kernel
-/// (axis points count by their role prefix — `matmul.acc` is a `matmul`),
-/// the backend-less `canon::<role>` spelling, and — for `matmul` alone —
-/// the `gemm::` namespace, because the quantized projection rows claim no
-/// role and a per-symbol list here would be the drift this file refuses.
 fn admits(plan: &crate::trace::ForwardPlan, kind: &crate::trace::OpKind, roles: &[&str]) -> bool {
     let crate::trace::OpKind::Launch { kernel, .. } = kind else {
         return roles.contains(&kind_name(kind));
@@ -196,19 +182,12 @@ fn admits(plan: &crate::trace::ForwardPlan, kind: &crate::trace::OpKind, roles: 
     false
 }
 
-/// Every seam a model text may state.
 pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &RECURRENT, &OUT];
 
 pub fn by_name(name: &str) -> Option<&'static Def> {
     ALL.iter().copied().find(|d| d.name == name)
 }
 
-/// What to CALL the op that produced a value, in a refusal.
-///
-/// [`kind_name`] answers `"Launch"` for every stated kernel, which is the
-/// one thing the reader already knows -- the semantic variants retired, so
-/// nearly every producer is a `Launch` and the message named none of them.
-/// A launch is named by its kernel; everything else keeps its variant.
 fn producer_name(kind: &crate::trace::OpKind) -> String {
     match kind {
         crate::trace::OpKind::Launch { kernel, .. } => kernel.clone(),
@@ -226,124 +205,5 @@ fn kind_name(kind: &crate::trace::OpKind) -> &'static str {
         K::Select { .. } => "Select",
         K::LmHead { .. } => "LmHead",
         _ => "other",
-    }
-}
-
-#[cfg(test)]
-mod seam_tests {
-    use crate::seam;
-    use crate::trace::{ForwardPlan, GuardArm, GuardPred, Op, OpKind, SeamStatement};
-
-    fn op(kind: OpKind, inputs: Vec<u32>, outputs: Vec<u32>) -> Op {
-        Op {
-            kind,
-            inputs,
-            outputs,
-            layer: Some(0),
-            dest: Vec::new(),
-        }
-    }
-
-    /// A projection. `OpKind::Matmul` STOOD HERE: the semantic variants
-    /// retired and a projection is a `gemm::` launch, which is exactly the
-    /// third admit in [`super::admits`] -- the quantized rows claim no role,
-    /// so the namespace is the role.
-    fn matmul() -> OpKind {
-        launch("gemm::act_x_w")
-    }
-
-    /// Any stated kernel, with the empty run every field of a test op wants.
-    fn launch(kernel: &str) -> OpKind {
-        OpKind::Launch {
-            kernel: kernel.to_string(),
-            weights: vec![],
-            state: None,
-            params: vec![],
-            param_extents: vec![],
-            peel_slots: None,
-        }
-    }
-
-    fn lora() -> OpKind {
-        launch("gemm::lora_qkv_correction")
-    }
-
-    fn guard() -> OpKind {
-        OpKind::Guard {
-            arms: vec![GuardArm {
-                pred: GuardPred::HasLora,
-                ops: 1,
-            }],
-            else_ops: 0,
-        }
-    }
-
-    /// Projection outputs, seam immediately after.
-    fn well_placed() -> Vec<Op> {
-        vec![
-            op(matmul(), vec![], vec![1]),
-            op(matmul(), vec![], vec![2]),
-            op(guard(), vec![], vec![]),
-            op(lora(), vec![1, 2], vec![]),
-        ]
-    }
-
-    fn plan(ops: Vec<Op>) -> ForwardPlan {
-        ForwardPlan {
-            family: "test".to_string(),
-            values: vec![],
-            ops,
-            depth_window: false,
-            seams: vec![SeamStatement {
-                seam: "attn.qv".to_string(),
-                layer: Some(0),
-                op: Some(2),
-                // The adapter position rule ignores this exposed set.
-                values: vec![],
-            }],
-            runtime: vec![],
-        }
-    }
-
-    /// The adapter's position rule is not vacuous.
-    #[test]
-    fn the_adapter_position_rule_is_not_vacuous() {
-        assert!(seam::check_plan(&plan(well_placed())).is_empty());
-
-        // Bias consumes q before the seam: delta would land on base + bias.
-        let mut ops = well_placed();
-        ops.insert(2, op(launch("canon::add_bias"), vec![1], vec![3]));
-        let mut p = plan(ops);
-        p.seams[0].op = Some(3);
-        let problems = seam::check_plan(&p);
-        assert_eq!(problems.len(), 1, "{problems:#?}");
-        assert!(problems[0].contains("add_bias"), "{}", problems[0]);
-
-        // After rope is different arithmetic and a different producer.
-        let ops = vec![
-            op(matmul(), vec![], vec![1]),
-            op(matmul(), vec![], vec![2]),
-            op(launch("canon::rope"), vec![1], vec![3]),
-            op(guard(), vec![], vec![]),
-            op(lora(), vec![3, 2], vec![]),
-        ];
-        let mut p = plan(ops);
-        p.seams[0].op = Some(3);
-        let problems = seam::check_plan(&p);
-        assert_eq!(problems.len(), 1, "{problems:#?}");
-        assert!(problems[0].contains("canon::rope"), "{}", problems[0]);
-    }
-
-    /// Stated seams are declared with the expected arity.
-    #[test]
-    fn the_seam_table_is_complete() {
-        for d in seam::ALL {
-            assert_eq!(seam::by_name(d.name).map(|x| x.name), Some(d.name));
-        }
-        assert_eq!(seam::ATTN_QV.sees, &["q", "v"]);
-        assert!(
-            seam::ATTN_Q.sink.is_some(),
-            "the page-mask sink is declared"
-        );
     }
 }

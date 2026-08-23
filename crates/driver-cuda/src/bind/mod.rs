@@ -581,7 +581,7 @@ impl DecodePlan {
         // them when it raises the cache -- and nothing did. Every planned
         // dispatch therefore read a null workspace, and the first one to
         // dereference it refused by the name of a buffer three frames down
-        // (`v is null`, out of `cascade::merge_states_varlen`, because a
+        // (`v is null`, out of fa2's split-KV merge, because a
         // split-KV decode folds its partials out of the float carve).
         //
         // Stamped BEFORE the planner runs, not after: `plan_decode` reads the

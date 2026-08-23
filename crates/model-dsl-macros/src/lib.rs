@@ -1,10 +1,6 @@
-//! `#[derive(Facts)]`: a struct of bools becomes the model's fact word.
-//! Each field gets a `Predicate` constructor carrying its bit and name;
-//! `FactWord` packs the bools in field order.
-
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+use syn::{Data, DeriveInput, Fields, Type, parse_macro_input};
 
 #[proc_macro_derive(Facts)]
 pub fn derive_facts(input: TokenStream) -> TokenStream {
@@ -57,5 +53,7 @@ pub fn derive_facts(input: TokenStream) -> TokenStream {
 }
 
 fn error(name: &syn::Ident, message: &str) -> TokenStream {
-    syn::Error::new(name.span(), message).to_compile_error().into()
+    syn::Error::new(name.span(), message)
+        .to_compile_error()
+        .into()
 }

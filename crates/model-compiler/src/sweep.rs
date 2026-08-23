@@ -75,6 +75,10 @@ pub fn resolve(plan: &Plan) -> Resolution {
             }
             continue;
         }
+        if model_ir::kernels::point_claims(plan.plane).contains(&kernel) {
+            resolution.resolved.push((kernel.to_string(), format!("points::{kernel}")));
+            continue;
+        }
         match model_ir::kernels::canon_symbol(plan.plane, kernel) {
             Some(symbol) => resolution.resolved.push((kernel.to_string(), symbol.to_string())),
             None => resolution.unresolved.push(kernel.to_string()),

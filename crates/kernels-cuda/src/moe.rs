@@ -79,7 +79,104 @@ fn routed_rows<P>(out_rows: i32, out_width: i32, aligned: Region<P>) -> Result<i
     Ok(routes)
 }
 
-#[routine(bf16, canon = "topk.sigmoid")]
+/// The `Moe` family, claimed. Each body is a delegation to the routine
+/// below that already fires the point; the router's own `experts` and
+/// `top_k` ride the declaration because the statement states them and the
+/// results are sized from them, while the routines read the same two
+/// numbers back off the rectangles they were given.
+///
+/// Three points stay on the floor's default body, and each absence is a
+/// measured row rather than an oversight:
+///
+/// * `moe.matmul_select` — the grouped GEMM is a five-step aligned leg
+///   (`moe_align_decode` → `gather_moe_aligned_inputs` →
+///   `build_moe_ptrs_aligned_bf16` → `moe_grouped_gemm` →
+///   `reorder_moe_aligned_output`), and four of those five steps state
+///   operands no declaration carries: the per-BLOCK expert ids, the gathered
+///   aligned activations, the block ceiling and the aligned row count. The
+///   statement holds the per-TOKEN routes and the raw rows. One call cannot
+///   bridge that, and the routine keeps its own claim so the point still
+///   resolves.
+/// * `moe.matmul_select_bias` — no cuda kernel adds an expert's bias row
+///   inside the grouped GEMM. The gptoss gap.
+/// * `moe.sigmoid_gate_add` — the statement hands over a gate COLUMN it
+///   already projected; cuda's kernel takes the gate's WEIGHT and does the
+///   dot itself, against the pre-norm row the statement no longer names.
+///   Both shader planes take the column, so the declaration follows them
+///   and the cuda routine keeps its claim.
+#[kernels_macros::claims]
+impl kernels::points::Moe for Ctx<'_> {
+    fn topk_softmax<T: kernels::points::Scalar>(
+        &self,
+        logits: In<Tensor<T>>,
+        experts: u32,
+        top_k: u32,
+        routes: Out<Tensor<i32>>,
+        weights: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        let _ = (experts, top_k);
+        topk_softmax(self, logits, routes, weights)
+    }
+
+    fn topk_sigmoid<T: kernels::points::Scalar>(
+        &self,
+        logits: In<Tensor<T>>,
+        experts: u32,
+        top_k: u32,
+        renormalize: bool,
+        scaling: f32,
+        routes: Out<Tensor<i32>>,
+        weights: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        let _ = (experts, top_k);
+        topk_sigmoid(
+            self,
+            logits,
+            routes,
+            weights,
+            // The routine takes an OPTIONAL correction bias; no statement of
+            // this point carries one — `topk_sqrt_softplus` is the router
+            // that does, and it states the bias in its own declaration.
+            None,
+            Const::new(renormalize),
+            Const::new(scaling),
+        )
+    }
+
+    fn topk_sqrt_softplus<T: kernels::points::Scalar>(
+        &self,
+        logits: In<Tensor<T>>,
+        bias: Const<Tensor<f32>>,
+        experts: u32,
+        top_k: u32,
+        renormalize: bool,
+        scaling: f32,
+        routes: Out<Tensor<i32>>,
+        weights: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        let _ = (experts, top_k);
+        topk_sqrtsoftplus(
+            self,
+            logits,
+            routes,
+            weights,
+            Some(bias),
+            Const::new(renormalize),
+            Const::new(scaling),
+        )
+    }
+
+    fn weighted_sum<T: kernels::points::Scalar>(
+        &self,
+        routed: In<Tensor<T>>,
+        weights: In<Tensor<f32>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        token_batched_weighted_sum(self, y, routed, weights)
+    }
+}
+
+#[routine(bf16, canon = "moe.topk_sigmoid")]
 pub fn topk_sigmoid<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -121,7 +218,7 @@ pub fn topk_sigmoid<T>(
     )
 }
 
-#[routine(bf16, canon = "topk.sqrt_softplus")]
+#[routine(bf16, canon = "moe.topk_sqrt_softplus")]
 pub fn topk_sqrtsoftplus<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -206,7 +303,7 @@ pub fn hash_route_lookup(
     )
 }
 
-#[routine(bf16, canon = "topk.softmax")]
+#[routine(bf16, canon = "moe.topk_softmax")]
 pub fn topk_softmax<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -345,7 +442,7 @@ pub const fn supported(m: i32, n: i32, k: i32) -> Result<(), Refusal> {
     Ok(())
 }
 
-#[routine(bf16, driver, canon = matmul_select)]
+#[routine(bf16, driver, canon = "moe.matmul_select")]
 pub fn moe_grouped_gemm<T>(
     ctx: &Ctx<'_>,
     a: In<Tensor<T>>,
@@ -754,7 +851,7 @@ pub fn gather_moe_aligned_inputs<T>(
     )
 }
 
-#[routine(bf16, canon = weighted_sum)]
+#[routine(bf16, canon = "moe.weighted_sum")]
 pub fn token_batched_weighted_sum<T>(
     ctx: &Ctx<'_>,
     out: Out<Tensor<T>>,

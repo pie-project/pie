@@ -288,7 +288,7 @@ pub fn gdn_prep(
     )
 }
 
-#[routine(canon = gdn_prep)]
+#[routine(canon = "ssm.gdn_prep")]
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
     mixed: In<Tensor<bf16>>,

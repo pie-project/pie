@@ -122,6 +122,17 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
         })
     }
 
+    pub fn d0_8b() -> Self {
+        assemble(Dims {
+            hidden: 1024, layers: 24, attn_every: 4,
+            q_heads: 8, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
+            k_heads: 16, v_heads: 16, k_dim: 128, v_dim: 128, conv_kernel: 4,
+            mlp_inter: 3584,
+            moe: None,
+            vocab: 248_320, tied: true, norm_eps: 1e-6,
+        })
+    }
+
     pub fn d3b() -> Self {
         assemble(Dims {
             hidden: 2048, layers: 24, attn_every: 4,

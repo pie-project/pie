@@ -58,7 +58,7 @@ fn positive(v: i32, what: &'static str) -> Result<u32, Refusal> {
     Ok(v.unsigned_abs())
 }
 
-#[routine(canon = split_qkv, out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
+#[routine(canon = "layout.split_qkv", out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -85,7 +85,7 @@ pub fn split_qkv_bf16(
     )
 }
 
-#[routine(canon = sigmoid_gate_mul, out(attn = like(attn)))]
+#[routine(canon = "gate.sigmoid_mul", out(attn = like(attn)))]
 pub fn gate(
     ctx: &Ctx<'_>,
     attn: InOut<Tensor<bf16>>,
@@ -102,7 +102,7 @@ pub fn gate(
     )
 }
 
-#[routine(canon = split_q_gate)]
+#[routine(canon = "layout.split_q_gate")]
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
     qg: In<Tensor<bf16>>,
@@ -168,7 +168,7 @@ pub fn kv_append(
     )
 }
 
-#[routine(canon = kv_append)]
+#[routine(canon = "attention.kv_append")]
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
     k_new: In<Tensor<bf16>>,

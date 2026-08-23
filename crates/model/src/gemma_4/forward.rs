@@ -35,16 +35,18 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::embed(&ids, &m.embed) * (m.hidden as f32).sqrt();
+        let mut y = kernels::layout::embed(&ids, &m.embed) * (m.hidden as f32).sqrt();
 
         let relay = m.ple.as_ref().map(|ple| {
-            let table = kernels::embed(&ids, &ple.table) * (ple.dim as f32).sqrt();
-            let proj = kernels::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
-            (ple, kernels::add(&table, &kernels::rmsnorm(&proj, &ple.model_norm)))
+            let table = kernels::layout::embed(&ids, &ple.table) * (ple.dim as f32).sqrt();
+            let proj = kernels::gemm::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
+            let n = &ple.model_norm;
+            (ple, kernels::norm::residual_add(&table, &kernels::norm::rmsnorm(&proj, &n.weight, n.eps)))
         });
 
         let last = m.layers.len() as u32 - 1;
-        let mut normed = kernels::rmsnorm(&y, &m.layers[0].attn_norm);
+        let first = &m.layers[0].attn_norm;
+        let mut normed = kernels::norm::rmsnorm(&y, &first.weight, first.eps);
 
         for (l, w) in m.layers.iter().enumerate() {
             let l = l as u32;
@@ -64,7 +66,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                         let (fast_x, rest_x) = normed.split(&fused);
                         let (fast_pos, rest_pos) = inputs.positions().split(&fused);
                         let qf = kernels::cuda::qkv_fused_qknorm_rope_vnorm_write(
-                            &kernels::matmul(&fast_x, bank),
+                            &kernels::gemm::matmul(&fast_x, bank),
                             &at.q_norm,
                             k_norm,
                             at.kind.kv_heads(),
@@ -86,47 +88,53 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
             let win = at.kind.window();
             let [mq, dq, p] = q.split([Facts::masked(), Facts::qo_one(), Predicate::rest()]);
             let a = merge![
-                kernels::attention_masked(&kernels::query_windows(&mq), &pages, win, d, at.sm_scale),
-                kernels::attention_decode(&dq, &pages, win, d, at.sm_scale),
-                kernels::attention_prefill(&kernels::query_windows(&p), &pages, win, d, at.kind.kv_heads(), at.sm_scale),
+                kernels::attention::masked(&kernels::query_windows(&mq), &pages, win, d, at.sm_scale),
+                kernels::attention::decode(&dq, &pages, win, d, at.sm_scale),
+                kernels::attention::prefill(&kernels::query_windows(&p), &pages, win, d, at.kind.kv_heads(), at.sm_scale),
             ];
             seam::at(seam::ATTN_OUT, (&a,), l);
-            let o = kernels::attention_landing(&a, &w.o_proj, l);
-            let o = if TP > 1 { kernels::all_reduce(&o) } else { o };
+            let o = kernels::gemm::attention_landing(&a, &w.o_proj, l);
+            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
 
-            y = kernels::add(&y, &kernels::rmsnorm(&o, &w.post_attn_norm));
-            let mlp_in = kernels::rmsnorm(&y, &w.pre_ffw_norm);
+            let pan = &w.post_attn_norm;
+            y = kernels::norm::residual_add(&kernels::norm::rmsnorm(&o, &pan.weight, pan.eps), &y);
+            let pff = &w.pre_ffw_norm;
+            let mlp_in = kernels::norm::rmsnorm(&y, &pff.weight, pff.eps);
 
             let act = match &w.gate_up {
                 GateUp::Packed { bank, inter } => {
-                    kernels::geglu_tanh_packed(&kernels::matmul(&mlp_in, bank), *inter)
+                    kernels::mlp::geglu_tanh_packed(&kernels::gemm::matmul(&mlp_in, bank), *inter)
                 }
                 GateUp::Split { gate, up } => {
-                    kernels::geglu_tanh(&kernels::matmul(&mlp_in, gate), &kernels::matmul(&mlp_in, up))
+                    kernels::mlp::geglu_tanh(&kernels::gemm::matmul(&mlp_in, gate), &kernels::gemm::matmul(&mlp_in, up))
                 }
             };
-            let f = kernels::matmul(&act, &w.down);
-            let f = if TP > 1 { kernels::all_reduce(&f) } else { f };
-            y = kernels::add(&y, &kernels::rmsnorm(&f, &w.post_ffw_norm));
+            let f = kernels::gemm::matmul(&act, &w.down);
+            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            let pfn = &w.post_ffw_norm;
+            y = kernels::norm::residual_add(&kernels::norm::rmsnorm(&f, &pfn.weight, pfn.eps), &y);
 
             if let Some((ple, relay)) = &relay {
                 let lp = &ple.per_layer[l as usize];
-                let gated = kernels::geglu_tanh(&kernels::matmul(&y, &lp.gate), &kernels::select(relay, l));
-                let out = kernels::matmul(&gated, &lp.proj);
-                y = kernels::add(&y, &kernels::scale(&kernels::rmsnorm(&out, &lp.norm), &lp.scalar));
+                let gated = kernels::mlp::geglu_tanh(&kernels::gemm::matmul(&y, &lp.gate), &kernels::layout::select(relay, l));
+                let out = kernels::gemm::matmul(&gated, &lp.proj);
+                let out = kernels::norm::rmsnorm(&out, &lp.norm.weight, lp.norm.eps);
+                y = kernels::norm::residual_add(&kernels::norm::scale(&lp.scalar, &out), &y);
             }
             if l < last {
-                normed = kernels::rmsnorm(&y, &m.layers[l as usize + 1].attn_norm);
+                let next = &m.layers[l as usize + 1].attn_norm;
+                normed = kernels::norm::rmsnorm(&y, &next.weight, next.eps);
             }
         }
 
-        let x = kernels::rmsnorm(&y, &m.final_norm);
+        let fin = &m.final_norm;
+        let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
         let logits = match &m.head {
-            Head::Tied => kernels::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::lm_head(&x, bank),
+            Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
+            Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
         };
         let logits = if let Some(cap) = m.softcap {
-            kernels::logit_softcap(&logits, cap)
+            kernels::attention::logit_softcap(&logits, cap)
         } else {
             logits
         };
@@ -147,29 +155,30 @@ fn qkv_unfused<W1: Dtype>(
     let d = at.kind.head_dim();
     let (q, k, v) = match qkv {
         Qkv::Packed(bank) => {
-            kernels::split_qkv(&kernels::matmul(x, bank), at.q_heads * d, at.kind.kv_heads() * d)
+            kernels::layout::split_qkv(&kernels::gemm::matmul(x, bank), at.q_heads * d, at.kind.kv_heads() * d)
         }
         Qkv::Split { q, k, v } => {
-            (kernels::matmul(x, q), kernels::matmul(x, k), kernels::matmul(x, v))
+            (kernels::gemm::matmul(x, q), kernels::gemm::matmul(x, k), kernels::gemm::matmul(x, v))
         }
     };
     seam::at(seam::ATTN_QV, (&q, &v), l);
-    let v = kernels::rmsnorm_no_scale(&v, d);
-    let q = kernels::rmsnorm_per_head(&q, &at.q_norm);
-    let k = kernels::rmsnorm_per_head(&k, k_norm);
+    let v = kernels::norm::rmsnorm_no_scale(&v, d, at.q_norm.eps);
+    let q = kernels::norm::rmsnorm_per_head(&q, &at.q_norm.weight, d, at.q_norm.eps);
+    let k = kernels::norm::rmsnorm_per_head(&k, &k_norm.weight, d, k_norm.eps);
     let (q, k) = match &at.kind {
-        AttnKind::Full { rotary_dim, theta, .. } => kernels::rope_partial(&q, &k, *rotary_dim, d, *theta, pos),
-        AttnKind::Sliding { theta, .. } => kernels::rope(&q, &k, d, *theta, pos),
+        AttnKind::Full { rotary_dim, theta, .. } => kernels::rope::partial(&q, &k, pos, *rotary_dim, d, *theta),
+        // NeoX pairing: gemma rotates `d` against `d + d/2`.
+        AttnKind::Sliding { theta, .. } => kernels::rope::full(&q, &k, pos, d, *theta, false),
     };
-    kernels::kv_append(&k, &v, pages);
+    kernels::attention::kv_append(&k, &v, pages);
     q
 }
 
 fn q_only<W1: Dtype>(x: &Value, pos: &Value, at: &Attn<W1>, q_proj: &Tensor<W1>) -> Value {
     let d = at.kind.head_dim();
-    let q = kernels::rmsnorm_per_head(&kernels::matmul(x, q_proj), &at.q_norm);
+    let q = kernels::norm::rmsnorm_per_head(&kernels::gemm::matmul(x, q_proj), &at.q_norm.weight, d, at.q_norm.eps);
     match &at.kind {
-        AttnKind::Full { rotary_dim, theta, .. } => kernels::rope_partial_q(&q, *rotary_dim, d, *theta, pos),
-        AttnKind::Sliding { theta, .. } => kernels::rope_partial_q(&q, d, d, *theta, pos),
+        AttnKind::Full { rotary_dim, theta, .. } => kernels::rope::partial_q(&q, pos, *rotary_dim, d, *theta),
+        AttnKind::Sliding { theta, .. } => kernels::rope::partial_q(&q, pos, d, d, *theta),
     }
 }

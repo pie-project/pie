@@ -133,7 +133,7 @@ wgpu = { version = "30", default-features = false, features = [
 # TEST-ONLY: `tests/arena.rs` states a declaration (`model_dsl::metal::
 # affine_gemm_point`) so the lowering under test is one the surface really
 # produces. `src/` reaches no authoring type, which is why this is a dev edge.
-model-dsl = { path = "../model-dsl" }
+model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
 # `tests/arena.rs` and `tests/checkpoint.rs`: real models to lower, so that the
 # offsets, the symbols and the scalar runs under test are the ones
 # `model-compiler` actually assigns rather than ones a test invented. Every

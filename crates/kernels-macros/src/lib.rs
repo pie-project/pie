@@ -1,12 +1,19 @@
-//! `#[routine]` — a kernel's row, built beside the `fn` it is derived from.
+//! The attributes the kernel crates are declared with.
 //!
-//! # Why an attribute and not just `routine!`
+//! `#[points]` reads a family trait and states its point table; `#[claims]`
+//! reads a plane's impl and states which of those points it answers
+//! (.wiki/baker.md). `#[routine]` is the per-launcher row those two replace,
+//! family by family.
+//!
+//! # `#[routine]` — a kernel's row, built beside the `fn` it is derived from
+//!
+//! ## Why an attribute and not just `routine!`
 //!
 //! `routine!` receives a PATH. By then the parameter names live in a `fn` the
 //! macro never sees, and neither does the module. An attribute sits on the
 //! `fn` and sees both, which is the whole of what this crate is for.
 //!
-//! # What it derives
+//! ## What it derives
 //!
 //! | column | from |
 //! |---|---|
@@ -16,7 +23,7 @@
 //! | `in_place` | the `InOut` marks, through `Source::Alias` |
 //! | `name`, `nullable` | the signature, which is the only thing left a type cannot say |
 //!
-//! # What it no longer derives, and why that matters
+//! ## What it no longer derives, and why that matters
 //!
 //! A SOURCE. It used to compute one per parameter by reading SYNTAX -- a
 //! table of marks, a `keys::` prefix rule, an allowlist of four handle types,
@@ -29,9 +36,66 @@
 //! a dump of both found rows where they disagreed. The types answer now, and
 //! everything in that paragraph is deleted.
 
+mod claims;
+mod points;
+
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Error, FnArg, ItemFn, Pat, PatType, Type, parse_macro_input, spanned::Spanned};
+use syn::{
+    Error, FnArg, ItemFn, ItemImpl, ItemTrait, Pat, PatType, Type, parse_macro_input,
+    spanned::Spanned,
+};
+
+/// Declare a family: the trait as written, and the point table it states.
+///
+/// ```ignore
+/// #[points]
+/// pub trait Norm: Plane {
+///     fn rmsnorm<T: Scalar>(&self, x: In<Self::Tensor<T>>, eps: f32,
+///                           y: Out<Self::Tensor<T>>) -> Result<(), Refusal> { .. }
+/// }
+/// // pub const NORM_POINTS: &[Point] = &[Point { name: "norm.rmsnorm", .. }];
+/// ```
+///
+/// The trait is re-emitted unchanged — the default bodies are the family's,
+/// hand-written, and this reads them without touching them. The table names
+/// `Point`, `Slot`, `Mark`, `Dtype` and `Prim` unqualified: it lands in the
+/// family's own module, and that is the vocabulary a family is declared in.
+#[proc_macro_attribute]
+pub fn points(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return no_arguments("points", attr);
+    }
+    let item = parse_macro_input!(item as ItemTrait);
+    points::expand(item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+/// Declare what a plane answers: the impl as written, and the point names it
+/// overrides. What it leaves to the family's default body is the backlog.
+#[proc_macro_attribute]
+pub fn claims(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return no_arguments("claims", attr);
+    }
+    let item = parse_macro_input!(item as ItemImpl);
+    claims::expand(item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn no_arguments(attr_name: &str, attr: TokenStream) -> TokenStream {
+    Error::new(
+        proc_macro2::TokenStream::from(attr)
+            .into_iter()
+            .next()
+            .map_or_else(proc_macro2::Span::call_site, |t| t.span()),
+        format!("`#[{attr_name}]` reads the item below it and takes no arguments"),
+    )
+    .into_compile_error()
+    .into()
+}
 
 /// Declare a routine: its column, its trace name and its namespace.
 ///

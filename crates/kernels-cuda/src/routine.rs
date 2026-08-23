@@ -13,6 +13,6 @@ pub use crate::jit::Routine;
 pub use crate::jit::ArgValue;
 
 pub use crate::jit::Abi;
-pub use crate::jit::abi::{Inst, bf16, f16};
+pub use crate::jit::abi::{bf16, f16};
 
 pub use crate::jit::aligned16;

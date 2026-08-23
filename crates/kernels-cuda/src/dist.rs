@@ -15,7 +15,19 @@ fn no_nccl(what: &'static str) -> Refusal {
     }
 }
 
-#[routine(whole, canon = all_reduce, out(buf = like(buf)))]
+/// The `Dist` family, claimed. The point quantifies over `T: Scalar` and the
+/// routine below is spelled at `bf16`, so the body reaches past it to the
+/// element-blind helper both share rather than casting a `*mut T` into a
+/// `*mut bf16` it is not: the communicator takes an address and a count.
+#[kernels_macros::claims]
+impl kernels::points::Dist for Ctx<'_> {
+    fn all_reduce<T: kernels::points::Scalar>(&self, buf: InOut<Tensor<T>>) -> Result<(), Refusal> {
+        let r = buf.all("out_width(0)")?;
+        all_reduce_in_place(self, r.ptr.cast(), i64::from(r.elements()))
+    }
+}
+
+#[routine(whole, canon = "dist.all_reduce", out(buf = like(buf)))]
 pub fn all_reduce_bf16(ctx: &Ctx<'_>, buf: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
     let r = buf.all("out_width(0)")?;
     all_reduce_in_place(ctx, r.ptr.cast(), i64::from(r.elements()))

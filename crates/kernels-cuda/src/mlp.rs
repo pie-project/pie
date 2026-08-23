@@ -32,6 +32,79 @@ const fn rms(rows: i32) -> Launch {
 
 pub const GPT_OSS_GLU_ALPHA: f32 = 1.702;
 
+/// The `Mlp` family, claimed. Each body is a delegation to the `chunked_*`
+/// routine below that already fires the point — the packed forms read one
+/// `[gate | up]` row and write a row half as wide.
+///
+/// Every body drops the stated `intermediate`. The declaration states it
+/// because the geometry is not derivable from the first `In` (the `Out` is
+/// HALF its width), but the `Out` reaching a body has already been sized by
+/// the `out(y = rows(packed) x half(packed))` rule on the routine, and the
+/// launch reads `y.width` from it. When `#[shape]` replaces those rules the
+/// stated width becomes their input; until then it is recorded and unread.
+///
+/// One point stays on the floor's default body, and the absence is measured
+/// rather than an oversight:
+///
+/// * `mlp.swiglu_clamp_alpha` — `gpt_oss_glu` below computes the same
+///   activation, but from gate and up as two separate rows. No cuda kernel
+///   reads the packed form the text states, so there is nothing to delegate
+///   to and the point reports itself unclaimed.
+#[kernels_macros::claims]
+impl kernels::points::Mlp for Ctx<'_> {
+    fn swiglu<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        intermediate: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = intermediate;
+        chunked_swiglu(self, packed, y)
+    }
+
+    fn swiglu_clamp<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        intermediate: u32,
+        limit: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = intermediate;
+        chunked_swiglu_clamp(self, packed, y, Const::new(limit))
+    }
+
+    fn geglu_tanh<T: kernels::points::Scalar>(
+        &self,
+        gate: In<Tensor<T>>,
+        up: In<Tensor<T>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        geglu_tanh(self, gate, up, y)
+    }
+
+    fn geglu_tanh_packed<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        intermediate: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = intermediate;
+        chunked_geglu_tanh(self, packed, y)
+    }
+
+    fn situ<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        intermediate: u32,
+        beta: f32,
+        up_cap: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = intermediate;
+        chunked_situ(self, packed, y, Const::new(beta), Const::new(up_cap))
+    }
+}
+
 #[routine(bf16, out(y = like(gate)))]
 pub fn swiglu<T>(
     ctx: &Ctx<'_>,
@@ -101,7 +174,7 @@ pub fn situ<T>(
     )
 }
 
-#[routine(bf16, canon = "swiglu.geglu_tanh", out(y = like(gate)))]
+#[routine(bf16, canon = "mlp.geglu_tanh", out(y = like(gate)))]
 pub fn geglu_tanh<T>(
     ctx: &Ctx<'_>,
     gate: In<Tensor<T>>,
@@ -163,7 +236,7 @@ pub fn gpt_oss_glu<T>(
     )
 }
 
-#[routine(bf16, canon = swiglu, out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = "mlp.swiglu", out(y = rows(packed) x half(packed)))]
 pub fn chunked_swiglu<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -195,7 +268,7 @@ pub fn chunked_swiglu_into<T>(
     )
 }
 
-#[routine(bf16, canon = "swiglu.clamp", out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = "mlp.swiglu_clamp", out(y = rows(packed) x half(packed)))]
 pub fn chunked_swiglu_clamp<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -214,7 +287,7 @@ pub fn chunked_swiglu_clamp<T>(
     )
 }
 
-#[routine(bf16, canon = situ, out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = "mlp.situ", out(y = rows(packed) x half(packed)))]
 pub fn chunked_situ<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -240,7 +313,7 @@ pub fn chunked_situ<T>(
     )
 }
 
-#[routine(bf16, canon = "swiglu.geglu_tanh_packed", out(y = rows(packed) x half(packed)))]
+#[routine(bf16, canon = "mlp.geglu_tanh_packed", out(y = rows(packed) x half(packed)))]
 pub fn chunked_geglu_tanh<T>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<T>>,
@@ -256,7 +329,46 @@ pub fn chunked_geglu_tanh<T>(
     )
 }
 
-#[routine(bf16, canon = sigmoid_gate_add, out(out = like(out)))]
+/// The `Gate` family, claimed. One point, and the delegation crosses a
+/// dtype pin to reach it: `driver_internal::sigmoid_gate_inplace_bf16` is a
+/// host program spelled at bf16, while a point quantifies over `Scalar`, so
+/// the body states the pin as a refusal by name and casts the two addresses
+/// it was handed. That is the whole of cuda's gating today; a second dtype
+/// wants a second spelling of the routine, not a cast here.
+///
+/// The impl lives beside `sigmoid_dot_scalar_gate_add` — the other gate
+/// kernel, and the module the C++ namespace names — rather than in
+/// `driver_internal.rs`, which collects host programs by CALLER. `GATE_CLAIMS`
+/// therefore reads `kernels_cuda::mlp::GATE_CLAIMS`.
+#[kernels_macros::claims]
+impl kernels::points::Gate for Ctx<'_> {
+    fn sigmoid_mul<T: kernels::points::Scalar>(
+        &self,
+        x: InOut<Tensor<T>>,
+        gate: In<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        if T::CPP != <bf16 as kernels::Elem>::CPP {
+            return Err(Refusal::Absent {
+                what: "gate.sigmoid_mul at an element other than bf16",
+            });
+        }
+        crate::driver_internal::sigmoid_gate_inplace_bf16(
+            self,
+            InOut {
+                ptr: x.ptr.cast::<bf16>(),
+                rows: x.rows,
+                width: x.width,
+            },
+            In {
+                ptr: gate.ptr.cast::<bf16>(),
+                rows: gate.rows,
+                width: gate.width,
+            },
+        )
+    }
+}
+
+#[routine(bf16, canon = "moe.sigmoid_gate_add", out(out = like(out)))]
 pub fn sigmoid_dot_scalar_gate_add<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,

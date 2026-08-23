@@ -51,6 +51,14 @@ pub enum Source {
     ScalarOf(String),
     /// Ungroup `groups`-way row interleaving into contiguous segments.
     Deinterleave(String, u32),
+    /// Drop one extent-1 axis. A depthwise conv ships as
+    /// `[channels, 1, width]` and the canonical weight is
+    /// `[channels, width]` -- the kernel point states the width in the
+    /// `[channels, width]` weight and nowhere else. The axis is spelled so
+    /// the drop is checkable: an axis whose extent is not 1 is refused,
+    /// which is what keeps this from becoming a blanket squeeze that would
+    /// eat the leading `1` a `[1, hidden]` gate genuinely has.
+    Squeeze(String, u32),
 }
 
 impl Import {
@@ -114,12 +122,36 @@ pub fn deinterleave(name: impl Into<String>, groups: u32) -> Source {
     Source::Deinterleave(name.into(), groups)
 }
 
-/// One shipping import point: the SKU, and the production run the CLI may
-/// execute for it. The produced table names its own flavor.
+pub fn squeeze(name: impl Into<String>, axis: u32) -> Source {
+    Source::Squeeze(name.into(), axis)
+}
+
+/// One shipping import point: which SKU it produces, which checkpoint flavor
+/// it reads, and the production run the CLI may execute for it.
+///
+/// The SKU alone does not key this table -- Gemma files the same SKU twice,
+/// once from safetensors and once from GGUF -- so `base` is a column and not
+/// merely a field of whatever `make` returns. A lookup that had to run the
+/// closure to learn which flavor it just built would be choosing after the
+/// work, which is the wrong order.
+#[derive(Clone, Copy)]
+pub struct ImportRow {
+    pub sku: &'static str,
+    pub base: &'static str,
+    pub make: fn() -> Import,
+}
+
+/// State one shipping import point per row. The first type argument of the
+/// production fn is its [`Base`], which is what puts the flavor in the key.
 #[macro_export]
 macro_rules! allow_import {
-    ($( $f:path => ($sku:literal, $m:expr $(,)?) ),+ $(,)?) => {
-        pub const IMPORTS: &[(&str, fn() -> $crate::load::Import)] =
-            &[ $( ($sku, || $f(&$m)) ),+ ];
+    ($( $f:ident::<$b:ty $(, $t:ty)* $(,)?> => ($sku:literal, $m:expr $(,)?) ),+ $(,)?) => {
+        pub const IMPORTS: &[$crate::load::ImportRow] = &[ $(
+            $crate::load::ImportRow {
+                sku: $sku,
+                base: <$b as $crate::load::Base>::NAME,
+                make: || $f::<$b $(, $t)*>(&$m),
+            }
+        ),+ ];
     };
 }

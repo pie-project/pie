@@ -29,7 +29,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::embed(&ids, &m.embed);
+        let mut y = kernels::layout::embed(&ids, &m.embed);
 
         for (l, w) in m.layers.iter().enumerate() {
             let l = l as u32;
@@ -37,25 +37,40 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
             let d = at.head_dim;
             let pages = inputs.kv(&at.kv);
 
-            let x = kernels::rmsnorm(&y, &w.attn_norm);
-            let q = kernels::add_bias(&kernels::matmul(&x, &at.q_proj), &at.q_bias);
-            let k = kernels::add_bias(&kernels::matmul(&x, &at.k_proj), &at.k_bias);
-            let v = kernels::add_bias(&kernels::matmul(&x, &at.v_proj), &at.v_bias);
+            let x = kernels::norm::rmsnorm(&y, &w.attn_norm.weight, w.attn_norm.eps);
+            let q = kernels::norm::add_bias(&at.q_bias, &kernels::gemm::matmul(&x, &at.q_proj));
+            let k = kernels::norm::add_bias(&at.k_bias, &kernels::gemm::matmul(&x, &at.k_proj));
+            let v = kernels::norm::add_bias(&at.v_bias, &kernels::gemm::matmul(&x, &at.v_proj));
             seam::at(seam::ATTN_QV, (&q, &v), l);
 
-            let (q, k) = kernels::rope_yarn(&q, &k, d, &at.rope, &inputs.positions());
-            kernels::kv_append(&k, &v, &pages);
+            // NeoX pairing, and the YaRN block unpacked: a builder mirrors its
+            // declaration one parameter at a time, and a struct is not a slot.
+            let r = &at.rope;
+            let (q, k) = kernels::rope::yarn(
+                &q,
+                &k,
+                &inputs.positions(),
+                d,
+                r.theta,
+                r.factor,
+                r.beta_fast,
+                r.beta_slow,
+                r.attention_factor,
+                r.original_max_position,
+                false,
+            );
+            kernels::attention::kv_append(&k, &v, &pages);
             seam::at(seam::ATTN_Q, (&q,), l);
 
             let win = at.kind.window();
             let (dq, p) = q.split(&Facts::qo_one());
             let a = merge![
                 {
-                    let (o, lse) = kernels::attention_decode_lse(&dq, &pages, win, d, at.sm_scale);
-                    kernels::attention_sink(&o, &lse, &at.sinks, d)
+                    let (o, lse) = kernels::attention::decode_lse(&dq, &pages, win, d, at.sm_scale);
+                    kernels::attention::sink(&o, &lse, &at.sinks, d)
                 },
                 {
-                    let (o, lse) = kernels::attention_prefill_lse(
+                    let (o, lse) = kernels::attention::prefill_lse(
                         &kernels::query_windows(&p),
                         &pages,
                         win,
@@ -63,32 +78,33 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
                         at.kv_heads,
                         at.sm_scale,
                     );
-                    kernels::attention_sink(&o, &lse, &at.sinks, d)
+                    kernels::attention::sink(&o, &lse, &at.sinks, d)
                 },
             ];
             seam::at(seam::ATTN_OUT, (&a,), l);
 
-            let o = kernels::attention_landing(&a, &at.o_proj, l);
-            let o = if TP > 1 { kernels::all_reduce(&o) } else { o };
-            y = kernels::add(&y, &kernels::add_bias(&o, &at.o_bias));
+            let o = kernels::gemm::attention_landing(&a, &at.o_proj, l);
+            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
+            y = kernels::norm::residual_add(&kernels::norm::add_bias(&at.o_bias, &o), &y);
 
             let e = &w.mlp;
-            let x = kernels::rmsnorm(&y, &w.mlp_norm);
-            let routes = kernels::topk_softmax(
-                &kernels::add_bias(&kernels::matmul(&x, &e.router), &e.router_bias),
+            let x = kernels::norm::rmsnorm(&y, &w.mlp_norm.weight, w.mlp_norm.eps);
+            let (routes, weights) = kernels::moe::topk_softmax(
+                &kernels::norm::add_bias(&e.router_bias, &kernels::gemm::matmul(&x, &e.router)),
                 e.experts,
                 e.top_k,
             );
-            let hidden = kernels::matmul_select_bias(&x, &e.gate_up, &e.gate_up_bias, &routes);
-            let act = kernels::swiglu_clamp_alpha(&hidden, e.inter, e.swiglu_limit, e.swiglu_alpha);
-            let routed = kernels::matmul_select_bias(&act, &e.down, &e.down_bias, &routes);
-            let f = kernels::weighted_sum(&routed, &routes);
-            let f = if TP > 1 { kernels::all_reduce(&f) } else { f };
-            y = kernels::add(&y, &f);
+            let hidden = kernels::moe::matmul_select_bias(&x, &e.gate_up, &e.gate_up_bias, &routes);
+            let act = kernels::mlp::swiglu_clamp_alpha(&hidden, e.inter, e.swiglu_limit, e.swiglu_alpha);
+            let routed = kernels::moe::matmul_select_bias(&act, &e.down, &e.down_bias, &routes);
+            let f = kernels::moe::weighted_sum(&routed, &weights);
+            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            y = kernels::norm::residual_add(&f, &y);
         }
 
-        let x = kernels::rmsnorm(&y, &m.final_norm);
-        let logits = kernels::lm_head(&x, &m.head);
+        let fin = &m.final_norm;
+        let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
+        let logits = kernels::gemm::lm_head(&x, &m.head);
 
         logits
     }

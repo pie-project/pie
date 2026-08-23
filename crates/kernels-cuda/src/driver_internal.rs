@@ -12,7 +12,7 @@ use kernels::routine::{Const, In, InOut, Out};
 
 const BLOCK: u32 = 256;
 
-#[routine(namespace = "attn", canon = split_qkv)]
+#[routine(namespace = "attn", canon = "layout.split_qkv")]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -70,7 +70,7 @@ pub fn add_bias_bf16(
     )
 }
 
-#[routine(namespace = "ssm", canon = gdn_prep)]
+#[routine(namespace = "ssm", canon = "ssm.gdn_prep")]
 pub fn qwen_gdn_post_conv_prep_bf16(
     ctx: &Ctx<'_>,
     qkv_post: In<Tensor<bf16>>,
@@ -147,7 +147,7 @@ pub fn qwen_gdn_post_conv_prep_bf16(
     )
 }
 
-#[routine(namespace = "layout", canon = split_q_gate)]
+#[routine(namespace = "layout", canon = "layout.split_q_gate")]
 pub fn split_q_gate_bf16(
     ctx: &Ctx<'_>,
     packed: In<Tensor<bf16>>,
@@ -189,7 +189,7 @@ pub fn split_q_gate_bf16(
     )
 }
 
-#[routine(namespace = "mlp", canon = sigmoid_gate_mul, out(x = like(x)))]
+#[routine(namespace = "mlp", canon = "gate.sigmoid_mul", out(x = like(x)))]
 pub fn sigmoid_gate_inplace_bf16(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,

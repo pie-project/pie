@@ -181,6 +181,169 @@ fn altup_factor<P>(row: &Region<P>, part: i32, part_what: &'static str) -> Resul
     Ok(width / part)
 }
 
+/// The `Norm` family, claimed. Each body is a delegation to the routine
+/// below that already fires the point, deriving the legacy-only parameters
+/// from the operands: a whole-row norm passes `per_head_dim = 0`, which is
+/// what the legacy wrapper passed for the same statement.
+///
+/// Three points stay on the floor's default body, and each absence is a
+/// measured row rather than an oversight:
+///
+/// * `norm.scale` — no cuda kernel multiplies by a learned `[1]` scalar.
+/// * `norm.rmsnorm_per_head` and `norm.rmsnorm_gated_by` — both need the
+///   head width, and no operand carries it. `Const<Tensor<T>>` holds the
+///   weight's ADDRESS and nothing else (`bind/table.rs`: "a weight's shape
+///   is the MODEL's, not the statement's"), so the width the declaration
+///   would have to be read for is not there to read. Serving them wants a
+///   stated `head_dim`, as `rmsnorm_no_scale` has.
+#[kernels_macros::claims]
+impl kernels::points::Norm for Ctx<'_> {
+    fn rmsnorm_per_head<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        weight: Const<Tensor<T>>,
+        head_dim: u32,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let head_dim = i32::try_from(head_dim).map_err(|_| Refusal::Wide {
+            what: "the head width this norm states",
+            at: i64::from(head_dim),
+            max: i64::from(i32::MAX),
+        })?;
+        rmsnorm(self, x, weight, y, Const::new(head_dim), Const::new(eps))
+    }
+
+    fn rmsnorm_gated_by<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<f32>>,
+        gate: In<Tensor<T>>,
+        weight: Const<Tensor<f32>>,
+        heads: u32,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let rect = x.all("the row the heads divide")?;
+        let heads = i32::try_from(heads).map_err(|_| Refusal::Wide {
+            what: "the head count this norm states",
+            at: i64::from(heads),
+            max: i64::from(i32::MAX),
+        })?;
+        let d = (rect.width as i32) / heads.max(1);
+        crate::ssm::kda_o_norm_gated(
+            self,
+            x,
+            gate,
+            weight,
+            y,
+            Const::new(heads),
+            Const::new(d),
+            Const::new(eps),
+        )
+    }
+
+    fn rmsnorm<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        weight: Const<Tensor<T>>,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        rmsnorm(self, x, weight, y, Const::new(0), Const::new(eps))
+    }
+
+    /// The offset-bank pair, both delegating to `rmsnorm_gemma` -- the same
+    /// `rmsnorm_row` body as `rmsnorm`, instantiated at
+    /// `WEIGHT_PLUS_ONE = true` (`kernels/norm/rmsnorm.cuh:226-237`). One
+    /// kernel, two conventions, and the declaration is what picks.
+    fn rmsnorm_plus_one<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        weight: Const<Tensor<T>>,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        rmsnorm_gemma(self, x, weight, y, Const::new(0), Const::new(eps))
+    }
+
+    fn rmsnorm_per_head_plus_one<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        weight: Const<Tensor<T>>,
+        head_dim: u32,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let head_dim = i32::try_from(head_dim).map_err(|_| Refusal::Wide {
+            what: "the head width this norm states",
+            at: i64::from(head_dim),
+            max: i64::from(i32::MAX),
+        })?;
+        rmsnorm_gemma(self, x, weight, y, Const::new(head_dim), Const::new(eps))
+    }
+
+    fn rmsnorm_no_scale<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        head_dim: u32,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let head_dim = i32::try_from(head_dim).map_err(|_| Refusal::Wide {
+            what: "the head width this norm states",
+            at: i64::from(head_dim),
+            max: i64::from(i32::MAX),
+        })?;
+        rmsnorm_no_scale(self, x, y, Const::new(head_dim), Const::new(eps))
+    }
+
+    fn rmsnorm_gated<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<f32>>,
+        gate: In<Tensor<T>>,
+        weight: Const<Tensor<f32>>,
+        head_dim: u32,
+        eps: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        // `per_head_dim`, and passing `0` here was the bug the declaration's
+        // new `head_dim` exists to close: zero means "the whole row" to
+        // `rmsnorm_gated_fp32_in`, so a `[value_heads * value_head_dim]`
+        // mixer output was reduced as one vector and `weight[i]` walked off
+        // the end of a one-head bank.
+        let head_dim = i32::try_from(head_dim).map_err(|_| Refusal::Wide {
+            what: "the head width this gated norm states",
+            at: i64::from(head_dim),
+            max: i64::from(i32::MAX),
+        })?;
+        rmsnorm_gated_fp32_in(self, x, gate, weight, y, Const::new(eps), Const::new(head_dim))
+    }
+
+    fn residual_add<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        y: InOut<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        residual_add(self, y, x)
+    }
+
+    fn add_bias<T: kernels::points::Scalar>(
+        &self,
+        bias: Const<Tensor<T>>,
+        out: InOut<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        add_bias(self, out, bias)
+    }
+
+    fn mul_scalar<T: kernels::points::Scalar>(
+        &self,
+        s: f32,
+        x: InOut<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        scalar_mul(self, x, Const::new(s))
+    }
+}
+
 #[routine]
 pub fn rmsnorm_strided_bf16(
     ctx: &Ctx<'_>,
@@ -327,7 +490,7 @@ pub fn rmsnorm_bf16_with_fp16(
     )
 }
 
-#[routine(bf16, canon = rmsnorm, out(y = like(x)))]
+#[routine(bf16, canon = "norm.rmsnorm", out(y = like(x)))]
 pub fn rmsnorm<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -408,7 +571,7 @@ pub fn rmsnorm_gemma<T>(
     )
 }
 
-#[routine(bf16, canon = "rmsnorm.no_scale", out(y = like(x)))]
+#[routine(bf16, canon = "norm.rmsnorm_no_scale", out(y = like(x)))]
 pub fn rmsnorm_no_scale<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -505,7 +668,7 @@ pub fn rmsnorm_gated<T>(
     )
 }
 
-#[routine(bf16, canon = rmsnorm_gated, out(y = like(gate)))]
+#[routine(bf16, canon = "norm.rmsnorm_gated", out(y = like(gate)))]
 pub fn rmsnorm_gated_fp32_in<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<f32>>,
@@ -678,7 +841,7 @@ pub fn rmsnorm_residual_add_scale_rmsnorm_bf16(
     )
 }
 
-#[routine(bf16, canon = add_bias, out(out = like(out)))]
+#[routine(bf16, canon = "norm.add_bias", out(out = like(out)))]
 pub fn add_bias<T>(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<T>>,
@@ -887,12 +1050,12 @@ pub fn tanh_f16(ctx: &Ctx<'_>, x: InOut<Tensor<f16>>) -> Result<(), Refusal> {
     )
 }
 
-/// The canon point `residual_add`: add a residual into an accumulator.
+/// The canon point `norm.residual_add`: add a residual into an accumulator.
 ///
 /// The claim was on `norm::residual_add_rmsnorm` -- the FUSED form -- for as
 /// long as the gate that would have said so could not compile. See the note
 /// there for what that cost.
-#[routine(bf16, canon = residual_add, out(y = like(y)))]
+#[routine(bf16, canon = "norm.residual_add", out(y = like(y)))]
 pub fn residual_add<T>(
     ctx: &Ctx<'_>,
     y: InOut<Tensor<T>>,
@@ -938,7 +1101,7 @@ pub fn residual_add_f16(
     )
 }
 
-#[routine(bf16, canon = mul_scalar, out(x = like(x)))]
+#[routine(bf16, canon = "norm.mul_scalar", out(x = like(x)))]
 pub fn scalar_mul<T>(ctx: &Ctx<'_>, x: InOut<Tensor<T>>, s: Const<f32>) -> Result<(), Refusal> {
     let rect = x.all("the rectangle's row width")?;
     let Ok(n) = usize::try_from(rect.elements()) else {
@@ -957,7 +1120,120 @@ pub fn scalar_mul<T>(ctx: &Ctx<'_>, x: InOut<Tensor<T>>, s: Const<f32>) -> Resul
     )
 }
 
-#[routine(bf16, canon = hc_gates)]
+/// The `Hc` family, claimed. Four of five points land, and every body is a
+/// delegation to the hyper-connection routine below it — the impl lives here
+/// because all five of its delegates do.
+///
+/// EVERY BODY DROPS THE STATED `stream_count`. The declaration states it
+/// because the collapsed row is an `Out` the statement allocates and a
+/// divisor has to exist before the row does; the routines reaching a body
+/// have both rectangles in hand and read the count back off them (`streams`
+/// above, the stack's width over the collapsed one). The `moe.experts`
+/// reading exactly.
+///
+/// `hc.rmsnorm_f32` crosses a bf16 PIN BY NAME rather than with a cast no
+/// kernel stands behind: `hc_rmsnorm_to_f32` is spelled at bf16 and nowhere
+/// else, so a second element wants a second spelling of the routine. The
+/// `gate.sigmoid_mul` precedent.
+///
+/// One point stays on the floor's default body:
+///
+/// * `hc.collapse` — `hc_head_postprocess` reads TWO planes where the
+///   statement names one: an `[N, streams]` f32 `mixes` (the head gate
+///   logits, "after GEMM" in the kernel's own comment) beside the
+///   `[N, streams, hidden]` residual stack. The legacy call site passed the
+///   bf16 stack for the f32 `mixes` slot — which reads a stack's leading
+///   bytes as gates — and that is a caller's bug, not a delegation to
+///   reproduce. The routine keeps its `canon` for the point to resolve
+///   through, and the day the text states the projection the kernel asks
+///   for, the delegation is four lines.
+#[kernels_macros::claims]
+impl kernels::points::Hc for Ctx<'_> {
+    fn expand<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        streams: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = streams;
+        hc_expand(self, x, y)
+    }
+
+    fn rmsnorm_f32<T: kernels::points::Scalar>(
+        &self,
+        streams: In<Tensor<T>>,
+        eps: f32,
+        y: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        if T::CPP != <bf16 as kernels::Elem>::CPP {
+            return Err(Refusal::Absent {
+                what: "hc.rmsnorm_f32 at an element other than bf16",
+            });
+        }
+        hc_rmsnorm_to_f32(
+            self,
+            In {
+                ptr: streams.ptr.cast::<bf16>(),
+                rows: streams.rows,
+                width: streams.width,
+            },
+            y,
+            Const::new(eps),
+        )
+    }
+
+    fn gates<T: kernels::points::Scalar>(
+        &self,
+        normed: In<Tensor<f32>>,
+        streams: In<Tensor<T>>,
+        scale: Const<Tensor<f32>>,
+        base: Const<Tensor<f32>>,
+        stream_count: u32,
+        gate_eps: f32,
+        alpha: f32,
+        sinkhorn: u32,
+        x: Out<Tensor<T>>,
+        post_mix: Out<Tensor<f32>>,
+        comb_mix: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        let _ = stream_count;
+        let sinkhorn = i32::try_from(sinkhorn).map_err(|_| Refusal::Wide {
+            what: "the Sinkhorn iteration count this statement states",
+            at: i64::from(sinkhorn),
+            max: i64::from(i32::MAX),
+        })?;
+        // THE STATEMENT'S RESULT ORDER IS NOT THE ROUTINE'S. A text reads
+        // `(x, post_mix, comb_mix)` — the row it runs on first, because that
+        // is the one it consumes — and the routine writes `post_mix`,
+        // `comb_mix`, `layer_input`. The mapping is here, named, once.
+        hc_pre_postprocess(
+            self,
+            normed,
+            scale,
+            base,
+            streams,
+            post_mix,
+            comb_mix,
+            x,
+            Const::new(gate_eps),
+            Const::new(alpha),
+            Const::new(sinkhorn),
+        )
+    }
+
+    fn fold<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        streams: In<Tensor<T>>,
+        post_mix: In<Tensor<f32>>,
+        comb_mix: In<Tensor<f32>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        hc_post(self, x, streams, post_mix, comb_mix, y)
+    }
+}
+
+#[routine(bf16, canon = "hc.gates")]
 pub fn hc_pre_postprocess<T>(
     ctx: &Ctx<'_>,
     mixes: In<Tensor<f32>>,
@@ -1005,7 +1281,7 @@ pub fn hc_pre_postprocess<T>(
     )
 }
 
-#[routine(bf16, canon = hc_fold, out(out_residual = like(residual)))]
+#[routine(bf16, canon = "hc.fold", out(out_residual = like(residual)))]
 pub fn hc_post<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -1036,7 +1312,7 @@ pub fn hc_post<T>(
     )
 }
 
-#[routine(bf16, canon = hc_collapse)]
+#[routine(bf16, canon = "hc.collapse")]
 pub fn hc_head_postprocess<T>(
     ctx: &Ctx<'_>,
     mixes: In<Tensor<f32>>,
@@ -1073,7 +1349,7 @@ pub fn hc_head_postprocess<T>(
     )
 }
 
-#[routine(bf16, canon = hc_expand)]
+#[routine(bf16, canon = "hc.expand")]
 pub fn hc_expand<T>(
     ctx: &Ctx<'_>,
     input: In<Tensor<T>>,
@@ -1098,7 +1374,7 @@ pub fn hc_expand<T>(
     )
 }
 
-#[routine(canon = hc_rmsnorm_f32)]
+#[routine(canon = "hc.rmsnorm_f32")]
 pub fn hc_rmsnorm_to_f32(
     ctx: &Ctx<'_>,
     input: In<Tensor<bf16>>,

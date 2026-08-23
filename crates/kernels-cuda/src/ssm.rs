@@ -1,14 +1,13 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::jit::Abi;
-use crate::jit::abi::Inst;
 use crate::jit::abi::Tensor;
 use crate::jit::abi::{MaybeConst, bf16};
 use crate::jit::{Ctx, Launch};
 use crate::views::{MoeBanks, RecurrentState};
 use kernels::Refusal;
 use kernels::raises::Struct;
-use kernels::routine::{Const, In, Out};
+use kernels::routine::{Cache, Const, In, Out};
 use kernels::{Bind, Fire};
 use kernels_macros::routine;
 
@@ -69,7 +68,140 @@ const PTRS_BLOCK: u32 = 256;
 
 const GDN_BLOCK: u32 = 128;
 
-#[routine(bf16, canon = causal_conv1d, out(y = like(x)))]
+/// The conv points are spelled at bf16 and NOWHERE ELSE. Both routines are
+/// `#[routine(bf16, ..)]`, and the reason is in their signatures: the
+/// optional bias rides `MaybeConst<T>`, whose `Abi` impl `jit::abi` writes
+/// one pointee at a time. A point quantifies over `Scalar`, so the claim
+/// states the pin as a refusal BY NAME rather than widening it with a cast
+/// no kernel stands behind — the `gate.sigmoid_mul` precedent. A second
+/// element wants a second spelling of the routine, not a cast here.
+fn conv_at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal> {
+    if T::CPP == <bf16 as kernels::Elem>::CPP {
+        Ok(())
+    } else {
+        Err(Refusal::Absent { what })
+    }
+}
+
+/// The conv's two numbers, as the routines ask for them.
+///
+/// `c` is the CHANNEL count and it is read, not stated: a depthwise conv
+/// runs one channel per column, so the channel count IS the operand's row.
+/// `k` is the kernel width and it is stated, because it lives in the
+/// `[channels, width]` weight and a `Const` carries an address with no
+/// rectangle behind it.
+fn conv_shape<T: kernels::Elem>(x: In<Tensor<T>>, conv_width: u32) -> Result<(i32, i32), Refusal> {
+    let rect = x.all("the conv's channel count")?;
+    let k = i32::try_from(conv_width).map_err(|_| Refusal::Wide {
+        what: "the conv width this statement states",
+        at: i64::from(conv_width),
+        max: i64::from(i32::MAX),
+    })?;
+    Ok((rect.width, k))
+}
+
+/// The `Ssm` family, claimed. Two of seven points land; the other five are
+/// measured backlog rows, and each absence is a stated one.
+///
+/// * `ssm.gdn_prep` — the statement carries ONE `[a | b]` operand and
+///   states ONE result; `qwen_gdn_post_conv_prep_bf16` takes the post-conv
+///   `qkv` beside the two gate halves already split, writes FIVE separate
+///   rectangles (`q_norm_kh`, `k_norm_kh`, `v`, `g_log`, `beta`), and asks
+///   for five geometry scalars on top. Neither the missing input nor the
+///   four missing results is geometry a declaration could state — they are
+///   the text's arithmetic — so no delegation is faked and the routine
+///   keeps its own `canon` for the point to resolve through.
+/// * `ssm.gated_delta` — the same seam from the other side. The
+///   recurrence takes those five f32 rows as five operands plus the request
+///   count `r`; the statement hands it the packed `qkv`, the gate row `z`,
+///   and the single fused `gates` value that stands for all five. Carving
+///   five rows out of one at offsets nothing declares would be a fiction,
+///   which is the `moe.matmul_select` reading exactly. Claim-only.
+/// * `ssm.gated_delta_chunked` — no cuda routine claims it. The GQA chunk
+///   prefill is a composite (a `repeat_interleave` of the key heads and
+///   then the chunked scan), and the legacy text staged it by hand. The
+///   measured qwen gap.
+/// * `ssm.kda_step` / `ssm.kda_chunked` — no cuda routine claims either,
+///   and none ever did: the legacy KDA leg staged NINE launches per mixer
+///   (dtype casts, an l2-norm, the gate/beta prologue, the step or the
+///   prefill, the gated out-norm). The measured kimi gaps.
+#[kernels_macros::claims]
+impl kernels::points::Ssm for Ctx<'_> {
+    fn causal_conv1d<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        weight: Const<Tensor<T>>,
+        state: Cache<kernels::raises::Struct<RecurrentState>>,
+        conv_width: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        conv_at_bf16::<T>("ssm.causal_conv1d at an element other than bf16")?;
+        let (c, k) = conv_shape(x, conv_width)?;
+        causal_conv1d_update_batched::<bf16>(
+            self,
+            In {
+                ptr: x.ptr.cast::<bf16>(),
+                rows: x.rows,
+                width: x.width,
+            },
+            Const::new(weight.v.cast::<bf16>()),
+            // The statement carries ONE weight, so there is no bias plane
+            // to hand over. Every shipping conv1d in this tree agrees —
+            // the legacy `ConvW` states `bias: None` — and a checkpoint
+            // that grew one would state a second `Const` on the point.
+            None,
+            Out {
+                ptr: y.ptr.cast::<bf16>(),
+                rows: y.rows,
+                width: y.width,
+            },
+            Const::new(c),
+            Const::new(k),
+            state.raised(),
+        )
+    }
+
+    fn causal_conv1d_chunked<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        indptr: In<Tensor<i32>>,
+        weight: Const<Tensor<T>>,
+        state: Cache<kernels::raises::Struct<RecurrentState>>,
+        conv_width: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        conv_at_bf16::<T>("ssm.causal_conv1d_chunked at an element other than bf16")?;
+        let (c, k) = conv_shape(x, conv_width)?;
+        causal_conv1d_prefill_batched::<bf16>(
+            self,
+            In {
+                ptr: x.ptr.cast::<bf16>(),
+                rows: x.rows,
+                width: x.width,
+            },
+            Const::new(weight.v.cast::<bf16>()),
+            None,
+            Out {
+                ptr: y.ptr.cast::<bf16>(),
+                rows: y.rows,
+                width: y.width,
+            },
+            Const::new(c),
+            Const::new(k),
+            state.raised(),
+            // A STATEMENT THAT NAMES A CACHE ROW LEAVES ITS TAIL THERE. A
+            // chunked conv that skipped the write-back would hand the next
+            // fire a stale window, so there is no second reading for the
+            // point to state; the driver has never bound the flag any other
+            // way either (`fire/launch.rs` builds every `Gdn` view with
+            // `write_state: true`).
+            Const::new(true),
+            indptr,
+        )
+    }
+}
+
+#[routine(bf16, canon = "ssm.causal_conv1d", out(y = like(x)))]
 pub fn causal_conv1d_update_batched<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -136,7 +268,7 @@ pub fn causal_conv1d_prefill_noact<T>(
     k: i32,
 ) -> Result<(), Refusal>
 where
-    T: Inst + kernels::Elem,
+    T: kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
     MaybeConst<T>: Abi,
@@ -163,7 +295,7 @@ where
     )
 }
 
-#[routine(bf16, canon = "causal_conv1d.chunked", out(y = like(x)))]
+#[routine(bf16, canon = "ssm.causal_conv1d_chunked", out(y = like(x)))]
 pub fn causal_conv1d_prefill_batched<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,
@@ -382,7 +514,7 @@ pub fn kda_gate_beta<T>(
     )
 }
 
-#[routine(bf16, canon = "rmsnorm_gated.by", out(out = like(g)))]
+#[routine(bf16, canon = "norm.rmsnorm_gated_by", out(out = like(g)))]
 pub fn kda_o_norm_gated<T>(
     ctx: &Ctx<'_>,
     o: In<Tensor<f32>>,
@@ -1259,7 +1391,7 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     )
 }
 
-#[routine(canon = gated_delta)]
+#[routine(canon = "ssm.gated_delta")]
 pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
     ctx: &Ctx<'_>,
     q_norm_kh: In<Tensor<f32>>,

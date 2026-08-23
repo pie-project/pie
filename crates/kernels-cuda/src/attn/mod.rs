@@ -33,6 +33,98 @@ pub mod plan;
 
 pub mod xqa;
 
+/// A stated `u32` as the `i32` the routines take.
+fn width_of(n: u32, what: &'static str) -> Result<i32, Refusal> {
+    i32::try_from(n).map_err(|_| Refusal::Wide {
+        what,
+        at: i64::from(n),
+        max: i64::from(i32::MAX),
+    })
+}
+
+/// The `Attention` family, claimed. Four of eleven points land, and the
+/// seven absences are the migration's most deliberate: THE FA2 CORE IS
+/// CLAIM-ONLY BY DESIGN.
+///
+/// * `attention.decode` / `attention.decode_lse` — the routine takes
+///   `plan: In<Struct<Fa2Decode>>`, the decode PLAN CACHE: a resident this
+///   plane builds at load, uploads per fire, and reads the split-kv
+///   partition out of. A statement carries the query, the page row and
+///   three numbers; nothing declared can conjure a plan cache, and a body
+///   that reached for one would be staging on the operand column's behalf.
+///   The routines keep their own `canon` and the points resolve through it.
+/// * `attention.prefill` / `attention.prefill_lse` — the same seam plus
+///   two HOST MIRRORS. `attention_flashinfer_prefill` plans in-body and
+///   wants `qo_indptr_host` and `kv_page_indptr_host` beside the device
+///   CSR, because the partition arithmetic runs on the host before the
+///   launch. A host mirror of a device buffer is the definition of plane
+///   staging.
+/// * `attention.masked` — the plan cache again, and `maskv:
+///   In<Struct<AttnMask>>` on top: the custom `(q, kv)` mask and its own
+///   CSR, published by the driver on every fire because `HasCustomMask` is
+///   a folded fact. The text states that it wants the masked reading; it
+///   never places the mask.
+/// * `attention.kv_append` — the deepest of them, and the reason is on the
+///   `untraced!` row below rather than in a signature. See
+///   `WRITE_KV_TO_PAGES_ROW`.
+/// * `attention.kv_append_shared` — no cuda routine claims it and none
+///   ever did. dsv4 appends ONE plane that stands as both key and value,
+///   and the legacy text staged that write by hand. The measured dsv4 gap.
+///
+/// What lands, lands because its whole input is the statement's: an
+/// operand run, a weight, and numbers.
+#[kernels_macros::claims]
+impl kernels::points::Attention for Ctx<'_> {
+    fn sink<T: kernels::points::Scalar>(
+        &self,
+        o: InOut<Tensor<T>>,
+        lse: In<Tensor<f32>>,
+        sink: Const<Tensor<f32>>,
+        head_dim: u32,
+    ) -> Result<(), Refusal> {
+        let head_dim = width_of(head_dim, "the head width this sink states")?;
+        crate::norm::attn_sink_correction(self, o, lse, sink, Const::new(head_dim))
+    }
+
+    fn merge_lse<T: kernels::points::Scalar>(
+        &self,
+        o1: In<Tensor<T>>,
+        lse1: In<Tensor<f32>>,
+        o2: In<Tensor<T>>,
+        lse2: In<Tensor<f32>>,
+        heads: u32,
+        head_dim: u32,
+        o: Out<Tensor<T>>,
+        lse: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        let heads = width_of(heads, "the head count this merge states")?;
+        let head_dim = width_of(head_dim, "the head width this merge states")?;
+        combine_attn_outputs(
+            self,
+            o1,
+            lse1,
+            o2,
+            lse2,
+            o,
+            lse,
+            Const::new(heads),
+            Const::new(head_dim),
+        )
+    }
+
+    fn lse_ln(&self, lse: InOut<Tensor<f32>>) -> Result<(), Refusal> {
+        lse_log2_to_ln(self, lse)
+    }
+
+    fn logit_softcap<T: kernels::points::Scalar>(
+        &self,
+        x: InOut<Tensor<T>>,
+        cap: f32,
+    ) -> Result<(), Refusal> {
+        crate::attn::logit_softcap(self, x, Const::new(cap))
+    }
+}
+
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -675,7 +767,7 @@ pub fn write_mla_to_pages(
 
 const DSV4_META_BLOCK: u32 = 128;
 
-#[routine(canon = "pool_boundary.decode", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
+#[routine(canon = "pool.boundary_decode", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
 pub fn dsv4_boundary_meta_decode(
     ctx: &Ctx<'_>,
     positions: In<Tensor<i32>>,
@@ -712,7 +804,7 @@ pub fn dsv4_boundary_meta_decode(
     )
 }
 
-#[routine(whole, canon = "pool_boundary.prefill", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
+#[routine(whole, canon = "pool.boundary_prefill", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
 pub fn dsv4_boundary_meta_paged(
     ctx: &Ctx<'_>,
     positions: In<Tensor<i32>>,
@@ -755,7 +847,7 @@ pub fn dsv4_boundary_meta_paged(
     )
 }
 
-#[routine(whole, canon = "attention.pooled_lse")]
+#[routine(whole, canon = "pool.attention_lse")]
 pub fn attention_compressed_paged_bf16(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -826,7 +918,7 @@ pub fn attention_compressed_paged_bf16(
     )
 }
 
-#[routine(bf16, canon = index_layernorm_rope, out(idx_k = like(idx_k)))]
+#[routine(bf16, canon = "index.layernorm_rope", out(idx_k = like(idx_k)))]
 pub fn dsa_index_knorm_rope<T>(
     ctx: &Ctx<'_>,
     idx_k: InOut<Tensor<T>>,
@@ -873,7 +965,7 @@ where
     )
 }
 
-#[routine(bf16, canon = index_rope, out(idx_q = split(idx_q, head_dim)))]
+#[routine(bf16, canon = "index.rope", out(idx_q = split(idx_q, head_dim)))]
 pub fn dsa_index_q_rope<T>(
     ctx: &Ctx<'_>,
     idx_q: InOut<Tensor<T>>,
@@ -1977,7 +2069,7 @@ pub mod dsv4_compress {
         Launch::per_row(rows, width.div_ceil(32).max(1).saturating_mul(32).min(1024))
     }
 
-    #[routine(canon = pool_gather)]
+    #[routine(canon = "pool.gather")]
     pub fn dsv4_compress_gather_paged_bf16(
         ctx: &Ctx<'_>,
         boundary_pos: In<Tensor<i32>>,
@@ -2030,7 +2122,7 @@ pub mod dsv4_compress {
         )
     }
 
-    #[routine(whole, canon = "kv_append.pool")]
+    #[routine(whole, canon = "pool.kv_append")]
     pub fn dsv4_store_comp_entries_bf16(
         ctx: &Ctx<'_>,
         entries: In<Tensor<bf16>>,
@@ -2561,10 +2653,26 @@ pub mod kv_paged {
         write_kv_to_pages_bf16,
         namespace = "attn"
     )
-    // The KV-append role: `Kv::append` resolves `canon = kv_append` and
-    // this declared name is what a text states; `Boot::route` still
-    // picks the bf16/quantised body.
-    .canon("kv_append");
+    // THE CORE APPEND'S CLAIM SITS ON AN UNTRACED ROW, and that is the
+    // whole reason `attention.kv_append` is claim-only on cuda.
+    //
+    // `write_kv_to_pages` is not a routine. It is a DECLARATION STANDING
+    // FOR A CHOICE: `Boot::route` resolves it to `write_kv_to_pages_bf16`
+    // or `write_kv_to_pages_quantised` from the KV storage the boot
+    // settled, long after the trace recorded the statement. `untraced!`
+    // is what says so — the row carries no operand column, which is why
+    // `bind::route` sends it to `Route::Driver` and why a `#[claims]`
+    // delegation would have nothing to delegate TO.
+    //
+    // The two legs want `first_token`, `qo_indptr` and `row_valid` beside
+    // the statement's `k`, `v` and page row, and all three are runtime
+    // residents the driver stages per fire (`Cx::first_token`,
+    // `Cx::row_valid_d`) rather than operands any text places. A
+    // declaration that stated them would be describing this plane's
+    // staging; a body that conjured them would be faking it. So the point
+    // keeps its default body and this row keeps its canon — which is now
+    // the point's own name.
+    .canon("attention.kv_append");
 
     #[cfg(not(target_family = "wasm"))]
     #[::linkme::distributed_slice(crate::ROUTINES)]
@@ -2796,7 +2904,7 @@ const fn per_head(rows: u32, heads: u32) -> Launch {
     Launch::grid([heads, rows, 1], [PAD_BLOCK, 1, 1])
 }
 
-#[routine(canon = lse_ln, out(lse = like(lse)))]
+#[routine(canon = "attention.lse_ln", out(lse = like(lse)))]
 pub fn lse_log2_to_ln(ctx: &Ctx<'_>, lse: InOut<Tensor<f32>>) -> Result<(), Refusal> {
     let elems = lse.all("out_width(0)")?.elements();
     let Ok(elems) = u32::try_from(elems) else {
@@ -2993,7 +3101,7 @@ pub fn attention_naive_paged(
     )
 }
 
-#[routine(bf16, canon = res_blend, out(out = like(prefix)))]
+#[routine(bf16, canon = "norm.res_blend", out(out = like(prefix)))]
 pub fn attn_res_blend<T>(
     ctx: &Ctx<'_>,
     prefix: In<Tensor<T>>,
@@ -3149,7 +3257,7 @@ fn softcap_launch(cap: f32, n: usize) -> Result<Launch, Refusal> {
     Ok(elementwise(elems))
 }
 
-#[routine(bf16, canon = logit_softcap)]
+#[routine(bf16, canon = "attention.logit_softcap")]
 pub fn logit_softcap<T>(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<T>>,
@@ -3185,7 +3293,7 @@ pub fn logit_softcap_f16(
     )
 }
 
-#[routine(bf16, canon = split_q_b)]
+#[routine(bf16, canon = "mla.split_q_b")]
 pub fn kimi_split_q_b<T>(
     ctx: &Ctx<'_>,
     q_b: In<Tensor<T>>,
@@ -3224,7 +3332,7 @@ pub fn kimi_split_q_b<T>(
     )
 }
 
-#[routine(bf16, canon = mla_latents)]
+#[routine(bf16, canon = "mla.latents")]
 pub fn kimi_split_kv_a_norm<T>(
     ctx: &Ctx<'_>,
     kv_a: In<Tensor<T>>,
@@ -3409,3 +3517,264 @@ pub struct Plan {
     pub row_valid: *const u8,
     pub requests: i32,
 }
+
+/// A stated width, as a routine's `Const<i32>` asks for it.
+fn width(what: &'static str, v: u32) -> Result<i32, Refusal> {
+    i32::try_from(v).map_err(|_| Refusal::Wide {
+        what,
+        at: i64::from(v),
+        max: i64::from(i32::MAX),
+    })
+}
+
+/// The bf16 pin, stated as a refusal BY NAME.
+///
+/// Every routine the three families below delegate to is spelled at bf16 and
+/// nowhere else — the absorbs because cuBLAS is handed `CUDA_R_16BF`
+/// literally, the two index rotations because their `where` clauses ask for
+/// `*const T: Abi`, which holds one pointee at a time. A point quantifies
+/// over `Scalar`, so the claim says the pin rather than widening it with a
+/// cast no kernel stands behind. The `gate.sigmoid_mul` precedent, and the
+/// `ssm` conv points' before it.
+fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal> {
+    if T::CPP == <bf16 as kernels::Elem>::CPP {
+        Ok(())
+    } else {
+        Err(Refusal::Absent { what })
+    }
+}
+
+/// The `Mla` family, claimed. Four of eleven points land.
+///
+/// The two cuts delegate straight through — `kimi_split_kv_a_norm` reads the
+/// latent width back off the `Out` the statement sized, so the stated
+/// `kv_lora_rank` is recorded and unread, the `moe.experts` reading.
+///
+/// THE TWO ABSORBS ARE WHY THE POINTS STATE A WIDTH THEY NEVER USE.
+/// `mla_absorb_q_to_latent_bf16` is a strided batched gemm over the whole
+/// `[heads, nope_dim + v_head_dim, kv_lora_rank]` bank, and the stride it
+/// walks between heads is `(nope_dim + v_head_dim) * kv_lora_rank` — BOTH
+/// halves, whichever half the gemm multiplies by. A `Const` weight carries
+/// an address and no rectangle, so neither half is in the operands; the
+/// declaration states both on both points and each body uses the one it
+/// needs and passes the other through. `tokens` is NOT stated: it is
+/// `q_nope.rows`, which is what the legacy lowering spliced there.
+///
+/// Seven stay on the floor's default body, and none is an oversight:
+///
+/// * `mla.latents_rope` — cuda's `mla_prepare_bf16` fuses this with the
+///   `q_b` cut AND the page append, one launch and four results, taking the
+///   layer's `MlaLayer` staging, a page view and the fire's row-validity
+///   plane. It is `untraced` for that reason and cannot claim a point.
+/// * `mla.absorb_q_pe` — the absorb is a gemm with ONE activation operand.
+///   There is no second one to fold `q_pe` into and a fold is not a gemm.
+/// * `mla.kv_append` — `write_mla_to_pages` is `untraced`: `MlaLayer`, the
+///   query CSR, the row-validity plane and the request count, none of them
+///   a statement's.
+/// * `mla.attention_{decode,prefill,decode_selected,prefill_selected}` — ONE
+///   routine served all four, `dispatch_attention_mla_bf16`, and it is
+///   `unsafe`, `untraced`, takes a host-side `&MlaPlan` measured against the
+///   page table, branches on the device's compute capability, and returns a
+///   `MlaDispatch` saying which kernel it picked. A routine that answers
+///   with its own choice is not a claim.
+#[kernels_macros::claims]
+impl kernels::points::Mla for Ctx<'_> {
+    fn latents<T: kernels::points::Scalar>(
+        &self,
+        kv_a: In<Tensor<T>>,
+        weight: Const<Tensor<T>>,
+        eps: f32,
+        kv_lora_rank: u32,
+        kv_c: Out<Tensor<T>>,
+        k_pe: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        // The cut's own width is `kv_c`'s, which the statement allocated
+        // from this very number; the routine reads it back off the result.
+        let _ = kv_lora_rank;
+        kimi_split_kv_a_norm(self, kv_a, weight, kv_c, k_pe, Const::new(eps))
+    }
+
+    fn split_q_b<T: kernels::points::Scalar>(
+        &self,
+        q_b: In<Tensor<T>>,
+        heads: u32,
+        nope_dim: u32,
+        rope_dim: u32,
+        q_nope: Out<Tensor<T>>,
+        q_pe: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        kimi_split_q_b(
+            self,
+            q_b,
+            q_nope,
+            q_pe,
+            Const::new(width("the head count this cut states", heads)?),
+            Const::new(width("the nope width this cut states", nope_dim)?),
+            Const::new(width("the rope width this cut states", rope_dim)?),
+        )
+    }
+
+    fn absorb_q<T: kernels::points::Scalar>(
+        &self,
+        q_nope: In<Tensor<T>>,
+        kv_b: Const<Tensor<T>>,
+        heads: u32,
+        kv_lora_rank: u32,
+        nope_dim: u32,
+        v_head_dim: u32,
+        q_latent: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("mla.absorb_q at an element other than bf16")?;
+        crate::gemm::absorb::mla_absorb_q_to_latent_bf16(
+            self,
+            In {
+                ptr: q_nope.ptr.cast::<c_void>(),
+                rows: q_nope.rows,
+                width: q_nope.width,
+            },
+            Const::new(kv_b.v.cast::<c_void>()),
+            Out {
+                ptr: q_latent.ptr.cast::<c_void>(),
+                rows: q_latent.rows,
+                width: q_latent.width,
+            },
+            Const::new(width("the head count this absorb states", heads)?),
+            Const::new(width("the nope width this absorb states", nope_dim)?),
+            Const::new(width("the value width this absorb states", v_head_dim)?),
+            Const::new(width("the latent rank this absorb states", kv_lora_rank)?),
+            // The token count is the operand's own rows, which is what the
+            // legacy lowering spliced into this run.
+            Const::new(q_nope.rows),
+        )
+    }
+
+    fn absorb_out<T: kernels::points::Scalar>(
+        &self,
+        latent: In<Tensor<T>>,
+        kv_b: Const<Tensor<T>>,
+        heads: u32,
+        kv_lora_rank: u32,
+        v_head_dim: u32,
+        nope_dim: u32,
+        o: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("mla.absorb_out at an element other than bf16")?;
+        crate::gemm::absorb::mla_absorb_latent_to_v_bf16(
+            self,
+            In {
+                ptr: latent.ptr.cast::<c_void>(),
+                rows: latent.rows,
+                width: latent.width,
+            },
+            Const::new(kv_b.v.cast::<c_void>()),
+            Out {
+                ptr: o.ptr.cast::<c_void>(),
+                rows: o.rows,
+                width: o.width,
+            },
+            Const::new(width("the head count this absorb states", heads)?),
+            Const::new(width("the nope width this absorb states", nope_dim)?),
+            Const::new(width("the value width this absorb states", v_head_dim)?),
+            Const::new(width("the latent rank this absorb states", kv_lora_rank)?),
+            Const::new(latent.rows),
+        )
+    }
+}
+
+/// The `Index` family, claimed. Both rotations land and both are IN PLACE,
+/// which is what the points' `InOut` says and what the routines' own
+/// `out(.. = like(..))` rules already said.
+///
+/// Two stay on the floor's default body:
+///
+/// * `index.topk` — `dsa_index_topk_mask` scores a TOKEN-PLANE `idx_k`, an
+///   ordinary rectangle of the keys this fire just wrote. The statement
+///   names the POOL those keys live in. A cache row and a staged rectangle
+///   are bound by different binders — the whole of what a mark says — so
+///   this is not a rename away from a claim.
+/// * `index.kv_append` — no routine on any plane answers it. The legacy
+///   indexer kept nothing across fires; it scored the plane it had just
+///   written. The pool is the new reading and this row measures it.
+#[kernels_macros::claims]
+impl kernels::points::Index for Ctx<'_> {
+    fn layernorm_rope<T: kernels::points::Scalar>(
+        &self,
+        k: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        weight: Const<Tensor<T>>,
+        bias: Const<Tensor<T>>,
+        eps: f32,
+        rope_dim: u32,
+        theta: f32,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("index.layernorm_rope at an element other than bf16")?;
+        dsa_index_knorm_rope::<bf16>(
+            self,
+            InOut {
+                ptr: k.ptr.cast::<bf16>(),
+                rows: k.rows,
+                width: k.width,
+            },
+            Const::new(weight.v.cast::<bf16>()),
+            Const::new(bias.v.cast::<bf16>()),
+            Const::new(width("the rope width this norm states", rope_dim)?),
+            Const::new(theta),
+            Const::new(eps),
+            positions,
+        )
+    }
+
+    fn rope<T: kernels::points::Scalar>(
+        &self,
+        q: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("index.rope at an element other than bf16")?;
+        dsa_index_q_rope::<bf16>(
+            self,
+            InOut {
+                ptr: q.ptr.cast::<bf16>(),
+                rows: q.rows,
+                width: q.width,
+            },
+            Const::new(width("the head count this rotation states", heads)?),
+            Const::new(width("the head width this rotation states", head_dim)?),
+            Const::new(width("the rope width this rotation states", rope_dim)?),
+            Const::new(theta),
+            positions,
+        )
+    }
+}
+
+/// The `Pool` family, claimed — and it claims NOTHING. Every point stays on
+/// the floor's default body and every one of them resolves through its
+/// routine's own `canon` instead, which is what claim-only means: the kernel
+/// exists and fires today, and no honest delegation reaches it from a
+/// statement.
+///
+/// THE SAME ABSENCE FIVE TIMES. DeepSeek-V4's compressed plane is three
+/// resident objects beside the page table — the state halves, the running
+/// scores and the absolute-position table — plus two runtime planes the fire
+/// stages, `row_valid` and `request_of_token`. A statement names ONE cache
+/// row and its operands, and a body cannot pull the rest from `self` because
+/// they are the DRIVER's staging and not this plane's.
+///
+/// * `pool.boundary_decode` / `pool.boundary_prefill` — the routines write
+///   THREE rectangles where the statement states two: an `out_rope` plane no
+///   text in this tree reads. The declaration keeps the statement as it
+///   stands rather than passing a scratch third out to swallow it — a result
+///   nothing reads is not a result, and a slot no text can name has no
+///   business on the floor. Both also read `row_valid`.
+/// * `pool.gather` — the three residents, plus a `coff` beside the ratio.
+///   The scalar alone would be derivable (it is `compressor_coff(ratio)`,
+///   the driver's own rule: 4 pools 2, else 1); the residents are not.
+/// * `pool.kv_append` — TWO cache views, the page table it walks and the
+///   compressed pool it writes. A statement names one cache row.
+/// * `pool.attention_lse` — both cache views again, and the fire's
+///   request-of-token plane on top.
+#[kernels_macros::claims]
+impl kernels::points::Pool for Ctx<'_> {}

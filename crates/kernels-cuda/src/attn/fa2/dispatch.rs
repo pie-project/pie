@@ -67,22 +67,6 @@ impl core::fmt::Display for Decline {
     }
 }
 
-impl Partials {
-    #[must_use]
-    pub const fn merge_job(self) -> crate::cascade::merge_states::VarLen {
-        crate::cascade::merge_states::VarLen {
-            v: self.tmp_v,
-            s: self.tmp_s,
-            indptr: self.indptr,
-            v_merged: self.o,
-            s_merged: self.lse,
-            max_seq_len: self.max_seq_len,
-            seq_len: self.seq_len,
-            num_heads: self.num_heads,
-            head_dim: self.head_dim,
-        }
-    }
-}
 
 #[must_use]
 pub fn decode_plan_of(cache: &DecodePlanCache, device: FaDevice) -> DecodePlan {

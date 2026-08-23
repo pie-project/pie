@@ -67,6 +67,11 @@ members = [
     # outside `default-members` all the same -- linking a CUDA shell into a
     # sweep should be a choice, and that is the rule the siblings follow.
     "crates/driver-cuda",
+    # The baker executor's smoke: one decode step of a catalog SKU fired out
+    # of a `model_compiler::program::Program`, on a real GPU, against real
+    # weights. A member so it shares this lockfile; outside `default-members`
+    # because it links a CUDA shell, which is `driver-cuda`'s rule above.
+    "crates/baker-smoke",
     # The Metal shell. It was `driver-metal-new` while the C++ `driver-metal`
     # still existed; that one was retired (2026-08-10) and this took the name.
     # A member so it shares this lockfile and so a workspace sweep on a Mac
@@ -127,6 +132,7 @@ members = [
     # the tracer fingerprint (`compiler_version()`), whose hash covers this
     # tree and `model-ir`'s, because the tracer is both of them.
     "crates/model-dsl",
+    "crates/model-dsl-legacy",
     "crates/model-dsl-macros",
     # Lowering alone now: traced form + the engine's rows + one fire ->
     # rectangles, operands, buffers. Keeps the name because a compiler is what
@@ -144,14 +150,14 @@ members = [
     # under the prefixed backends, holding what all of their tables are
     # written in rather than anything any one of them does.
     "crates/kernels",
-    # `#[routine]`: the operand table, derived from a launcher's own Rust
-    # signature. Separate from `kernels` for two reasons, and both are hard.
-    # A `proc-macro = true` crate can export NOTHING but macros, so it could
-    # not have been a module; and `kernels` declares "no dependencies, and
-    # none is wanted", which a `syn`/`quote` edge would end. So the backends
-    # depend on this crate directly and `kernels` stays the bare floor it
-    # says it is -- the macro names `::kernels::Derived` in its output, which
-    # costs the macro crate no edge at all.
+    # `#[points]`, `#[claims]`, `#[routine]`: the table a family, a plane and
+    # a launcher each state, every one of them derived from the Rust it is
+    # written on. Separate from `kernels` because a `proc-macro = true` crate
+    # can export NOTHING but macros, so it could not have been a module.
+    # `kernels` itself takes the edge now -- `#[points]` expands on the
+    # floor's own family traits -- and it costs the floor nothing it cared
+    # about: a proc macro is a compiler plugin, so no `syn` reaches an
+    # artifact and the "no dependencies" line still holds where it meant to.
     "crates/kernels-macros",
     # The JIT-native shape of the CUDA half: the table, the device sources
     # carried in the binary, and the runtime that NVRTC-compiles and fires

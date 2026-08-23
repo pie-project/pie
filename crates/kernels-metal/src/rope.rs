@@ -63,7 +63,7 @@ pub fn neox_decode(
     )
 }
 
-#[routine(canon = rope, out(x = like(x)))]
+#[routine(canon = "rope.full", out(x = like(x)))]
 pub fn neox_mb(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,

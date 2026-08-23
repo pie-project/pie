@@ -115,7 +115,7 @@ model-loader = { path = "../model-loader", default-features = false, optional = 
 # not here at all -- it is a `[dev-dependencies]` entry below, because the
 # only code in this crate that lowers anything is a test asserting a
 # declaration lowers the way it says it does.
-model-dsl = { path = "../model-dsl" }
+model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
 model-ir = { path = "../model-ir" }
 serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 # Host-side media decode for the model-agnostic multimodal API.

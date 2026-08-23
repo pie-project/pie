@@ -1,0 +1,53 @@
+[package]
+name = "baker-smoke"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The baker executor's first end-to-end fire: one decode step of a catalog SKU, on the GPU, out of a `model_compiler::program::Program`."
+license = "Apache-2.0"
+publish = false
+
+# A WORKSPACE MEMBER AND NOT A DEFAULT ONE, for `driver-cuda`'s reason: this
+# links a CUDA shell, and a host sweep should not have to. The build is
+# `cargo check -p baker-smoke --features cuda-13`; a bare `cargo check` never
+# resolves it.
+
+[features]
+# Mirrors `driver-cuda`'s: exactly one CUDA runtime version, and it must be
+# the one this binary will LOAD. There is deliberately no default -- a
+# default would be a guess about someone else's machine, and the cost of
+# guessing wrong is a segfault inside libcudart rather than a build error.
+cuda-12 = ["_cuda", "cudarc/cuda-12080", "kernels-cuda/cuda-12"]
+cuda-13 = ["_cuda", "cudarc/cuda-13000", "kernels-cuda/cuda-13"]
+_cuda = ["dep:cudarc"]
+
+[dependencies]
+# The demand side: `catalog()` -> the trace fn, `imports()` -> the production
+# table, `produce` -> the host tensors this uploads.
+model = { path = "../model" }
+model-dsl = { path = "../model-dsl" }
+# The binding half: `program::bound` turns a plan's lanes into steps and
+# slots. This binary is the first consumer of that output that fires.
+model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
+# The declaration floor: the `In`/`Out`/`InOut`/`Const`/`Cache` marks the
+# point shim below builds by hand.
+kernels = { path = "../kernels" }
+# The plane. Device features copied from `driver-cuda`'s dep line, for the
+# reason stated there: two crates in one binary that disagreed about which
+# libcudart to load would be one set of bindings calling the other's runtime.
+kernels-cuda = { path = "../kernels-cuda" }
+# The raw runtime: device alloc, the H2D/D2H copies, the stream, and the
+# cuBLAS handle `gemm.matmul` wants. Same version and the same
+# `fallback-dynamic-loading` posture as `driver-cuda`, so a box with a driver
+# and no toolkit still builds.
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "runtime",
+    "cublas",
+    "fallback-dynamic-loading",
+] }
+# The checkpoint's own header, and the tokenizer's vocabulary for printing
+# the token this decode picks.
+serde_json = "1.0"

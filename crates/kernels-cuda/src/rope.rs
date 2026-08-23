@@ -120,6 +120,195 @@ fn k_heads<T>(q: *mut T, k: *mut T, width: i32, head_dim: i32) -> Result<i32, Re
     heads(width, head_dim)
 }
 
+/// A stated width as the routines below spell one. A declaration states
+/// `u32` because a width is not negative; a routine takes `i32` because the
+/// device text does.
+fn stated(width: u32, what: &'static str) -> Result<i32, Refusal> {
+    i32::try_from(width).map_err(|_| Refusal::Wide {
+        what,
+        at: i64::from(width),
+        max: i64::from(i32::MAX),
+    })
+}
+
+/// The element a statement rides, re-marked as the one this plane's rotate
+/// rows take, or a refusal naming the point that has no row for it.
+///
+/// Which axes a plane serves is a runtime truth, never a declared list, and
+/// cuda's rotations are rows rather than open templates: `rope.cuh` states
+/// that only `standard_table` and `rotate_partial` are templates and that
+/// "the other eight stay bf16", because they rotate through
+/// `rope_device.cuh`'s `rotate_pair`, which takes `bf16*`. `rotate_partial`
+/// IS a template and `rope_partial_f16` is the row that would open the f16
+/// axis — no text has ever stated one, so it stays a row nothing fires and
+/// this claim stays at the element the family is measured on. The compare
+/// is what makes the cast sound: past it, `T` IS `bf16`.
+fn rotates_bf16<T: kernels::points::Scalar>(
+    r: InOut<Tensor<T>>,
+    what: &'static str,
+) -> Result<InOut<Tensor<bf16>>, Refusal> {
+    if <T as kernels::Elem>::TY_MUT != <bf16 as kernels::Elem>::TY_MUT {
+        return Err(Refusal::Absent { what });
+    }
+    Ok(InOut {
+        ptr: r.ptr.cast::<bf16>(),
+        rows: r.rows,
+        width: r.width,
+    })
+}
+
+/// The `Rope` family, claimed. Each body is a delegation to the routine
+/// below that already fires the point, deriving the legacy-only parameters
+/// from the operands: `num_q_heads` and `num_kv_heads` are the operand row
+/// over the STATED head width, which is the whole reason `head_dim` is
+/// stated and the only thing the delegations derive.
+///
+/// `rope.partial_last` passes [`Yarn::NONE`]'s numbers, and that is the
+/// point's definition rather than a guess: the trailing rotation states no
+/// YaRN block, `rotate_partial_last` guards its ramp with
+/// `if (yarn_factor > 1.f)`, and the interpolated rotation is `rope.yarn` —
+/// a different point, not a parameterisation of this one.
+#[kernels_macros::claims]
+impl kernels::points::Rope for Ctx<'_> {
+    fn full<T: kernels::points::Scalar>(
+        &self,
+        q: InOut<Tensor<T>>,
+        k: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        head_dim: u32,
+        theta: f32,
+        interleaved: bool,
+    ) -> Result<(), Refusal> {
+        let head_dim = stated(head_dim, "the head width this rotation states")?;
+        let q = rotates_bf16(q, "rope.full")?;
+        let k = rotates_bf16(k, "rope.full")?;
+        let (num_q_heads, num_kv_heads) = (
+            q_heads(q.width, head_dim)?,
+            k_heads(q.ptr, k.ptr, k.width, head_dim)?,
+        );
+        rope_bf16(
+            self,
+            q,
+            k,
+            Const::new(num_q_heads),
+            Const::new(num_kv_heads),
+            Const::new(head_dim),
+            Const::new(theta),
+            Const::new(interleaved),
+            positions,
+        )
+    }
+
+    fn partial<T: kernels::points::Scalar>(
+        &self,
+        q: InOut<Tensor<T>>,
+        k: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        rotary_dim: u32,
+        head_dim: u32,
+        theta: f32,
+    ) -> Result<(), Refusal> {
+        let rotary_dim = stated(rotary_dim, "the rotated width this statement states")?;
+        let head_dim = stated(head_dim, "the head width this rotation states")?;
+        let q = rotates_bf16(q, "rope.partial")?;
+        let k = rotates_bf16(k, "rope.partial")?;
+        rope_partial_bf16(
+            self,
+            q,
+            k,
+            Const::new(rotary_dim),
+            Const::new(head_dim),
+            Const::new(theta),
+            positions,
+        )
+    }
+
+    fn partial_q<T: kernels::points::Scalar>(
+        &self,
+        q: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        rotary_dim: u32,
+        head_dim: u32,
+        theta: f32,
+    ) -> Result<(), Refusal> {
+        let rotary_dim = stated(rotary_dim, "the rotated width this statement states")?;
+        let head_dim = stated(head_dim, "the head width this rotation states")?;
+        let q = rotates_bf16(q, "rope.partial_q")?;
+        rope_partial_q_bf16(
+            self,
+            q,
+            Const::new(rotary_dim),
+            Const::new(head_dim),
+            Const::new(theta),
+            positions,
+        )
+    }
+
+    fn partial_last<T: kernels::points::Scalar>(
+        &self,
+        q: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        rotary_dim: u32,
+        head_dim: u32,
+        theta: f32,
+        interleaved: bool,
+    ) -> Result<(), Refusal> {
+        let rotary_dim = stated(rotary_dim, "the rotated width this statement states")?;
+        let head_dim = stated(head_dim, "the head width this rotation states")?;
+        let q = rotates_bf16(q, "rope.partial_last")?;
+        rope_partial_last_q_bf16(
+            self,
+            q,
+            Const::new(head_dim),
+            Const::new(rotary_dim),
+            Const::new(theta),
+            Const::new(interleaved),
+            Const::new(Yarn::NONE.factor),
+            Const::new(Yarn::NONE.beta_fast),
+            Const::new(Yarn::NONE.beta_slow),
+            Const::new(Yarn::NONE.original_max_position),
+            positions,
+        )
+    }
+
+    fn yarn<T: kernels::points::Scalar>(
+        &self,
+        q: InOut<Tensor<T>>,
+        k: InOut<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        head_dim: u32,
+        theta: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        attention_factor: f32,
+        original_max_position: u32,
+        interleaved: bool,
+    ) -> Result<(), Refusal> {
+        let head_dim = stated(head_dim, "the head width this rotation states")?;
+        let original_max_position = stated(
+            original_max_position,
+            "the position span this checkpoint's YaRN block states",
+        )?;
+        let q = rotates_bf16(q, "rope.yarn")?;
+        let k = rotates_bf16(k, "rope.yarn")?;
+        rope_yarn_original_bf16(
+            self,
+            q,
+            k,
+            Const::new(head_dim),
+            Const::new(theta),
+            Const::new(factor),
+            Const::new(beta_fast),
+            Const::new(beta_slow),
+            Const::new(attention_factor),
+            Const::new(original_max_position),
+            Const::new(interleaved),
+            positions,
+        )
+    }
+}
+
 #[routine]
 pub fn rope_standard_table(
     ctx: &Ctx<'_>,
@@ -145,7 +334,7 @@ pub fn rope_standard_table(
     )
 }
 
-#[routine(canon = rope, out(q = like(q)), out(k = like(k)))]
+#[routine(canon = "rope.full", out(q = like(q)), out(k = like(k)))]
 pub fn rope_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,

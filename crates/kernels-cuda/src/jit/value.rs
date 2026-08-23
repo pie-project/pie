@@ -102,6 +102,13 @@ impl Bound {
     }
 }
 
+/// The plane binds addresses: every raw pointer reaches a fire as one.
+impl kernels::routine::Addressed for ArgValue {
+    fn address(p: *mut c_void) -> Self {
+        Self::Ptr(p)
+    }
+}
+
 impl kernels::routine::Absent for ArgValue {
     fn is_absent(&self) -> bool {
         matches!(self, Self::Ptr(p) if p.is_null())

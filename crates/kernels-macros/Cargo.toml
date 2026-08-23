@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
-description = "The `#[routine]` attribute: derives a kernel's operand sources from its own signature"
+description = "The kernel crates' declaration attributes: `#[points]` (a family's point table), `#[claims]` (the points a plane answers), `#[routine]` (a launcher's operand column)"
 
 [lib]
 proc-macro = true

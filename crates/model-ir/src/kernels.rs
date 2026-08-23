@@ -1,56 +1,20 @@
-//! Kernel signatures, from the compiler's side.
-//!
-//! Contracts live beside their kernels ([`kernels_cuda::sigs`], and for Metal
-//! the routines behind [`kernels_metal::declared`]); [`Stated`] is the shape
-//! both planes answer in. What lives here is compiler-side: [`Backend`] and
-//! [`check_plan`]. The tables are consumed with `default-features = false`,
-//! so reading a contract builds no `.cu`.
-
 use crate::trace::{ForwardPlan, Op, OpKind};
 
 pub use kernels::{Cap, KernelSig};
-// The two a `Stated::sources` entry is made of. `Stated` already exposes the
-// column publicly, so a consumer that wants to READ it needed a second path
-// to the same crate to name what it found; these are that path.
+
 pub use kernels::{Kind, Source};
 pub use kernels_cuda::sigs;
-/// Every entrypoint Metal can dispatch, and so everything a text may launch.
+
 pub use kernels_metal::entrypoints as metal_entrypoints;
 
-/// Which backend's kernels a lowered trace states.
-///
-/// Two variants, four execution shells: this names the surface a text was
-/// written against, not the device that runs it. Vulkan and WGPU execute
-/// plans traced by `llama_like_metal`, so they are checked against Metal's
-/// statements. Hence no `Backend::Vulkan`: no family name could construct
-/// one.
-///
-/// # What makes reading a shader plan through Metal sound
-///
-/// It used to be that the three shader backends each published a `KERNELS`
-/// table and `kernels/tests/shader_backends_agree.rs` held those three tables
-/// equal, so Metal's row could stand in for Vulkan's. That is no longer where
-/// the soundness comes from, and a reader who goes looking for those tables
-/// finds three EMPTY SLICES: all three backends crossed to routines, wgpu
-/// last, and `930fee2cb` deleted the leftovers.
-///
-/// What holds the claim up now is one plane comparing directly against
-/// another, with no table in the middle —
-/// `two_backends_that_crossed_the_same_kernel_agree_on_its_signature` for the
-/// signatures, and the census check that the three backends still name the
-/// same 481 firable points. Both live in the same file, which is why the file
-/// name here is still the right pointer even though the claim it holds is a
-/// different one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Backend {
-    /// `kernels-cuda`'s table.
     Cuda,
-    /// `kernels-metal`'s table.
+
     Metal,
 }
 
 impl Backend {
-    /// `None` for a semantic trace, which states no kernels at all.
     pub fn of_family(family: &str) -> Option<Backend> {
         let mut parts = family.split('.').skip(1);
         match parts.next() {
@@ -61,68 +25,31 @@ impl Backend {
     }
 }
 
-/// What a backend states about one symbol, with the plane forgotten — a CUDA
-/// row and a Metal [`kernels::routine::Declared`] answer here alike.
 #[derive(Debug, Clone, Copy)]
 pub struct Stated {
-    /// Consumes its whole operand, not a row range.
     pub whole: bool,
-    /// Pairs the depth-prefix plan, and its workspace, on a union's tail
-    /// layers. A kernel property, not an op's.
+
     pub depth_prefix_plan: bool,
-    /// The routine's arguments, in signature order, and who supplies each.
-    /// Derived from the `fn`, which is what makes the arity rule cost no new
-    /// column. Empty means the plane states no signature, and the rule then
-    /// has nothing to compare.
+
     pub args: &'static [kernels::Ty],
-    /// Which side of the statement each argument sits on, in [`Self::args`]
-    /// order. A `*mut` in an input slot is an operand the statement places,
-    /// Where each argument comes from, in [`Self::args`] order.
-    ///
-    /// Carries the aliasing now: a [`kernels::Source::Alias`] is one address
-    /// wearing an operand slot and a result slot, which is what `in_place`
-    /// used to say on the row. [`Self::in_place`] reads them back out.
+
     pub sources: &'static [Option<kernels::Source>],
-    /// Each parameter's name and NULLABILITY, in [`Self::args`] order.
-    ///
-    /// A nullable operand is an OPTIONAL one, and that is the whole of why
-    /// this column is carried here: `Provenance::Either` used to say it on a
-    /// wrapper, and when `Env` and its provenance went the claim went with
-    /// them — so every routine with a bias plane the statement may omit
-    /// started reading one operand more than the text places.
-    ///
-    /// Empty where the plane states no column, which reads as *"nothing is
-    /// optional"* — the same answer an all-required row gives.
+
     pub derived: &'static [kernels::Derived],
 }
 
-/// What one signature asks the statement to place, required and optional apart.
-///
-/// `Provenance::Either` was the old name for the optional half, and it lived
-/// on a WRAPPER (`Unbound<T>`) rather than on the operand. It is the carrier's
-/// fact — a `MaybeConst<T>` is a plane that may not exist — so it is read off
-/// the same column the names come from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pointers {
-    /// Pointers the statement MUST place.
     pub reads: usize,
-    /// Pointers the statement MAY place: a nullable operand binds null.
+
     pub optional_reads: usize,
-    /// Results the statement must declare.
+
     pub writes: usize,
-    /// Results it may declare.
+
     pub optional_writes: usize,
 }
 
 impl Stated {
-    /// The `(output, input)` pairs that must be given the same address.
-    ///
-    /// DERIVED, where it used to be stated. The pairs came off the row as
-    /// `in_place = &[(0, 0)]`, forty-five of them, written forty lines from
-    /// the parameters they indexed; they come off the SIGNATURE now, through
-    /// the [`kernels::routine::InOut`] mark that wears both slots.
-    ///
-    /// Output first, as the readers expect.
     #[must_use]
     pub fn in_place(&self) -> Vec<(u32, u32)> {
         self.sources
@@ -136,49 +63,20 @@ impl Stated {
 }
 
 impl Stated {
-    /// The pointers a statement must place: `(reads, writes)`, before the
-    /// in-place slack and optional ceiling the caller adds.
-    ///
-    /// # Read off the SOURCE column, which is now the only column that says
-    ///
-    /// It used to read `args`' `Provenance` beside a `Side`, and both are
-    /// deleted: with `Env` out of the parameter list every parameter is the
-    /// statement's, so the provenance column had one value at every row, and
-    /// the mark says which side. The `Source` a mark resolves to carries the
-    /// same fact and cannot drift from it — `Slot(Kind::In, _)` and
-    /// `Slot(Kind::Weight, _)` are placed, `Slot(Kind::Out, _)` is declared,
-    /// and `Alias(_, _)` is one address wearing both.
-    ///
-    /// THE PARAMS RUN IS COUNTED SEPARATELY and not here: a `Const` scalar is
-    /// the statement's too, but it rides the `params` field rather than the
-    /// operand list, so counting it as a pointer would make every routine that
-    /// takes one read one operand more than the statement carries. See
-    /// [`Self::scalars`].
-    ///
-    /// `(0, 0)` both when the plane states no signature and when a routine
-    /// binds nothing; check [`Self::args`] for emptiness to tell them apart.
     #[must_use]
     pub fn places(&self) -> (usize, usize) {
         let p = self.pointers();
         (p.reads, p.writes)
     }
 
-    /// [`Self::places`], with the optional half kept apart.
     #[must_use]
     pub fn pointers(&self) -> Pointers {
         use kernels::{Kind, Source};
 
         let mut p = Pointers::default();
         for (at, source) in self.sources.iter().enumerate() {
-            // A NULLABLE OPERAND IS AN OPTIONAL ONE. The carrier says it —
-            // `Const<Tensor<MaybeConst<T>>>` is a bias plane the export may
-            // not have — and `#[routine]` reads it off the syntax into this
-            // column. A statement that omits one is short by design, so it is
-            // counted where a short count is allowed.
             let optional = self.derived.get(at).is_some_and(|d| d.nullable);
             match source {
-                // A WEIGHT IS A READ, positional since the named half of the
-                // old chain retired with the semantic ops.
                 Some(Source::Slot(Kind::In | Kind::Weight, _)) => {
                     if optional {
                         p.optional_reads += 1;
@@ -193,11 +91,7 @@ impl Stated {
                         p.writes += 1;
                     }
                 }
-                // ONE ADDRESS IN TWO SLOTS, counted on the WRITE side only.
-                // The statement placed it once; counting it on both would make
-                // every aliasing routine read one operand more than there is.
-                // The input slot it also wears is an ALIASING fact, which
-                // `in_place` reads out of the same source.
+
                 Some(Source::Alias(..)) => p.writes += 1,
                 _ => {}
             }
@@ -205,18 +99,6 @@ impl Stated {
         p
     }
 
-    /// How many scalars the statement must carry in its `params` run.
-    ///
-    /// THE COUNT THE PARAMS RUN NEVER HAD. `Param<N, T>` was deleted and the
-    /// eighteen scalars that used it became `fact!(stated ..)` keys resolving
-    /// through `Source::Named`, which no driver answers — so a statement that
-    /// passed two scalars to a routine that takes three bound a zero at run
-    /// time instead of being refused at plan time. `Const<i32>` gives the run
-    /// a mark again, and a mark gives it an arity.
-    ///
-    /// The highest slot claimed plus one, not the number of `Const` marks:
-    /// `Kind::Param` and `Kind::ParamF32` are two READINGS of one channel, and
-    /// a routine may read a slot twice.
     #[must_use]
     pub fn scalars(&self) -> usize {
         use kernels::{Kind, Source};
@@ -232,10 +114,6 @@ impl Stated {
     }
 }
 
-/// What `backend` states about `symbol`, or `None` if nothing does.
-///
-/// Metal resolves through [`kernels_metal::kernel_of`], so a text spelling a
-/// base name and a lowering carrying an instantiated point agree.
 #[must_use]
 pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
     match backend {
@@ -247,8 +125,6 @@ pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
             derived: k.derived,
         }),
         Backend::Metal => {
-            // Memoised: `declared()` rebuilds its `Vec` on every call, and
-            // this is asked once per launched op of every model that loads.
             static ROUTINES: std::sync::OnceLock<
                 std::collections::BTreeMap<&'static str, kernels::routine::Declared>,
             > = std::sync::OnceLock::new();
@@ -269,9 +145,6 @@ pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
                     sources: d.sources,
                     derived: d.derived,
                 })
-                // Metal's `silu_mul_strided` has no routine: its entrypoint
-                // leaves a buffer slot empty, so it has no positional
-                // argument list. `driver-metal` refuses to lower it.
                 .or(Some(Stated {
                     whole: false,
                     depth_prefix_plan: false,
@@ -283,9 +156,6 @@ pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
     }
 }
 
-/// The canon claim `backend`'s row for `symbol` makes, if any — the
-/// reverse of [`canon_symbol`], for readers that hold a symbol and want
-/// its role (the seam rules).
 #[must_use]
 pub fn claim_of(backend: Backend, symbol: &str) -> Option<&'static str> {
     match backend {
@@ -300,17 +170,63 @@ pub fn claim_of(backend: Backend, symbol: &str) -> Option<&'static str> {
     }
 }
 
-/// The symbol `backend` CLAIMS for one canon point (`"rmsnorm"`,
-/// `"rmsnorm.gemma"`), or `None` when nothing claims it.
+/// Every family a cuda `#[claims]` block answers, one line per migrated
+/// family. A family's line is its `*_CLAIMS` slice and nothing else, so
+/// migrating one is adding one line here; the macro grows an aggregate when
+/// there are enough of them to want one.
+const CUDA_CLAIMS: &[&[&str]] = &[
+    kernels_cuda::norm::NORM_CLAIMS,
+    kernels_cuda::rope::ROPE_CLAIMS,
+    kernels_cuda::mlp::MLP_CLAIMS,
+    kernels_cuda::gemm::GEMM_CLAIMS,
+    kernels_cuda::dist::DIST_CLAIMS,
+    kernels_cuda::moe::MOE_CLAIMS,
+    kernels_cuda::layout::LAYOUT_CLAIMS,
+    // `GATE_CLAIMS` reads from `mlp` rather than a module of its own: the
+    // impl lives beside the other gate kernel firing the same C++ namespace.
+    kernels_cuda::mlp::GATE_CLAIMS,
+    kernels_cuda::ssm::SSM_CLAIMS,
+    // `ATTENTION_CLAIMS` reads from `attn` and not `attention`: the impl
+    // lives in the module the fa2 core is filed under, which is where the
+    // four delegations' neighbours already are.
+    kernels_cuda::attn::ATTENTION_CLAIMS,
+    // The three latent/paged families answer from `attn`, where their
+    // delegates live — `mla`'s two absorbs reach across into `gemm::absorb`
+    // from there, since a family is one impl block and its points may fire
+    // out of two modules. `POOL_CLAIMS` is EMPTY and still listed: cuda
+    // implements the family and overrides nothing, which is a measurement
+    // and not an omission.
+    kernels_cuda::attn::MLA_CLAIMS,
+    kernels_cuda::attn::INDEX_CLAIMS,
+    kernels_cuda::attn::POOL_CLAIMS,
+    // `HC_CLAIMS` reads from `norm`, beside the five hyper-connection
+    // kernels firing the same C++ namespace — the `GATE_CLAIMS` shape.
+    kernels_cuda::norm::HC_CLAIMS,
+];
+
+/// The points a plane's `#[claims]` impl blocks answer — baker's claim
+/// table, consulted ahead of the routine `canon` attributes. One slice per
+/// migrated family, concatenated; a family lands by adding its line, and the
+/// macro grows an aggregate when the list is long enough to want one.
+#[must_use]
+pub fn point_claims(backend: Backend) -> &'static [&'static str] {
+    static CUDA: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    match backend {
+        Backend::Cuda => CUDA.get_or_init(|| CUDA_CLAIMS.concat()),
+        Backend::Metal => &[],
+    }
+}
+
+/// The plane symbol whose `#[routine(canon = ..)]` answers a claim, or none.
 ///
-/// THE tier-1 resolution: `dsl::rmsnorm` reads the family's backend off the
-/// trace and asks here, so the symbol table lives on the routines
-/// (`#[routine(canon = ..)]`) and nowhere in the DSL. A claim shared by two
-/// routines of one backend is a bug the tables' tests refuse; first match
-/// answers here.
+/// There is no second walk behind this one. `canon::DEFAULTS` used to say
+/// that an unanswered `lm_head` falls back on `matmul`; a delegation is a
+/// claim now, written in the plane's own `#[claims]` block where it can be
+/// read and where `point_claims` reports it, so a claim nothing spells is
+/// simply a backlog row.
 #[must_use]
 pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
-    let direct = match backend {
+    match backend {
         Backend::Cuda => sigs()
             .iter()
             .find(|k| k.canon == Some(claim))
@@ -328,21 +244,9 @@ pub fn canon_symbol(backend: Backend, claim: &str) -> Option<&'static str> {
                 .get(claim)
                 .copied()
         }
-    };
-    direct.or_else(|| {
-        kernels::canon::DEFAULTS
-            .iter()
-            .find(|(role, _)| *role == claim)
-            .and_then(|(_, target)| canon_symbol(backend, target))
-    })
+    }
 }
 
-/// Evaluate one result's [`kernels::OutRule`] against a statement's
-/// operands — the B4-gen evaluator (design-no-ask §10). `None` is
-/// [`kernels::OutRule::Unstated`]'s honest answer: the caller supplies the
-/// `Shape`, exactly as today; a rule that names a slot the statement does
-/// not fill is a `None` too, and the generated wrapper's own `Shape`
-/// fallback refuses louder than a guess would.
 #[must_use]
 pub fn out_shape(
     rule: kernels::OutRule,
@@ -371,10 +275,7 @@ pub fn out_shape(
             let w = match width {
                 OutWidth::Half { of } => width_of(input_shapes.get(usize::from(of))?)? / 2,
                 OutWidth::Of { of } => width_of(input_shapes.get(usize::from(of))?)?,
-                // A weight's projection width is not readable from the
-                // statement (weights are names); a rule naming one is
-                // resolved by the GENERATED wrapper, which holds the
-                // handle. Here it is honestly unanswerable.
+
                 OutWidth::Weight { .. } => return None,
                 OutWidth::Param { of } => *params.get(usize::from(of))?,
             };
@@ -399,63 +300,12 @@ pub fn out_shape(
     }
 }
 
-/// The row for one CUDA symbol, for readers that want the row itself: the
-/// CUDA emitter and the table tests.
-///
-/// Anything the compiler decides goes to [`stated_in`] instead — this answers
-/// `None` for every Metal symbol, which does not mean nothing declares it.
 pub fn sig(symbol: &str) -> Option<&'static KernelSig> {
     kernels::sig_in(sigs(), symbol)
 }
 
-/// Symbols the arity rule cannot hold. Empty: each former entry encoded an
-/// operation in its operand count, and was fixed by splitting the symbol.
 pub const ARITY_EXCEPTIONS: &[&str] = &[];
 
-// AN ALLOWLIST FOR HALF-STATED PARAMS RUNS STOOD HERE, and its doc and its
-// `#[must_use]` outlived it: the predicate went, the six lines above it did
-// not, and an attribute with nothing between it and the next item applies to
-// THAT item. So `arity_problem` was carrying a `#[must_use]` it never asked
-// for and a rustdoc summary line describing a function that is not there --
-// "Is `symbol`'s params run one the DSL has not finished stating? A metal
-// statement names an INSTANTIATED POINT, and a routine is stamped over a
-// product of axes; `kernels_metal::kernel_of` is the same map `stated_in`
-// uses to find the signature, so the allowlist is read through it and one
-// entry covers one routine however many points it has."
-//
-// The allowlist is empty for the same reason `ARITY_EXCEPTIONS` above it is:
-// `Const<i32>` gave the params run its mark back, so a statement short of
-// what the signature claims is refused rather than excused.
-
-/// For one statement: does it place what the routine reads and writes?
-///
-/// `None` when it agrees, when the symbol is excepted, or when the plane
-/// states no signature.
-///
-/// An in-place pair is slack on the read side rather than a subtraction,
-/// because a routine may spell the alias as one `*mut` parameter or as a
-/// `*const`/`*mut` pair: placed reads run from `inputs + weights - in_place`
-/// to `inputs + weights`. `in_value_region` says the guard owns the result and
-/// the launch records none, so the write floor drops to zero — the ceiling
-/// still holds, since declaring more results than the routine writes is wrong
-/// in a region too.
-///
-/// # There is no optional half any more
-///
-/// `Provenance::Either` used to raise the read ceiling by one and the floor by
-/// nothing, for the nullable spellings and for `keys::Unstated`. Both are gone:
-/// every parameter of a columned routine is the statement's, and a parameter
-/// nothing supplies is a bare pointer the launcher fills itself, which claims
-/// no slot and so is not counted at all. What is left is one count per side,
-/// read off the same `Source` column the binder walks.
-///
-/// # And the params run is checked the same way now
-///
-/// [`Stated::scalars`] is the arity the signature declares for the statement's
-/// `params`, which nothing checked before — the run lost its mark when
-/// `Param<N, T>` was deleted, so a statement that passed two scalars to a
-/// routine taking three bound a zero at run time. `Const<i32>` gives it back,
-/// and a statement short of what the signature claims is refused here.
 fn arity_problem(
     k: &Stated,
     kernel: &str,
@@ -469,11 +319,7 @@ fn arity_problem(
     let p = k.pointers();
     let (reads, writes) = (p.reads, p.writes);
     let (opt_reads, opt_writes) = (p.optional_reads, p.optional_writes);
-    // Read side only, and the asymmetry is deliberate: a pair is
-    // `(output, input)`, so its output half is already in `op.outputs` and
-    // the write side compares flat. Parameters that write STATE rather than a
-    // result -- `rope::rope_write_kv_bf16`'s `k_pages` -- are counted on
-    // neither side; the vocabulary cannot yet declare them.
+
     let aliased = k.in_place().len().min(op.inputs.len());
     let placed = op.inputs.len() + weights;
     let read_problem = if reads > placed || reads + opt_reads < placed.saturating_sub(aliased) {
@@ -516,36 +362,14 @@ fn arity_problem(
     }
 }
 
-/// `""` or `"s"`.
 const fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Load-time check of a traced form against the kernel table, catching three
-/// failures that would otherwise surface at runtime:
-///
-/// 1. a `whole` kernel stated inside a [`OpKind::Peel`] region, which gives
-///    it a row window it cannot honour;
-/// 2. a launched symbol nothing declares;
-/// 3. operand counts that disagree with the routine's.
-///
-/// The table is [`Backend::of_family`]'s answer, which is the authoring
-/// surface, not the executing device — see [`Backend`] before trusting this
-/// for Vulkan or WGPU. Reads are compared against `inputs + weights`
-/// together, since a weight and an input are both `const T*`.
-///
-/// Returns the failures rather than panicking, so a caller can name the
-/// family it was loading.
 pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     let mut problems = Vec::new();
     let backend = Backend::of_family(&plan.family);
-    // THE RUNTIME VOCABULARY IS CLOSED (B3's rule, late). A tier-1 name
-    // must be one the floor declares — every backend answers those. A
-    // tier-2 name is the plane's own and not enumerable from rows, so the
-    // closure the check can hold is the SPELLING: plane keys are dotted
-    // (`fa2.prefill`, `attn.score`), floor names are not — an undotted
-    // name outside the floor's list is a typo'd tier-1, refused at load
-    // instead of surfacing as an unanswered bind at fire.
+
     for b in &plan.runtime {
         if kernels::runtime::tier1(&b.name).is_none() && !b.name.contains('.') {
             problems.push(format!(
@@ -555,12 +379,9 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
             ));
         }
     }
-    // Countdowns over the flat op list; both kinds' regions are consecutive
-    // and sit immediately after the op.
+
     let mut peeled = 0usize;
-    // A value-producing guard owns its outputs, so the launches inside it
-    // record none and their writes must not be compared against their own
-    // `outputs`. Stays zero for a guard that declares nothing.
+
     let mut regioned = 0usize;
     for op in &plan.ops {
         let inside_peel = peeled > 0;
@@ -585,49 +406,6 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                 params,
                 ..
             } => match backend.and_then(|b| stated_in(b, kernel)) {
-                // A SEMANTIC TEXT NAMES CANON ROLES, and a canon role has no
-                // signature to check against -- that is what makes it
-                // semantic. `canon::matmul` is the reading every backend's
-                // projection is a reading OF; `seam::admits` matches producers
-                // by exactly this spelling, and `lower::walk` refuses a
-                // semantic family outright (`Uncovered::UnknownBackend`), so
-                // nothing downstream ever tries to fire one.
-                //
-                // This arm refused all thirteen of `qwen3_5_moe_mlp_block`'s,
-                // which made every SEMANTIC text unbuildable: `finish` runs
-                // this check and panics. Two callers in `engine` and four
-                // gates could not construct the fragment they exist to walk.
-                // It went unnoticed because their targets did not compile
-                // either -- see the commits either side of this one.
-                //
-                // A backend-less family stating a BACKEND symbol is still a
-                // defect, and still refused, because a text that names
-                // `attn::…` has picked a backend without saying so.
-                // A BACKEND-LESS FAMILY IS CHECKED AGAINST EVERY TABLE.
-                //
-                // `Backend::of_family` answers `None` when the family names no
-                // backend, and this arm then refused every statement in the
-                // text -- so `finish`, which runs this check and panics, made
-                // every semantic text unconstructable. `qwen3_5_moe_mlp_block`
-                // lost thirteen statements, `llama_like` and `qwen3_5_hybrid`
-                // their whole bodies. Two callers in `engine` and four gates
-                // could not build the fragment they exist to walk; it went
-                // unnoticed because their targets did not compile either.
-                //
-                // The doc on `of_family` says a semantic trace "states no
-                // kernels at all", and that is no longer true of any of them:
-                // the semantic op variants retired, so a semantic text states
-                // the same `layout::embed_bf16` and `attn::write_kv_to_pages`
-                // its CUDA reading does, plus the `canon::*` roles that ARE
-                // backend-less (`seam::admits` reads producers by exactly that
-                // spelling and nothing fires one -- `lower::walk` refuses a
-                // backend-less family outright).
-                //
-                // So a text that names no backend is held to the UNION: a
-                // symbol some table declares is a symbol, and a typo is still
-                // a typo. What is lost is the per-backend arity check, which
-                // needs a table to be against, and that is exactly the check
-                // the family's own reading gets when it is compiled.
                 None if backend.is_none()
                     && (kernel.starts_with("canon::")
                         || stated_in(Backend::Cuda, kernel).is_some()
@@ -637,7 +415,7 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                     plan.family,
                     match backend {
                         Some(b) => format!("{b:?}").to_lowercase(),
-                        // A semantic trace states no kernels.
+
                         None => "backend's".to_string(),
                     }
                 )),
@@ -647,44 +425,11 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                     plan.family
                 )),
                 Some(k) => {
-                    // A `scale.` name is a constant riding the weight slot,
-                    // not a pointer: it reaches the arm through
-                    // `DispatchCtx::scales`, so counting it as an operand
-                    // would make `norm::scalar_mul` look one short.
                     let bound = weights.iter().filter(|w| !w.starts_with("scale.")).count();
                     if let Some(why) = arity_problem(&k, kernel, bound, op, inside_value_region) {
                         problems.push(format!("{}: {why}", plan.family));
                     }
-                    // THE PARAMS RUN, CHECKED THE WAY THE OPERANDS ALREADY
-                    // WERE. Nothing checked it before: the run lost its mark
-                    // when `Param<N, T>` was deleted, so a statement short of
-                    // what the signature claims bound a zero at run time and
-                    // the fire ran on it. `Const<i32>` gives the run an arity,
-                    // and this is where a statement short of it is refused --
-                    // at plan time, naming both counts.
-                    //
-                    // # ONLY WHERE THE STATEMENT HAS STARTED STATING THEM
-                    //
-                    // A run of length zero is not a short run: it is a symbol
-                    // whose scalars a hand ARM supplies, which is most of them
-                    // while the DSL stage of this migration is outstanding.
-                    // `model-ir` cannot tell the two apart -- whether a symbol
-                    // is bound from its column or fired by an arm is recorded
-                    // in `driver-cuda/src/bind/arms/`, which this crate does
-                    // not see and must not.
-                    //
-                    // So the check is aimed at the failure it can actually
-                    // establish, which is also the one §5.8 of
-                    // `.wiki/migration.md` names: a statement that carries SOME
-                    // scalars and not all of them. `dequant_fp8_e4m3`'s
-                    // `vec![0, rows, cols]` is that shape -- a placeholder hole
-                    // held open so `rows` would land at index 1 -- and a
-                    // builder that adds a `Const` without adding its value is
-                    // caught here rather than at the fire.
-                    //
-                    // WHAT COMPLETES IT: when `model-dsl` states every `Const`
-                    // for a symbol, drop the `!params.is_empty()` guard and the
-                    // check becomes total.
+
                     let wants = k.scalars();
                     if !params.is_empty() && params.len() < wants {
                         problems.push(format!(
@@ -704,8 +449,6 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     problems
 }
 
-/// Which outputs a stated kernel writes over which inputs. Takes the plan
-/// because the answer is the backend's.
 pub fn in_place_pairs(plan: &ForwardPlan, kernel: &str) -> Vec<(u32, u32)> {
     Backend::of_family(&plan.family)
         .and_then(|b| stated_in(b, kernel))
@@ -713,12 +456,6 @@ pub fn in_place_pairs(plan: &ForwardPlan, kernel: &str) -> Vec<(u32, u32)> {
         .unwrap_or_default()
 }
 
-/// Which outputs a semantic op writes over which inputs.
-///
-/// RETIRED with the semantic vocabulary: every statement is a
-/// [`OpKind::Launch`] now, and aliasing comes off the routine's own column
-/// ([`in_place_pairs`]). Kept because `Select` still launches nothing and
-/// callers still ask; it answers empty for everything.
 pub fn semantic_in_place(kind: &OpKind) -> &'static [(u32, u32)] {
     let _ = kind;
     &[]

@@ -47,55 +47,6 @@ pub struct f16(pub u16);
 #[repr(transparent)]
 pub struct fp8_e4m3(pub u8);
 
-pub trait Inst {
-    const CPP: &'static str;
-}
-
-impl Inst for bf16 {
-    const CPP: &'static str = "::pie::bf16";
-}
-
-impl Inst for f16 {
-    const CPP: &'static str = "::pie::f16";
-}
-
-impl Inst for fp8_e4m3 {
-    const CPP: &'static str = "::pie::fp8_e4m3";
-}
-
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct u16_(pub u16);
-
-impl Inst for u16_ {
-    const CPP: &'static str = "::pie::u16";
-}
-
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ssm_f32;
-
-impl Inst for ssm_f32 {
-    const CPP: &'static str = "::pie::ssm::f32";
-}
-
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ssm_state_bf16;
-
-impl Inst for ssm_state_bf16 {
-    const CPP: &'static str = "::pie::ssm::state_bf16";
-}
-
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct quant_f32;
-
-impl Inst for quant_f32 {
-    const CPP: &'static str = "::pie::quant::f32";
-}
-
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct MaybeConst<T>(pub Option<NonNull<T>>);
@@ -119,6 +70,7 @@ impl<T: 'static> kernels::Elem for MaybeConst<T> {
         write
     }
 
+    const CPP: &'static str = "void";
     const CPP_CONST: &'static str = "const void*";
     const CPP_MUT: &'static str = "void*";
     const TY_CONST: Ty = Ty::Buf;
@@ -270,12 +222,8 @@ macro_rules! ptr_abi {
                 }
             }
         }
-        $crate::arg_via_abi!(
-            *const $pointee,
-            *mut $pointee,
-            Option<NonNull<$pointee>>,
-            MaybeConst<$pointee>,
-        );
+        $crate::arg_via_abi!(addressed *const $pointee, *mut $pointee);
+        $crate::arg_via_abi!(Option<NonNull<$pointee>>, MaybeConst<$pointee>);
     };
 }
 
@@ -310,6 +258,7 @@ impl<E: kernels::Elem> kernels::Elem for Tensor<E> {
         unsafe { E::advance_write(write, elems) }
     }
 
+    const CPP: &'static str = E::CPP;
     const CPP_CONST: &'static str = E::CPP_CONST;
     const CPP_MUT: &'static str = E::CPP_MUT;
     const TY_CONST: Ty = E::TY_CONST;
@@ -334,6 +283,7 @@ impl kernels::Elem for bf16 {
         unsafe { write.add(elems) }
     }
 
+    const CPP: &'static str = "::pie::bf16";
     const CPP_CONST: &'static str = "const ::pie::bf16*";
     const CPP_MUT: &'static str = "::pie::bf16*";
     const TY_CONST: Ty = Ty::Bf16s;
@@ -352,6 +302,7 @@ impl kernels::Elem for f16 {
         unsafe { write.add(elems) }
     }
 
+    const CPP: &'static str = "::pie::f16";
     const CPP_CONST: &'static str = "const ::pie::f16*";
     const CPP_MUT: &'static str = "::pie::f16*";
     const TY_CONST: Ty = Ty::F16s;
@@ -680,23 +631,23 @@ pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
 
 elem_agrees!(bf16, f16, i32, i64, i8, u32, u8, u16, f32, c_void);
 
+/// THE ELEMENT A ROUTINE CAN INSTANTIATE AND BIND: its device text spells it
+/// (`Elem::CPP`) and its addresses bind (`Addressed`, one impl for every
+/// pointee). Both hold for every `points::Scalar`, which is what lets a
+/// family implementation delegate here at the floor's own bound.
 pub trait Pointee:
-    Inst
-    + kernels::routine::Elem<
-        Read: Abi + kernels::routine::Bind<crate::jit::ArgValue>,
-        Write: Abi
-                   + kernels::routine::Bind<crate::jit::ArgValue>
+    kernels::routine::Elem<
+        Read: kernels::routine::Bind<crate::jit::ArgValue>,
+        Write: kernels::routine::Bind<crate::jit::ArgValue>
                    + kernels::routine::BindMut<crate::jit::ArgValue>,
     >
 {
 }
 
 impl<T> Pointee for T where
-    T: Inst
-        + kernels::routine::Elem<
-            Read: Abi + kernels::routine::Bind<crate::jit::ArgValue>,
-            Write: Abi
-                       + kernels::routine::Bind<crate::jit::ArgValue>
+    T: kernels::routine::Elem<
+            Read: kernels::routine::Bind<crate::jit::ArgValue>,
+            Write: kernels::routine::Bind<crate::jit::ArgValue>
                        + kernels::routine::BindMut<crate::jit::ArgValue>,
         >
 {

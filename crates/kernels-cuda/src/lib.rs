@@ -33,7 +33,6 @@ pub mod comm;
 pub mod tile;
 
 pub mod attn;
-pub mod cascade;
 pub mod gemm;
 pub mod graph;
 pub mod layout;

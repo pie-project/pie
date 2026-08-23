@@ -1,5 +1,3 @@
-//! Trace data: symbolic SSA values, operations, plans and the recorder.
-
 mod builder;
 mod op;
 mod plan;

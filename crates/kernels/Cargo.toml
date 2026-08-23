@@ -12,34 +12,9 @@ publish = false
 name = "kernels"
 path = "src/lib.rs"
 
-# No dependencies, and none is wanted: a row in a backend's table must be
-# writable next to the .cu it describes without dragging a graph along.
 [dependencies]
-
-# The three shader backends' tables, so ONE test can compare them.
-#
-# `.wiki/kernel-x/refactor-bigplan.md` §1.1: the three are one table written
-# down three times -- 100/100 identical `launch`, 100/100 identical `axes`,
-# 94/100 `operands` -- and *nothing in the workspace compares them*, which is
-# why seven statements had drifted and nobody had noticed. This is that
-# comparison.
-#
-# A dev-dependency, so the cycle is legal: each of these depends on `kernels`,
-# and cargo permits a dev-dependency to point back. Nothing in `src` gains an
-# edge, so the shared crate stays the floor it is.
-[dev-dependencies]
-# The attribute half of the pair, so that `routine_derivation` can check the
-# DERIVED column and not only the argument table. `kernels-macros` depends on
-# `syn`, `quote` and `proc-macro2` and on nothing in this workspace, so there
-# is no cycle to break -- and a dev-dependency keeps it out of the crate's
-# real dependency graph, which `lib.rs:1522` is careful about: *"the macro
-# lives in `kernels-macros` because `routine!` takes a PATH"*.
+# `#[points]`, which reads a family trait on the floor and states its point
+# table beside it. The one edge the "no dependencies" line allows, and only
+# because it is not one at run time: a proc macro is a compiler plugin, so
+# nothing of `syn` reaches this crate's artifact.
 kernels-macros = { path = "../kernels-macros" }
-# `#[routine]` REGISTERS ITS ROW BY EXISTING, through a distributed slice, so a
-# test that exercises the attribute needs the slice's crate the same way a real
-# plane does. A dev-dependency: `src` gains no edge, and the floor stays a
-# floor.
-linkme.workspace = true
-kernels-metal = { path = "../kernels-metal" }
-kernels-vulkan = { path = "../kernels-vulkan" }
-kernels-wgpu = { path = "../kernels-wgpu" }

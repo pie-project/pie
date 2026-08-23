@@ -20,7 +20,7 @@ macro_rules! raise_abi {
                 }
             }
 
-            $crate::arg_via_abi!(*const $value);
+            $crate::arg_via_abi!(addressed *const $value);
         )*
     };
 }

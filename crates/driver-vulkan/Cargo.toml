@@ -96,7 +96,7 @@ ash = { version = "0.38", default-features = false, features = [
 # nothing from the authoring surface, which is what makes this a dev edge --
 # and what it was before the toolchain split is the same 4,469-line
 # `dsl::cuda` surface, linked into a VULKAN driver on every build.
-model-dsl = { path = "../model-dsl" }
+model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
 
 # `tests/checkpoint.rs` only: the tensor names and extents a real `.zt` states,
 # which is the one place a weight's SIZE exists -- `Arg::Weight` carries a name

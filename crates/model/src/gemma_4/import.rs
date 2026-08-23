@@ -41,7 +41,13 @@ pub fn import_hf<B: SfBase, W1: Dtype, K: KvDtype>(m: &Model<W1, K>) -> Import {
             i.write(format!("layer.{l}.ple_gate"), copy(format!("layer.{l}.per_layer_input_gate")));
             i.write(format!("layer.{l}.ple_proj"), copy(format!("layer.{l}.per_layer_projection")));
             i.write(format!("layer.{l}.ple_norm"), plus_one(format!("layer.{l}.post_per_layer_input_norm")));
-            i.write(format!("layer.{l}.ple_scalar"), scalar_of(format!("layer.{l}.post_per_layer_input_norm")));
+            // The HF release files this as a `[1]` tensor of its own, beside
+            // the norm rather than inside it -- `layers.{l}.layer_scalar`,
+            // which the legacy alias table reaches under the role name
+            // `scalar` (`shared/weight_names.rs`). A plain copy, then; the
+            // GGUF leg below still says `scalar_of`, whose form nobody has
+            // read a file for.
+            i.write(format!("layer.{l}.ple_scalar"), copy(format!("layer.{l}.layer_scalar")));
         }
     }
     i

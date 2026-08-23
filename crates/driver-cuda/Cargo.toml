@@ -320,7 +320,7 @@ kernels = { path = "../kernels" }
 # `src/` spells nothing from this crate at all. It used to arrive as part of
 # `model-compiler`, so the 4,469-line `dsl::cuda` surface was in every build
 # of this driver rather than only in its test binaries.
-model-dsl = { path = "../model-dsl" }
+model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
 kernels = { path = "../kernels" }
 # THE ARCHIVE CRATE STOOD HERE TOO, and its line is the one that predicted
 # its own removal: *"This line is kept because removing it is a separate
@@ -426,10 +426,6 @@ driver-api = { path = "../driver-api" }
 # It still RUNS, in both ABI jobs, because `cuda-12` and `cuda-13` each imply
 # `_cuda`. What the stanza buys is that the featureless job stops trying to
 # build a module that is not there.
-[[test]]
-name = "every_runtime_name_is_answered"
-required-features = ["_cuda"]
-
 [[test]]
 name = "attn_score_parity"
 required-features = ["_cuda"]

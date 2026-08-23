@@ -29,7 +29,7 @@ pub fn select(x: &Val, index: u32) -> Val {
 /// (`+=`) swaps the symbol to `gemm::act_x_w_acc` — see `AddAssign`.
 pub fn matmul(x: &Val, w: &MatW) -> Val {
     let (symbol, mut weights) = match w.gemm_symbol() {
-        None => (x.t.canon("matmul"), vec![w.name.clone()]),
+        None => (x.t.canon("gemm.matmul"), vec![w.name.clone()]),
         Some(symbol) => (symbol.to_string(), vec![w.name.clone()]),
     };
     weights.extend(w.scale_names());
@@ -56,7 +56,7 @@ pub fn matmul(x: &Val, w: &MatW) -> Val {
 /// forward's, which is the checkpoint's.
 pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
     let symbol = x.t.canon(if w.variant.is_plain() {
-        "rmsnorm"
+        "norm.rmsnorm"
     } else {
         "rmsnorm.gemma"
     });
@@ -82,7 +82,7 @@ pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
 
 /// `norm::add_bias`: `x[r, :] += bias`, in place.
 pub fn add_bias(x: &Val, w: &MatW) -> Val {
-    let symbol = x.t.canon("add_bias");
+    let symbol = x.t.canon("norm.add_bias");
     let id = x.t.with(w.layer, |b| {
         let shape = b.value_shape(x.id);
         let dtype = b.value_dtype(x.id);
@@ -103,7 +103,7 @@ pub fn add_bias(x: &Val, w: &MatW) -> Val {
 
 /// `attn::split_qkv_bf16`: packed `[N, q + 2kv]` into three.
 pub fn split_qkv(x: &Val, q_width: u32, kv_width: u32) -> (Val, Val, Val) {
-    let symbol = x.t.canon("split_qkv");
+    let symbol = x.t.canon("layout.split_qkv");
     let outs = x.t.with(x.layer, |b| {
         b.launch(
             &symbol,
@@ -150,7 +150,7 @@ pub fn rope(q: &Val, k: &Val, kind: RopeKind, n: RopeShape) -> (Val, Val) {
         n.theta.to_bits(),
         u32::from(n.interleaved),
     ];
-    let symbol = q.t.canon("rope");
+    let symbol = q.t.canon("rope.full");
     let (qo, ko) = q.t.with(q.layer, |b| {
         let positions = b.runtime_tensor("positions", None, Shape(vec![Dim::Tokens]), DType::I32);
         let q_shape = b.value_shape(q.id);
@@ -368,7 +368,7 @@ pub fn dense_gated_mlp(
 /// as fixed behaviour, so a lowered text states its own symbol and this
 /// `canon::` form appears only in backend-less description traces.
 pub fn swiglu(x: &Val, inter: u32) -> Val {
-    let symbol = x.t.canon("swiglu");
+    let symbol = x.t.canon("mlp.swiglu");
     let id = x.t.with(x.layer, |b| {
         b.launch(
             &symbol,
@@ -388,6 +388,23 @@ pub fn swiglu(x: &Val, inter: u32) -> Val {
 /// Description-trace paged attention over `kv`'s layer cache. Lowered texts
 /// state their attention kernel as their own launch; this `canon::` form is
 /// the backend-less description's.
+///
+/// THE ROLE AND NOT A POINT, deliberately, and the string survived the
+/// Attention migration unchanged for that reason. Probed the way `split_gdn`
+/// was: all three callers are on description traces (`llama_like`,
+/// `qwen3_5_full_attn_block`, `qwen3_5_hybrid`), whose family carries no
+/// plane suffix, so `Backend::of_family` answers `None`, `Trace::canon`
+/// spells `canon::attention` and no claim table is ever reached. Nothing
+/// claims a bare `canon = "attention"` on any plane and nothing ever did —
+/// a bound caller would have panicked at trace time, which is how the probe
+/// answers "description-only" without a test.
+///
+/// Spelling a point here would be a lie at two of the three sites: this one
+/// statement stands for the whole reading, and the family splits it into
+/// `attention.decode`, `attention.prefill` and `attention.masked` by a fire
+/// class the description does not carry. The role still exists in
+/// `canon::ROLES` — every dotted point above rides it — so the description
+/// keeps naming the role.
 pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
     let symbol = q.t.canon("attention");
     let id = q.t.with(Some(kv.l), |b| {
@@ -412,7 +429,7 @@ pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
 /// Expert-bank matmul: `moe::moe_grouped_gemm`, the selector as the
 /// LAST input — the convention the retired `Matmul::selector` recorded.
 pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
-    let symbol = x.t.canon("matmul_select");
+    let symbol = x.t.canon("moe.matmul_select");
     let id = x.t.with(w.layer, |b| {
         b.launch(
             &symbol,
@@ -432,7 +449,7 @@ pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
 /// Router top-k: `moe::topk_softmax`, `(indices, weights)` in that
 /// order, `k` on the params run.
 pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
-    let symbol = logits.t.canon("topk.softmax");
+    let symbol = logits.t.canon("moe.topk_softmax");
     let outs = logits.t.with(logits.layer, |b| {
         b.launch_with_params(
             &symbol,
@@ -456,7 +473,7 @@ pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
 
 /// `moe::token_batched_weighted_sum`; operand order: weights, value.
 pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
-    let symbol = weights.t.canon("weighted_sum");
+    let symbol = weights.t.canon("moe.weighted_sum");
     let id = weights.t.with(weights.layer, |b| {
         let shape = match b.value_shape(x.id).0.as_slice() {
             [Dim::Tokens, _, d] => Shape(vec![Dim::Tokens, *d]),
@@ -479,7 +496,7 @@ pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
 
 /// `mlp::sigmoid_dot_scalar_gate_add`; operands: value, gate, base.
 pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
-    let symbol = x.t.canon("sigmoid_gate_add");
+    let symbol = x.t.canon("moe.sigmoid_gate_add");
     let id = x.t.with(x.layer, |b| {
         let shape = b.value_shape(base.id);
         b.launch(
@@ -499,7 +516,7 @@ pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
 
 /// `mlp::sigmoid_gate_inplace_bf16`: `x *= sigmoid(gate)`.
 pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
-    let symbol = x.t.canon("sigmoid_gate_mul");
+    let symbol = x.t.canon("gate.sigmoid_mul");
     let id = x.t.with(x.layer, |b| {
         let shape = b.value_shape(x.id);
         b.launch(
@@ -517,11 +534,17 @@ pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
     }
 }
 
-/// GDN two-way split at `w0`. Description form (`canon::`); no plane
-/// declares a split routine, and a lowered text states its own — CUDA's
-/// `layout::split_bf16_rows` and `layout::split_qwen_gdn_ba`.
+/// GDN two-way split at `w0` — the point `layout.split_rows` names.
+///
+/// Description form only: both callers are on description traces
+/// (`qwen3_5_gdn_block`, `qwen3_5_hybrid`), whose family carries no plane
+/// suffix, so `Trace::canon` spells `canon::layout.split_rows` and never
+/// reaches a claim table. The bound texts state their own cut instead —
+/// CUDA's `layout::split_bf16_rows` for the leading/trailing divide and
+/// `layout::split_qwen_gdn_ba` for the interleaved one, which this single
+/// description covers at both of its call sites.
 pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
-    let symbol = x.t.canon("split_gdn");
+    let symbol = x.t.canon("layout.split_rows");
     let outs = x.t.with(x.layer, |b| {
         b.launch(
             &symbol,
@@ -546,7 +569,7 @@ pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
 /// `head_dim` on the params run (the swept signature's one `Const`).
 pub fn split_q_gate(x: &Val, heads: u32, head_dim: u32) -> (Val, Val) {
     let w = heads * head_dim;
-    let symbol = x.t.canon("split_q_gate");
+    let symbol = x.t.canon("layout.split_q_gate");
     let outs = x.t.with(x.layer, |b| {
         b.launch_with_params(
             &symbol,
@@ -574,7 +597,7 @@ pub fn split_q_gate(x: &Val, heads: u32, head_dim: u32) -> (Val, Val) {
 pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
     let mut weights = vec![w.name.clone()];
     weights.extend(w.bias.clone());
-    let symbol = x.t.canon("causal_conv1d");
+    let symbol = x.t.canon("ssm.causal_conv1d");
     let id = x.t.with(Some(w.layer), |b| {
         let shape = b.value_shape(x.id);
         let conv_dim = match shape.0.as_slice() {
@@ -614,7 +637,7 @@ pub fn gdn_prep(
     value_dim: u32,
     conv_dim: u32,
 ) -> (Val, Val, Val, Val, Val) {
-    let symbol = qkv.t.canon("gdn_prep");
+    let symbol = qkv.t.canon("ssm.gdn_prep");
     let outs = qkv.t.with(Some(w.layer), |bld| {
         bld.launch_with_params(
             &symbol,
@@ -668,7 +691,7 @@ pub fn gdn_prep(
 /// GDN recurrence over `rs`'s layer state. Description form (`canon::`);
 /// a lowered text states its own recurrence launch.
 pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> Val {
-    let symbol = rs.t.canon("gated_delta");
+    let symbol = rs.t.canon("ssm.gated_delta");
     let id = rs.t.with(Some(rs.l), |b| {
         let shape = b.value_shape(v.id);
         b.launch(
@@ -715,9 +738,9 @@ impl std::ops::AddAssign<Val> for Val {
     /// `gemm::act_x_w_acc` and takes the residual); otherwise state
     /// `norm::residual_add`.
     fn add_assign(&mut self, rhs: Val) {
-        let plain = rhs.t.canon("matmul");
-        let acc = rhs.t.canon("matmul.acc");
-        let add = rhs.t.canon("residual_add");
+        let plain = rhs.t.canon("gemm.matmul");
+        let acc = rhs.t.canon("gemm.matmul_acc");
+        let add = rhs.t.canon("norm.residual_add");
         let folded_or_added = rhs.t.with(rhs.layer, |b| {
             if b.try_fold_beta(rhs.id, self.id, &plain, &acc) {
                 rhs.id

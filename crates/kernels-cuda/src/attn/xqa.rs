@@ -107,13 +107,14 @@ impl kernels::Elem for XqaIoHead {
         write
     }
 
+    const CPP: &'static str = "IOHead";
     const CPP_CONST: &'static str = "const IOHead*";
     const CPP_MUT: &'static str = "OutputHead*";
     const TY_CONST: Ty = Ty::Buf;
     const TY_MUT: Ty = Ty::BufMut;
 }
 
-crate::arg_via_abi!(*const XqaIoHead);
+crate::arg_via_abi!(addressed *const XqaIoHead);
 
 impl crate::jit::Abi for *mut XqaIoHead {
     const CPP: &'static str = "OutputHead*";
@@ -132,7 +133,7 @@ impl crate::jit::Abi for *mut XqaIoHead {
     }
 }
 
-crate::arg_via_abi!(*mut XqaIoHead);
+crate::arg_via_abi!(addressed *mut XqaIoHead);
 
 pub struct XqaVariant {
     pub unit: &'static str,

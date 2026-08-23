@@ -35,19 +35,19 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::embed(&ids, &m.embed);
+        let mut y = kernels::layout::embed(&ids, &m.embed);
 
         for (l, w) in m.layers.iter().enumerate() {
             let l = l as u32;
-            let x = kernels::rmsnorm(&y, &w.attn_norm);
+            let x = kernels::norm::rmsnorm(&y, &w.attn_norm.weight, w.attn_norm.eps);
             let o = latent_attention(&x, &inputs, &w.attn, l);
-            let o = if TP > 1 { kernels::all_reduce(&o) } else { o };
-            y = kernels::add(&y, &o);
+            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
+            y = kernels::norm::residual_add(&o, &y);
 
-            let x = kernels::rmsnorm(&y, &w.mlp_norm);
+            let x = kernels::norm::rmsnorm(&y, &w.mlp_norm.weight, w.mlp_norm.eps);
             let f = match &w.mlp {
-                Mlp::Dense { gate_up, down, inter } => kernels::matmul(
-                    &kernels::swiglu(&kernels::matmul(&x, gate_up), *inter),
+                Mlp::Dense { gate_up, down, inter } => kernels::gemm::matmul(
+                    &kernels::mlp::swiglu(&kernels::gemm::matmul(&x, gate_up), *inter),
                     down,
                 ),
                 Mlp::Routed {
@@ -61,8 +61,8 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
                     norm_weights,
                     scaling,
                 } => {
-                    let routes = kernels::topk_sigmoid(
-                        &kernels::matmul(&x, router),
+                    let (routes, weights) = kernels::moe::topk_sigmoid(
+                        &kernels::gemm::matmul(&x, router),
                         *experts,
                         *top_k,
                         *norm_weights,
@@ -70,27 +70,30 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
                     );
                     let shared = shared.as_ref().map(|s| {
                         let act =
-                            kernels::swiglu(&kernels::matmul(&x, &s.gate_up), s.inter);
-                        kernels::matmul(&act, &s.down)
+                            kernels::mlp::swiglu(&kernels::gemm::matmul(&x, &s.gate_up), s.inter);
+                        kernels::gemm::matmul(&act, &s.down)
                     });
-                    let hidden = kernels::matmul_select(&x, gate_up, &routes);
-                    let act = kernels::swiglu(&hidden, *inter);
-                    let routed =
-                        kernels::weighted_sum(&kernels::matmul_select(&act, down, &routes), &routes);
+                    let hidden = kernels::moe::matmul_select(&x, gate_up, &routes);
+                    let act = kernels::mlp::swiglu(&hidden, *inter);
+                    let routed = kernels::moe::weighted_sum(
+                        &kernels::moe::matmul_select(&act, down, &routes),
+                        &weights,
+                    );
                     match shared {
                         None => routed,
-                        Some(dense) => kernels::add(&routed, &dense),
+                        Some(dense) => kernels::norm::residual_add(&dense, &routed),
                     }
                 }
             };
-            let f = if TP > 1 { kernels::all_reduce(&f) } else { f };
-            y = kernels::add(&y, &f);
+            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            y = kernels::norm::residual_add(&f, &y);
         }
 
-        let x = kernels::rmsnorm(&y, &m.final_norm);
+        let fin = &m.final_norm;
+        let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
         let logits = match &m.head {
-            Head::Tied => kernels::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::lm_head(&x, bank),
+            Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
+            Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
         };
 
         logits
@@ -101,32 +104,34 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
     let pages = inputs.kv(&a.kv);
     let positions = inputs.positions();
 
-    let q_a = kernels::rmsnorm(&kernels::matmul(x, &a.q_a_proj), &a.q_a_norm);
-    let q_b = kernels::matmul(&q_a, &a.q_b_proj);
-    let kv_a = kernels::matmul(x, &a.kv_a_proj);
+    let q_a = kernels::gemm::matmul(x, &a.q_a_proj);
+    let q_a = kernels::norm::rmsnorm(&q_a, &a.q_a_norm.weight, a.q_a_norm.eps);
+    let q_b = kernels::gemm::matmul(&q_a, &a.q_b_proj);
+    let kv_a = kernels::gemm::matmul(x, &a.kv_a_proj);
     seam::at(seam::ATTN_QV, (&q_b, &kv_a), l);
 
     let selection = index_select(x, &q_a, inputs, a, &positions);
 
-    let (kv_c, k_pe) = kernels::mla_latents_rope(
+    let (kv_c, k_pe) = kernels::mla::latents_rope(
         &kv_a,
+        &positions,
         &a.kv_a_norm,
         a.kv_lora_rank,
         a.qk_rope_head_dim,
         a.theta,
-        &positions,
     );
-    kernels::kv_append_mla(&kv_c, &k_pe, &pages);
+    kernels::mla::kv_append(&kv_c, &k_pe, &pages);
 
-    let (q_nope, q_pe) = kernels::split_q_b(&q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
-    let q_pe = kernels::rope_partial_q(&q_pe, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta, &positions);
-    let q = kernels::mla_absorb_q_pe(
+    let (q_nope, q_pe) = kernels::mla::split_q_b(&q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
+    let q_pe = kernels::rope::partial_q(&q_pe, &positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta);
+    let q = kernels::mla::absorb_q_pe(
         &q_nope,
         &q_pe,
         &a.kv_b_proj,
         a.heads,
         a.kv_lora_rank,
         a.qk_nope_head_dim,
+        a.v_head_dim,
     );
     seam::at(seam::ATTN_Q, (&q,), l);
 
@@ -134,26 +139,27 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
     let (dq, pq) = q.split(&one);
     let (d_sel, p_sel) = selection.split(&one);
     let scored = merge![
-        kernels::mla_attention_decode_selected(&dq, &pages, &d_sel, a.heads, a.kv_lora_rank, a.sm_scale),
-        kernels::mla_attention_prefill_selected(
+        kernels::mla::attention_decode_selected(&dq, &d_sel, &pages, a.heads, a.kv_lora_rank, a.sm_scale),
+        kernels::mla::attention_prefill_selected(
             &kernels::query_windows(&pq),
-            &pages,
             &p_sel,
+            &pages,
             a.heads,
             a.kv_lora_rank,
             a.sm_scale,
         ),
     ];
 
-    let v = kernels::mla_absorb_out(
+    let v = kernels::mla::absorb_out(
         &scored,
         &a.kv_b_proj,
         a.heads,
         a.kv_lora_rank,
         a.v_head_dim,
+        a.qk_nope_head_dim,
     );
     seam::at(seam::ATTN_OUT, (&v,), l);
-    kernels::attention_landing(&v, &a.o_proj, l)
+    kernels::gemm::attention_landing(&v, &a.o_proj, l)
 }
 
 fn index_select<W1: Dtype>(
@@ -165,23 +171,23 @@ fn index_select<W1: Dtype>(
 ) -> Value {
     let ix = &a.indexer;
     let keys = inputs.kv(&ix.keys);
-    let k = kernels::index_layernorm_rope(
-        &kernels::matmul(x, &ix.k_proj),
+    let k = kernels::index::layernorm_rope(
+        &kernels::gemm::matmul(x, &ix.k_proj),
+        positions,
         &ix.k_norm,
         &ix.k_norm_bias,
         a.qk_rope_head_dim,
         a.theta,
-        positions,
     );
-    kernels::kv_append_index(&k, &keys);
-    let q = kernels::index_rope(
-        &kernels::matmul(q_a, &ix.q_proj),
+    kernels::index::kv_append(&k, &keys);
+    let q = kernels::index::rope(
+        &kernels::gemm::matmul(q_a, &ix.q_proj),
+        positions,
         ix.heads,
         ix.head_dim,
         a.qk_rope_head_dim,
         a.theta,
-        positions,
     );
-    let weights = kernels::matmul(q_a, &ix.weights_proj);
-    kernels::index_topk(&q, &weights, &keys, ix.heads, ix.head_dim, ix.top_k)
+    let weights = kernels::gemm::matmul(q_a, &ix.weights_proj);
+    kernels::index::topk(&q, &weights, &keys, ix.heads, ix.head_dim, ix.top_k)
 }

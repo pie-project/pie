@@ -21,7 +21,71 @@ pub mod lora;
 #[cfg(feature = "_cuda")]
 pub mod quant;
 
-#[routine(canon = matmul, out(y = rows(act) x weight(w)))]
+/// The plane's payload, forgotten down to an address. cuBLAS's routine below
+/// takes `Tensor<c_void>` because the dtype it multiplies in is the handle's
+/// business, not the operand's; a point quantifies over `T: Scalar`, so the
+/// three bodies hand the pointer across and keep nothing else.
+fn opaque_in<T: kernels::points::Scalar>(x: In<Tensor<T>>) -> In<Tensor<c_void>> {
+    In {
+        ptr: x.ptr.cast(),
+        rows: x.rows,
+        width: x.width,
+    }
+}
+
+fn opaque_const<T: kernels::points::Scalar>(w: Const<Tensor<T>>) -> Const<Tensor<c_void>> {
+    Const { v: w.v.cast() }
+}
+
+fn opaque_out<T: kernels::points::Scalar>(y: Out<Tensor<T>>) -> Out<Tensor<c_void>> {
+    Out {
+        ptr: y.ptr.cast(),
+        rows: y.rows,
+        width: y.width,
+    }
+}
+
+/// The `Gemm` family, claimed. `matmul` delegates to the cuBLAS routine that
+/// already fires it; the two purpose-wearing points claim by calling this
+/// plane's own `matmul`, which is what the retired `canon::DEFAULTS` table
+/// used to say from a distance.
+///
+/// `attention_landing`'s `layer` is stated and unread here: cuBLAS needs no
+/// layer, and the driver finds the attention output by the statement's own
+/// layer tag, which the DSL records beside the op rather than in its params.
+#[kernels_macros::claims]
+impl kernels::points::Gemm for Ctx<'_> {
+    fn matmul<T: kernels::points::Scalar>(
+        &self,
+        act: In<Tensor<T>>,
+        w: Const<Tensor<T>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        act_x_wt_bf16(self, opaque_in(act), opaque_const(w), opaque_out(y))
+    }
+
+    fn lm_head<T: kernels::points::Scalar>(
+        &self,
+        act: In<Tensor<T>>,
+        w: Const<Tensor<T>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        self.matmul(act, w, y)
+    }
+
+    fn attention_landing<T: kernels::points::Scalar>(
+        &self,
+        act: In<Tensor<T>>,
+        w: Const<Tensor<T>>,
+        layer: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = layer;
+        self.matmul(act, w, y)
+    }
+}
+
+#[routine(canon = "gemm.matmul", out(y = rows(act) x weight(w)))]
 pub fn act_x_wt_bf16(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
@@ -65,7 +129,7 @@ pub fn act_x_w(
     act_x_wt_bf16_beta(ctx, act, w, y, beta)
 }
 
-#[routine(canon = "matmul.acc", out(y = like(y)))]
+#[routine(canon = "gemm.matmul_acc", out(y = like(y)))]
 pub fn act_x_w_acc(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,

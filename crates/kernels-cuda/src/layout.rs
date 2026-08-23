@@ -48,7 +48,135 @@ const fn this_family(refusal: Refusal) -> Refusal {
     }
 }
 
-#[routine(canon = split_rows)]
+/// A stated width as the routines here spell one. A declaration states `u32`
+/// because a width is not negative; a routine takes `i32` because the device
+/// text does.
+fn stated_width(width: u32, what: &'static str) -> Result<i32, Refusal> {
+    i32::try_from(width).map_err(|_| Refusal::Wide {
+        what,
+        at: i64::from(width),
+        max: i64::from(i32::MAX),
+    })
+}
+
+/// Whether the element a statement rides is the one this family's rows take.
+///
+/// Which axes a plane serves is a runtime truth, never a declared list, and
+/// cuda's cuts are ROWS rather than open templates: `split_rows`,
+/// `split_qkv` and `split_q_gate` are each instantiated at `::pie::bf16` by
+/// a literal symbol, so there is no f16 row to fire and no host arithmetic
+/// that would make one. The compare is what makes the casts below sound —
+/// past it, `T` IS `bf16`.
+fn cuts_bf16<T: kernels::points::Scalar>() -> bool {
+    <T as kernels::Elem>::TY_MUT == <bf16 as kernels::Elem>::TY_MUT
+}
+
+fn as_bf16_in<T: kernels::points::Scalar>(x: In<Tensor<T>>) -> In<Tensor<bf16>> {
+    In {
+        ptr: x.ptr.cast::<bf16>(),
+        rows: x.rows,
+        width: x.width,
+    }
+}
+
+fn as_bf16_out<T: kernels::points::Scalar>(y: Out<Tensor<T>>) -> Out<Tensor<bf16>> {
+    Out {
+        ptr: y.ptr.cast::<bf16>(),
+        rows: y.rows,
+        width: y.width,
+    }
+}
+
+/// The `Layout` family, claimed. Each body is a delegation to the routine
+/// that already fires the point; the stated widths ride the declaration
+/// because the STATEMENT states them and its results are sized from them,
+/// while the routines read the same numbers back off the rectangles they
+/// were handed. `split_q_gate` is the one that passes a width through — the
+/// per-head interleave is a pitch no half's rectangle carries.
+///
+/// Two points stay on the floor's default body, and each absence is a
+/// measured row rather than an oversight:
+///
+/// * `layout.embed` — `embed_bf16` takes `vocab`, the table's ROW count,
+///   and clamps every id against it so a runaway wire payload reads row
+///   zero instead of past the largest tensor in the model. The declaration
+///   carries the table as a `Const`, which is an address and no rectangle,
+///   so the row count is nowhere in the slots to read; a delegation could
+///   only invent a bound, and inventing `i32::MAX` would retire the clamp.
+///   The routine keeps its own claim, so the point still resolves.
+/// * `layout.select` — no plane has a kernel for a layer slice, which is
+///   the gap the declaration exists to measure.
+#[kernels_macros::claims]
+impl kernels::points::Layout for Ctx<'_> {
+    fn split_qkv<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        q_width: u32,
+        kv_width: u32,
+        q: Out<Tensor<T>>,
+        k: Out<Tensor<T>>,
+        v: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        // Stated and unread: `split_qkv_bf16` takes the two halves' widths
+        // off `q` and `k`, which the statement sized from these very
+        // numbers.
+        let _ = (q_width, kv_width);
+        if !cuts_bf16::<T>() {
+            return Err(Refusal::Absent {
+                what: "layout.split_qkv",
+            });
+        }
+        crate::driver_internal::split_qkv_bf16(
+            self,
+            as_bf16_in(packed),
+            as_bf16_out(q),
+            as_bf16_out(k),
+            as_bf16_out(v),
+        )
+    }
+
+    fn split_q_gate<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        head_dim: u32,
+        q: Out<Tensor<T>>,
+        gate: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let head_dim = stated_width(head_dim, "the head pitch this cut states")?;
+        if !cuts_bf16::<T>() {
+            return Err(Refusal::Absent {
+                what: "layout.split_q_gate",
+            });
+        }
+        crate::driver_internal::split_q_gate_bf16(
+            self,
+            as_bf16_in(packed),
+            as_bf16_out(q),
+            as_bf16_out(gate),
+            Const::new(head_dim),
+        )
+    }
+
+    fn split_rows<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        width: u32,
+        left: Out<Tensor<T>>,
+        right: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        // Stated and unread, as above: `split_bf16_rows` divides where the
+        // two halves' own rectangles say it divides.
+        let _ = width;
+        if !cuts_bf16::<T>() {
+            return Err(Refusal::Absent {
+                what: "layout.split_rows",
+            });
+        }
+        split_bf16_rows(self, as_bf16_in(x), as_bf16_out(left), as_bf16_out(right))
+    }
+}
+
+#[routine(canon = "layout.split_rows")]
 pub fn split_bf16_rows(
     ctx: &Ctx<'_>,
     src: In<Tensor<bf16>>,
@@ -416,7 +544,7 @@ pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(weight.cast()) && aligned16(y.cast())
 }
 
-#[routine(canon = embed)]
+#[routine(canon = "layout.embed")]
 pub fn embed_bf16(
     ctx: &Ctx<'_>,
     weight: Const<Tensor<bf16>>,

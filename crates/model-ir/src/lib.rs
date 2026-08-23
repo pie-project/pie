@@ -1,6 +1,3 @@
-//! Model IR: traced ops, symbolic shapes, seams and kernel checks.
-//! plan only names symbols they cover.
-
 pub mod facts;
 pub mod kernels;
 pub mod plan;
