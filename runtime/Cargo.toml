@@ -34,7 +34,7 @@ opentelemetry-semantic-conventions = "0.27"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 wasmtime = { version = "41.0.3", features = ["pooling-allocator"] }
 wasmtime-wasi = "41.0.3"
-wasmtime-wasi-http = "41.0.3"
+wasmtime-wasi-http = "48.0.0"
 bytes = "1.10.1"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 dashmap = "6.1.0"
