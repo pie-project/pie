@@ -120,6 +120,45 @@
 
 namespace pie::attn {
 
+/// Device mirror of `driver_cuda::bind::abi::KvCacheScheme`.
+///
+/// The host enum cannot cross: its header pulls `<cstdint>`, which NVRTC
+/// answers 0 of 31 times. `driver-cuda/tests/enum_mirrors.rs` reads THIS
+/// file and compares every enumerator against the Rust it mirrors, so it is
+/// a checked mirror rather than a commented one.
+enum class KvScheme : u8 {
+    Native = 0,
+    Fp8PerTensor = 1,
+    Int8PerTokenHead = 2,
+    Fp8PerTokenHead = 3,
+    Fp4Block = 4,
+};
+
+/// Device mirror of `driver_cuda::dtype::DType`. Only `BF16`, `FP8_E4M3`
+/// and `FP8_E5M2` are read here, but every enumerator is mirrored and checked:
+/// a partial mirror is a renumbering waiting to happen.
+enum class KvDType : u8 {
+    BF16 = 0,
+    FP16 = 1,
+    FP32 = 2,
+    INT8 = 3,
+    INT32 = 4,
+    INT64 = 5,
+    UINT8 = 6,
+    FP8_E4M3 = 7,
+    FP8_E5M2 = 8,
+    INT4_PACKED = 9,
+    // Added when `driver-cuda`'s `DType` grew them. Neither is switched on
+    // here and neither ever will be -- an MXFP4 weight is unpacked before it
+    // reaches a paged-attention kernel, and E8M0 is a block-scale companion,
+    // never a tensor a kernel reads as a value. They are mirrored because the
+    // rule above says every enumerator is, and because the rule's whole point
+    // is that appending is safe right up until someone inserts.
+    MXFP4_PACKED = 10,
+    E8M0 = 11,
+};
+
+
 // One block per current-step token. Threads stride over the (h_kv * head_dim)
 // destination row.
 //

@@ -248,17 +248,15 @@ fn allowlists() -> Allowlists {
             // happens to be the same golden-ratio word; not a keyed-RNG
             // transcription.
             "crates/engine/src/pipeline/offload.rs",
-            // The staged lora table's fingerprint, a splitmix mixer over what
-            // a captured lora body bakes. Same word, same reason, and it is
-            // here rather than deduplicated because it has to agree with the
-            // capture it fingerprints, branch for branch.
-            //
-            // Two C++ siblings used to sit beside it — `llama_like.cpp`'s
-            // NS-3 spatial-split plan fingerprint and `dispatch.cu`'s
-            // stage-hook `hash_combine` — and a Rust `model/llama_like.rs`
-            // carrying the NS-3 layout key. All three went with the C++
-            // driver and the module that had no caller.
-            "crates/driver-cuda/src/fire/lora.rs",
+            // driver-cuda/src/fire/lora.rs STOOD HERE — the staged lora
+            // table's fingerprint, a splitmix mixer over what a captured lora
+            // body baked, allowlisted because it had to agree with the
+            // capture it fingerprinted branch for branch. Two C++ siblings
+            // and a Rust `model/llama_like.rs` had already gone with the C++
+            // driver; the file itself went with R2 (no point declares the
+            // lora correction, so nothing fired the staging). An allowlist
+            // entry for a file that is not there is what
+            // `allowlisted_paths_still_exist` catches.
             // boost-style `hash_combine` for the GEMM autotune cache key; the
             // golden-ratio word again, and nothing to do with the PTIR stream.
             // These have moved twice — `driver-cuda/ops/` to `kernels-cuda/ops/`

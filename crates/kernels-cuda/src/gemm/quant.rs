@@ -1086,6 +1086,23 @@ unsafe fn int8_w_bf16_act(
     }
 }
 
+/// The quantised dense GEMM, over any weight a [`WeightView`] describes.
+///
+/// NO CALLER, AS OF THE ROUTINE FOLD, AND THAT IS A MEASUREMENT RATHER THAN
+/// AN OVERSIGHT. Three `#[routine]`s in `gemm.rs` were its entry points —
+/// `act_x_wt_channel_scaled`, `act_x_wt_grouped_scaled`,
+/// `act_x_wt_mxfp4_marlin` — and each was reached by the legacy driver by
+/// SYMBOL and by nothing else, so all three went with the registry.
+///
+/// What would give it one is a POINT. `Gemm::matmul` declares
+/// `w: Const<Self::Tensor<T>>` — one plane at the statement's element — and
+/// every arm below takes a bank: codes, a scale plane, a quantisation kind
+/// and a group size. That is the `Bank<R: Repr>` payload `.wiki/baker.md`
+/// names and the floor does not carry yet; `moe.matmul_select` is the one
+/// point that reaches a bank today, and it does it through a slot the MoE
+/// family declares for itself. Until a dense point can say the same thing,
+/// this file is the arithmetic with nothing to state it — kept whole,
+/// because deleting a capability no declaration replaces is not a fold.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn act_x_w(
     handle: *mut c_void,
@@ -1254,135 +1271,4 @@ fn stream_of(handle: *mut c_void) -> *mut c_void {
     let status = unsafe { cublasGetStream_v2(handle.cast::<cublasContext>(), &raw mut stream) };
     check(status, "cublasGetStream");
     stream.cast()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn act_x_wt_channel_scaled(
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    w_dtype: i32,
-    w_nbytes: usize,
-    scale: *const c_void,
-    scale_dtype: i32,
-    scale_numel: usize,
-    _zero_point: *const c_void,
-    _channel_axis: i32,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    let view = WeightView {
-        data: w,
-        dtype: w_dtype,
-        nbytes: w_nbytes,
-        scale_data: scale,
-        scale_dtype,
-        scale_numel,
-        quant_kind: quant_kind::PER_CHANNEL,
-        group_size: 0,
-    };
-
-    unsafe {
-        act_x_w(
-            handle,
-            act,
-            view,
-            y,
-            m,
-            n,
-            k,
-            beta,
-            dtype::BF16,
-            dtype::BF16,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn act_x_wt_grouped_scaled(
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    w_dtype: i32,
-    w_nbytes: usize,
-    scale: *const c_void,
-    scale_dtype: i32,
-    scale_numel: usize,
-    _zero_point: *const c_void,
-    group_size: i32,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    let view = WeightView {
-        data: w,
-        dtype: w_dtype,
-        nbytes: w_nbytes,
-        scale_data: scale,
-        scale_dtype,
-        scale_numel,
-        quant_kind: quant_kind::PER_GROUP,
-        group_size,
-    };
-
-    unsafe {
-        act_x_w(
-            handle,
-            act,
-            view,
-            y,
-            m,
-            n,
-            k,
-            beta,
-            dtype::BF16,
-            dtype::BF16,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn act_x_wt_mxfp4_marlin(
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    w_nbytes: usize,
-    scale: *const c_void,
-    scale_numel: usize,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    let view = WeightView {
-        data: w,
-        dtype: dtype::MXFP4_PACKED,
-        nbytes: w_nbytes,
-        scale_data: scale,
-        scale_dtype: dtype::UINT8,
-        scale_numel,
-        quant_kind: quant_kind::PER_GROUP,
-        group_size: 32,
-    };
-
-    unsafe {
-        act_x_w(
-            handle,
-            act,
-            view,
-            y,
-            m,
-            n,
-            k,
-            beta,
-            dtype::BF16,
-            dtype::BF16,
-        );
-    }
 }

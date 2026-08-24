@@ -63,17 +63,16 @@ pub struct Boot {
     // lane will not build is REFUSED at load with the reason named --
     // `serve::load::load_impl`'s last block -- rather than served by
     // something else.
-    /// Which new-catalog row to trace, when the checkpoint's own identity
-    /// does not name one. `[baker] sku`, else `PIE_BAKER_SKU`.
+    /// Which catalog row to trace, stated rather than matched.
+    /// `[baker] sku`, else `PIE_BAKER_SKU`.
     ///
-    /// A STRING KNOB BECAUSE THE TWO CATALOGUES DO NOT SHARE AN ID SPACE.
-    /// `model::catalog::identify` reads the checkpoint's tensors and answers
-    /// a legacy row id (`"qwen3.5-0.8b-base"`); the new catalog files the
-    /// same checkpoint under a SKU that also states its dtypes
-    /// (`"qwen35-d0.8b-bf16-kv-bf16"`). `serve::baker::sku_for` carries the
-    /// bridge table for the rows that are proven; this knob is how a
-    /// deployment names one the table does not hold yet. Both die when the
-    /// id spaces merge.
+    /// A STRING KNOB THAT OUTRANKS THE MATCH. `baker::identify` reads the
+    /// checkpoint's own tensors against the import tables and answers a SKU
+    /// (`"qwen35-d0.8b-bf16-kv-bf16"`); a deployment that sets this is
+    /// telling the driver something the tensors cannot say, which is how a
+    /// new row is proven before its checkpoint is one the reader can tell
+    /// apart. The `BRIDGE` table this knob used to stand in for is gone with
+    /// the second catalog — see `baker::identify`.
     pub baker_sku: Option<String>,
 }
 

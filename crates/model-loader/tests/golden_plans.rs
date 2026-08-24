@@ -17,10 +17,12 @@
 //! UPDATE_GOLDEN=1 cargo test -p pie-loader --test golden_plans
 //! ```
 //!
-//! Two fields are normalized away before comparison. `compiler_version` is a
-//! hash of the compiler's own source, so it changes on every edit and would
-//! make every golden stale for no reason. File paths are made relative, because
-//! a golden that embedded a checkout path would only pass on one machine.
+//! One field is normalized away before comparison: file paths are made
+//! relative, because a golden that embedded a checkout path would only pass on
+//! one machine. A `compiler_version` stamp was normalized here too, and is gone
+//! from the plan — it hashed the compiler's own source for an on-disk plan cache
+//! that had no readers, so every golden carried a field that was zeroed before
+//! anyone looked at it.
 
 use std::path::PathBuf;
 
@@ -29,7 +31,7 @@ use model_loader::contract::ModelContract;
 use model_loader::plan::compile as compile_load_plan;
 use model_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
-    TILE_MAP_REPACK, compiler_version,
+    TILE_MAP_REPACK,
 };
 use model_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
@@ -554,15 +556,9 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
     }
 }
 
-/// Strip the two fields that are true of the machine rather than of the plan.
+/// Strip the one field that is true of the machine rather than of the plan.
 fn render(plan: &LoadPlan) -> String {
     let mut plan = plan.clone();
-    assert_eq!(
-        plan.compiler_version,
-        compiler_version(),
-        "a freshly compiled plan should carry this compiler's version"
-    );
-    plan.compiler_version = 0;
     // The fixture checkpoint lives in a temp directory under a name carrying
     // this process's pid, so the path is not a property of the plan at all.
     // The file *table* still is: its length, ids and sizes stay.

@@ -94,7 +94,7 @@ _cuda = ["dep:cudarc"]
 # shell into the same binary: same symbols, one provider.
 # `_cuda` was inherited through `bridge` and is stated directly now; the
 # feature set an `abi` build resolves to is unchanged.
-abi = ["_cuda", "dep:driver-api", "dep:model-loader", "model/contract"]
+abi = ["_cuda", "dep:driver-api", "dep:model-loader"]
 
 # `jit-parity` STOOD HERE and is deleted with `bind::dispatch_jit_probe`.
 #
@@ -110,9 +110,9 @@ abi = ["_cuda", "dep:driver-api", "dep:model-loader", "model/contract"]
 # `table::ROW_TABLES` is `&[]`. There is no unrouted row left to be the AOT
 # side of a comparison, so the probe compares a thing to itself.
 #
-# `tests/jit_parity.rs` is a two-line PLACEHOLDER-REFACTOR-SCAFFOLD with no
-# `[[test]]` stanza and was never the real target; it is left where it is,
-# because it is not this feature's and deleting it is a different question.
+# `tests/jit_parity.rs` went with it: a two-line placeholder with no `[[test]]`
+# stanza, and no cases to move anywhere. So did `tests/attn_score_fold_parity.rs`,
+# the same shape for a fold whose reference is in the deleted archive.
 
 [dependencies]
 # The CUDA version is pinned EXPLICITLY rather than through
@@ -182,53 +182,39 @@ tracing = "0.1"
 # exists to prevent.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 
-# The `pie.model/1` schema. Two features now, not three, and the third's
-# disappearance is the refactor in one line: `config` is GONE, because the
-# `HfConfig` this driver used to read back out of the artifact is gone with
-# it. A checkpoint's identity is a `model::catalog` row, linked into both
-# this driver and the worker, so there is nothing to parse and nothing to
-# agree about.
+# THE CATALOG — and after R3 there is exactly one, so it is spelled `model`.
 #
-# The `contract` because the library authors a load contract
-# (`model::boot::compile_load_plan` -> `model::contract::author_with_policy`),
-# and carries `model::encoding` with it. There is no second feature to name:
-# `model::catalog`'s `deployment`/`trace` used to be gated on a `forward`
-# feature that every consumer enabled, and it is deleted -- the family texts
-# are as ungated as the rows they belong to.
+# This line USED to read `path = "../model-legacy"`, and the whole of R3 is
+# the reason it no longer does. What came through the legacy edge was the
+# checkpoint's identity (`catalog::identify`), the numbers every pool was
+# sized from (`deployment::Deployment`), the load contract
+# (`encoding` + `contract`) and the tower name tables — four answers about a
+# checkpoint that the baker path was already answering from a traced `Plan`,
+# which is why `baker::Geometry::agrees_with` had to exist.
 #
-# Getting the OLD list to three took two wrong answers -- it said `config`
-# alone for a while and still built, then `contract` alone, and still built.
-# Both times for the same reason: this crate's DEV-dependency on `model`
-# names every feature, and the resolver unifies them back on for every
-# `cargo test` and every `cargo check` that resolves dev targets. So the
-# library declaration is the one thing in this file that NOTHING in the
-# workspace reads -- CI's `cargo test --workspace` excludes this crate, and
-# any build that includes it also builds its tests.
+# All four now come from here:
 #
-# `cargo tree -e features,no-dev` is what shows the truth, and
-# `crates/model/tests/declared_features.rs` is what now checks it, because a
-# trap found three times is not going to be remembered the fourth.
+#   * `model::identify` matches the snapshot's tensors against the IMPORT
+#     tables — the same list production is about to read, so there is no
+#     second manifest to keep in step;
+#   * `model::deployment::Deployment::of` reads the pool geometry off the
+#     plan the program is built from, so the pool and the program have one
+#     source and cannot drift;
+#   * the load contract is deleted: `produce` reads the checkpoint through
+#     the import table, so there is no plan to author and no encoding to
+#     parse;
+#   * the tower name tables went with the multimodal `Encode` verb, which
+#     had no producer for its weights once the legacy arena went.
 #
-# Not `chat`: the chat templates are not in the load path.
-# WHAT IS LEFT OF THIS EDGE, AND WHY IT IS STILL HERE (R2).
+# NOT `serve`: that feature gates `serve::multimodal`, which is twenty image
+# crates and a codec. A driver reads `serve::ROWS` for the two DEPLOYMENT
+# facts no trace states (the architecture label and the context ceiling) and
+# nothing else from that module.
 #
-# The legacy FIRE path is gone: nothing in `src/` calls `Variant::trace`,
-# `model_compiler::lower`, or any of the dispatch that consumed them. What
-# still comes through this edge is the checkpoint's IDENTITY and its SHAPE:
-#
-#   * `catalog::identify` -- reads the checkpoint's own tensors and answers
-#     which model it is, which `baker::sku_for` bridges to a new-catalog SKU;
-#   * `deployment::Deployment` -- the numbers every POOL is sized, strided and
-#     slot-addressed from (`kv_geometry`, `recurrent_layout`, `memory_planner`,
-#     the advertised caps, `servable_by`'s GQA gate);
-#   * `encoding::Encoding` + `contract` -- the load contract `weights::plan`
-#     authors for the checkpoint reader;
-#   * `shared::tower_names` -- the `Encode` verb's vision/audio slot order.
-#
-# THE SEAM, MEASURED: the baker lane fires the NEW catalog's program on pools
-# the OLD catalog sized, and `baker::Geometry::agrees_with` is the check that
-# stands between those two accounts. R3 is where the second account dies.
-model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
+# `crates/model/tests/declared_features.rs` is what checks this line, because
+# this crate's DEV-dependency names the feature set too and the resolver
+# unifies them back on for every `cargo test`.
+model = { path = "../model" }
 
 # NO `libc`. It was here for `flock` and `open` on the profile cache —
 # the read -> merge -> rename has to be atomic against another process
@@ -242,32 +228,17 @@ model = { path = "../model-legacy", package = "model-legacy", default-features =
 # bound}`: one `Program` per lane, built at LOAD, whose statements carry their
 # own operands. Pure Rust either way, so the toolkit-free build is unaffected.
 #
-# `model_compiler::lower` is still COMPILED (the module is not feature-gated,
-# and the three shader drivers still consume it), and nothing in this crate
-# names a path into it. Gating it off is `model-compiler`'s call to make and
-# belongs with R3, when the shader planes are its only consumers left.
+# `model_compiler::lower` is DELETED (R3): the three shader drivers were its
+# last consumers and they left the workspace with them, so what this edge
+# carries now is exactly what this crate names.
 model-compiler = { path = "../model-compiler" }
 model-ir = { path = "../model-ir" }
 
-# THE NEW CATALOG, under a name that says which one it is.
-#
-# `model` in this manifest is `model-legacy` (see its line above), and it has
-# been that since the split. So the baker's front end — `catalog()`, the
-# trace fns, `import_of`, `produce`, `snapshot` — cannot be spelled `model`
-# here: the name is taken, by 63 `model::` paths in `src/` and 186 in
-# `tests/` that all mean the legacy crate. Renaming that edge to free the
-# word would touch every one of them for no behaviour change, on the one
-# path this work is required to leave alone.
-#
-# So the new crate arrives aliased and is spelled `model_baker::` at every
-# call site, which reads as what it is. The alias dies when the legacy
-# crate does and the word comes free.
-#
-# NOT optional and NOT feature-gated: it is pure Rust — a trace is a host
-# walk that allocates a `Plan`, and `produce` reads safetensors with
-# `std::fs` — so it costs the toolkit-free build nothing, exactly as
-# `model-compiler` above costs it nothing.
-model-baker = { path = "../model", package = "model" }
+# `model-baker` STOOD HERE. It was `crates/model` under an alias, because
+# the word `model` was taken by the legacy crate and freeing it would have
+# touched 63 paths in `src/` and 186 in `tests/`. R3 freed the word, so the
+# alias is gone and the new crate is spelled `model::` — which is the name it
+# should always have had.
 
 # NO `model-dsl` EDGE, and the reason is worth the four lines because the
 # obvious reading of `trace_of`'s signature says otherwise. It answers a
@@ -403,7 +374,7 @@ kernels = { path = "../kernels" }
 # not in the workspace.
 # The executor's binder test lowers a REAL deployment's traced form, which
 # needs no feature of its own: the family texts are ungated.
-model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
+model = { path = "../model" }
 # The PRODUCER, for `tests/gpu_ptir_emitted.rs` only: that test authors a
 # trace, runs the host's real bind → compile → lower → emit chain over it, and
 # compiles the result — so it proves the emitter's CUDA and this driver's NVRTC
@@ -496,7 +467,8 @@ required-features = ["_cuda"]
 # §45's parity gate. `_cuda`, because it constructs a `DispatchCtx` to hand
 # the ports — and that type is NOT the bridge's. Thirty-five fields: two
 # stream/handle pointers, scalars, three `Vec`s, a `BTreeMap`, and device
-# pointers. Not one comes from the C++ archive (BRIDGE_RETIREMENT.md §2.2),
+# pointers. Not one comes from the C++ archive (BRIDGE_RETIREMENT.md §2.2 --
+# doc not in tree; the fields are the measurement),
 # and this comment asserting otherwise is how the gate spread: the type was
 # read through the attribute it carried instead of through its fields.
 [[test]]
@@ -507,9 +479,10 @@ required-features = ["_cuda"]
 name = "entry_validation"
 required-features = ["_cuda"]
 
-[[test]]
-name = "gpu_plan_load"
-required-features = ["_cuda"]
+# `gpu_plan_load` STOOD HERE. It compiled a `model_legacy` load contract for
+# a cached Qwen3-0.6B and staged it into device memory; R3 deleted the
+# contract, so its subject is gone. What replaced it is `baker_serve`, which
+# loads through `model::produce` and fires what it loaded.
 
 [[test]]
 name = "kv_cache_live_parity"
@@ -525,10 +498,6 @@ required-features = ["_cuda"]
 name = "sideband_arena_parity"
 required-features = ["_cuda"]
 
-
-[[test]]
-name = "weight_view_parity"
-required-features = ["_cuda"]
 
 # The one test target with no CUDA feature: it asks whether the portable
 # half is still portable, which is a question only a build can answer.

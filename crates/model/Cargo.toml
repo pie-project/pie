@@ -11,14 +11,18 @@ name = "model"
 path = "src/lib.rs"
 
 [features]
-# THE SERVING HALF, off by default — and off for the reason `model-legacy`'s
-# `chat` feature was off for every driver that linked it: a driver fires
-# kernels. It does not write a turn of conversation, and it does not decode a
-# PNG. `image` alone is twenty crates, and `driver-cuda`, `driver-metal`,
-# `model-compiler` and `baker-smoke` all take this crate for its declarations.
+# HOST-SIDE MEDIA DECODE, off by default. `image` alone is twenty crates, and
+# `driver-cuda`, `model-compiler` and `baker-smoke` all take this crate
+# without wanting one of them.
 #
-# `engine` and `worker` are the two consumers that ask for it, which is exactly
-# the split the aspect had before it moved here.
+# It gated the whole of `serve` when the module arrived from `model-legacy`'s
+# `chat` feature, on the argument that a driver fires kernels and does not
+# write a turn of conversation. R3 made that line wrong in one direction: a
+# driver reads `serve::ROWS` for the architecture label and the context
+# ceiling it advertises, which are two `&'static str`-shaped facts and no
+# codec at all. So the gate moved down to the one module that needs one,
+# `serve::multimodal`, and the feature keeps its name because `engine` and
+# `worker` — still its only consumers — ask for it by that name.
 default = []
 serve = ["dep:image"]
 

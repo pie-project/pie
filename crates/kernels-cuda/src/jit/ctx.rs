@@ -1,7 +1,8 @@
 use core::ffi::c_void;
 use kernels::routine::Fire;
 
-use kernels::routine::{Backend, Extent, Refusal};
+use kernels::raises::Struct;
+use kernels::routine::{Backend, Extent, In, Refusal};
 
 use crate::comm::Plane;
 use crate::jit::{ArgValue, Root};
@@ -154,6 +155,17 @@ pub struct Ctx<'a> {
     cublas: *mut c_void,
     comm: Option<Plane>,
     env: Option<&'a (dyn kernels::routine::Answers<Cuda> + 'a)>,
+    /// THE EXECUTOR'S STAGING, BY KEY — what a `#[claims]` body pulls off
+    /// `self` when the statement carries no slot for it: the fa2 schedules,
+    /// the host CSR mirrors the planless prefill walks, the custom mask, the
+    /// dsv4 residents. `.wiki/baker.md`: *"Plane staging (fa2 plan residents,
+    /// host mirrors) never appears in a declaration — the body pulls it from
+    /// `self`."* This field is that `self`.
+    ///
+    /// `None` on a context built for a hand-written call, which is what every
+    /// device test does: such a context stages nothing and every raise on it
+    /// refuses with its own key in the message.
+    raised: Option<&'a (dyn kernels::raises::Answered + 'a)>,
     held: core::marker::PhantomData<&'a ()>,
 }
 
@@ -171,6 +183,7 @@ impl<'a> Ctx<'a> {
             cublas: core::ptr::null_mut(),
             comm: None,
             env: None,
+            raised: None,
             held: core::marker::PhantomData,
         }
     }
@@ -205,6 +218,55 @@ impl<'a> Ctx<'a> {
     pub const fn with_env(mut self, env: &'a (dyn kernels::routine::Answers<Cuda> + 'a)) -> Self {
         self.env = Some(env);
         self
+    }
+
+    /// The same context, carrying this fire's staging — see [`Ctx::raised`].
+    #[must_use]
+    pub const fn with_raised(mut self, staged: &'a (dyn kernels::raises::Answered + 'a)) -> Self {
+        self.raised = Some(staged);
+        self
+    }
+
+    /// One staged object a claim body MUST have, by the key its [`Raise`]
+    /// declares.
+    ///
+    /// The mark is the one every routine already takes for a raise —
+    /// `In<Struct<R>>`, an address with no rectangle — so a body hands the
+    /// answer straight on. An unstaged key refuses with the KEY as the
+    /// reason, which is what makes "this driver stages no `mla.plan`" a
+    /// sentence a load can print rather than a null a launch dereferences.
+    ///
+    /// [`Raise`]: kernels::raises::Raise
+    pub fn raised<R: kernels::raises::Raise>(&self) -> Result<In<Struct<R>>, Refusal> {
+        let ptr = self
+            .raised
+            .and_then(|staged| staged.raised(R::KEY))
+            .ok_or(Refusal::Absent { what: R::KEY })?;
+        Ok(In {
+            ptr: ptr.cast::<R::Value>(),
+            rows: 0,
+            width: 0,
+        })
+    }
+
+    /// One staged object whose ABSENCE a kernel reads, as a null.
+    ///
+    /// The narrow door beside [`Ctx::raised`], and the caller is what makes
+    /// it narrow: `row_valid` null means every row of this fire is valid and
+    /// every appending kernel in this crate tests for exactly that, so a
+    /// refusal there would refuse the ordinary fire. Nothing else may use
+    /// this — an object a kernel dereferences unconditionally is a
+    /// [`Ctx::raised`], and the difference is the kernel's own null test.
+    #[must_use]
+    pub fn staged<R: kernels::raises::Raise>(&self) -> In<Struct<R>> {
+        In {
+            ptr: self
+                .raised
+                .and_then(|staged| staged.raised(R::KEY))
+                .map_or(core::ptr::null(), |p| p.cast::<R::Value>()),
+            rows: 0,
+            width: 0,
+        }
     }
 
     #[must_use]

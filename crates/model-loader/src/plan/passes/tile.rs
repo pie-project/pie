@@ -92,8 +92,8 @@ pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_pe
 /// three drivers implements `run_tile_map`, so a decode in one of their plans
 /// runs on the HOST, streaming into the arena — slower than a load whose bytes
 /// are already plain, and the price of an archive that kept its source
-/// packing. `pie model build` is how that price is paid once instead of every
-/// boot.
+/// packing. The three masks below say the same thing about their own backends;
+/// this is the copy that states it.
 pub const CUDA_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
@@ -116,19 +116,9 @@ pub const CUDA_TILE_MAP_MASK: u32 =
 /// the name of the second.
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
-///
-/// `TILE_MAP_DECODE` is here because an archive may hold a self-contained
-/// block. It is not a device kernel and does not claim to be: none of these
-/// three drivers implements `run_tile_map`, so a decode in one of their plans
-/// runs on the HOST, streaming into the arena — slower than a load whose bytes
-/// are already plain, and the price of an archive that kept its source
-/// packing. `pie model build` is how that price is paid once instead of every
-/// boot.
 pub const METAL_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
-/// The transforms `host_executor` implements. Not a device capability, so it is
-/// not part of the C surface.
 /// The transforms a Vulkan plan may carry.
 ///
 /// The same three Metal's does, and for the same reason rather than by
@@ -143,19 +133,12 @@ pub const METAL_TILE_MAP_MASK: u32 =
 /// the other.
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
-///
-/// `TILE_MAP_DECODE` is here because an archive may hold a self-contained
-/// block. It is not a device kernel and does not claim to be: none of these
-/// three drivers implements `run_tile_map`, so a decode in one of their plans
-/// runs on the HOST, streaming into the arena — slower than a load whose bytes
-/// are already plain, and the price of an archive that kept its source
-/// packing. `pie model build` is how that price is paid once instead of every
-/// boot.
 pub const VULKAN_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
-/// The transforms `host_executor` implements. Not a device capability, so it is
-/// not part of the C surface.
+/// The transforms `host_executor` implements. Not a device capability: it is
+/// what a plan compiled for no device may carry, which is the reference the
+/// device answers are checked against.
 pub const HOST_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE | TILE_MAP_BIAS;
 

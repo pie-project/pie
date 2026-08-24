@@ -102,10 +102,10 @@ async fn declared_forward_token_parity() -> Result<()> {
     );
 
     // naive-baseline over the engine-test inferlets: it is the golden model
-    // pie-application-plan.md names — a seeded Gumbel-max sampler whose
-    // stream depends on every logit the forward produced. (`generate` from
-    // the engine-test workspace echoes a channel constant; it exercises the
-    // pipeline, not the forward.)
+    // pie-application-plan.md names (doc not in tree) — a seeded Gumbel-max
+    // sampler whose stream depends on every logit the forward produced.
+    // (`generate` from the engine-test workspace echoes a channel constant;
+    // it exercises the pipeline, not the forward.)
     let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let ok = Command::new("cargo")
         .args([

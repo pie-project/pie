@@ -13,7 +13,11 @@ use crate::record::{Value, Windows};
 /// `attention_landing`'s `layer` is a stated scalar in the declaration and
 /// the statement's own layer TAG here, not a param — that is where the
 /// driver has always read it, and moving it into the params run would have
-/// changed every plan for nothing.
+/// changed every plan for nothing. IT TAKES NO ARGUMENT, because a text
+/// already said which layer it is on: `Recorder::at` carries the layer the
+/// text's `inputs.layers(..)` loop opened, every statement is stamped with
+/// it, and a builder that asked for it again would be asking the text to
+/// spell the loop's own index a second time.
 pub mod gemm {
     use super::*;
 
@@ -25,8 +29,8 @@ pub mod gemm {
         act.stmt("gemm.lm_head").weight(w).done()
     }
 
-    pub fn attention_landing<W: Dtype>(act: &Value, w: &Tensor<W>, layer: u32) -> Value {
-        act.stmt("gemm.attention_landing").weight(w).layer(layer).done()
+    pub fn attention_landing<W: Dtype>(act: &Value, w: &Tensor<W>) -> Value {
+        act.stmt("gemm.attention_landing").weight(w).done()
     }
 }
 

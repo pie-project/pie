@@ -45,10 +45,11 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
-# The routine registry — see the workspace table for why this one.
-linkme = { workspace = true }
-inventory = { workspace = true }
-# `#[routine]`, which builds each row beside its own `fn`.
+# `#[claims]`, which states beside each `impl <Family> for Ctx<'_>` which of
+# the family's points that block answers. The `#[routine]` layer this crate
+# used to carry is gone, and `linkme`/`inventory` — the two distributed-slice
+# registries its rows were collected into — went with it: the by-name reach
+# they served was `driver-wgpu`'s, and that crate left the workspace at R3.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }
 
@@ -57,5 +58,5 @@ kernels = { path = "../kernels" }
 # gone does not make a skipped target, it makes a manifest cargo cannot PARSE,
 # and this crate is a workspace member, so every command in the workspace fails
 # with it. `examples/` is deleted here -- `dump_layout.rs` printed the launch
-# ABI that `kernels_wgpu::bindings` and `uniform_layout` derive -- so there is
-# no file for such a section to name.
+# ABI of a routine table that no longer exists -- so there is no file for such
+# a section to name.

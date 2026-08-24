@@ -1,6 +1,6 @@
 //! The supergraph recorder: the text runs once, conditions ride as data.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Mul;
 use std::rc::Rc;
 
@@ -14,6 +14,20 @@ use crate::Plane;
 #[derive(Clone)]
 pub struct Recorder {
     inner: Rc<RefCell<Plan>>,
+
+    /// WHICH LAYER THE TEXT IS INSIDE, and the whole of how a statement
+    /// learns its own. A text states its tower as one loop
+    /// (`crate::forward::Layers`, reached as `inputs.layers(&m.layers)`) and
+    /// that loop is the only thing that writes here: every statement
+    /// recorded while it holds an item carries that item's index, and
+    /// everything recorded outside it -- the embedding, the final norm, the
+    /// head -- carries `None`, because there is no layer to carry.
+    ///
+    /// A CELL AND NOT A COLUMN OF THE PLAN: this is where the RECORDER is,
+    /// not something the plan holds. It is `Rc` for the same reason `inner`
+    /// is -- every `Value` carries a `Recorder` and they must all be inside
+    /// the same layer.
+    at: Rc<Cell<Option<u32>>>,
 }
 
 impl Recorder {
@@ -29,6 +43,7 @@ impl Recorder {
                 ops: Vec::new(),
                 seams: Vec::new(),
             })),
+            at: Rc::new(Cell::new(None)),
         }
     }
 
@@ -64,9 +79,9 @@ impl Recorder {
     ///
     /// [`Recorder::param`] is the dense reading of this and passes the
     /// tensor's own three columns straight through; a bank's planes differ
-    /// from the tensor in two of the three, which is what this exists for.
-    /// The SHARD is not one of them — every plane of one bank is cut the same
-    /// way, because they are the same weight described twice.
+    /// from the tensor in all three, which is what this exists for — see
+    /// [`restated`] for the cut, which is the column that used to be copied
+    /// verbatim and was wrong for every quantized bank in the catalog.
     pub(crate) fn plane(&self, name: &str, shape: &[u64], shard: &Shard, repr: &str) {
         let mut p = self.inner.borrow_mut();
         if let Some(seen) = p.params.iter().find(|q| q.name == name) {
@@ -84,13 +99,24 @@ impl Recorder {
         });
     }
 
-    pub(crate) fn seam(&self, seam: &str, values: &[&Value], layer: Option<u32>) {
+    pub(crate) fn seam(&self, seam: &str, values: &[&Value]) {
         let ids = values.iter().map(|v| v.id).collect();
         self.inner.borrow_mut().seams.push(Seam {
             seam: seam.to_string(),
             values: ids,
-            layer,
+            layer: self.at.get(),
         });
+    }
+
+    /// Enter the layer the text's loop is on. See [`Recorder::at`].
+    pub(crate) fn enter(&self, l: u32) {
+        self.at.set(Some(l));
+    }
+
+    /// Leave it -- what the loop's own end does, and what a `break` does
+    /// through the iterator's `Drop`.
+    pub(crate) fn leave(&self) {
+        self.at.set(None);
     }
 }
 
@@ -102,7 +128,6 @@ pub(crate) struct Stmt<'r> {
     weights: Vec<String>,
     params: Vec<u64>,
     cache: Option<String>,
-    layer: Option<u32>,
     cond: Cond,
 }
 
@@ -141,7 +166,8 @@ impl<'r> Stmt<'r> {
     pub(crate) fn bank<W: Dtype>(mut self, t: &Tensor<W>) -> Self {
         for plane in W::planes(&t.shape) {
             let name = format!("{}{}", t.name, plane.suffix);
-            self.rec.plane(&name, &plane.shape, &t.shard, plane.repr);
+            let shard = restated(&t.shard, &t.shape, &plane.shape, &name);
+            self.rec.plane(&name, &plane.shape, &shard, plane.repr);
             self.weights.push(name);
         }
         self
@@ -168,11 +194,6 @@ impl<'r> Stmt<'r> {
 
     pub(crate) fn cache(mut self, name: &str) -> Self {
         self.cache = Some(name.to_string());
-        self
-    }
-
-    pub(crate) fn layer(mut self, l: u32) -> Self {
-        self.layer = Some(l);
         self
     }
 
@@ -221,7 +242,11 @@ impl<'r> Stmt<'r> {
             weights: self.weights,
             params: self.params,
             cache: self.cache,
-            layer: self.layer,
+            // THE LAYER IS NOT THE STATEMENT'S TO SPELL. It is where in the
+            // tower the text is standing, which the text said once, in its
+            // loop; a builder that took it as an argument would be asking
+            // every statement to repeat the loop's own index.
+            layer: self.rec.at.get(),
             cond: self.cond,
         });
         ids
@@ -244,7 +269,6 @@ impl Value {
             weights: Vec::new(),
             params: Vec::new(),
             cache: None,
-            layer: None,
             cond: Cond::Always,
         }
         .value(self)
@@ -329,6 +353,58 @@ impl<const N: usize> SplitSpec for [Predicate; N] {
             };
             v.refined(mine)
         })
+    }
+}
+
+/// A bank's logical cut, said in one stored plane's own extents.
+///
+/// THE COLUMN THAT WAS COPIED AND SHOULD NOT HAVE BEEN. A text declares a
+/// bank at its LOGICAL rectangle — gpt-oss's `expert_down_bank` is
+/// `[experts, hidden, inter]` and the cut runs along `inter` — and the repr
+/// decides what the bytes look like: mxfp4 stores that same bank as codes
+/// `[experts, hidden, inter/32, 16]` beside scales `[experts, hidden,
+/// inter/32]`. Handing both planes the logical mark said "cut axis 2 into
+/// one segment of `inter`" about an axis that is `inter/32` long, which is a
+/// row a load could not slice and a row `model/tests/
+/// a_rank_cut_is_the_shard_column.rs` catches the moment it is asked.
+///
+/// The axis SURVIVES and the extent does not. A repr in this tree stores the
+/// leading axes verbatim and blocks the contracted one, so a logical axis
+/// keeps its index and may shrink by the block; the segments shrink with it,
+/// which is also the check that a cut lands on a whole number of blocks —
+/// half a block is a code word no scale describes.
+fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard {
+    let Shard::Cut { axis, segments } = shard else {
+        return Shard::Replicated;
+    };
+    let at = *axis as usize;
+    let whole = logical[at];
+    let stored = *plane.get(at).unwrap_or_else(|| {
+        panic!("`{name}` stores {plane:?} and its cut names axis {at} of {logical:?}")
+    });
+    assert_eq!(
+        logical[..at],
+        plane[..at],
+        "`{name}`: the axes before its cut are not stored verbatim",
+    );
+    assert!(
+        stored > 0 && whole.is_multiple_of(stored),
+        "`{name}`: axis {at} is {whole} logically and {stored} as stored",
+    );
+    let block = whole / stored;
+    Shard::Cut {
+        axis: *axis,
+        segments: segments
+            .iter()
+            .map(|s| {
+                assert!(
+                    s.is_multiple_of(block),
+                    "`{name}`: a segment of {s} is not a whole number of \
+                     {block}-wide blocks",
+                );
+                s / block
+            })
+            .collect(),
     }
 }
 

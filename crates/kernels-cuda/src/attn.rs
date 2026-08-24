@@ -4,19 +4,22 @@ use core::ffi::c_void;
 use kernels::Bind;
 use kernels::Fire;
 use kernels::Refusal;
-use kernels_macros::routine;
 
 use crate::jit::abi::Tensor;
-use crate::views::{Dsv4CompKvPages, KvCache, MtpPendingHidden, RecurrentState};
+use crate::views::KvCache;
 use kernels::raises::Struct;
 use kernels::routine::{Cache, Const, In, Out};
 
-use crate::jit::Abi;
 #[allow(unused_imports)]
 use crate::jit::abi::bf16;
-use crate::jit::abi::f16;
-use crate::rope::Yarn;
 use kernels::routine::InOut;
+// The vocabulary `#[claims]` writes this module's TIER-2 table in — the same
+// five names `#[points]` writes a family's in, because one reader writes both.
+use kernels::points::{Dtype, Mark, Point, Prim, Slot};
+// The floor's plane trait, named so a tier-2 declaration can spell its
+// payloads: `Self::Tensor<T>` is E0223 in an inherent impl, so the slots
+// below say `<Self as Plane>::Tensor<T>` and mean the same thing.
+use kernels::points::Plane;
 // SEVEN NAMES STOOD HERE, and none of them was a re-export. `kv_paged`'s
 // five write-KV routines and `qkv_fused`'s two were imported into this
 // module so that the launcher bodies below could call them; those bodies
@@ -42,37 +45,462 @@ fn width_of(n: u32, what: &'static str) -> Result<i32, Refusal> {
     })
 }
 
-/// The `Attention` family, claimed. Five of eleven points land, and the
-/// six absences are the migration's most deliberate: THE FA2 CORE IS
-/// CLAIM-ONLY BY DESIGN.
+/// What "no logit soft cap" spells at every fa2 arm.
 ///
-/// * `attention.decode` / `attention.decode_lse` — the routine takes
-///   `plan: In<Struct<Fa2Decode>>`, the decode PLAN CACHE: a resident this
-///   plane builds at load, uploads per fire, and reads the split-kv
-///   partition out of. A statement carries the query, the page row and
-///   three numbers; nothing declared can conjure a plan cache, and a body
-///   that reached for one would be staging on the operand column's behalf.
-///   The routines keep their own `canon` and the points resolve through it.
-/// * `attention.prefill` / `attention.prefill_lse` — the same seam plus
-///   two HOST MIRRORS. `attention_flashinfer_prefill` plans in-body and
-///   wants `qo_indptr_host` and `kv_page_indptr_host` beside the device
-///   CSR, because the partition arithmetic runs on the host before the
-///   launch. A host mirror of a device buffer is the definition of plane
-///   staging.
-/// * `attention.masked` — the plan cache again, and `maskv:
-///   In<Struct<AttnMask>>` on top: the custom `(q, kv)` mask and its own
-///   CSR, published by the driver on every fire because `HasCustomMask` is
-///   a folded fact. The text states that it wants the masked reading; it
-///   never places the mask.
-/// * `attention.kv_append` — the deepest of them, and the reason is on the
-///   `untraced!` row below rather than in a signature. See
-///   `WRITE_KV_TO_PAGES_ROW`.
+/// The attention points declare no cap, so a statement states none, and this
+/// is the value `decode_arm`/`prefill_arm` read as "take the uncapped arm"
+/// (`> 0.0` is the whole test). A text that wants a cap wants a slot for it;
+/// `attention.logit_softcap` is the separate point that has one.
+const NO_SOFT_CAP: f32 = 0.0;
+
+/// A stated sliding window as flashinfer's `window_left`.
 ///
-/// What lands, lands because its whole input is the statement's: an
-/// operand run, a weight, and numbers — and `kv_append_shared` below is
-/// the one that had to argue for it.
+/// ZERO IS NO WINDOW — that is what the DSL's `.window()` verb records
+/// (`self.int(w.unwrap_or(0))`) and what the declaration states — and
+/// flashinfer spells the same absence `-1`.
+///
+/// A NON-ZERO WINDOW IS `w - 1`, read off both kernels rather than assumed.
+/// flashinfer's window predicate is
+/// `kv_idx + qo_len + window_left >= kv_len + qo_idx`
+/// (`flashinfer/attention/variants.cuh`); a query at absolute position
+/// `p = kv_len - qo_len + qo_idx` therefore keeps `kv_idx >= p - window_left`,
+/// which is `window_left + 1` keys counting itself. The naive paged kernel
+/// spells the same thing arithmetically — `kv < kv_lim - 1 - window_left` is
+/// dropped (`attn/attention_naive_paged.cuh`). A text's `window` is the HF
+/// number and counts the query's own key, so gemma's 512 means
+/// `kv_idx > p - 512` and `window_left = 511`.
+///
+/// LEGACY WAS OFF BY ONE HERE and no A/B in this tree could see it: the
+/// retired `gemma_4/project.rs` passed `sliding_window` itself as
+/// `window_left`, which shows one key too many, and every gemma A/B prefills
+/// seven tokens — a prompt shorter than the window never reaches the
+/// predicate.
+fn window_left(window: u32) -> Result<i32, Refusal> {
+    if window == 0 {
+        return Ok(-1);
+    }
+    width_of(window - 1, "the sliding window this statement states")
+}
+
+/// Two accounts of one number, checked before a launch reads rows at the
+/// wrong pitch: what the STATEMENT states, and what the SCHEDULE was planned
+/// at.
+///
+/// They agree by construction wherever the executor reads its ask off the
+/// lane (`driver-cuda`'s `Baked::attn_ask`), which is the only place either
+/// number comes from in a real fire. What this catches is an executor that
+/// raised ONE schedule for a stack that wants two — which is silent
+/// otherwise, and wrong for half the launches.
+fn agrees(planned: i32, stated: u32) -> Result<(), Refusal> {
+    if planned == width_of(stated, "a stated head width")? {
+        return Ok(());
+    }
+    Err(Refusal::Narrow {
+        what: "the head width this statement states is not the one this fire's \
+               attention schedule was planned at",
+        at: i64::from(stated),
+    })
+}
+
+/// An operand at the one element this plane's fa2 core is written for.
+///
+/// The cast is the whole function and `at_bf16` is what makes it sound: a
+/// `Tensor<T>` and a `Tensor<bf16>` are one address and two rows-and-width,
+/// so re-marking is free once the element has been checked. The bodies that
+/// landed before this one spell it out at each slot; eight new ones in a row
+/// is what made it a name.
+fn as_in<T: kernels::points::Scalar>(r: &In<Tensor<T>>) -> In<Tensor<bf16>> {
+    In {
+        ptr: r.ptr.cast::<bf16>(),
+        rows: r.rows,
+        width: r.width,
+    }
+}
+
+/// [`as_in`] for a result.
+fn as_out<T: kernels::points::Scalar>(r: &Out<Tensor<T>>) -> Out<Tensor<bf16>> {
+    Out {
+        ptr: r.ptr.cast::<bf16>(),
+        rows: r.rows,
+        width: r.width,
+    }
+}
+
+/// The pool row's row-validity plane, as the `In<Tensor<i32>>` fiction every
+/// appender in this file carries: the routine casts the pointer to
+/// `*const u8` and the buffer must be BYTES. Null is legal and means every
+/// row of this fire is valid.
+fn row_valid_at(view: &crate::views::PagedKvView, rows: i32) -> In<Tensor<i32>> {
+    In {
+        ptr: view.row_valid.cast::<i32>(),
+        rows,
+        width: 1,
+    }
+}
+
+/// The fa2 DECODE reading, shared by the two points that differ only in
+/// whether they keep the log-sum-exp.
+#[allow(clippy::too_many_arguments)]
+fn fa2_decode(
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    pages: Cache<Struct<KvCache>>,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Out<Tensor<bf16>>,
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
+    let plan = ctx.raised::<crate::raises::Fa2Decode>()?;
+    // SAFETY: `Ctx::raised` answers a live object or refuses; an answerer
+    // that returned a null would be claiming to have staged one.
+    let planned = unsafe { &*plan.ptr };
+    agrees(planned.head_dim, head_dim)?;
+    fa2::dispatch_attention_flashinfer_decode(
+        ctx,
+        q,
+        plan,
+        o,
+        Const::new(window_left(window)?),
+        Const::new(NO_SOFT_CAP),
+        Const::new(sm_scale),
+        pages.raised(),
+        lse,
+    )
+}
+
+/// The fa2 PREFILL reading — the planless leg, which carves its own schedule
+/// out of the two host CSR mirrors the executor stages.
+#[allow(clippy::too_many_arguments)]
+fn fa2_prefill(
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    indptr: In<Tensor<i32>>,
+    pages: Cache<Struct<KvCache>>,
+    window: u32,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    o: Out<Tensor<bf16>>,
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
+    fa2::attention_flashinfer_prefill(
+        ctx,
+        q,
+        o,
+        Const::new(NO_SOFT_CAP),
+        Const::new(sm_scale),
+        pages.raised(),
+        indptr,
+        Const::new(width_of(head_dim, "the head width this attention states")?),
+        ctx.raised::<crate::raises::Fa2Prefill>()?,
+        ctx.raised::<crate::views::QoIndptrHost>()?,
+        ctx.raised::<crate::views::KvPageIndptrHost>()?,
+        Const::new(width_of(kv_heads, "the kv head count this attention states")?),
+        Const::new(window_left(window)?),
+        lse,
+    )
+}
+
+/// The `Attention` family, claimed — ELEVEN OF ELEVEN, and what closed the
+/// last six was a door rather than six kernels.
+///
+/// # The fa2 core was never missing a kernel
+///
+/// Six points sat on the floor's default body until R4b, and every one of
+/// them for the same reason spelled six ways: the launcher wants PLANE
+/// STAGING that no statement carries — the decode schedule, the prefill plan
+/// cache, the two host CSR mirrors the planless prefill walks, the custom
+/// mask, the fire's write origin. `.wiki/baker.md` says where that belongs
+/// ("the body pulls it from `self`") and R2 built the answering half and left
+/// it caller-less: `driver-cuda/src/bind/views.rs::FireViews::raised`
+/// resolves a driver-owned object BY KEY, which is the only handle a
+/// generated arm could ever have.
+///
+/// `Ctx::raised::<Fa2Decode>()` is that handle. A body asks for the key its
+/// `Raise` declares, the executor answers or refuses WITH THE KEY IN IT, and
+/// the statement's own column is untouched — so the declarations below are
+/// exactly the declarations that were already there. Nothing on the floor
+/// moved to make these land.
+///
+/// # The three conventions these bodies pin
+///
+/// * **`window_left = window - 1`** ([`window_left`]), read off both kernels
+///   rather than guessed, and the staging shims that came before refused a
+///   non-zero window rather than choose. Gemma is the only shipping text that
+///   states one.
+/// * **No soft cap.** The points declare none, so the statement states none,
+///   and `0.0` is what "no cap" spells at `decode_arm`/`prefill_arm`. A text
+///   that wants one wants a slot for it.
+/// * **The write origin is zero** ([`kernels::points::Attention::kv_append`]),
+///   and that is a LANE fact, not an assumption — see the body.
 #[kernels_macros::claims]
 impl kernels::points::Attention for Ctx<'_> {
+    /// One query row per request, through the schedule this fire was raised
+    /// on.
+    ///
+    /// THE SCHEDULE IS A RAISE AND NOT AN OPERAND. `fa2::plan::plan_decode`
+    /// runs on the HOST out of the fire's page CSR, stamps two workspaces
+    /// inside a plan-update fence and leaves an int arena the launch reads
+    /// without bounds-checking it — the plan is what bounded it. A body that
+    /// built one would have to copy the device CSR back mid-fire, which is a
+    /// sync a graph capture cannot record, so the executor stages it once per
+    /// fire and this asks for it by name.
+    ///
+    /// THE STATED HEAD WIDTH IS CHECKED AGAINST IT, because they are two
+    /// accounts of one number: the statement states the width its rectangles
+    /// were cut at, the schedule was planned at the width the executor asked
+    /// for. They agree by construction where the executor reads the ask off
+    /// the lane (`Baked::attn_ask`), and a fire where they do not is a fire
+    /// whose q rows are being read at the wrong pitch.
+    fn decode<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        pages: Cache<Struct<KvCache>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.decode at an element other than bf16")?;
+        fa2_decode(
+            self,
+            as_in(&q),
+            pages,
+            window,
+            head_dim,
+            sm_scale,
+            as_out(&o),
+            None,
+        )
+    }
+
+    /// [`kernels::points::Attention::decode`], keeping the per-row
+    /// log-sum-exp. ONE BODY AND TWO POINTS, because the routine is literally
+    /// the same call with `Some(lse)`.
+    fn decode_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        pages: Cache<Struct<KvCache>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+        lse: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.decode_lse at an element other than bf16")?;
+        fa2_decode(
+            self,
+            as_in(&q),
+            pages,
+            window,
+            head_dim,
+            sm_scale,
+            as_out(&o),
+            Some(lse),
+        )
+    }
+
+    /// The prefill window, through the PLANLESS leg.
+    ///
+    /// THIS ONE PLANS ITSELF, and the two host CSR mirrors are why it can.
+    /// `attention_flashinfer_prefill` walks `qo_indptr_host` and
+    /// `kv_page_indptr_host` — host copies of the device CSRs the executor
+    /// already holds, because it built them — and carves its schedule into
+    /// the plan cache it was handed. Three raises, no operand: a host mirror
+    /// of a device buffer is the definition of plane staging, and the
+    /// executor answers all three by key.
+    fn prefill<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        indptr: In<Tensor<i32>>,
+        pages: Cache<Struct<KvCache>>,
+        window: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.prefill at an element other than bf16")?;
+        fa2_prefill(
+            self,
+            as_in(&q),
+            indptr,
+            pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            as_out(&o),
+            None,
+        )
+    }
+
+    /// [`kernels::points::Attention::prefill`], keeping the log-sum-exp.
+    fn prefill_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        indptr: In<Tensor<i32>>,
+        pages: Cache<Struct<KvCache>>,
+        window: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+        lse: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.prefill_lse at an element other than bf16")?;
+        fa2_prefill(
+            self,
+            as_in(&q),
+            indptr,
+            pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            as_out(&o),
+            Some(lse),
+        )
+    }
+
+    /// The prefill window under the fire's CUSTOM MASK.
+    ///
+    /// THE MASK IS THE ORDERING, AND IT IS THE ONLY ONE. `prefill_custom_arm`
+    /// selects flashinfer's `kCustom` mask mode and the launcher pins
+    /// `window_left = -1` beside it: a byte per `(q, kv)` pair says which
+    /// pairs attend, and a window applied on top would be a second, disagreeing
+    /// source for the same fact. So a statement that states BOTH is refused by
+    /// name rather than served with one of them dropped — gemma's sliding
+    /// layers state a 512-wide window on this point and the mask this executor
+    /// publishes is plain causal, so serving them would silently widen the
+    /// window to the whole prefix.
+    ///
+    /// The stated head width is read by the SCHEDULE and checked against it,
+    /// for [`kernels::points::Attention::decode`]'s reason.
+    fn masked<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        indptr: In<Tensor<i32>>,
+        pages: Cache<Struct<KvCache>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.masked at an element other than bf16")?;
+        if window != 0 {
+            return Err(Refusal::Unstated {
+                what: "a custom mask beside a stated sliding window: the masked arm reads \
+                       the mask and nothing else, so one of the two orderings would be lost",
+            });
+        }
+        let plan = self.raised::<crate::raises::Fa2Prefill>()?;
+        // SAFETY: `Ctx::raised` answers a live object or refuses; an answerer
+        // that returned a null would be claiming to have staged one.
+        let planned = unsafe { &*plan.ptr };
+        agrees(planned.head_dim, head_dim)?;
+        fa2::dispatch_attention_flashinfer_prefill_custom(
+            self,
+            as_in(&q),
+            plan,
+            as_out(&o),
+            Const::new(NO_SOFT_CAP),
+            Const::new(sm_scale),
+            self.raised::<crate::views::AttnMask>()?,
+            pages.raised(),
+            indptr,
+            None,
+        )
+    }
+
+    /// Leave this fire's keys and values in the pool row the statement names.
+    ///
+    /// [`kernels::points::Attention::kv_append_shared`]'s body with two
+    /// planes instead of one, and the two things that kept it off the floor
+    /// are both answered here rather than dodged:
+    ///
+    /// * **The choice.** `attn::write_kv_to_pages` was never a routine — it
+    ///   was an `untraced!` row standing for a choice `Boot::route` made from
+    ///   the checkpoint's KV storage, long after the trace recorded the
+    ///   statement, and a claim cannot delegate to a name that is not a body.
+    ///   A BODY fires with the pool row in hand and `PagedKvView::native_bf16`
+    ///   IS that fact, so the choice happens at the fire, where the fact is.
+    ///   The row is deleted; the two legs it stood for are called directly.
+    ///
+    /// * **The write origin.** `first_token` is how many leading rows a fused
+    ///   producer already left in the pages, and it is ZERO for every
+    ///   statement of this point — not by assumption but because the split
+    ///   that could make it non-zero is a LANE SPLIT. Gemma is the only text
+    ///   with a fused producer, and it states
+    ///   `normed.split(&(Facts::qo_one() & !Facts::masked()))`: a predicate
+    ///   over the fire's FACT WORD, so a lane either takes the fused arm for a
+    ///   layer or takes this one, never both. Measured on the traced plans —
+    ///   gemma-e4b's decode lane carries 20 fused writes and 4 appends and
+    ///   they are disjoint LAYERS, and every other lane carries appends
+    ///   alone. Every row of this fire is therefore this statement's to write,
+    ///   which is what `kv_append_shared` says for dsv4 and what a peel would
+    ///   have to come back to change.
+    fn kv_append<T: kernels::points::Scalar>(
+        &self,
+        k: In<Tensor<T>>,
+        v: In<Tensor<T>>,
+        pages: Cache<Struct<KvCache>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.kv_append at an element other than bf16")?;
+        let row = pages.raised();
+        let view = kv_view_of(&row)?;
+        if view.qo_indptr.is_null() {
+            return Err(Refusal::Null {
+                what: "the query CSR this fire's pool row carries",
+            });
+        }
+        let (kv_heads, head_dim) = head_split(view, k.width)?;
+        let (k, v) = (as_in(&k), as_in(&v));
+        let csr = In {
+            ptr: view.qo_indptr,
+            rows: view.requests,
+            width: 1,
+        };
+        // THE WRITE ORIGIN IS ZERO, AND IT RIDES A POINTER. Both appenders
+        // declare `first_token: In<Tensor<i32>>` and then read `ptr as i32` —
+        // the mark carries a NUMBER, which is the fiction that operand has
+        // always been. Null is that number's zero.
+        let origin = In {
+            ptr: core::ptr::null::<i32>(),
+            rows: 1,
+            width: 1,
+        };
+        if view.native_bf16 {
+            kv_paged::write_kv_to_pages_bf16(
+                self,
+                k,
+                v,
+                row,
+                Const::new(kv_heads),
+                Const::new(head_dim),
+                origin,
+                csr,
+                row_valid_at(view, k.rows),
+            )
+        } else {
+            // THE SHORTER LEG, and its operand list is this one's prefix by
+            // construction: the quantised appender refuses a non-zero origin
+            // outright and has no partial rows to skip, so `row_valid` is
+            // what hangs off the end and nothing else moves.
+            kv_paged::write_kv_to_pages_quantised(
+                self,
+                k,
+                v,
+                row,
+                Const::new(kv_heads),
+                Const::new(head_dim),
+                origin,
+                csr,
+            )
+        }
+    }
+
     /// THE REBASE IS THE POINT'S, AND `attn_sink_rescale` IS THE KERNEL
     /// THAT HAS IT. Two kernels in this crate fold a sink: this one, which
     /// reads the sink at `T` and multiplies the lse by `ln 2` on the way
@@ -91,7 +519,25 @@ impl kernels::points::Attention for Ctx<'_> {
         let head_dim = width_of(head_dim, "the head width this sink states")?;
         let dst = o.all("the row whose heads are counted")?;
         let heads = crate::norm::heads(&dst, head_dim)?;
-        attention_sink_rescale(self, o, lse, sink, Const::new(heads), Const::new(head_dim))
+        self.fire(
+            Fire::at(
+                "attn/attn_sink.cuh",
+                crate::jit::symbol(&format!("::pie::attn::attn_sink_rescale<{}>", T::CPP)),
+            )
+            .apply(per_head_elementwise(
+                o.rows.unsigned_abs(),
+                heads.unsigned_abs(),
+                head_dim.unsigned_abs(),
+            )),
+            &[
+                o.arg(),
+                lse.arg(),
+                sink.arg(),
+                o.rows.arg(),
+                heads.arg(),
+                head_dim.arg(),
+            ],
+        )
     }
 
     fn merge_lse<T: kernels::points::Scalar>(
@@ -107,16 +553,35 @@ impl kernels::points::Attention for Ctx<'_> {
     ) -> Result<(), Refusal> {
         let heads = width_of(heads, "the head count this merge states")?;
         let head_dim = width_of(head_dim, "the head width this merge states")?;
-        combine_attn_outputs(
-            self,
-            o1,
-            lse1,
-            o2,
-            lse2,
-            o,
-            lse,
-            Const::new(heads),
-            Const::new(head_dim),
+        // `attn/dsv4_compress.cuh`'s grid: one block per (row, head), the
+        // block as wide as a head and clamped into a launchable range.
+        const COMBINE_BLOCK_MIN: u32 = 32;
+        const COMBINE_BLOCK_MAX: u32 = 256;
+        self.fire(
+            Fire::at(
+                "attn/dsv4_compress.cuh",
+                crate::jit::symbol(&format!("::pie::attn::combine_attn_outputs<{}>", T::CPP)),
+            )
+            .apply(Launch::grid(
+                [o.rows.unsigned_abs(), heads.unsigned_abs(), 1],
+                [
+                    head_dim
+                        .unsigned_abs()
+                        .clamp(COMBINE_BLOCK_MIN, COMBINE_BLOCK_MAX),
+                    1,
+                    1,
+                ],
+            )),
+            &[
+                o1.arg(),
+                lse1.arg(),
+                o2.arg(),
+                lse2.arg(),
+                o.arg(),
+                lse.arg(),
+                heads.arg(),
+                head_dim.arg(),
+            ],
         )
     }
 
@@ -125,7 +590,15 @@ impl kernels::points::Attention for Ctx<'_> {
         x: InOut<Tensor<T>>,
         cap: f32,
     ) -> Result<(), Refusal> {
-        crate::attn::logit_softcap(self, x, Const::new(cap))
+        let n = softcap_elems(&x.all("out_width(0)")?)?;
+        self.fire(
+            Fire::at(
+                "attn/softcap.cuh",
+                crate::jit::symbol(&format!("::pie::attn::logit_softcap<{}>", T::CPP)),
+            )
+            .apply(softcap_launch(cap, n)?),
+            &[x.arg(), cap.arg(), n.arg()],
+        )
     }
 
     /// Leave dsv4's ONE plane in the pool row, as both halves of the read.
@@ -374,11 +847,10 @@ pub mod attention_flashinfer {
     use crate::jit::abi::Tensor;
     use kernels::Refusal;
     use kernels::routine::{In, Out};
-    use kernels_macros::routine;
 
     use kernels::Bind;
 
-    #[routine(whole, untraced)]
+#[allow(clippy::too_many_arguments)]
     pub fn attn_score_fold_heads(
         ctx: &Ctx<'_>,
         scores: In<Tensor<f32>>,
@@ -555,325 +1027,12 @@ pub mod page_compact {
     pub const K_BLOCK: u32 = 256;
 }
 
-#[routine(whole, untraced)]
-pub fn compact_page_csr(
-    ctx: &Ctx<'_>,
-    keep: In<Tensor<u8>>,
-    keep_stride: Const<u32>,
-    kvc: In<Struct<KvCache>>,
-    num_requests: Const<i32>,
-    scratch_counts: Out<Tensor<u32>>,
-    page_indices_out: Out<Tensor<u32>>,
-    page_indptr_out: Out<Tensor<u32>>,
-    last_page_lens_out: Out<Tensor<u32>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keep_stride = *keep_stride;
-    let page_indices_in = kvc.page_indices as *const u32;
-    let page_indptr_in = kvc.page_indptr as *const u32;
-
-    let last_page_lens_in = kvc.last_page_lens as *const u32;
-    let scratch_counts = scratch_counts.ptr;
-    let page_indices_out = page_indices_out.ptr;
-    let page_indptr_out = page_indptr_out.ptr;
-    let last_page_lens_out = last_page_lens_out.ptr;
-    let num_requests = *num_requests;
-    if scratch_counts.is_null() {
-        return Err(Refusal::Absent {
-            what: "the compaction scratch buffer",
-        });
-    }
-    let launch = Launch::per_row(num_requests.unsigned_abs(), page_compact::K_BLOCK);
-
-    ctx.fire(
-        Fire::at(
-            "attn/page_compact.cuh",
-            "::pie::attn::count_kept<::pie::i32(256)>",
-        )
-        .apply(launch),
-        &[
-            page_indptr_in.arg(),
-            keep.arg(),
-            keep_stride.arg(),
-            num_requests.arg(),
-            scratch_counts.arg(),
-        ],
-    )?;
-    ctx.fire(
-        Fire::at(
-            "attn/page_compact.cuh",
-            "::pie::attn::scan_and_scatter<::pie::i32(256)>",
-        )
-        .apply(launch),
-        &[
-            page_indices_in.arg(),
-            page_indptr_in.arg(),
-            last_page_lens_in.arg(),
-            keep.arg(),
-            scratch_counts.cast_const().arg(),
-            keep_stride.arg(),
-            num_requests.arg(),
-            page_indptr_out.arg(),
-            last_page_lens_out.arg(),
-            page_indices_out.arg(),
-        ],
-    )
-}
-
 pub mod attention_naive {
     pub const BLOCK: u32 = 256;
 }
 
-#[routine(bf16, whole, out(out = like(target_hidden)))]
-pub fn mtp_shift_hidden<T>(
-    ctx: &Ctx<'_>,
-    target_hidden: In<Tensor<T>>,
-    pending_hidden: In<Tensor<T>>,
-    out: Out<Tensor<T>>,
-    qo_indptr: In<Tensor<i32>>,
-    rsv: In<Struct<RecurrentState>>,
-) -> Result<(), Refusal>
-where
-    <T as kernels::Elem>::Read: Abi + kernels::Bind<crate::jit::ArgValue>,
-    <T as kernels::Elem>::Write:
-        Abi + kernels::Bind<crate::jit::ArgValue> + kernels::BindMut<crate::jit::ArgValue>,
-{
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    // The request count is the CSR operand's own row count.
-    let num_requests = qo_indptr.rows;
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    let slot_ids = rsv.slots;
-
-    if matches!(pending_hidden.ptr.arg(), crate::jit::ArgValue::Ptr(p) if p.is_null()) {
-        return Err(Refusal::Absent {
-            what: "the MTP pending-hidden state",
-        });
-    }
-
-    let dst = out.all("out_width(0)")?;
-    let hidden_size = dst.width;
-
-    ctx.fire(
-        Fire::at(
-            "attn/attention_naive.cuh",
-            crate::jit::symbol(&format!("::pie::attn::mtp_shift_hidden<{}>", T::CPP)),
-        )
-        .apply(Launch::per_row(
-            dst.rows.unsigned_abs(),
-            attention_naive::BLOCK,
-        )),
-        &[
-            target_hidden.arg(),
-            pending_hidden.arg(),
-            qo_indptr.arg(),
-            slot_ids.arg(),
-            out.arg(),
-            num_requests.arg(),
-            hidden_size.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, whole)]
-pub fn mtp_update_pending_hidden<T>(
-    ctx: &Ctx<'_>,
-    target_hidden: In<Tensor<T>>,
-    qo_indptr: In<Tensor<i32>>,
-    rsv: In<Struct<RecurrentState>>,
-    pending: In<Struct<MtpPendingHidden>>,
-) -> Result<(), Refusal>
-where
-    *const T: Abi + kernels::Bind<crate::jit::ArgValue>,
-    *mut T: Abi + kernels::Bind<crate::jit::ArgValue>,
-    T: kernels::Elem<Write = *mut T>,
-{
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    // The request count is the CSR operand's own row count.
-    let num_requests = qo_indptr.rows;
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    let slot_ids = rsv.slots;
-    let pending_hidden = pending.ptr.cast_mut().cast::<T>();
-    if pending_hidden.is_null() {
-        return Err(Refusal::Absent {
-            what: "the MTP pending-hidden state",
-        });
-    }
-
-    let src = target_hidden.all("in_width(0)")?;
-    let hidden_size = src.width;
-
-    ctx.fire(
-        Fire::at(
-            "attn/attention_naive.cuh",
-            crate::jit::symbol(&format!(
-                "::pie::attn::mtp_update_pending_hidden<{}>",
-                T::CPP
-            )),
-        )
-        .apply(Launch::per_row(
-            num_requests.unsigned_abs(),
-            attention_naive::BLOCK,
-        )),
-        &[
-            target_hidden.arg(),
-            pending_hidden.arg(),
-            qo_indptr.arg(),
-            slot_ids.arg(),
-            num_requests.arg(),
-            hidden_size.arg(),
-        ],
-    )
-}
-
-#[allow(clippy::similar_names)]
-#[routine(whole, untraced)]
-pub fn mla_prepare_bf16(
-    ctx: &Ctx<'_>,
-    layer: MlaLayer,
-    kv_a: In<Tensor<bf16>>,
-    kv_a_norm_weight: Const<Tensor<bf16>>,
-    q_b: In<Tensor<bf16>>,
-    kv_c: Out<Tensor<bf16>>,
-    k_pe: Out<Tensor<bf16>>,
-    q_nope: Out<Tensor<bf16>>,
-    q_pe: Out<Tensor<bf16>>,
-    heads: i32,
-    qk_nope_head_dim: i32,
-    eps: Const<f32>,
-    theta: Const<f32>,
-    interleaved: bool,
-    kv_a_row_stride: i32,
-    yarn: Option<Yarn>,
-    qo_indptr: In<Tensor<i32>>,
-    positions: In<Tensor<i32>>,
-    kvc: In<Struct<KvCache>>,
-    row_valid: In<Tensor<i32>>,
-    num_requests: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    let positions = positions.ptr;
-    let kv_page_indices = kvc.page_indices as *const u32;
-    let kv_page_indptr = kvc.page_indptr as *const u32;
-    let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let row_valid = row_valid.ptr as *const u8;
-    let num_requests = *num_requests;
-
-    #[must_use]
-    pub fn mla_q_blocks(heads: i32, heads_per_block: i32) -> i32 {
-        if heads_per_block <= 0 {
-            return 0;
-        }
-        heads.saturating_add(heads_per_block - 1) / heads_per_block
-    }
-
-    #[must_use]
-    pub fn mla_heads_per_block(rope: i32) -> i32 {
-        let half = rope / 2;
-        if half >= MLA_PREPARE_BLOCK {
-            1
-        } else if half > 0 {
-            MLA_PREPARE_BLOCK / half
-        } else {
-            1
-        }
-    }
-
-    pub const MLA_PREPARE_BLOCK: i32 = 256;
-
-    let kv_lora = layer.kv_lora_rank;
-    let rope = layer.qk_rope_head_dim;
-    let stride = if kv_a_row_stride > 0 {
-        kv_a_row_stride
-    } else {
-        kv_lora + rope
-    };
-    let per_block = mla_heads_per_block(rope);
-    let blocks = mla_q_blocks(heads, per_block);
-
-    let (low_dim, high_dim) = match yarn {
-        Some(y) => crate::rope::ramp_bounds(
-            rope,
-            *theta,
-            y.beta_fast,
-            y.beta_slow,
-            y.original_max_position,
-        ),
-        None => (0.0, 0.0),
-    };
-    let yarn_factor = yarn.map_or(-1.0_f32, |y| y.factor);
-    let yarn_mscale = yarn.map_or(1.0_f32, |y| y.attention_factor);
-
-    ctx.fire(
-        Fire::at(
-            "attn/mla_paged.cuh",
-            "::pie::attn::mla_prepare<::pie::i32(256)>",
-        )
-        .apply(Launch::grid(
-            [
-                kv_c.rows.unsigned_abs(),
-                blocks.saturating_add(1).max(1).unsigned_abs(),
-                1,
-            ],
-            [MLA_PREPARE_BLOCK.unsigned_abs(), 1, 1],
-        )),
-        &[
-            kv_a.arg(),
-            kv_a_norm_weight.arg(),
-            q_b.arg(),
-            kv_c.arg(),
-            k_pe.arg(),
-            q_nope.arg(),
-            q_pe.arg(),
-            layer.ckv_pages.cast::<bf16>().arg(),
-            layer.kpe_pages.cast::<bf16>().arg(),
-            positions.arg(),
-            qo_indptr.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            kv_last_page_lens.arg(),
-            row_valid.arg(),
-            num_requests.arg(),
-            layer.page_size.arg(),
-            heads.arg(),
-            kv_lora.arg(),
-            qk_nope_head_dim.arg(),
-            rope.arg(),
-            stride.arg(),
-            eps.arg(),
-            theta.arg(),
-            interleaved.arg(),
-            per_block.arg(),
-            yarn_factor.arg(),
-            low_dim.arg(),
-            high_dim.arg(),
-            yarn_mscale.arg(),
-        ],
-    )
-}
-
-#[routine(whole, untraced)]
-pub fn write_mla_to_pages(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_mla_to_pages(
     ctx: &Ctx<'_>,
     layer: MlaLayer,
     ckv_curr: In<Tensor<bf16>>,
@@ -923,276 +1082,6 @@ pub fn write_mla_to_pages(
 }
 
 const DSV4_META_BLOCK: u32 = 128;
-
-#[routine(canon = "pool.boundary_decode", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
-pub fn dsv4_boundary_meta_decode(
-    ctx: &Ctx<'_>,
-    positions: In<Tensor<i32>>,
-    out_pos: Out<Tensor<i32>>,
-    out_req: Out<Tensor<i32>>,
-    out_rope: Out<Tensor<i32>>,
-    ratio: Const<i32>,
-    row_valid: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let ratio = *ratio;
-    let row_valid = row_valid.ptr as *const u8;
-    if ratio <= 0 {
-        return Err(Refusal::Narrow {
-            what: "ratio",
-            at: i64::from(ratio),
-        });
-    }
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsv4_compress.cuh",
-            "::pie::attn::dsv4_boundary_meta_decode<::pie::i32>",
-        )
-        .apply(Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK)),
-        &[
-            positions.arg(),
-            out_pos.arg(),
-            out_req.arg(),
-            out_rope.arg(),
-            out_pos.rows.arg(),
-            ratio.arg(),
-            row_valid.arg(),
-        ],
-    )
-}
-
-#[routine(whole, canon = "pool.boundary_prefill", out(out_pos = like(positions)), out(out_req = like(positions)), out(out_rope = like(positions)))]
-pub fn dsv4_boundary_meta_paged(
-    ctx: &Ctx<'_>,
-    positions: In<Tensor<i32>>,
-    out_pos: Out<Tensor<i32>>,
-    out_req: Out<Tensor<i32>>,
-    out_rope: Out<Tensor<i32>>,
-    ratio: Const<i32>,
-    row_valid: In<Tensor<i32>>,
-    qo_indptr: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let ratio = *ratio;
-    let row_valid = row_valid.ptr as *const u8;
-    // The request count is the CSR operand's own row count.
-    let num_requests = qo_indptr.rows;
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    if ratio <= 0 {
-        return Err(Refusal::Narrow {
-            what: "ratio",
-            at: i64::from(ratio),
-        });
-    }
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsv4_compress.cuh",
-            "::pie::attn::dsv4_boundary_meta_paged<::pie::i32>",
-        )
-        .apply(Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK)),
-        &[
-            positions.arg(),
-            qo_indptr.arg(),
-            out_pos.arg(),
-            out_req.arg(),
-            out_rope.arg(),
-            out_pos.rows.arg(),
-            num_requests.arg(),
-            ratio.arg(),
-            row_valid.arg(),
-        ],
-    )
-}
-
-#[routine(whole, canon = "pool.attention_lse")]
-pub fn attention_compressed_paged_bf16(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    o: Out<Tensor<bf16>>,
-    lse_out: Out<Tensor<f32>>,
-    ratio: Const<i32>,
-    num_q_heads: Const<i32>,
-    head_dim: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    sm_scale: Const<f32>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    comp_kv: In<Struct<Dsv4CompKvPages>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let ratio = *ratio;
-    let num_q_heads = *num_q_heads;
-    let head_dim = *head_dim;
-    let page_size = kvc.page_size;
-    let sm_scale = *sm_scale;
-
-    let positions = positions.ptr;
-    let kv_page_indices = kvc.page_indices as *const u32;
-    let kv_page_indptr = kvc.page_indptr as *const u32;
-    let req_of_token = request_of_token.ptr;
-    let comp_kv_pages = comp_kv.ptr;
-
-    const DSV4_ATTN_BLOCK: u32 = 128;
-
-    let smem = head_dim
-        .max(0)
-        .unsigned_abs()
-        .saturating_add(DSV4_ATTN_BLOCK)
-        .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsv4_compress.cuh",
-            "::pie::attn::compressed_attn_paged",
-        )
-        .apply(
-            Launch::grid(
-                [o.rows.unsigned_abs(), num_q_heads.unsigned_abs(), 1],
-                [DSV4_ATTN_BLOCK, 1, 1],
-            )
-            .smem(smem),
-        ),
-        &[
-            q.arg(),
-            comp_kv_pages.arg(),
-            o.arg(),
-            lse_out.arg(),
-            positions.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            req_of_token.arg(),
-            num_q_heads.arg(),
-            head_dim.arg(),
-            ratio.arg(),
-            page_size.arg(),
-            sm_scale.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "index.layernorm_rope", out(idx_k = like(idx_k)))]
-pub fn dsa_index_knorm_rope<T>(
-    ctx: &Ctx<'_>,
-    idx_k: InOut<Tensor<T>>,
-    k_norm_weight: Const<Tensor<T>>,
-    k_norm_bias: Const<Tensor<T>>,
-    rope_dim: Const<i32>,
-    theta: Const<f32>,
-    eps: Const<f32>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal>
-where
-    *const T: Abi + kernels::Bind<crate::jit::ArgValue>,
-    *mut T: Abi + kernels::Bind<crate::jit::ArgValue>,
-    T: kernels::Elem<Write = *mut T>,
-{
-    let rope_dim = *rope_dim;
-    let theta = *theta;
-    let eps = *eps;
-
-    let positions = positions.ptr;
-
-    let dst = idx_k.all("out_width(0)")?;
-    let head_dim = dst.width;
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsa_indexer.cuh",
-            crate::jit::symbol(&format!("::pie::attn::index_knorm_rope<{}>", T::CPP)),
-        )
-        .apply(Launch::per_row(
-            dst.rows.unsigned_abs(),
-            dsa_indexer::K_BLOCK,
-        )),
-        &[
-            idx_k.arg(),
-            k_norm_weight.arg(),
-            k_norm_bias.arg(),
-            positions.arg(),
-            head_dim.arg(),
-            rope_dim.arg(),
-            theta.arg(),
-            eps.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "index.rope", out(idx_q = split(idx_q, head_dim)))]
-pub fn dsa_index_q_rope<T>(
-    ctx: &Ctx<'_>,
-    idx_q: InOut<Tensor<T>>,
-    n_heads: Const<i32>,
-    head_dim: Const<i32>,
-    rope_dim: Const<i32>,
-    theta: Const<f32>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let n_heads = *n_heads;
-    let head_dim = *head_dim;
-    let rope_dim = *rope_dim;
-    let theta = *theta;
-
-    let positions = positions.ptr;
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsa_indexer.cuh",
-            crate::jit::symbol(&format!("::pie::attn::index_q_rope<{}>", T::CPP)),
-        )
-        .apply(Launch::per_row(
-            idx_q.rows.unsigned_abs(),
-            dsa_indexer::q_rope_block(n_heads),
-        )),
-        &[
-            idx_q.arg(),
-            positions.arg(),
-            n_heads.arg(),
-            head_dim.arg(),
-            rope_dim.arg(),
-            theta.arg(),
-        ],
-    )
-}
-
-#[routine(whole)]
-pub fn dsa_index_topk_mask(
-    ctx: &Ctx<'_>,
-    idx_q: In<Tensor<bf16>>,
-    idx_k: In<Tensor<bf16>>,
-    idx_w: In<Tensor<bf16>>,
-    mask: Out<Tensor<u8>>,
-    n_heads: Const<i32>,
-    head_dim: Const<i32>,
-    topk: Const<i32>,
-) -> Result<(), Refusal> {
-    let smem = mask
-        .rows
-        .unsigned_abs()
-        .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsa_indexer.cuh",
-            "::pie::attn::index_topk_mask<::pie::bf16>",
-        )
-        .apply(Launch::per_row(mask.rows.unsigned_abs(), dsa_indexer::K_BLOCK).smem(smem)),
-        &[
-            idx_q.arg(),
-            idx_k.arg(),
-            idx_w.arg(),
-            mask.arg(),
-            mask.rows.arg(),
-            n_heads.arg(),
-            head_dim.arg(),
-            topk.arg(),
-        ],
-    )
-}
 
 pub mod mla_params {
     use super::bf16;
@@ -1813,11 +1702,10 @@ pub enum MlaDispatch {
 /// that cannot honestly carry a `canon` — there is nothing for a binder to
 /// bind and nothing for a claim to delegate to, which is exactly what
 /// `kernels/src/points.rs` recorded against these four points. The four
-/// `attention_mla_*_bf16` routines below are the columned form: one per
-/// declared reading, each taking the statement's own operands with the plan
-/// as a RAISE, and each carrying the point's name as its `canon`. This is
-/// the shared body they call. It still answers with its choice, because the
-/// device tests and the benchmarks read it; the routines drop it.
+/// readings are `#[claims]` bodies now — each takes the statement's own
+/// operands with the plan as a RAISE — and this is the shared launch they
+/// call. It still answers with its CHOICE, because the device tests and the
+/// benchmarks read which kernel it picked; the four callers drop it.
 ///
 /// # The plan
 ///
@@ -2028,7 +1916,14 @@ fn kv_view_of(kvc: &In<Struct<KvCache>>) -> Result<&crate::views::PagedKvView, R
 /// request and the statement carries no window. `PagedKvView::qo_indptr` is
 /// the same buffer `attention_mla_prefill_bf16` takes as its second operand
 /// — the driver stages one per fire and hands it to both.
-#[routine(no_join, canon = "mla.attention_decode")]
+/// The MLA decode launch, which `mla.attention_decode` names.
+///
+/// A POINT AND A TEST reach it: the claim above, and
+/// `tests/mla_paged.rs`, which measures the planned leg against the ragged
+/// one and against an unplanned and an unbound view — three refusals a
+/// claim body cannot state on its own, because a raise answers or refuses
+/// before the body runs.
+#[allow(clippy::too_many_arguments)]
 pub fn attention_mla_decode_bf16(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -2060,46 +1955,6 @@ pub fn attention_mla_decode_bf16(
         kvc,
         view.qo_indptr as *const u32,
         Const::new(view.requests),
-        None,
-    )
-    .map(|_| ())
-}
-
-/// `mla.attention_prefill`: the same reading over a query WINDOW, with the
-/// statement's own CSR and the causal order it implies.
-#[routine(no_join, canon = "mla.attention_prefill")]
-pub fn attention_mla_prefill_bf16(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    indptr: In<Tensor<i32>>,
-    plan: In<Struct<crate::raises::MlaPlanned>>,
-    q_pe: In<Tensor<bf16>>,
-    o: Out<Tensor<bf16>>,
-    kvc: In<Struct<KvCache>>,
-    heads: Const<i32>,
-    kv_lora_rank: Const<i32>,
-    sm_scale: Const<f32>,
-) -> Result<(), Refusal> {
-    let view = kv_view_of(&kvc)?;
-    let heads = *heads;
-    let rope = rope_per_head(&q_pe, heads)?;
-    let layer = mla_layer(view, *kv_lora_rank, rope);
-    // The request count is the CSR operand's own row count, which is what
-    // every other prefill routine in this file reads.
-    let num_requests = indptr.rows;
-    dispatch_attention_mla_bf16(
-        ctx,
-        mla_plan_of(&plan)?,
-        q,
-        q_pe,
-        layer,
-        o,
-        heads,
-        sm_scale,
-        true,
-        kvc,
-        indptr.ptr as *const u32,
-        Const::new(num_requests),
         None,
     )
     .map(|_| ())
@@ -2208,169 +2063,164 @@ fn selected_attention_mla_bf16(
 }
 
 pub mod qkv_fused {
-    use super::bf16;
-    use super::{Ctx, Launch, Refusal};
+    
+    
 
-    use crate::jit::abi::Tensor;
-    use crate::views::KvCache;
+    
+    
 
-    use kernels::raises::Struct;
-    use kernels::routine::{Const, In, Out};
-    use kernels::{Bind, Fire};
-    use kernels_macros::routine;
+    
+    
+    
 
-    #[routine]
-    pub fn qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
-        ctx: &Ctx<'_>,
-        packed: In<Tensor<bf16>>,
-        q_out: Out<Tensor<bf16>>,
-        q_weight: Const<Tensor<bf16>>,
-        k_weight: Const<Tensor<bf16>>,
-        num_kv_heads: Const<i32>,
-        head_dim: Const<i32>,
-        kvc: In<Struct<KvCache>>,
-        theta: Const<f32>,
-        eps: Const<f32>,
-        positions: In<Tensor<i32>>,
-        row_valid: In<Tensor<i32>>,
+
+}
+
+/// This plane's TIER-2 SURFACE: what one plane can do that no floor states.
+///
+/// `.wiki/baker.md`: *"Tier-2 = an inherent method on `Ctx`. No trait, no
+/// floor entry — an inherent impl can only live in the plane crate, which is
+/// the whole rule."* `#[claims]` reads this block the way it reads a family
+/// impl and writes ONE table for it (`TIER2_POINTS`), because a tier-2 point
+/// is declared and claimed by the same line: there is no obligation to
+/// measure against and so no backlog row it could be.
+///
+/// THE POINT'S NAME IS THE METHOD'S, WITHOUT THE PLANE. A text spells this
+/// statement `cuda::qkv_fused_qknorm_rope_vnorm_write` and the `cuda::`
+/// prefix is the LOWERING'S GATE — `model_compiler::sweep::resolve` files a
+/// violation when another plane's plan states it, and `call_of` strips it on
+/// the way to `Call::Tier2`. Inside this crate there is nothing left to gate,
+/// and a plane crate that spelled its own name in its own table would be
+/// stating the gate a second time. The two name spaces cannot collide in the
+/// generated dispatch's one match either way: a tier-1 point is
+/// `family.method` and carries a dot, an inherent method cannot.
+#[kernels_macros::claims]
+impl Ctx<'_> {
+    /// gemma's fused decode step: ONE launch for the packed QKV row's split,
+    /// both head norms, rope, and the kv write into the pages.
+    ///
+    /// # Why this is tier-2 and not a point
+    ///
+    /// It is not a kernel the floor could ask every plane for. It is a
+    /// FUSION — five points' worth of work (`layout.split_qkv`,
+    /// `rmsnorm.per_head` twice, `rope.full`, `attention.kv_append`) collapsed
+    /// into one launch because this plane has a kernel that does all five in
+    /// registers. A floor entry for it would oblige every plane to either
+    /// write that kernel or carry a backlog row for a fusion it has no reason
+    /// to want, which is precisely the obligation tier-2 exists to not
+    /// create. So gemma's text states it behind `inputs.cuda()` with the
+    /// unfused chain as the else, and both arms are on the traced plan.
+    ///
+    /// # The two epsilons
+    ///
+    /// The statement names two `Norm`s and so states two epsilons; the kernel
+    /// takes ONE and applies it to both head norms. They agree in gemma's
+    /// text by construction (`d.norm_eps`, spelled once and read twice), and
+    /// a statement where they do not is REFUSED BY NAME rather than served
+    /// with one of them dropped — `attention.masked`'s window-beside-a-mask
+    /// precedent, for the same reason: the kernel would silently normalise k
+    /// at q's epsilon and the answer would be plausible and wrong.
+    ///
+    /// # No rope table, by declaration
+    ///
+    /// The `.cuh` behind this takes an optional precomputed rope table and
+    /// dispatches on its null. This declaration states `theta` and no table
+    /// slot, so a table can never arrive and the tableless instantiation is
+    /// the only one reachable — which is why the two `<.., false>` arms are
+    /// spelled here and their `true` siblings are not. A text that wants a
+    /// table wants a slot for it, and adding one is a declaration change that
+    /// regenerates the dispatch.
+    ///
+    /// # The staging
+    ///
+    /// `row_valid` comes off the POOL ROW and not off `Ctx::staged`, which is
+    /// the rule `crate::views::RowValid`'s own header states: a point that
+    /// names a cache row reads the plane the view already carries, and the
+    /// raise is declared for the points that name no row at all. The write
+    /// origin, the page CSR and the request count come from the same view.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_fused_qknorm_rope_vnorm_write<T: kernels::points::Scalar>(
+        &self,
+        packed: In<<Self as Plane>::Tensor<T>>,
+        positions: In<<Self as Plane>::Tensor<i32>>,
+        q_weight: Const<<Self as Plane>::Tensor<T>>,
+        q_eps: f32,
+        k_weight: Const<<Self as Plane>::Tensor<T>>,
+        k_eps: f32,
+        pages: Cache<<Self as Plane>::Pages>,
+        kv_heads: u32,
+        head_dim: u32,
+        theta: f32,
+        q: Out<<Self as Plane>::Tensor<T>>,
     ) -> Result<(), Refusal> {
-        if kvc.ptr.is_null() {
-            return Err(Refusal::Null {
-                what: "the kv view this statement names",
+        at_bf16::<T>("cuda::qkv_fused_qknorm_rope_vnorm_write at an element other than bf16")?;
+        if q_eps != k_eps {
+            return Err(Refusal::Unstated {
+                what: "two head-norm epsilons on a fused write: the kernel applies one to \
+                       both norms, so serving this would normalise k at q's epsilon",
             });
         }
-        let kvc = unsafe { &*kvc.ptr };
-        let num_kv_heads = *num_kv_heads;
-        let head_dim = *head_dim;
-        let page_size = kvc.page_size;
-        let hnd_layout = kvc.layout != 0;
-        let theta = *theta;
-        let eps = *eps;
-
-        let k_pages = kvc.keys;
-        let v_pages = kvc.values;
-        let positions = positions.ptr;
-        let kv_page_indices = kvc.page_indices as *const u32;
-        let kv_page_indptr = kvc.page_indptr as *const u32;
-        let kv_last_page_lens = kvc.last_page_lens as *const u32;
-        let row_valid = row_valid.ptr as *const u8;
-
-        pub const PACKED_BLOCK: u32 = 256;
-
+        let row = pages.raised();
+        let view = kv_view_of(&row)?;
+        let head_dim = width_of(head_dim, "the head width this fused write states")?;
+        let kv_heads = width_of(kv_heads, "the kv head count this fused write states")?;
         if head_dim <= 0 {
-            return Err(Refusal::Empty { what: "head_dim" });
+            return Err(Refusal::Empty {
+                what: "the head width this fused write states",
+            });
         }
-        let num_q_heads = q_out.all("out_width(0)")?.width / head_dim;
-        let heads = num_q_heads.unsigned_abs() + num_kv_heads.unsigned_abs();
-
-        ctx.fire(
-            Fire::at(
-                "attn/qkv_fused.cuh",
-                "::pie::attn::qkv_packed_qk_norm_rope_vnorm_write_kv<::pie::i32(256)>",
-            )
-            .apply(Launch::grid(
-                [packed.rows.unsigned_abs(), heads, 1],
-                [PACKED_BLOCK, 1, 1],
-            )),
-            &[
-                packed.arg(),
-                q_out.arg(),
-                k_pages.arg(),
-                v_pages.arg(),
-                q_weight.arg(),
-                k_weight.arg(),
-                positions.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                kv_last_page_lens.arg(),
-                row_valid.arg(),
-                num_q_heads.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-                page_size.arg(),
-                hnd_layout.arg(),
-                theta.arg(),
-                eps.arg(),
-            ],
-        )
-    }
-
-    fn warp_instantiation(head_dim: i32, rope_table: bool) -> Option<&'static str> {
-        Some(match (head_dim, rope_table) {
-            (64, true) => {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(64), true>"
-            }
-            (64, false) => {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(64), false>"
-            }
-            (128, true) => {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(128), true>"
-            }
-            (128, false) => {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(128), false>"
-            }
-            (256, true) => {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(256), true>"
-            }
-            (256, false) => {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(256), false>"
-            }
-            _ => return None,
-        })
-    }
-
-    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
-    pub fn qkv_decode_fused_dispatch(
-        ctx: &Ctx<'_>,
-        packed: *const bf16,
-        q_out: *mut bf16,
-        k_pages: *mut bf16,
-        v_pages: *mut bf16,
-        q_weight: *const bf16,
-        k_weight: *const bf16,
-        positions: *const i32,
-        rope_table: *const f32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        w_page: *const u32,
-        w_off: *const u32,
-        row_valid: *const u8,
-        win: *const u32,
-        num_requests: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        hnd_layout: bool,
-        theta: f32,
-        eps: f32,
-    ) -> Result<(), Refusal> {
-        pub const WARP_BLOCK: u32 = 256;
-
-        const fn block_instantiation(rope_table: bool) -> &'static str {
-            if rope_table {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv<::pie::i32(128), true>"
-            } else {
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv<::pie::i32(128), false>"
-            }
+        let (packed, q_out) = (as_in(&packed), as_out(&q));
+        // THE Q HEADS ARE THE PACKED ROW LESS THE TWO KV PLANES, which is the
+        // same arithmetic `model_compiler::program` runs to SIZE the result:
+        // the two kv planes go straight into the pages and never reach the
+        // arena, so what is left of the packed row is q.
+        let width = packed.all("the packed qkv row this write splits")?.width;
+        let num_q_heads = (width - 2 * kv_heads * head_dim) / head_dim;
+        if num_q_heads <= 0 {
+            return Err(Refusal::Narrow {
+                what: "a packed qkv row with no q plane left after its two kv planes",
+                at: i64::from(width),
+            });
         }
+        let heads = num_q_heads.unsigned_abs() + kv_heads.unsigned_abs();
+        let rows = packed.rows;
 
+        let k_pages = view.keys.cast::<bf16>();
+        let v_pages = view.values.cast::<bf16>();
+        let page_indices = view.page_indices as *const u32;
+        let page_indptr = view.page_indptr as *const u32;
+        let last_page_lens = view.last_page_lens as *const u32;
+        let w_page = view.write_page as *const u32;
+        let w_off = view.write_offset as *const u32;
+        let row_valid = view.row_valid;
+        // NO ROPE TABLE AND NO WINDOW PLANE, both by declaration: the kernel
+        // reads a null for each as "compute the angles from `theta`" and "no
+        // per-request window", and neither is a slot this statement carries.
+        let rope_table = core::ptr::null::<f32>();
+        let win = core::ptr::null::<u32>();
+        let page_size = view.page_size;
+        let hnd_layout = view.layout != 0;
+
+        // THE WARP ARM IS THE NARROW ONE, and its instantiation is the head
+        // width: one warp per (request, head) at a width the kernel has a
+        // register tiling for. Everything else takes the block arm, whose
+        // 128-wide instantiation reads the width as a runtime argument.
+        const WARP_BLOCK: u32 = 256;
         const WARPS_PER_BLOCK: u32 = WARP_BLOCK / 32;
-
-        pub const DECODE_BLOCK: u32 = 128;
-
-        if q_out.is_null() {
-            return Err(Refusal::Absent { what: "q_out" });
-        }
-
-        let use_rope_table = !rope_table.is_null();
-        let heads = num_q_heads.unsigned_abs() + num_kv_heads.unsigned_abs();
-
-        if let Some(instantiation) = warp_instantiation(head_dim, use_rope_table) {
-            let units = num_requests.unsigned_abs().saturating_mul(heads);
-
-            return ctx.fire(
+        const DECODE_BLOCK: u32 = 128;
+        let warped = match head_dim {
+            64 => Some("::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(64), false>"),
+            128 => {
+                Some("::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(128), false>")
+            }
+            256 => {
+                Some("::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(256), false>")
+            }
+            _ => None,
+        };
+        if let Some(instantiation) = warped {
+            let units = rows.unsigned_abs().saturating_mul(heads);
+            return self.fire(
                 Fire::at("attn/qkv_fused.cuh", instantiation).apply(Launch::grid(
                     [units.div_ceil(WARPS_PER_BLOCK), 1, 1],
                     [WARP_BLOCK, 1, 1],
@@ -2384,30 +2234,29 @@ pub mod qkv_fused {
                     k_weight.arg(),
                     positions.arg(),
                     rope_table.arg(),
-                    kv_page_indices.arg(),
-                    kv_page_indptr.arg(),
-                    kv_last_page_lens.arg(),
+                    page_indices.arg(),
+                    page_indptr.arg(),
+                    last_page_lens.arg(),
                     w_page.arg(),
                     w_off.arg(),
                     row_valid.arg(),
                     win.arg(),
-                    num_requests.arg(),
+                    rows.arg(),
                     num_q_heads.arg(),
-                    num_kv_heads.arg(),
+                    kv_heads.arg(),
                     page_size.arg(),
                     hnd_layout.arg(),
                     theta.arg(),
-                    eps.arg(),
+                    q_eps.arg(),
                 ],
             );
         }
-        ctx.fire(
-            Fire::at("attn/qkv_fused.cuh", block_instantiation(use_rope_table)).apply(
-                Launch::grid(
-                    [num_requests.unsigned_abs(), heads, 1],
-                    [DECODE_BLOCK, 1, 1],
-                ),
-            ),
+        self.fire(
+            Fire::at(
+                "attn/qkv_fused.cuh",
+                "::pie::attn::qkv_decode_qk_norm_rope_write_kv<::pie::i32(128), false>",
+            )
+            .apply(Launch::grid([rows.unsigned_abs(), heads, 1], [DECODE_BLOCK, 1, 1])),
             &[
                 packed.arg(),
                 q_out.arg(),
@@ -2417,232 +2266,35 @@ pub mod qkv_fused {
                 k_weight.arg(),
                 positions.arg(),
                 rope_table.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                kv_last_page_lens.arg(),
+                page_indices.arg(),
+                page_indptr.arg(),
+                last_page_lens.arg(),
                 w_page.arg(),
                 w_off.arg(),
                 row_valid.arg(),
                 win.arg(),
                 num_q_heads.arg(),
-                num_kv_heads.arg(),
+                kv_heads.arg(),
                 head_dim.arg(),
                 page_size.arg(),
                 hnd_layout.arg(),
                 theta.arg(),
-                eps.arg(),
+                q_eps.arg(),
             ],
-        )
-    }
-
-    const QKV_DECODE_FUSED_DISPATCH_ROW: ::kernels::routine::Routine<crate::Plane> =
-        ::kernels::untraced!(
-            crate::Plane,
-            "qkv_decode_fused_dispatch",
-            qkv_decode_fused_dispatch,
-            namespace = "attn"
-        )
-        .internal();
-
-    #[cfg(not(target_family = "wasm"))]
-    #[::linkme::distributed_slice(crate::ROUTINES)]
-    #[allow(non_upper_case_globals)]
-    static QKV_DECODE_FUSED_DISPATCH_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
-        QKV_DECODE_FUSED_DISPATCH_ROW;
-
-    #[cfg(target_family = "wasm")]
-    ::inventory::submit! { crate::Registered(QKV_DECODE_FUSED_DISPATCH_ROW) }
-
-    #[allow(clippy::fn_params_excessive_bools)]
-    #[routine]
-    pub fn qkv_decode_qk_norm_rope_write_kv_bf16(
-        ctx: &Ctx<'_>,
-        packed: In<Tensor<bf16>>,
-        q_out: Out<Tensor<bf16>>,
-        q_weight: Const<Tensor<bf16>>,
-        k_weight: Const<Tensor<bf16>>,
-        // NULLABLE: the launcher dispatches on a null table (the tableless
-        // instantiation), and the statement may omit the operand.
-        rope_table: Option<In<Tensor<f32>>>,
-        num_kv_heads: Const<i32>,
-        head_dim: Const<i32>,
-        kvc: In<Struct<KvCache>>,
-        theta: Const<f32>,
-        eps: Const<f32>,
-        positions: In<Tensor<i32>>,
-        row_valid: In<Tensor<i32>>,
-    ) -> Result<(), Refusal> {
-        if kvc.ptr.is_null() {
-            return Err(Refusal::Null {
-                what: "the kv view this statement names",
-            });
-        }
-        let kvc = unsafe { &*kvc.ptr };
-        let num_kv_heads = *num_kv_heads;
-        let head_dim = *head_dim;
-        let page_size = kvc.page_size;
-        let hnd_layout = kvc.layout != 0;
-        let theta = *theta;
-        let eps = *eps;
-
-        let k_pages = kvc.keys;
-        let v_pages = kvc.values;
-        let positions = positions.ptr;
-        let kv_page_indices = kvc.page_indices as *const u32;
-        let kv_page_indptr = kvc.page_indptr as *const u32;
-        let kv_last_page_lens = kvc.last_page_lens as *const u32;
-        let w_page = kvc.write_page as *const u32;
-        let w_off = kvc.write_offset as *const u32;
-        let row_valid = row_valid.ptr as *const u8;
-
-        if head_dim <= 0 {
-            return Err(Refusal::Empty { what: "head_dim" });
-        }
-        let packed_width = packed.all("in_width(0)")?.width;
-        let num_q_heads = (packed_width - 2 * num_kv_heads * head_dim) / head_dim;
-        qkv_decode_fused_dispatch(
-            ctx,
-            packed.ptr,
-            q_out.ptr,
-            k_pages.cast::<bf16>(),
-            v_pages.cast::<bf16>(),
-            q_weight.v,
-            k_weight.v,
-            positions,
-            rope_table.map_or(core::ptr::null(), |t| t.ptr),
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            w_page,
-            w_off,
-            row_valid,
-            core::ptr::null(),
-            packed.rows,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            hnd_layout,
-            theta,
-            eps,
         )
     }
 }
 
-pub mod dsv4_compress {
-    use super::bf16;
-    use super::{Ctx, Launch, Refusal};
-    use crate::jit::abi::Tensor;
-    use crate::views::{Dsv4Ape, Dsv4CompKvPages, Dsv4StateKv, Dsv4StateScore, KvCache};
-
-    use kernels::raises::Struct;
-    use kernels::routine::{Const, In, Out};
-    use kernels::{Bind, Fire};
-    use kernels_macros::routine;
-
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "both are guarded positive by every caller"
-    )]
-    fn route_rows(rows: i32, width: i32) -> Launch {
-        let (rows, width) = (rows as u32, width as u32);
-        Launch::per_row(rows, width.div_ceil(32).max(1).saturating_mul(32).min(1024))
-    }
-
-    #[routine(canon = "pool.gather")]
-    pub fn dsv4_compress_gather_paged_bf16(
-        ctx: &Ctx<'_>,
-        boundary_pos: In<Tensor<i32>>,
-        boundary_req: In<Tensor<i32>>,
-        out: Out<Tensor<bf16>>,
-        ratio: Const<i32>,
-        coff: Const<i32>,
-        kvc: In<Struct<KvCache>>,
-        state_kv: In<Struct<Dsv4StateKv>>,
-        state_score: In<Struct<Dsv4StateScore>>,
-        ape: In<Struct<Dsv4Ape>>,
-    ) -> Result<(), Refusal> {
-        if kvc.ptr.is_null() {
-            return Err(Refusal::Null {
-                what: "the kv view this statement names",
-            });
-        }
-        let kvc = unsafe { &*kvc.ptr };
-        let num_entries = boundary_pos.rows;
-        let ratio = *ratio;
-        let coff = *coff;
-        let page_size = kvc.page_size;
-        let kv_page_indices = kvc.page_indices as *const u32;
-        let kv_page_indptr = kvc.page_indptr as *const u32;
-        let state_kv = state_kv.ptr;
-        let state_score = state_score.ptr;
-        let ape = ape.ptr;
-        let head_dim = out.all("out_width(0)")?.width;
-
-        ctx.fire(
-            Fire::at(
-                "attn/dsv4_compress.cuh",
-                "::pie::attn::dsv4_compress_gather_paged<::pie::bf16>",
-            )
-            .apply(route_rows(num_entries, head_dim)),
-            &[
-                state_kv.arg(),
-                state_score.arg(),
-                ape.arg(),
-                boundary_pos.arg(),
-                boundary_req.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                out.arg(),
-                head_dim.arg(),
-                ratio.arg(),
-                coff.arg(),
-                page_size.arg(),
-            ],
-        )
-    }
-
-    #[routine(whole, canon = "pool.kv_append")]
-    pub fn dsv4_store_comp_entries_bf16(
-        ctx: &Ctx<'_>,
-        entries: In<Tensor<bf16>>,
-        boundary_pos: In<Tensor<i32>>,
-        boundary_req: In<Tensor<i32>>,
-        kvc: In<Struct<KvCache>>,
-        comp_kv: In<Struct<Dsv4CompKvPages>>,
-    ) -> Result<(), Refusal> {
-        if kvc.ptr.is_null() {
-            return Err(Refusal::Null {
-                what: "the kv view this statement names",
-            });
-        }
-        let kvc = unsafe { &*kvc.ptr };
-        let num_entries = entries.rows;
-        let page_size = kvc.page_size;
-        let kv_page_indices = kvc.page_indices as *const u32;
-        let kv_page_indptr = kvc.page_indptr as *const u32;
-        let comp_kv_pages = comp_kv.ptr.cast_mut();
-
-        let head_dim = entries.all("in_width(0)")?.width;
-
-        ctx.fire(
-            Fire::at(
-                "attn/dsv4_compress.cuh",
-                "::pie::attn::dsv4_store_comp_entries<::pie::bf16>",
-            )
-            .apply(route_rows(num_entries, head_dim)),
-            &[
-                entries.arg(),
-                comp_kv_pages.arg(),
-                boundary_pos.arg(),
-                boundary_req.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                head_dim.arg(),
-                page_size.arg(),
-            ],
-        )
-    }
+/// One block per row, the block a whole number of warps as wide as the row
+/// asks for, capped at the launch maximum. `attn/dsv4_compress.cuh`'s two
+/// entry-copy kernels are gridded this way and nothing else in this file is.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "both are guarded positive by every caller"
+)]
+fn route_rows(rows: i32, width: i32) -> Launch {
+    let (rows, width) = (rows as u32, width as u32);
+    Launch::per_row(rows, width.div_ceil(32).max(1).saturating_mul(32).min(1024))
 }
 
 pub mod kv_paged {
@@ -2660,7 +2312,6 @@ pub mod kv_paged {
     use kernels::raises::Struct;
     use kernels::routine::{Const, In, Out};
     use kernels::{Bind, Fire};
-    use kernels_macros::routine;
 
     const BLOCK: u32 = 256;
 
@@ -2688,174 +2339,8 @@ pub mod kv_paged {
         (total_tokens + page_size - 1) / page_size + num_requests
     }
 
-    #[routine]
-    pub fn write_kv_explicit_bf16(
-        ctx: &Ctx<'_>,
-        k_curr: In<Tensor<bf16>>,
-        v_curr: In<Tensor<bf16>>,
-        kvc: In<Struct<KvCache>>,
-        num_kv_heads: Const<i32>,
-        head_dim: Const<i32>,
-        row_valid: In<Tensor<i32>>,
-    ) -> Result<(), Refusal> {
-        if kvc.ptr.is_null() {
-            return Err(Refusal::Null {
-                what: "the kv view this statement names",
-            });
-        }
-        let kvc = unsafe { &*kvc.ptr };
-        let page_size = kvc.page_size;
-        let num_kv_heads = *num_kv_heads;
-        let head_dim = *head_dim;
-        let hnd = kvc.layout != 0;
-        let has_envelopes = kvc.has_envelopes;
-        let is_native_bf16 = kvc.native_bf16;
-
-        let k_pages = kvc.keys;
-        let v_pages = kvc.values;
-        let w_page = kvc.write_page as *const u32;
-        let w_off = kvc.write_offset as *const u32;
-        let row_valid = row_valid.ptr as *const u8;
-        let k_env_min = kvc.env_min;
-        let k_env_max = kvc.env_max;
-        assert!(
-            is_native_bf16,
-            "attn::write_kv_explicit_bf16 requires native bf16 KV cache"
-        );
-
-        let instantiation = if hnd {
-            "::pie::attn::write_kv_explicit<\
-                                ::pie::true_type::value>"
-        } else {
-            "::pie::attn::write_kv_explicit<::pie::false_type::value>"
-        };
-
-        ctx.fire(
-            Fire::at("attn/kv_paged.cuh", instantiation)
-                .apply(Launch::per_row(k_curr.rows.unsigned_abs(), BLOCK)),
-            &[
-                k_curr.arg(),
-                v_curr.arg(),
-                k_pages.arg(),
-                v_pages.arg(),
-                w_page.arg(),
-                w_off.arg(),
-                MaybeConst::new(row_valid).arg(),
-                k_curr.rows.arg(),
-                page_size.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-            ],
-        )?;
-
-        if has_envelopes && !hnd {
-            let _ = crate::layout::envelope_merge_written(
-                ctx,
-                In {
-                    ptr: k_curr.ptr,
-                    rows: k_curr.rows,
-                    width: head_dim,
-                },
-                In {
-                    ptr: w_page,
-                    rows: k_curr.rows,
-                    width: 1,
-                },
-                In {
-                    ptr: w_off,
-                    rows: k_curr.rows,
-                    width: 1,
-                },
-                MaybeConst::new(row_valid),
-                Out {
-                    ptr: (k_env_min).cast::<bf16>().cast_mut(),
-                    rows: k_curr.rows,
-                    width: head_dim,
-                },
-                Out {
-                    ptr: (k_env_max).cast::<bf16>().cast_mut(),
-                    rows: k_curr.rows,
-                    width: head_dim,
-                },
-                k_curr.rows,
-                num_kv_heads,
-                head_dim,
-            );
-        }
-        Ok(())
-    }
-
-    #[routine(whole)]
-    pub fn write_kv_explicit_bf16_devwin(
-        ctx: &Ctx<'_>,
-        k_curr: In<Tensor<bf16>>,
-        v_curr: In<Tensor<bf16>>,
-        kvc: In<Struct<KvCache>>,
-        num_kv_heads: Const<i32>,
-        head_dim: Const<i32>,
-        row_valid: In<Tensor<i32>>,
-        n_max: Const<i32>,
-        win_start: Const<i32>,
-        win_len: Const<i32>,
-    ) -> Result<(), Refusal> {
-        if kvc.ptr.is_null() {
-            return Err(Refusal::Null {
-                what: "the kv view this statement names",
-            });
-        }
-        let kvc = unsafe { &*kvc.ptr };
-        let page_size = kvc.page_size;
-        let num_kv_heads = *num_kv_heads;
-        let head_dim = *head_dim;
-        let hnd = kvc.layout != 0;
-        let has_envelopes = kvc.has_envelopes;
-        let is_native_bf16 = kvc.native_bf16;
-
-        let k_pages = kvc.keys;
-        let v_pages = kvc.values;
-        let w_page = kvc.write_page as *const u32;
-        let w_off = kvc.write_offset as *const u32;
-        let win_d = crate::stage_peel_window(ctx, "attn::write_kv_devwin", *win_start, *win_len)?;
-        let row_valid = row_valid.ptr as *const u8;
-        let n_max = *n_max;
-        assert!(
-            is_native_bf16,
-            "attn::write_kv_explicit_bf16_devwin requires native bf16 KV cache"
-        );
-        assert!(
-            !has_envelopes,
-            "attn::write_kv_explicit_bf16_devwin: envelope maintenance not yet \
-             windowed — use the host-window form"
-        );
-
-        let instantiation = if hnd {
-            "::pie::attn::write_kv_explicit_devwin<::pie::true_type::value>"
-        } else {
-            "::pie::attn::write_kv_explicit_devwin<::pie::false_type::value>"
-        };
-
-        ctx.fire(
-            Fire::at("attn/kv_paged.cuh", instantiation)
-                .apply(Launch::per_row((n_max).unsigned_abs(), BLOCK)),
-            &[
-                k_curr.arg(),
-                v_curr.arg(),
-                k_pages.arg(),
-                v_pages.arg(),
-                w_page.arg(),
-                w_off.arg(),
-                MaybeConst::new(row_valid).arg(),
-                win_d.arg(),
-                n_max.arg(),
-                page_size.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-            ],
-        )
-    }
-
-    #[routine]
-    pub fn write_kv_to_pages_bf16(
+#[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_kv_to_pages_bf16(
         ctx: &Ctx<'_>,
         k_curr: In<Tensor<bf16>>,
         v_curr: In<Tensor<bf16>>,
@@ -2980,8 +2465,8 @@ pub mod kv_paged {
         Ok(())
     }
 
-    #[routine]
-    pub fn write_kv_to_pages_quantised(
+#[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_kv_to_pages_quantised(
         ctx: &Ctx<'_>,
         k_curr: In<Tensor<bf16>>,
         v_curr: In<Tensor<bf16>>,
@@ -3127,66 +2612,6 @@ pub mod kv_paged {
         let _ = (write_kv_to_pages_bf16, write_kv_to_pages_quantised);
     }
 
-    const WRITE_KV_TO_PAGES_ROW: ::kernels::routine::Routine<crate::Plane> = ::kernels::untraced!(
-        crate::Plane,
-        "write_kv_to_pages",
-        write_kv_to_pages_bf16,
-        namespace = "attn"
-    )
-    // THE CORE APPEND'S CLAIM SITS ON AN UNTRACED ROW, and that is the
-    // whole reason `attention.kv_append` is claim-only on cuda.
-    //
-    // `write_kv_to_pages` is not a routine. It is a DECLARATION STANDING
-    // FOR A CHOICE: `Boot::route` resolves it to `write_kv_to_pages_bf16`
-    // or `write_kv_to_pages_quantised` from the KV storage the boot
-    // settled, long after the trace recorded the statement. `untraced!`
-    // is what says so — the row carries no operand column, which is why
-    // `bind::route` sends it to `Route::Driver` and why a `#[claims]`
-    // delegation would have nothing to delegate TO.
-    //
-    // The two legs want `first_token`, `qo_indptr` and `row_valid` beside
-    // the statement's `k`, `v` and page row, and all three are runtime
-    // residents the driver stages per fire (`Cx::first_token`,
-    // `Cx::row_valid_d`) rather than operands any text places. A
-    // declaration that stated them would be describing this plane's
-    // staging; a body that conjured them would be faking it. So the point
-    // keeps its default body and this row keeps its canon — which is now
-    // the point's own name.
-    //
-    // TWO OF THOSE THREE MOVED, AND IT DOES NOT CHANGE THE ANSWER. `W7` put
-    // `qo_indptr` and `row_valid` on `PagedKvView` so `mla.kv_append` could
-    // be claimed by a body, and this append could read them the same way.
-    // What is left is what was always decisive: `first_token` is the fire's
-    // WRITE ORIGIN, a peel scalar with no home on a pool row, and the row
-    // above is a DECLARATION STANDING FOR A CHOICE between two kernels that
-    // `Boot::route` makes from the checkpoint's KV storage. A claim
-    // delegates to a body; there is no body here to delegate to until the
-    // choice has been made, and the choice is made after the trace.
-    //
-    // THE SHARED FORM BESIDE IT IS A BODY ALL THE SAME, and the difference
-    // is the peel and only the peel. `Attention::kv_append_shared` fires
-    // `write_kv_to_pages_bf16` and `write_kv_to_pages_quantised` directly,
-    // branching on
-    // `PagedKvView::native_bf16` — which is to say it makes `Boot::route`'s
-    // choice at the fire, where the fact is, rather than at load where the
-    // trace could not see it. That half of the argument above is therefore
-    // about THIS ROW rather than about the point: a row with no operand
-    // column cannot carry the choice, a body can. What does not move is
-    // `first_token`: gptoss's fused QKV leaves a prefix of rows already in
-    // the pages and the fire says how many, while dsv4's shared plane has
-    // no fused producer and every row of it is the statement's. One append
-    // has a write origin to be told and the other's is zero by the text.
-    .canon("attention.kv_append");
-
-    #[cfg(not(target_family = "wasm"))]
-    #[::linkme::distributed_slice(crate::ROUTINES)]
-    #[allow(non_upper_case_globals)]
-    static WRITE_KV_TO_PAGES_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
-        WRITE_KV_TO_PAGES_ROW;
-
-    #[cfg(target_family = "wasm")]
-    ::inventory::submit! { crate::Registered(WRITE_KV_TO_PAGES_ROW) }
-
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_fp8_per_tensor_pages_active(
         ctx: &Ctx<'_>,
@@ -3248,9 +2673,8 @@ pub mod kv_paged {
         )
     }
 
-    #[routine]
     #[allow(clippy::too_many_arguments)]
-    pub fn dequant_kv_cache_layer_to_bf16_active(
+    pub(crate) fn dequant_kv_cache_layer_to_bf16_active(
         ctx: &Ctx<'_>,
         kvc: In<Struct<KvCache>>,
         num_kv_heads: Const<i32>,
@@ -3401,218 +2825,8 @@ const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> Launch {
     Launch::grid([rows, heads, 1], [head_dim_block(head_dim), 1, 1])
 }
 
-#[must_use]
-const fn per_head(rows: u32, heads: u32) -> Launch {
-    const PAD_BLOCK: u32 = 128;
-
-    Launch::grid([heads, rows, 1], [PAD_BLOCK, 1, 1])
-}
-
-/// NO CANON, BECAUSE NO POINT REBASES AN LSE ANY MORE. `attention.lse_ln`
-/// was a point for exactly as long as the floor left the base of an lse
-/// unsaid and two kernels answered it differently; `attention.decode_lse`
-/// states base two now and `attention.sink` is where the one quantity that
-/// is not base two — a checkpoint's logit — meets it. The legacy dsv4 text
-/// still fires this launcher, and it dies with `model-dsl-legacy`.
-#[routine(out(lse = like(lse)))]
-pub fn lse_log2_to_ln(ctx: &Ctx<'_>, lse: InOut<Tensor<f32>>) -> Result<(), Refusal> {
-    let elems = lse.all("out_width(0)")?.elements();
-    let Ok(elems) = u32::try_from(elems) else {
-        return Err(Refusal::Empty {
-            what: "lse elements",
-        });
-    };
-    let n = elems as usize;
-
-    ctx.fire(
-        Fire::at(
-            "attn/attn_sink.cuh",
-            "::pie::attn::lse_log2_to_ln<::pie::attn::f32>",
-        )
-        .apply(elementwise(elems)),
-        &[lse.arg(), n.arg()],
-    )
-}
-
-#[routine(bf16, out(o = like(o)))]
-pub fn attention_sink_rescale<T>(
-    ctx: &Ctx<'_>,
-    o: InOut<Tensor<T>>,
-    lse: In<Tensor<f32>>,
-    sinks: Const<Tensor<T>>,
-    num_q_heads: Const<i32>,
-    head_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    let num_q_heads = *num_q_heads;
-    let head_dim = *head_dim;
-
-    ctx.fire(
-        Fire::at(
-            "attn/attn_sink.cuh",
-            crate::jit::symbol(&format!("::pie::attn::attn_sink_rescale<{}>", T::CPP)),
-        )
-        .apply(per_head_elementwise(
-            o.rows.unsigned_abs(),
-            num_q_heads.unsigned_abs(),
-            head_dim.unsigned_abs(),
-        )),
-        &[
-            o.arg(),
-            lse.arg(),
-            sinks.arg(),
-            o.rows.arg(),
-            num_q_heads.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn split_qkv_bf16_devwin(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<bf16>>,
-    q_out: Out<Tensor<bf16>>,
-    k_out: Out<Tensor<bf16>>,
-    v_out: Out<Tensor<bf16>>,
-    n_max: Const<i32>,
-    win_start: Const<i32>,
-    win_len: Const<i32>,
-) -> Result<(), Refusal> {
-    let win = crate::stage_peel_window(ctx, "attn::split_qkv_devwin", *win_start, *win_len)?;
-    let n_max = *n_max;
-
-    pub const SPLIT_BLOCK: u32 = 256;
-
-    let (q_dim, kv_dim) = (
-        q_out.all("out_width(0)")?.width,
-        k_out.all("out_width(1)")?.width,
-    );
-    let max_dim = if q_dim > kv_dim { q_dim } else { kv_dim };
-    let xblocks = max_dim.unsigned_abs().div_ceil(SPLIT_BLOCK);
-
-    ctx.fire(
-        Fire::at(
-            "attn/split_packed.cuh",
-            "::pie::attn::split_qkv_devwin<::pie::bf16>",
-        )
-        .apply(Launch::grid(
-            [xblocks.max(1), (n_max).unsigned_abs(), 1],
-            [SPLIT_BLOCK, 1, 1],
-        )),
-        &[
-            packed.arg(),
-            q_out.arg(),
-            k_out.arg(),
-            v_out.arg(),
-            win.arg(),
-            q_dim.arg(),
-            kv_dim.arg(),
-        ],
-    )
-}
-
-#[routine(whole)]
-pub fn attention_naive_paged(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    o: Out<Tensor<bf16>>,
-    kvc: In<Struct<KvCache>>,
-    head_dim: Const<i32>,
-    num_kv_heads: Const<i32>,
-    window_left: Const<i32>,
-    sm_scale: Const<f32>,
-    logits_soft_cap: Const<f32>,
-    qo_indptr: In<Tensor<i32>>,
-    lse_out: Option<Out<Tensor<f32>>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let page_size = kvc.page_size;
-    let head_dim = *head_dim;
-    let num_kv_heads = *num_kv_heads;
-    let scheme = kvc.scheme_byte;
-    let storage_dtype = kvc.storage_dtype;
-    let block_size = kvc.block_size;
-    let window_left = *window_left;
-    let sm_scale = *sm_scale;
-    let logits_soft_cap = *logits_soft_cap;
-    // The request count is the CSR operand's own row count.
-    let num_requests = qo_indptr.rows;
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    let kv_page_indices = kvc.page_indices as *const u32;
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-    let k_scales = kvc.key_scales as *mut core::ffi::c_void;
-    let v_scales = kvc.value_scales as *mut core::ffi::c_void;
-    let kv_page_indptr = kvc.page_indptr as *const u32;
-    let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let lse_out = lse_out.map_or(core::ptr::null_mut(), |l| l.ptr);
-
-    pub const PAGED_MAX_HEAD_DIM: i32 = 1024;
-
-    pub const PAGED_BLOCK: u32 = 128;
-
-    if head_dim > PAGED_MAX_HEAD_DIM {
-        return Err(Refusal::Wide {
-            what: "head_dim",
-            at: i64::from(head_dim),
-            max: i64::from(PAGED_MAX_HEAD_DIM),
-        });
-    }
-    let src = q.all("in_width(0)")?;
-    let num_q_heads = src.width.checked_div(head_dim).unwrap_or(0);
-    let smem = ((head_dim).unsigned_abs() + PAGED_BLOCK) * 4;
-
-    ctx.fire(
-        Fire::at(
-            "attn/attention_naive_paged.cuh",
-            "::pie::attn::naive_paged_attn<::pie::i32(128)>",
-        )
-        .apply(
-            Launch::grid(
-                [
-                    num_requests.unsigned_abs(),
-                    src.rows.unsigned_abs(),
-                    num_q_heads.unsigned_abs(),
-                ],
-                [PAGED_BLOCK, 1, 1],
-            )
-            .smem(smem),
-        ),
-        &[
-            q.arg(),
-            (k_pages).cast_const().arg(),
-            (v_pages).cast_const().arg(),
-            (k_scales).cast::<f32>().cast_const().arg(),
-            (v_scales).cast::<f32>().cast_const().arg(),
-            o.arg(),
-            qo_indptr.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            kv_last_page_lens.arg(),
-            core::ptr::null::<u8>().arg(),
-            core::ptr::null::<i32>().arg(),
-            num_q_heads.arg(),
-            num_kv_heads.arg(),
-            head_dim.arg(),
-            page_size.arg(),
-            kv_scheme(scheme_byte(scheme)).arg(),
-            kv_dtype(scheme_byte(storage_dtype)).arg(),
-            block_size.arg(),
-            window_left.arg(),
-            sm_scale.arg(),
-            logits_soft_cap.arg(),
-            lse_out.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "norm.res_blend", out(out = like(prefix)))]
-pub fn attn_res_blend<T>(
+#[allow(clippy::too_many_arguments)]
+pub fn attn_res_blend<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     prefix: In<Tensor<T>>,
     blocks: In<Tensor<T>>,
@@ -3650,99 +2864,6 @@ pub fn attn_res_blend<T>(
     )
 }
 
-#[routine(bf16)]
-pub fn pad_head_dim<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    padded: Out<Tensor<T>>,
-    head_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    let head_dim = *head_dim;
-
-    let num_heads = packed.width.checked_div(head_dim).unwrap_or(0);
-    let head_dim_padded = padded.width.checked_div(num_heads).unwrap_or(0);
-    if let Some(why) = head_dim_refusal(packed.rows, num_heads, head_dim, head_dim_padded) {
-        return Err(why);
-    }
-
-    ctx.fire(
-        Fire::at(
-            "attn/head_dim_pad.cuh",
-            crate::jit::symbol(&format!("::pie::attn::pad_head_dim<{}>", T::CPP)),
-        )
-        .apply(per_head(
-            packed.rows.unsigned_abs(),
-            num_heads.unsigned_abs(),
-        )),
-        &[
-            packed.arg(),
-            padded.arg(),
-            num_heads.arg(),
-            head_dim.arg(),
-            head_dim_padded.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, out(packed = rows(padded) x const(head_dim)))]
-pub fn strip_head_dim<T>(
-    ctx: &Ctx<'_>,
-    padded: In<Tensor<T>>,
-    packed: Out<Tensor<T>>,
-    head_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    let head_dim = *head_dim;
-
-    let num_heads = packed.width.checked_div(head_dim).unwrap_or(0);
-    let head_dim_padded = padded.width.checked_div(num_heads).unwrap_or(0);
-    if let Some(why) = head_dim_refusal(padded.rows, num_heads, head_dim, head_dim_padded) {
-        return Err(why);
-    }
-
-    ctx.fire(
-        Fire::at(
-            "attn/head_dim_pad.cuh",
-            crate::jit::symbol(&format!("::pie::attn::strip_head_dim<{}>", T::CPP)),
-        )
-        .apply(per_head(
-            padded.rows.unsigned_abs(),
-            num_heads.unsigned_abs(),
-        )),
-        &[
-            padded.arg(),
-            packed.arg(),
-            num_heads.arg(),
-            head_dim.arg(),
-            head_dim_padded.arg(),
-        ],
-    )
-}
-
-#[must_use]
-fn head_dim_refusal(
-    num_tokens: i32,
-    num_heads: i32,
-    head_dim: i32,
-    head_dim_padded: i32,
-) -> Option<Refusal> {
-    if num_tokens <= 0 {
-        return Some(Refusal::Empty { what: "rows" });
-    }
-    if num_heads <= 0 {
-        return Some(Refusal::Empty { what: "num_heads" });
-    }
-    if head_dim <= 0 {
-        return Some(Refusal::Empty { what: "head_dim" });
-    }
-    if head_dim_padded < head_dim {
-        return Some(Refusal::Narrow {
-            what: "head_dim_padded",
-            at: i64::from(head_dim_padded),
-        });
-    }
-    None
-}
-
 fn softcap_elems<P: Copy>(x: &kernels::Region<P>) -> Result<usize, Refusal> {
     let elems = x.elements();
     usize::try_from(elems).map_err(|_| Refusal::Narrow {
@@ -3767,83 +2888,7 @@ fn softcap_launch(cap: f32, n: usize) -> Result<Launch, Refusal> {
     Ok(elementwise(elems))
 }
 
-#[routine(bf16, canon = "attention.logit_softcap")]
-pub fn logit_softcap<T>(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<T>>,
-    cap: Const<f32>,
-) -> Result<(), Refusal> {
-    let cap = *cap;
-    let n = softcap_elems(&x.all("out_width(0)")?)?;
-    let launch = softcap_launch(cap, n)?;
-
-    ctx.fire(
-        Fire::at(
-            "attn/softcap.cuh",
-            crate::jit::symbol(&format!("::pie::attn::logit_softcap<{}>", T::CPP)),
-        )
-        .apply(launch),
-        &[x.arg(), cap.arg(), n.arg()],
-    )
-}
-
-#[routine(internal)]
-pub fn logit_softcap_f16(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<f16>>,
-    cap: Const<f32>,
-) -> Result<(), Refusal> {
-    let cap = *cap;
-
-    let n = softcap_elems(&x.all("out_width(0)")?)?;
-    let launch = softcap_launch(cap, n)?;
-    ctx.fire(
-        Fire::at("attn/softcap.cuh", "::pie::attn::logit_softcap<::pie::f16>").apply(launch),
-        &[x.arg(), cap.arg(), n.arg()],
-    )
-}
-
-#[routine(bf16, canon = "mla.split_q_b")]
-pub fn kimi_split_q_b<T>(
-    ctx: &Ctx<'_>,
-    q_b: In<Tensor<T>>,
-    q_nope: Out<Tensor<T>>,
-    q_pe: Out<Tensor<T>>,
-    heads: Const<i32>,
-    nope: Const<i32>,
-    rope: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = i64::from(*heads) * (i64::from(*nope) + i64::from(*rope));
-    let total = i64::from(q_b.rows) * width;
-    if total > i64::from(i32::MAX) {
-        return Err(Refusal::Wide {
-            what: "rows",
-            at: i64::from(q_b.rows),
-            max: i64::from(i32::try_from(i64::from(i32::MAX) / width).unwrap_or(i32::MAX)),
-        });
-    }
-    let total = total as i32;
-
-    ctx.fire(
-        Fire::at(
-            "attn/kimi_mla.cuh",
-            crate::jit::symbol(&format!("::pie::attn::split_q_b<{}>", T::CPP)),
-        )
-        .apply(elementwise(total.unsigned_abs())),
-        &[
-            q_b.arg(),
-            q_nope.arg(),
-            q_pe.arg(),
-            total.arg(),
-            heads.arg(),
-            nope.arg(),
-            rope.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "mla.latents")]
-pub fn kimi_split_kv_a_norm<T>(
+pub(crate) fn kimi_split_kv_a_norm<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     kv_a: In<Tensor<T>>,
     norm_weight: Const<Tensor<T>>,
@@ -3886,61 +2931,6 @@ pub fn kimi_split_kv_a_norm<T>(
             rope.arg(),
             src_row_stride.arg(),
             eps.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "attention.merge_lse", out(o_out = like(o1)), out(lse_out = like(lse1)))]
-pub fn combine_attn_outputs<T>(
-    ctx: &Ctx<'_>,
-    o1: In<Tensor<T>>,
-    lse1: In<Tensor<f32>>,
-    o2: In<Tensor<T>>,
-    lse2: In<Tensor<f32>>,
-    o_out: Out<Tensor<T>>,
-    lse_out: Out<Tensor<f32>>,
-    num_heads: Const<i32>,
-    head_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    #[must_use]
-    const fn combine_attn(rows: u32, heads: u32, head_dim: u32) -> Launch {
-        #[must_use]
-        const fn combine_block(head_dim: u32) -> u32 {
-            const COMBINE_BLOCK_MAX: u32 = 256;
-
-            const COMBINE_BLOCK_MIN: u32 = 32;
-
-            if head_dim < COMBINE_BLOCK_MIN {
-                COMBINE_BLOCK_MIN
-            } else if head_dim > COMBINE_BLOCK_MAX {
-                COMBINE_BLOCK_MAX
-            } else {
-                head_dim
-            }
-        }
-
-        Launch::grid([rows, heads, 1], [combine_block(head_dim), 1, 1])
-    }
-
-    ctx.fire(
-        Fire::at(
-            "attn/dsv4_compress.cuh",
-            crate::jit::symbol(&format!("::pie::attn::combine_attn_outputs<{}>", T::CPP)),
-        )
-        .apply(combine_attn(
-            o_out.rows.unsigned_abs(),
-            num_heads.unsigned_abs(),
-            head_dim.unsigned_abs(),
-        )),
-        &[
-            o1.arg(),
-            lse1.arg(),
-            o2.arg(),
-            lse2.arg(),
-            o_out.arg(),
-            lse_out.arg(),
-            num_heads.arg(),
-            head_dim.arg(),
         ],
     )
 }
@@ -4112,18 +3102,22 @@ fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal
 /// `q_pe` beside it, the two `_selected` readings take the pair, and the
 /// declaration is deleted.
 ///
-/// Two stay on the floor's default body, and neither is an oversight:
+/// EVERY POINT THIS PLANE HAS A KERNEL FOR NOW LANDS, and the last two —
+/// `mla.attention_{decode,prefill}` — landed the way the fa2 core did: the
+/// schedule was never an operand, and R4b gave the body a door to ask for it
+/// by key. `attn::plan::mla` measures it on the HOST out of `qo_indptr`,
+/// `kv_indptr` and `kv_len_arr` slices and uploads it into an int arena the
+/// launch reads without bounds-checking, exactly as `Fa2Decode` is; a body
+/// that built one would have to copy the device CSR back mid-fire, which is a
+/// sync a capture cannot record. So `Ctx::raised::<MlaPlanned>()` asks for
+/// `"mla.plan"` and the executor answers or refuses WITH THE KEY IN IT.
 ///
-/// * `mla.attention_{decode,prefill}` — CLAIM-ONLY, and the routines below
-///   are now the columned form that makes the `canon` real. What keeps them
-///   from having bodies is the fa2 precedent verbatim: `attn::plan::mla`
-///   measures the schedule on the HOST out of `qo_indptr`, `kv_indptr` and
-///   `kv_len_arr` slices and uploads it into an int arena the launch reads.
-///   A statement carries a query, a page row and three numbers; a body that
-///   built the schedule would have to copy the device CSR back to the host
-///   mid-fire, which is a sync a graph capture cannot record. The plane
-///   stages it, as `Fa2Decode` is staged, and the points resolve through
-///   `attention_mla_{decode,prefill}_bf16`.
+/// `driver-cuda` STAGES NO `"mla.plan"` TODAY — it is on that driver's
+/// `UNSTAGED` list beside the moe banks and the dsv4 slabs — so these two
+/// still refuse there. What changed is the sentence the refusal makes: it
+/// used to be "no staging shim for `attn::attention_mla_decode_bf16`", which
+/// is a fact about a shim, and it is now "this fire staged no `mla.plan`",
+/// which is a fact about the fire and names the thing to build.
 #[kernels_macros::claims]
 impl kernels::points::Mla for Ctx<'_> {
     fn latents<T: kernels::points::Scalar>(
@@ -4174,14 +3168,7 @@ impl kernels::points::Mla for Ctx<'_> {
         // rope covers all of it, so the pitch and the rotated slice are the
         // same number. `rope_partial_q_bf16` passes a zero `k_width`, which
         // is what makes the kv half of `rotate_partial` empty.
-        crate::rope::rope_partial_q_bf16(
-            self,
-            rotated,
-            Const::new(rope),
-            Const::new(rope),
-            Const::new(theta),
-            positions,
-        )
+        crate::rope::rope_partial_q_bf16(self, rotated, rope, rope, theta, positions.ptr)
     }
 
     /// Leave this fire's latent pair in the pool row the statement names.
@@ -4241,6 +3228,83 @@ impl kernels::points::Mla for Ctx<'_> {
         )
     }
 
+    /// Attend in the latent basis, one token per request, through the
+    /// schedule this fire was raised on.
+    ///
+    /// The fire's CSR comes off the POOL ROW and not off an operand, because
+    /// the declaration states none: a decode reading is one row per request
+    /// and the statement carries no window. `PagedKvView::qo_indptr` is the
+    /// same buffer [`kernels::points::Mla::attention_prefill`] takes as its
+    /// second operand — one per fire, handed to both.
+    fn attention_decode<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        q_pe: In<Tensor<T>>,
+        pages: Cache<Struct<KvCache>>,
+        heads: u32,
+        kv_lora_rank: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("mla.attention_decode at an element other than bf16")?;
+        attention_mla_decode_bf16(
+            self,
+            as_in(&q),
+            self.raised::<crate::raises::MlaPlanned>()?,
+            as_in(&q_pe),
+            as_out(&o),
+            pages.raised(),
+            Const::new(width("the head count this attention states", heads)?),
+            Const::new(width("the latent rank this attention states", kv_lora_rank)?),
+            Const::new(sm_scale),
+        )
+    }
+
+    /// [`kernels::points::Mla::attention_decode`] over a query WINDOW, with
+    /// the statement's own CSR and the causal order it implies.
+    fn attention_prefill<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        indptr: In<Tensor<i32>>,
+        q_pe: In<Tensor<T>>,
+        pages: Cache<Struct<KvCache>>,
+        heads: u32,
+        kv_lora_rank: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("mla.attention_prefill at an element other than bf16")?;
+        let q = as_in(&q);
+        let plan = self.raised::<crate::raises::MlaPlanned>()?;
+        let q_pe = as_in(&q_pe);
+        let o = as_out(&o);
+        let kvc = pages.raised();
+        let heads = width("the head count this attention states", heads)?;
+        let kv_lora_rank = width("the latent rank this attention states", kv_lora_rank)?;
+        let view = kv_view_of(&kvc)?;
+        let rope = rope_per_head(&q_pe, heads)?;
+        let layer = mla_layer(view, kv_lora_rank, rope);
+        // The request count is the CSR operand's own row count, which is what
+        // every other prefill routine in this file reads.
+        let num_requests = indptr.rows;
+        dispatch_attention_mla_bf16(
+            self,
+            mla_plan_of(&plan)?,
+            q,
+            q_pe,
+            layer,
+            o,
+            heads,
+            Const::new(sm_scale),
+            true,
+            kvc,
+            indptr.ptr as *const u32,
+            Const::new(num_requests),
+            None,
+        )
+        .map(|_| ())
+    }
+
     fn split_q_b<T: kernels::points::Scalar>(
         &self,
         q_b: In<Tensor<T>>,
@@ -4250,14 +3314,35 @@ impl kernels::points::Mla for Ctx<'_> {
         q_nope: Out<Tensor<T>>,
         q_pe: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        kimi_split_q_b(
-            self,
-            q_b,
-            q_nope,
-            q_pe,
-            Const::new(width("the head count this cut states", heads)?),
-            Const::new(width("the nope width this cut states", nope_dim)?),
-            Const::new(width("the rope width this cut states", rope_dim)?),
+        let heads = width("the head count this cut states", heads)?;
+        let nope = width("the nope width this cut states", nope_dim)?;
+        let rope = width("the rope width this cut states", rope_dim)?;
+        let width = i64::from(heads) * (i64::from(nope) + i64::from(rope));
+        let total = i64::from(q_b.rows) * width;
+        if total > i64::from(i32::MAX) {
+            return Err(Refusal::Wide {
+                what: "rows",
+                at: i64::from(q_b.rows),
+                max: i64::from(i32::try_from(i64::from(i32::MAX) / width).unwrap_or(i32::MAX)),
+            });
+        }
+        let total = total as i32;
+
+        self.fire(
+            Fire::at(
+                "attn/kimi_mla.cuh",
+                crate::jit::symbol(&format!("::pie::attn::split_q_b<{}>", T::CPP)),
+            )
+            .apply(elementwise(total.unsigned_abs())),
+            &[
+                q_b.arg(),
+                q_nope.arg(),
+                q_pe.arg(),
+                total.arg(),
+                heads.arg(),
+                nope.arg(),
+                rope.arg(),
+            ],
         )
     }
 
@@ -4486,19 +3571,39 @@ impl kernels::points::Index for Ctx<'_> {
         theta: f32,
     ) -> Result<(), Refusal> {
         at_bf16::<T>("index.layernorm_rope at an element other than bf16")?;
-        dsa_index_knorm_rope::<bf16>(
-            self,
-            InOut {
-                ptr: k.ptr.cast::<bf16>(),
-                rows: k.rows,
-                width: k.width,
-            },
-            Const::new(weight.v.cast::<bf16>()),
-            Const::new(bias.v.cast::<bf16>()),
-            Const::new(width("the rope width this norm states", rope_dim)?),
-            Const::new(theta),
-            Const::new(eps),
-            positions,
+        let idx_k: InOut<Tensor<bf16>> = InOut {
+            ptr: k.ptr.cast::<bf16>(),
+            rows: k.rows,
+            width: k.width,
+        };
+        let k_norm_weight: Const<Tensor<bf16>> = Const::new(weight.v.cast::<bf16>());
+        let k_norm_bias: Const<Tensor<bf16>> = Const::new(bias.v.cast::<bf16>());
+        let rope_dim = width("the rope width this norm states", rope_dim)?;
+
+        let positions = positions.ptr;
+
+        let dst = idx_k.all("out_width(0)")?;
+        let head_dim = dst.width;
+
+        self.fire(
+            Fire::at(
+                "attn/dsa_indexer.cuh",
+                "::pie::attn::index_knorm_rope<::pie::bf16>",
+            )
+            .apply(Launch::per_row(
+                dst.rows.unsigned_abs(),
+                dsa_indexer::K_BLOCK,
+            )),
+            &[
+                idx_k.arg(),
+                k_norm_weight.arg(),
+                k_norm_bias.arg(),
+                positions.arg(),
+                head_dim.arg(),
+                rope_dim.arg(),
+                theta.arg(),
+                eps.arg(),
+            ],
         )
     }
 
@@ -4512,18 +3617,34 @@ impl kernels::points::Index for Ctx<'_> {
         theta: f32,
     ) -> Result<(), Refusal> {
         at_bf16::<T>("index.rope at an element other than bf16")?;
-        dsa_index_q_rope::<bf16>(
-            self,
-            InOut {
-                ptr: q.ptr.cast::<bf16>(),
-                rows: q.rows,
-                width: q.width,
-            },
-            Const::new(width("the head count this rotation states", heads)?),
-            Const::new(width("the head width this rotation states", head_dim)?),
-            Const::new(width("the rope width this rotation states", rope_dim)?),
-            Const::new(theta),
-            positions,
+        let idx_q: InOut<Tensor<bf16>> = InOut {
+            ptr: q.ptr.cast::<bf16>(),
+            rows: q.rows,
+            width: q.width,
+        };
+        let n_heads = width("the head count this rotation states", heads)?;
+        let head_dim = width("the head width this rotation states", head_dim)?;
+        let rope_dim = width("the rope width this rotation states", rope_dim)?;
+
+        let positions = positions.ptr;
+
+        self.fire(
+            Fire::at(
+                "attn/dsa_indexer.cuh",
+                "::pie::attn::index_q_rope<::pie::bf16>",
+            )
+            .apply(Launch::per_row(
+                idx_q.rows.unsigned_abs(),
+                dsa_indexer::q_rope_block(n_heads),
+            )),
+            &[
+                idx_q.arg(),
+                positions.arg(),
+                n_heads.arg(),
+                head_dim.arg(),
+                rope_dim.arg(),
+                theta.arg(),
+            ],
         )
     }
 
@@ -4738,31 +3859,381 @@ fn index_pool_pitch(view: &crate::views::PagedKvView, row: i32) -> Result<(), Re
     Ok(())
 }
 
-/// The `Pool` family, claimed — and it claims NOTHING. Every point stays on
-/// the floor's default body and every one of them resolves through its
-/// routine's own `canon` instead, which is what claim-only means: the kernel
-/// exists and fires today, and no honest delegation reaches it from a
-/// statement.
+/// The compressor's window multiplier for a pooling ratio.
 ///
-/// THE SAME ABSENCE FIVE TIMES. DeepSeek-V4's compressed plane is three
-/// resident objects beside the page table — the state halves, the running
-/// scores and the absolute-position table — plus two runtime planes the fire
-/// stages, `row_valid` and `request_of_token`. A statement names ONE cache
-/// row and its operands, and a body cannot pull the rest from `self` because
-/// they are the DRIVER's staging and not this plane's.
+/// A ratio-4 layer pools over `2 * 4` tokens, not `4`; every other ratio
+/// pools over its own span. DERIVED AND NOT STATED, which is what
+/// [`kernels::points::Pool::gather`]'s declaration decided: it is a pure
+/// function of the ratio the statement already states, and a slot for it
+/// would put a second spelling of one number on the floor.
 ///
-/// * `pool.boundary_decode` / `pool.boundary_prefill` — the routines write
-///   THREE rectangles where the statement states two: an `out_rope` plane no
-///   text in this tree reads. The declaration keeps the statement as it
-///   stands rather than passing a scratch third out to swallow it — a result
-///   nothing reads is not a result, and a slot no text can name has no
-///   business on the floor. Both also read `row_valid`.
-/// * `pool.gather` — the three residents, plus a `coff` beside the ratio.
-///   The scalar alone would be derivable (it is `compressor_coff(ratio)`,
-///   the driver's own rule: 4 pools 2, else 1); the residents are not.
-/// * `pool.kv_append` — TWO cache views, the page table it walks and the
-///   compressed pool it writes. A statement names one cache row.
-/// * `pool.attention_lse` — both cache views again, and the fire's
-///   request-of-token plane on top.
+/// The DRIVER holds the other half of this rule
+/// (`driver-cuda/src/layout/compressed_plane_geometry.rs::compressor_coff`),
+/// where it SIZES the state slab; this one READS the window. They are the
+/// same number for the same reason and they must move together: a slab sized
+/// at one multiplier and read at another reads past its own row.
+const fn compressor_coff(ratio: i32) -> i32 {
+    if ratio == 4 { 2 } else { 1 }
+}
+
+/// The boundary meta's THIRD result, which no statement states.
+///
+/// `dsv4_boundary_meta_{decode,paged}` write `out_rope[t]` unconditionally —
+/// the rope base of the window a boundary closes — and NOTHING IN THIS TREE
+/// READS IT. The declaration records the statement as it stands rather than
+/// inventing a consumer, so the plane sinks the write into scratch of its
+/// own: a result nobody reads is not a result, and a slot for it would be a
+/// rectangle no text could name.
+///
+/// PLANE-STAGED AND ONE FIRE WIDE, the `index.topk`/`ssm.kda_*` idiom: one
+/// slab per name, grown to the widest fire and reused, never read back.
+fn boundary_rope(ctx: &Ctx<'_>, rows: i32) -> Result<Out<Tensor<i32>>, Refusal> {
+    let bytes = usize::try_from(rows.max(0)).unwrap_or(0) * core::mem::size_of::<i32>();
+    let ptr = ctx.scratch("attn::dsv4_boundary_rope", bytes)?;
+    Ok(Out {
+        ptr: ptr.cast::<i32>(),
+        rows,
+        width: 1,
+    })
+}
+
+/// The fire's row-validity plane, as the `In<Tensor<i32>>` fiction the
+/// boundary kernels carry: the routine casts the pointer to `*const u8` and
+/// the buffer must be BYTES.
+///
+/// THROUGH THE OPTIONAL DOOR, because null is the ordinary answer and the
+/// kernels test for it (`row_valid == nullptr || row_valid[t] != 0`). These
+/// two points name no cache row, so unlike every appender in this file they
+/// cannot read the plane off a pool view — `"row_valid"` is what they have,
+/// and `Ctx::staged` is the door for a raise whose absence a kernel reads.
+fn row_valid_staged(ctx: &Ctx<'_>, rows: i32) -> In<Tensor<i32>> {
+    In {
+        ptr: ctx.staged::<crate::views::RowValid>().ptr.cast::<i32>(),
+        rows,
+        width: 1,
+    }
+}
+
+/// The `Pool` family, claimed — ALL FIVE, and the absences that stood here
+/// were staging rather than kernels.
+///
+/// DeepSeek-V4's compressed plane is three resident objects beside the page
+/// table — the state halves, the running scores, the absolute-position
+/// table — plus the compressed pool itself and two runtime planes the fire
+/// stages. A statement names ONE cache row and its operands, so none of that
+/// could be an operand and this family was claim-only five times over. Every
+/// one of those objects is a `Raise` with a KEY, though, and R4b gave a body
+/// the door to ask by key (`Ctx::raised`), so what was "no honest delegation
+/// exists" is now "this executor stages that object, or refuses and names
+/// it".
+///
+/// THE REFUSALS ARE REAL AND THEY ARE THE POINT. `driver-cuda` allocates
+/// nothing for `"dsv4.state_kv"`, `"dsv4.state_score"`, `"dsv4.ape"` or
+/// `"dsv4.comp_kv_pages"` — its own `UNSTAGED` list says so — so dsv4 still
+/// does not serve through it. What moved is where the sentence is written: a
+/// fire used to stop at "a staging shim for `attn::dsv4_compress_gather_paged_bf16`;
+/// this driver states none", which is a fact about a shim, and now stops at
+/// `"dsv4.state_kv"`, which is a fact about the fire and names the thing to
+/// build. The bodies are exercised by `tests/dsv4_pool.rs`, which stages all
+/// four out of a hand-built answerer.
+///
+/// ONE SEAM STAYS NAMED. `pool.kv_append` and `pool.attention_lse` read the
+/// PAGE TABLE off the cache row the statement names and the COMPRESSED PLANE
+/// off `"dsv4.comp_kv_pages"`, which is two objects where the text states
+/// one — the text names its `entries` row for both. They collapse into the
+/// cache slot the day an executor builds a pool view per named ROW instead of
+/// per model LAYER (`baker::fire::Fire::layer` is the parse that stands in the
+/// way, and its own header calls it the seam). Until then the page CSR is
+/// fire-wide and identical on every row of a fire, so reading it off the
+/// statement's row is right for the fields these kernels take from it.
 #[kernels_macros::claims]
-impl kernels::points::Pool for Ctx<'_> {}
+impl kernels::points::Pool for Ctx<'_> {
+    /// Which tokens close a pooling window, one per request.
+    fn boundary_decode(
+        &self,
+        positions: In<Tensor<i32>>,
+        ratio: u32,
+        boundary_pos: Out<Tensor<i32>>,
+        boundary_req: Out<Tensor<i32>>,
+    ) -> Result<(), Refusal> {
+        let rows = boundary_pos.rows;
+        let out_pos = boundary_pos;
+        let out_req = boundary_req;
+        let out_rope = boundary_rope(self, rows)?;
+        let ratio = width("the pooling ratio this statement states", ratio)?;
+        let row_valid = row_valid_staged(self, rows);
+        let row_valid = row_valid.ptr as *const u8;
+        if ratio <= 0 {
+            return Err(Refusal::Narrow {
+                what: "ratio",
+                at: i64::from(ratio),
+            });
+        }
+
+        self.fire(
+            Fire::at(
+                "attn/dsv4_compress.cuh",
+                "::pie::attn::dsv4_boundary_meta_decode<::pie::i32>",
+            )
+            .apply(Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK)),
+            &[
+                positions.arg(),
+                out_pos.arg(),
+                out_req.arg(),
+                out_rope.arg(),
+                out_pos.rows.arg(),
+                ratio.arg(),
+                row_valid.arg(),
+            ],
+        )
+    }
+
+    /// [`kernels::points::Pool::boundary_decode`] over a prefill window,
+    /// `indptr` the fire's query CSR — which is the one thing the prefill
+    /// form needs and the decode form can shortcut (`out_req[t] = t` holds
+    /// only when each request contributes exactly one row).
+    fn boundary_prefill(
+        &self,
+        positions: In<Tensor<i32>>,
+        indptr: In<Tensor<i32>>,
+        ratio: u32,
+        boundary_pos: Out<Tensor<i32>>,
+        boundary_req: Out<Tensor<i32>>,
+    ) -> Result<(), Refusal> {
+        let rows = boundary_pos.rows;
+        let out_pos = boundary_pos;
+        let out_req = boundary_req;
+        let out_rope = boundary_rope(self, rows)?;
+        let ratio = width("the pooling ratio this statement states", ratio)?;
+        let row_valid = row_valid_staged(self, rows);
+        let qo_indptr = indptr;
+        let row_valid = row_valid.ptr as *const u8;
+        // The request count is the CSR operand's own row count.
+        let num_requests = qo_indptr.rows;
+        let qo_indptr = qo_indptr.ptr as *const u32;
+        if ratio <= 0 {
+            return Err(Refusal::Narrow {
+                what: "ratio",
+                at: i64::from(ratio),
+            });
+        }
+
+        self.fire(
+            Fire::at(
+                "attn/dsv4_compress.cuh",
+                "::pie::attn::dsv4_boundary_meta_paged<::pie::i32>",
+            )
+            .apply(Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK)),
+            &[
+                positions.arg(),
+                qo_indptr.arg(),
+                out_pos.arg(),
+                out_req.arg(),
+                out_rope.arg(),
+                out_pos.rows.arg(),
+                num_requests.arg(),
+                ratio.arg(),
+                row_valid.arg(),
+            ],
+        )
+    }
+
+    /// Build one pooled entry per boundary, out of the `ratio` tokens ending
+    /// there.
+    ///
+    /// The stated head width is CHECKED rather than passed: the routine reads
+    /// it back off the result the statement sized, so the two are two accounts
+    /// of one number and a disagreement is a gather striding the wrong row.
+    fn gather<T: kernels::points::Scalar>(
+        &self,
+        boundary_pos: In<Tensor<i32>>,
+        boundary_req: In<Tensor<i32>>,
+        pages: Cache<Struct<KvCache>>,
+        head_dim: u32,
+        ratio: u32,
+        entries: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("pool.gather at an element other than bf16")?;
+        if entries.width != width("the head width this gather states", head_dim)? {
+            return Err(Refusal::Narrow {
+                what: "the head width this statement states is not the width of the \
+                       entry it sized",
+                at: i64::from(entries.width),
+            });
+        }
+        let ratio = width("the pooling ratio this statement states", ratio)?;
+        let out = as_out(&entries);
+        let coff = compressor_coff(ratio);
+        let kvc = pages.raised();
+        let state_kv = self.raised::<crate::views::Dsv4StateKv>()?;
+        let state_score = self.raised::<crate::views::Dsv4StateScore>()?;
+        let ape = self.raised::<crate::views::Dsv4Ape>()?;
+        if kvc.ptr.is_null() {
+            return Err(Refusal::Null {
+                what: "the kv view this statement names",
+            });
+        }
+        let kvc = unsafe { &*kvc.ptr };
+        let num_entries = boundary_pos.rows;
+        let page_size = kvc.page_size;
+        let kv_page_indices = kvc.page_indices as *const u32;
+        let kv_page_indptr = kvc.page_indptr as *const u32;
+        let state_kv = state_kv.ptr;
+        let state_score = state_score.ptr;
+        let ape = ape.ptr;
+        let head_dim = out.all("out_width(0)")?.width;
+
+        self.fire(
+            Fire::at(
+                "attn/dsv4_compress.cuh",
+                "::pie::attn::dsv4_compress_gather_paged<::pie::bf16>",
+            )
+            .apply(route_rows(num_entries, head_dim)),
+            &[
+                state_kv.arg(),
+                state_score.arg(),
+                ape.arg(),
+                boundary_pos.arg(),
+                boundary_req.arg(),
+                kv_page_indices.arg(),
+                kv_page_indptr.arg(),
+                out.arg(),
+                head_dim.arg(),
+                ratio.arg(),
+                coff.arg(),
+                page_size.arg(),
+            ],
+        )
+    }
+
+    /// Append the pooled entries to the entries pool.
+    fn kv_append<T: kernels::points::Scalar>(
+        &self,
+        entries: In<Tensor<T>>,
+        boundary_pos: In<Tensor<i32>>,
+        boundary_req: In<Tensor<i32>>,
+        pool: Cache<Struct<KvCache>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("pool.kv_append at an element other than bf16")?;
+        let entries = as_in(&entries);
+        let kvc = pool.raised();
+        let comp_kv = self.raised::<crate::views::Dsv4CompKvPages>()?;
+        if kvc.ptr.is_null() {
+            return Err(Refusal::Null {
+                what: "the kv view this statement names",
+            });
+        }
+        let kvc = unsafe { &*kvc.ptr };
+        let num_entries = entries.rows;
+        let page_size = kvc.page_size;
+        let kv_page_indices = kvc.page_indices as *const u32;
+        let kv_page_indptr = kvc.page_indptr as *const u32;
+        let comp_kv_pages = comp_kv.ptr.cast_mut();
+
+        let head_dim = entries.all("in_width(0)")?.width;
+
+        self.fire(
+            Fire::at(
+                "attn/dsv4_compress.cuh",
+                "::pie::attn::dsv4_store_comp_entries<::pie::bf16>",
+            )
+            .apply(route_rows(num_entries, head_dim)),
+            &[
+                entries.arg(),
+                comp_kv_pages.arg(),
+                boundary_pos.arg(),
+                boundary_req.arg(),
+                kv_page_indices.arg(),
+                kv_page_indptr.arg(),
+                head_dim.arg(),
+                page_size.arg(),
+            ],
+        )
+    }
+
+    /// Attend over the pooled entries, stating the log-sum-exp beside the
+    /// output so the merge with the full-resolution attention is exact.
+    ///
+    /// `request_of_token` IS THE THIRD THING NO STATEMENT CARRIES, and it is
+    /// derivable from the query CSR — the executor derives it there — but a
+    /// kernel handed one row cannot do the search, so the plane is staged and
+    /// this asks for it by key.
+    fn attention_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<Tensor<T>>,
+        positions: In<Tensor<i32>>,
+        entries: Cache<Struct<KvCache>>,
+        ratio: u32,
+        heads: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Tensor<T>>,
+        lse: Out<Tensor<f32>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("pool.attention_lse at an element other than bf16")?;
+        let request_of_token = self.raised::<crate::views::RequestOfToken>()?;
+        let q = as_in(&q);
+        let o = as_out(&o);
+        let lse_out = lse;
+        let ratio = width("the pooling ratio this statement states", ratio)?;
+        let num_q_heads = width("the head count this attention states", heads)?;
+        let head_dim = width("the head width this attention states", head_dim)?;
+        let kvc = entries.raised();
+        let request_of_token: In<Tensor<i32>> = In {
+            ptr: request_of_token.ptr,
+            rows: o.rows,
+            width: 1,
+        };
+        let comp_kv = self.raised::<crate::views::Dsv4CompKvPages>()?;
+        if kvc.ptr.is_null() {
+            return Err(Refusal::Null {
+                what: "the kv view this statement names",
+            });
+        }
+        let kvc = unsafe { &*kvc.ptr };
+        let page_size = kvc.page_size;
+
+        let positions = positions.ptr;
+        let kv_page_indices = kvc.page_indices as *const u32;
+        let kv_page_indptr = kvc.page_indptr as *const u32;
+        let req_of_token = request_of_token.ptr;
+        let comp_kv_pages = comp_kv.ptr;
+
+        const DSV4_ATTN_BLOCK: u32 = 128;
+
+        let smem = head_dim
+            .max(0)
+            .unsigned_abs()
+            .saturating_add(DSV4_ATTN_BLOCK)
+            .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
+
+        self.fire(
+            Fire::at(
+                "attn/dsv4_compress.cuh",
+                "::pie::attn::compressed_attn_paged",
+            )
+            .apply(
+                Launch::grid(
+                    [o.rows.unsigned_abs(), num_q_heads.unsigned_abs(), 1],
+                    [DSV4_ATTN_BLOCK, 1, 1],
+                )
+                .smem(smem),
+            ),
+            &[
+                q.arg(),
+                comp_kv_pages.arg(),
+                o.arg(),
+                lse_out.arg(),
+                positions.arg(),
+                kv_page_indices.arg(),
+                kv_page_indptr.arg(),
+                req_of_token.arg(),
+                num_q_heads.arg(),
+                head_dim.arg(),
+                ratio.arg(),
+                page_size.arg(),
+                sm_scale.arg(),
+            ],
+        )
+    }
+}

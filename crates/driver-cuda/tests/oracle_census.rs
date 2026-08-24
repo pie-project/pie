@@ -256,11 +256,18 @@ const ALIVE: &[(&str, &str)] = &[
 
 /// Directories with no `run.sh`, which are therefore not oracles at all.
 ///
-/// `launch_abi/` holds headers `tests/launch_abi.rs` reads from disk and
-/// `real_decode/` holds captured JSON four `real_*.rs` tests read. Neither has
-/// ever had a script, so neither can have stopped working; listing them stops
-/// a future census from "discovering" them.
-const NO_SCRIPT: &[&str] = &["launch_abi", "real_decode"];
+/// `real_decode/` holds the captured decode transcripts — the same shape per
+/// SKU: prompt ids, the argmax, a top-5 and a probe row, each carrying its own
+/// provenance. `tests/baker_serve.rs` is the reader, and it opens
+/// `qwen3_5_0_8b.json`. The directory has never had a script, so it cannot
+/// have stopped working; listing it stops a future census from "discovering"
+/// it.
+///
+/// `launch_abi/` STOOD BESIDE IT, holding two stand-in CUDA headers for a
+/// `tests/launch_abi.rs` that is deleted. Two headers nothing includes are
+/// not a data directory, they are the residue of one, so they went and the
+/// row went with them.
+const NO_SCRIPT: &[&str] = &["real_decode"];
 
 fn dirs_with_script() -> Vec<String> {
     let mut out = Vec::new();

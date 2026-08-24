@@ -3,7 +3,7 @@ name = "kernels-vulkan"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Vulkan kernel implementations (Slang compute shaders + SPIR-V variant instantiation) and the signature table that declares them."
+description = "Vulkan kernel implementations (Slang compute shaders + SPIR-V variant instantiation) and the `#[claims]` blocks that launch them."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
@@ -23,9 +23,9 @@ path = "src/lib.rs"
 # `native` is what costs `slangc`. Unlike Metal, Vulkan has no runtime shader
 # compiler in the driver: a pipeline is built from a SPIR-V module, so the
 # Slang -> SPIR-V hop has to happen at BUILD time, and `native` is the hop.
-# Off by default for the reason it is off on both siblings — `model-ir`
-# takes the signature table and should reach nothing else, least of all a
-# shader toolchain.
+# Off by default for the reason it is off on both siblings: the portable
+# half of this crate is an entrypoint census and a set of claim bodies, and
+# a reader of those should reach no shader toolchain.
 default = []
 # `native` is still the BUILD-time hop and costs `slangc` on `PATH`, which is
 # an external binary and not a Rust dependency.
@@ -44,18 +44,23 @@ native = []
 runtime = ["dep:shader-slang"]
 
 [dependencies]
-# The routine registry — see the workspace table for why this one.
-linkme = { workspace = true }
-inventory = { workspace = true }
-# `#[routine]`, which builds each row beside its own `fn`.
+# `linkme` AND `inventory` STOOD HERE, and they were the routine registry:
+# a `distributed_slice` of `Routine<Vulkan>` on every host target and an
+# `inventory` collection on wasm, filled by 101 `#[routine]` fns. The
+# launches are `#[claims]` methods now and nothing walks a row by name --
+# `model-ir`'s `Backend` has no vulkan arm, so `canon_symbol` never reached
+# this crate -- so the slice went with the fns that filled it.
+#
+# `#[claims]`, which states the points this plane answers beside the impl
+# that answers them.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }
 
 # The Slang compiler, as a LIBRARY rather than the `slangc` program the build
 # script used to shell. Optional and behind `native` for the same reason
-# `slangc` was: the portable half of this crate is a signature table that
-# `model-ir` reads, and linking a shader compiler into that would undo the
-# split. Needs the Slang SDK at build time (`SLANG_DIR`) to compile its FFI,
+# `slangc` was: the portable half of this crate is an entrypoint census and
+# the claim bodies over it, and linking a shader compiler into that would
+# undo the split. Needs the Slang SDK at build time (`SLANG_DIR`) to compile its FFI,
 # and `libslang` beside the binary at run time.
 shader-slang = { version = "0.1.0", optional = true }
 

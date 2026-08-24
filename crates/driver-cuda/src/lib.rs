@@ -55,16 +55,12 @@ pub mod device;
 #[cfg(feature = "_cuda")]
 pub mod pools;
 
-/// The checkpoint onto the device; the plan half is [`layout`]'s. Split at
-/// `abi` inside the module, because `plan` and `stage` name loader types.
-#[cfg(feature = "_cuda")]
-pub mod weights;
-
-/// A lowered launch onto a kernel entry, its arguments and its grid.
+/// The fire's prepared state: the fa2 plan caches, the per-fire descriptors
+/// every view is cut from, and the view arena itself.
 #[cfg(feature = "_cuda")]
 pub mod bind;
 
-/// One forward pass: its scratch, tables, recordings and retirement.
+/// One forward pass: its scratch, the planes it stages, and its retirement.
 #[cfg(feature = "_cuda")]
 pub mod fire;
 
@@ -75,12 +71,12 @@ pub mod fire;
 // second path.
 //
 // `pub(crate)` and not `pub`, unlike its neighbours: nothing outside this
-// crate reaches it, and the surface it WOULD publish (`Baked`, the point
-// shim, the staging table) is the surface `#[claims]` is going to generate.
+// crate reaches it, and the surface it WOULD publish (`Baked`, `bound`, the
+// staging table) is the surface `#[claims]` generates or is going to.
 // Publishing it now would be publishing a shape that is about to change.
 //
 // Gated on `_cuda` and not on `abi`, though only the `abi` shell has a
-// `Shell` to hang it off: the load, the resolve and the shim name CUDA
+// `Shell` to hang it off: the load, the resolve and the binding name CUDA
 // symbols and nothing else, so a `--features cuda-13` build compiles and
 // unit-tests them without the ABI door.
 #[cfg(feature = "_cuda")]

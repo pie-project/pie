@@ -284,11 +284,10 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 // answer to what a gate was measuring.
 //
 // * `dummy_add_program` -- the chunked-`add_program` session-bridge deadlock
-//   repro -- took `boot_vulkan()` and is `vulkan_add_program` now. What it
-//   measures is the gateway/worker turn model under a ~12 MB upload, which is
-//   driver-agnostic; it only ever wanted the CHEAPEST boot, and on a machine
-//   with no CUDA the Vulkan driver is that. It costs an artifact env var it
-//   did not use to need, which is the whole price.
+//   repro -- became a Vulkan gate, and went with the Vulkan gates at R3. What
+//   it measures is the gateway/worker turn model under a ~12 MB upload, which
+//   is driver-agnostic; it wanted the CHEAPEST boot, and the cheapest boot in
+//   this tree is a CUDA one again.
 //
 // * tests/boot_smoke.rs and tests/boot_artifact.rs, in the root `pie` package,
 //   are DELETED -- named without backticks because they are not there to be
@@ -300,20 +299,16 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 //   was the fabricating driver itself.
 //
 //   They are not replaced so much as already covered from both sides. The
-//   end-to-end half -- convert a checkpoint, boot from the artifact alone,
-//   round-trip a turn through the real client edge -- is what
-//   `vulkan_chat_completion_e2e` and `vulkan_two_conversations` in this
-//   directory do, against a real model on a real device. The artifact half --
-//   that the objects written under `__meta__/` come back out of a `.zt` by
-//   name and rebuild the same tokenizer -- is `tests/artifact_tokenizer.rs`,
-//   which asserts it directly and needs no boot at all.
+//   end-to-end half -- boot from a snapshot and round-trip a turn through the
+//   real client edge -- is what `cuda_chat_completion_e2e` in this directory
+//   does, against a real model on a real device.
 //
 //   What is genuinely lost is that those two ran in a plain `cargo test` with
 //   no GPU and no env var, and the gates that took over do not: they are
-//   `#[ignore]`d and want `PIE_VULKAN_ARTIFACT`. That is a real reduction in
-//   what CI notices on a machine with no device, and it is stated here rather
-//   than discovered later. It is the cost of the dummy driver's deletion, not
-//   of this edit.
+//   `#[ignore]`d and want a device. That is a real reduction in what CI
+//   notices on a machine with no device, and it is stated here rather than
+//   discovered later. It is the cost of the dummy driver's deletion, not of
+//   this edit.
 
 // ── Client submit (golf) ────────────────────────────────────────────────────
 //
@@ -400,182 +395,10 @@ pub async fn run_inferlet(
 
     proc.wait_for_return().await
 }
-
-/// The standalone TOML for a Vulkan deployment.
-///
-/// `kv_pages` sizes the pool. `kernels` STOOD beside it, naming the SPIR-V
-/// directory the seam read at `create`; the modules are in the binary now, so
-/// this block states one knob. There is no `gpu_mem_utilization` here:
-/// this driver does not derive a pool from a fraction of the card, it is told
-/// how many pages to hold. `device` is stated because the config requires it
-/// and ignored because `Device::open` takes the first Vulkan device the
-/// loader reports -- a selector here would be a setting nothing acts on.
-pub fn vulkan_standalone_toml(artifact: &str) -> String {
-    vulkan_standalone_toml_with_pages(artifact, 256)
-}
-
-/// The same, with the pool sized by the caller.
-///
-/// A test that wants the pool to RUN OUT needs this: 256 pages is four
-/// thousand tokens, which no gate here comes close to, so the driver's
-/// `Exhausted` answer and the engine's re-post are never taken at the default.
-#[must_use]
-pub fn vulkan_standalone_toml_with_pages(artifact: &str, kv_pages: u32) -> String {
-    vulkan_standalone_toml_named(artifact, kv_pages, "qwen3")
-}
-
-/// The same, with `[model] name` stated by the caller.
-///
-/// The name is a LABEL, not a selector: the driver reads the architecture out
-/// of the artifact's embedded `model/config`, so a Qwen2 artifact serves a
-/// Qwen2 whatever this says. It is parameterised anyway because a gate that
-/// boots a second architecture under the first one's name reads as though the
-/// name were doing work, and the next person to change the boot path would
-/// have to re-derive that it is not.
-#[must_use]
-pub fn vulkan_standalone_toml_named(artifact: &str, kv_pages: u32, name: &str) -> String {
-    format!(
-        "         [server]\n\
-         port = 0\n\
-         \n\
-         [model]\n\
-         name = \"{name}\"\n\
-         model = \"{artifact}\"\n\
-         \n\
-         [driver]\n\
-         type = \"vulkan\"\n\
-         device = [\"vulkan:0\"]\n\
-         kv_pages = {kv_pages}\n"
-    )
-}
-
-/// The standalone TOML for the WebGPU driver.
-///
-/// No artifact, which is the whole difference from the Vulkan block now that
-/// both backends carry their shaders in the binary: the weights come from the
-/// `$PIE_HOME` model cache that `pie serve` reads, so a gate names a model the
-/// cache already holds rather than a file it was handed.
-///
-/// `device` says `gpu:0` and no driver reads it as a selector: `wgpu` asks the
-/// platform for an adapter itself. It is written because `device` is required
-/// of every driver and `cuda:0` would be a lie about the hardware.
-///
-/// `name` is the ARCHITECTURE label. It was hard-coded to `qwen3` here while
-/// the Vulkan twin took it as a parameter, which meant no wgpu gate could
-/// serve a second architecture even though the driver can: the one file whose
-/// whole subject is "a different model" would have been the one place still
-/// saying `qwen3`. See `wgpu_second_model`.
-#[must_use]
-pub fn wgpu_standalone_toml_named(model: &str, name: &str, kv_pages: u32) -> String {
-    format!(
-        "         [server]\n\
-         port = 0\n\
-         \n\
-         [model]\n\
-         name = \"{name}\"\n\
-         model = \"{model}\"\n\
-         \n\
-         [driver]\n\
-         type = \"wgpu\"\n\
-         device = [\"gpu:0\"]\n\
-         activation_dtype = \"bfloat16\"\n\
-         kv_pages = {kv_pages}\n"
-    )
-}
-
-/// [`wgpu_standalone_toml_named`] under the architecture every other gate here
-/// serves.
-#[must_use]
-pub fn wgpu_standalone_toml(model: &str, kv_pages: u32) -> String {
-    wgpu_standalone_toml_named(model, "qwen3", kv_pages)
-}
-
-/// Boot the embedded standalone with the real WebGPU driver.
-///
-/// `PIE_WGPU_MODEL` names the model in `$PIE_HOME`'s cache, defaulting to the
-/// one every other gate here uses. There is no artifact variable because this
-/// driver quantizes through the load plan and reads what the cache holds.
-pub async fn boot_wgpu() -> Result<pie::StandaloneHandle> {
-    boot_wgpu_with_pages(256).await
-}
-
-/// The same, with the pool sized by the caller -- which is how a gate asks for
-/// pool PRESSURE rather than for room.
-pub async fn boot_wgpu_with_pages(kv_pages: u32) -> Result<pie::StandaloneHandle> {
-    let model = std::env::var("PIE_WGPU_MODEL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "Qwen--Qwen3-0.6B-optimized".to_string());
-    boot_wgpu_named(&model, "qwen3", kv_pages).await
-}
-
-/// Boot a NAMED model under a NAMED architecture.
-///
-/// One deployment serves one model, so every other boot here takes the
-/// default. A gate that means to prove a SECOND architecture has to name both
-/// halves: the cache entry, which is a different `.zt`, and the label, which
-/// the engine reports and hashes. The label is not a selector -- the driver
-/// reads the architecture out of the artifact -- but the one gate whose whole
-/// subject is a different model should not be the place that says `qwen3`.
-pub async fn boot_wgpu_named(
-    model: &str,
-    name: &str,
-    kv_pages: u32,
-) -> Result<pie::StandaloneHandle> {
-    let (controller, gateway, worker) =
-        derive_standalone(&wgpu_standalone_toml_named(model, name, kv_pages))?;
-    run_standalone(controller, gateway, worker).await
-}
-
-/// Boot the embedded standalone with the real Vulkan driver.
-///
-/// `PIE_VULKAN_ARTIFACT` names a `.zt` that `pie model build --backend
-/// vulkan` authored -- an artifact rather than a snapshot because this driver
-/// reads its declared quantization out of the embedded `model/config`, and
-/// one carrying its tokenizer because the runtime parses one at boot
-/// unconditionally. The compiled modules need no variable: they are in the
-/// binary under `kernels-vulkan/native`.
-/// A colon-separated list is accepted and the first entry used: a deployment
-/// serves one model, and the engine's own tests take the list.
-pub async fn boot_vulkan() -> Result<pie::StandaloneHandle> {
-    boot_vulkan_with_pages(256).await
-}
-
-/// The same, with the pool sized by the caller. See
-/// [`vulkan_standalone_toml_with_pages`].
-pub async fn boot_vulkan_with_pages(kv_pages: u32) -> Result<pie::StandaloneHandle> {
-    boot_vulkan_nth(0, "qwen3", kv_pages).await
-}
-
-/// Boot the `nth` artifact of `PIE_VULKAN_ARTIFACT` under `[model] name`.
-///
-/// One deployment serves one model, so every other boot here takes entry 0.
-/// A gate that means to prove a SECOND architecture cannot say that with an
-/// env var it shares with the first, and inventing a second variable would
-/// leave two places to keep in step. The list is already colon-separated
-/// because the engine's own tests take it whole, so the second entry is where
-/// a second model already lives.
-pub async fn boot_vulkan_nth(
-    nth: usize,
-    name: &str,
-    kv_pages: u32,
-) -> Result<pie::StandaloneHandle> {
-    let artifacts = std::env::var("PIE_VULKAN_ARTIFACT")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context("PIE_VULKAN_ARTIFACT names the built artifact")?;
-    let artifact = artifacts
-        .split(':')
-        .nth(nth)
-        .filter(|v| !v.is_empty())
-        .with_context(|| {
-            format!(
-                "PIE_VULKAN_ARTIFACT has no entry {nth}: {artifacts:?}. A second entry is a \
-                 second model's `.zt`, built by `pie model build --backend vulkan`."
-            )
-        })?
-        .to_string();
-    let (controller, gateway, worker) =
-        derive_standalone(&vulkan_standalone_toml_named(&artifact, kv_pages, name))?;
-    run_standalone(controller, gateway, worker).await
-}
+// ── The shader-plane boots STOOD HERE ───────────────────────────────────
+//
+// `vulkan_standalone_toml*`, `wgpu_standalone_toml*`, `boot_vulkan*` and
+// `boot_wgpu*`, together with the fifteen gates that called them, went with
+// R3: `driver-vulkan` and `driver-wgpu` are out of the workspace until their
+// baker executors land (P5), so this crate has no feature that reaches one.
+// They come back with the drivers.

@@ -1,3 +1,19 @@
+# ── THIS MANIFEST DOES NOT RESOLVE, AND THAT IS THE QUARANTINE (R3) ─────
+#
+# `driver-vulkan` is in the root workspace's `exclude` list and no member
+# path-depends on it, because it was one of the last three consumers of
+# `model-legacy` and `model_compiler::lower` — both deleted. The
+# `model-legacy` edge below therefore points at a directory that is not
+# there.
+#
+# It is left standing rather than deleted because the crate is not being
+# repaired, it is being REWRITTEN: P5 ("Shader planes — impl the families for
+# metal/vulkan/wgpu Ctx") gives this driver a `#[claims] impl` for its plane
+# and a `Program` walk of its own, and what it will depend on then is
+# `crates/model`, exactly as `driver-cuda` does now. Editing the line to a
+# crate this source cannot use would be a manifest that resolves and a build
+# that does not, which is a worse lie than a dangling path.
+
 [package]
 name = "driver-vulkan"
 version = "0.1.0"

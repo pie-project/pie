@@ -153,6 +153,38 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
+/// ways, with `..d` saying that everything else is replicated.
+///
+/// Both mixers' head counts and all three intermediates. The MLA half cuts
+/// only its head fan — `kv_lora_rank`, `q_lora_rank` and `qk_rope_head_dim`
+/// name the latent row every rank writes and caches whole, which is the same
+/// reading glm-5 states. The KDA half cuts `heads` and leaves `head_dim`,
+/// so its packed `[q | k | v]` projection, its convolution, its per-head
+/// `a_log`/`dt_bias` columns and both recurrent slabs come out narrower
+/// together, and `kda_o_norm` stays a per-head norm over a width no cut
+/// touches.
+fn per_rank<const TP: usize>(d: Dims) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+    Dims {
+        mla: MlaDims {
+            heads: cut("mla heads", d.mla.heads),
+            ..d.mla
+        },
+        kda: KdaDims {
+            heads: cut("kda heads", d.kda.heads),
+            ..d.kda
+        },
+        moe: MoeDims {
+            inter: cut("moe inter", d.moe.inter),
+            shared_inter: cut("shared inter", d.moe.shared_inter),
+            ..d.moe
+        },
+        dense_inter: cut("dense inter", d.dense_inter),
+        ..d
+    }
+}
+
 impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
     pub fn k3() -> Self {
         assemble(Dims {
@@ -175,6 +207,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
 }
 
 fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, W2, K, TP> {
+    let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
     let full_at = |l: u32| d.full_attn_every > 0 && (l + 1) % d.full_attn_every == 0;
     let moe_at = |l: u32| l >= d.dense_layers;
@@ -236,8 +269,8 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
             let shared_inter = m.shared_inter as u64;
             Mlp::Routed {
                 router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
-                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * inter, hidden]).experts(),
-                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, inter]).experts(),
+                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * inter, hidden]).bank([inter, inter]),
+                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, inter]).rows(),
                 shared: (m.shared_inter > 0).then(|| Shared {
                     gate_up: Tensor::sym(n("shared_gate_up"), [2 * shared_inter, hidden]).packed([shared_inter, shared_inter]),
                     down: Tensor::sym(n("shared_down"), [hidden, shared_inter]).rows(),

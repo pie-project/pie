@@ -12,7 +12,7 @@ compile_error!(
      loads one libcudart, and the two disagree on `cudaGraphAddNode`'s arity"
 );
 
-pub use kernels::{Cap, KernelSig, LaunchRule, Lit, Refusal, Source, Ty};
+pub use kernels::{Cap, LaunchRule, Lit, Refusal, Source, Ty};
 
 pub use kernels::routine::{In, InOut, Out};
 
@@ -44,7 +44,6 @@ pub mod norm;
 pub mod points_dispatch;
 pub mod quant;
 pub mod rope;
-pub mod sample;
 pub mod ssm;
 
 /// The device-side checks for the kernels this crate declares AND launches
@@ -62,30 +61,38 @@ pub mod vision;
 
 pub type Plane = crate::jit::Cuda;
 
-#[cfg(not(target_family = "wasm"))]
-#[::linkme::distributed_slice]
-pub static CUDA_ROUTINES: [::kernels::routine::Routine<Plane>];
-
-#[cfg(not(target_family = "wasm"))]
-pub use CUDA_ROUTINES as ROUTINES;
-
-#[cfg(target_family = "wasm")]
-#[doc(hidden)]
-pub struct Registered(pub ::kernels::routine::Routine<Plane>);
-
-#[cfg(target_family = "wasm")]
-::inventory::collect!(Registered);
-
-pub fn rows() -> impl Iterator<Item = &'static ::kernels::routine::Routine<Plane>> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        ROUTINES.iter()
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        ::inventory::iter::<Registered>.into_iter().map(|r| &r.0)
-    }
-}
+/// The claims this plane answers by SYMBOL rather than by point.
+///
+/// TWO ROWS, AND EACH IS A MEASURED BACKLOG WITH ITS REASON WRITTEN DOWN.
+/// `model_compiler::sweep::resolve` asks every kernel a plan names, in this
+/// order: a `cuda::` prefix is tier-2, a name in a family's `*_CLAIMS` is a
+/// point, and anything left is asked of this table. Across all sixteen
+/// catalog rows exactly two claims get here:
+///
+/// * `norm.res_blend` — kimi's variadic ledger item. The text states one
+///   value per earlier block and the count grows with the layer, so the
+///   statement's arity is a function of where it stands; the floor has no
+///   `Vararg` mark to declare that with.
+/// * `hc.collapse` — dsv4's head-gate collapse. The kernel reads an
+///   `[N, streams]` f32 gate plane beside the residual stack, NO TEXT
+///   PRODUCES ONE, and the import ships no bank it could come from, so both
+///   honest readings need a checkpoint dsv4 does not have.
+///
+/// Each names the launcher that would fire it, spelled as the plane's own
+/// `module::fn`. Nothing FIRES through this table — a `Call::Symbol` refuses
+/// at load, because the staging its fire would need does not exist — so what
+/// a row buys is that the claim reports RESOLVED rather than unclaimed, and
+/// deleting one silently loses a resolution per lane.
+///
+/// A TABLE AND NOT A COLUMN ON A ROUTINE ROW. This was the `canon` field of a
+/// `#[routine]`, one of thirteen columns on a linkme-collected registry that
+/// four crates carried so that this one question could be asked of it. The
+/// routine layer is folded — every launch is a `#[claims]` body or a function
+/// beside one — and two `(claim, symbol)` pairs are what was left of it.
+pub const CANON: &[(&str, &str)] = &[
+    ("hc.collapse", "norm::hc_head_postprocess"),
+    ("norm.res_blend", "attn::attn_res_blend"),
+];
 
 #[cfg(feature = "_cuda")]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "cuda-12", feature = "cuda-13"))))]
@@ -93,157 +100,4 @@ pub use jit::Error;
 
 pub use jit::ArgValue;
 
-#[must_use]
-pub fn sigs() -> &'static [KernelSig] {
-    static ROWS: std::sync::OnceLock<&'static [KernelSig]> = std::sync::OnceLock::new();
-    ROWS.get_or_init(|| {
-        let mut rows: Vec<KernelSig> = Vec::new();
-        for r in crate::rows() {
-            {
-                let symbol: &'static str = String::leak(r.symbol());
-                rows.push(KernelSig {
-                    name: symbol,
-                    symbol,
-                    args: r.args,
-                    whole: r.whole,
-                    depth_prefix_plan: r.depth_prefix_plan,
-                    sources: r.sources,
-                    derived: r.derived,
-                    internal: r.internal,
-                    no_join: r.no_join,
-                    driver: r.driver,
-                    canon: r.canon,
-                    point: r.point,
-                    out_rule: r.out_rule,
-                    ..SIG_BASE
-                });
-            }
-        }
-        Vec::leak(rows)
-    })
-}
-
-const SIG_BASE: KernelSig = KernelSig {
-    name: "",
-    symbol: "",
-    whole: false,
-    depth_prefix_plan: false,
-    args: &[],
-    sources: &[],
-    derived: &[],
-    axes: &[],
-    internal: false,
-    no_join: false,
-    driver: false,
-    canon: None,
-    point: &[],
-    out_rule: &[],
-};
-
-#[must_use]
-pub fn routine(symbol: &str) -> Option<&'static jit::Routine> {
-    rows().find(|r| r.answers(symbol))
-}
-
-/// The row for `symbol` AT a dtype point — how a caller that knows the
-/// statement's value dtype selects among the rows `dtypes(..)` stamped.
-/// Falls back to the first row when no row names the point (a single-point
-/// routine's row has an empty or singleton `point`), so a caller with no
-/// hint gets exactly what [`routine`] gives.
-#[must_use]
-pub fn routine_at(symbol: &str, point: &str) -> Option<&'static jit::Routine> {
-    rows()
-        .find(|r| r.answers(symbol) && r.point.contains(&point))
-        .or_else(|| routine(symbol))
-}
-
-/// Fire a symbol on a stream, with no cuBLAS handle and no environment.
-///
-/// # Safety
-///
-/// [`call_answering`]'s, with both of the pointers it names left null.
-pub unsafe fn call(
-    symbol: &str,
-    args: &[ArgValue],
-    stream: *mut core::ffi::c_void,
-) -> Result<(), kernels::Refusal> {
-    unsafe { call_with_cublas(symbol, args, stream, core::ptr::null_mut()) }
-}
-
-/// [`call`], carrying a cuBLAS handle for the routines that want one.
-///
-/// # Safety
-///
-/// [`call_answering`]'s.
-pub unsafe fn call_with_cublas(
-    symbol: &str,
-    args: &[ArgValue],
-    stream: *mut core::ffi::c_void,
-    cublas: *mut core::ffi::c_void,
-) -> Result<(), kernels::Refusal> {
-    unsafe { call_answering(symbol, args, stream, cublas, None) }
-}
-
-/// Fire a symbol, answering its asks out of `env`.
-///
-/// # Safety
-///
-/// Every pointer in `args` must address device memory of the extent the
-/// symbol reads, and the kinds must match the signature the symbol was
-/// compiled from -- `ArgValue` carries a kind but not a length, so an
-/// argument of the right kind and the wrong size passes every check here
-/// and faults on device. `stream` must be a live stream in the current
-/// context, and `cublas`, if not null, a live handle set to that stream.
-pub unsafe fn call_answering(
-    symbol: &str,
-    args: &[ArgValue],
-    stream: *mut core::ffi::c_void,
-    cublas: *mut core::ffi::c_void,
-    env: Option<&dyn kernels::routine::Answers<jit::Cuda>>,
-) -> Result<(), kernels::Refusal> {
-    let Some(routine) = routine(symbol) else {
-        return Err(kernels::Refusal::Undeclared);
-    };
-
-    let ctx = unsafe { jit::Ctx::on(stream).with_cublas(cublas) };
-    let ctx = match env {
-        Some(env) => ctx.with_env(env),
-        None => ctx,
-    };
-    (routine.body)(&ctx, args)
-}
-
 pub use crate::jit::abi::Pointee as RoutineElem;
-
-/// Stage a peel window's `(start, len)` pair into a named device scratch
-/// slot, for the `devwin` kernels whose ABI reads `win[0]`/`win[1]` from
-/// device memory.
-///
-/// The pair used to arrive as `keys::PeelWindow`, a driver-owned device
-/// buffer; it is lowering-spliced now (design-no-ask §3, category E), so the
-/// routine takes the two `Const<i32>`s the splice writes and stages them
-/// itself. Eight bytes, stream-ordered against the launch that reads them.
-pub(crate) fn stage_peel_window(
-    ctx: &jit::Ctx<'_>,
-    name: &'static str,
-    start: i32,
-    len: i32,
-) -> Result<*mut u32, Refusal> {
-    let win = ctx.scratch(name, 2 * core::mem::size_of::<u32>())?;
-    let bounds = [start.unsigned_abs(), len.unsigned_abs()];
-    #[cfg(feature = "_cuda")]
-    {
-        // Pageable host memory: `cudaMemcpyAsync` stages it before
-        // returning, so the stack pair may die after this call.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                bounds.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(&bounds),
-            )
-        };
-        unsafe { jit::device::upload(win, bytes, ctx.stream())? };
-    }
-    #[cfg(not(feature = "_cuda"))]
-    let _ = bounds;
-    Ok(win.cast::<u32>())
-}

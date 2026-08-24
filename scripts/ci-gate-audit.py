@@ -40,18 +40,22 @@ a rewrite that is actively in flight.
 
 `STEPS` reads steps by name from the whole workflow, not from one job, so
 a crate gated on the macOS runner is GATED and not merely excused.
-`driver-metal` used to be an exclusion reading "gated on the macOS job
-instead, in BOTH feature halves" -- a true sentence that nothing checked.
-Deleting those two steps would have left the audit green while the crate
-went unlinted, which is precisely the failure this file exists to catch,
-one level up. Naming them makes the claim a check: remove either step and
-the audit fails saying so.
+
+`driver-metal` was the case that shaped this and it has now been through
+the whole cycle. It began as an exclusion reading "gated on the macOS job
+instead, in BOTH feature halves" -- a true sentence that nothing checked,
+so deleting those two steps would have left this audit green while the
+crate went unlinted. Naming them in `STEPS` turned the sentence into a
+check. Then R3 put the crate out of the workspace and deleted the macOS
+job, and the check fired from the other direction: the step names were
+gone and the audit said so by name. Both failure modes it was built for
+have now happened to the same crate, and it reported each.
 
 Duplicates are therefore counted WITHIN a step rather than across them. A
 crate named twice in one command is the bug that happened here; a crate
-named in two steps is a crate linted in two feature configurations, and
-`driver-metal` is deliberately in both halves because a lint that fires
-in only one half is a lint nobody sees.
+named in two steps is a crate linted in two feature configurations, which
+is why two steps are allowed to name one -- a lint that fires in only one
+feature half is a lint nobody sees.
 
 ## What it does not check
 
@@ -117,6 +121,21 @@ EXCLUSIONS = {
             "kernels-cuda | grep -c '^Diff'` and `git log "
             "--since='24 hours ago' -- crates/kernels-cuda`."
         ),
+        # Found by this audit, not by a reader: `baker-smoke` had never been
+        # in either gate list, which is the exact shape the docstring above
+        # describes -- a crate that is merely absent looks like a crate that
+        # passes. It is in the CLIPPY list now, at zero warnings; only fmt
+        # excuses it, and only for churn.
+        "baker-smoke": (
+            "22 drifted hunks against 12 commits in the last seven days: "
+            "the crate R4's baker executor is landing in, so it is the "
+            "churn itself rather than a crate that drifted once. Same "
+            "shape as `kernels-cuda` above and the same expiry -- when "
+            "the executor stops moving, run `cargo fmt -p baker-smoke` "
+            "once and delete this entry. Re-measure with `cargo fmt "
+            "--check -p baker-smoke | grep -c '^Diff'` and `git log "
+            "--since='7 days ago' -- crates/baker-smoke`."
+        ),
     },
     "clippy": {
         # Everything not yet at zero warnings. A gate is worth nothing
@@ -126,17 +145,20 @@ EXCLUSIONS = {
         # replays nothing and reports zero, which is how several of these
         # looked clean for months.
         "driver-cuda": "needs nvcc, and is being rewritten",
-        # These two are NOT waiting on warnings any more -- both are at zero
-        # under `-D warnings`, driver-vulkan in both feature halves. What
-        # they wait on is the runner: `kernels-vulkan`'s build script shells
-        # out to `slangc` and panics without it, and driver-vulkan depends on
-        # that crate, so neither can be linted without a shader compiler.
+        # `driver-vulkan` STOOD HERE reading "needs slangc on the runner;
+        # zero warnings otherwise", and the entry outlived its subject the
+        # way an exclusion always can: R3 put the crate in the root
+        # manifest's `exclude`, and an exclusion naming a NON-MEMBER is what
+        # the check below refuses -- correctly, because it reads as a crate
+        # somebody decided not to lint rather than as a crate cargo can no
+        # longer see. `driver-metal` and `driver-wgpu` went the same way and
+        # were never entries here at all: they were named in the gate lists,
+        # which is why they surfaced as `-p ... is not a workspace member`
+        # instead. Both halves of this file caught the same deletion from
+        # opposite sides, which is the point of having both.
         #
-        # So the entry to remove here is an install step, not a lint. The
-        # `driver-vulkan` job now has one -- it fetches the pinned Slang
-        # release tarball, since `slangc` is in no distribution -- and runs
-        # clippy over both crates with `-D warnings`.
-        "driver-vulkan": "needs slangc on the runner; zero warnings otherwise",
+        # None of the three comes back as an exclusion. They come back as
+        # members, at P5, and then the question is whether they are gated.
         # `kernels-cuda` STOOD HERE reading "52 warnings, and the rewrite is
         # landing in it". Both halves expired. The crate is named by the
         # clippy step in `ci.yml` AND was excluded here, which is the one
@@ -169,14 +191,18 @@ STEPS = {
     "clippy": [
         "cargo clippy (deny warnings)",
         "cargo clippy (model, deny warnings)",
-        # On the macOS job, because a lint can depend on `cfg(target_os)`
-        # and only a Mac can ask the question this crate needs asked. Both
-        # halves, because a lint that fires in one half is a lint nobody
-        # sees. Named here so the claim is CHECKED: while `driver-metal`
-        # was an exclusion saying "gated on the macOS job instead", nothing
-        # verified that those steps still existed.
-        "cargo clippy (driver-metal, portable half)",
-        "cargo clippy (driver-metal, metal-4)",
+        # `cargo clippy (driver-metal, portable half)` and `(driver-metal,
+        # metal-4)` STOOD HERE, on the macOS job, because a lint can depend
+        # on `cfg(target_os)` and only a Mac can ask that question in both
+        # feature halves. Naming them here is what turned "gated on the macOS
+        # job instead" from a sentence into a check, and the check then did
+        # its job in the direction nobody expected: R3 deleted the macOS job
+        # with the crate, and this list said so by name rather than going
+        # quietly narrower.
+        #
+        # They return at P5 with the job. A step named here that ci.yml does
+        # not have is an error, so this list cannot be restored ahead of the
+        # steps it claims.
     ],
 }
 

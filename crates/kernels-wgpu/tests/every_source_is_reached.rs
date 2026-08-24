@@ -11,9 +11,8 @@
 //! `moe/params.inc.wgsl` held `RouterParams`, `ExpertCombineParams` and
 //! `MoeRouteParams` -- the three storage blocks the five MoE routing arms bound
 //! on `@group(0)`. They do not bind them any more. `moe/route.wgsl`'s own
-//! header says so in capitals: every one of those fields is a `Const<u32>` mark
-//! in its routine's signature now, packed into the `@group(1)` uniform block by
-//! `driver-wgpu::lowering::routine::bind`.
+//! header says so in capitals: every one of those fields arrives in the
+//! `@group(1)` uniform block, packed there by whatever fires the entrypoint.
 //!
 //! Nothing has included the file since. Its header opened with "This tree is
 //! the last one still reading them from a block", which was true when the Slang

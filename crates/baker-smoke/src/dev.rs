@@ -19,8 +19,10 @@ use cudarc::runtime::sys as rt;
 ///
 /// NOT AN ARENA AND NOT POOLED. Every slab here lives for the whole fire --
 /// the weights, the arena, the caches, the plan workspaces -- so `Drop` is
-/// the only lifetime anything needs, and the no-reuse layout
-/// `model_compiler::program` already commits to is the one this mirrors.
+/// the only lifetime anything needs. The reuse `model_compiler::program`
+/// does is INSIDE the activation slab and none of this type's business: the
+/// walk hands out offsets into one block, and one block is what this
+/// allocates.
 #[derive(Debug)]
 pub struct Slab {
     ptr: *mut c_void,

@@ -118,7 +118,7 @@ impl Shell {
             }
             let (kv_heads, head_dim) = (
                 i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
-                i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
+                i32::try_from(model.deployment.shape.head_dim_kernel).unwrap_or(0),
             );
             let page_size: i32 = 16;
             let _layers_n = model.deployment.layers as usize;
@@ -367,7 +367,11 @@ impl Shell {
                             d_soff.as_ptr().cast(),
                             i32::try_from(cells.len()).unwrap_or(i32::MAX),
                             stream.as_ref().as_raw().cast(),
-                        );
+                        )
+                        .map_err(|why| {
+                            eprintln!("[driver-cuda] copy_kv: the cell move refused: {why}");
+                            PIE_STATUS_DRIVER_ERROR
+                        })?;
                         debug_assert!(
                             matches!(moved, crate::fire::kv_paged::CopyKvCells::Launched),
                             "copy_kv_cells_bf16 declined a non-empty cell list"

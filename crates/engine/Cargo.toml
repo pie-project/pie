@@ -15,19 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 # tart: the declared-forward toolchain, and OPTIONAL now.
 #
-# These two were unconditional, for the fire planner's site table: `lower` (the
-# launch list its cost model read) and the traced form's vocabulary. R1 deleted
-# that table -- it had no producer, no carrier and no consumer, and it walked
-# `model_ir::trace::ForwardPlan`, the LEGACY traced form the baker path does not
-# produce (`src/scheduler/fire_plan.rs` records the measurement).
-#
-# What is left of either in this crate is `backend/{vulkan,wgpu}.rs`, which
-# lower a legacy declaration to build a shader program: `model_compiler::lower`
-# and `model_ir::trace::FireClass`, nowhere else. So they ride the same two
-# features `model-legacy` does, and a default build of this crate carries no
-# part of the legacy forward toolchain at all.
-model-compiler = { path = "../model-compiler", optional = true }
-model-ir = { path = "../model-ir", optional = true }
 driver-api = { path = "../driver-api" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
@@ -36,25 +23,13 @@ tensor-compiler = { path = "../tensor-compiler" }
 # the seam linked was the whole switch and `backend/cuda.rs` was unchanged
 # either way. There is one now, and it has the name.
 driver-cuda = { path = "../driver-cuda", optional = true }
-# The Rust Metal shell. Unlike `driver-cuda` this is not linked for an
-# archive: the seam calls it as a plain Rust library, which is what a driver
-# written in the same language should cost. Its device half is
-# `#[cfg(target_vendor = "apple")]`, so the seam below is too.
-driver-metal = { path = "../driver-metal", optional = true }
+# `driver-metal` STOOD HERE. R3 took the three shader drivers out of the
+# workspace (they were the last consumers of `model-legacy` and
+# `model_compiler::lower`), and an optional path dependency is enough to drag
+# one back in: cargo adopts a path dep inside the workspace directory as a
+# member whatever its features say. So the edge is cut, not merely gated. It
+# comes back with the driver at P5.
 
-# The Rust Vulkan shell, and the checkpoint reader it deliberately does not
-# have. `driver-vulkan` keeps `model-loader` a DEV-dependency and proves the
-# closure with a test, because a driver that depended on a checkpoint format
-# would be a driver that could not be handed bytes. So the conversion runs
-# here, on the side that already reads checkpoints.
-driver-vulkan = { path = "../driver-vulkan", optional = true }
-# The Rust WebGPU shell. Same arrangement as `driver-vulkan` above and for the
-# same reason -- it keeps `model-loader` a DEV-dependency and proves the
-# closure with `tests/pure.rs`, so the checkpoint is read on this side -- with
-# one thing neither sibling has: no SDK, no loader, no `-sys` crate anywhere in
-# its closure. See the `driver-wgpu` feature below.
-driver-wgpu = { path = "../driver-wgpu", optional = true }
-model-loader = { path = "../model-loader", default-features = false, optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
 parking_lot = "0.12"
@@ -135,20 +110,6 @@ grammar = { path = "../grammar" }
 # declaration. Everything left is serving knowledge, and it moved to this crate
 # rather than being ported, file for file.
 model = { path = "../model", features = ["serve"] }
-# THE LEGACY DECLARATIONS, and only for the two shader backends that still read
-# one. `backend/{vulkan,wgpu}.rs` identify a checkpoint against the legacy
-# catalog, author its load plan through `model::boot`, and trace
-# `shared::llama_like` to build the shader program — that is the whole of what
-# is left, it is what P5 replaces with a baker executor per plane, and R2
-# quarantines these two backends until it lands.
-#
-# Optional, and pulled in by those two features ALONE. That is the cut: a
-# default `cargo build -p engine` has no `model-legacy` edge at all, and one
-# appears exactly when a build asks for a backend that still reads a legacy
-# declaration.
-model-legacy = { path = "../model-legacy", package = "model-legacy", default-features = false, features = [
-    "contract",
-], optional = true }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
@@ -194,85 +155,7 @@ default = []
 _driver-cuda = ["dep:driver-cuda", "driver-cuda/abi"]
 driver-cuda-12 = ["_driver-cuda", "driver-cuda/cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "driver-cuda/cuda-13"]
-# The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
-# library call, so the feature owes nothing but the dependency and the
-# driver's own device gate.
-#
-# `driver-metal/metal-4` is NOT optional here. That crate deliberately has no
-# default feature, so that `cargo test -p driver-metal` reaches its portable
-# half; a consumer that wants the serving path has to say so. Omitting it
-# makes `driver_metal::gpu` an unresolved path IN THIS CRATE, which is the
-# better place to find out.
-driver-metal = ["dep:driver-metal", "driver-metal/metal-4"]
-# The Rust Vulkan shell's seam. A library call, like the Metal one, and gated
-# on the feature ALONE -- not on a target. Vulkan is a loader rather than a
-# platform: the same crate builds and runs on Linux, Windows and Android.
-#
-# `driver-vulkan/native` is not optional here for the same reason
-# `driver-metal/metal-4` is not: that crate has no default feature so its
-# portable half can be tested without a GPU, and a consumer that wants the
-# serving path has to say so. Omitting it makes `driver_vulkan::device` an
-# unresolved path IN THIS CRATE, which is the better place to find out.
-#
-# `model-loader` comes with it, because THIS crate loads the checkpoint for
-# that driver -- see `src/driver/backend/vulkan.rs` for why loading is on this
-# side of the seam and not the other.
-driver-vulkan = [
-    "dep:driver-vulkan",
-    "driver-vulkan/native",
-    "dep:model-loader",
-    "dep:model-compiler",
-    "dep:model-ir",
-    # `catalog::identify`, `contract::author` and `boot::compile_load_plan_for`
-    # -- the identification and the load plan, all of them off the LEGACY
-    # declarations. This is the only kind of consumer that still needs them,
-    # which is why the dependency is optional and named here rather than
-    # carried by every build.
-    "dep:model-legacy",
-]
-# The Rust WebGPU shell's seam. A library call, like the two above, and gated
-# on the feature ALONE.
-#
-# `driver-wgpu/native` is not optional here, for the reason
-# `driver-vulkan/native` and `driver-metal/metal-4` are not: that crate has no
-# default feature so its portable half -- which parses the WGSL it will
-# dispatch and checks it against the kernel table, with no adapter present --
-# can be tested without a GPU. Omitting it makes `driver_wgpu::device` an empty
-# module and `driver_wgpu::shell` absent, and the failure arrives at model load
-# instead of at `cargo build`.
-#
-# `model-loader` and `model-legacy` come with it because THIS crate loads the
-# checkpoint for that driver, exactly as it does for Vulkan -- see
-# `src/driver/backend/wgpu.rs` for why loading is on this side of the seam.
-#
-# THE ARGUMENT THIS BACKEND HAS THAT NEITHER SIBLING DOES, for whoever decides
-# what ships on by default:
-#
-# `driver-cuda` needs a CUDA toolkit and an NVIDIA card. `driver-metal` needs a
-# Mac. `driver-vulkan` needs a loader and an ICD. This one needs NONE of them.
-# Its whole dependency closure is pure Rust -- `driver-wgpu/tests/pure.rs`
-# asserts that with `native` ON, which is the version of the claim that matters
-# -- `naga` compiles the shaders in-process so there is no module directory to
-# ship beside the binary, it builds for `wasm32-unknown-unknown` including the
-# browser backend (`tests/browser.rs`), and it reaches Vulkan, Metal, D3D12 and
-# WebGPU through one binary. Nothing about turning it on can fail to build on a
-# machine that can build the engine at all.
-#
-# That makes it the only driver that could reasonably be a DEFAULT feature.
-# This change deliberately does not make it one: the existing three are all
-# opt-in, "which backends a build carries" is a deployment policy rather than a
-# seam's decision, and `create` still opens an adapter -- so a default would
-# turn a machine with no GPU from "no backend compiled in" into "a backend that
-# fails at boot". The case is stated here so that whoever makes that call has
-# it in one place rather than reconstructing it.
-driver-wgpu = [
-    "dep:driver-wgpu",
-    "driver-wgpu/native",
-    "dep:model-loader",
-    "dep:model-legacy",
-    "dep:model-compiler",
-    "dep:model-ir",
-]
+# The `driver-metal` feature STOOD HERE, and went with the dependency above.
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in
@@ -297,12 +180,11 @@ tempfile = "3"
 # parser has no business in a shipped binary. Dev-dependencies are not built
 # for `cargo build`, which is exactly the line we want here.
 wasmtime = { version = "47", default-features = false, features = ["wat"] }
-tensor-ir = { path = "../tensor-ir" }
-criterion = { version = "0.8", features = ["html_reports"] }
-# Benchmarks must allocate the way production does. Every engine entry point
-# links `worker`, which sets mimalloc as the global allocator; a bench that
-# omitted it would measure glibc malloc and report a machine nobody runs.
-mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+# `criterion` and `mimalloc` STOOD HERE, for benchmarks: this crate has no
+# `benches/` directory and no `[[bench]]`, and neither name appears in a line
+# of its source. The mimalloc line carried the one fact worth keeping — a
+# bench of an engine entry point has to link the allocator `worker` installs
+# or it measures glibc malloc — so bring both back together when a bench does.
 
 #[profile.release]
 #lto = "fat"

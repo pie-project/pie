@@ -10,13 +10,11 @@
 
 pub mod budget;
 pub mod calibrate;
-pub mod compressed_plane_geometry;
 pub mod dtoa;
 pub mod json;
 pub mod kv_format;
 pub mod kv_geometry;
 pub mod memory_planner;
-pub mod mla_geometry;
 pub mod model_costs;
 pub mod planner_policy;
 pub mod profile_cache;
@@ -26,5 +24,8 @@ pub mod rendezvous;
 pub mod swap_plan;
 /// How big the fire's scratch is.
 pub mod workspace;
+
+// `mla_geometry` and `compressed_plane_geometry` STOOD HERE — the shape half
+// of the two pools `pools/mod.rs` names, deleted with them.
 
 pub use kv_format::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};

@@ -14,12 +14,12 @@ use crate::config::DriverKind;
 pub enum Flavor {
     #[cfg(feature = "_driver-cuda")]
     Cuda,
-    #[cfg(feature = "driver-metal")]
-    Metal,
-    #[cfg(feature = "driver-vulkan")]
-    Vulkan,
-    #[cfg(feature = "driver-wgpu")]
-    Wgpu,
+    // `Metal`, `Vulkan` and `Wgpu` STOOD HERE. Their drivers left the
+    // workspace at R3 — the last two were the last consumers of
+    // `model-legacy` and `model_compiler::lower`, and none of the three can
+    // be brought forward without a baker executor of its own (P5).
+    // `DriverKind` still NAMES all three, so a deployment that asks for one
+    // is told what happened instead of being told its config is malformed.
 }
 
 impl Flavor {
@@ -28,12 +28,6 @@ impl Flavor {
         match self {
             #[cfg(feature = "_driver-cuda")]
             Flavor::Cuda => "cuda",
-            #[cfg(feature = "driver-metal")]
-            Flavor::Metal => "metal",
-            #[cfg(feature = "driver-vulkan")]
-            Flavor::Vulkan => "vulkan",
-            #[cfg(feature = "driver-wgpu")]
-            Flavor::Wgpu => "wgpu",
         }
     }
 
@@ -52,46 +46,29 @@ impl Flavor {
                     Err(missing_feature_msg("cuda_native", "driver-cuda"))
                 }
             }
-            DriverKind::Metal => {
-                #[cfg(feature = "driver-metal")]
-                {
-                    Ok(Flavor::Metal)
-                }
-                #[cfg(not(feature = "driver-metal"))]
-                {
-                    Err(missing_feature_msg("metal", "driver-metal"))
-                }
-            }
-            DriverKind::Vulkan => {
-                #[cfg(feature = "driver-vulkan")]
-                {
-                    Ok(Flavor::Vulkan)
-                }
-                #[cfg(not(feature = "driver-vulkan"))]
-                {
-                    Err(missing_feature_msg("vulkan", "driver-vulkan"))
-                }
-            }
-            DriverKind::Wgpu => {
-                #[cfg(feature = "driver-wgpu")]
-                {
-                    Ok(Flavor::Wgpu)
-                }
-                #[cfg(not(feature = "driver-wgpu"))]
-                {
-                    Err(missing_feature_msg("wgpu", "driver-wgpu"))
-                }
-            }
+            DriverKind::Metal => Err(retired_msg("metal")),
+            DriverKind::Vulkan => Err(retired_msg("vulkan")),
+            DriverKind::Wgpu => Err(retired_msg("wgpu")),
         }
     }
 }
 
-#[cfg(any(
-    not(feature = "_driver-cuda"),
-    not(feature = "driver-metal"),
-    not(feature = "driver-vulkan"),
-    not(feature = "driver-wgpu"),
-))]
+/// A shader flavor that no build can host, whatever it was built with.
+///
+/// Distinct from [`missing_feature_msg`] on purpose: "rebuild with a feature"
+/// is advice that would not work, because the crate the feature would name is
+/// not in the workspace.
+fn retired_msg(toml_type: &str) -> String {
+    format!(
+        "driver type {toml_type:?} is not hosted by any build of pie right \
+         now. `driver-{toml_type}` left the workspace with the legacy \
+         declarations it was the last consumer of, and returns when its \
+         baker executor lands (P5). Compiled flavors: {compiled}.",
+        compiled = compiled_summary(),
+    )
+}
+
+#[cfg(not(feature = "_driver-cuda"))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
         "driver type {toml_type:?} is not built into this binary. \
@@ -110,23 +87,12 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
 )]
 pub fn compiled_summary() -> String {
     #[cfg_attr(
-        not(any(
-            feature = "_driver-cuda",
-            feature = "driver-metal",
-            feature = "driver-vulkan",
-            feature = "driver-wgpu"
-        )),
-        allow(unused_mut, reason = "every push below is feature-gated")
+        not(feature = "_driver-cuda"),
+        allow(unused_mut, reason = "the push below is feature-gated")
     )]
     let mut out: Vec<&'static str> = Vec::new();
     #[cfg(feature = "_driver-cuda")]
     out.push("cuda");
-    #[cfg(feature = "driver-metal")]
-    out.push("metal");
-    #[cfg(feature = "driver-vulkan")]
-    out.push("vulkan");
-    #[cfg(feature = "driver-wgpu")]
-    out.push("wgpu");
     out.join(", ")
 }
 
@@ -140,47 +106,23 @@ pub fn compiled_summary() -> String {
 pub fn compiled_embedded() -> [(&'static str, bool); 4] {
     [
         ("cuda_native", cfg!(feature = "_driver-cuda")),
-        ("metal", cfg!(feature = "driver-metal")),
-        ("vulkan", cfg!(feature = "driver-vulkan")),
-        ("wgpu", cfg!(feature = "driver-wgpu")),
+        // FALSE, and not because a feature is off: these three drivers are
+        // out of the workspace until P5. See `retired_msg`.
+        ("metal", false),
+        ("vulkan", false),
+        ("wgpu", false),
     ]
 }
 
 /// Pick a sensible default flavor for commands that don't specify one
 /// (e.g. `pie smoke` without `--flavor`, `pie config init`'s template).
-/// Order: cuda → metal → vulkan → wgpu, and `None` when none was compiled in.
-///
-/// The two portable shells come last on purpose, and the reason covers both:
-/// a machine with a CUDA build has an NVIDIA card, and either of them would
-/// serve that card through a portable path rather than the vendor one. Between
-/// themselves, Vulkan precedes wgpu because a build that asked for both asked
-/// for the more specific one too — wgpu may well end up running over Vulkan,
-/// and if that is what a deployment wants it can say so in one word.
+/// CUDA, or `None` when it was not compiled in. It was a preference order
+/// while there were four flavors; the three shader shells are out of the
+/// workspace until P5, so one candidate is the whole list.
 pub fn default_flavor() -> Option<Flavor> {
     #[cfg(feature = "_driver-cuda")]
     {
         return Some(Flavor::Cuda);
-    }
-    #[cfg(all(not(feature = "_driver-cuda"), feature = "driver-metal"))]
-    {
-        return Some(Flavor::Metal);
-    }
-    #[cfg(all(
-        not(feature = "_driver-cuda"),
-        not(feature = "driver-metal"),
-        feature = "driver-vulkan"
-    ))]
-    {
-        return Some(Flavor::Vulkan);
-    }
-    #[cfg(all(
-        not(feature = "_driver-cuda"),
-        not(feature = "driver-metal"),
-        not(feature = "driver-vulkan"),
-        feature = "driver-wgpu"
-    ))]
-    {
-        return Some(Flavor::Wgpu);
     }
     #[allow(unreachable_code)]
     None

@@ -5,7 +5,6 @@ use crate::views::GemmGroups;
 use kernels::Refusal;
 use kernels::raises::Struct;
 use kernels::routine::{Const, In, InOut, Out};
-use kernels_macros::routine;
 
 use core::ffi::c_void;
 
@@ -14,6 +13,9 @@ pub mod absorb;
 #[cfg(feature = "_cuda")]
 pub mod dense;
 
+// GATED WITH ITS CALLER. `dense`'s autotuner is the only thing that picks
+// this launch, and that module is `_cuda`'s.
+#[cfg(feature = "_cuda")]
 pub mod gemv;
 
 pub mod lora;
@@ -85,8 +87,7 @@ impl kernels::points::Gemm for Ctx<'_> {
     }
 }
 
-#[routine(canon = "gemm.matmul", out(y = rows(act) x weight(w)))]
-pub fn act_x_wt_bf16(
+pub(crate) fn act_x_wt_bf16(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
     w: Const<Tensor<c_void>>,
@@ -118,35 +119,6 @@ fn act_x_wt_bf16_beta(
     Ok(())
 }
 
-#[routine(out(y = rows(act) x weight(w)))]
-pub fn act_x_w(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<c_void>>,
-    w: Const<Tensor<c_void>>,
-    y: Out<Tensor<c_void>>,
-) -> Result<(), Refusal> {
-    let beta = 0.0f32;
-    act_x_wt_bf16_beta(ctx, act, w, y, beta)
-}
-
-#[routine(canon = "gemm.matmul_acc", out(y = like(y)))]
-pub fn act_x_w_acc(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<c_void>>,
-    w: Const<Tensor<c_void>>,
-    y: InOut<Tensor<c_void>>,
-) -> Result<(), Refusal> {
-    let beta = 1.0f32;
-
-    let dst = Out {
-        ptr: y.ptr,
-        rows: y.rows,
-        width: y.width,
-    };
-    act_x_wt_bf16_beta(ctx, act, w, dst, beta)
-}
-
-#[routine]
 pub fn act_x_wt_bf16_out_fp32(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
@@ -168,7 +140,6 @@ pub fn act_x_wt_bf16_out_fp32(
     Ok(())
 }
 
-#[routine(whole)]
 pub fn grouped_act_x_wt_bf16(
     ctx: &Ctx<'_>,
     group_count: Const<i32>,
@@ -222,7 +193,6 @@ pub fn grouped_act_x_wt_bf16(
     Ok(())
 }
 
-#[routine(out(y = rows(act) x weight(w)))]
 pub fn act_x_wt_bias_bf16(
     ctx: &Ctx<'_>,
     act: In<Tensor<c_void>>,
@@ -265,182 +235,5 @@ pub fn act_x_wt_bias_bf16(
     )
 }
 
-#[routine(untraced)]
-pub fn act_x_wt_channel_scaled(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<c_void>>,
-    w: Const<Tensor<c_void>>,
-    w_dtype: i32,
-    w_nbytes: usize,
-    scale: Const<Tensor<c_void>>,
-    scale_dtype: i32,
-    scale_numel: usize,
-    zero_point: Const<Tensor<c_void>>,
-    channel_axis: i32,
-    y: Out<Tensor<c_void>>,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) -> Result<(), Refusal> {
-    let handle = ctx.cublas()?;
-    let (act, w, scale, zero_point, y) = (act.ptr, w.v, scale.v, zero_point.v, y.ptr);
 
-    #[cfg(feature = "_cuda")]
-    unsafe {
-        quant::act_x_wt_channel_scaled(
-            handle,
-            act,
-            w,
-            w_dtype,
-            w_nbytes,
-            scale,
-            scale_dtype,
-            scale_numel,
-            zero_point,
-            channel_axis,
-            y,
-            m,
-            n,
-            k,
-            beta,
-        );
-    }
-    #[cfg(not(feature = "_cuda"))]
-    let _ = (
-        handle,
-        act,
-        w,
-        w_dtype,
-        w_nbytes,
-        scale,
-        scale_dtype,
-        scale_numel,
-        zero_point,
-        channel_axis,
-        y,
-        m,
-        n,
-        k,
-        beta,
-    );
-    Ok(())
-}
 
-#[routine(untraced)]
-pub fn act_x_wt_grouped_scaled(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<c_void>>,
-    w: Const<Tensor<c_void>>,
-    w_dtype: i32,
-    w_nbytes: usize,
-    scale: Const<Tensor<c_void>>,
-    scale_dtype: i32,
-    scale_numel: usize,
-    zero_point: Const<Tensor<c_void>>,
-    group_size: i32,
-    y: Out<Tensor<c_void>>,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) -> Result<(), Refusal> {
-    let handle = ctx.cublas()?;
-    let (act, w, scale, zero_point, y) = (act.ptr, w.v, scale.v, zero_point.v, y.ptr);
-
-    #[cfg(feature = "_cuda")]
-    unsafe {
-        quant::act_x_wt_grouped_scaled(
-            handle,
-            act,
-            w,
-            w_dtype,
-            w_nbytes,
-            scale,
-            scale_dtype,
-            scale_numel,
-            zero_point,
-            group_size,
-            y,
-            m,
-            n,
-            k,
-            beta,
-        );
-    }
-    #[cfg(not(feature = "_cuda"))]
-    let _ = (
-        handle,
-        act,
-        w,
-        w_dtype,
-        w_nbytes,
-        scale,
-        scale_dtype,
-        scale_numel,
-        zero_point,
-        group_size,
-        y,
-        m,
-        n,
-        k,
-        beta,
-    );
-    Ok(())
-}
-
-#[routine(untraced)]
-pub fn act_x_wt_mxfp4_marlin(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<c_void>>,
-    w: Const<Tensor<c_void>>,
-    w_nbytes: usize,
-    scale: Const<Tensor<c_void>>,
-    scale_numel: usize,
-    y: Out<Tensor<c_void>>,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) -> Result<(), Refusal> {
-    let handle = ctx.cublas()?;
-    let (act, w, scale, y) = (act.ptr, w.v, scale.v, y.ptr);
-
-    #[cfg(feature = "_cuda")]
-    unsafe {
-        quant::act_x_wt_mxfp4_marlin(
-            handle,
-            act,
-            w,
-            w_nbytes,
-            scale,
-            scale_numel,
-            y,
-            m,
-            n,
-            k,
-            beta,
-        );
-    }
-    #[cfg(not(feature = "_cuda"))]
-    let _ = (
-        handle,
-        act,
-        w,
-        w_nbytes,
-        scale,
-        scale_numel,
-        y,
-        m,
-        n,
-        k,
-        beta,
-    );
-    Ok(())
-}
-
-pub use gemv::gemv_bf16;
-
-pub use absorb::{mla_absorb_latent_to_v_bf16, mla_absorb_q_to_latent_bf16};
-
-pub use lora::lora_qkv_correction;

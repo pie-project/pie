@@ -1,9 +1,7 @@
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 
-#[routine]
 pub fn copy_logits_bf16(
     ctx: &Ctx<'_>,
     source: In<Tensor<bf16>>,

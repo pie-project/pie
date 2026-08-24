@@ -58,11 +58,12 @@
 //! a claim a program binds against, so a false one is a silent no-op. Five
 //! fixtures, one cause. Nobody needs to go looking in the checkpoint.
 //!
-//! Both refusals SAY that now -- `tensor_ir::validate`'s `IntrinsicUnavailable`
-//! and `KernelUnavailable` name the driver's `PtirCaps` and add, of the
-//! intrinsic one, that it "says nothing about the checkpoint". The census
-//! quotes the old wording above because that is what the run printed when it
-//! was taken.
+//! Both refusals SAY that now -- the `IntrinsicUnavailable` and
+//! `KernelUnavailable` that `tensor-ir`'s `validate` raises (this crate does
+//! not link it; the strings arrive over the wire) name the driver's
+//! `PtirCaps` and add, of the intrinsic one, that it "says nothing about the
+//! checkpoint". The census quotes the old wording above because that is what
+//! the run printed when it was taken.
 //!
 //! `PIE_CUDA_KV_ENVELOPES=1` does not change it. The refusal text used to name
 //! that variable and invite the attempt, which is why this was tried: all four

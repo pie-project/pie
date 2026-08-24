@@ -1,9 +1,10 @@
 //! Default `config.toml` emitted by `pie config init`.
 //!
-//! The highest-priority compiled flavor (cuda → metal → vulkan → wgpu) picks
-//! the `[driver]` block, so the generated file works without a follow-up edit.
-//! A binary carrying none of them has no block to write and says so, rather
-//! than writing a file it knows will not parse.
+//! The compiled flavor picks the `[driver]` block, so the generated file
+//! works without a follow-up edit. There is ONE candidate — it was a
+//! cuda → metal → vulkan → wgpu priority order while the shader shells were
+//! in the workspace — and a binary carrying none has no block to write and
+//! says so, rather than writing a file it knows will not parse.
 //!
 //! Five live sections, plus a commented `[cluster]` for distributed
 //! deployments. What the file no longer has is as much the point as what it
@@ -30,17 +31,11 @@ pub fn default_config_content() -> Result<String> {
     let driver_block: Option<&str> = match flavor {
         #[cfg(feature = "_driver-cuda")]
         Some(driver_ffi::Flavor::Cuda) => Some(CUDA_DRIVER_BLOCK),
-        #[cfg(feature = "driver-metal")]
-        Some(driver_ffi::Flavor::Metal) => Some(METAL_DRIVER_BLOCK),
-        #[cfg(feature = "driver-vulkan")]
-        Some(driver_ffi::Flavor::Vulkan) => Some(VULKAN_DRIVER_BLOCK),
-        #[cfg(feature = "driver-wgpu")]
-        Some(driver_ffi::Flavor::Wgpu) => Some(WGPU_DRIVER_BLOCK),
         // `default_flavor` answers `None` when this binary carries no driver,
-        // and `worker` may compile `Flavor::Cuda`/`Metal` while this crate's
-        // matching `driver-*` arm is cfg'd off (workspace feature-unification
-        // can desync the two). Both land here, and both mean the same thing to
-        // the operator: this binary cannot serve, so a config naming a driver
+        // and `worker` may compile `Flavor::Cuda` while this crate's matching
+        // `driver-cuda-*` arm is cfg'd off (workspace feature-unification can
+        // desync the two). Both land here, and both mean the same thing to the
+        // operator: this binary cannot serve, so a config naming a driver
         // would be a guess.
         _ => None,
     };
@@ -48,24 +43,13 @@ pub fn default_config_content() -> Result<String> {
         bail!(
             "this pie binary carries no driver, so there is no `[driver]` \
              section to write and the config would not parse. Rebuild with \
-             --features set to one of driver-cuda-13, driver-cuda-12, \
-             driver-metal, driver-vulkan or driver-wgpu."
+             --features set to driver-cuda-13 or driver-cuda-12."
         );
     };
-    let model_block: &str = match flavor {
-        // Metal's llama path binds `.weight`/`.scales`/`.biases` for every
-        // matvec and has no unquantized kernel, so the stock bf16 default
-        // imports fine and then cannot bind at load. A default has to run.
-        #[cfg(feature = "driver-metal")]
-        Some(driver_ffi::Flavor::Metal) => METAL_MODEL_BLOCK,
-        // Both portable shells load through `Binding::MLX_IN_PLACE`, so both
-        // want the quantized default for one reason. See `MLX_MODEL_BLOCK`.
-        #[cfg(feature = "driver-vulkan")]
-        Some(driver_ffi::Flavor::Vulkan) => MLX_MODEL_BLOCK,
-        #[cfg(feature = "driver-wgpu")]
-        Some(driver_ffi::Flavor::Wgpu) => MLX_MODEL_BLOCK,
-        _ => DEFAULT_MODEL_BLOCK,
-    };
+    // ONE FLAVOR, so one block. It was a `match` on the flavor while Metal
+    // wanted a 4-bit default its llama path could bind; that driver is out of
+    // the workspace until P5.
+    let model_block: &str = DEFAULT_MODEL_BLOCK;
     Ok(format!("{HEADER}{model_block}{driver_block}{TAIL}"))
 }
 
@@ -107,37 +91,15 @@ model = "Qwen/Qwen3-0.6B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 "#;
 
-/// Metal's llama path is 4-bit-only, so the default names a quantized repo.
-#[cfg(feature = "driver-metal")]
-const METAL_MODEL_BLOCK: &str = r#"[model]
-name = "default"
-# Metal's llama path is 4-bit-only: every matvec binds `.weight`/`.scales`/
-# `.biases`, and there is no unquantized kernel to fall back to. So the default
-# is an MLX-quantized checkpoint -- a raw bf16 repo (e.g. `Qwen/Qwen3-0.6B`)
-# imports fine and then fails to bind at load.
-model = "mlx-community/Qwen3-0.6B-4bit"
-# weight_cache_dir = ""       # empty derives $PIE_HOME/models
-"#;
+// `METAL_MODEL_BLOCK` STOOD HERE, beside `MLX_MODEL_BLOCK` below: Metal's
+// llama path is 4-bit-only, so its default named an MLX-quantized repo. Its
+// driver left the workspace at R3 and returns at P5.
 
-/// The default both portable shells need, and they need it for ONE reason
-/// rather than two: each seam compiles its load plan through
-/// `model::boot::Binding::MLX_IN_PLACE`, so every projection binds
-/// `.weight`/`.scales`/`.biases` and a raw bf16 repo is refused at load with
-/// the remedy named in the refusal.
-///
-/// Shared between them and NOT with `METAL_MODEL_BLOCK` above, which names the
-/// same repo for a different reason -- that driver has no unquantized matvec
-/// at all. Two reasons, two blocks; one reason, one block.
-#[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
-const MLX_MODEL_BLOCK: &str = r#"[model]
-name = "default"
-# This driver loads through MLX in-place binding: every projection wants
-# `.weight`/`.scales`/`.biases`, so the default is an MLX-quantized checkpoint.
-# A raw bf16 repo (e.g. `Qwen/Qwen3-0.6B`) imports fine and is then refused at
-# load, saying it needs quantized weights.
-model = "mlx-community/Qwen3-0.6B-4bit"
-# weight_cache_dir = ""       # empty derives $PIE_HOME/models
-"#;
+// `MLX_MODEL_BLOCK` STOOD HERE — the quantized default both portable shells
+// wanted, because each loaded through `model_legacy::boot::Binding::MLX_IN_PLACE`
+// and every projection bound `.weight`/`.scales`/`.biases`. Its two readers
+// left the workspace at R3 and return at P5, when their baker executors say
+// for themselves what they bind.
 
 const TAIL: &str = r#"
 [runtime]
@@ -194,55 +156,10 @@ gpu_mem_utilization = 0.90
 # random_seed     = 42
 "#;
 
-#[cfg(feature = "driver-metal")]
-const METAL_DRIVER_BLOCK: &str = r#"
-[driver]
-# Which keys are valid here depends on `type`: the common ones below, plus
-# whatever the named driver accepts. A key it does not know is a parse error
-# naming the driver that rejected it.
-type = "metal"
-device = ["metal:0"]
-activation_dtype = "bfloat16"
-kv_page_size = 32
-total_pages = 1024
-# max_forward_tokens      = 10240
-# max_forward_requests    = 512
-# cpu_pages               = 0      # 0 disables KV swapping to host memory
-# kv_cache_dtype          = "auto"
-# stream_routed_experts   = false  # page MoE experts from the checkpoint
-"#;
-
-#[cfg(feature = "driver-vulkan")]
-const VULKAN_DRIVER_BLOCK: &str = r#"
-[driver]
-# Which keys are valid here depends on `type`: the common ones below, plus
-# whatever the named driver accepts. A key it does not know is a parse error
-# naming the driver that rejected it.
-type = "vulkan"
-# Not a selector this driver reads: it opens the first Vulkan device the
-# loader reports. Written because `device` is required of every driver.
-device = ["vulkan:0"]
-activation_dtype = "bfloat16"
-kv_pages = 1024
-"#;
-
-#[cfg(feature = "driver-wgpu")]
-const WGPU_DRIVER_BLOCK: &str = r#"
-[driver]
-# Which keys are valid here depends on `type`: the common ones below, plus
-# whatever the named driver accepts. A key it does not know is a parse error
-# naming the driver that rejected it.
-type = "wgpu"
-# Not a selector this driver reads either, and for a different reason than the
-# Vulkan block's: `wgpu` asks the platform for an adapter itself. Written
-# because `device` is required of every driver.
-device = ["gpu:0"]
-activation_dtype = "bfloat16"
-# The one knob this backend reads. No `kv_page_size` (16, fixed by the
-# kernels) and no `kv_cache_dtype` (bf16, the only one it stores). The shaders
-# are inside the binary, as the Vulkan block's SPIR-V now is too.
-kv_pages = 1024
-"#;
+// `METAL_DRIVER_BLOCK`, `VULKAN_DRIVER_BLOCK` and `WGPU_DRIVER_BLOCK` STOOD
+// HERE, and went with their drivers at R3. A `[driver] type = "vulkan"`
+// config still PARSES — `DriverKind` keeps all three names — and is refused
+// at boot with what happened, which is `driver_ffi::retired_msg`.
 
 #[cfg(test)]
 mod tests {
@@ -299,12 +216,6 @@ mod tests {
         let expected: Option<&str> = match driver_ffi::default_flavor() {
             #[cfg(feature = "_driver-cuda")]
             Some(driver_ffi::Flavor::Cuda) => Some("cuda_native"),
-            #[cfg(feature = "driver-metal")]
-            Some(driver_ffi::Flavor::Metal) => Some("metal"),
-            #[cfg(feature = "driver-vulkan")]
-            Some(driver_ffi::Flavor::Vulkan) => Some("vulkan"),
-            #[cfg(feature = "driver-wgpu")]
-            Some(driver_ffi::Flavor::Wgpu) => Some("wgpu"),
             // No flavor, no claim to check -- the refusal is pinned by
             // `a_binary_without_a_driver_refuses_instead_of_writing_one`.
             _ => None,

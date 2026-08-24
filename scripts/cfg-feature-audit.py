@@ -93,6 +93,7 @@ for -- editing the prose -- would be a scanner appeasing itself.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tomllib
@@ -163,12 +164,43 @@ def features_declared(manifest: dict) -> set[str]:
     return declared
 
 
+# Directories this audit does not descend into.
+#
+# `.claude` is the same exclusion the root `Cargo.toml` carries, and for a
+# harder version of the same reason. That directory holds whole `git
+# worktree` checkouts of THIS repository, one per agent, so a walk that
+# descends finds every manifest in the tree again once per worktree, and
+# the count is a multiple of however many worktrees exist rather than a
+# property of the tree. Measured on the box this was written on: 3,612
+# manifests pruned down to 79, and 5.8 seconds of walking down to 0.01 --
+# before the old code went on to read and TOML-parse all 3,612 and glob
+# `*.rs` beneath each, which is where the wait actually was. It also
+# attributed another checkout's crates to this one. The root manifest
+# excludes the directory so cargo cannot adopt a worktree's packages as
+# members; this excludes it so the audit cannot report a worktree's `cfg`
+# as this tree's, and so it finishes.
+#
+# `target` and `.git` were already filtered, but only AFTER `rglob` had
+# descended into them and produced the paths: the files were skipped and
+# the walk was still paid for. Pruning is where that belongs, and none of
+# the three can hold a manifest this audit is about.
+PRUNE = {".claude", ".git", "target"}
+
+
+def manifests() -> list[Path]:
+    """Every `Cargo.toml` in the tree, without descending into `PRUNE`."""
+    found = []
+    for parent, directories, files in os.walk(ROOT):
+        directories[:] = [d for d in directories if d not in PRUNE]
+        if "Cargo.toml" in files:
+            found.append(Path(parent) / "Cargo.toml")
+    return sorted(found)
+
+
 def packages() -> list[tuple[str, Path, dict]]:
     """Every manifest in the tree that names a package, root included."""
     found = []
-    for manifest_path in sorted(ROOT.rglob("Cargo.toml")):
-        if "target" in manifest_path.parts or ".git" in manifest_path.parts:
-            continue
+    for manifest_path in manifests():
         try:
             manifest = tomllib.loads(manifest_path.read_text())
         except tomllib.TOMLDecodeError as exc:

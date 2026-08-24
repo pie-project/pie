@@ -46,23 +46,17 @@ pub enum Error {
     Internal(String),
 }
 
-impl Error {
-    /// The stable code this error crosses the C ABI as -- a caller that cannot read the message can still tell a bad contract from a bad checkpoint.
-    pub const fn code(&self) -> u32 {
-        match self {
-            Self::Contract(_) => 1,
-            Self::Shard(_) => 2,
-            Self::Checkpoint(_) => 3,
-            Self::Unsupported(_) => 4,
-            Self::Overflow(_) => 5,
-            Self::Internal(_) => 6,
-        }
-    }
-}
+// `Error::code(&self) -> u32` STOOD HERE: a stable number per variant, "the
+// code this error crosses the C ABI as", for a caller that could not read the
+// message. There is no C ABI -- the drivers link this crate as an rlib and
+// match on the variants, which is what `driver-cuda/src/error.rs` does -- so
+// the number told nobody anything the type did not. Its only readers were the
+// two assertions in this file's own test, which now name the variants they
+// were always about.
 
 /// zTensor's failures, mapped onto the loader's, in one place since the distinction is load-bearing and easy to lose.
 ///
-/// `Unsupported` is the one that matters: a file using a layout this build does not implement is not a malformed checkpoint, and it crosses the C ABI as a different [`code`](Error::code).
+/// `Unsupported` is the one that matters: a file using a layout this build does not implement is not a malformed checkpoint, and a caller that can retry against a newer build has to be able to tell the two apart.
 impl From<ztensor::Error> for Error {
     fn from(err: ztensor::Error) -> Self {
         match err {
@@ -106,14 +100,15 @@ impl<T> OrOverflow<T> for std::result::Result<T, std::num::TryFromIntError> {
 mod ztensor_conversion {
     use super::*;
 
-    /// The two zTensor outcomes a caller must be able to tell apart across the
-    /// C ABI, where only the code survives.
+    /// The two zTensor outcomes a caller must be able to tell apart: a layout
+    /// this build does not implement is a reason to try a newer pie, and a
+    /// checkpoint that did not deliver is not.
     #[test]
     fn unsupported_survives_as_unsupported() {
         let unfamiliar = ztensor::Error::Unsupported("layout \"x.future/1\"".into());
-        assert_eq!(Error::from(unfamiliar).code(), 4);
+        assert!(matches!(Error::from(unfamiliar), Error::Unsupported(_)));
 
         let broken = ztensor::Error::NotFound("tensor \"w\"".into());
-        assert_eq!(Error::from(broken).code(), 3);
+        assert!(matches!(Error::from(broken), Error::Checkpoint(_)));
     }
 }

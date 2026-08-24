@@ -2,8 +2,9 @@
 //!
 //! This module exposes:
 //!   * [`DriverCapabilities`] — typed driver capability payloads.
-//!   * [`write_cuda_startup_toml`] / [`write_metal_startup_toml`] — emit the
-//!     per-launch TOML each native driver reads at creation.
+//!   * [`write_cuda_startup_toml`] — emits the per-launch TOML the one hosted
+//!     driver reads at creation. Its Metal, Vulkan and wgpu counterparts stood
+//!     beside it and left with the drivers that read them.
 //!   * [`create_driver_backend`] — build a runtime-owned [`::engine::driver::DriverBackend`]
 //!     plus its caps before `::engine::bootstrap`.
 
@@ -13,11 +14,12 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+// Every `with_context` in this file is inside cuda-gated code: the one
+// bootstrap-TOML writer left, and the two seams that read back what it wrote.
+#[cfg(any(feature = "_driver-cuda", test))]
+use anyhow::Context;
 
-use crate::config::MetalDriverOptions;
-use crate::config::VulkanDriverOptions;
-use crate::config::WgpuDriverOptions;
 #[cfg(any(feature = "_driver-cuda", test))]
 use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions};
 use crate::driver_ffi::Flavor;
@@ -75,12 +77,9 @@ fn nccl_unique_id_hex() -> Result<String> {
 pub enum DriverOptions {
     #[cfg(feature = "_driver-cuda")]
     CudaNative(CudaNativeDriverOptions),
-    #[cfg(feature = "driver-metal")]
-    Metal(MetalDriverOptions),
-    #[cfg(feature = "driver-vulkan")]
-    Vulkan(VulkanDriverOptions),
-    #[cfg(feature = "driver-wgpu")]
-    Wgpu(WgpuDriverOptions),
+    // `Metal`, `Vulkan` and `Wgpu` STOOD HERE, with their drivers, until R3
+    // took all three out of the workspace. They return at P5; see
+    // `driver_ffi::retired_msg`.
 }
 
 impl DriverOptions {
@@ -95,18 +94,7 @@ impl DriverOptions {
         match self {
             #[cfg(feature = "_driver-cuda")]
             DriverOptions::CudaNative(_) => Flavor::Cuda,
-            #[cfg(feature = "driver-metal")]
-            DriverOptions::Metal(_) => Flavor::Metal,
-            #[cfg(feature = "driver-vulkan")]
-            DriverOptions::Vulkan(_) => Flavor::Vulkan,
-            #[cfg(feature = "driver-wgpu")]
-            DriverOptions::Wgpu(_) => Flavor::Wgpu,
-            #[cfg(not(any(
-                feature = "_driver-cuda",
-                feature = "driver-metal",
-                feature = "driver-vulkan",
-                feature = "driver-wgpu"
-            )))]
+            #[cfg(not(feature = "_driver-cuda"))]
             _ => unreachable!("`DriverOptions` has no variants in this build"),
         }
     }
@@ -118,12 +106,8 @@ impl DriverOptions {
 /// build) but never inspected -- so the allow is scoped to exactly that build,
 /// and a field that dies under a driver build is still caught.
 ///
-/// Neither `driver-vulkan` nor `driver-wgpu` is in this list, unlike the lists
-/// that gate whether `DriverOptions` has a variant at all: both serve one
-/// device and write no rank state, so a build carrying only those reads none
-/// of these fields and the allow is what that build needs.
 #[cfg_attr(
-    not(any(feature = "_driver-cuda", feature = "driver-metal", test)),
+    not(any(feature = "_driver-cuda", test)),
     allow(dead_code, reason = "read by the cfg-gated TOML writers")
 )]
 #[derive(Clone)]
@@ -143,10 +127,6 @@ pub(crate) fn tp_launches(size: usize) -> Result<Vec<TpLaunch>> {
             nccl_unique_id_hex: nccl_unique_id_hex.clone(),
         })
         .collect())
-}
-
-fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
-    table.insert(key.into(), toml::Value::Integer(value.into()));
 }
 
 /// This model's materialized-weight artifact directory, installed once before
@@ -188,6 +168,10 @@ pub fn set_cache_dir(dir: String) {
     let _ = CACHE_DIR.set(dir);
 }
 
+/// Gated as `write_cuda_startup_toml` is, like `weight_cache_dir` above and
+/// for the same reason: emitting a bootstrap TOML is all this and the nine
+/// helpers under it are for, and the one seam still emitting one is cuda's.
+#[cfg(any(feature = "_driver-cuda", test))]
 fn cache_dir() -> String {
     CACHE_DIR.get().cloned().unwrap_or_default()
 }
@@ -197,6 +181,7 @@ fn cache_dir() -> String {
 /// Omitted when unset so a driver launched with a hand-written TOML (its own
 /// `dev.toml`, say) keeps the XDG derivation rather than losing its cache to
 /// an empty path.
+#[cfg(any(feature = "_driver-cuda", test))]
 fn insert_cache_table(doc: &mut toml::Table) {
     let dir = cache_dir();
     if dir.is_empty() {
@@ -207,18 +192,27 @@ fn insert_cache_table(doc: &mut toml::Table) {
     insert_table(doc, "cache", table);
 }
 
+#[cfg(any(feature = "_driver-cuda", test))]
+fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
+    table.insert(key.into(), toml::Value::Integer(value.into()));
+}
+
+#[cfg(any(feature = "_driver-cuda", test))]
 fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
 
+#[cfg(any(feature = "_driver-cuda", test))]
 fn insert_bool(table: &mut toml::Table, key: &str, value: bool) {
     table.insert(key.into(), toml::Value::Boolean(value));
 }
 
+#[cfg(any(feature = "_driver-cuda", test))]
 fn insert_table(doc: &mut toml::Table, key: &str, table: toml::Table) {
     doc.insert(key.into(), toml::Value::Table(table));
 }
 
+#[cfg(any(feature = "_driver-cuda", test))]
 fn path_string(path: &Path) -> String {
     path.display().to_string()
 }
@@ -238,6 +232,7 @@ fn path_string(path: &Path) -> String {
 /// old name meant a `pie.model/1` document — ~40 resolved fields, a schema, a
 /// reader in each driver — and that document is deleted. What travels here is
 /// the checkpoint's own `config.json`, verbatim, read for exactly one field.
+#[cfg(any(feature = "_driver-cuda", test))]
 fn write_config_beside(out_path: &Path, config: &[u8], model: &mut toml::Table) -> Result<()> {
     let beside = out_path.with_file_name("model.config.json");
     std::fs::write(&beside, config).with_context(|| format!("write model config {beside:?}"))?;
@@ -281,12 +276,14 @@ fn write_config_beside(out_path: &Path, config: &[u8], model: &mut toml::Table) 
 /// OVERRIDE, for the case where a checkpoint is genuinely a known model
 /// under an unknown name — a fine-tune, a re-upload, a mirror that
 /// renamed the directory — and it does not skip the manifest check.
+#[cfg(any(feature = "_driver-cuda", test))]
 fn insert_model_id(model: &mut toml::Table, id: Option<&str>) {
     if let Some(id) = id.filter(|s| !s.is_empty()) {
         insert_str(model, "id", id);
     }
 }
 
+#[cfg(any(feature = "_driver-cuda", test))]
 fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
     let serialized = toml::to_string(&doc).map_err(|e| anyhow!("serialize bootstrap TOML: {e}"))?;
     if let Some(parent) = out_path.parent() {
@@ -382,154 +379,6 @@ pub fn remove_launch_state() {
 // sites in pie-worker keep working through the
 // `embedded_driver::DriverCapabilities` path.
 pub use driver_api::DriverCapabilities;
-
-/// Emit the metal driver's bootstrap TOML — same `[model]` + `[batching]` +
-/// `[runtime]` layout consumed by `crates/driver-metal/csrc/src/config.hpp`. The metal
-/// launch state is identical apart from the `metal:N` backend selector.
-///
-/// Not gated on `driver-metal`: what it produces is a TOML file, and whether
-/// the operator's settings survive into that file is a question a machine
-/// without a Metal device can still answer. Gating it would put the test out
-/// of reach of every machine that is not a Mac.
-pub fn write_metal_startup_toml(
-    out_path: &Path,
-    options: &MetalDriverOptions,
-    snapshot_dir: &Path,
-    _group_id: usize,
-    config: &[u8],
-) -> Result<()> {
-    let mut doc = toml::Table::new();
-
-    let mut model = toml::Table::new();
-    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    // Same arrangement as the CUDA driver.
-    write_config_beside(out_path, config, &mut model)?;
-    insert_model_id(&mut model, options.model_id.as_deref());
-    insert_str(&mut model, "backend", &options.device);
-    insert_bool(
-        &mut model,
-        "stream_routed_experts",
-        options.stream_routed_experts,
-    );
-    // Omitted when unset rather than written as 0: the driver reads an absent
-    // key as "the whole bank stays resident", which is the same statement.
-    if let Some(bytes) = options.expert_slab_bytes {
-        model.insert(
-            "expert_slab_bytes".into(),
-            toml::Value::Integer(bytes as i64),
-        );
-    }
-    insert_table(&mut doc, "model", model);
-
-    let mut batching = toml::Table::new();
-    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
-    insert_int(&mut batching, "total_pages", options.total_pages);
-    insert_int(
-        &mut batching,
-        "max_forward_tokens",
-        options.max_forward_tokens,
-    );
-    insert_int(
-        &mut batching,
-        "max_forward_requests",
-        options.max_forward_requests,
-    );
-    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
-    insert_str(
-        &mut batching,
-        "kv_cache_dtype",
-        options.kv_cache_dtype.clone(),
-    );
-    // Omitted when unset rather than written as 0: the driver reads absent and
-    // zero the same way, and a config that does not mention the knob is the
-    // honest record of a run that did not use it.
-    if let Some(len) = options.max_model_len {
-        insert_int(&mut batching, "max_model_len", len);
-    }
-    insert_table(&mut doc, "batching", batching);
-
-    let mut runtime = toml::Table::new();
-    insert_bool(&mut runtime, "verbose", options.verbose);
-    insert_table(&mut doc, "runtime", runtime);
-    insert_cache_table(&mut doc);
-
-    write_toml_table(out_path, doc)
-}
-
-/// Emit the Vulkan driver's bootstrap TOML, and hand back what was written.
-///
-/// One key, because one is read: `crates/engine/src/driver/backend/vulkan.rs`
-/// looks up `[model] kv_pages` and nothing else -- `kernels` STOOD beside it,
-/// naming a directory of compiled SPIR-V, and is gone because the modules ride
-/// in `driver-vulkan`'s rlib and no deployment has a path to state. The
-/// snapshot directory rides in the load request rather than in this file, but
-/// it is written here anyway for the same reason the other two writers write
-/// it -- a boot TOML an operator finds in the state directory should say what
-/// was served.
-///
-/// # Why it returns the document
-///
-/// Because the seam is handed the DOCUMENT and not the path. `VulkanDriver::
-/// create` parses its `config_bytes` as TOML (`boot_of`), where the CUDA and
-/// Metal drivers open the path they are given -- so this writer has two
-/// consumers, the operator reading the file and the seam reading the bytes,
-/// and returning the text is what keeps them the same text.
-///
-/// Handing over the path instead is the defect this shape exists to prevent,
-/// and it is silent: a path is not a TOML document, `boot_of` reads the parse
-/// failure as "no boot config", and `kv_pages` falls back to the seam's own
-/// default. The server then boots at a pool size nobody asked for and says
-/// nothing.
-///
-/// Not gated on `driver-vulkan`, matching the Metal writer: whether an
-/// operator's settings survive into the file is a question a machine with no
-/// Vulkan device can still answer, and gating it would put its test out of
-/// reach of exactly the machines that run the rest of the suite.
-pub fn write_vulkan_startup_toml(
-    out_path: &Path,
-    options: &VulkanDriverOptions,
-    snapshot_dir: &Path,
-    config: &[u8],
-) -> Result<String> {
-    let mut doc = toml::Table::new();
-
-    let mut model = toml::Table::new();
-    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    write_config_beside(out_path, config, &mut model)?;
-    insert_int(&mut model, "kv_pages", options.kv_pages);
-    insert_table(&mut doc, "model", model);
-    insert_cache_table(&mut doc);
-
-    let text = doc.to_string();
-    write_toml_table(out_path, doc)?;
-    Ok(text)
-}
-
-/// The wgpu shell's bootstrap TOML, as a STRING and no file at all.
-///
-/// The same document the Vulkan writer above hands its seam, minus the file:
-/// `WgpuDriver::create` parses bytes the same way `VulkanDriver::create` does,
-/// and this driver has no second reader to write for. There is no module
-/// directory an operator could be pointed at -- the shaders are in the rlib --
-/// so a `driver.toml` here would record one settable number, and the launch
-/// state directory it lives in would be created for that alone.
-///
-/// One key, because one key is what the seam reads. The snapshot directory
-/// travels in the `ModelLoadDesc`, the adapter is `wgpu`'s own choice, and the
-/// page size is fixed by the kernels; see [`crate::config::WgpuDriverOptions`]
-/// for the knobs this backend deliberately does not offer.
-///
-/// Not gated on `driver-wgpu`, for the reason the two writers above are not:
-/// whether the operator's page count survives into the document is a question
-/// a machine with no adapter can answer.
-#[must_use]
-pub fn wgpu_startup_toml(options: &WgpuDriverOptions) -> String {
-    let mut doc = toml::Table::new();
-    let mut model = toml::Table::new();
-    insert_int(&mut model, "kv_pages", options.kv_pages);
-    insert_table(&mut doc, "model", model);
-    doc.to_string()
-}
 
 /// Build the model-load request the driver will compile from.
 ///
@@ -676,11 +525,7 @@ pub(crate) fn write_cuda_startup_toml(
 // Native driver creation helpers.
 // -----------------------------------------------------------------------------
 
-#[cfg(any(
-    feature = "_driver-cuda",
-    feature = "driver-metal",
-    feature = "driver-vulkan"
-))]
+#[cfg(feature = "_driver-cuda")]
 fn local_driver_state_dir(group_id: usize, tp: Option<&TpLaunch>) -> Result<PathBuf> {
     let rank_suffix = tp
         .as_ref()
@@ -804,12 +649,7 @@ pub(crate) fn create_driver_backend_group(
 }
 
 #[cfg_attr(
-    not(any(
-        feature = "_driver-cuda",
-        feature = "driver-metal",
-        feature = "driver-vulkan",
-        feature = "driver-wgpu"
-    )),
+    not(feature = "_driver-cuda"),
     allow(
         unused_variables,
         unreachable_code,
@@ -836,12 +676,7 @@ pub(crate) fn create_driver_backend(
     // fall back to.
     let (mut backend, runtime_quant, mxfp4_moe): (::engine::driver::DriverBackend, &str, &str) =
         match options {
-            #[cfg(not(any(
-                feature = "_driver-cuda",
-                feature = "driver-metal",
-                feature = "driver-vulkan",
-                feature = "driver-wgpu"
-            )))]
+            #[cfg(not(feature = "_driver-cuda"))]
             _ => unreachable!("`DriverOptions` has no variants in this build"),
             #[cfg(feature = "_driver-cuda")]
             DriverOptions::CudaNative(opts) => {
@@ -865,12 +700,11 @@ pub(crate) fn create_driver_backend(
                 // `[model] id` and `[driver] runahead`, all written into the
                 // file and none of them read.
                 //
-                // `BootConfig::parse` documents the tolerance that hid it:
-                // bytes "that are a PATH rather than a document" read as "the
-                // operator stated nothing", "which is what the seams handed a
-                // path already depended on". The seam is fixed here instead,
-                // so all four now hand over the same thing -- the two arms
-                // below already passed the document.
+                // The tolerance that hid it was the engine's own boot
+                // reader, which took bytes "that are a PATH rather than a
+                // document" for "the operator stated nothing". That reader
+                // had no callers left and is gone; this seam hands over the
+                // document, so there is nothing left to tolerate.
                 let boot_doc = std::fs::read(&toml_path).with_context(|| {
                     format!("read the driver boot config just written to {toml_path:?}")
                 })?;
@@ -880,59 +714,18 @@ pub(crate) fn create_driver_backend(
                     opts.runtime_quant.as_str(),
                     opts.mxfp4_moe.as_str(),
                 )
-            }
-            #[cfg(feature = "driver-metal")]
-            DriverOptions::Metal(opts) => {
-                let state_dir = local_driver_state_dir(group_id, tp)?;
-                let toml_path = state_dir.join("driver.toml");
-                write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id, config)?;
-                let config_path = toml_path.to_string_lossy();
-                let backend = ::engine::driver::backend::open::metal(config_path.as_bytes())?;
-                (backend, "", "auto")
-            }
-            // THE TWO ARMS BELOW HAND OVER A DOCUMENT WHERE THE TWO ABOVE HAND
-            // OVER A PATH, and the difference is the seam's, not a choice made
-            // here: `open::cuda` and `open::metal` open the file they are
-            // named, and `open::vulkan` and `open::wgpu` parse the bytes they
-            // are given. Passing a path to either of those is not an error --
-            // it is a document that does not parse, read as "no boot config",
-            // and every key in it falls back to a default in silence.
-            #[cfg(feature = "driver-vulkan")]
-            DriverOptions::Vulkan(opts) => {
-                let state_dir = local_driver_state_dir(group_id, tp)?;
-                let toml_path = state_dir.join("driver.toml");
-                // Written for the operator, returned for the seam. One text,
-                // so the file in the state directory is the configuration the
-                // driver was actually booted with.
-                let boot = write_vulkan_startup_toml(&toml_path, opts, snapshot_dir, config)?;
-                let backend = ::engine::driver::backend::open::vulkan(boot.as_bytes())?;
-                // No requantization and no MoE choice to make: this driver binds
-                // what the checkpoint holds, and `--quant` here would be a
-                // setting nothing reads. "auto" is what the load request calls
-                // "the checkpoint's own", which is the only thing on offer.
-                (backend, "", "auto")
-            }
-            // No state directory and no file: this driver has no second reader
-            // for one. See `wgpu_startup_toml`.
-            #[cfg(feature = "driver-wgpu")]
-            DriverOptions::Wgpu(opts) => {
-                let boot = wgpu_startup_toml(opts);
-                let backend = ::engine::driver::backend::open::wgpu(boot.as_bytes())?;
-                // As the Vulkan arm, and for the same reason: the encoding is
-                // the checkpoint's own and there is no re-encode path here.
-                (backend, "", "auto")
-            }
+            } // THE METAL, VULKAN AND WGPU ARMS STOOD HERE, and with them the
+              // one difference between the seams: `open::cuda` and
+              // `open::metal` open the file they are named, while
+              // `open::vulkan` and `open::wgpu` parsed the bytes they were
+              // given. All three drivers left the workspace at R3 and return
+              // at P5.
         };
     // Uniform across backends now that the load is a request rather than a
     // compiled plan (§10.3). Unreachable in a build with no `driver-*`
     // feature, where the match above diverges on an empty enum.
     #[cfg_attr(
-        not(any(
-            feature = "_driver-cuda",
-            feature = "driver-metal",
-            feature = "driver-vulkan",
-            feature = "driver-wgpu"
-        )),
+        not(feature = "_driver-cuda"),
         allow(
             unreachable_code,
             reason = "`DriverOptions` has no variants in this build"
@@ -1450,144 +1243,6 @@ calibrate_planner = true
         assert!(!val["runtime"]["verbose"].as_bool().unwrap());
     }
 
-    /// The wgpu shell's boot document is one key, and it is the operator's.
-    ///
-    /// # What this is guarding
-    ///
-    /// The seam reads `[model] kv_pages` and nothing else -- so if this string
-    /// ever stopped carrying it, the driver would open its pool at
-    /// `DEFAULT_KV_PAGES` and never say that the number in the config was
-    /// dropped. It is the same class of silence
-    /// `metal_startup_toml_carries_expert_streaming` below was written for: a
-    /// setting nobody wired up fails by working, at somebody else's value.
-    ///
-    /// The counting is the rest of it: a document with a key the seam does
-    /// not read is a key an operator can spell and nothing obeys, which is
-    /// what `WgpuDriverOptions` exists to keep out of the table.
-    /// `a_parsing_seam_is_handed_the_text_that_was_written` is the separate
-    /// claim that the seam is given this text at all.
-    #[test]
-    fn the_wgpu_boot_document_carries_the_page_count_and_nothing_else() {
-        let boot = wgpu_startup_toml(&crate::config::WgpuDriverOptions { kv_pages: 64 });
-        let val: toml::Value = toml::from_str(&boot).expect("the driver parses these bytes");
-        assert_eq!(
-            val["model"]["kv_pages"].as_integer(),
-            Some(64),
-            "the operator's page count did not survive into the boot document"
-        );
-        let model = val["model"].as_table().expect("a [model] table");
-        assert_eq!(
-            model.len(),
-            1,
-            "the document grew a key the seam does not read: {model:?}"
-        );
-        assert_eq!(
-            val.as_table().expect("a document").len(),
-            1,
-            "this driver reads one section; the rest would be written for nobody"
-        );
-    }
-
-    /// Expert streaming is one decision, so it is one setting, and it has to
-    /// reach both drivers by the same name.
-    ///
-    /// It did not. `[model].stream_routed_experts` was emitted for cuda only,
-    /// and metal read `PIE_METAL_STREAM_EXPERTS` from the environment -- so
-    /// setting the documented option on a Metal backend did nothing, and said
-    /// nothing about doing nothing. The failure mode of a switch nobody wired
-    /// up is silence, which is why it needs a test rather than a reading.
-    #[test]
-    fn metal_startup_toml_carries_expert_streaming() {
-        let tmp = tempfile::tempdir().unwrap();
-        let snap = tmp.path().join("snap");
-
-        let off = MetalDriverOptions {
-            device: "metal:0".to_string(),
-            ..Default::default()
-        };
-        let out_off = tmp.path().join("off.toml");
-        write_metal_startup_toml(&out_off, &off, &snap, 0, CONFIG).unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
-        assert_eq!(val["model"]["backend"].as_str().unwrap(), "metal:0");
-        assert!(
-            !val["model"]["stream_routed_experts"].as_bool().unwrap(),
-            "streaming is off unless asked for: it trades resident memory for \
-             page faults, which only pays when the weights do not fit"
-        );
-
-        let on = MetalDriverOptions {
-            device: "metal:0".to_string(),
-            stream_routed_experts: true,
-            ..Default::default()
-        };
-        let out_on = tmp.path().join("on.toml");
-        write_metal_startup_toml(&out_on, &on, &snap, 0, CONFIG).unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
-        assert!(
-            val["model"]["stream_routed_experts"].as_bool().unwrap(),
-            "the operator asked for streaming and the driver never heard about it"
-        );
-    }
-
-    /// The bounded form of the same trade has to reach the driver too, and it
-    /// is the one whose absence is hardest to notice: `expert_slab_bytes` is
-    /// the only setting under which a checkpoint larger than the machine can
-    /// be admitted, the C++ has read it since the slab landed, and no operator
-    /// could say it -- it was reachable only from a test binary's environment.
-    /// A model that does not fit then refuses to load with a message about
-    /// arithmetic rather than about the switch that would have helped.
-    ///
-    /// Omitted and not zeroed when unset, because the driver already reads an
-    /// absent key as "keep the whole bank resident".
-    #[test]
-    fn metal_startup_toml_carries_expert_slab_budget() {
-        let tmp = tempfile::tempdir().unwrap();
-        let snap = tmp.path().join("snap");
-
-        let off = MetalDriverOptions {
-            device: "metal:0".to_string(),
-            ..Default::default()
-        };
-        let out_off = tmp.path().join("off.toml");
-        write_metal_startup_toml(&out_off, &off, &snap, 0, CONFIG).unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
-        assert!(
-            val["model"].get("expert_slab_bytes").is_none(),
-            "an unset budget is an absent key, not a zero: the driver's own \
-             default is already the derivation"
-        );
-
-        let on = MetalDriverOptions {
-            device: "metal:0".to_string(),
-            expert_slab_bytes: Some(2048 * 1024 * 1024),
-            ..Default::default()
-        };
-        let out_on = tmp.path().join("on.toml");
-        write_metal_startup_toml(&out_on, &on, &snap, 0, CONFIG).unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
-        assert_eq!(
-            val["model"]["expert_slab_bytes"].as_integer().unwrap(),
-            2048 * 1024 * 1024,
-            "the operator capped the expert bank and the driver never heard about it"
-        );
-    }
-
-    /// The option is spelled the same in the config an operator writes, not
-    /// just in the file we generate. A metal `[model.driver.options]` block
-    /// carrying it must parse -- `deny_unknown_fields` means a name that only
-    /// cuda knows is a hard error, which is the good failure but not this one.
-    #[test]
-    fn metal_driver_options_accept_expert_streaming_by_the_cuda_name() {
-        let parsed: MetalDriverOptions = toml::from_str("stream_routed_experts = true").unwrap();
-        assert!(parsed.stream_routed_experts);
-
-        let cuda: CudaNativeDriverOptions = toml::from_str("stream_routed_experts = true").unwrap();
-        assert_eq!(
-            parsed.stream_routed_experts, cuda.stream_routed_experts,
-            "the two backends must answer to one name"
-        );
-    }
-
     #[test]
     fn cuda_startup_toml_emits_runtime_verbose_when_set() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1684,8 +1339,8 @@ calibrate_planner = true
     /// it is the resolver's job, done once — so this is about the *contract*,
     /// not about where the bytes came from.
     ///
-    /// All three drivers take the same arrangement, so all three are pinned
-    /// here.
+    /// The Metal and Vulkan writers were pinned here beside it, taking the
+    /// same argument; both left with the drivers that read them.
     #[test]
     fn the_startup_toml_always_carries_the_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -1693,134 +1348,16 @@ calibrate_planner = true
         std::fs::create_dir(&snapshot).unwrap();
         let body = br#"{"version":"pie.model/1","hidden_size":64}"#;
 
+        let out = dir.path().join("cuda").join("driver.toml");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
         let cuda = CudaNativeDriverOptions::default();
-        let metal = MetalDriverOptions::default();
-        let vulkan = VulkanDriverOptions::default();
+        write_cuda_startup_toml(&out, &cuda, &snapshot, 0, None, body).unwrap();
 
-        let carried = |name: &str, write: &dyn Fn(&Path)| -> Option<Vec<u8>> {
-            let out = dir.path().join(name).join("driver.toml");
-            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
-            write(&out);
-            let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-            doc["model"]
-                .get("config")
-                .and_then(|v| v.as_str())
-                .map(|path| std::fs::read(path).unwrap())
-        };
-
-        assert_eq!(
-            carried("cuda", &|out| {
-                write_cuda_startup_toml(out, &cuda, &snapshot, 0, None, body).unwrap()
-            })
-            .as_deref(),
-            Some(body.as_slice())
-        );
-        assert_eq!(
-            carried("metal", &|out| {
-                write_metal_startup_toml(out, &metal, &snapshot, 0, body).unwrap()
-            })
-            .as_deref(),
-            Some(body.as_slice())
-        );
-        assert_eq!(
-            carried("vulkan", &|out| {
-                // Semicolon: this writer hands its text back, and the closure
-                // is here to write the file.
-                write_vulkan_startup_toml(out, &vulkan, &snapshot, body).unwrap();
-            })
-            .as_deref(),
-            Some(body.as_slice())
-        );
-    }
-
-    /// The Vulkan boot file says the thing the Vulkan seam reads, and says it
-    /// where it looks.
-    ///
-    /// This is the whole point of the writer, and it is the kind of thing
-    /// that is silently wrong: `crates/engine/src/driver/backend/vulkan.rs`
-    /// reads `[model] kv_pages`, so a file that put it under `[batching]` --
-    /// where the Metal writer puts its page geometry, which is the obvious
-    /// thing to copy -- would boot with the driver's own defaults and no
-    /// complaint. An operator who set the pool size would get 1024 pages and
-    /// no sign that the number was ignored.
-    ///
-    /// `kernels` is the other half, and it is asserted ABSENT. It named a
-    /// directory of compiled SPIR-V until the modules moved into the rlib;
-    /// writing it now would hand the seam a path to a `target/` tree that
-    /// nothing reads, which is the failure this file is least able to notice.
-    #[test]
-    fn the_vulkan_startup_toml_states_the_keys_the_seam_reads() {
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot = dir.path().join("snap");
-        std::fs::create_dir(&snapshot).unwrap();
-
-        let asked = VulkanDriverOptions {
-            kv_pages: 4096,
-            ..Default::default()
-        };
-        let out = dir.path().join("asked.toml");
-        write_vulkan_startup_toml(&out, &asked, &snapshot, CONFIG).unwrap();
         let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        assert_eq!(doc["model"]["kv_pages"].as_integer().unwrap(), 4096);
-        assert!(
-            doc["model"].get("kernels").is_none(),
-            "the modules are in the rlib; a `kernels` key would name a \
-             directory nothing reads"
-        );
-    }
-
-    /// The two seams that PARSE their config are handed a document, and it is
-    /// the same document the operator can read on disk.
-    ///
-    /// # What this is guarding
-    ///
-    /// The four seams do not agree about what `config_bytes` is, and they
-    /// cannot: `cuda_create` and `metal_create` open the path they are named,
-    /// because those drivers read a file; `vulkan_create` and `wgpu_create`
-    /// parse the bytes, because `boot_of` and its wgpu counterpart run
-    /// `str::parse::<toml::Table>` on them. `create_driver_backend` therefore
-    /// hands two of them a path and two of them a text.
-    ///
-    /// Handing a parsing seam the path instead is not an error. A path is a
-    /// document that does not parse, both readers take a parse failure as "no
-    /// boot config", and every key falls back — `kv_pages` to the seam's own
-    /// 1024. The server boots at a pool size nobody asked for, with the
-    /// operator's file sitting in the state directory saying otherwise. That is what happened, and it is why
-    /// the Vulkan writer returns its text rather than only writing it.
-    ///
-    /// The last assertion is the one that explains the whole shape: a path is
-    /// not a parseable document, so the mistake cannot announce itself.
-    #[test]
-    fn a_parsing_seam_is_handed_the_text_that_was_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot = dir.path().join("snap");
-        std::fs::create_dir(&snapshot).unwrap();
-
-        let asked = VulkanDriverOptions {
-            kv_pages: 4096,
-            ..Default::default()
-        };
-        let out = dir.path().join("driver.toml");
-        let handed = write_vulkan_startup_toml(&out, &asked, &snapshot, CONFIG).unwrap();
-        assert_eq!(
-            handed,
-            std::fs::read_to_string(&out).unwrap(),
-            "the seam is handed one text and the operator reads another"
-        );
-        let doc: toml::Value = toml::from_str(&handed).expect("the seam parses what it is given");
-        assert_eq!(doc["model"]["kv_pages"].as_integer(), Some(4096));
-
-        // The wgpu shell has no file to compare against -- see
-        // `wgpu_startup_toml` -- so the claim is only the parse.
-        let handed = wgpu_startup_toml(&crate::config::WgpuDriverOptions { kv_pages: 4096 });
-        let doc: toml::Value = toml::from_str(&handed).expect("the seam parses what it is given");
-        assert_eq!(doc["model"]["kv_pages"].as_integer(), Some(4096));
-
-        assert!(
-            toml::from_str::<toml::Value>(&out.to_string_lossy()).is_err(),
-            "a path parses as a TOML document, so handing one over in place of \
-             the text would be caught somewhere. It is not: this is why the \
-             writer returns what it wrote."
-        );
+        let carried = doc["model"]
+            .get("config")
+            .and_then(|v| v.as_str())
+            .map(|path| std::fs::read(path).unwrap());
+        assert_eq!(carried.as_deref(), Some(body.as_slice()));
     }
 }

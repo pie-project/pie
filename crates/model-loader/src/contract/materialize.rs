@@ -1,6 +1,6 @@
 //! What materializing a checkpoint as pie's own format means.
 //!
-//! `pie model convert` rewrites any checkpoint as a `.zt` artifact, and this
+//! `pie model import` rewrites any checkpoint as a `.zt` artifact, and this
 //! module derives the split that rewrite works from: which tensors are
 //! *rewritten* — narrowed to the BF16 every device kernel reads — and which
 //! pass through byte for byte, keeping the encoding they arrived in.
@@ -126,8 +126,10 @@ pub fn materialize_contract(metadata: &CheckpointMetadata) -> Result<Materializa
             // The cost is a host decode at every boot taken FROM THE ARCHIVE
             // rather than from a built runtime. Measured cold, that boot is
             // not slower (0.22-0.23 s against 0.22-0.27 s): the decode is
-            // cheaper than the I/O it avoids. `pie model build` is how the
-            // price is paid once regardless, which is what layer 3 is for.
+            // cheaper than the I/O it avoids. An offline `pie model build`
+            // WAS how the price is paid once regardless -- that command is
+            // deleted, so today every boot from a packed archive pays this
+            // decode, and the measurement above is why that is affordable.
             //
             // Swept both ways before flipping -- Llama-3.2-1B at IQ4_XS, Q2_K,
             // UD-IQ2_XXS and UD-Q2_K_XL, qwen2.5-0.5b Q4_K_M, the two-shard

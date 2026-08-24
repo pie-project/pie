@@ -49,7 +49,7 @@
 //! A program whose geometry evolves in-graph -- which is the entire subject of
 //! this file -- is exactly that class. Without the bit the engine classifies
 //! it as a host-evaluated decode, and a host cannot know what token the
-//! epilogue is about to sample. `engine/src/driver/backend/vulkan.rs` and
+//! epilogue is about to sample. engine's vulkan seam (deleted at R3; back at P5) and
 //! `.../wgpu.rs` each carry a long note about paying for this twice and then
 //! building the machinery; `.../cuda.rs` has neither the note nor the bit.
 //!

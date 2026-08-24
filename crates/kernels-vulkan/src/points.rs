@@ -238,12 +238,11 @@ impl<V: ShaderValue, T> kernels::routine::BindMut<V> for Handle<T> {
 
 /// What this plane is to a `points` declaration.
 ///
-/// The two pool associated types are the raises this plane's routines
-/// already take — `In<Struct<KvCache>>` and `In<Struct<RecurrentState>>`,
-/// declared in [`crate::views`] — so a `Cache` slot lands on the exact view
-/// the encoder already builds. Nothing new is invented here; what the views
-/// are MISSING for a claim body to use them is stated on [`Staged`] and in
-/// each family's own doc.
+/// The two pool associated types are the raises [`crate::views`] declares —
+/// `Struct<KvCache>` and `Struct<RecurrentState>` — so a `Cache` slot lands
+/// on the exact view the encoder already builds. Nothing new is invented
+/// here; what the views are MISSING for a claim body to use them is stated
+/// on [`Staged`] and in each family's own doc.
 impl kernels::points::Plane for Ctx<'_> {
     type Tensor<T: Scalar> = Handle<T>;
 
@@ -392,11 +391,10 @@ pub trait Staged {
     /// `"request_of_token"`, `"qo_indptr"`, `"row_valid"`
     /// (`kernels::runtime::TIER1`).
     ///
-    /// SEAM. A `#[routine]` takes one as an ordinary `In<Tensor<i32>>` and
-    /// the LOWERING splices it into the statement's input column, so
-    /// `bind::one` answers it as `Source::Slot(Kind::In, n)`. A point
-    /// declares no such column — `attention.decode` states `q`, the pool
-    /// row and three scalars — so a claim body has to ask by NAME, and
+    /// SEAM. The LOWERED path splices one into the statement's input
+    /// column, so `bind::one` answers it as `Source::Slot(Kind::In, n)`. A
+    /// point declares no such column — `attention.decode` states `q`, the
+    /// pool row and three scalars — so a claim body has to ask by NAME, and
     /// `Encode` has no method that takes one.
     ///
     /// What P5 needs: `Encode::stream(&self, name: &'static str)`, answered

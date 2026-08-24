@@ -89,6 +89,32 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
+/// ways, with `..d` saying that everything else is replicated.
+///
+/// The head counts and the expert intermediate. `head_dim` is one head's own
+/// width and does not divide; `experts` is the fan the router scores across
+/// and every rank scores the whole of it, because the routed leg is cut
+/// INSIDE each expert (`expert_gate_up_bank` packed on its `2 * inter` axis,
+/// `expert_down_bank` on its `inter` one) and not across the bank.
+///
+/// A SEAM THIS CUT DOES NOT CLOSE, and it is a numeric one rather than a
+/// width: `o_bias` and `expert_down_bias` are added by the row-parallel
+/// statement that precedes `dist.all_reduce`, so a `world`-way deployment
+/// sums them `world` times. Every other family in this catalog lands its
+/// attention and its feed-forward without a bias and is unaffected. Fixing
+/// it is a statement change (a bias that lands after the reduce, or a rank
+/// that owns it), which is the driver-side rank story and not this column.
+fn per_rank<const TP: usize>(d: Dims) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+    Dims {
+        q_heads: cut("q_heads", d.q_heads),
+        kv_heads: cut("kv_heads", d.kv_heads),
+        inter: cut("inter", d.inter),
+        ..d
+    }
+}
+
 impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
     pub fn b20() -> Self {
         assemble(Dims {
@@ -120,6 +146,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
 }
 
 fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, W2, K, TP> {
+    let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
     let hd = d.head_dim as u64;
     let q_w = d.q_heads as u64 * hd;
@@ -171,10 +198,10 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
                 swiglu_alpha: d.swiglu_alpha,
                 router: Tensor::sym(n("router"), [experts, hidden]),
                 router_bias: Tensor::sym(n("router_bias"), [experts]),
-                gate_up: Tensor::sym(n("expert_gate_up_bank"), [experts, 2 * inter, hidden]).experts(),
-                gate_up_bias: Tensor::sym(n("expert_gate_up_bias"), [experts, 2 * inter]).experts(),
-                down: Tensor::sym(n("expert_down_bank"), [experts, hidden, inter]).experts(),
-                down_bias: Tensor::sym(n("expert_down_bias"), [experts, hidden]).experts(),
+                gate_up: Tensor::sym(n("expert_gate_up_bank"), [experts, 2 * inter, hidden]).bank([inter, inter]),
+                gate_up_bias: Tensor::sym(n("expert_gate_up_bias"), [experts, 2 * inter]).bank([inter, inter]),
+                down: Tensor::sym(n("expert_down_bank"), [experts, hidden, inter]).rows(),
+                down_bias: Tensor::sym(n("expert_down_bias"), [experts, hidden]),
             },
         }
     }).collect();

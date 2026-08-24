@@ -111,6 +111,35 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
+/// ways, with `..d` saying that everything else is replicated.
+///
+/// The attention heads and the three intermediates. THE LATENT DOES NOT
+/// DIVIDE, and that is what makes MLA cheap under a rank cut: `kv_a_proj`
+/// writes the `[1, kv_lora_rank + qk_rope_head_dim]` row this text caches
+/// and every rank writes and holds the whole of it, so `kv_lora_rank`,
+/// `qk_rope_head_dim` and the `q_lora_rank` beside them stay put while
+/// `q_b_proj` and `kv_b_proj` cut the head fan they expand it into.
+///
+/// The sparse indexer does not divide either: every one of its banks is
+/// replicated, so each rank scores the same keys and reaches the same
+/// `index.topk` selection — which is the only way a selection two ranks
+/// attend through can be the same selection without a statement to make it
+/// so.
+fn per_rank<const TP: usize>(d: Dims) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+    Dims {
+        heads: cut("heads", d.heads),
+        dense_inter: cut("dense inter", d.dense_inter),
+        moe: MoeDims {
+            inter: cut("moe inter", d.moe.inter),
+            shared_inter: cut("shared inter", d.moe.shared_inter),
+            ..d.moe
+        },
+        ..d
+    }
+}
+
 impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
     pub fn a12b() -> Self {
         assemble(Dims {
@@ -130,6 +159,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
 }
 
 fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, W2, K, TP> {
+    let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
     let q_lora = d.q_lora_rank as u64;
     let kv_lora = d.kv_lora_rank as u64;
@@ -185,8 +215,8 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
             let sw = m.shared_inter as u64;
             Mlp::Routed {
                 router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
-                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * iw, hidden]).experts(),
-                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, iw]).experts(),
+                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * iw, hidden]).bank([iw, iw]),
+                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, iw]).rows(),
                 shared: (m.shared_inter > 0).then(|| Shared {
                     gate_up: Tensor::sym(n("shared_gate_up"), [2 * sw, hidden]).packed([sw, sw]),
                     down: Tensor::sym(n("shared_down"), [hidden, sw]).rows(),

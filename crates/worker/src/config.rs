@@ -150,7 +150,9 @@ pub struct OffloadConfig {
     #[serde(default = "default_offload_max_outstanding")]
     pub max_outstanding_per_partner: u32,
     /// How KV pages cross between workers: `inline` in the message,
-    /// `nixl` via RDMA, or `auto` to use NIXL where it is available.
+    /// `nixl` via RDMA, or `auto` to use NIXL where it is available. No
+    /// shipped build hosts NIXL, so `nixl` refuses the boot and `auto` is
+    /// `inline` -- see [`OffloadTransfer`].
     #[serde(default)]
     pub transfer: OffloadTransfer,
 }
@@ -180,6 +182,19 @@ fn default_offload_max_outstanding() -> u32 {
     4
 }
 
+/// How KV pages cross between workers.
+///
+/// `Nixl` IS SPELLABLE AND NO SHIPPED BUILD HOSTS IT. The RDMA path lives
+/// behind `worker`'s `nixl` feature, which `pie` — the only member with a
+/// binary — deliberately does not forward (`scripts/ci-gate-audit.py` names
+/// the exclusion and the reason: `transport`'s NIXL engine is a stub). So in
+/// every build a user can run, `offload.transfer = "nixl"` parses and then
+/// fails the boot at `link::partner::PartnerLinkManager::new` with
+/// *"offload.transfer=nixl requires feature \"nixl\""*. That refusal is the
+/// current truth about this variant, not a missing feature line.
+///
+/// `Auto` takes NIXL where it is available, which today is nowhere, and so
+/// costs nothing.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OffloadTransfer {
@@ -959,8 +974,9 @@ fn default_frame_dispatch_depth() -> u32 {
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
 pub struct DriverConfig {
-    /// Driver discriminator. Embedded drivers (`cuda_native`, `metal`,
-    /// `wgpu`) run in-process.
+    /// Which driver hosts this model. `cuda_native` is the one this build
+    /// runs; `metal`, `vulkan` and `wgpu` are accepted spellings that boot
+    /// refuses by name until their drivers return.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -1000,57 +1016,14 @@ impl DriverConfig {
                 opts.validate()?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
-            DriverKind::Metal => {
-                let opts: MetalDriverOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [model.driver.options] for driver type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
-            }
-            DriverKind::Vulkan => {
-                let opts: VulkanDriverOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [model.driver.options] for driver type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                opts.validate()?;
-            }
-            DriverKind::Wgpu => {
-                let opts: WgpuDriverOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid [model.driver.options] for driver type {:?}: {e}",
-                        self.kind,
-                    )
-                })?;
-                opts.validate()?;
-            }
+            // NOTHING TO CHECK, because there is no schema left to check
+            // against: the three option tables went with the drivers that
+            // read them. The kind itself is still refused, by name and
+            // once, at `driver_ffi::Flavor::from_kind`.
+            DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => {}
         }
         Ok(())
     }
-}
-
-/// The KV page count two option tables state and no driver can serve at zero.
-///
-/// A free function beside [`validate_kv_cache_dtype`], and for the same reason
-/// that one is: the invariant belongs to the setting rather than to either
-/// driver, and stating it twice is how the two spellings drift into saying
-/// different things about the same key.
-fn validate_kv_pages(pages: u32) -> Result<()> {
-    ensure!(
-        pages > 0,
-        "[model.driver.options] kv_pages must be at least 1; a cache of no \
-         pages cannot seat a conversation"
-    );
-    Ok(())
 }
 
 fn validate_kv_cache_dtype(value: &str) -> Result<()> {
@@ -1074,29 +1047,27 @@ fn validate_kv_cache_dtype(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which driver a `[model.driver] type` names.
+///
+/// THE LAST THREE ARE NAMED, NOT OFFERED, and no build flag changes that.
+/// Their drivers left the workspace at R3, so there is no `--features
+/// driver-metal|driver-vulkan|driver-wgpu` to rebuild with — the crates such
+/// a feature would name are not members. The names stay so that a deployment
+/// asking for one is told what happened, by `driver_ffi::retired_msg`, rather
+/// than being told its config is malformed. They come back at P5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     /// Native CUDA driver — embedded as a static lib in `worker`
     /// (requires `--features driver-cuda-13`).
     CudaNative,
-    /// Native MLX + Metal driver for Apple Silicon — embedded as a static
-    /// lib in `worker` (requires `--features driver-metal`, macOS only).
+    /// Native MLX + Metal driver for Apple Silicon.
     Metal,
-    /// Pure-Rust Vulkan driver — embedded in `worker` (requires
-    /// `--features driver-vulkan`). Portable rather than vendor-specific:
-    /// it runs on whatever Vulkan 1.3 device the machine exposes.
+    /// Pure-Rust Vulkan driver: portable rather than vendor-specific, on
+    /// whatever Vulkan 1.3 device the machine exposes.
     Vulkan,
-    /// The WebGPU shell — embedded in `worker` (requires
-    /// `--features driver-wgpu`).
-    ///
-    /// Portable in a second sense than [`Self::Vulkan`] is: that one runs on
-    /// any Vulkan 1.3 device, this one runs over Vulkan, Metal, D3D12 or
-    /// WebGPU, whichever the machine has, from one binary. It needs no SDK,
-    /// no loader and no shader directory to build — `wgpu` and `naga` are
-    /// pure Rust and `kernels-wgpu` ships the WGSL inside the rlib. What it
-    /// still needs at run time is an adapter, which is why the feature is
-    /// opt-in like the other three.
+    /// The WebGPU shell — one binary over Vulkan, Metal, D3D12 or WebGPU,
+    /// whichever the machine has.
     Wgpu,
 }
 
@@ -1155,216 +1126,6 @@ where
 // -----------------------------------------------------------------------------
 // Driver-specific options (typed views over `DriverConfig::options`)
 // -----------------------------------------------------------------------------
-
-/// `[model.driver.options]` for `type = "metal"` (Apple Silicon MLX/Metal
-/// driver) — page geometry, forward limits, and timeouts; the metal driver
-/// speaks the embedded in-process ABI. `device` is the `metal:N` selector
-/// filled from `model.driver.device`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MetalDriverOptions {
-    /// `[model] id`: the operator's answer to "which model is this".
-    ///
-    /// Absent — the ordinary case — the driver identifies the checkpoint
-    /// from its TENSORS against the catalog every driver links. Present,
-    /// it names a row directly, for a checkpoint that is genuinely a
-    /// known model under an unknown name: a fine-tune, a re-upload, a
-    /// mirror that renamed the directory.
-    ///
-    /// It is an OVERRIDE and not a bypass. The named row's manifest is
-    /// still matched, so this cannot be used to load a checkpoint as
-    /// something it is not — which is the failure the whole arrangement
-    /// exists to prevent.
-    pub model_id: Option<String>,
-    /// KV page size in tokens. Used as given -- unlike the CUDA driver, the
-    /// Metal driver has no planner to derive one.
-    pub kv_page_size: u32,
-    /// KV pages to allocate. Used directly, and 1024 is a real default.
-    ///
-    /// The CUDA driver's nearest equivalent is `max_total_pages`, which is a
-    /// different quantity with a name that now says so: a ceiling over a
-    /// derived number, usually absent.
-    pub total_pages: u32,
-    /// Tokens one forward pass may carry, across all requests in the batch.
-    pub max_forward_tokens: u32,
-    /// Requests one forward pass may carry. Also what `max_concurrent_processes`
-    /// derives from when the operator leaves it unset.
-    pub max_forward_requests: u32,
-    /// Host-memory KV pages to swap into. `0` disables swapping.
-    pub cpu_pages: u32,
-    /// Tokens the KV ring holds across the whole resident fleet. Absent -- the
-    /// default -- keeps the driver's own constant, which is what a `pie serve`
-    /// fleet wants and what every run got before this existed.
-    ///
-    /// The one knob that shrinks the KV, and it only shrinks: the driver
-    /// clamps to its own ceiling, so this cannot ask for a ring it will not
-    /// build. `total_pages` is NOT that knob and never was -- the simple
-    /// families derive their pool from this context and discard it.
-    pub max_model_len: Option<u32>,
-    /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
-    /// a narrower one buys pages at some accuracy.
-    pub kv_cache_dtype: String,
-    /// Page routed MoE experts in from a mapping of the checkpoint instead of
-    /// keeping every expert resident in the heap.
-    ///
-    /// The same knob, spelled the same way, as the CUDA driver's -- because it
-    /// is the same decision: a residency trade the operator makes about a
-    /// model. What the two backends *do* with it differs (CUDA copies through
-    /// a bounded slab, Metal binds over a file-backed mapping and lets the
-    /// kernel evict), which is a backend's business and not the operator's.
-    ///
-    /// Off by default: it trades resident memory for page faults, which only
-    /// pays when the weights do not comfortably fit.
-    pub stream_routed_experts: bool,
-    /// How many bytes the routed experts may occupy on the device, or `None`
-    /// to keep the whole bank resident.
-    ///
-    /// A stronger statement than `stream_routed_experts` and a different
-    /// mechanism, not a dial on the same one. Streaming binds the bank over a
-    /// mapping, and on Apple Silicon every mapped page is WIRED -- so it moves
-    /// bytes out of the heap but bounds nothing. A budget turns the mapping
-    /// off and pages experts through a slab of exactly this size, which is the
-    /// only setting under which a checkpoint larger than the machine can be
-    /// admitted at all. It costs a submit-and-wait per mixture layer, so it is
-    /// for when the alternative is not running.
-    ///
-    /// `None` and not 0 for "unset", the way the CUDA driver spells
-    /// `expert_cache`: the C++ side already reads an absent key as "keep the
-    /// bank resident", so a sentinel would be a second spelling of one thing.
-    ///
-    /// The C++ has read `[model].expert_slab_bytes` since the slab landed;
-    /// what was missing was any way for an operator to say it, which made the
-    /// one feature that admits an oversized model reachable only from a test
-    /// binary's environment variable.
-    pub expert_slab_bytes: Option<u64>,
-    /// Metal device string, e.g. `"metal:0"`. Populated from
-    /// `model.driver.device` rather than written here.
-    #[serde(skip)]
-    pub device: String,
-    /// Driver-side verbose logging. Populated from `server.verbose` rather
-    /// than written here.
-    #[serde(skip)]
-    pub verbose: bool,
-    /// How long to wait for the driver's caps handshake before giving up.
-    /// Generous because it covers loading the weights.
-    pub ready_timeout: Duration,
-    /// How long to wait for the driver to drain before abandoning it.
-    pub shutdown_timeout: Duration,
-}
-
-impl Default for MetalDriverOptions {
-    fn default() -> Self {
-        Self {
-            model_id: None,
-            kv_page_size: 32,
-            total_pages: 1024,
-            max_forward_tokens: 10240,
-            max_forward_requests: 512,
-            cpu_pages: 0,
-            max_model_len: None,
-            kv_cache_dtype: "auto".to_string(),
-            stream_routed_experts: false,
-            expert_slab_bytes: None,
-            device: "metal:0".to_string(),
-            verbose: false,
-            ready_timeout: Duration::from_secs(120),
-            shutdown_timeout: Duration::from_secs(5),
-        }
-    }
-}
-
-/// `[model.driver.options]` for `type = "vulkan"` (the pure-Rust Vulkan
-/// driver) — where the compiled shaders are, and how much KV to hold.
-///
-/// Short, and deliberately so. Every other driver's options table grew from
-/// what its C++ reads; this one states exactly the two keys the Vulkan seam
-/// looks up in the boot TOML (`[model] kv_pages`) plus
-/// the two timeouts the worker itself honours. A knob here that the driver
-/// does not read would be a setting an operator can spell and nothing obeys.
-///
-/// There is no `device` selector and no `model_id`: `Device::open` takes the
-/// first Vulkan device the loader reports, and the checkpoint is identified
-/// from its TENSORS with no override. Both are stated here so that an
-/// operator reading this file learns it rather than discovering it.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct VulkanDriverOptions {
-    /// KV pages to allocate. Pages, not tokens: the page size is the text's.
-    pub kv_pages: u32,
-    /// How long to wait for the driver's caps handshake before giving up.
-    pub ready_timeout: Duration,
-    /// How long to wait for the driver to drain before abandoning it.
-    pub shutdown_timeout: Duration,
-}
-
-impl Default for VulkanDriverOptions {
-    fn default() -> Self {
-        Self {
-            kv_pages: 1024,
-            ready_timeout: Duration::from_secs(120),
-            shutdown_timeout: Duration::from_secs(5),
-        }
-    }
-}
-
-impl VulkanDriverOptions {
-    fn validate(&self) -> Result<()> {
-        validate_kv_pages(self.kv_pages)?;
-        Ok(())
-    }
-}
-
-/// `[model.driver.options]` for `type = "wgpu"` (the WebGPU shell).
-///
-/// One key, where the Vulkan table above states three, and the difference is a
-/// description of the backend. There is no `kernels` directory because there
-/// is nothing to ship beside the binary — `kernels-wgpu` embeds the WGSL in
-/// its rlib and `naga` compiles it in this process — so `[model] kv_pages` is
-/// the whole of what `crates/engine/src/driver/backend/wgpu.rs`'s `create`
-/// reads.
-///
-/// What the siblings offer and this does not, each for its own reason:
-///
-/// * no `device`: `wgpu` picks its own adapter, as `Device::open` picks
-///   Vulkan's, and `[model.driver] device` is still required and still
-///   validated — so there is nowhere for a second selector to disagree;
-/// * no `kv_page_size`: it is 16, fixed by the tiled GEMM's `bm` and stated
-///   by `driver_wgpu::facts::PAGE_SIZE`. A settable one would be a number the
-///   engine believes and the kernels ignore;
-/// * no `kv_cache_dtype`: the cache is bf16 and `Deployment::bytes` is the
-///   only place that could change it. Offering the string would be offering a
-///   choice with one legal value;
-/// * no `model_id`: this seam identifies a checkpoint from its TENSORS
-///   (`catalog::Override::None`), so an id here would be read by nothing;
-/// * no `stream_routed_experts` or `expert_slab_bytes`: there is no expert
-///   paging path in this driver at all;
-/// * no `ready_timeout` or `shutdown_timeout`: those two bound a wait on a
-///   driver the worker starts and then watches. `wgpu_create` is a library
-///   call on this thread, which has either returned or not.
-///
-/// A key is added here when the seam reads it, and not before.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct WgpuDriverOptions {
-    /// KV pages to allocate at boot.
-    ///
-    /// Used as given. The pool is resizable — the driver serves `resize_pool`
-    /// — so this is where it starts rather than where it stays, and 1024
-    /// pages of 16 tokens is a real default for a desktop card.
-    pub kv_pages: u32,
-}
-
-impl Default for WgpuDriverOptions {
-    fn default() -> Self {
-        Self { kv_pages: 1024 }
-    }
-}
-
-impl WgpuDriverOptions {
-    fn validate(&self) -> Result<()> {
-        validate_kv_pages(self.kv_pages)
-    }
-}
 
 /// `[model.driver.options]` for `type = "cuda_native"`.
 /// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
@@ -1813,34 +1574,13 @@ device = ["cpu"]
         );
     }
 
-    /// The wgpu driver's option table is exactly one key, and an unknown one
-    /// is refused rather than dropped.
-    ///
-    /// `deny_unknown_fields` is the whole of `DriverConfig::validate`'s wgpu
-    /// arm, and it is what stops a config that sets `total_pages` -- Metal's
-    /// name for very nearly this quantity -- from booting a pool of 1024 while
-    /// the operator believes they asked for 64.
-    #[test]
-    fn the_wgpu_options_refuse_a_key_this_driver_does_not_read() {
-        let with = |options: &str| {
-            let toml = format!(
-                "[model]\nname = \"default\"\nhf_repo = \"Qwen/Qwen3-0.6B\"\n\n\
-                 [model.driver]\ntype = \"wgpu\"\ndevice = [\"cpu\"]\n\n\
-                 [model.driver.options]\n{options}\n"
-            );
-            toml::from_str::<Config>(&toml)
-                .expect("the options table is untyped until validate reads it")
-                .validate()
-        };
-        with("kv_pages = 64").expect("the one key this driver reads");
-        let err = with("total_pages = 64")
-            .expect_err("a key this driver does not read is a key nobody honours")
-            .to_string();
-        assert!(
-            err.contains("total_pages"),
-            "the refusal names the key: {err}"
-        );
-    }
+    // `the_wgpu_options_refuse_a_key_this_driver_does_not_read` STOOD HERE,
+    // and `rejects_legacy_metal_kv_page_knob` and
+    // `rejects_options_for_wrong_embedded_driver_type` below it. All three
+    // asserted `deny_unknown_fields` on an option table that no longer
+    // exists: only `cuda_native` names a struct now, and
+    // `rejects_unknown_cuda_option` makes the same claim about the one that
+    // does.
 
     /// `model` is the name now, `hf_repo` still parses.
     ///
@@ -2048,25 +1788,6 @@ device = ["cpu"]
         cfg.validate().unwrap();
     }
 
-    #[test]
-    fn rejects_legacy_metal_kv_page_knob() {
-        let stale = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "metal"
-device = ["cpu"]
-
-[model.driver.options]
-max_num_kv_pages = 1024
-"#;
-        let cfg: Config = toml::from_str(stale).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("max_num_kv_pages"), "got: {err}");
-    }
-
     // `rejects_public_driver_capacity_knobs` was here, and it went with
     // the driver it was about. It asserted that `max_forward_tokens`,
     // `max_forward_requests` and `max_model_len` are the DRIVER's to
@@ -2161,16 +1882,18 @@ total_pages = 512
 
     #[test]
     fn rejects_legacy_binary_path() {
-        // Both driver option structs carried it "for compatibility with the
+        // Every driver option struct carried it "for compatibility with the
         // Python wrapper", and nothing anywhere read it -- the drivers are
-        // linked in, so there has never been an executable to point at.
+        // linked in, so there has never been an executable to point at. An
+        // unknown `[driver]` key is reshaped into the options table, so what
+        // refuses it is the kind's own `deny_unknown_fields`.
         let legacy = r#"
 [model]
 name = "a"
 hf_repo = "x"
 [driver]
-type = "metal"
-device = ["metal:0"]
+type = "cuda_native"
+device = ["cuda:0"]
 binary_path = "/opt/pie/driver"
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
@@ -2435,25 +2158,5 @@ mxfp4_moe = "mystery"
         let cfg: Config = toml::from_str(cuda).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("mxfp4_moe"), "got: {err}");
-    }
-
-    #[test]
-    fn rejects_options_for_wrong_embedded_driver_type() {
-        let stale = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "metal"
-device = ["cpu"]
-
-[model.driver.options]
-gpu_mem_utilization = 0.50
-"#;
-        let cfg: Config = toml::from_str(stale).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("gpu_mem_utilization"), "got: {err}");
-        assert!(err.contains("Metal"), "got: {err}");
     }
 }

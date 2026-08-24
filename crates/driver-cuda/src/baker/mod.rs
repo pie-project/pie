@@ -25,14 +25,18 @@
 //! manifest's — 1.40 GiB twice for qwen35-d0.8b — because both loads ran.
 //! Only [`load`] runs now.
 //!
-//! # What is still the OTHER catalogue's
+//! # ONE CATALOGUE (R3)
 //!
-//! The pools. `model::deployment` sizes and strides the KV pages and the
-//! recurrent slabs, gates the KV style and the GQA ratio at the door, and
-//! publishes the caps — so this lane's program is fired against pools laid
-//! out by the legacy catalog's account of the same checkpoint.
-//! [`Geometry::agrees_with`] is the check that stands between those two
-//! accounts, and R3 is where the second one dies.
+//! The pools used to be the OTHER catalogue's: `model_legacy::deployment`
+//! sized and strided the KV pages and the recurrent slabs, gated the KV
+//! style and the GQA ratio at the door and published the caps, while this
+//! lane fired a program traced out of the new one. `Geometry::agrees_with`
+//! was the check that stood between two accounts of one checkpoint.
+//!
+//! There is one account now. `model::deployment::Deployment::of` reads the
+//! pool geometry off the same [`Plan`] the program is built from, so the
+//! check has nothing left to compare and is deleted with the crate that
+//! made it necessary.
 
 use std::collections::BTreeMap;
 
@@ -42,14 +46,12 @@ use model_ir::trace::FireClass;
 
 use crate::device::{Allocator, DeviceBuffer, OwnedStream};
 
+pub(crate) mod bound;
 pub(crate) mod fire;
-pub(crate) mod geometry;
 pub(crate) mod marks;
-pub(crate) mod points_shim;
 pub(crate) mod resolve;
 pub(crate) mod staging;
 
-pub(crate) use geometry::Geometry;
 
 /// The checkpoint flavor this driver's reader can produce from.
 ///
@@ -83,12 +85,20 @@ const BANK_ALIGN: usize = 256;
 pub(crate) struct Bank {
     pub ptr: *mut std::ffi::c_void,
     pub shape: Vec<u64>,
-    pub dtype: model_baker::produce::Dtype,
+    pub dtype: model::produce::Dtype,
+    /// The plan's own `repr` column for this parameter, which the storage
+    /// dtype above cannot stand in for and does not try to.
+    ///
+    /// A QUANTISED BANK'S FORM LIVES ONLY HERE. `mxfp4` codes and `e8m0`
+    /// block exponents are both `U8` on disk, so `dtype` tells the two planes
+    /// of one bank apart in neither direction; what says which is which is
+    /// the name the model text declared them under and the repr it declared
+    /// them at. `BoundOp::form` reads this and nothing else.
+    pub repr: String,
 }
 
 // SAFETY: a device address is a number, never dereferenced on the host; its
-// CUDA context outlives the shell that holds it. `weights::stage`'s
-// `WeightSpan` carries the same pair of impls for the same reason.
+// CUDA context outlives the shell that holds it.
 unsafe impl Send for Bank {}
 unsafe impl Sync for Bank {}
 
@@ -112,14 +122,12 @@ pub(crate) struct Baked {
     pub lanes: Vec<Result<Program, Refusal>>,
     /// Every param the plan named, on the device.
     ///
-    /// THE SEAM, HALF CLOSED: these are `model::produce`'s bytes and not the
+    /// THE SEAM IS CLOSED: these are `model::produce`'s bytes and not the
     /// legacy manifest's, and they used to be a SECOND residency of the same
-    /// checkpoint because both loads ran. Only this one runs now.
-    ///
-    /// What is left of the seam is that `LoadedModel::weights` still exists
-    /// beside this map — `weights::stage` still stages the manifest's arena,
-    /// because `serve::encode`'s towers and the `Encode` verb read weights by
-    /// the legacy names. A fire reads only this map.
+    /// checkpoint because both loads ran. `LoadedModel::weights` and the
+    /// `weights::stage` that filled it are both gone — R3 deleted the load
+    /// contract and `serve::encode`'s towers with it — so this map is the
+    /// one weight residency the driver has.
     pub banks: BTreeMap<String, Bank>,
     /// The arena the banks are spans of, held to keep them alive.
     ///
@@ -129,21 +137,19 @@ pub(crate) struct Baked {
     /// lane is about to fire against. It is the field's existence that is
     /// load-bearing, not its value.
     _owned: Vec<DeviceBuffer>,
-    /// The numbers the claim-only routines want and the statements do not
-    /// carry, all read off the plan.
-    pub geom: Geometry,
     /// The value the plan's `out` seam names.
     pub out: model_ir::plan::ValueId,
 }
 
 impl Baked {
-    /// The lane that serves `class`, and the fact word that picked it.
+    /// The lane that serves a fire of `class` carrying (or not) a user mask,
+    /// and the fact word that picked it.
     ///
     /// A REFUSAL AND NOT A PANIC when no lane serves: the smoke could
     /// `panic!` on an unknown fact because the next line was its own exit,
     /// and a driver's next line is somebody else's request.
-    pub fn lane(&self, class: FireClass) -> Result<(u64, &Program), String> {
-        let word = word_of(&self.plan, class)?;
+    pub fn lane(&self, class: FireClass, masked: bool) -> Result<(u64, &Program), String> {
+        let word = word_of(&self.plan, class, masked)?;
         let mut refused = Vec::new();
         for lane in &self.lanes {
             match lane {
@@ -222,7 +228,7 @@ impl Baked {
                     })
             };
             match op.kernel.as_str() {
-                "attention.decode" | "attention.decode_lse" | "attention.masked" => {
+                "attention.decode" | "attention.decode_lse" => {
                     let want = (param(1)?, param(0)? == 0);
                     match ask.decode {
                         Some(held) if held != want => {
@@ -235,7 +241,16 @@ impl Baked {
                         _ => ask.decode = Some(want),
                     }
                 }
-                "attention.prefill" | "attention.prefill_lse" => {
+                // `attention.masked` READS A PREFILL SCHEDULE, and it stood in
+                // the decode arm above until the point became a claim body.
+                // The routine it resolved through is
+                // `dispatch_attention_flashinfer_prefill_custom`, which takes
+                // `In<Struct<Fa2Prefill>>` and refuses an unplanned cache
+                // (`prefill_plan_usable`); asking for a decode schedule left
+                // its lane's prefill workspace unstamped and the point could
+                // only ever have refused. Nothing caught it because no
+                // executor answered the point at all.
+                "attention.prefill" | "attention.prefill_lse" | "attention.masked" => {
                     let want = param(1)?;
                     match ask.prefill {
                         Some(held) if held != want => {
@@ -262,12 +277,24 @@ impl Baked {
 /// token — is exactly what `fire_class_of` already decided when it compared
 /// `rows` to `requests` (`fire/launch.rs:57-68`), so the driver does not
 /// re-derive it from the CSR: the two would be free to disagree, and the
-/// one that picks the lane must be the one that named the class.
+/// one that picks the lane must be the one that named the class. `masked` is
+/// the frame's `has_user_mask`, which the caller states and nothing derives.
 ///
 /// A fact this does not know is a REFUSAL and not a zero. A zero would be a
 /// guess that silently picks a lane, and the lane is the whole program.
-fn word_of(plan: &Plan, class: FireClass) -> Result<u64, String> {
+///
+/// # And a fact the FIRE holds that the TEXT does not name
+///
+/// That is the other half, and only `masked` needs it. A text that does not
+/// branch on `qo_one` serves both cases with the same statements, which is
+/// right — the fact is an optimisation the text declined. A text that does
+/// not branch on `masked` has ONE attention arm and it is causal, so a masked
+/// frame would have its mask staged and then attended over as if it were not
+/// there: the right-looking wrong answer. So the mask is refused HERE, where
+/// the lane is picked, and the refusal names the text rather than the flag.
+fn word_of(plan: &Plan, class: FireClass, masked: bool) -> Result<u64, String> {
     let mut word = 0u64;
+    let mut says_masked = false;
     for (bit, fact) in plan.facts.iter().enumerate() {
         if bit >= 64 {
             return Err(format!(
@@ -278,6 +305,10 @@ fn word_of(plan: &Plan, class: FireClass) -> Result<u64, String> {
         }
         let holds = match fact.as_str() {
             "qo_one" => class == FireClass::Decode,
+            "masked" => {
+                says_masked = true;
+                masked
+            }
             other => {
                 return Err(format!(
                     "`{other}` is a fact this driver cannot answer for a \
@@ -291,50 +322,55 @@ fn word_of(plan: &Plan, class: FireClass) -> Result<u64, String> {
             word |= 1 << bit;
         }
     }
+    if masked && !says_masked {
+        return Err(format!(
+            "this frame carries a user attention mask and `{}` states no \
+             `masked` fact, so every lane it has attends causally: the mask \
+             would be staged and IGNORED, and the request answered as though \
+             it had asked nothing",
+            plan.name
+        ));
+    }
     Ok(word)
 }
 
-/// The new-catalog SKU for a checkpoint the legacy catalog identified.
+/// Which catalog SKU this snapshot IS.
 ///
-/// # Why this table exists
+/// # The bridge that STOOD HERE
 ///
-/// The two catalogues do not share an id space, and neither is wrong.
-/// `model_legacy::catalog::identify` reads the checkpoint's own tensors and
-/// answers what model it IS (`"qwen3.5-0.8b-base"`); the new catalog files
-/// a row under a SKU that also states how the numbers are stored
-/// (`"qwen35-d0.8b-bf16-kv-bf16"`), because a trace's dtypes are part of
-/// what it traces. Nothing in the tree maps between them — I looked.
+/// `BRIDGE` was a one-row table mapping the legacy catalog's spelling
+/// (`"qwen3.5-0.8b-base"`, what `model_legacy::catalog::identify` read off
+/// the checkpoint's tensors) to this catalog's (`"qwen35-d0.8b-bf16-kv-bf16"`),
+/// because the two catalogues did not share an id space and neither was
+/// wrong. R3 deleted the legacy catalog, so there is one id space and
+/// nothing to bridge: the checkpoint is matched against the IMPORT tables —
+/// the same tensor list `produce` is about to read — and the answer is the
+/// SKU itself.
 ///
-/// So the bridge is written down, here, with one row per checkpoint whose
-/// baker lane has actually been fired. It is deliberately NOT a fuzzy match
-/// on the family name: `"qwen3.5-4b"` and `"qwen35-d3b-bf16-kv-bf16"` are
-/// close enough to pair by accident and are different models.
+/// The stated SKU still outranks the match, and for the reason it always
+/// did: a deployment that names one through `[baker] sku` / `PIE_BAKER_SKU`
+/// is telling the driver something the tensors cannot say, and a table that
+/// silently won would make the knob untestable. It is also how a new row is
+/// proven before its checkpoint is one this reader can tell apart.
 ///
-/// A deployment can name a SKU the table does not hold, through
-/// `[baker] sku` / `PIE_BAKER_SKU` — which is also how a new row is proven
-/// before it is added here.
+/// # Errors
 ///
-/// **This table dies when the id spaces merge**, which is the real fix and
-/// is not this work's.
-const BRIDGE: &[(&str, &str)] = &[
-    // Proven end to end: `baker-smoke --sku qwen35-d0.8b-bf16-kv-bf16`
-    // fires 381 steps against this checkpoint's real weights.
-    ("qwen3.5-0.8b-base", "qwen35-d0.8b-bf16-kv-bf16"),
-];
-
-/// Which new-catalog row to trace for `legacy_id`, if any.
-///
-/// The knob outranks the table: a deployment that states a SKU is telling
-/// the driver something the table cannot know, and a table row that
-/// silently won would make the knob untestable.
-pub(crate) fn sku_for(legacy_id: &str, stated: Option<&str>) -> Option<String> {
+/// A stated SKU that is not a catalog row, or a snapshot no row matches (or
+/// that two match) — every one carrying [`model::Unmatched`]'s own account
+/// of what it found.
+pub(crate) fn identify(
+    snapshot: &model::snapshot::Snapshot,
+    stated: Option<&str>,
+) -> Result<&'static str, String> {
     if let Some(sku) = stated {
-        return Some(sku.to_owned());
+        return model::serve::row(sku).map(|row| row.id).ok_or_else(|| {
+            format!(
+                "`{sku}` is not a row of `model::catalog()`; did you mean {}?",
+                model::serve::nearest_ids(sku, 3).join(", "),
+            )
+        });
     }
-    BRIDGE
-        .iter()
-        .find(|(id, _)| *id == legacy_id)
-        .map(|(_, sku)| (*sku).to_owned())
+    model::identify(&|name| snapshot.shape_of(name)).map_err(|why| why.to_string())
 }
 
 /// Trace, bind, produce, upload and resolve — the whole baker load.
@@ -351,7 +387,7 @@ pub(crate) fn load(
     alloc: &Allocator,
 ) -> Result<Baked, String> {
     // ── 1. The plan, and every lane it binds to. ────────────────────────
-    let trace = model_baker::trace_of(sku)
+    let trace = model::trace_of(sku)
         .ok_or_else(|| format!("`{sku}` is not a row of `model::catalog()`"))?;
     // `model_dsl::Plane` IS `model_ir::kernels::Backend` (a re-export at
     // `model-dsl/src/lib.rs:20`), so this names the plane without the
@@ -366,51 +402,30 @@ pub(crate) fn load(
         .and_then(|s| s.values.first().copied())
         .ok_or_else(|| format!("`{sku}` states no `out` seam"))?;
 
-    // The geometry every claim-only routine needs, read off the plan and
-    // never off a config file. It needs a bound lane to read a slot width
-    // out of, so it is derived from the decode lane specifically — the one
-    // this work fires.
-    let (_, decode) = {
-        let word = word_of(&plan, FireClass::Decode)?;
-        let mut found = None;
-        for lane in &lanes {
-            if let Ok(p) = lane {
-                if p.words.contains(&word) {
-                    found = Some((word, p));
-                    break;
-                }
-            }
-        }
-        found.ok_or_else(|| {
-            format!("`{sku}` binds no decode lane; the baker path has nothing to fire")
-        })?
-    };
-    let geom = Geometry::of(&plan, decode)?;
-
     // ── 2. The weights, through `produce` and not the manifest. ─────────
-    let base = model_baker::bases_for(sku)
+    let base = model::bases_for(sku)
         .into_iter()
         .find(|b| b.starts_with(READABLE_BASE))
         .ok_or_else(|| {
             format!(
                 "`{sku}` names no `{READABLE_BASE}*` import; this driver's \
                  reader is safetensors and the SKU offers {:?}",
-                model_baker::bases_for(sku)
+                model::bases_for(sku)
             )
         })?;
-    let import = model_baker::import_of(sku, base)
+    let import = model::import_of(sku, base)
         .ok_or_else(|| format!("`{sku}` names no `{base}` import"))?;
     // `Snapshot::at` AND NOT `Snapshot::open`: `open` resolves a cache-dir
     // NAME under `$HOME/.cache/huggingface/hub`, and the driver is handed
     // the snapshot directory itself (`ModelLoadDesc::snapshot_dir`). Going
     // through `open` would mean reconstructing a cache name from a path
     // that need not be in a cache at all.
-    let snap = model_baker::snapshot::Snapshot::at(snapshot.to_path_buf())
+    let snap = model::snapshot::Snapshot::at(snapshot.to_path_buf())
         .ok_or_else(|| format!("no safetensors snapshot at {}", snapshot.display()))?;
-    let produced = model_baker::produce::produce(&import, &|n| snap.read(n))
+    let produced = model::produce::produce(&import, &|n| snap.read(n))
         .map_err(|e| format!("production refused: {e}"))?;
 
-    let (banks, owned) = upload(&produced, alloc)?;
+    let (banks, owned) = upload(&produced, &plan, alloc)?;
     drop(produced);
 
     // The join `baker_load` proves, restated here as a precondition: a
@@ -440,7 +455,6 @@ pub(crate) fn load(
         lanes,
         banks,
         _owned: owned,
-        geom,
         out,
     })
 }
@@ -448,19 +462,20 @@ pub(crate) fn load(
 /// Every produced tensor into one arena, one span each.
 ///
 /// ONE ARENA AND NOT 260 ALLOCATIONS, which is the driver's idiom and not
-/// the smoke's: `weights::stage::stage_plan_weights` allocates the whole
-/// arena before a byte is read and names every tensor a span inside it,
-/// and this mirrors it exactly (`weights/stage.rs:57-125`). The smoke took
-/// a `cudaMalloc` per tensor because it had no allocator to reuse; the
-/// driver has one, and 260 separate allocations would be 260 chances for
-/// the allocator's live-bytes accounting to disagree with the device's.
+/// the smoke's: the whole arena is allocated before a byte is read and every
+/// tensor is a span inside it — the shape `weights::stage::stage_plan_weights`
+/// held before R3 deleted it. The smoke took a `cudaMalloc` per tensor because
+/// it had no allocator to reuse; the driver has one, and 260 separate
+/// allocations would be 260 chances for the allocator's live-bytes accounting
+/// to disagree with the device's.
 ///
 /// THE UPLOAD HAS NO DECISION IN IT, which is what `baker_load` says and
 /// what makes this loop short: every produced tensor is dense, row-major
 /// and canonical, so one contiguous H2D per bank and no restride, no
 /// repack, no cast.
 fn upload(
-    produced: &[(String, model_baker::produce::HostTensor)],
+    produced: &[(String, model::produce::HostTensor)],
+    plan: &Plan,
     alloc: &Allocator,
 ) -> Result<(BTreeMap<String, Bank>, Vec<DeviceBuffer>), String> {
     let mut at = 0usize;
@@ -499,6 +514,15 @@ fn upload(
                 ptr,
                 shape: t.shape.clone(),
                 dtype: t.dtype,
+                // The demand side's own column, carried across by name. A
+                // produced row the plan binds no param for keeps an empty
+                // repr, which is a refusal at a bank slot and no statement
+                // can name it anyway.
+                repr: plan
+                    .params
+                    .iter()
+                    .find(|p| p.name == *name)
+                    .map_or_else(String::new, |p| p.repr.clone()),
             },
         );
     }
@@ -513,53 +537,53 @@ fn upload(
 mod tests {
     use super::*;
 
-    /// The knob outranks the table, and the table answers the row it holds.
+    /// A stated SKU outranks the tensors, and a stated non-row is refused
+    /// by name rather than traced into a panic.
     #[test]
-    fn the_stated_sku_outranks_the_bridge_table() {
+    fn a_stated_sku_must_be_a_catalog_row() {
+        let empty = model::snapshot::Snapshot::at(std::path::PathBuf::from("/nonexistent"));
+        assert!(empty.is_none(), "there is no snapshot at /nonexistent");
+
+        // The stated arm never reads the snapshot, which is what lets this
+        // be a host test: it is a catalog lookup and nothing else.
         assert_eq!(
-            sku_for("qwen3.5-0.8b-base", None).as_deref(),
+            model::serve::row("qwen35-d0.8b-bf16-kv-bf16").map(|r| r.id),
             Some("qwen35-d0.8b-bf16-kv-bf16"),
         );
+        assert!(model::serve::row("qwen3.5-0.8b-base").is_none(), "the legacy spelling is not an id any more");
         assert_eq!(
-            sku_for("qwen3.5-0.8b-base", Some("something-else")).as_deref(),
-            Some("something-else"),
-            "a deployment that states a SKU is not overruled by the table",
-        );
-        assert_eq!(
-            sku_for("a-checkpoint-nobody-has-bridged", None),
-            None,
-            "an unbridged id answers nothing rather than guessing",
+            model::serve::nearest_ids("qwen35-d0.8b-bf16-kv-bf1", 1),
+            vec!["qwen35-d0.8b-bf16-kv-bf16"],
+            "a typo is answered with the row it is a typo OF",
         );
     }
 
-    /// Every SKU the table names is a row of the catalog it bridges TO.
+    /// Every SKU this driver can serve can be built from a checkpoint this
+    /// driver can read.
     ///
-    /// The failure this prevents is a table row that rots: the new catalog
-    /// renames a SKU, the bridge keeps the old spelling, and the only
-    /// symptom is that `PIE_BAKER=1` quietly stops building a lane.
+    /// The failure this prevents is a row that traces, binds and fires and
+    /// then cannot be loaded at all, because its only import is a flavor
+    /// `model::snapshot` does not open.
     #[test]
-    fn every_bridged_sku_is_a_catalog_row() {
-        let catalog = model_baker::catalog();
-        for (legacy, sku) in BRIDGE {
-            assert!(
-                catalog.iter().any(|(n, _)| n == sku),
-                "the bridge maps `{legacy}` to `{sku}`, which `model::catalog()` \
-                 does not ship",
-            );
+    fn every_servable_sku_has_a_readable_import() {
+        let mut unreadable = Vec::new();
+        for row in model::serve::ROWS {
+            let bases = model::bases_for(row.id);
+            if bases.is_empty() {
+                // A tensor-parallel row is the same bytes cut at load and
+                // names no import of its own; that is the table's rule, not
+                // a gap.
+                continue;
+            }
+            if !bases.iter().any(|b| b.starts_with(READABLE_BASE)) {
+                unreadable.push((row.id, bases));
+            }
         }
-    }
-
-    /// A bridged SKU can be built from a checkpoint this driver can read.
-    #[test]
-    fn every_bridged_sku_has_a_readable_import() {
-        for (_, sku) in BRIDGE {
-            let bases = model_baker::bases_for(sku);
-            assert!(
-                bases.iter().any(|b| b.starts_with(READABLE_BASE)),
-                "`{sku}` offers {bases:?}, none of which this driver's \
-                 safetensors reader can produce from",
-            );
-        }
+        assert!(
+            unreadable.is_empty(),
+            "these SKUs offer no `{READABLE_BASE}*` import, so this driver's \
+             reader cannot produce them: {unreadable:?}",
+        );
     }
 
     /// The decode word is the one the smoke fired, and the class picks it.
@@ -575,13 +599,38 @@ mod tests {
             ops: Vec::new(),
             seams: Vec::new(),
         };
-        assert_eq!(word_of(&plan, FireClass::Decode), Ok(0b1));
-        assert_eq!(word_of(&plan, FireClass::Prefill), Ok(0b0));
+        assert_eq!(word_of(&plan, FireClass::Decode, false), Ok(0b1));
+        assert_eq!(word_of(&plan, FireClass::Prefill, false), Ok(0b0));
+
+        // A text with one fact has ONE attention arm and it is causal, so a
+        // masked frame reaching it would be answered as if it had asked
+        // nothing. The refusal names the text.
+        let why = word_of(&plan, FireClass::Decode, true).expect_err("refused");
+        assert!(why.contains("`masked` fact"), "{why}");
 
         plan.facts.push("a_fact_nobody_declared".into());
         assert!(
-            word_of(&plan, FireClass::Decode).is_err(),
+            word_of(&plan, FireClass::Decode, false).is_err(),
             "an unknown fact refuses rather than reading as a clear bit",
         );
+    }
+
+    /// A text that DOES branch on the mask gets the lane it asked for, and
+    /// the same text unmasked gets the other one.
+    #[test]
+    fn a_text_that_states_masked_selects_on_it() {
+        let plan = Plan {
+            name: "a-masked-row".into(),
+            plane: model_ir::kernels::Backend::Cuda,
+            facts: vec!["qo_one".into(), "masked".into()],
+            params: Vec::new(),
+            caches: Vec::new(),
+            values: Vec::new(),
+            ops: Vec::new(),
+            seams: Vec::new(),
+        };
+        assert_eq!(word_of(&plan, FireClass::Decode, false), Ok(0b01));
+        assert_eq!(word_of(&plan, FireClass::Decode, true), Ok(0b11));
+        assert_eq!(word_of(&plan, FireClass::Prefill, true), Ok(0b10));
     }
 }

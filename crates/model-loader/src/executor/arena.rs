@@ -45,7 +45,7 @@ pub trait ArenaBacking {
         Ok(())
     }
 
-    /// Whether this backing launches the kernels the plan names. `false` -- the default -- is the whole of "host mode", keeping `pie model convert` working on a machine with no GPU. One bit, read ONCE before the first instruction: the plan already names a kernel row per instruction, so this only states whether a device was handed over at all.
+    /// Whether this backing launches the kernels the plan names. `false` -- the default -- is the whole of "host mode", keeping `pie model import` working on a machine with no GPU. One bit, read ONCE before the first instruction: the plan already names a kernel row per instruction, so this only states whether a device was handed over at all.
     fn runs_named_kernels(&self) -> bool {
         false
     }

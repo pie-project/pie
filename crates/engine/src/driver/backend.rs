@@ -110,12 +110,7 @@ pub mod open {
     // Every function below is gated on a driver feature, so with none
     // selected -- which is how the workspace clippy gate builds this crate --
     // the import has no user and `-D warnings` refuses the crate.
-    #[cfg(any(
-        feature = "_driver-cuda",
-        feature = "driver-metal",
-        feature = "driver-vulkan",
-        feature = "driver-wgpu"
-    ))]
+    #[cfg(feature = "_driver-cuda")]
     use super::{DriverBackend, Result};
 
     /// Open a CUDA device.
@@ -138,116 +133,30 @@ pub mod open {
         let (driver, ranks) = super::cuda::CudaDriver::create_group(config_blobs)?;
         Ok((Box::new(driver), ranks))
     }
-
-    /// Open the default Metal 4 device.
-    ///
-    /// # Errors
-    ///
-    /// No Metal 4 device, or a device whose queue could not be created.
-    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-    pub fn metal(config_bytes: &[u8]) -> Result<DriverBackend> {
-        Ok(Box::new(super::metal::MetalDriver::create(config_bytes)?))
-    }
-
-    /// Open a Vulkan device.
-    ///
-    /// # Errors
-    ///
-    /// No Vulkan device, or no readable SPIR-V module directory.
-    #[cfg(feature = "driver-vulkan")]
-    pub fn vulkan(config_bytes: &[u8]) -> Result<DriverBackend> {
-        Ok(Box::new(super::vulkan::VulkanDriver::create(config_bytes)?))
-    }
-
-    /// Open a WebGPU adapter.
-    ///
-    /// Needs no SDK, no loader and no vendor runtime -- only an adapter --
-    /// which is the whole argument for this backend. There is no module
-    /// directory to find, because `kernels-wgpu` ships its shaders in the
-    /// rlib.
-    ///
-    /// # Errors
-    ///
-    /// No adapter, or an adapter whose storage-buffer limit cannot bind this
-    /// build's attention kernels.
-    #[cfg(feature = "driver-wgpu")]
-    pub fn wgpu(config_bytes: &[u8]) -> Result<DriverBackend> {
-        Ok(Box::new(super::wgpu::WgpuDriver::create(config_bytes)?))
-    }
 }
 
-/// Settle a control op that has already finished by the time it returns.
-///
-/// A host-side driver -- one whose memory is coherent, so `copy_kv` is a
-/// `memmove` and `resize_pool` is an allocation -- has done the work before
-/// the verb returns. The asynchronous seams hand the whole `CompletionTarget`
-/// to whoever finishes: CUDA to its shell, `remote` to its RPC task. There is
-/// nobody here to hand it to, so this seam must do both halves itself.
-///
-/// BOTH, and in this order. `control_completion` mints a completion carrying
-/// a TERMINAL CELL, and the engine resolves the op by reading it, so a notify
-/// without a publish trips the engine's own check on the way out ("driver
-/// callback published before terminal outcome settled"). A publish without a
-/// notify is the failure this function exists for: a fork hung a real
-/// `pie run` for 850 seconds, and the scheduler's watchdog named it
-/// `in_flight_control: KV copy pipeline Some(..) settled=false`.
-///
-/// Free rather than a method because nothing in it needs a device, which is
-/// what lets a test check the order of two writes without building an
-/// adapter.
-///
-/// Three seams share it. The Metal one is the last to take it and had the
-/// defect in all three of its control verbs -- `copy_kv`, `copy_state` and
-/// `resize_pool` each minted a completion and dropped the target -- which is
-/// the same shape the Vulkan seam's own doc records having fixed.
-#[cfg(any(
-    feature = "driver-vulkan",
-    feature = "driver-wgpu",
-    all(feature = "driver-metal", target_vendor = "apple")
-))]
-pub(crate) fn settle_control(
-    broker: &driver_api::CompletionBroker,
-) -> driver_api::SubmissionCompletion {
-    let (raw, completion) = broker.control_completion(1);
-    if !raw.terminal_cell.is_null() {
-        // SAFETY: the broker owns this cell for the life of the completion it
-        // was minted with, and `publish` is a release store into an
-        // `AtomicU32` the engine only ever reads.
-        unsafe {
-            (*raw.terminal_cell).publish(driver_api::PIE_TERMINAL_OUTCOME_SUCCESS);
-        }
-    }
-    broker.notify(completion.wait_id(), raw.target_epoch);
-    completion
-}
+// `settle_control` STOOD HERE — the helper a HOST-SIDE seam (one whose memory
+// is coherent, so `copy_kv` is a `memmove`) used to publish a terminal cell
+// and notify the broker itself, because it has nobody to hand the target to.
+// Its three callers were the metal, vulkan and wgpu seams, and R3 took all
+// three out of the workspace with the legacy declarations two of them read.
+// `cuda` and `remote` never used it and must not: they are asynchronous, so
+// each hands the whole target to whatever finishes the work.
+//
+// The 850-second hang it exists to prevent is worth carrying forward with it:
+// a seam that minted a `control_completion` and dropped the target parked a
+// real `pie run`, with the scheduler's watchdog naming it exactly —
+// `in_flight_control: KV copy pipeline Some(..) settled=false`. Publishing
+// without notifying trips the engine's own check on the way out. Whoever
+// brings a host-side seam back at P5 owes both halves, in that order.
 
 #[cfg(feature = "_driver-cuda")]
 mod cuda;
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-mod metal;
-// NOT target-gated, unlike the Metal seam above it. Vulkan is a loader rather
-// than a platform: the same crate builds and runs on Linux, Windows and
-// Android, so the feature is the whole gate.
 mod remote;
-#[cfg(feature = "driver-vulkan")]
-mod vulkan;
-// Not target-gated either, and for a wider reason than Vulkan's. Vulkan is a
-// loader; this is a loader with no C in it. `driver-wgpu`'s whole closure is
-// pure Rust -- no SDK, no ICD, no `-sys` crate -- so the feature can be turned
-// on wherever this crate builds at all, which is not something the other three
-// seams can say.
-#[cfg(feature = "driver-wgpu")]
-mod wgpu;
 
 #[cfg(feature = "_driver-cuda")]
 pub use cuda::CudaDriver;
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-pub use metal::MetalDriver;
 pub use remote::{RemoteDisconnectHandle, RemoteDriver};
-#[cfg(feature = "driver-vulkan")]
-pub use vulkan::VulkanDriver;
-#[cfg(feature = "driver-wgpu")]
-pub use wgpu::WgpuDriver;
 
 struct DriverRegistration {
     spec: DriverSpec,
@@ -312,319 +221,8 @@ pub fn unregister_driver(driver_id: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
-    use super::settle_control;
-
-    /// A control op that has already happened settles its completion here.
-    ///
-    /// Lives beside [`super::settle_control`] rather than in a seam, because
-    /// both host-side seams call it and either feature alone should run it.
-    ///
-    /// # The two ways to get this wrong, both measured
-    ///
-    /// A `control_completion` carries a TERMINAL CELL and the engine resolves
-    /// the op by reading it -- unlike `launch_completion`, which carries none
-    /// because a frame answers per member. The asynchronous backends hand the
-    /// whole target to whatever finishes the work; a host-side driver has
-    /// nobody to hand it to, so it publishes and notifies itself.
-    ///
-    /// * Neither: a fork hung a real `pie run` for 850 s, with the scheduler's
-    ///   watchdog naming it exactly -- `in_flight_control: KV copy ...
-    ///   settled=false`.
-    /// * Notify without publishing: the engine catches the ordering on the way
-    ///   out -- `driver callback published before terminal outcome settled` --
-    ///   which is how the order became legible at all.
-    ///
-    /// So the test asserts the STATE, not the call: after `settled_control`
-    /// the completion answers `is_settled`, and its cell holds SUCCESS rather
-    /// than `Pending`. Either omission fails it.
-    /// Every HOST-SIDE seam settles its control ops through the helper.
-    ///
-    /// The test above proves the helper is right. This one proves the seams
-    /// use it, which is a different claim and the one that regressed: the
-    /// 850-second hang was a seam that minted a completion and dropped the
-    /// target, and nothing about the helper being correct would have caught
-    /// that.
-    ///
-    /// # Why only three of the five
-    ///
-    /// `cuda` and `remote` call `control_completion` directly and must: they
-    /// are asynchronous, so they hand the whole target to whatever finishes
-    /// the work -- CUDA to the shell, `remote` to its RPC task -- and each
-    /// publishes and notifies there. A host-side seam has nobody to hand it
-    /// to, because the work is already done when the call returns.
-    ///
-    /// # Why it reads the source
-    ///
-    /// Because `metal.rs` is `#[cfg(target_vendor = "apple")]` and this test
-    /// runs on Linux. Compiling the Mac seam is a Mac's job; reading it is
-    /// anyone's, and a seam nobody on this platform can build is exactly the
-    /// one whose regression nobody on this platform would see.
-    ///
-    /// The wgpu seam's own doc used to say both siblings got this wrong. They
-    /// did, and they no longer do -- which is how a sentence about another
-    /// crate rots. This asks the question instead of asserting the answer.
-    #[test]
-    fn every_host_side_seam_settles_its_control_ops_through_the_helper() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver/backend");
-        let mut wrong = Vec::new();
-        let mut checked = 0;
-        for seam in ["metal.rs", "vulkan.rs", "wgpu.rs"] {
-            let path = dir.join(seam);
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                wrong.push(format!("{seam} is not where this test looks for it"));
-                continue;
-            };
-            checked += 1;
-            let code: Vec<&str> = text
-                .lines()
-                .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
-                .collect();
-            if code.iter().any(|l| l.contains("control_completion(")) {
-                wrong.push(format!(
-                    "{seam} mints a control completion itself. A host-side seam \
-                     has nobody to hand the target to, so dropping it parks \
-                     the scheduler on an op nobody will settle -- call \
-                     `settle_control` instead"
-                ));
-            }
-            if !code.iter().any(|l| l.contains("settle_control(")) {
-                wrong.push(format!(
-                    "{seam} never calls `settle_control`, so either it settles \
-                     control ops some other way or it does not settle them"
-                ));
-            }
-        }
-        assert_eq!(checked, 3, "a seam went missing and this read {checked}");
-        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    }
-
-    #[test]
-    #[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
-    fn a_control_op_that_already_happened_publishes_then_notifies() {
-        let broker = ::driver_api::CompletionBroker::new();
-        let completion = settle_control(&broker);
-        assert!(
-            completion.is_settled(),
-            "an op whose work is already done must hand back a settled \
-             completion; an unsettled one parks the scheduler forever"
-        );
-        assert!(
-            completion.check().is_some_and(|r| r.is_ok()),
-            "and it settled as a success, not as a failure"
-        );
-        let cell = completion
-            .terminal_cell_ptr()
-            .expect("a control completion carries a terminal cell");
-        // SAFETY: the broker owns the cell for the life of the completion,
-        // which this frame holds.
-        let outcome = unsafe { (*cell).load() };
-        assert_eq!(
-            outcome,
-            ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
-            "the cell the engine reads must say the op ran; `Pending` is what \
-             an untouched cell holds and it is a failure, not a silence"
-        );
-    }
-
-    /// Every verb of the wgpu seam is reachable through `dyn Driver`, with no
-    /// adapter, and each one either serves or refuses in words.
-    ///
-    /// # What this is guarding
-    ///
-    /// An `impl` that compiles proves a method EXISTS. It does not prove the
-    /// method does anything: `todo!()`, `unimplemented!()` and a silent
-    /// `Ok(())` all type-check, and the last of those is the one that matters
-    /// here -- a verb that answered success without doing the work would take
-    /// a KV copy the scheduler then believes happened. So every verb is
-    /// called, through the trait object, and its answer is read.
-    ///
-    /// It matters more than it did: four of these verbs are DEFAULT methods
-    /// now, so this is also the test that a driver which overrides none of
-    /// them still refuses by name rather than silently succeeding.
-    ///
-    /// No adapter is opened, which is what makes this a CI test rather than a
-    /// GPU one: ten of the fourteen verbs are host code. `encode` and
-    /// `copy_state` refuse by name; `launch`, `copy_kv` and `resize_pool`
-    /// refuse because there is no shell yet, which is the same refusal a real
-    /// driver gives between `create` and `load_model`; the registry five are
-    /// served.
-    #[cfg(feature = "driver-wgpu")]
-    #[test]
-    fn the_wgpu_variant_answers_every_verb_without_a_device() {
-        use ::driver_api::FrameLaunchOutcome;
-
-        // The trait object, not the concrete driver: what is under test is
-        // that every verb is reachable THROUGH the contract.
-        let mut backend: super::DriverBackend =
-            Box::new(super::wgpu::WgpuDriver::without_adapter());
-
-        assert_eq!(backend.kind(), "wgpu", "the seam's name in the handshake");
-        assert_eq!(
-            backend.device_domain(),
-            ::driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE
-        );
-        assert!(
-            backend.export_kv_handle().is_none(),
-            "there is no cross-process sharing path in WebGPU to export"
-        );
-        // In-process: this is a no-op that must not panic.
-        backend.disconnect("a message nobody is listening to");
-
-        // THE REGISTRY FIVE, which are alive before any model. A program with
-        // one epilogue stage is the emptiest package the registry accepts.
-        let program = backend
-            .register_program(&::driver_api::ProgramRegistration {
-                program_hash: 0x_c0_ff_ee,
-                launch: ::driver_api::plan::LaunchPackage {
-                    channels: vec![::driver_api::plan::LaunchChannel {
-                        id: 9,
-                        capacity: 2,
-                        dtype: ::driver_api::PIE_CHANNEL_DTYPE_F32,
-                        flags: ::driver_api::PIE_CHANNEL_HOST_VISIBLE,
-                        extern_dir: -1,
-                        readiness: ::driver_api::PIE_READINESS_UNTOUCHED,
-                        shape: vec![4],
-                        extern_name: vec![],
-                    }],
-                    stages: vec![::driver_api::plan::LaunchStage {
-                        kind: 3,
-                        ..Default::default()
-                    }],
-                    plans: vec![::driver_api::plan::LaunchStagePlan::default()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .expect("a one-stage program registers before any model is loaded");
-
-        let channel = backend
-            .register_channel(&::driver_api::ChannelRegistrationPlan {
-                driver_id: 4,
-                channel_id: 9,
-                shape: vec![4],
-                dtype: ::driver_api::PIE_CHANNEL_DTYPE_F32,
-                host_role: ::driver_api::PIE_CHANNEL_HOST_ROLE_WRITER,
-                seeded: false,
-                extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
-                capacity: 2,
-                reader_wait_id: 11,
-                writer_wait_id: 12,
-                extern_name: Vec::new(),
-            })
-            .expect("a channel matching the program's declaration");
-        assert_eq!(
-            (
-                channel.driver_id,
-                channel.reader_wait_id,
-                channel.writer_wait_id
-            ),
-            (4, 11, 12),
-            "the three fields the driver does not answer came from the wrong \
-             side, so this channel signals nobody"
-        );
-
-        let instance = backend
-            .bind_instance(&::driver_api::InstanceBindingPlan {
-                driver_id: 4,
-                program_id: program,
-                // Zero is "any", not instance zero.
-                requested_instance_id: 0,
-                pacing_wait_id: 13,
-                channel_ids: vec![9],
-                seed_values: Vec::new(),
-                geometry_class: ::driver_api::geometry::GeometryClass::Host,
-            })
-            .expect("an instance over the one channel");
-        assert_eq!(instance.program_id, program);
-        assert_eq!(instance.pacing_wait_id, 13);
-
-        backend
-            .close_instance(instance.instance_id)
-            .expect("closes");
-        backend.close_channel(9).expect("closes");
-
-        // THE REFUSALS. Each is read, not merely counted: a refusal whose
-        // words do not name the field leaves the caller to guess.
-        //
-        // `launch` is served on this seam and cannot be served HERE: a frame
-        // is fired over a model's cache, and there is no model. So the words
-        // to check are the ones every pre-load verb gives -- which verb, and
-        // what it was waiting for -- and not the name of a missing feature.
-        let said = backend
-            .launch(&::driver_api::FrameSubmission {
-                instance_ids: vec![1],
-                kv_translation: vec![0],
-                kv_translation_indptr: vec![0, 1],
-                required_kv_pages: 1,
-                steps: Vec::new(),
-            })
-            .map(|outcome| match outcome {
-                FrameLaunchOutcome::Launched(_) => "launched",
-                FrameLaunchOutcome::Exhausted => "exhausted",
-                FrameLaunchOutcome::Impossible => "impossible",
-            })
-            .expect_err("a frame before a load has no cache to fire over");
-        let said = said.to_string();
-        assert!(
-            said.contains("launch") && said.contains("load_model"),
-            "the refusal names the verb and what it was waiting for: {said}"
-        );
-
-        // `let Err(..) else` rather than `expect_err`, here and below: the
-        // Ok type is `SubmissionCompletion`, which is deliberately not
-        // `Debug` -- it owns a raw terminal cell.
-        let Err(said) = backend.encode(&mut ::driver_api::MediaEncodePlan::default()) else {
-            panic!("there is no encode entry point in this driver")
-        };
-        let said = said.to_string();
-        assert!(said.contains("encode"), "{said}");
-
-        let Err(said) = backend.copy_state(&::driver_api::StateCopyPlan::default()) else {
-            panic!("no model this driver serves holds a recurrent state")
-        };
-        let said = said.to_string();
-        assert!(said.contains("recurrent"), "{said}");
-
-        // AND THE TWO THAT NEED A MODEL. Before `load_model` there is no pool
-        // to move a page within, and the answer says which verb was early
-        // rather than reporting a success nothing performed.
-        let Err(said) = backend.copy_kv(&::driver_api::KvCopyPlan {
-            src_domain: ::driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE,
-            dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE,
-            src_page_ids: vec![0],
-            dst_page_ids: vec![1],
-            ..Default::default()
-        }) else {
-            panic!("a copy before a load has no pool to copy within")
-        };
-        let said = said.to_string();
-        assert!(
-            said.contains("copy_kv") && said.contains("load_model"),
-            "the refusal names the verb and what it was waiting for: {said}"
-        );
-
-        let Err(said) = backend.resize_pool(&::driver_api::PoolResizePlan {
-            pool_id: ::driver_api::PIE_ELASTIC_POOL_KV,
-            target_pages: 8,
-            ..Default::default()
-        }) else {
-            panic!("a resize before a load has no pool to resize")
-        };
-        let said = said.to_string();
-        assert!(said.contains("resize_pool"), "{said}");
-
-        // `load_model` with no descriptor, which is the one shape of it that
-        // needs no checkpoint on disk.
-        let said = backend
-            .load_model(Vec::new())
-            .expect_err("zero descriptors is not one model")
-            .to_string();
-        assert!(
-            said.contains("descriptor"),
-            "the refusal counts what it was given: {said}"
-        );
-    }
-}
+// The `tests` module STOOD HERE, and held exactly two things: that
+// `settle_control` publishes before it notifies, and that every host-side
+// seam calls it rather than minting a completion of its own. Both went with
+// the helper and its three seams (see the note above). This module has no
+// host-side seam left to make a claim about.

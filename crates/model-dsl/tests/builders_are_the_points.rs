@@ -1,11 +1,14 @@
 //! Every builder in `model_dsl::kernels` IS the point its declaration
 //! states — checked, not assumed.
 //!
-//! THE PAIR THIS IMITATES is `model-dsl-legacy`'s retired
-//! `tests/generator/mod.rs` + `tests/wrappers_are_current.rs`: a generator
-//! writes the surface it expects and a test diffs it against what is
-//! committed. The one difference is the DIRECTION. There the file was
-//! generated and the test refused a stale copy; here `src/kernels.rs` is
+//! THE PAIR THIS IMITATES is `kernels-cuda`'s
+//! `tests/points_dispatch_is_current.rs` + its
+//! `points_dispatch_is_current/generator.rs`: a generator writes the surface
+//! it expects and a test diffs it against what is committed. (The pair that
+//! first ran the idiom was this crate's own `tests/generator/mod.rs` +
+//! `tests/wrappers_are_current.rs`, deleted when the north-star crate took
+//! the `model-dsl` name.) The one difference is the DIRECTION. There the
+//! file is generated and the test refuses a stale copy; here `src/kernels.rs` is
 //! still hand-written — texts read it, and it carries prose the tables have
 //! no column for — so this test generates the builder each `*_POINTS` row
 //! implies and refuses a builder that has DRIFTED off its declaration. When
@@ -130,12 +133,16 @@ enum Except {
     /// decision" is this row; when presence bits land, it goes.
     UpCap,
 
-    /// `layer` is the statement's own TAG (`Op::layer`), not a param —
-    /// `.layer(l)` rather than `.int(l)`. That is where the driver has
-    /// always read an attention landing's layer, and moving it into the
-    /// params run would change every plan for nothing. `layout.select`
-    /// declares a `layer` too and it IS a param there, which is why this is
-    /// a per-point row and not a rule about the name.
+    /// `layer` is the statement's own TAG (`Op::layer`), not a param, and
+    /// the builder therefore takes NO PARAMETER FOR IT AT ALL. The tag is
+    /// filled by the recorder from the text's `inputs.layers(..)` loop
+    /// (`model-dsl/src/record.rs`'s `Recorder::at`), so a builder that
+    /// asked a text for `layer: u32` would be asking it to spell its own
+    /// loop index a second time; moving the slot into the params run
+    /// instead would change every plan for nothing. `layout.select`
+    /// declares a `layer` too and it IS a param there — it says WHICH SLICE
+    /// of a relayed table to cut, which no scope can answer — and that is
+    /// why this is a per-point row and not a rule about the name.
     LayerTag,
 
     /// `norm.res_blend`'s `blocks` is `&[Value]`: it grows by one every
@@ -337,8 +344,6 @@ fn expected(p: &Point) -> String {
                     continue;
                 }
                 if has(Except::LayerTag) && name == "layer" {
-                    params.push("layer: u32".into());
-                    chain.push(".layer(layer)".into());
                     continue;
                 }
                 match s.dtype {
@@ -517,14 +522,20 @@ fn builders_are_the_points() {
     );
 }
 
-/// The tier-2 surface has NO declaration to check against, and that is the
-/// shape of the gap rather than an oversight.
+/// The tier-2 surface has no declaration THIS CRATE CAN READ, and that is
+/// the shape of the gap rather than an oversight.
 ///
-/// A tier-2 point is an inherent method on one plane's `Ctx` — no trait, so
-/// `#[points]` never sees it and no `*_POINTS` row exists to generate from.
-/// `model_dsl::kernels::cuda` is therefore hand-written and stays that way
-/// until the floor grows a way to declare a one-plane surface. This test
-/// records what is in there so the list cannot grow silently.
+/// A tier-2 point is declared — `#[claims]` reads the inherent `impl Ctx<'_>`
+/// and writes its slots into that plane's own `TIER2_POINTS`, which is what
+/// the generated dispatch reads its columns off. What no floor holds is the
+/// declaration, because there is no floor: the point exists on one plane and
+/// `model-dsl` is plane-agnostic by construction (its only kernel dependency
+/// is `kernels`, the floor). So the builder in `model_dsl::kernels::cuda` is
+/// hand-written against a table it cannot name, and the check that the two
+/// agree lives where both are visible — the plane's own generated arm, whose
+/// column indices are read off `TIER2_POINTS` and whose fire is A/B'd in
+/// `kernels-cuda/tests/qkv_fused_tier2.rs`. This test records what is in
+/// there so the list cannot grow silently.
 #[test]
 fn tier_two_is_unchecked_and_small() {
     let have = surface();

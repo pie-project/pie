@@ -524,7 +524,7 @@ fn named_kernels(plan: &LoadPlan) -> Vec<String> {
 /// A load that completes says so, once.
 ///
 /// `.wiki/fix/weight-loader.md` §8.1: release belongs to the seam, not to the
-/// caller. Before it did, `driver-cuda/src/weights/stage.rs` called
+/// caller. Before it did, driver-cuda's own staging (deleted with the legacy load contract at R3) called
 /// `arena.finish()?` itself after `run()?` returned — which is the same
 /// sentence with a `?` in the middle of it, and the `?` is the bug. Every
 /// caller had to remember, and on the path where it mattered most none of

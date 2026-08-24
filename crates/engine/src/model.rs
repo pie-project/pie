@@ -50,9 +50,9 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
 /// second one.
 ///
 /// It is the row now: `model::serve::ROWS`, whose two numbers are held equal
-/// to the catalog the driver linked by `model-legacy`'s `serve_rows` test.
-/// Both sides knowing one fact differently is not a bug that got fixed; it is
-/// a sentence that can no longer be written.
+/// to the SKU's own traced plan by `model/tests/rows_are_the_traces.rs` —
+/// the same plan the driver fires. Both sides knowing one fact differently is
+/// not a bug that got fixed; it is a sentence that can no longer be written.
 fn loaded_row(model_id: &str) -> Result<&'static serve::Row> {
     serve::row(model_id).ok_or_else(|| {
         anyhow!(
@@ -63,17 +63,8 @@ fn loaded_row(model_id: &str) -> Result<&'static serve::Row> {
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one model row, stated once: its name and architecture, the catalog id \
-              it resolves to, the KV page size, its recurrent-state and PTIR \
-              capability sets, its tokenizer, and the checkpoint metadata. These \
-              come from different sources at the call site, so a struct would need \
-              assembling field-by-field first"
-)]
 pub fn register(
     name: String,
-    arch_name: &str,
     model_id: &str,
     kv_page_size: u32,
     rs: RsCaps,
@@ -140,7 +131,7 @@ pub fn register(
 
     let model = Arc::new(Model {
         name,
-        arch_name: arch_name.to_string(),
+        arch_name: row.arch,
         instruct,
         kv_page_size,
         rs_caps: rs,
@@ -167,9 +158,12 @@ pub fn model() -> &'static Arc<Model> {
 
 pub struct Model {
     name: String,
-    /// Architecture identifier supplied at registration (e.g. "gemma4",
-    /// "qwen3_6"). Used to select the multimodal processor / vision front-end.
-    arch_name: String,
+    /// The family label the vision front-end and the speech front-end dispatch
+    /// on (e.g. "gemma4", "qwen3_5"). The ROW's, like the chat template and
+    /// the two numbers: the driver advertises the same string off the same
+    /// row, so reading its copy only opened the way for a build to select a
+    /// processor for one model and a template for another.
+    arch_name: &'static str,
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     /// Recurrent-state (working-set) capabilities surfaced via model.wit
@@ -229,9 +223,9 @@ impl Model {
         &self.name
     }
 
-    /// Gets the architecture identifier (e.g. "gemma4", "qwen3_6").
-    pub fn arch_name(&self) -> &str {
-        &self.arch_name
+    /// Gets the architecture identifier (e.g. "gemma4", "qwen3_5").
+    pub fn arch_name(&self) -> &'static str {
+        self.arch_name
     }
 
     /// Gets the instruct implementation for this model.

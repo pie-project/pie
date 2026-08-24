@@ -7,7 +7,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
     Error, FnArg, GenericParam, Ident, ItemTrait, Pat, PathSegment, ReceiverKind, ReturnType,
-    Signature, TraitItem, TraitItemFn, Type, TypeParamBound, WherePredicate, spanned::Spanned,
+    Signature, TraitItem, Type, TypeParamBound, WherePredicate, spanned::Spanned,
 };
 
 pub fn expand(item: ItemTrait) -> Result<TokenStream, Error> {
@@ -23,7 +23,7 @@ pub fn expand(item: ItemTrait) -> Result<TokenStream, Error> {
             TraitItem::Fn(f) => Some(f),
             _ => None,
         })
-        .map(|f| point(&family, f))
+        .map(|f| point(format!("{family}.{}", f.sig.ident), &f.sig))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(quote! {
         #item
@@ -50,16 +50,24 @@ pub(crate) fn snake(ident: &Ident) -> String {
     out
 }
 
-fn point(family: &str, f: &TraitItemFn) -> Result<TokenStream, Error> {
-    let name = format!("{family}.{}", f.sig.ident);
-    let Axes { scalars, reprs } = axes(&name, &f.sig)?;
-    answers(&name, &f.sig)?;
-    let mut args = f.sig.inputs.iter();
+/// One row of a point table, read off the signature that declares it.
+///
+/// THE NAME IS THE CALLER'S, and that is the only thing the two callers
+/// differ in. A tier-1 point's name is `family.method`, composed from the
+/// trait that declares it; a tier-2 point's is the method alone, because an
+/// inherent impl has no family to prefix with — see [`crate::claims`]. Every
+/// other question this asks is asked of a `Signature`, which both kinds of
+/// item carry, so ONE READER writes both tables and a tier-2 declaration is
+/// written in exactly the vocabulary a floor declaration is.
+pub(crate) fn point(name: String, sig: &Signature) -> Result<TokenStream, Error> {
+    let Axes { scalars, reprs } = axes(&name, sig)?;
+    answers(&name, sig)?;
+    let mut args = sig.inputs.iter();
     match args.next() {
         Some(FnArg::Receiver(r)) if matches!(r.kind, ReceiverKind::Reference(_, _, None)) => {}
         _ => {
             return Err(Error::new(
-                f.sig.span(),
+                sig.span(),
                 format!("`{name}` takes `&self` first: the plane the point fires on"),
             ));
         }
@@ -254,6 +262,29 @@ fn marked(
     Ok((seg.ident.clone(), dtype))
 }
 
+/// The PLANE PAYLOAD a slot carries, as the associated item's own segment.
+///
+/// TWO SPELLINGS, ONE MEANING, and the second exists because rustc has no
+/// shorthand at the tier-2 site. A family declaration writes
+/// `Self::Tensor<T>`: inside a trait, `Self` is bounded by that trait, so the
+/// associated item resolves. An inherent `impl Ctx<'_>` states no such bound
+/// and `Self::Tensor` there is E0223 — ambiguous associated type — so a
+/// tier-2 declaration writes the same thing fully qualified,
+/// `<Self as Plane>::Tensor<T>`. Both name THE PLANE'S payload for the
+/// method's own `Self`, which is the one thing this needs to read, so both
+/// are accepted and neither is preferred.
+fn payload<'t>(ty: &'t Type, named: &str) -> Option<&'t PathSegment> {
+    let Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last().filter(|s| s.ident == named)?;
+    match &p.qself {
+        Some(q) => matches!(&*q.ty, Type::Path(s)
+            if s.qself.is_none() && s.path.is_ident("Self"))
+        .then_some(seg),
+        None => (p.path.segments.len() == 2 && p.path.segments[0].ident == "Self")
+            .then_some(seg),
+    }
+}
+
 /// `Self::Bank<R>` → `Dtype::Bank(i)` for the method's i-th repr axis.
 ///
 /// `None` — not an error — when the payload is not a `Self::Bank<..>` at
@@ -267,16 +298,7 @@ fn bank(
     ty: &Type,
     reprs: &[Ident],
 ) -> Option<Result<TokenStream, Error>> {
-    let seg = match ty {
-        Type::Path(p)
-            if p.qself.is_none()
-                && p.path.segments.len() == 2
-                && p.path.segments[0].ident == "Self" =>
-        {
-            p.path.segments.last().filter(|s| s.ident == "Bank")?
-        }
-        _ => return None,
-    };
+    let seg = payload(ty, "Bank")?;
     let carried = args(seg);
     let [repr] = carried.as_slice() else {
         return Some(Err(Error::new(
@@ -307,18 +329,9 @@ fn bank(
 /// the latent, index and pooled families address are two pools, and every
 /// family reading either names the pool's own view here.
 fn pool(point: &str, slot: &str, ty: &Type) -> Result<TokenStream, Error> {
-    let named = match ty {
-        Type::Path(p)
-            if p.qself.is_none()
-                && p.path.segments.len() == 2
-                && p.path.segments[0].ident == "Self" =>
-        {
-            p.path.segments.last().filter(|s| {
-                (s.ident == "Recurrent" || s.ident == "Pages") && s.arguments.is_none()
-            })
-        }
-        _ => None,
-    };
+    let named = payload(ty, "Recurrent")
+        .or_else(|| payload(ty, "Pages"))
+        .filter(|s| s.arguments.is_none());
     if named.is_some() {
         return Ok(quote!(Dtype::Opaque));
     }
@@ -334,17 +347,7 @@ fn pool(point: &str, slot: &str, ty: &Type) -> Result<TokenStream, Error> {
 /// `Self::Tensor<T>` → `Dtype::Generic(i)` for the method's i-th axis;
 /// `Self::Tensor<f32>` → `Dtype::Fixed(Prim::F32)`.
 fn tensor(point: &str, slot: &str, ty: &Type, axes: &[Ident]) -> Result<TokenStream, Error> {
-    let payload = match ty {
-        Type::Path(p)
-            if p.qself.is_none()
-                && p.path.segments.len() == 2
-                && p.path.segments[0].ident == "Self" =>
-        {
-            p.path.segments.last().filter(|s| s.ident == "Tensor")
-        }
-        _ => None,
-    };
-    let Some(seg) = payload else {
+    let Some(seg) = payload(ty, "Tensor") else {
         return Err(Error::new(
             ty.span(),
             format!(

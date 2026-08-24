@@ -51,4 +51,3 @@ pub fn symbol(name: &str) -> &'static str {
     fresh
 }
 
-pub type Routine = kernels::routine::Routine<Cuda>;

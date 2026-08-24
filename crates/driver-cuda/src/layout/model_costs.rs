@@ -49,34 +49,11 @@ impl CheckpointCosts {
     }
 
     fn head_dim(&self) -> u64 {
-        u64::from(self.dep.shape.head_dim_alloc())
+        u64::from(self.dep.shape.head_dim_kernel)
     }
 
     fn layers(&self) -> u64 {
         u64::from(self.dep.layers)
-    }
-
-    /// This checkpoint's MLA cache shape, or `None` for ordinary attention.
-    fn mla_geometry(&self) -> Option<super::mla_geometry::MlaGeometry> {
-        let model::deployment::KvStyle::Mla {
-            kv_lora_rank,
-            qk_rope_head_dim,
-        } = &self.dep.kv
-        else {
-            return None;
-        };
-        if *kv_lora_rank == 0 || *qk_rope_head_dim == 0 {
-            return None;
-        }
-        super::mla_geometry::MlaGeometry::new(
-            u32::try_from(self.layers()).unwrap_or(1).max(1),
-            1,
-            16,
-            *kv_lora_rank,
-            *qk_rope_head_dim,
-            crate::dtype::DType::Bf16,
-        )
-        .ok()
     }
 
     /// The widest MLP any layer in the stack asks for.
@@ -84,33 +61,22 @@ impl CheckpointCosts {
     /// A mixture's experts can be wider than the dense `intermediate`, and the
     /// one shared workspace buffer must hold whichever is wider.
     fn max_intermediate(&self) -> i64 {
-        i64::from(self.dep.shape.widest_mlp())
+        i64::from(self.dep.shape.widest_mlp)
     }
 }
 
 impl ModelCosts for CheckpointCosts {
     /// Layers × this rank's heads × head dim × 2 bytes × (K and V).
     ///
-    /// MLA (DeepSeek/Kimi/GLM5) instead caches a compressed latent plus a rope
-    /// key per token: `kv_lora_rank + qk_rope_head_dim`, not
-    /// `kv_heads × head_dim × 2`. On DeepSeek-V3 these differ by more than an
-    /// order of magnitude, so the dense formula would oversize the pool.
+    /// ONE FORMULA, because there is one pool. The MLA and compressed-plane
+    /// arms STOOD HERE — a latent `kv_lora_rank + qk_rope_head_dim` per token
+    /// and DSv4's per-layer compressor ratios — and both were unreachable
+    /// from this function: `Deployment::of` refuses a plan whose kv rows are
+    /// not the `[2, kv_heads * head_dim]` pair before any cost is asked for,
+    /// so a checkpoint that needed either arm never reached a planner. The
+    /// arms come back with the pool, which is where their geometry belongs.
     fn per_kv_token_bytes(&self) -> u64 {
-        // DSv4 carries a compressor cache beside its KV, charged per token via
-        // `compress_bytes_per_token`. A checkpoint that states no ratios adds
-        // zero, which is every family but this one.
-        let ratios: &[i32] = match &self.dep.kv {
-            model::deployment::KvStyle::CompressedPlane { ratios } => ratios,
-            model::deployment::KvStyle::Paged | model::deployment::KvStyle::Mla { .. } => &[],
-        };
-        let compress = super::compressed_plane_geometry::compress_bytes_per_token(
-            ratios,
-            u32::try_from(self.head_dim()).unwrap_or(0),
-        );
-        if let Some(mla) = self.mla_geometry() {
-            return mla.bytes_per_token() + compress;
-        }
-        self.layers() * self.kv_heads() * self.head_dim() * 2 * 2 + compress
+        self.layers() * self.kv_heads() * self.head_dim() * 2 * 2
     }
 
     /// Zero: this driver keeps no Quest key envelopes, and
@@ -142,7 +108,7 @@ impl ModelCosts for CheckpointCosts {
             hidden_size: i64::from(self.dep.shape.hidden),
             vocab_size: i64::from(self.dep.shape.vocab),
             head_dim,
-            head_dim_kernel: i64::from(self.dep.shape.head_dim_alloc()),
+            head_dim_kernel: i64::from(self.dep.shape.head_dim_kernel),
             max_tokens: i64::from(n).max(0),
             max_intermediate: self.max_intermediate(),
             max_hq: i64::from(self.dep.shape.q_heads) * head_dim,
@@ -200,36 +166,28 @@ impl ModelCosts for CheckpointCosts {
 mod tests {
     use super::*;
 
-    use model::deployment::{Geometry, KvStyle, LayerAttention, RecurrentShape};
+    use model::deployment::{Geometry, LayerAttention, RecurrentShape};
 
-    /// Qwen3-0.6B, as the catalog row projects it.
-    fn qwen3_0_6b() -> Deployment {
+    /// A 28-layer dense tower with a paged cache, the shape every cost
+    /// below is arithmetic about. Written out rather than traced: what is
+    /// under test is the COST FORMULA, and a formula wants a shape it can
+    /// vary one number of at a time.
+    fn dense_28() -> Deployment {
         let mut d = Deployment::empty();
         d.layers = 28;
-        d.norm_eps = 1e-6;
         d.shape = Geometry {
             hidden: 1024,
             q_heads: 16,
             kv_heads: 8,
             head_dim: 128,
             head_dim_kernel: 128,
-            intermediate: 3072,
-            // Dense: no router, so no expert count and no shared FFN.
-            moe_intermediate: 0,
-            experts_per_token: 0,
-            shared_intermediate: 0,
+            widest_mlp: 3072,
             vocab: 151_936,
         };
         d.attention = (0..28)
             .map(|l| LayerAttention {
                 head_dim: 128,
-                kv_heads: 8,
-                window: -1,
                 kv_source: l,
-                sm_scale: 1.0 / (128.0_f32).sqrt(),
-                rope_theta: 1e6,
-                rotary_dim: 0,
-                q_gate: false,
             })
             .collect();
         d
@@ -246,13 +204,10 @@ mod tests {
             // in-projection; the recurrent state is fp32.
             conv_stride: 4 * (2 * key_width + value_width) * 2,
             state_stride: 32 * 128 * 128 * 4,
-            state_elem: 4,
             k_h: 16,
             v_h: 32,
             k_d: 128,
             v_d: 128,
-            // Mamba-2's grouping; a GDN slab has none.
-            n_groups: 0,
             conv_dim: (2 * key_width + value_width) as i32,
             conv_k: 4,
         }
@@ -260,28 +215,28 @@ mod tests {
 
     #[test]
     fn a_kv_token_costs_what_a_page_is_made_of() {
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
+        let c = CheckpointCosts::new(&dense_28(), 1);
         // 28 layers x 8 heads x 128 dim x 2 bytes x (K and V).
         assert_eq!(c.per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
     }
 
     #[test]
     fn a_rank_of_two_holds_half_the_heads() {
-        let whole = CheckpointCosts::new(&qwen3_0_6b(), 1).per_kv_token_bytes();
-        let half = CheckpointCosts::new(&qwen3_0_6b(), 2).per_kv_token_bytes();
+        let whole = CheckpointCosts::new(&dense_28(), 1).per_kv_token_bytes();
+        let half = CheckpointCosts::new(&dense_28(), 2).per_kv_token_bytes();
         assert_eq!(half * 2, whole, "the split is exact on eight heads");
     }
 
     #[test]
     fn a_rank_never_holds_less_than_one_head() {
         // Truncating division floored at one; `kv_geometry` floors the same.
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 16);
+        let c = CheckpointCosts::new(&dense_28(), 16);
         assert_eq!(c.per_kv_token_bytes(), 28 * 1 * 128 * 2 * 2);
     }
 
     #[test]
     fn the_arena_grows_with_the_forward_shape() {
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
+        let c = CheckpointCosts::new(&dense_28(), 1);
         let small = c.arena_bytes(128, 0, 0);
         let large = c.arena_bytes(4096, 0, 0);
         assert!(small > 0, "a shape with tokens has an arena");
@@ -306,94 +261,46 @@ mod tests {
 
     #[test]
     fn a_mixtures_workspace_holds_its_widest_layer() {
-        let mut d = qwen3_0_6b();
-        d.shape.moe_intermediate = 9216;
+        let mut d = dense_28();
+        d.shape.widest_mlp = 9216;
         let c = CheckpointCosts::new(&d, 1);
         assert_eq!(c.max_intermediate(), 9216);
         assert!(
             c.arena_bytes(4096, 0, 0)
-                > CheckpointCosts::new(&qwen3_0_6b(), 1).arena_bytes(4096, 0, 0)
+                > CheckpointCosts::new(&dense_28(), 1).arena_bytes(4096, 0, 0)
         );
     }
 
-    #[test]
-    fn an_mla_checkpoint_is_charged_its_latent_and_not_a_dense_cache() {
-        // DeepSeek-V3: 128 kv heads of 192, but the cache holds a 512 latent
-        // plus a 64 rope key — ~85x smaller per token than the dense formula.
-        let mut d = qwen3_0_6b();
-        d.layers = 61;
-        d.shape.kv_heads = 128;
-        d.shape.head_dim = 192;
-        d.shape.head_dim_kernel = 192;
-        d.kv = KvStyle::Mla {
-            kv_lora_rank: 512,
-            qk_rope_head_dim: 64,
-        };
-        let c = CheckpointCosts::new(&d, 1);
-
-        let latent = 61 * (512 + 64) * 2;
-        assert_eq!(c.per_kv_token_bytes(), latent, "the cache is the latent");
-
-        let dense = 61 * 128 * 192 * 2 * 2;
-        assert!(
-            dense > c.per_kv_token_bytes() * 80,
-            "the dense formula would have charged {dense} for {latent}"
-        );
-    }
+    // FOUR TESTS STOOD HERE — an MLA latent charged instead of a dense
+    // cache, a zero-width latent falling back, a DSv4 compressor cache
+    // charged beside its KV, and the dense formula's own control. All four
+    // exercised arms of `per_kv_token_bytes` that R3 deleted, and they were
+    // deleted rather than repaired because the arms were UNREACHABLE from
+    // this function: `model::deployment::Deployment::of` refuses a plan
+    // whose kv rows are not the `[2, kv_heads * head_dim]` pair, so a
+    // checkpoint that needed either arm never reached a planner. What the
+    // tests actually proved is now
+    // `model/tests/rows_are_the_traces.rs::the_pool_refusals_are_the_measured_ones`,
+    // which names the SKUs by name. The dense control survives below.
 
     #[test]
-    fn a_checkpoint_without_a_latent_keeps_the_dense_formula() {
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
-        assert_eq!(c.per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
-    }
-
-    #[test]
-    fn a_latent_of_zero_width_is_not_a_latent() {
-        // The loader won't build this, but falling back beats a later divide by zero.
-        let mut d = qwen3_0_6b();
-        d.kv = KvStyle::Mla {
-            kv_lora_rank: 0,
-            qk_rope_head_dim: 64,
-        };
+    fn the_dense_formula_is_the_only_formula() {
         assert_eq!(
-            CheckpointCosts::new(&d, 1).per_kv_token_bytes(),
+            CheckpointCosts::new(&dense_28(), 1).per_kv_token_bytes(),
             28 * 8 * 128 * 2 * 2
-        );
-        d.kv = KvStyle::Mla {
-            kv_lora_rank: 512,
-            qk_rope_head_dim: 0,
-        };
-        assert_eq!(
-            CheckpointCosts::new(&d, 1).per_kv_token_bytes(),
-            28 * 8 * 128 * 2 * 2
-        );
-    }
-
-    #[test]
-    fn a_v4_checkpoint_pays_for_its_compressor_cache_too() {
-        let plain = CheckpointCosts::new(&qwen3_0_6b(), 1).per_kv_token_bytes();
-
-        let mut d = qwen3_0_6b();
-        d.kv = KvStyle::CompressedPlane {
-            ratios: vec![4, 4, 4],
-        };
-        let with_compressor = CheckpointCosts::new(&d, 1).per_kv_token_bytes();
-        assert!(
-            with_compressor > plain,
-            "the compressor cache is resident and was charged nothing"
         );
     }
 
     #[test]
     fn a_dense_model_keeps_no_recurrent_state() {
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
+        let c = CheckpointCosts::new(&dense_28(), 1);
         assert!(!c.has_linear_state());
         assert_eq!(c.state_slot_bytes(), 0);
     }
 
     #[test]
     fn a_stated_recurrence_over_no_layers_is_no_recurrence() {
-        let mut d = qwen3_0_6b();
+        let mut d = dense_28();
         d.recurrent = Some(gdn(Vec::new()));
         let c = CheckpointCosts::new(&d, 1);
         assert!(!c.has_linear_state());
@@ -402,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_hybrid_charges_for_its_slabs() {
-        let mut d = qwen3_0_6b();
+        let mut d = dense_28();
         d.recurrent = Some(gdn(vec![0]));
         let c = CheckpointCosts::new(&d, 1);
         assert!(c.has_linear_state());
@@ -416,7 +323,7 @@ mod tests {
 
     #[test]
     fn only_the_linear_layers_of_a_hybrid_carry_slabs() {
-        let mut d = qwen3_0_6b();
+        let mut d = dense_28();
         d.recurrent = Some(gdn(vec![0, 1, 2, 3]));
         let all_linear = CheckpointCosts::new(&d, 1).state_slot_bytes();
 
@@ -427,7 +334,7 @@ mod tests {
 
     #[test]
     fn the_workspace_and_the_envelopes_are_what_this_shell_states() {
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
+        let c = CheckpointCosts::new(&dense_28(), 1);
         assert_eq!(
             c.attn_float_workspace_bytes(4096, 256),
             ATTN_FLOAT_WORKSPACE_BYTES
@@ -438,7 +345,7 @@ mod tests {
 
     #[test]
     fn the_persistent_inputs_are_charged_even_though_they_are_small() {
-        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
+        let c = CheckpointCosts::new(&dense_28(), 1);
         let b = c.persistent_input_bytes(4096, 256, 1024, 0);
         assert!(b > 0, "a term left out is bytes handed to the KV pool");
         assert!(b < 1 << 20, "and it is kilobytes, not megabytes");

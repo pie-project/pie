@@ -10,7 +10,6 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use kernels::Bind;
-use kernels_macros::routine;
 
 use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
 use crate::attn::fa2::params::{
@@ -22,7 +21,7 @@ use crate::jit::abi::{bf16, unpack_aggregate};
 use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
 use crate::raises::{Fa2Decode, Fa2Prefill};
 use crate::routine::Fire;
-use crate::views::{AttnMask, AttnScore, KvCache, KvPageIndptrHost, QoIndptrHost};
+use crate::views::{AttnMask, KvCache, KvPageIndptrHost, QoIndptrHost};
 use kernels::raises::Struct;
 use kernels::routine::{Arg, Const, In, Out};
 use kernels::{Refusal, Ty};
@@ -1255,6 +1254,7 @@ fn blocks_per_sm(_instantiation: &str, _smem: u32) -> u32 {
     1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_states_varlen(
     ctx: &Ctx<'_>,
     v: *mut bf16,
@@ -1343,15 +1343,14 @@ fn buffers(
     }
 }
 
-const CAPTURE_VARIANT: Refusal = Refusal::Unstated {
-    what: "a score capture without a soft cap or a window",
-};
-
-const CAPTURE_SINK: Refusal = Refusal::Absent {
-    what: "the score sink",
-};
-
-#[routine(depth_prefix_plan, no_join, canon = "attention.decode")]
+/// The fa2 DECODE launch, and the schedule this file owns rather than the
+/// claim that names it.
+///
+/// TWO POINTS AND A TEST reach it: `attention.decode` and
+/// `attention.decode_lse` through `attn::fa2_decode`, which differ only in
+/// whether `lse` is `Some`, and `tests/attention_paged.rs`, which measures
+/// the planned leg against the ragged one.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_attention_flashinfer_decode(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -1435,130 +1434,6 @@ pub fn dispatch_attention_flashinfer_decode(
     }
 }
 
-#[routine(depth_prefix_plan, no_join, canon = "attention.decode_lse")]
-pub fn dispatch_attention_flashinfer_decode_lse(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    plan: In<Struct<Fa2Decode>>,
-    o: Out<Tensor<bf16>>,
-    _lse: Out<Tensor<f32>>,
-    _window_left: Const<i32>,
-    _logits_soft_cap: Const<f32>,
-    _sm_scale: Const<f32>,
-    kvc: In<Struct<KvCache>>,
-) -> Result<(), Refusal> {
-    dispatch_attention_flashinfer_decode(
-        ctx,
-        q,
-        plan,
-        o,
-        _window_left,
-        _logits_soft_cap,
-        _sm_scale,
-        kvc,
-        Some(_lse),
-    )
-}
-
-#[routine(no_join)]
-pub fn dispatch_attention_flashinfer_decode_capture(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    plan: In<Struct<Fa2Decode>>,
-    o: Out<Tensor<bf16>>,
-    window_left: Const<i32>,
-    logits_soft_cap: Const<f32>,
-    sm_scale: Const<f32>,
-    kvc: In<Struct<KvCache>>,
-    score_out: Out<Tensor<f32>>,
-    score: In<Struct<AttnScore>>,
-    lse: Option<Out<Tensor<f32>>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc_ptr = kvc.ptr;
-    let kvc = unsafe { &*kvc_ptr };
-
-    let score_out = score_out.ptr;
-    if score.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the score view this statement names",
-        });
-    }
-    let score_indptr = unsafe { (*score.ptr).indptr };
-
-    let lse = lse.map_or(core::ptr::null_mut(), |l| l.ptr);
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-    let kv_page_indices = kvc.page_indices as *const u32;
-    let kv_page_indptr = kvc.page_indptr as *const u32;
-    let kv_last_page_lens = kvc.last_page_lens as *const u32;
-    let broadcast_q = false;
-
-    if plan.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the decode plan this statement names",
-        });
-    }
-
-    let cache = unsafe { &*plan.ptr };
-    let planned = dispatch::decode_plan_of(cache, crate::attn::fa2::plan::fa_device());
-
-    dequant_prelude(ctx, kvc_ptr, cache.num_kv_heads, cache.head_dim);
-
-    let int_base = cache.int_workspace;
-    upload_plan(
-        ctx,
-        cache.int_upload.as_slice().as_ptr(),
-        cache.int_upload.as_slice().len(),
-        (int_base as usize).saturating_add(cache.int_base_bytes) as *mut u8,
-    )?;
-
-    if score_out.is_null() || score_indptr.is_null() {
-        return Err(CAPTURE_SINK);
-    }
-    let Some(arm) = decode_capture_arm(
-        planned.full_attention_variant,
-        *window_left,
-        *logits_soft_cap,
-    ) else {
-        return Err(CAPTURE_VARIANT);
-    };
-    let bufs = buffers(
-        q.ptr,
-        k_pages.cast::<bf16>(),
-        v_pages.cast::<bf16>(),
-        o.ptr,
-        kv_page_indices,
-        kv_page_indptr,
-        kv_last_page_lens,
-        core::ptr::null(),
-        lse,
-        int_base,
-        cache.float_workspace,
-    );
-    let (base, split) =
-        make_decode_params(&planned, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
-    let params = DecodeScoreParams {
-        base,
-        score_out: addr(score_out),
-        score_indptr: addr(score_indptr),
-    };
-    decode(
-        ctx,
-        decode_at(&planned, arm, params.base.padded_batch_size),
-        &params,
-    )?;
-    if planned.info.split_kv {
-        fold(ctx, &split)
-    } else {
-        Ok(())
-    }
-}
-
 fn prefill_paged(
     ctx: &Ctx<'_>,
     bufs: &Buffers,
@@ -1585,173 +1460,9 @@ fn prefill_paged(
     }
 }
 
-#[routine(no_join)]
-pub fn dispatch_attention_flashinfer_prefill_bf16(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    plan: In<Struct<Fa2Prefill>>,
-    o: Out<Tensor<bf16>>,
-    logits_soft_cap: Const<f32>,
-    sm_scale: Const<f32>,
-    qo_indptr: In<Tensor<i32>>,
-    kvc: In<Struct<KvCache>>,
-    lse: Option<Out<Tensor<f32>>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-
-    let logits_soft_cap = *logits_soft_cap;
-    let sm_scale = *sm_scale;
-
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    let lse = lse.map_or(core::ptr::null_mut(), |l| l.ptr);
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-    let kv_page_indices = kvc.page_indices as *const u32;
-    let kv_page_indptr = kvc.page_indptr as *const u32;
-    let kv_last_page_lens = kvc.last_page_lens as *const u32;
-
-    if plan.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the prefill plan this statement names",
-        });
-    }
-
-    let cache = unsafe { &*plan.ptr };
-    let planned = dispatch::prefill_plan_of(cache, crate::attn::fa2::plan::fa_device());
-
-    let carve = cache.int_workspace;
-    upload_plan(
-        ctx,
-        cache.int_upload.as_slice().as_ptr(),
-        cache.int_upload.as_slice().len(),
-        (carve as usize).saturating_add(cache.int_base_bytes) as *mut u8,
-    )?;
-
-    let float_base = cache.float_workspace;
-
-    let int_base = (carve as usize).saturating_add(cache.int_base_bytes) as *mut c_void;
-
-    let bufs = buffers(
-        q.ptr,
-        k_pages.cast::<bf16>(),
-        v_pages.cast::<bf16>(),
-        o.ptr,
-        kv_page_indices,
-        kv_page_indptr,
-        kv_last_page_lens,
-        qo_indptr,
-        lse,
-        int_base,
-        float_base,
-    );
-    prefill_paged(ctx, &bufs, &planned, logits_soft_cap, sm_scale)
-}
-
-#[routine(no_join)]
-pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    plan: In<Struct<Fa2Prefill>>,
-    o: Out<Tensor<bf16>>,
-    logits_soft_cap: Const<f32>,
-    sm_scale: Const<f32>,
-    kvc: In<Struct<KvCache>>,
-    qo_indptr: In<Tensor<i32>>,
-    score_out: Out<Tensor<f32>>,
-    score: In<Struct<AttnScore>>,
-    lse: Option<Out<Tensor<f32>>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-
-    let score_out = score_out.ptr;
-    if score.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the score view this statement names",
-        });
-    }
-    let score_indptr = unsafe { (*score.ptr).indptr };
-    let score_window = unsafe { (*score.ptr).window };
-
-    let lse = lse.map_or(core::ptr::null_mut(), |l| l.ptr);
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-    let qo_indptr = qo_indptr.ptr as *const u32;
-    let kv_page_indices = kvc.page_indices as *const u32;
-    let kv_page_indptr = kvc.page_indptr as *const u32;
-    let kv_last_page_lens = kvc.last_page_lens as *const u32;
-
-    if plan.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the prefill plan this statement names",
-        });
-    }
-
-    let cache = unsafe { &*plan.ptr };
-    let planned = dispatch::prefill_plan_of(cache, crate::attn::fa2::plan::fa_device());
-
-    let carve = cache.int_workspace;
-    upload_plan(
-        ctx,
-        cache.int_upload.as_slice().as_ptr(),
-        cache.int_upload.as_slice().len(),
-        (carve as usize).saturating_add(cache.int_base_bytes) as *mut u8,
-    )?;
-
-    let float_base = cache.float_workspace;
-    let int_base = (carve as usize).saturating_add(cache.int_base_bytes) as *mut c_void;
-
-    if score_out.is_null() || score_indptr.is_null() || score_window == 0 {
-        return Err(CAPTURE_SINK);
-    }
-    let Some(arm) = prefill_capture_arm(planned.causal_mask, planned.window_left, *logits_soft_cap)
-    else {
-        return Err(CAPTURE_VARIANT);
-    };
-    prefill_plan_usable(&planned)?;
-    let bufs = buffers(
-        q.ptr,
-        k_pages.cast::<bf16>(),
-        v_pages.cast::<bf16>(),
-        o.ptr,
-        kv_page_indices,
-        kv_page_indptr,
-        kv_last_page_lens,
-        qo_indptr,
-        lse,
-        int_base,
-        float_base,
-    );
-    let (base, split) = make_prefill_params(&planned, &bufs, 0.0, *sm_scale);
-    let params = PrefillScoreParams {
-        base,
-        score_out: addr(score_out),
-        score_indptr: addr(score_indptr),
-        score_window,
-    };
-    prefill(
-        ctx,
-        prefill_at(&planned, arm, params.base.padded_batch_size),
-        &params,
-    )?;
-    if planned.info.split_kv {
-        fold(ctx, &split)
-    } else {
-        Ok(())
-    }
-}
-
-#[routine(no_join, canon = "attention.masked")]
-pub fn dispatch_attention_flashinfer_prefill_custom(
+/// The fa2 CUSTOM-MASK prefill launch, which `attention.masked` names.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_attention_flashinfer_prefill_custom(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
     plan: In<Struct<Fa2Prefill>>,
@@ -1935,8 +1646,13 @@ fn plan_own_prefill(
     Ok(dispatch::prefill_plan_of(cache, plan::fa_device()))
 }
 
-#[routine(whole, no_join, canon = "attention.prefill")]
-pub fn attention_flashinfer_prefill(
+/// The fa2 PREFILL launch — the planless leg, which carves its own schedule
+/// out of the two host CSR mirrors the executor stages.
+///
+/// TWO POINTS reach it through `attn::fa2_prefill`: `attention.prefill` and
+/// `attention.prefill_lse`, which differ only in whether `lse` is `Some`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_flashinfer_prefill(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
     o: Out<Tensor<bf16>>,
@@ -2007,41 +1723,6 @@ pub fn attention_flashinfer_prefill(
         float_buffer,
     );
     prefill_paged(ctx, &bufs, &plan, *logits_soft_cap, *sm_scale)
-}
-
-#[routine(whole, no_join, canon = "attention.prefill_lse")]
-pub fn attention_flashinfer_prefill_lse(
-    ctx: &Ctx<'_>,
-    q: In<Tensor<bf16>>,
-    o: Out<Tensor<bf16>>,
-    _lse: Out<Tensor<f32>>,
-    attn_logits_soft_cap: Const<f32>,
-    sm_scale: Const<f32>,
-    kvc: In<Struct<KvCache>>,
-    qo_indptr: In<Tensor<i32>>,
-    head_dim: Const<i32>,
-    plan_cache: In<Struct<Fa2Prefill>>,
-    qo_indptr_host: In<Struct<QoIndptrHost>>,
-    kv_page_indptr_host: In<Struct<KvPageIndptrHost>>,
-    kv_num_heads: Const<i32>,
-    window_left: Const<i32>,
-) -> Result<(), Refusal> {
-    attention_flashinfer_prefill(
-        ctx,
-        q,
-        o,
-        attn_logits_soft_cap,
-        sm_scale,
-        kvc,
-        qo_indptr,
-        head_dim,
-        plan_cache,
-        qo_indptr_host,
-        kv_page_indptr_host,
-        kv_num_heads,
-        window_left,
-        Some(_lse),
-    )
 }
 
 fn prefill_plan_usable(plan: &PrefillPlan) -> Result<(), Refusal> {

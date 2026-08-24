@@ -62,11 +62,15 @@ cuda-13 = ["_cuda", "cudarc/cuda-13000"]
 _cuda = ["dep:cudarc"]
 
 [dependencies]
-# The routine registry — see the workspace table for why this one.
-linkme = { workspace = true }
-inventory = { workspace = true }
-# The vocabulary a row is written in: `KernelSig`, `LaunchRule`, `Ty`,
-# `Source`. Layer 1 is this crate's re-export of it.
+# `linkme` AND `inventory` STOOD HERE, and they were the routine registry: a
+# `distributed_slice` of `Routine<Cuda>` on every host target and an
+# `inventory` collection on wasm, filled by 208 `#[routine]` fns. Every
+# launch is a `#[claims]` body or a function beside one now, and the one
+# question the registry was still asked — "which symbol answers this claim's
+# canon" — is `CANON`, four rows in `src/lib.rs`.
+#
+# The vocabulary a launch is written in: `Fire`, `LaunchRule`, `Ty`,
+# `Source`, the marks. Layer 1 is this crate's re-export of it.
 kernels = { path = "../kernels" }
 # `#[routine]`, which reads a launcher's Rust signature and derives the
 # `Source` per parameter. A separate crate because `proc-macro = true`

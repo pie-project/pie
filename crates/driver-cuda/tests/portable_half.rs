@@ -19,6 +19,10 @@
 //! `compressed_plane_geometry` came to be parity-tested with zero callers, for
 //! months, without anyone noticing.
 //!
+//! The last two never found a caller and are DELETED: this file's
+//! `the_attention_geometries_resolve` was the only place either of them ran,
+//! which is a module kept alive by the test that noticed it was dead.
+//!
 //! The gate now ends at the modules that own DEVICE MEMORY. That is the
 //! honest boundary: `kv_geometry` says what shape the pages are and
 //! `kv_cache` allocates them, and only the second one needs a card.
@@ -139,30 +143,6 @@ fn the_memory_planner_plans() {
         "and a request width"
     );
     assert!(planned.plan.kv_page_size > 0, "and a page size");
-}
-
-/// The geometry modules resolve their shapes.
-///
-/// `mla_geometry` and `compressed_plane_geometry` are the other two the rule names.
-/// They are still waiting on a forward path — there is no MLA arm in the
-/// executor — so this is the ONLY place either of them runs.
-#[test]
-fn the_attention_geometries_resolve() {
-    use driver_cuda::layout::{compressed_plane_geometry, mla_geometry};
-
-    // DeepSeek's numbers: 512 compressed KV, 64 rope.
-    let mla = mla_geometry::MlaGeometry::new(8, 128, 16, 512, 64, driver_cuda::DType::Bf16)
-        .expect("a deepseek-shaped MLA resolves");
-    assert!(
-        mla.ckv_layer_bytes() > 0,
-        "an MLA layer has a size before it has an address"
-    );
-    assert_eq!(mla.kv_lora_rank() + mla.qk_rope_head_dim(), 576, "512 + 64");
-
-    let widths = compressed_plane_geometry::layer_widths(&[1, 2, 4], 3, 128);
-    assert_eq!(widths.len(), 3, "one width per layer");
-    let per_token = compressed_plane_geometry::compress_bytes_per_token(&[1, 2, 4], 128);
-    assert!(per_token > 0, "a compressed token costs something");
 }
 
 /// The KV geometry answers page shapes with no pages allocated.

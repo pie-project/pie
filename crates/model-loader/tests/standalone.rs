@@ -73,29 +73,24 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 ///   separate, so it has to live somewhere, and it lives in one module.
 /// * `executor/walk.rs` — it runs a finished plan, which means copying
 ///   weight bytes; that is its whole job. (It lived under `testkit/` until
-///   `pie model convert` made it a production path.)
-/// * `cache_key.rs` — the on-disk plan cache. It stats and writes files that are
-///   outputs of compilation, never inputs to it.
+///   `pie model import` made it a production path.)
 /// * `verify.rs` — staleness. `verify` is deliberately *not* `compile`: its
 ///   whole point is to compare a plan against the world it was compiled for, so
 ///   asking whether the files still have the recorded sizes is the check, not a
 ///   leak. A `compile` that could do this would be a different function.
-/// * `testkit.rs` — feature-gated test support (the fixture writer). The
-///   build this property protects — the worker's — compiles with `testkit`
-///   off, so the gate enforces for production what this exemption relaxes
-///   for tests.
+///
+/// Two names left this list by losing their reason rather than by argument.
+/// cache_key.rs stated and wrote the on-disk plan cache; it had no callers at
+/// all and is deleted. `testkit.rs` was exempted for a fixture writer that was
+/// never called either — what is left under `testkit/` computes over values and
+/// opens nothing, so it is held to the same rule as the rest.
 ///
 /// An exemption that names no file is itself an offence — weight_store.rs was
 /// on this list for a module that had been deleted, and a list of exemptions
 /// is a list nothing else checks.
 #[test]
 fn nothing_below_the_reader_opens_a_file() {
-    const ALLOWED: &[&str] = &[
-        "executor/walk.rs",
-        "cache_key.rs",
-        "verify.rs",
-        "testkit.rs",
-    ];
+    const ALLOWED: &[&str] = &["executor/walk.rs", "verify.rs"];
     // `Path`/`PathBuf` are values and may be passed around freely; what must not
     // appear is anything that *touches* the filesystem.
     const FORBIDDEN: &[&str] = &[

@@ -194,7 +194,7 @@ fn attributes_of(source: &Source) -> Attributes {
 
 /// Verifies every tensor digest of a `.zt` artifact; returns the tensor count.
 ///
-/// The gate a destructive caller (`pie model convert --delete-source`) runs
+/// The gate a destructive caller (`pie model import --delete-source`) runs
 /// before destroying what the artifact was computed from. A part *without* a
 /// digest fails rather than passes: "nothing was checked" cannot justify a
 /// delete.

@@ -1,76 +1,37 @@
+//! The host programs a DRIVER fires, collected by caller rather than by
+//! family.
+//!
+//! Every other module in this crate is a family: a `#[claims]` impl and the
+//! launches its bodies make. Nothing here answers a point. What the file
+//! holds is the launches whose caller is the executor rather than a
+//! statement — the paging geometry an envelope is composed from, the
+//! graph-padding row writer, the two weight transcoders a load plan names —
+//! and one measurement.
+//!
+//! [`qwen_gdn_post_conv_prep_bf16`] IS THE MEASUREMENT. It is the composite
+//! prologue the legacy executor fired for qwen's gated delta: the
+//! post-convolution `qkv` in, five compact f32 planes out. `ssm.gdn_prep` is
+//! claimed by a different launch over the PACKED rows a statement carries
+//! (see `crate::ssm`'s header for why the two are different statements), and
+//! `kernels-cuda/tests/gdn_chunk_prefill.rs` measures that claim against
+//! this one, at four rows, where the executor's old pointer cut did not
+//! agree with itself. That test is its only reader and this is what it is
+//! for.
+
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use kernels::{Bind, Fire};
-use kernels_macros::routine;
 
 use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
 use crate::jit::{Ctx, Launch};
-use crate::{norm, quant};
+use crate::quant;
 use kernels::Refusal;
-use kernels::routine::{Const, In, InOut, Out};
+use kernels::routine::{Const, In, Out};
 
 const BLOCK: u32 = 256;
 
-#[routine(namespace = "attn", canon = "layout.split_qkv")]
-pub fn split_qkv_bf16(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<bf16>>,
-    q_out: Out<Tensor<bf16>>,
-    k_out: Out<Tensor<bf16>>,
-    v_out: Out<Tensor<bf16>>,
-) -> Result<(), Refusal> {
-    let q = q_out.all("the q half")?;
-    let k = k_out.all("the k half")?;
-    let (q_dim, kv_dim) = (q.width, k.width);
-    if q_dim <= 0 && kv_dim <= 0 {
-        return Err(Refusal::Empty {
-            what: "q_dim and kv_dim",
-        });
-    }
-    let n_tokens = q.rows;
-    let width = q_dim.max(kv_dim).unsigned_abs();
-    ctx.fire(
-        Fire::at(
-            "attn/split_packed.cuh",
-            "::pie::attn::split_qkv<::pie::bf16>",
-        )
-        .apply(Launch::grid(
-            [width.div_ceil(BLOCK), n_tokens.unsigned_abs(), 1],
-            [BLOCK, 1, 1],
-        )),
-        &[
-            packed.arg(),
-            q_out.arg(),
-            k_out.arg(),
-            v_out.arg(),
-            q_dim.arg(),
-            kv_dim.arg(),
-        ],
-    )
-}
-
-pub fn add_bias_bf16(
-    ctx: &Ctx<'_>,
-    out: *mut c_void,
-    bias: *const c_void,
-    num_rows: i32,
-    dim: i32,
-) -> Result<(), Refusal> {
-    norm::add_bias::<bf16>(
-        ctx,
-        InOut {
-            ptr: out.cast::<bf16>(),
-            rows: num_rows,
-            width: dim,
-        },
-        Const {
-            v: bias.cast::<bf16>(),
-        },
-    )
-}
-
-#[routine(namespace = "ssm", canon = "ssm.gdn_prep")]
+#[allow(clippy::too_many_arguments)]
 pub fn qwen_gdn_post_conv_prep_bf16(
     ctx: &Ctx<'_>,
     qkv_post: In<Tensor<bf16>>,
@@ -144,103 +105,6 @@ pub fn qwen_gdn_post_conv_prep_bf16(
             v_d.arg(),
             conv_dim.arg(),
         ],
-    )
-}
-
-#[routine(namespace = "layout", canon = "layout.split_q_gate")]
-pub fn split_q_gate_bf16(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<bf16>>,
-    q_out: Out<Tensor<bf16>>,
-    gate_out: Out<Tensor<bf16>>,
-    head_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    let head_dim = *head_dim;
-    let q = q_out.all("the query half")?;
-    if head_dim <= 0 {
-        return Err(Refusal::Unstated {
-            what: "the head pitch a q/gate split grids by",
-        });
-    }
-    if q.width % head_dim != 0 {
-        return Err(Refusal::Unstated {
-            what: "a q/gate half whose width is not whole heads",
-        });
-    }
-    let (n, num_heads) = (q.rows, q.width / head_dim);
-    let block = if head_dim < 128 { 64 } else { 128 };
-    ctx.fire(
-        Fire::at(
-            "layout/deinterleave.cuh",
-            "::pie::layout::split_q_gate<::pie::bf16>",
-        )
-        .apply(Launch::grid(
-            [n.unsigned_abs(), num_heads.unsigned_abs(), 1],
-            [block, 1, 1],
-        )),
-        &[
-            packed.arg(),
-            q_out.arg(),
-            gate_out.arg(),
-            n.arg(),
-            num_heads.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-#[routine(namespace = "mlp", canon = "gate.sigmoid_mul", out(x = like(x)))]
-pub fn sigmoid_gate_inplace_bf16(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    gate: In<Tensor<bf16>>,
-) -> Result<(), Refusal> {
-    let num_elements = x.all("the gated rectangle")?.elements();
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            "::pie::mlp::sigmoid_gate_inplace<::pie::bf16>",
-        )
-        .apply(Launch::flat(num_elements.unsigned_abs(), BLOCK)),
-        &[x.arg(), gate.arg(), num_elements.arg()],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn rmsnorm_gated_fp32_in_bf16(
-    ctx: &Ctx<'_>,
-    x: *const c_void,
-    gate: *const c_void,
-    weight: *const c_void,
-    y: *mut c_void,
-    num_rows: i32,
-    hidden: i32,
-    eps: f32,
-    per_head_dim: i32,
-) -> Result<(), Refusal> {
-    let shape = |p: *mut bf16| Out {
-        ptr: p,
-        rows: num_rows,
-        width: hidden,
-    };
-    norm::rmsnorm_gated_fp32_in::<bf16>(
-        ctx,
-        In {
-            ptr: x.cast::<f32>(),
-            rows: num_rows,
-            width: hidden,
-        },
-        In {
-            ptr: gate.cast::<bf16>(),
-            rows: num_rows,
-            width: hidden,
-        },
-        Const {
-            v: weight.cast::<f32>(),
-        },
-        shape(y.cast::<bf16>()),
-        Const { v: eps },
-        Const { v: per_head_dim },
     )
 }
 

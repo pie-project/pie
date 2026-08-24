@@ -48,8 +48,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
         let first = &m.layers[0].attn_norm;
         let mut normed = kernels::norm::rmsnorm(&y, &first.weight, first.eps);
 
-        for (l, w) in m.layers.iter().enumerate() {
-            let l = l as u32;
+        for (l, w) in inputs.layers(&m.layers) {
             let at = &w.attn;
             let d = at.kind.head_dim();
             let pages = inputs.kv(&at.kv);
@@ -75,15 +74,15 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                             at.kind.theta(),
                             &fast_pos,
                         );
-                        let qr = qkv_unfused(&rest_x, &rest_pos, at, qkv, k_norm, &pages, l);
+                        let qr = qkv_unfused(&rest_x, &rest_pos, at, qkv, k_norm, &pages);
                         merge![qf, qr]
                     } else {
-                        qkv_unfused(&normed, &inputs.positions(), at, qkv, k_norm, &pages, l)
+                        qkv_unfused(&normed, &inputs.positions(), at, qkv, k_norm, &pages)
                     }
                 }
             };
 
-            seam::at(seam::ATTN_Q, (&q,), l);
+            seam::at(seam::ATTN_Q, (&q,));
 
             let win = at.kind.window();
             let [mq, dq, p] = q.split([Facts::masked(), Facts::qo_one(), Predicate::rest()]);
@@ -92,8 +91,8 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                 kernels::attention::decode(&dq, &pages, win, d, at.sm_scale),
                 kernels::attention::prefill(&kernels::query_windows(&p), &pages, win, d, at.kind.kv_heads(), at.sm_scale),
             ];
-            seam::at(seam::ATTN_OUT, (&a,), l);
-            let o = kernels::gemm::attention_landing(&a, &w.o_proj, l);
+            seam::at(seam::ATTN_OUT, (&a,));
+            let o = kernels::gemm::attention_landing(&a, &w.o_proj);
             let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
 
             let pan = &w.post_attn_norm;
@@ -150,7 +149,6 @@ fn qkv_unfused<W1: Dtype>(
     qkv: &Qkv<W1>,
     k_norm: &Norm<W1>,
     pages: &Pages,
-    l: u32,
 ) -> Value {
     let d = at.kind.head_dim();
     let (q, k, v) = match qkv {
@@ -161,7 +159,7 @@ fn qkv_unfused<W1: Dtype>(
             (kernels::gemm::matmul(x, q), kernels::gemm::matmul(x, k), kernels::gemm::matmul(x, v))
         }
     };
-    seam::at(seam::ATTN_QV, (&q, &v), l);
+    seam::at(seam::ATTN_QV, (&q, &v));
     let v = kernels::norm::rmsnorm_no_scale(&v, d, at.q_norm.eps);
     let q = kernels::norm::rmsnorm_per_head(&q, &at.q_norm.weight, d, at.q_norm.eps);
     let k = kernels::norm::rmsnorm_per_head(&k, &k_norm.weight, d, k_norm.eps);

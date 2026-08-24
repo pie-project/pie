@@ -12,7 +12,7 @@
 //! * how wide is the logits row the sampler operates on, and how many layers
 //!   deep is the tower ([`Row::vocab`], [`Row::layers`]);
 //! * how do I turn an image or a clip into the tokens and the geometry the
-//!   model was trained on ([`multimodal`]);
+//!   model was trained on (`multimodal`, behind the `serve` feature);
 //! * what did the artifact this process was handed actually carry
 //!   ([`ModelMetadata`], [`encoding`]).
 //!
@@ -30,28 +30,29 @@
 //! behaviour, one namespace over. What changed is the shape of the thing it
 //! reads.
 //!
-//! # `ROWS` is a projection, not a second catalog
+//! # `ROWS` is the catalog's serving face, and there is no other catalog
 //!
 //! `model-legacy`'s `catalog::Variant` answered seven questions: an id, a
 //! manifest, a load shape, a deployment, an authoring pass, a trace, a chat
-//! template. `engine` asked three of them — layers, logits width, template —
-//! and the other four are precisely what the baker path replaces. [`Row`]
-//! states those three and nothing else, which is why it is a flat `const` table
-//! rather than a trait: three columns per shipping id, no deployment algebra to
-//! run and nothing to refuse.
+//! template. R3 deleted that crate. What is left is this table and
+//! [`crate::catalog`]: the table states the four things a serving process
+//! asks that no computation states — the SKU, the architecture label, the
+//! context ceiling, and the chat template — and everything else is read off
+//! the SKU's own traced plan ([`crate::deployment::Deployment::of`]).
 //!
-//! The numbers are MEASURED, not transcribed: every column is asserted equal to
-//! the legacy catalog's own answer by `model-legacy`'s `serve_rows_agree` test,
-//! which links both crates and dies with the legacy one.
+//! The two numbers that ARE also computation facts, `layers` and `vocab`,
+//! are stated here because `engine` and `worker` size a sampler and a
+//! recognizer without ever holding a plan. They are not a second opinion:
+//! `tests/rows_are_the_traces.rs` asserts each one equal to what the row's
+//! own trace says, which is the pin `model-legacy/tests/serve_rows.rs` used
+//! to hold against the OTHER catalog and now holds against this crate's.
 //!
-//! THE IDS ARE THE DRIVER'S SPELLING. `engine::model::register` is handed the
-//! id the driver reported loading, and today every driver reports the legacy
-//! catalog's spelling (`"qwen3.5-35b-a3b"`), not the baker SKU's
-//! (`"qwen35-a3b-bf16-kv-bf16"`) — `driver-cuda`'s `baker::sku_for` BRIDGE
-//! exists exactly because the two spellings differ. This table is therefore
-//! keyed the way the wire is keyed. When R2/R3 collapses the two id spaces,
-//! this table's keys move with the wire and its columns come off
-//! [`crate::catalog`], which states the same numbers already.
+//! THE IDS ARE THE SKU. They used to be the legacy catalog's spelling
+//! (`"qwen3.5-35b-a3b"`), because that is what a driver reported having
+//! loaded, and `driver-cuda`'s `baker::sku_for` BRIDGE existed to translate.
+//! R3 collapsed the two id spaces into one: a driver identifies a checkpoint
+//! against [`crate::imports`] and reports the SKU it matched, the engine
+//! looks that SKU up here, and the bridge is deleted.
 
 use std::sync::Arc;
 
@@ -59,6 +60,10 @@ use tokenizer::Tokenizer;
 
 pub mod encoding;
 pub mod instruct;
+/// Host-side image and clip decode. The one part of this module that needs a
+/// codec, and so the one part behind the `serve` feature: a driver links this
+/// crate for its catalog and must not link twenty image crates to get one.
+#[cfg(feature = "serve")]
 pub mod multimodal;
 
 mod chatml;
@@ -72,20 +77,29 @@ mod metadata;
 pub use instruct::Instruct;
 pub use metadata::ModelMetadata;
 
-/// One shipping model, as a *serving* runtime sees it.
+/// One shipping SKU, as a *serving* runtime sees it.
 pub struct Row {
-    /// The id the driver reports having loaded (see the module doc on
-    /// whose spelling this is).
+    /// The SKU — a `crate::catalog()` row name, and the id every part of the
+    /// tree now spells (see the module doc on whose spelling this is).
     pub id: &'static str,
     /// Transformer layers in the tower.
     pub layers: u32,
-    /// The LOGITS width — `config.json`'s `vocab_size`, which is the dim the
-    /// sampler operates on and the driver's recognizer table is keyed by.
+    /// The LOGITS width — the leading extent of the `embed` table, which is
+    /// the dim the sampler operates on and the driver's recognizer table is
+    /// keyed by.
     ///
     /// It may EXCEED the tokenizer's token count (qwen3: 151 936 logits vs
     /// 151 669 tokens). Sizing a sampler from the tokenizer instead is the
     /// vocab-padding device fault.
     pub vocab: u32,
+    /// The architecture label a driver advertises and a control plane files
+    /// this model under. A DEPLOYMENT fact: no trace states it, because a
+    /// trace says what a layer computes and not what a fleet calls it.
+    pub arch: &'static str,
+    /// The context ceiling this deployment admits, or `0` for a row whose
+    /// legacy spec stated none. Also a deployment fact, and also stated
+    /// nowhere in a plan.
+    pub max_model_len: u32,
     /// How this model's turns are written and read back.
     ///
     /// A `fn` and not a `dyn` because a template needs the process's
@@ -126,91 +140,140 @@ fn deepseek_r1(tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     Arc::new(deepseek::R1Instruct::new(tokenizer))
 }
 
-/// Every id this build can serve, in catalog order.
+/// Every SKU this build can serve, in catalog order.
+///
+/// One row per `crate::catalog()` entry that has a chat template, keyed by
+/// the SKU — which is now the ONLY id space in the tree. Every number is
+/// asserted equal to the SKU's own traced [`Plan`](model_ir::plan::Plan) by
+/// `tests/rows_are_the_traces.rs`.
 pub const ROWS: &[Row] = &[
     Row {
-        id: "qwen3.5-0.8b-base",
-        layers: 24,
-        vocab: 248_320,
-        template: qwen_chatml,
+        id: "dsv4-base-bf16-kv-bf16",
+        layers: 6,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+        max_model_len: 0,
+        template: deepseek_r1,
     },
     Row {
-        id: "qwen3.5-4b",
-        layers: 32,
-        vocab: 248_320,
-        template: qwen_chatml,
+        id: "dsv4-base-bf16-kv-bf16-tp2",
+        layers: 6,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+        max_model_len: 0,
+        template: deepseek_r1,
     },
     Row {
-        id: "qwen3.5-9b",
-        layers: 32,
-        vocab: 248_320,
-        template: qwen_chatml,
-    },
-    Row {
-        id: "qwen3.5-35b-a3b",
-        layers: 40,
-        vocab: 248_320,
-        template: qwen_chatml,
-    },
-    Row {
-        id: "qwen3.6-27b",
-        layers: 64,
-        vocab: 248_320,
-        template: qwen_chatml,
-    },
-    Row {
-        id: "gemma-4-e2b",
-        layers: 35,
-        vocab: 262_144,
-        template: gemma4,
-    },
-    Row {
-        id: "gemma-4-e4b",
+        id: "gemma4-e4b-bf16-kv-bf16",
         layers: 42,
         vocab: 262_144,
+        arch: "gemma4",
+        max_model_len: 131_072,
         template: gemma4,
     },
     Row {
-        id: "gemma-4-31b",
+        id: "gemma4-31b-bf16-kv-bf16",
         layers: 60,
         vocab: 262_144,
+        arch: "gemma4",
+        max_model_len: 262_144,
         template: gemma4,
     },
     Row {
-        id: "gemma-4-26b-a4b",
-        layers: 30,
+        id: "gemma4-31b-bf16-kv-bf16-tp2",
+        layers: 60,
         vocab: 262_144,
+        arch: "gemma4",
+        max_model_len: 262_144,
         template: gemma4,
     },
     Row {
-        id: "glm-5-106b-a12b",
+        id: "glm5-a12b-bf16-bf16-kv-bf16",
         layers: 46,
         vocab: 151_552,
+        arch: "glm_moe_dsa",
+        max_model_len: 0,
         template: glm_chatml,
     },
     Row {
-        id: "gpt-oss-20b",
+        id: "glm5-a12b-bf16-bf16-kv-bf16-tp2",
+        layers: 46,
+        vocab: 151_552,
+        arch: "glm_moe_dsa",
+        max_model_len: 0,
+        template: glm_chatml,
+    },
+    Row {
+        id: "gptoss-20b-bf16-mxfp4-kv-bf16",
         layers: 24,
         vocab: 201_088,
+        arch: "gptoss",
+        max_model_len: 131_072,
         template: gpt_oss,
     },
     Row {
-        id: "gpt-oss-120b",
+        id: "gptoss-120b-bf16-mxfp4-kv-bf16",
         layers: 36,
         vocab: 201_088,
+        arch: "gptoss",
+        max_model_len: 131_072,
         template: gpt_oss,
     },
     Row {
-        id: "kimi-k3",
+        id: "gptoss-120b-bf16-mxfp4-kv-bf16-tp2",
+        layers: 36,
+        vocab: 201_088,
+        arch: "gptoss",
+        max_model_len: 131_072,
+        template: gpt_oss,
+    },
+    Row {
+        id: "kimik3-bf16-mxfp4-kv-bf16",
         layers: 8,
         vocab: 163_840,
+        arch: "kimi_k3",
+        max_model_len: 0,
         template: kimi,
     },
     Row {
-        id: "deepseek-v4",
-        layers: 6,
-        vocab: 129_280,
-        template: deepseek_r1,
+        id: "kimik3-bf16-mxfp4-kv-bf16-tp2",
+        layers: 8,
+        vocab: 163_840,
+        arch: "kimi_k3",
+        max_model_len: 0,
+        template: kimi,
+    },
+    Row {
+        id: "qwen35-a3b-bf16-kv-bf16",
+        layers: 40,
+        vocab: 248_320,
+        arch: "qwen3_5",
+        max_model_len: 262_144,
+        template: qwen_chatml,
+    },
+    Row {
+        id: "qwen35-a3b-bf16-kv-bf16-tp2",
+        layers: 40,
+        vocab: 248_320,
+        arch: "qwen3_5",
+        max_model_len: 262_144,
+        template: qwen_chatml,
+    },
+    Row {
+        id: "qwen35-d3b-bf16-kv-bf16",
+        layers: 24,
+        vocab: 151_936,
+        arch: "qwen3_5",
+        max_model_len: 262_144,
+        template: qwen_chatml,
+    },
+    Row {
+        id: "qwen35-d0.8b-bf16-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+        max_model_len: 262_144,
+        template: qwen_chatml,
     },
 ];
 
@@ -277,12 +340,15 @@ mod tests {
     /// engine's "the driver loaded X, nearest ids: .." refusal rests on.
     #[test]
     fn an_unknown_id_is_none_and_names_its_near_misses() {
-        assert!(row("qwen3.5-0.8b-bas").is_none());
+        assert!(row("qwen35-d0.8b-bf16-kv-bf1").is_none());
         assert_eq!(
-            nearest_ids("qwen3.5-0.8b-bas", 1),
-            vec!["qwen3.5-0.8b-base"]
+            nearest_ids("qwen35-d0.8b-bf16-kv-bf1", 1),
+            vec!["qwen35-d0.8b-bf16-kv-bf16"]
         );
-        assert!(row("gpt-oss-21b").is_none());
-        assert_eq!(nearest_ids("gpt-oss-21b", 1), vec!["gpt-oss-20b"]);
+        assert!(row("gptoss-21b-bf16-mxfp4-kv-bf16").is_none());
+        assert_eq!(
+            nearest_ids("gptoss-21b-bf16-mxfp4-kv-bf16", 1),
+            vec!["gptoss-20b-bf16-mxfp4-kv-bf16"]
+        );
     }
 }

@@ -232,7 +232,8 @@ pub mod kernel {
     /// projection sites. Returns nothing; legal only in the pass prologue
     /// (T11 — a pass-wide sink must precede everything that consumes it).
     ///
-    /// Three invariants carried from the design (`tensor-ir-log.md` §6.5):
+    /// Three invariants carried from the design (`tensor-ir-log.md` §6.5 —
+    /// doc not in tree; the three are stated in full below):
     ///
     /// * `a` is `[num_layers, R, d]` and `b` is `[num_layers, d_out, R]`, with
     ///   the rank `R` trace-known — a different rank is a different traced

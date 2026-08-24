@@ -12,21 +12,22 @@
 //! | three hand-uploaded runtime planes | the fire's own, through `FireViews::streams` |
 //! | its own `DecodePlanCache`, replanned per fire | the driver's, raised per fire by `raise_attn_plans` |
 //!
-//! What did NOT change is the arena, and that is the honest MVP this work
-//! ships with rather than around: see [`Fire::arena`].
+//! What did NOT change is the arena's SHAPE — one block, cut by the walk's
+//! offsets — and what did change is how much of it there is: the offsets
+//! reuse now, so the block is the lane's busiest instant instead of the sum
+//! of everything it ever mints. See [`Fire::arena`].
 
 use core::ffi::c_void;
 use std::collections::BTreeMap;
 
 use kernels::raises::Struct;
-use kernels::routine::{Cache, In, Refusal};
+use kernels::routine::{Cache, Refusal};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::views::{KvCache, RecurrentState};
 use model_compiler::program::{Call, Dt, Program, Slot};
 use model_ir::plan::{Op, Plan, ValueId};
 
 use super::Bank;
-use super::geometry::Geometry;
 use super::marks::Rect;
 
 /// Everything one fire of the baker lane addresses.
@@ -39,25 +40,26 @@ pub(crate) struct Fire<'a> {
     pub stream: *mut c_void,
     /// The base of this fire's activation arena.
     ///
-    /// `rows * row_pitch` BYTES, WITH NO REUSE, and the no-reuse half is
-    /// `model_compiler::program`'s rather than a choice made here: the walk
-    /// assigns every result a fresh 16-byte-aligned offset and never frees
-    /// one, so `row_pitch` is the sum of every value the lane states. On
-    /// qwen35-d0.8b that is **2.45 MiB per row** — for a stack whose
-    /// activations are a few hundred KiB live at any moment.
+    /// `rows * row_pitch` BYTES, AND THE OFFSETS REUSE. Values whose lives do
+    /// not overlap share bytes — the walk's call, not this executor's
+    /// (`model_compiler::program::carve`), and this field did not change
+    /// shape when it landed, only size: qwen35-d0.8b went from **2.45 MiB
+    /// per row** to **487 KiB**, gemma4-31b from **21.8 MiB** to **1 MiB**,
+    /// both sitting exactly on the busiest-instant bound. A 64-row batch is
+    /// 30 MiB where it was 1.4 GiB.
     ///
-    /// How the block is CUT is [`Fire::rect`]'s, and it is value-major
-    /// rather than the row-major reading `program.rs` describes. The
-    /// argument is there; the short version is that the marks a kernel
-    /// takes carry no stride, so value-major is the only cut they can
-    /// express for a fire of more than one row.
+    /// How the block is CUT is [`Fire::rect`]'s, and it is value-major: the
+    /// marks a kernel takes carry no stride, so value-major is the only cut
+    /// they can express for a fire of more than one row. Reuse rides that
+    /// reading unchanged, because scaling every per-row offset and every
+    /// per-row size by `rows` is a uniform stretch — it preserves exactly
+    /// the disjointness (and the sharing) the walk assigned.
     ///
-    /// THE COST, STATED: a 64-row batch is 157 MiB of arena where liveness
-    /// analysis would want single-digit MiB. It is affordable at the batch
-    /// sizes this lane is being brought up at and it is not affordable at
-    /// serving ones. The fix is `program.rs`'s to make — arena liveness and
-    /// `InOut` aliasing are on the baker backlog as one item — and when it
-    /// lands this field does not change shape, only size.
+    /// WHAT REUSE COSTS THIS EXECUTOR: nothing at bind time and one rule at
+    /// read time — a rectangle is only its value's between the steps
+    /// `program::spans` says it is live. Every read here is from a step that
+    /// is running, and the single read past the walk (the `out` seam, in
+    /// `fire/launch.rs`) is the case the walk holds open to fire end.
     ///
     /// NOT the driver's `Scratch::arena`, deliberately: that one is sized
     /// `lowered.arena_bytes` for the LEGACY lowering firing beside this,
@@ -72,9 +74,6 @@ pub(crate) struct Fire<'a> {
     /// The driver's per-fire view arena: the KV pages, the recurrent slabs
     /// and the runtime planes, all bound to this fire's actual request.
     pub views: &'a crate::bind::views::FireViews,
-    pub geom: &'a Geometry,
-    /// The fa2 decode schedule this fire was raised on.
-    pub decode_plan: *const kernels_cuda::attn::fa2::plan::DecodePlanCache,
 }
 
 impl<'a> Fire<'a> {
@@ -89,26 +88,30 @@ impl<'a> Fire<'a> {
             } => Ok(Rect {
                 // VALUE-MAJOR, AND THAT IS THE WHOLE MULTI-ROW STORY.
                 //
-                // `program.rs` describes the arena row-major over FIRE ROWS:
-                // "every arena slot's row sits at `row * row_pitch +
-                // offset`" (`program.rs:22`, and the carve at :288-296). So
-                // a value's rows are `row_pitch` apart. But the marks a
-                // kernel is handed carry `{ptr, rows, width}` and NO STRIDE
-                // (`kernels/src/routine.rs:493-499`), so every kernel reads
-                // row `r` at `ptr[r * width]`. For a one-row fire the two
-                // agree and the smoke never met the difference. For rows > 1
-                // they do not, and the failure is silent: every address
-                // stays inside the arena and every launch succeeds.
+                // The marks a kernel is handed carry `{ptr, rows, width}`
+                // and NO STRIDE (`kernels/src/routine.rs:493-499`), so every
+                // kernel reads row `r` at `ptr[r * width]`. A value's rows
+                // must therefore be CONTIGUOUS, which is what this reading
+                // gives them: value `V` owns
+                // `[offset_V * rows, offset_V * rows + bytes_V * rows)` and
+                // its rows are `width` apart inside it.
                 //
-                // So this reads the SAME offsets value-major instead:
-                // value V owns `[offset_V * rows, offset_{V+1} * rows)` and
-                // its rows are `width` apart inside it. That is exactly
-                // what the strideless marks mean, and it fits, because the
-                // walk packs offsets in value order — the block is
-                // `(offset_{V+1} - offset_V) * rows`, which is at least
-                // `width * size * rows`, and the last one ends at
-                // `cursor * rows <= row_pitch * rows`, the arena's size.
-                // `offset` is 16-aligned, so `offset * rows` is too.
+                // A ROW-MAJOR READING WOULD PUT `row_pitch` BETWEEN THEM and
+                // agrees with this one only at `rows == 1` — where the smoke
+                // lives, which is why it never met the difference. For
+                // rows > 1 they disagree and the failure is silent: every
+                // address stays inside the arena and every launch succeeds.
+                // So `program.rs` states value-major and this reads it; the
+                // two descriptions of one arena no longer disagree on paper.
+                //
+                // REUSE RIDES THIS UNCHANGED. The walk hands out per-row
+                // offsets that SHARE between values never live at once, and
+                // multiplying every offset and every size by `rows` is a
+                // uniform stretch of the per-row layout — it preserves both
+                // the sharing and the disjointness exactly. What the sharing
+                // asks of this function is nothing: a rectangle is read only
+                // while its value is live, which is what a running step and
+                // the walk's held-open `out` seam both are.
                 //
                 // W10 SETTLED THE OTHER HALF and left this reading alone.
                 // The remaining disagreement was not here — it was four
@@ -118,17 +121,11 @@ impl<'a> Fire<'a> {
                 // DENSE rectangles only, and a packed row is cut by a
                 // kernel that is told the packing. So `rows > 1` fires.
                 //
-                // The two descriptions of one arena still disagree on
-                // paper, and that is `program.rs`'s to retire: value-major
-                // is what its offsets mean when the marks are read
-                // honestly, and its own prose still says row-major. Sizing
-                // does not change either way (`row_pitch * rows`), so the
-                // fix is a paragraph and an arena-liveness pass, not a
-                // relayout.
-                //
-                // SAFETY: `offset * rows` and the `rows * width` that
+                // SAFETY: the walk keeps `offset + bytes <= row_pitch` for
+                // every slot (`program::clashes` is that invariant's guard),
+                // so `offset * rows` and the `rows * factor * width` that
                 // follows it are bounded by `row_pitch * rows`, the arena's
-                // length, by the argument above.
+                // length. `offset` is 16-aligned, so `offset * rows` is too.
                 ptr: unsafe {
                     self.arena
                         .cast::<u8>()
@@ -216,28 +213,6 @@ impl<'a> Fire<'a> {
         })
     }
 
-    /// A runtime plane by name, for a staging shim that needs one the
-    /// statement does not carry as an operand.
-    pub(crate) fn rect_of_runtime(&self, name: &str) -> Result<Rect, Refusal> {
-        self.runtime(name)
-    }
-
-    /// This fire's write origin.
-    ///
-    /// A SCALAR SMUGGLED THROUGH THE POINTER CHANNEL: the appender reads
-    /// `first_token.ptr as i32` (`kernels-cuda/src/attn/mod.rs:2423`) and
-    /// the driver answers the same way (`bind/views.rs:93`). Zero is a real
-    /// origin, and the only one a fire with no peel split ever has — which
-    /// is why `FireStreams::named` answers it rather than treating the null
-    /// as absent.
-    ///
-    /// REUSED: taken off the fire's own streams rather than assumed zero,
-    /// so a peel tail's origin arrives correctly if this lane ever runs in
-    /// one.
-    pub(crate) fn first_token(&self) -> i32 {
-        self.views.streams.first_token
-    }
-
     pub(crate) fn input(&self, op: &Op, at: usize) -> Result<Rect, Refusal> {
         self.rect(*op.inputs.get(at).ok_or(Refusal::Unstated {
             what: "an operand this statement does not carry",
@@ -284,9 +259,17 @@ impl<'a> Fire<'a> {
     /// handed, so the executor has to put the operand's bytes in the
     /// result's rectangle before it fires — otherwise the launch mutates
     /// the operand and the result's column stays whatever the arena held.
-    /// Aliasing the two instead would be a liveness claim this executor has
-    /// no analysis to make, and it is the same claim the arena's no-reuse
-    /// rule is waiting on.
+    ///
+    /// AND THE ARENA'S REUSE DID NOT CHANGE THAT — it is what makes the copy
+    /// safe. The walk's spans are inclusive at the step that runs
+    /// (`program::Span`), so an operand read at step `s` and a result
+    /// written at step `s` are live together and can never be given the same
+    /// bytes: `from` and `to` are always disjoint here. Aliasing them
+    /// instead would be a claim about the kernel's own indexing — whether it
+    /// may read a lane of its input after writing that lane of its output —
+    /// which is a fact no plan states and no walk can infer. A text that
+    /// WANTS the aliasing already has a way to say so: a merge, which
+    /// allocates nothing.
     pub(crate) fn inout(&self, from: Rect, to: Rect) -> Result<Rect, Refusal> {
         let bytes = from.bytes();
         if bytes > 0 {
@@ -324,8 +307,8 @@ impl<'a> Fire<'a> {
     /// `slab`/`slot_stride_elems` for the recurrence arms, which the kernels
     /// read disjointly (`kernels-cuda/src/ssm.rs`). So both names resolve to
     /// the same view and the layer is what tells them apart. `Op::layer`
-    /// carries that index already, so nothing parses the suffix — a parse
-    /// would be a second spelling of a number the plan states.
+    /// carries that index, so nothing parses the suffix — a parse would be
+    /// a second spelling of a number the plan states.
     pub(crate) fn recurrent(&self, op: &Op) -> Result<Cache<Struct<RecurrentState>>, Refusal> {
         let layer = self.layer(op)?;
         let view = self
@@ -349,8 +332,9 @@ impl<'a> Fire<'a> {
     /// what is there.
     ///
     /// A RAISE HAS NO SHAPE -- one object with one lifetime, not a
-    /// rectangle (`kernels/src/routine.rs:543-560`).
-    pub(crate) fn pages(&self, op: &Op) -> Result<In<Struct<KvCache>>, Refusal> {
+    /// rectangle (`kernels/src/routine.rs:543-560`), which is what
+    /// `Cache::raised` unwraps it to.
+    pub(crate) fn pages(&self, op: &Op) -> Result<Cache<Struct<KvCache>>, Refusal> {
         let layer = self.layer(op)?;
         let view = self
             .views
@@ -360,64 +344,86 @@ impl<'a> Fire<'a> {
             .ok_or(Refusal::Absent {
                 what: "a kv page table for the layer this statement names",
             })?;
-        Ok(In {
+        Ok(Cache {
             ptr: core::ptr::from_ref(view),
-            rows: 0,
-            width: 0,
         })
     }
 
-    /// Which layer's pool a cache statement names.
+    /// Which layer's pool a cache statement addresses.
     ///
-    /// # The layer is in the NAME, and that is a seam
+    /// # Two columns, one for each half of the question
     ///
     /// The driver's pools are `Vec`s indexed by dense model layer:
-    /// `FireViews::kv[l]`, `FireViews::recurrent[l]`. The new DSL spells a
-    /// layer by putting it in the cache row's NAME — `kv.{l}`, `conv.{l}`,
-    /// `delta.{l}` (`model/src/qwen_3_5/forward.rs:36-42`, and every other
-    /// family the same way) — while `Op::layer` exists on the statement and
-    /// is left `None` by everything except `gemm.attention_landing`
-    /// (`model-dsl/src/kernels.rs:29` is its only `.layer(..)` caller).
+    /// `FireViews::kv[l]`, `FireViews::recurrent[l]`. `Op::cache` says a
+    /// pool row is addressed AT ALL — it is the name the text's `caches()`
+    /// declared and the statement joined to — and `Op::layer` says where in
+    /// the tower the statement stands, which is the index those vectors are
+    /// keyed by. Both are read here and neither is derived from the other.
     ///
-    /// So this parses the suffix, and it does so because there is nothing
-    /// else to read — not as a cross-check on a number the plan states
-    /// twice. **The fix is the DSL's**: `Stmt::cache` knows the row it is
-    /// naming and could set `.layer(l)` beside it, at which point this
-    /// function is one field read and the parse is deleted. Until then the
-    /// parse is the mechanism and is written down as one.
+    /// THIS USED TO PARSE THE NAME's suffix (`conv.7` -> 7), because
+    /// `Op::layer` was left `None` by every builder except
+    /// `gemm.attention_landing` and there was nothing else to read. The
+    /// recorder fills it now — a text's `inputs.layers(..)` loop opens the
+    /// scope and every statement inside it is stamped
+    /// (`model-dsl/src/record.rs`'s `Recorder::at`) — so the parse is gone
+    /// and this is one field read, which is what the note standing here
+    /// said the fix would be.
     ///
-    /// `Op::layer` is still PREFERRED where it is set, so the day the DSL
-    /// fills it this quietly starts using it and the parse becomes the
-    /// fallback it should always have been.
+    /// WHERE THE TWO READINGS DIFFER, gemma is the one place and the column
+    /// is the truthful one: its kv-sharing layers name another layer's row
+    /// (`kv.{source}`), so the suffix answered the row's OWNER while this
+    /// answers the layer that is computing. The driver's own view for a
+    /// shared layer already reports the source's pages
+    /// (`pools/kv_cache_live.rs::layer_view` resolves through
+    /// `kv_source_layer`), so indexing at the statement's layer lands on the
+    /// same storage by the pool's own alias table rather than by a second
+    /// reading of a string.
     fn layer(&self, op: &Op) -> Result<usize, Refusal> {
-        let name = op.cache.as_deref().ok_or(Refusal::Unstated {
-            what: "the cache row this statement names",
-        })?;
-        if let Some(l) = op.layer {
-            return Ok(l as usize);
+        if op.cache.is_none() {
+            return Err(Refusal::Unstated {
+                what: "the cache row this statement names",
+            });
         }
-        // `conv.7` -> 7. The separator is the LAST dot, so a family that
-        // ever names a row `gdn.conv.7` still resolves.
-        name.rsplit_once('.')
-            .and_then(|(_, n)| n.parse::<usize>().ok())
-            .ok_or(Refusal::Unstated {
-                what: "the layer this cache row's name encodes",
-            })
+        op.layer.map(|l| l as usize).ok_or(Refusal::Unstated {
+            what: "the layer this statement is read at",
+        })
     }
 
-    /// One step: the point shim, the staging table, or a refusal naming the
-    /// statement.
+    /// One step: the generated dispatch, the staging table, or a refusal
+    /// naming the statement.
     pub(crate) fn step(&self, at: u32, call: &Call) -> Result<(), Refusal> {
         let op = &self.plan.ops[at as usize];
         match call {
-            Call::Point(point) => super::points_shim::point(self, point, op),
+            // THE GENERATED DISPATCH, AND NO SHIM BESIDE IT. Every arm the
+            // hand-written `points_shim` carried is emitted from the point's
+            // own slot list into `kernels_cuda::points_dispatch`; what stays
+            // on this side is `super::bound::Bound`, which says where THIS
+            // executor's rectangles live. `baker-smoke` crossed at W5 and was
+            // byte-identical across the move; this crossed at R4b, because a
+            // claim body that pulls its staging off `Ctx` cannot be reached
+            // by an arm that never had a `Ctx` door.
+            //
+            // AND THE TIER-2 STATEMENT GOES THROUGH THE SAME DOOR, which is
+            // what `.wiki/baker.md` draws ("tier-2, same match"). The only
+            // difference is where the point it names was declared — an
+            // inherent method on `Ctx` rather than a family trait — and that
+            // is a fact about the plane crate, settled before this file is
+            // compiled. `Call::Tier2` carries the statement with the `cuda::`
+            // gate already stripped, which is the name the plane's own table
+            // spells. A SHIM STOOD HERE: "a tier-2 shim; this driver states
+            // none", refused at load and at fire, and gemma's fused decode
+            // arm was unreachable for as long as it did.
+            Call::Point(point) | Call::Tier2(point) => {
+                kernels_cuda::points_dispatch::dispatch(
+                    self.ctx,
+                    &super::bound::Bound {
+                        fire: self,
+                        op,
+                        point,
+                    },
+                )
+            }
             Call::Symbol(symbol) => super::staging::symbol(self, symbol, op),
-            // Named rather than swallowed: a SKU that states a tier-2
-            // statement needs a shim written for it, and the refusal says
-            // which one.
-            Call::Tier2(_) => Err(Refusal::Absent {
-                what: "a tier-2 shim; this driver states none",
-            }),
         }
     }
 }

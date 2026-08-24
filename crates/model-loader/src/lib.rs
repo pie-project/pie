@@ -13,7 +13,6 @@
 //! compiler below it opens nothing — [`executor::walk`] does, which is exactly
 //! why it is not the compiler.
 
-pub mod cache_key;
 pub mod checkpoint;
 pub mod codec;
 pub mod contract;

@@ -6,25 +6,9 @@ use anyhow::{Result, anyhow};
 
 #[cfg(feature = "_driver-cuda")]
 use crate::config::CudaNativeDriverOptions;
-#[cfg(feature = "driver-metal")]
-use crate::config::MetalDriverOptions;
-#[cfg(feature = "driver-vulkan")]
-use crate::config::VulkanDriverOptions;
-#[cfg(feature = "driver-wgpu")]
-use crate::config::WgpuDriverOptions;
 use crate::config::{self, DriverKind};
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
-
-/// Top-level dispatcher: the inbound `[model]` either binds to an
-/// in-process [`Flavor`] (C++/Rust static lib).
-///
-/// Returned by [`resolve_flavor`]; consumed by [`super::start_engine`]
-/// to pick which supervisor to spawn per group.
-#[derive(Copy, Clone, Debug)]
-pub enum ResolvedFlavor {
-    Embedded(Flavor),
-}
 
 /// Partition `world_size` ranks into ONE tensor-parallel group.
 ///
@@ -71,17 +55,16 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
         .collect())
 }
 
-/// Resolve the `[model].driver.type` to a [`ResolvedFlavor`]. Errors
-/// out with a clear, model-named message when the requested embedded
-/// flavor was not compiled into this binary.
-pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlavor> {
-    match kind {
-        DriverKind::CudaNative | DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => {
-            Flavor::from_kind(kind)
-                .map(ResolvedFlavor::Embedded)
-                .map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
-        }
-    }
+/// Resolve the `[model].driver.type` to the [`Flavor`] that hosts it, naming
+/// the model in the refusal when this binary hosts none.
+///
+/// A `ResolvedFlavor` enum STOOD HERE, wrapping the flavor in an `Embedded`
+/// variant, and a four-arm match fed it the same expression from every arm.
+/// It dated from a runtime with out-of-process drivers to dispatch to as
+/// well; every driver is a static lib now, so "which of the ways of hosting
+/// one" has one answer and does not need to be asked.
+pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<Flavor> {
+    Flavor::from_kind(kind).map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
 }
 
 /// Project a [`config::ModelConfig`] into the typed [`DriverOptions`]
@@ -91,13 +74,12 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 /// The cuda variant's `device` is filled from the first device in the
 /// model's list as a placeholder — the per-group spawn loop overwrites
 /// it with the right device for each DP replica.
+///
+/// One arm, because one flavor: the `Metal`, `Vulkan` and `Wgpu` arms went
+/// with their `Flavor` variants, and [`resolve_flavor`] refuses those kinds
+/// before a `DriverOptions` is ever asked for.
 #[cfg_attr(
-    not(any(
-        feature = "_driver-cuda",
-        feature = "driver-metal",
-        feature = "driver-vulkan",
-        feature = "driver-wgpu"
-    )),
+    not(feature = "_driver-cuda"),
     allow(
         unused_variables,
         unreachable_code,
@@ -123,41 +105,6 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
             })?;
             c.device = device.clone();
             Ok(DriverOptions::CudaNative(c))
-        }
-        #[cfg(feature = "driver-metal")]
-        Flavor::Metal => {
-            let p: MetalDriverOptions = m
-                .driver
-                .options
-                .clone()
-                .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            Ok(DriverOptions::Metal(p))
-        }
-        #[cfg(feature = "driver-vulkan")]
-        Flavor::Vulkan => {
-            let v: VulkanDriverOptions = m
-                .driver
-                .options
-                .clone()
-                .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            // `model.driver.device` is not consulted. `Device::open` takes
-            // the first Vulkan device the loader reports, so filling a
-            // selector in here would be a setting nothing acts on.
-            Ok(DriverOptions::Vulkan(v))
-        }
-        #[cfg(feature = "driver-wgpu")]
-        Flavor::Wgpu => {
-            let w: WgpuDriverOptions = m
-                .driver
-                .options
-                .clone()
-                .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            // Nor here, and for the reason one arm up: `wgpu` asks the
-            // platform for an adapter itself.
-            Ok(DriverOptions::Wgpu(w))
         }
     }
 }

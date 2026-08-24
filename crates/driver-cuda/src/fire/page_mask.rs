@@ -26,11 +26,12 @@
 //! body reads it through the view; nothing writes into it mid-fire. That is
 //! why it survives the hook that died beside it.
 //!
-//! THE SEAM: no arm of `baker::points_shim` takes the mask operand today, so
-//! the causal form is staged and unread and a frame that supplies its OWN
-//! mask is refused at launch rather than answered causally
-//! (`fire::launch::publish_seam_pins`). `from_words` below is the staging
-//! that refusal is waiting on.
+//! BOTH PLANNERS FIRE NOW. `fire::launch::publish_seam_pins` runs
+//! `from_words` for a frame that carries a mask and `plan_causal` for one
+//! that does not, and `attention.masked` is a claim body that reads the
+//! result through the raise door. What is refused is a text with no `masked`
+//! fact — one attention arm and it is causal — and that refusal is
+//! `baker::word_of`'s, where the lane is picked.
 
 /// The element mask the custom-mask attention dispatch reads — element-, not
 /// page-granularity like everything above.

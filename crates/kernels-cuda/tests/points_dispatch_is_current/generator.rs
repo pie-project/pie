@@ -17,10 +17,14 @@
 //!   and an arm for it would turn a measured gap into a call that refuses
 //!   one layer deeper.
 //!
-//! WHAT IT CANNOT READ. A tier-2 point is an inherent method on `Ctx` — no
-//! trait, so `#[claims]` never sees it and no table names it. Those stay
-//! hand-written wherever they are needed, and `Call::Tier2` is how a lane
-//! says so.
+//! AND THE PLANE'S TIER-2 SURFACE, off the same two reads. A tier-2 point is
+//! an inherent method on `Ctx` — no trait, so no floor table declares it —
+//! but `#[claims]` reads that block too (`.wiki/baker.md` says it does) and
+//! writes its slots into `TIER2_POINTS`. That is a point table like any
+//! other, so it generates like any other: same slot reader, same column
+//! counting, same `Elem^axes` match, ONE ARM IN THE SAME MATCH. What it does
+//! NOT have is a claim table, because a tier-2 point is declared and claimed
+//! by the same line — see [`Surface`].
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -31,53 +35,108 @@ use kernels::points::{
     Prim, ROPE_POINTS, SSM_POINTS,
 };
 
-/// One family: its trait, its points, and the plane's claims against them.
+/// One block of arms, and what it is generated from.
 ///
-/// THE ONE HAND-WRITTEN LIST IN THIS GENERATOR, and the seam is worth
-/// naming: `#[claims]` states its table BESIDE the impl, so a family's
-/// claims live in whichever module claimed them, and nothing in the tree
-/// enumerates either the point tables or the claim tables. A family added
-/// to `kernels/src/points.rs` and not added here would be generated as
+/// TWO KINDS, AND THE ASYMMETRY IS THE TIER ITSELF. A tier-1 family's points
+/// are DECLARED on the floor — every plane's obligation — and CLAIMED here,
+/// so it carries two tables and the gap between them IS the backlog. A tier-2
+/// surface is declared and claimed by the same inherent method, so it carries
+/// one table and can have no backlog row; and it has no trait, so nothing
+/// ever has to name a receiver through one — an inherent method wins method
+/// resolution outright.
+///
+/// THE ONE HAND-WRITTEN LIST IN THIS GENERATOR is [`surfaces`], and the seam
+/// is worth naming: `#[claims]` states its table BESIDE the impl, so a
+/// family's claims live in whichever module claimed them, and nothing in the
+/// tree enumerates either the point tables or the claim tables. A family
+/// added to `kernels/src/points.rs` and not added there would be generated as
 /// nothing at all. `every_claim_has_an_arm` in
 /// `tests/points_dispatch_is_current.rs` checks the half that IS
-/// checkable — that no claim named here was dropped on the way out — and a
+/// checkable — that no claim named there was dropped on the way out — and a
 /// registry (`linkme`, the way `#[routine]` collects) would close the rest.
-pub struct Family {
-    /// The trait, as `kernels::points` spells it: what the generated file
-    /// has to import for `ctx.<method>()` to resolve.
-    pub trait_name: &'static str,
-    pub points: &'static [Point],
-    pub claims: &'static [&'static str],
+pub enum Surface {
+    /// A tier-1 family: the floor declares `points`, this plane answers
+    /// `claims`, and the rest are measured backlog rows.
+    Family {
+        /// The trait, as `kernels::points` spells it: what the generated file
+        /// has to import for `ctx.<method>()` to resolve.
+        trait_name: &'static str,
+        points: &'static [Point],
+        claims: &'static [&'static str],
+    },
+    /// The plane's tier-2 surface: inherent methods on its own `Ctx`, whose
+    /// declaration and claim are one line.
+    Tier2 { points: &'static [Point] },
 }
 
-pub fn families() -> Vec<Family> {
+impl Surface {
+    /// The points this surface puts an arm in the dispatch for.
+    ///
+    /// An unclaimed tier-1 point keeps its family's default body and gets no
+    /// arm; every tier-2 point gets one, because there is no such thing as a
+    /// tier-2 point this plane declared and did not claim.
+    pub fn arms(&self) -> Vec<&'static Point> {
+        match self {
+            Surface::Family { points, claims, .. } => {
+                points.iter().filter(|p| claims.contains(&p.name)).collect()
+            }
+            Surface::Tier2 { points } => points.iter().collect(),
+        }
+    }
+
+    /// Every point this surface declares, answered or not. `arms` is the
+    /// answered half; the difference is the measured backlog.
+    pub const fn declares(&self) -> &'static [Point] {
+        match self {
+            Surface::Family { points, .. } | Surface::Tier2 { points } => points,
+        }
+    }
+
+    /// The trait this surface's arms are called through, where the method
+    /// name alone is ambiguous. `None` on the tier-2 surface: there is no
+    /// trait, and an inherent method needs no disambiguation.
+    const fn trait_name(&self) -> Option<&'static str> {
+        match self {
+            Surface::Family { trait_name, .. } => Some(trait_name),
+            Surface::Tier2 { .. } => None,
+        }
+    }
+}
+
+pub fn surfaces() -> Vec<Surface> {
     vec![
-        Family { trait_name: "Norm", points: NORM_POINTS, claims: kernels_cuda::norm::NORM_CLAIMS },
-        Family { trait_name: "Mlp", points: MLP_POINTS, claims: kernels_cuda::mlp::MLP_CLAIMS },
-        Family { trait_name: "Gemm", points: GEMM_POINTS, claims: kernels_cuda::gemm::GEMM_CLAIMS },
-        Family { trait_name: "Dist", points: DIST_POINTS, claims: kernels_cuda::dist::DIST_CLAIMS },
-        Family { trait_name: "Rope", points: ROPE_POINTS, claims: kernels_cuda::rope::ROPE_CLAIMS },
-        Family { trait_name: "Moe", points: MOE_POINTS, claims: kernels_cuda::moe::MOE_CLAIMS },
-        Family { trait_name: "Gate", points: GATE_POINTS, claims: kernels_cuda::mlp::GATE_CLAIMS },
-        Family {
+        Surface::Family { trait_name: "Norm", points: NORM_POINTS, claims: kernels_cuda::norm::NORM_CLAIMS },
+        Surface::Family { trait_name: "Mlp", points: MLP_POINTS, claims: kernels_cuda::mlp::MLP_CLAIMS },
+        Surface::Family { trait_name: "Gemm", points: GEMM_POINTS, claims: kernels_cuda::gemm::GEMM_CLAIMS },
+        Surface::Family { trait_name: "Dist", points: DIST_POINTS, claims: kernels_cuda::dist::DIST_CLAIMS },
+        Surface::Family { trait_name: "Rope", points: ROPE_POINTS, claims: kernels_cuda::rope::ROPE_CLAIMS },
+        Surface::Family { trait_name: "Moe", points: MOE_POINTS, claims: kernels_cuda::moe::MOE_CLAIMS },
+        Surface::Family { trait_name: "Gate", points: GATE_POINTS, claims: kernels_cuda::mlp::GATE_CLAIMS },
+        Surface::Family {
             trait_name: "Layout",
             points: LAYOUT_POINTS,
             claims: kernels_cuda::layout::LAYOUT_CLAIMS,
         },
-        Family { trait_name: "Ssm", points: SSM_POINTS, claims: kernels_cuda::ssm::SSM_CLAIMS },
-        Family {
+        Surface::Family { trait_name: "Ssm", points: SSM_POINTS, claims: kernels_cuda::ssm::SSM_CLAIMS },
+        Surface::Family {
             trait_name: "Attention",
             points: ATTENTION_POINTS,
             claims: kernels_cuda::attn::ATTENTION_CLAIMS,
         },
-        Family { trait_name: "Mla", points: MLA_POINTS, claims: kernels_cuda::attn::MLA_CLAIMS },
-        Family {
+        Surface::Family { trait_name: "Mla", points: MLA_POINTS, claims: kernels_cuda::attn::MLA_CLAIMS },
+        Surface::Family {
             trait_name: "Index",
             points: INDEX_POINTS,
             claims: kernels_cuda::attn::INDEX_CLAIMS,
         },
-        Family { trait_name: "Pool", points: POOL_POINTS, claims: kernels_cuda::attn::POOL_CLAIMS },
-        Family { trait_name: "Hc", points: HC_POINTS, claims: kernels_cuda::norm::HC_CLAIMS },
+        Surface::Family { trait_name: "Pool", points: POOL_POINTS, claims: kernels_cuda::attn::POOL_CLAIMS },
+        Surface::Family { trait_name: "Hc", points: HC_POINTS, claims: kernels_cuda::norm::HC_CLAIMS },
+        // THE TIER-2 SURFACE, and it reads from the PLANE and not the floor:
+        // `kernels::points` has no table for it to come from, because the
+        // methods it names exist only here. One line, like a family, because
+        // a plane may state more than one such block and each writes its own
+        // `TIER2_POINTS` in the module that claimed it.
+        Surface::Tier2 { points: kernels_cuda::attn::TIER2_POINTS },
     ]
 }
 
@@ -186,6 +245,13 @@ fn bank_column(point: &Point, r: usize) -> usize {
 /// `model-dsl/tests/builders_are_the_points.rs` makes when it picks between
 /// `&State` and `&Pages`, and a `Mark::Cache(Pool)` on the floor would
 /// retire both.
+///
+/// A TIER-2 POINT HAS NO FAMILY TO READ, its name being the method alone, so
+/// the split answers with the whole name and the paged arm is what it lands
+/// on. That is right for the one that exists and it is right for the reason
+/// the rule above is right — the recurrent pool is `Ssm`'s and nothing else's
+/// — but it is an accident of spelling rather than a reading, and it is the
+/// second thing the floor mark would close.
 fn pool(point: &Point) -> &'static str {
     let family = point.name.split('.').next().unwrap_or_default();
     if family == "ssm" { "op.recurrent()?" } else { "op.pages()?" }
@@ -261,7 +327,7 @@ fn witness(point: &Point, a: usize) -> String {
     site
 }
 
-/// The method names TWO CLAIMED FAMILIES BOTH DECLARE.
+/// The method names TWO SURFACES BOTH DECLARE.
 ///
 /// `Attention`, `Mla`, `Index` and `Pool` each declare a `kv_append`: four
 /// pools, four appends, one name. Every trait a family claims from is
@@ -269,16 +335,27 @@ fn witness(point: &Point, a: usize) -> String {
 /// moment a second one of them claims — which is what `mla.kv_append`
 /// landing did. The names are collected off the POINT tables rather than the
 /// claim tables, so an arm's spelling does not change when a sibling family
-/// claims or unclaims: what makes a name ambiguous is that two families
+/// claims or unclaims: what makes a name ambiguous is that two surfaces
 /// DECLARE it, and both traits are in scope either way.
-fn ambiguous(families: &[Family]) -> BTreeSet<&'static str> {
+///
+/// THE TIER-2 SURFACE IS COUNTED, and it is the one that would be silent.
+/// Two traits colliding is a compile error the moment the file is built; an
+/// INHERENT method colliding with a trait method is not — inherent wins
+/// method resolution outright, so a tier-2 `decode` would quietly steal
+/// `attention.decode`'s arm and the wrong kernel would fire. Counting it here
+/// makes the tier-1 arm spell its trait, which is exactly the fix, and leaves
+/// the tier-2 arm as `ctx.decode(..)`, which is exactly right.
+fn ambiguous(surfaces: &[Surface]) -> BTreeSet<&'static str> {
     let mut seen: BTreeSet<&'static str> = BTreeSet::new();
     let mut twice: BTreeSet<&'static str> = BTreeSet::new();
-    for f in families {
-        // One family cannot collide with itself: a trait's methods are
-        // distinct by definition.
+    for s in surfaces {
+        // One surface cannot collide with itself: a trait's methods are
+        // distinct by definition, and so are one impl block's.
         let mut mine: BTreeSet<&'static str> = BTreeSet::new();
-        for p in f.points {
+        let points = match s {
+            Surface::Family { points, .. } | Surface::Tier2 { points } => points,
+        };
+        for p in *points {
             mine.insert(p.name.split('.').next_back().expect("`family.method`"));
         }
         for m in mine {
@@ -299,7 +376,7 @@ fn call(
     point: &Point,
     at: &[&str],
     reprs_at: &[&str],
-    trait_name: &str,
+    trait_name: Option<&str>,
     shared: &BTreeSet<&'static str>,
 ) -> String {
     let method = point.name.split('.').next_back().expect("`family.method`");
@@ -363,10 +440,14 @@ fn call(
     // THE RECEIVER SPELLING IS THE DISAMBIGUATION, and nothing else
     // changes: `Mla::kv_append::<bf16>(ctx, ..)` is `ctx.kv_append::<bf16>(..)`
     // with the family said out loud. See `ambiguous`.
-    if shared.contains(method) {
+    //
+    // A TIER-2 ARM NEVER TAKES IT, shared name or not: there is no trait to
+    // say out loud, and an inherent method is what a shared name resolves to
+    // anyway.
+    if let Some(family) = trait_name.filter(|_| shared.contains(method)) {
         let mut all = vec!["ctx".to_string()];
         all.extend(args);
-        return format!("{trait_name}::{method}{turbofish}({})", all.join(", "));
+        return format!("{family}::{method}{turbofish}({})", all.join(", "));
     }
     format!("ctx.{method}{turbofish}({})", args.join(", "))
 }
@@ -379,7 +460,7 @@ fn call(
 /// the parameter table. They are separate questions with separate answers,
 /// but they pick ONE instantiation between them, so a nested match would be
 /// two places to write the same refusal.
-fn arm(point: &Point, trait_name: &str, shared: &BTreeSet<&'static str>) -> String {
+fn arm(point: &Point, trait_name: Option<&str>, shared: &BTreeSet<&'static str>) -> String {
     let mut out = String::new();
     let quantified = point.axes + point.reprs;
     if quantified == 0 {
@@ -428,6 +509,41 @@ fn arm(point: &Point, trait_name: &str, shared: &BTreeSet<&'static str>) -> Stri
     out
 }
 
+/// One row of [`generate`]'s claim census: the point, the slot its FIRST
+/// element axis is witnessed at, and the elements that axis is instantiated
+/// at.
+///
+/// THE TABLE IS THE MATCH, which is what closes the doubling
+/// `driver-cuda/src/baker/resolve.rs` used to carry by hand. That file needs
+/// to answer "does this plane claim this point, at the element this lane's
+/// rectangles ride" BEFORE anything fires, and a `match` cannot be
+/// enumerated — so it kept its own spelling of the arms and a note about why
+/// the drift was fail-safe. Both halves are written here now, from the same
+/// `witness` and the same `AXES` the arm above is written from, so there is
+/// nothing left to drift.
+///
+/// ONE WITNESS AND NOT ALL OF THEM. A point's arm matches on `axes + reprs`
+/// scrutinees; the census reports the first ELEMENT axis, because that is the
+/// one an executor can answer from the lowered plan alone — a repr comes off
+/// the parameter table and a second element axis rides a slot the first one
+/// already pins by construction (no declaration has two independent element
+/// axes today, and `#[points]` would have to grow a second witness rule
+/// before one could). `None` for a point that quantifies over nothing, which
+/// resolves by name.
+fn row(point: &Point) -> String {
+    let witness = if point.axes == 0 {
+        "None".to_string()
+    } else {
+        format!("Some({})", witness(point, 0))
+    };
+    let elements: Vec<&str> = AXES.iter().map(|(pattern, _)| *pattern).collect();
+    format!(
+        "    ({:?}, {witness}, &[{}]),\n",
+        point.name,
+        elements.join(", ")
+    )
+}
+
 /// `AXES^a × REPRS^r`, in odometer order — the elements first, then the
 /// reprs, which is the order `#[points]` makes a declaration state them in.
 fn cartesian(a: usize, r: usize) -> Vec<Vec<(&'static str, &'static str)>> {
@@ -461,24 +577,50 @@ fn cartesian(a: usize, r: usize) -> Vec<Vec<(&'static str, &'static str)>> {
 
 /// The file.
 pub fn generate() -> String {
-    let families = families();
-    let shared = ambiguous(&families);
+    let surfaces = surfaces();
+    let shared = ambiguous(&surfaces);
     let mut traits: BTreeSet<&'static str> = BTreeSet::new();
     let mut arms = String::new();
+    let mut census = String::new();
+    let mut tier2 = String::new();
     let mut claimed = 0usize;
-    for f in &families {
+    let mut inherent = 0usize;
+    for s in &surfaces {
         let mut wrote = false;
-        for p in f.points {
-            if !f.claims.contains(&p.name) {
-                continue;
-            }
+        for p in s.arms() {
             if !wrote {
-                let _ = writeln!(arms, "        // ── {} ──", p.name.split('.').next().unwrap_or_default());
+                let _ = writeln!(
+                    arms,
+                    "        // ── {} ──",
+                    // A tier-1 point's heading is its family; a tier-2 point
+                    // has none, and what its arms share is the tier.
+                    match s {
+                        Surface::Family { .. } =>
+                            p.name.split('.').next().unwrap_or_default(),
+                        Surface::Tier2 { .. } => "tier-2, inherent on Ctx",
+                    }
+                );
                 wrote = true;
             }
-            arms.push_str(&arm(p, f.trait_name, &shared));
-            claimed += 1;
-            traits.insert(f.trait_name);
+            arms.push_str(&arm(p, s.trait_name(), &shared));
+            // TWO CENSUSES, ONE PER CALL VARIANT. A lane reaches a tier-1
+            // point as `Call::Point` and a tier-2 statement as `Call::Tier2`,
+            // and an executor's eager pass asks its question against the one
+            // its call can actually produce — a `Call::Point` naming an
+            // inherent method is not a thing `call_of` can answer.
+            match s {
+                Surface::Family { .. } => {
+                    census.push_str(&row(p));
+                    claimed += 1;
+                }
+                Surface::Tier2 { .. } => {
+                    tier2.push_str(&row(p));
+                    inherent += 1;
+                }
+            }
+            if let Some(t) = s.trait_name() {
+                traits.insert(t);
+            }
         }
     }
     let traits = traits.into_iter().collect::<Vec<_>>().join(", ");
@@ -486,8 +628,9 @@ pub fn generate() -> String {
     let mut out = String::new();
     let _ = write!(
         out,
-        r#"//! GENERATED — do not edit. One arm per point this plane CLAIMS, read off
-//! `kernels::points`' slot lists and this crate's `*_CLAIMS` tables.
+        r#"//! GENERATED — do not edit. One arm per point this plane ANSWERS: the tier-1
+//! points it CLAIMS, read off `kernels::points`' slot lists and this crate's
+//! `*_CLAIMS` tables, and its TIER-2 surface, read off `TIER2_POINTS`.
 //!
 //! The generator is `tests/points_dispatch_is_current/generator.rs`;
 //! `cargo test -p kernels-cuda --test points_dispatch_is_current` refuses a
@@ -503,9 +646,17 @@ pub fn generate() -> String {
 //! needs that a statement does not carry is STAGING, and staging is not this
 //! file's job.
 //!
-//! {claimed} claimed point(s). An unclaimed point keeps its family's default
-//! body — a measured backlog row — and gets no arm here, so a lane that
-//! states one refuses with the point named rather than one call deeper.
+//! {claimed} claimed point(s) and {inherent} tier-2 point(s). An unclaimed
+//! tier-1 point keeps its family's default body — a measured backlog row —
+//! and gets no arm here, so a lane that states one refuses with the point
+//! named rather than one call deeper. A tier-2 point cannot be unclaimed: the
+//! inherent method that declares it is the claim.
+//!
+//! ONE MATCH FOR BOTH TIERS, which is what `.wiki/baker.md` draws, and the
+//! two name spaces cannot collide inside it: a tier-1 point is
+//! `family.method` and carries a dot, an inherent method cannot. A lane
+//! reaches the first as `Call::Point` and the second as `Call::Tier2`, having
+//! stripped the `cuda::` gate the plan spells it with.
 #![cfg_attr(rustfmt, rustfmt::skip)]
 // The families whose points are claimed change as the plane grows; the
 // prelude does not.
@@ -522,7 +673,29 @@ use kernels::routine::Refusal;
 use crate::jit::Ctx;
 use crate::jit::abi::bf16;
 
-/// Fire one bound statement through this plane's claims.
+/// Every point this plane claims, with the slot its element axis is read off
+/// and the elements that axis is instantiated at.
+///
+/// THE MATCH BELOW, ENUMERABLE. An executor that wants to know before it
+/// fires whether a lane's every statement will resolve cannot walk a
+/// `match`; it walks this. `None` is a point that quantifies over nothing and
+/// resolves by name alone.
+pub const CLAIMED: &[(&str, Option<Site>, &[Axis])] = &[
+{census}];
+
+/// The same, for this plane's TIER-2 surface — the points an inherent method
+/// on `Ctx` both declares and claims.
+///
+/// A SECOND TABLE AND NOT A COLUMN ON THE FIRST, because the two answer
+/// different questions asked by different call variants. `CLAIMED` answers
+/// "does this plane claim the tier-1 point this lane routed as
+/// `Call::Point`"; this answers the same of a `Call::Tier2`. A row in the
+/// wrong table would be a row no call can reach.
+pub const TIER2: &[(&str, Option<Site>, &[Axis])] = &[
+{tier2}];
+
+/// Fire one bound statement through this plane's claims and its tier-2
+/// surface.
 pub fn dispatch<'p, B>(ctx: &Ctx<'p>, op: &B) -> Result<(), Refusal>
 where
     B: BoundOp<Plane = Ctx<'p>>,
@@ -532,7 +705,8 @@ where
             // The point is the CALLER's — it handed this the statement and
             // can name it in the report. `Refusal` carries `&'static str`
             // and a generated arm has no name to leak.
-            what: "a point this plane does not claim; see the family's `*_CLAIMS`",
+            what: "a point this plane does not claim; see the family's `*_CLAIMS`, \
+                   or `TIER2_POINTS` for an inherent one",
         }}),
     }}
 }}

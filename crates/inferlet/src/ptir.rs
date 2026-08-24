@@ -523,7 +523,8 @@ from_channel!(bool);
 // ---------------------------------------------------------------------------
 
 /// The attention working set (overview §5.2) — a logical page address space
-/// over the runtime's KV mapping trie (kv_refact.md). Wraps the WIT
+/// over the runtime's KV mapping trie (kv_refact.md — doc not in tree).
+/// Wraps the WIT
 /// `kv-working-set`. Every page reference on this surface is a
 /// WorkingSet-RELATIVE index (never a physical page id); the runtime
 /// translates at the kernel through the working set's flattened table.

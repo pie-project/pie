@@ -1131,14 +1131,14 @@ pub trait Ssm: Plane {
     /// A_log` beside `const T* __restrict__ dt_bias` — and its own header
     /// says why: *"HF Qwen3.5 stores `A_log` and the RMSNormGated weight in
     /// fp32 (matches the FLA fast-path expectation), even when the rest of
-    /// the model is bf16. dt_bias stays bf16."* The routine that claims
+    /// the model is bf16. dt_bias stays bf16."* The launch that answered
     /// this point, `qwen_gdn_post_conv_prep_bf16`, has taken `a_log:
     /// Const<Tensor<f32>>` beside `dt_bias: Const<Tensor<bf16>>` the whole
     /// time. THIS DECLARATION SAID `T` FOR BOTH, which is the one slot
     /// where the floor disagreed with the plane claiming it, and the
     /// shipped 35B-A3B checkpoint settles it from the third side: `A_log`
-    /// is F32 [value_heads] and `dt_bias` is BF16 [value_heads] in the same
-    /// BF16 file. Handing that `float*` a bf16 bank is not a cast — it is
+    /// is `F32 [value_heads]` and `dt_bias` is `BF16 [value_heads]` in the
+    /// same BF16 file. Handing that `float*` a bf16 bank is not a cast — it is
     /// half the decays per head, read as nonsense.
     fn gdn_prep<T: Scalar>(
         &self,
@@ -1304,9 +1304,17 @@ pub trait Ssm: Plane {
 ///
 /// WHAT IS NOT HERE is the plane's staging, and on this family that is most
 /// of the fa2 core: the decode and prefill plan caches, the host mirrors of
-/// the two CSRs, the mask view. A body pulls those from `self`; a
-/// declaration that stated them would be describing one plane's plan
-/// vocabulary as though every plane had it.
+/// the two CSRs, the mask view, the fire's write origin. A body pulls those
+/// from `self`; a declaration that stated them would be describing one
+/// plane's plan vocabulary as though every plane had it.
+///
+/// "PULLS THOSE FROM `self`" IS A MECHANISM AND NOT A HOPE, which is what
+/// kept six of these points on the default body for as long as it was only a
+/// sentence. Every such object is declared with a KEY
+/// (`kernels::raises::Raise`), an executor answers keys
+/// (`kernels::raises::Answered`), and a plane's context is where the two
+/// meet. The declarations below did not move when cuda claimed all eleven —
+/// that is the test of whether the split was drawn in the right place.
 #[points]
 pub trait Attention: Plane {
     /// One query row per request, against the pool row's pages.
@@ -1695,17 +1703,17 @@ pub trait Mla: Plane {
     /// rotated half the absorb did not fold in, matched against the pool's
     /// own `k_pe` plane.
     ///
-    /// CLAIM-ONLY on cuda, and this one and [`Mla::attention_prefill`] now
-    /// resolve through a routine that has a real operand column.
-    /// `dispatch_attention_mla_bf16` was `unsafe`, `untraced` and answered
-    /// with a `MlaDispatch` saying which kernel it picked; it is none of
-    /// those any more, and `attn::attention_mla_{decode,prefill}_bf16` are
-    /// the columned form — the statement's operands, with the SCHEDULE as a
-    /// raise. What keeps a body off these two is the schedule: it is
+    /// THE SCHEDULE IS THE PLANE'S, AND THE BODY ASKS FOR IT BY NAME. This
+    /// point and [`Mla::attention_prefill`] were claim-only while the only
+    /// thing a claim could delegate to was an operand column: the schedule is
     /// measured on the HOST out of three CSR slices and uploaded into an int
-    /// arena the launch reads, which is [`Attention::decode`]'s plan-cache
-    /// seam exactly. Two rows, and they are plane staging rather than
-    /// missing kernels.
+    /// arena the launch reads, which is [`Attention::decode`]'s seam exactly,
+    /// and a body that built one would have to read the device CSR back
+    /// mid-fire — a sync a capture cannot record. Both are BODIES on cuda
+    /// now, and nothing here moved to allow it: an implementation pulls plane
+    /// staging off `self`, and `"mla.plan"` is the key it pulls this one by.
+    /// An executor that stages no such object refuses with that key, which is
+    /// a sentence about the fire rather than about a missing kernel.
     fn attention_decode<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
@@ -1935,27 +1943,40 @@ pub trait Index: Plane {
 /// pooling ratio is the checkpoint's and appears in no operand; the gather's
 /// head width sizes a result the statement allocates.
 ///
-/// NOT ONE POINT OF THIS FAMILY DELEGATES, and the reason is the same at
-/// every one of them: the compressed plane is THREE resident objects beside
-/// the page table — the state halves, the running scores, the absolute-
-/// position table — plus the fire's own row-validity and request-of-token
-/// planes, and a statement names ONE cache row and its operands. Each point
-/// below says which of those it is missing.
+/// WHAT THIS FAMILY IS MISSING IS AN EXECUTOR, NOT A DELEGATION. The
+/// compressed plane is THREE resident objects beside the page table — the
+/// state halves, the running scores, the absolute-position table — plus the
+/// compressed pool itself and the fire's own row-validity and
+/// request-of-token planes, and a statement names ONE cache row and its
+/// operands. That kept every point here claim-only until an implementation
+/// had somewhere to ask from: each of those objects is declared with a KEY,
+/// and a body pulls it off `self` by that key. All five are bodies on cuda.
+///
+/// The absences each point below records are therefore about the EXECUTOR
+/// now: an implementation that stages the object answers, and one that does
+/// not refuses with the key in it. `driver-cuda` stages none of them today
+/// and says so on its own `UNSTAGED` list.
 #[points]
 pub trait Pool: Plane {
     /// Which tokens close a pooling window, one token per request: the
     /// boundary's own position and the request it belongs to, with `-1` at
     /// every token that closes nothing.
     ///
-    /// TWO RESULTS, AND THE ROUTINE WRITES THREE. `dsv4_boundary_meta_decode`
-    /// also states an `out_rope` plane — the boundary's rope position — that
-    /// no statement in this tree reads. The declaration records the
-    /// statement as it stands rather than inventing a consumer for the
-    /// third: a result nothing reads is not a result, and passing a scratch
-    /// rectangle to swallow it would put a slot on the floor that no text
-    /// can name. The arity is one reason this point stays claim-only; the
-    /// other is the fire's row-validity plane, which the routine reads and
-    /// no statement names.
+    /// TWO RESULTS, AND THE KERNEL WRITES THREE. `dsv4_boundary_meta_decode`
+    /// also writes an `out_rope` plane — the boundary's rope position — that
+    /// no statement in this tree reads. The declaration records the statement
+    /// as it stands rather than inventing a consumer for the third: a result
+    /// nothing reads is not a result, and a slot for it would be a rectangle
+    /// no text could name. An IMPLEMENTATION sinks it into plane scratch,
+    /// which is the right home for a write nobody wants — the same place
+    /// every other body puts the buffers a kernel needs and a statement does
+    /// not state.
+    ///
+    /// THE ROW-VALIDITY PLANE IS THIS POINT'S ONE RAISE, and it is the one
+    /// place in the tree where that plane cannot be read off a pool row:
+    /// this point names no cache. A body asks for it by key, and its ABSENCE
+    /// is an answer — null means every row of the fire is valid, which the
+    /// kernels test for.
     fn boundary_decode(
         &self,
         positions: In<Self::Tensor<i32>>,
@@ -1970,8 +1991,10 @@ pub trait Pool: Plane {
     }
 
     /// [`Pool::boundary_decode`] over a prefill window, `indptr` the fire's
-    /// query CSR. The same two-of-three arity, and the same row-validity
-    /// plane behind it.
+    /// query CSR — which is the one thing the prefill form needs and the
+    /// decode form can shortcut, since one row per request makes the request
+    /// column the row index. The same two-of-three arity and the same
+    /// row-validity raise behind it.
     fn boundary_prefill(
         &self,
         positions: In<Self::Tensor<i32>>,
@@ -1989,12 +2012,13 @@ pub trait Pool: Plane {
     /// Build one pooled entry per boundary, out of the `ratio` tokens ending
     /// there.
     ///
-    /// Claim-only. `dsv4_compress_gather_paged` reads the page table AND the
-    /// three dsv4 residents, and asks for a `coff` beside the ratio — the
-    /// compressor's window multiplier, which is a pure function of the ratio
-    /// the DRIVER owns (`compressed_plane_geometry::compressor_coff`). The
-    /// scalar could be derived here; the three residents could not, and a
-    /// claim that bound them out of thin air would be a fiction.
+    /// `dsv4_compress_gather_paged` reads the page table — which the
+    /// statement names — AND the three dsv4 residents, and wants a `coff`
+    /// beside the ratio: the compressor's window multiplier, a pure function
+    /// of the stated ratio. THE SCALAR IS DERIVED AND THE RESIDENTS ARE
+    /// RAISED, which is the split this family kept getting wrong: a number a
+    /// statement already implies has no business being a second slot, and an
+    /// object no statement can name has no business being one either.
     fn gather<T: Scalar>(
         &self,
         boundary_pos: In<Self::Tensor<i32>>,
@@ -2012,10 +2036,15 @@ pub trait Pool: Plane {
 
     /// Append the pooled entries to the entries pool.
     ///
-    /// Claim-only. `dsv4_store_comp_entries` takes TWO cache views — the
-    /// page table it walks for the boundary's page, and the compressed pool
-    /// it writes — and a statement names one cache row. A second `Cache`
-    /// slot would be a second pool the text does not state.
+    /// `dsv4_store_comp_entries` reads TWO pools — the page table it walks
+    /// for the boundary's page, and the compressed plane it writes — where a
+    /// statement names ONE cache row. A second `Cache` slot would be a second
+    /// pool the text does not state, so the plane is a RAISE and the page
+    /// table is the statement's row. They collapse into one slot the day an
+    /// executor builds a pool view per named ROW rather than per model layer;
+    /// until then the page CSR is fire-wide and identical on every row of a
+    /// fire, so reading it off this one is right for the fields the kernel
+    /// takes from it.
     fn kv_append<T: Scalar>(
         &self,
         entries: In<Self::Tensor<T>>,
@@ -2035,9 +2064,11 @@ pub trait Pool: Plane {
     /// The lse rides [`Attention::decode_lse`]'s base, because the only
     /// thing that ever reads it is the merge against one.
     ///
-    /// Claim-only, for [`Pool::kv_append`]'s two-cache reason and one more:
-    /// `attention_compressed_paged` also reads the fire's request-of-token
-    /// plane, which is runtime staging and not an operand.
+    /// [`Pool::kv_append`]'s two pools, and one more raise on top:
+    /// `attention_compressed_paged` reads the fire's request-of-token plane,
+    /// which is derivable from the query CSR and derived by the executor —
+    /// but a kernel handed one row at a time cannot do the search, so the
+    /// plane is staged and a body asks for it by key.
     fn attention_lse<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
@@ -2160,14 +2191,28 @@ pub trait Hc: Plane {
     /// Collapse the stack back into one row — the gated sum that closes a
     /// text, with no Sinkhorn behind it.
     ///
-    /// Claim-only on cuda, and the absence is an OPERAND rather than a
-    /// kernel. `hc_head_postprocess` reads TWO planes: an `[N, streams]`
-    /// f32 `mixes` — the head gate logits, which the kernel's own comment
-    /// says arrive "after GEMM" — and the `[N, streams, hidden]` residual
-    /// stack. The statement names ONE value, and the legacy call site passed
-    /// the bf16 stack for the f32 `mixes` slot, which reads a stack's first
-    /// bytes as gates. That is a bug in the caller, not a delegation to
-    /// copy, and a claim reproducing it would put the lie on the floor.
+    /// CLAIM-ONLY ON EVERY PLANE, and the absence is an OPERAND WITH NO
+    /// PRODUCER — which is a different gap from the rest of this family's and
+    /// the reason R4b left this one where it stands while claiming the four
+    /// pool points beside it.
+    ///
+    /// `hc_head_postprocess` reads TWO planes: an `[N, streams]` f32 `mixes`
+    /// — the head gate logits, which the kernel's own comment says arrive
+    /// "after GEMM" — and the `[N, streams, hidden]` residual stack. The
+    /// statement names ONE value. The legacy call site passed the bf16 stack
+    /// for the f32 `mixes` slot, which reads a stack's leading bytes as
+    /// gates; that is a bug in the caller, not a delegation to copy.
+    ///
+    /// AND THERE IS NOTHING ELSE TO BIND. This is not a raise waiting for an
+    /// executor: no text in this tree computes a head-mix plane, and the
+    /// import ships no bank one could come from — deepseek-v4's checkpoint
+    /// carries `hc_head_scale` `[1]` and `hc_head_base` `[streams]` and no
+    /// head mix weight at all, which is exactly the two `Const` slots this
+    /// declaration already states. So the honest readings are a new operand
+    /// with a producer to write, or a per-stream gate with no per-token term
+    /// — and dsv4 has no cached checkpoint to decide between them, which is
+    /// the third party this tree's own law says has to. Until one is cached,
+    /// the routine keeps its `canon` and this note is the measurement.
     fn collapse<T: Scalar>(
         &self,
         streams: In<Self::Tensor<T>>,

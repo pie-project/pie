@@ -13,7 +13,9 @@
 //!   kernel over batched cuBLAS on `x::moe::supported`. That choice belongs
 //!   in a `#[claims]` body beside the point it serves (the baker backlog's
 //!   `moe.matmul_select_bias`), not in the driver; it had no caller left
-//!   once `dispatch` went.
+//!   once `dispatch` went;
+//! * `moe_ptrs` — the pointer-array arena `moe_grouped` carved its two
+//!   batched GEMMs out of. It outlived its only consumer by one commit.
 pub mod all_reduce;
 pub mod attention_workspace;
 pub mod attn_score;
@@ -27,9 +29,6 @@ pub mod hand;
 pub mod kv_paged;
 #[cfg(feature = "abi")]
 pub mod launch;
-/// `moe::build_moe_ptrs_aligned_bf16`: the aligned MoE leg's pointer build.
-pub mod moe_ptrs;
-
 pub mod page_mask;
 #[cfg(feature = "abi")]
 pub mod scratch;

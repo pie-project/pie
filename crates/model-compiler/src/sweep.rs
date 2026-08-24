@@ -67,9 +67,20 @@ pub fn resolve(plan: &Plan) -> Resolution {
             continue;
         }
         seen.push(kernel);
-        if let Some(symbol) = kernel.strip_prefix("cuda::") {
+        // THE `cuda::` PREFIX IS THE PLANE GATE AND NOTHING ELSE. A tier-2
+        // statement is legal on one plane, so a plan on any other states a
+        // lowering violation; on that plane the gate has done its job and
+        // what is left is the point's own name, which is what the plane's
+        // `TIER2_POINTS` spells and what `Call::Tier2` carries. Answered
+        // `tier2::` and not a bare symbol, because a bare symbol is what a
+        // `canon` row answers with and the two reach the driver by different
+        // doors — this one through the generated dispatch, that one through a
+        // staging shim.
+        if let Some(point) = kernel.strip_prefix("cuda::") {
             if plan.plane == Backend::Cuda {
-                resolution.resolved.push((kernel.to_string(), symbol.to_string()));
+                resolution
+                    .resolved
+                    .push((kernel.to_string(), format!("tier2::{point}")));
             } else {
                 resolution.violations.push(kernel.to_string());
             }

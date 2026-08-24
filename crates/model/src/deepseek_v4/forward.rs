@@ -37,8 +37,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
         let ids = inputs.token_ids();
         let mut streams = kernels::hc::expand(&kernels::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
 
-        for (l, w) in m.layers.iter().enumerate() {
-            let l = l as u32;
+        for (_, w) in inputs.layers(&m.layers) {
             let at = &w.attn;
             let pages = inputs.kv(&at.kv);
             let pos = inputs.positions();
@@ -54,7 +53,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
             // statements here — q, the shared plane, the pooled rows — are the
             // same rotation and state the same convention.
             let q = kernels::rope::partial_last(&q, &pos, at.rope_dim, at.head_dim, at.theta, true);
-            seam::at(seam::ATTN_Q, (&q,), l);
+            seam::at(seam::ATTN_Q, (&q,));
 
             let plane = kernels::gemm::matmul(&x, &at.kv_down);
             let plane = kernels::norm::rmsnorm(&plane, &at.kv_norm.weight, at.kv_norm.eps);
@@ -91,7 +90,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                 None => (o, lse),
             };
             let o = kernels::attention::sink(&o, &lse, &at.sink, at.head_dim);
-            seam::at(seam::ATTN_OUT, (&o,), l);
+            seam::at(seam::ATTN_OUT, (&o,));
 
             let o = kernels::gemm::matmul(&o, &at.o_down);
             let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };

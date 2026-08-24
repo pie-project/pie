@@ -19,10 +19,6 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
         .unwrap_or_default();
-    let boot_config = boot
-        .get("model")
-        .and_then(|m| m.get("config")?.as_str())
-        .map(std::path::PathBuf::from);
     // One string: a model id, not a document. Optional — absent, the checkpoint
     // is identified from its tensors.
     let boot_model_id = boot
@@ -95,7 +91,6 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
     // Stated, not parsed from a `CAPS_JSON`: see `state::device_facts`.
     Ok(Shell {
         facts: super::state::device_facts(),
-        boot_config,
         boot_model_id,
         runahead,
         boot: cfg.clone(),
@@ -157,21 +152,23 @@ const FUSED_WORLD_SIZE: u32 = 2;
 /// MiB, the 16-byte multiple, the NCCL crossover) is `CustomAllReduce::can_handle`'s,
 /// answered per fire.
 ///
-/// # THE SEAM R2 LEFT, NAMED
+/// # THE SEAM R2 LEFT, RE-MEASURED
 ///
-/// **Nothing reduces through the plane this admits.** The collective was
-/// issued by `bind::dispatch`'s comm arms, which are deleted with the legacy
-/// walk, and no point of `kernels::points` declares an all-reduce — so a
-/// `Program` cannot state one and `baker::points_shim` has no arm to answer
-/// with. `fire::all_reduce` is kept whole (the P2P plane, the rendezvous,
-/// the resident buffers) because it is dist/comm machinery and its shape is
-/// not the lowering's opinion; what it lacks is a statement.
+/// **Nothing reduces through the plane this admits**, and the reason is no
+/// longer the missing statement R2 named. `dist.all_reduce` IS a point
+/// (`kernels::points::Dist`), every model text states it at `TP > 1`, and the
+/// generated dispatch answers it — with `kernels_cuda::dist`'s claim, whose
+/// body refuses every call because `cudarc` is built without its `nccl`
+/// feature. `fire::all_reduce` is kept whole (the P2P plane, the rendezvous,
+/// the resident buffers) and is a SECOND implementation that no claim body
+/// reaches: `all_reduce_bf16` there is called from nowhere in this crate.
 ///
-/// This is not currently reachable, and that is why it is a note rather than
-/// a refusal: the first check below already turns every `tp_size > 1` away,
-/// because `kernels_cuda::comm::CAN_LAUNCH` is false in this build. The day
-/// that constant flips, THIS function is where the missing statement has to
-/// be checked for — before a rank serves a shard as if it were the answer.
+/// A note rather than a refusal because the failure it guards against cannot
+/// happen through that path: a rank admitted here meets `Refusal::Absent` at
+/// its first reduction, loudly, instead of returning its shard as the answer.
+/// `CAN_LAUNCH` is `true` now, so the first check below no longer turns every
+/// `tp_size > 1` away, and THIS function stays where the missing wire — a
+/// claim body that reaches the resident plane — has to be checked for.
 ///
 /// # Errors
 ///
@@ -218,7 +215,11 @@ pub(crate) fn tp_serving_refusal(tp_size: u32, tp_group_id: &str) -> Result<(), 
     Ok(())
 }
 
-/// Build this rank's P2P all-reduce plane, and publish it for the bind arms.
+/// Build this rank's P2P all-reduce plane, and hand it to the shell
+/// (`serve::state::Shell::all_reduce`).
+///
+/// It was built "for the bind arms", and those are deleted; nothing fires it
+/// today. See `tp_serving_refusal` above for the wire that is missing.
 ///
 /// `group_devices` is gathered (`tp_host_allgather`, an in-process barrier —
 /// TP ranks are threads), not configured, and must be real device ordinals,
@@ -318,112 +319,68 @@ impl Drop for Shell {
 
 /// The load itself; `i32` errors are the ABI's status codes.
 pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result<(), i32> {
-    use model_loader::checkpoint::read::{parse_checkpoint_metadata, read_meta};
+    // WHICH SKU THIS IS, asked of the checkpoint's own tensors — the same
+    // list `produce` is about to read, so identification and loadability are
+    // one question. `[baker] sku` / `PIE_BAKER_SKU` / `[model] id` outranks
+    // it, which is how a row is proven before its checkpoint is one the
+    // reader can tell apart.
+    //
+    // `Snapshot::at` AND NOT `Snapshot::open`: `open` resolves a cache-dir
+    // NAME under `$HOME/.cache/huggingface/hub`, and the driver is handed
+    // the snapshot directory itself.
+    let snap = model::snapshot::Snapshot::at(snapshot.to_path_buf()).ok_or_else(|| {
+        i32::from(crate::Error::invalid(
+            "load_model",
+            format!(
+                "no safetensors snapshot at {} — this driver produces its \
+                 weights through `model::produce`, which reads a checkpoint \
+                 directory holding `model.safetensors` or a shard index",
+                snapshot.display()
+            ),
+        ))
+    })?;
+    let stated = state
+        .boot
+        .baker_sku
+        .clone()
+        .or_else(|| state.boot_model_id.clone());
+    let sku = crate::baker::identify(&snap, stated.as_deref())
+        .map_err(|why| crate::Error::unsupported("load_model: identify", why))?;
+    let row = model::serve::row(sku).expect("`identify` answers a serving row");
 
-    let meta = parse_checkpoint_metadata(snapshot)
-        .map_err(|e| crate::Error::invalid("load_model: checkpoint parse", format!("{e:?}")))?;
-
-    // The checkpoint's own `config.json`: embedded, else the boot TOML's path.
-    // Only the declared quantization is read out — a catalog row can't state it.
-    let config_json = match read_meta(&meta, model::encoding::CONFIG_OBJECT) {
-        Ok(Some(bytes)) => {
-            String::from_utf8(bytes).map_err(|e| i32::from(crate::Error::from(e)))?
-        }
-        Ok(None) => {
-            let Some(path) = &state.boot_config else {
-                return Err(crate::Error::unsupported(
-                    "load_model",
-                    "no embedded model/config and no [model] config in \
-                     the boot TOML",
-                )
-                .into());
-            };
-            std::fs::read_to_string(path).map_err(|e| i32::from(crate::Error::from(e)))?
-        }
-        Err(e) => {
-            return Err(crate::Error::invalid("load_model: read_meta", format!("{e:?}")).into());
-        }
-    };
-
-    // Which model this is, asked of the tensors, not the config: identification
-    // and validation are one operation — a checkpoint is a known model or not.
-    let chosen = state
-        .boot_model_id
-        .as_ref()
-        .map_or(model::catalog::Override::None, |id| {
-            model::catalog::Override::Id(id.clone())
-        });
-    let row = model::catalog::identify(&meta, &chosen)
-        .map_err(|e| crate::Error::unsupported("load_model: identify", e.to_string()))?;
-
-    // How the numbers are stored — not part of what model this is.
-    let encoding = model::encoding::Encoding::from_config_json(&config_json)
-        .map_err(|e| crate::Error::invalid("load_model: config", e.to_string()))?;
-
-    // The load is `model-loader`'s plan, executed onto the device: it decides
-    // which encodings are loadable (a transform outside `CUDA_TILE_MAP_MASK` is
-    // refused at compile, not mis-bound at launch) and which projections fuse.
-    let target = crate::weights::plan::cuda_storage_target(state.tp_rank, state.tp_size);
-    let (plan, _moe) =
-        crate::weights::plan::compile_load_plan_for(snapshot, &meta, &target, row, &encoding)
-            .map_err(|e| crate::Error::unsupported("load_model: load plan", e))?;
+    // ── THE LANE. Not beside anything — this IS the fire path. ────────
+    //
+    // Its `Plan` is also where the pools come from: `Deployment::of` reads
+    // the KV row, the recurrent slabs and every advertised width off the
+    // same trace the program is built from, so a pool and the program that
+    // indexes it cannot describe different models. That is what R3 bought,
+    // and it is why `baker::Geometry::agrees_with` is gone.
+    //
+    // A REFUSED LOAD AND NOT A WARNING. Serving a checkpoint whose Program
+    // refuses would mean accepting `load_model` and then failing every fire
+    // — the engine would have a model registered, capabilities published and
+    // a scheduler admitting requests against a driver that cannot answer one.
+    state.baker = None;
     let alloc = crate::device::Allocator::new();
-    // `Error::from` spelled out because `?` won't chain two of them: the orphan
-    // rule forbids `From<LoaderError> for i32` on a primitive this crate lacks.
-    let staged = crate::weights::stage::stage_plan_weights(&plan, snapshot, &alloc)
-        .map_err(crate::Error::from)?;
+    let baked = crate::baker::load(sku, snapshot, &alloc).map_err(|why| {
+        crate::Error::unsupported("load_model", format!("`{sku}` did not build: {why}"))
+    })?;
 
-    let mut model = LoadedModel {
-        id: row.id(),
-        // Filled below once the checkpoint view exists; it reads the weight map.
-        deployment: model::deployment::Deployment::empty(),
-        load_caps: Vec::new(),
-        weights: staged.spans,
-        owned: staged.owned,
-        aliases: std::collections::BTreeMap::new(),
-        layer_scalars: Vec::new(),
-        tp_size: state.tp_size,
-    };
-    wire_trace_names(&mut model);
-    build_moe_expert_ptrs(&mut model, row.load_shape().n_experts, &alloc);
+    let deployment = model::deployment::Deployment::of(
+        &baked.plan,
+        model::deployment::Advertised {
+            arch: row.arch,
+            max_model_len: row.max_model_len,
+        },
+    )
+    .map_err(|why| crate::Error::unsupported("load_model: deployment", why.to_string()))?;
 
-    // Once, at load; see `LoadedModel::deployment`. From the matched row.
-    model.deployment = row
-        .deployment(model::catalog::Deployed {
-            // The row serves both backends; the caller states which asks.
-            backend: model::catalog::Backend::Cuda,
-            tp_size: state.tp_size,
-            layer_scalars: &model.layer_scalars,
-        })
-        .map_err(|e| i32::from(crate::Error::from(e)))?;
-
-    // A KV shape this shell has no pool for is refused at load, not at first
-    // fire: the `match` on `KvStyle` cannot forget a variant. MLA and
-    // compressed planes are ported but have no forward path yet.
-    if let Some(what) = match &model.deployment.kv {
-        model::deployment::KvStyle::Paged => None,
-        model::deployment::KvStyle::Mla { .. } => Some(
-            "this checkpoint attends through a latent ckv/kpe pair, which this \
-             driver does not build — `pools::mla_cache` is ported and has \
-             no forward path to serve",
-        ),
-        model::deployment::KvStyle::CompressedPlane { .. } => Some(
-            "this checkpoint attends through a compressed KV plane, which this \
-             driver does not build — `pools::compressed_plane_cache` is ported \
-             and has no forward path to serve",
-        ),
-    } {
-        return Err(crate::error::Error::Unsupported {
-            what: what.to_string(),
-        }
-        .into());
-    }
-
-    // The GQA ratio, refused at load: FlashInfer's decode instantiates a fixed
-    // set of group sizes and reports anything else by throwing, and a throw
-    // across the C ABI is undefined behaviour. `DECODE_GQA_GROUPS` is this build's.
-    model
-        .deployment
+    // A KV shape this shell has no pool for is refused inside `Deployment::of`
+    // and never reaches here. The GQA ratio is this build's own limit and is
+    // refused at the door for the reason it always was: FlashInfer's decode
+    // instantiates a fixed set of group sizes and reports anything else by
+    // throwing, and a throw across the C ABI is undefined behaviour.
+    deployment
         .servable_by(super::DECODE_GQA_GROUPS)
         .map_err(|why| -> i32 {
             // `servable_by` distinguishes a fractional ratio from an
@@ -432,8 +389,8 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
                 what: format!(
                     "{why}: {} q heads over {} kv heads; this build \
                      instantiates {:?}",
-                    model.deployment.shape.q_heads,
-                    model.deployment.shape.kv_heads,
+                    deployment.shape.q_heads,
+                    deployment.shape.kv_heads,
                     super::DECODE_GQA_GROUPS,
                 ),
             }
@@ -448,8 +405,12 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // equality, so a plane built for the previous checkpoint declines (or
     // mis-reduces) the next one's fused fires. Safe to drop — ranks rebuild.
     state.all_reduce = None;
-    state.model = Some(model);
-    // After the model is stored: a calibration boot fires the ordinary path.
+    state.model = Some(LoadedModel {
+        id: row.id,
+        deployment,
+        load_caps: Vec::new(),
+        tp_size: state.tp_size,
+    });
     let caps = capabilities_json(state, snapshot)?;
     state.model.as_mut().expect("just stored").load_caps = caps;
 
@@ -489,49 +450,10 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         }
     }
 
-    // ── THE LANE. Not beside anything — this IS the fire path. ────────
-    //
-    // LAST, AND AFTER EVERY REFUSAL ABOVE HAS HAD ITS SAY. The order is
-    // the whole safety argument: by the time this runs, `deployment` has
-    // gated the KV style and the GQA ratio, the pools are sized, the caps
-    // are published and the TP plane is up. So the lane is built only for
-    // a checkpoint the driver has already agreed to serve, and it inherits
-    // every refusal the door already knows how to make without restating
-    // one of them.
-    //
-    // `row.id()` is the checkpoint's identification — read off its own
-    // tensors, which is the authoritative answer to "what model is this".
-    // `sku_for` translates it into the new catalog's spelling.
-    //
-    // A REFUSED LOAD AND NOT A WARNING. This block used to print and carry
-    // on, because there was a second path to carry on to. There is not.
-    // Serving a checkpoint whose Program refuses would mean accepting
-    // `load_model` and then failing every fire — the engine would have a
-    // model registered, capabilities published and a scheduler admitting
-    // requests against a driver that cannot answer one. The refusal
-    // belongs here, with the reason in it.
-    state.baker = None;
-    let stated = state.boot.baker_sku.clone();
-    let Some(sku) = crate::baker::sku_for(row.id(), stated.as_deref()) else {
-        return Err(crate::Error::unsupported(
-            "load_model",
-            format!(
-                "`{}` bridges to no `model::catalog()` row, so this driver \
-                 has no program to fire for it. Name one with `[baker] sku` \
-                 / PIE_BAKER_SKU, or add the checkpoint to \
-                 `baker::BRIDGE` once its lane is proven.",
-                row.id()
-            ),
-        )
-        .into());
-    };
-    if let Err(why) = baker_lane(state, &sku, snapshot) {
-        return Err(crate::Error::unsupported(
-            "load_model",
-            format!("`{sku}` did not build: {why}"),
-        )
-        .into());
-    }
+    // The lane's own report, now that the caps are published: a refused or
+    // partly-bound lane is a MEASUREMENT and is printed rather than hidden.
+    report_lane(&baked);
+    state.baker = Some(baked);
 
     // The calibration sweep fires the ORDINARY path, so it goes after the
     // lane it fires: a sweep run before the lane was built would measure a
@@ -542,30 +464,13 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     Ok(())
 }
 
-/// Build the fire lane and report what it resolved.
+/// Report what the lane resolved.
 ///
-/// Split out of `load_impl` so the happy path there stays four lines and
-/// the reporting lives beside the thing it reports on. Its `Err` is what
-/// `load_impl` turns into a refused load.
-fn baker_lane(state: &mut Shell, sku: &str, snapshot: &std::path::Path) -> Result<(), String> {
-    let alloc = crate::device::Allocator::new();
-    let baked = crate::baker::load(sku, snapshot, &alloc)?;
-
-    // The two catalogues must agree about the model before the lane is
-    // allowed to fire on pools the OTHER catalog sized. See
-    // `Geometry::agrees_with`: a disagreement here is a wrong answer with
-    // no error in it.
-    //
-    // THE SEAM, NAMED: `model::deployment` is still the legacy catalog's
-    // account of this checkpoint, and it is what sizes the KV pages, the
-    // recurrent slabs and the advertised caps. The program is the new
-    // catalog's. R3 is where that stops being two answers.
-    let dep = &state
-        .model
-        .as_ref()
-        .ok_or("the load stored no model")?
-        .deployment;
-    baked.geom.agrees_with(dep)?;
+/// Split out of `load_impl` so the happy path there stays short and the
+/// reporting lives beside the thing it reports on. It cannot fail: a lane
+/// with nothing armed is refused by [`crate::baker::load`] itself, before
+/// any pool has been sized against it.
+fn report_lane(baked: &crate::baker::Baked) {
     eprintln!(
         "[driver-cuda] baker: `{}` traced — {} facts {:?}, {} params, {} caches, {} ops",
         baked.plan.name,
@@ -575,11 +480,6 @@ fn baker_lane(state: &mut Shell, sku: &str, snapshot: &std::path::Path) -> Resul
         baked.plan.caches.len(),
         baked.plan.ops.len(),
     );
-
-    // The eager resolve, per BUILT lane. A refused lane is already a
-    // measurement (`program::Refusal` carries every gap it found), so it is
-    // reported as it stands rather than walked again.
-    let mut armed = 0usize;
     for (at, lane) in baked.lanes.iter().enumerate() {
         match lane {
             Err(r) => eprintln!(
@@ -590,7 +490,6 @@ fn baker_lane(state: &mut Shell, sku: &str, snapshot: &std::path::Path) -> Resul
             Ok(program) => {
                 let gaps = crate::baker::resolve::check(&baked.plan, program);
                 if gaps.is_empty() {
-                    armed += 1;
                     eprintln!(
                         "[driver-cuda] baker: lane {at} (words {:?}) RESOLVED — \
                          {} steps, row_pitch {} B, {} slots",
@@ -615,13 +514,6 @@ fn baker_lane(state: &mut Shell, sku: &str, snapshot: &std::path::Path) -> Resul
             }
         }
     }
-    if armed == 0 {
-        return Err(format!(
-            "no lane of `{sku}` resolved against this plane; see the gaps above"
-        ));
-    }
-    state.baker = Some(baked);
-    Ok(())
 }
 
 /// The calibration sweep: time the reachable fire shapes and cache the fastest
@@ -704,7 +596,7 @@ fn calibrate_planner(state: &mut Shell) {
         num_hidden_layers: i32::try_from(model.deployment.layers).unwrap_or(0),
         num_attention_heads: i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
         num_key_value_heads: i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
-        head_dim: i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
+        head_dim: i32::try_from(model.deployment.shape.head_dim_kernel).unwrap_or(0),
     };
 
     // ONE probe program and as many instances as the widest point needs.
@@ -874,168 +766,21 @@ fn synthetic_fire(
     crate::fire::launch::step_impl(state, &frame, step, None)
 }
 
-/// Answer the trace names a launch will ask for, from `model`'s tables. Most
-/// naming is family knowledge (`model::shared::weight_names`); two need the driver.
-///
-/// Whether a join is a rename or nothing: a checkpoint shipping pre-joined
-/// projections (Phi-3) has its contract split them, so the halves are adjacent
-/// in the arena (the plan wrote them in file order). The driver checks
-/// contiguity rather than assumes: a GEMM handed a discontiguous operand reads
-/// what lies between.
-///
-/// The per-expert POINTER ARRAYS an MXFP4 decode kernel indexes.
-///
-/// `quant::mxfp4_moe_gate_up_decode`'s `packed_ptrs` and `scale_ptrs` are
-/// `const u8* const*` over `num_experts` — the kernel's first act is
-/// `packed_ptrs[expert]`, with `expert` off the router's top-k run. Nothing
-/// states them and nothing can: a statement names the BANK, and which address
-/// each expert's slab begins at is a property of where the load put it.
-///
-/// So they are built here, once, beside the bank they slice. A bank is
-/// `[E, ...]` contiguous, so expert `e` begins at `base + e * (bytes / E)` —
-/// `WeightSpan` carries both halves of that and `LoadShape::n_experts` the
-/// third. The arrays are registered under the bank's own name plus a suffix
-/// (`_ptrs`, `_scales_ptrs`, `_bias_ptrs`), which is how the per-fire view
-/// arena finds them: `bind::views::FireViews::fill_expert_weights` resolves
-/// them beside the bank each statement names and hands the routine one
-/// `ExpertWeightsView` where the keyed asks used to be.
-///
-/// Binding the bank's base where an array of bases belongs is what this
-/// replaces: `compute-sanitizer` measured the first eight bytes of MXFP4 weight
-/// data being dereferenced as a pointer. An illegal address poisons the
-/// context, so the fault surfaces on a later, unrelated `cuModuleLoadData` —
-/// which is why the rows were refused at load until something built these.
-fn build_moe_expert_ptrs(
-    model: &mut LoadedModel,
-    n_experts: u32,
-    alloc: &crate::device::Allocator,
-) {
-    let experts = n_experts as usize;
-    if experts == 0 {
-        return;
-    }
-    let Ok(stream) = crate::device::OwnedStream::new(0) else {
-        return;
-    };
-    // Collected first: the loop below inserts into the same map it reads.
-    // EVERY PLANE OF A BANK, not just the packed one. The kernel indexes all
-    // four the same way -- `packed_ptrs[expert]`, `scale_ptrs[expert]`,
-    // `gate_bias_ptrs[expert]`, `bias_ptrs[expert]` -- so a base bound at any
-    // of them is the same illegal address as a base bound at the first.
-    //
-    // Over the ALIASES as well as the weights, because a bank is normally
-    // neither: `wire_trace_names` publishes `layer.0.expert_gate_up_bank` as an
-    // alias onto the checkpoint's `...mlp.experts.gate_up_proj.weight`, and
-    // only a JOIN lands a trace name in `weights` directly. Reading one map
-    // found nothing and every fire refused for want of an array the load had
-    // silently declined to build.
-    let banks: Vec<String> = model
-        .weights
-        .keys()
-        .chain(model.aliases.keys())
-        .filter(|n| n.contains("_bank") && !n.ends_with("_ptrs"))
-        .cloned()
-        .collect();
-    for bank in banks {
-        // The same two-step `LoadedModel::weight` takes, for the same reason.
-        let Some(span) = model
-            .weights
-            .get(&bank)
-            .or_else(|| model.aliases.get(&bank).and_then(|t| model.weights.get(t)))
-            .copied()
-        else {
-            continue;
-        };
-        // A bank that does not divide is not `[E, ...]`, so it is not one of
-        // these — leave it alone rather than publish a stride that is a
-        // rounding of the truth.
-        if span.bytes == 0 || span.bytes % experts != 0 {
-            continue;
-        }
-        let stride = span.bytes / experts;
-        let mut host = Vec::with_capacity(experts * size_of::<u64>());
-        for e in 0..experts {
-            let at = (span.ptr as usize + e * stride) as u64;
-            host.extend_from_slice(&at.to_le_bytes());
-        }
-        let Ok(mut buffer) = alloc.alloc(host.len()) else {
-            continue;
-        };
-        if buffer.copy_from_host(&host, stream.as_ref()).is_err() {
-            continue;
-        }
-        if stream.as_ref().synchronize().is_err() {
-            continue;
-        }
-        model.weights.insert(
-            format!("{bank}_ptrs"),
-            crate::weights::stage::WeightSpan {
-                ptr: buffer.as_ptr(),
-                bytes: host.len(),
-            },
-        );
-        model.owned.push(buffer);
-    }
-}
-
-/// And reading a load-time scalar to the host: gemma-4's `layer_scalar` is one
-/// bf16 on device; `model` says which and in what order.
-fn wire_trace_names(model: &mut LoadedModel) {
-    let Some(row) = model::catalog::find(model.id) else {
-        return; // no row, no names; the load already refused
-    };
-    let published: Vec<String> = model.weights.keys().cloned().collect();
-    let set: std::collections::BTreeSet<&str> = published.iter().map(String::as_str).collect();
-    let has = |n: &str| set.contains(n);
-    let wiring = model::shared::weight_names::wire(row.load_shape(), &has);
-
-    for (trace, name) in wiring.aliases {
-        model.aliases.insert(trace, name);
-    }
-    for (trace, parts) in wiring.joins {
-        let mut spans = Vec::with_capacity(parts.len());
-        for p in &parts {
-            let Some(span) = model.weights.get(p).copied() else {
-                spans.clear();
-                break;
-            };
-            spans.push(span);
-        }
-        if spans.len() != parts.len() {
-            continue;
-        }
-        let abut = spans.windows(2).all(|p| {
-            std::ptr::eq(
-                p[0].ptr.wrapping_byte_add(p[0].bytes).cast_const(),
-                p[1].ptr.cast_const(),
-            )
-        });
-        if abut {
-            model.weights.insert(
-                trace,
-                crate::weights::stage::WeightSpan {
-                    ptr: spans[0].ptr,
-                    bytes: spans.iter().map(|s| s.bytes).sum(),
-                },
-            );
-        }
-    }
-    model.layer_scalars = wiring
-        .scalars
-        .iter()
-        .map(|n| {
-            model
-                .weights
-                .get(n)
-                .map_or(1.0f32, |b| match crate::weights::stage::read_span(*b) {
-                    Ok(back) if back.len() == 2 => {
-                        f32::from_bits(u32::from(u16::from_le_bytes([back[0], back[1]])) << 16)
-                    }
-                    _ => 1.0,
-                })
-        })
-        .collect();
-}
+// `wire_trace_names` and `build_moe_expert_ptrs` STOOD HERE, and the whole
+// LEGACY WEIGHT ARENA with them.
+//
+// Both existed to serve `model_legacy`'s load contract: the first answered
+// the trace names a launch asked for out of `shared::weight_names`' tables
+// (aliases, contiguity-checked joins, gemma-4's `layer_scalar` read back to
+// the host), and the second built the per-expert pointer arrays an MXFP4
+// decode kernel indexes into a bank the contract had staged.
+//
+// R2 left them standing because `serve::encode`'s towers still read weights
+// by the legacy names. R3 deletes the contract, so there is no arena for
+// either to wire: `model::produce` reads the checkpoint through the import
+// table and `baker::Baked::banks` is the only weight map a fire touches. The
+// per-expert arrays came with it — `baker::staging` builds them from the
+// produced bank, which is where they belong, beside the bank they slice.
 
 /// What `load_model` answers: a `driver_api::DriverCapabilities` document.
 ///
@@ -1092,7 +837,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         num_hidden_layers: i32::try_from(deployment.layers).unwrap_or(0),
         num_attention_heads: i32::try_from(deployment.shape.q_heads).unwrap_or(0),
         num_key_value_heads: i32::try_from(deployment.shape.kv_heads).unwrap_or(0),
-        head_dim_kernel: i32::try_from(deployment.shape.head_dim_alloc()).unwrap_or(0),
+        head_dim_kernel: i32::try_from(deployment.shape.head_dim_kernel).unwrap_or(0),
         model_id: model_id.to_owned(),
     };
     let props = DeviceProps {
@@ -1215,11 +960,10 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // pool-owned `devgeo` class this driver does not claim, so a decode
         // envelope is unaffected. Saying true would advertise a refused class.
         resolves_geometry_per_step: false,
-        // True when this checkpoint has a tower `pie_cuda_encode` serves. A
-        // false negative makes the worker build no encode executor, so gemma-4's
-        // towers go unreachable. Qwen3-VL is deliberately absent — its tower
-        // writes the fire's hidden rows in-fire, not through encode.
-        supports_media_encode: deployment.advertised.media_encode,
+        // FALSE, and it is a measurement: no catalog import table produces a
+        // tower's weights, so `Shell::encode` has nothing resident to encode
+        // with and refuses by name. See `serve::encode`.
+        supports_media_encode: false,
         kv_handle: None,
         // This driver compiles its own PTIR through NVRTC; nothing upstream
         // needs to generate a kernel for it.

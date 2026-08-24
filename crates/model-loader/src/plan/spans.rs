@@ -20,6 +20,17 @@
 //!
 //! Both are answers to questions the plan already contains. Asking it once,
 //! here, is what makes them the same answer.
+//!
+//! # Who reads this today, measured
+//!
+//! `driver-metal`'s `weights/stage.rs`, and nothing else — the two copies this
+//! module replaced were Metal's and CUDA's, and CUDA's has not come back yet.
+//! That makes it a candidate for moving out beside its one reader, and it is
+//! the wrong move: walking a `StorageInstr` stream to find out where a plan
+//! puts things is a question about the PLAN, and answering it inside a driver
+//! is precisely the arrangement that produced the two divergences above. Five
+//! files in this crate point at it for that reason. It stays where the
+//! question is.
 
 use std::collections::{BTreeMap, HashMap};
 

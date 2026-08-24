@@ -39,9 +39,13 @@ members = [
     "crates/ids",
 
     # -- boundary contracts, suffix-named after their subject ---------------
-    # `-api` = wire/message contract, `-abi` = the repr(C) FFI contract. They
-    # stay extracted because roles never dep each other, bidirectional pairs
-    # would cycle, and the driver contract has a non-Rust consumer.
+    # `-api` = wire/message contract. They stay extracted because roles never
+    # dep each other and bidirectional pairs would cycle.
+    #
+    # `-abi` was the other suffix, for the repr(C) FFI contract, and no crate
+    # carries it any more: every driver on the far side is Rust, so the
+    # marshalling shapes went and `driver-api` is owned Rust types with one
+    # `#[repr(C)]` survivor that earns it. See `driver-api/src/local.rs`.
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
@@ -72,42 +76,24 @@ members = [
     # weights. A member so it shares this lockfile; outside `default-members`
     # because it links a CUDA shell, which is `driver-cuda`'s rule above.
     "crates/baker-smoke",
-    # The Metal shell. It was `driver-metal-new` while the C++ `driver-metal`
-    # still existed; that one was retired (2026-08-10) and this took the name.
-    # A member so it shares this lockfile and so a workspace sweep on a Mac
-    # sees it; outside `default-members` because selecting a Metal shell on a
-    # Linux box should be a choice, which is the rule its siblings follow.
-    #
-    # Unlike the C++ shell it replaced, it does BUILD on a non-Apple host:
-    # everything that names a Metal type is behind
-    # `cfg(target_vendor = "apple")`, and what is left is the shader-include
-    # splicer and the tuning table, which are the two parts with logic worth
-    # testing and no reason to need a GPU.
-    "crates/driver-metal",
-    # The Vulkan execution shell. Unlike the Metal one, its DEVICE half builds
-    # and tests on the same Linux hosts the rest of the workspace is developed
-    # on -- Vulkan is not a platform, it is a loader -- so the portable/device
-    # split here is about what needs a GPU present, not about what a compiler
-    # will accept.
-    "crates/driver-vulkan",
-    # The WebGPU shell. The only driver in this list that is a
-    # `default-member`, and the reason is that it is the only one whose device
-    # half costs nothing to REACH: `wgpu` is pure Rust with no `-sys` crate
-    # anywhere in its closure, `naga` compiles the shaders in-process, and so a
-    # workspace sweep on any machine builds the whole crate and runs every test
-    # that does not need an adapter to answer. Its `native` feature gates only
-    # what asks a real adapter a question, which is a narrower line than either
-    # sibling's -- Metal splits on what a compiler accepts, Vulkan on what needs
-    # a GPU present, and this one on neither.
-    "crates/driver-wgpu",
+    # `driver-metal`, `driver-vulkan` and `driver-wgpu` STOOD HERE. They are
+    # out of the workspace entirely as of R3 -- not members, not path deps of
+    # any member, and named in `exclude` below so cargo cannot re-adopt them.
+    # See that note for why and for when they come back.
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
-    # The two registries (`model_type` -> load-contract author, `arch_name` ->
-    # chat template), the twenty generations they dispatch to, the vocabulary
-    # those share, and the `pie.model/1` descriptor (`config`, ex
-    # `model-config`) that every one of them is parameterized by -- one crate,
-    # module per generation, feature per aspect.
-    "crates/model-legacy",
+    # THE catalog, singular since R3 -- there were two registries here
+    # (`model_type` -> load-contract author, `arch_name` -> the forward text)
+    # and the load contract went with `model-legacy`. One model text per
+    # family (the declarations `#[points]` is traced through), one import
+    # table per checkpoint flavor, and the serving face `engine` and every
+    # driver read: the SKU, its tower depth and logits width, its architecture
+    # label and context ceiling, and its chat template.
+    #
+    # `model-legacy` STOOD BESIDE IT -- the config-projected registries, the
+    # hand-written manifests, the load contract and the legacy forward texts,
+    # 16 312 lines -- and R3 deleted it. `model-dsl-legacy`, the frozen eDSL
+    # it was written against (18 235 lines), went with it.
     "crates/model",
     "crates/model-dsl-macros",
     # The forward-pass toolchain, in the three layers `tensor-*` is already in
@@ -118,26 +104,33 @@ members = [
     # wanted both halves. What that cost was `driver-metal`, `driver-vulkan`
     # and `driver-wgpu` each compiling `dsl::cuda`'s 4,469 lines -- an
     # authoring surface for a backend they are not -- to reach `lower`, which
-    # they reached without calling a line of it.
+    # they reached without calling a line of it. `lower` is deleted now (R3):
+    # those three were its last consumers and they left with it.
     #
     # The traced form: the op vocabulary, the plan container and the
     # `TraceBuilder` a declaration records onto, the seam words, and the
     # signature tables a plan is checked against at trace time. The floor both
-    # halves stand on, and it names no family, no `Val` and no device.
+    # halves stand on. It carries no tape and no authoring value -- a
+    # declaration is recorded THROUGH it, not written in it -- but it is not
+    # device-blind: `kernels::Backend` names Cuda and Metal, and the claim
+    # tables `check_plan` reads are `kernels-cuda`'s and `kernels-metal`'s
+    # own, re-exported from here so that trace time and lowering time cannot
+    # be looking at two differently featured copies of one table.
     "crates/model-ir",
     # The authoring eDSL: typed weight handles, tape-carrying values, and the
-    # raw kernel-signature surfaces (`cuda`, `metal`) a lowered declaration is
-    # written against. Depended on by `crates/model` and NOTHING else -- which
-    # is the fact the split turned from a convention into a build rule. Carries
-    # the tracer fingerprint (`compiler_version()`), whose hash covers this
-    # tree and `model-ir`'s, because the tracer is both of them.
+    # backend-neutral role points (`kernels`) a model text states, which the
+    # planes answer with claims. `crates/model` is the reader it exists for;
+    # `baker-smoke` takes it to drive the same catalog on a real device, and
+    # `model-compiler` takes it as a DEV edge so its width table can be
+    # measured against the shipping texts rather than a fixture.
     "crates/model-dsl",
-    "crates/model-dsl-legacy",
-    "crates/model-dsl-macros",
-    # Lowering alone now: traced form + the engine's rows + one fire ->
-    # rectangles, operands, buffers. Keeps the name because a compiler is what
-    # turns a representation into what a machine runs, which is what is left
-    # here once the surface and the IR are their own crates.
+    # Lowering, and after R3 the baker path is all of it: `sweep` derives
+    # which ops a fact word runs and joins role points against the plane's
+    # claims, `program` binds each surviving lane into steps and slots. Keeps
+    # the name because a compiler is what turns a representation into what a
+    # machine runs, which is what is left here once the surface and the IR are
+    # their own crates. `lower`, the legacy launch-list half, is deleted --
+    # see this crate's `lib.rs` for its headstone.
     "crates/model-compiler",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime. One crate: the drivers
@@ -254,27 +247,9 @@ default-members = [
     "crates/worker-api",
     "crates/driver-api",
     "crates/driver",
-    # ── THE SHADER PLANES ARE QUARANTINED (R2) ─────────────────────────────
-    #
-    # `driver-metal`, `driver-vulkan` and `driver-wgpu` are MEMBERS (they share
-    # this lockfile) and none of the three is a default member. The first two
-    # never were, for the reasons their member comments give; `driver-wgpu`
-    # was, on the argument that it needs no SDK and no adapter to build, and it
-    # is pulled out here with the other two.
-    #
-    # WHY, AND IT IS NOT ABOUT WGPU'S BUILD: the three shader drivers are the
-    # only consumers left of the legacy lowering surface this round deleted
-    # from `driver-cuda`. Their own executors are the baker migration's P5
-    # ("Shader planes — impl the families for metal/vulkan/wgpu Ctx; the
-    # tier-1 law's other half"), and until P5 lands they are code that cannot
-    # be brought forward and must not gate a host sweep. Their test suites
-    # already carry pre-existing failures.
-    #
-    # THEY COME BACK AT P5, as default members, when each has a `#[claims] impl`
-    # for its plane and a `Program` walk of its own. `cargo check -p
-    # driver-metal` (and the other two) still works today — quarantine is
-    # about what a bare `cargo check` sweeps, not about what exists.
-    "crates/model-legacy",
+    # The three shader drivers stood here through R2's quarantine and are out
+    # of the workspace altogether now — see `exclude`.
+    "crates/model",
     "crates/model-ir",
     "crates/model-dsl",
     "crates/model-compiler",
@@ -292,6 +267,27 @@ default-members = [
     "tests/gpu",
 ]
 exclude = [
+    # ── THE SHADER PLANES ARE OUT OF THE WORKSPACE (R3) ────────────────────
+    #
+    # `driver-metal`, `driver-vulkan` and `driver-wgpu` were the last
+    # consumers of `model-legacy` and `model_compiler::lower`, and R3 deletes
+    # both. They cannot be brought forward without their baker executors,
+    # which is P5 ("Shader planes — impl the families for metal/vulkan/wgpu
+    # Ctx; the tier-1 law's other half"), so they stay in tree and stay
+    # UNBUILT: no member path-depends on one, and `exclude` is what keeps
+    # cargo from re-adopting them (a path dependency inside the workspace
+    # directory becomes a member automatically, which is why deleting the
+    # three `engine` dependency lines was the actual cut).
+    #
+    # `kernels-metal`, `kernels-vulkan` and `kernels-wgpu` are NOT here. They
+    # compile green, they carry the claim tables P5 is measured against, and
+    # nothing in them reads a legacy declaration.
+    #
+    # THEY COME BACK AT P5, as members and as default members, when each has a
+    # `#[claims] impl` for its plane and a `Program` walk of its own.
+    "crates/driver-metal",
+    "crates/driver-vulkan",
+    "crates/driver-wgpu",
     "tests/inferlets",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
     # THIS manifest when cargo walks up from a worktree's excluded package
@@ -345,8 +341,10 @@ path = "src/bin/pie-worker.rs"
 
 [features]
 # This package selects the driver backend; it forwards the flavors to the
-# embedded worker. Default = none (dummy fallback); enable driver-cuda-12 /
-# driver-cuda-13 or driver-metal for real inference.
+# embedded worker. Default = none, and none means none: the always-linked
+# `Dummy` flavor that used to catch a featureless build went with its crate,
+# so `pie config init` refuses rather than writing a config naming it. Enable
+# driver-cuda-12 / driver-cuda-13 for real inference.
 default = []
 # NVIDIA. The number is the CUDA runtime ABI the binary will LOAD, and it is
 # in the name because this is the last package in the chain -- the one that
@@ -356,20 +354,8 @@ default = []
 _driver-cuda = ["worker/_driver-cuda"]
 driver-cuda-12 = ["_driver-cuda", "worker/driver-cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "worker/driver-cuda-13"]
-# macOS/Apple Silicon. Without this the `pie` binary has no way to reach the
-# Metal driver at all: `worker`'s `driver-metal` is what links the archive,
-# and this is the only package that builds a binary.
-driver-metal = ["worker/driver-metal"]
-# Vulkan, anywhere there is a loader and an ICD. No vendor or platform
-# condition on it: `worker`'s `driver-vulkan` is what puts the driver in the
-# graph, and this is the only package that builds a binary.
-driver-vulkan = ["worker/driver-vulkan"]
-# The WebGPU shell, which needs neither. Vulkan builds anywhere and RUNS where
-# an ICD is installed; this one carries its own way to every API -- Vulkan,
-# Metal, D3D12 and WebGPU through one pure-Rust binary, shaders included. Same
-# forwarding, and the same reason it lives here: this is the only package that
-# builds a binary.
-driver-wgpu = ["worker/driver-wgpu"]
+# `driver-metal` STOOD HERE, forwarding to `worker`. It went with the three
+# shader drivers at R3; see this file's `exclude`.
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 
@@ -382,21 +368,32 @@ controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 worker = { path = "crates/worker", default-features = false }
 engine = { path = "crates/engine" }  # program/manifest types for `pie inferlet`
-# `pie model convert` — the host-side load-plan executor and checkpoint
+# `pie model import` — the host-side load-plan executor and checkpoint
 # writer. Pure Rust; needs no driver and no GPU.
 model-loader = { path = "crates/model-loader" }
-# The tokenizer compiler — `pie model convert` runs it once at import and
-# serializes the result into the artifact (`pie.tokenizer/1`), so the runtime
-# never parses `tokenizer.json` again.
+# The tokenizer compiler — `pie model import` runs it once and serializes the
+# result into the artifact (`pie.tokenizer/1`), so the runtime never parses
+# `tokenizer.json` again.
 tokenizer = { path = "crates/tokenizer" }
-# The HF `config.json` normalizer — `pie model convert` runs it once and
-# writes the result as the `pie.model/1` descriptor, so the runtime and the
-# driver stop re-deriving it from HF quirks at every boot.
+# `model-config` STOOD HERE, the HF `config.json` normalizer. It is gone, and
+# the config now rides into the artifact verbatim under `CONFIG_OBJECT` below.
 # Client edge for `pie config tune`: the sweep generates load through
 # the same websocket path a deployment is reached by, because measuring an
 # in-process shortcut would measure something nobody runs.
 client = { path = "crates/client" }
-model = { path = "crates/model-legacy", package = "model-legacy", features = ["contract"] }
+# THE CATALOG, and after R3 there is one. This line read `model-legacy` and
+# carried `features = ["contract"]`, because `pie model build` authored that
+# crate's load contract and `pie model import` applied its per-family ingest
+# pass. Both are deleted (see `src/ops/model.rs`), and what is left needs
+# three things from this crate. `pie model import` needs
+# `serve::encoding::CONFIG_OBJECT`, the object name the checkpoint's own
+# `config.json` is carried into an artifact under -- a literal here would be a
+# second definition of something a reader elsewhere has to match exactly, and
+# a mismatch does not fail, the read just finds nothing. `pie model list`
+# needs `snapshot::Snapshot` and `identify`, because "can pie serve this?" is
+# now a question about a checkpoint's tensor names and not about a table of HF
+# `model_type` strings. None of the three is behind the `serve` feature.
+model = { path = "crates/model" }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
@@ -428,18 +425,11 @@ toml_edit = "0.25.13"
 
 [dev-dependencies]
 tempfile = "3"
-# `boot_smoke` drives the one public composition seam (`run_standalone`) the
-# way a client does; that is the reason this package has a `[lib]` at all.
-client = { path = "crates/client" }
+# The `client` dev-dep STOOD HERE for `tests/boot_smoke.rs`, which drove
+# `run_standalone` the way a client does. That test is deleted (`src/lib.rs`
+# says so) and `client` is a plain dependency of this package besides, so the
+# line named a reason that no longer exists for an edge that already did.
 
-# The same `model`, with the one row that is not a model. `model_artifact`
-# writes a checkpoint and runs it through `pie model build`, which identifies
-# it against the catalog -- so the test needs a row small enough to write.
-#
-# Cargo unifies this with the `[dependencies]` entry above, which is why the
-# guarantee cannot be "the binary does not enable it": it is
-# `a_shipped_catalog_has_no_test_rows`, in `model` itself.
-model = { path = "crates/model-legacy", package = "model-legacy", features = ["contract"] }
 
 # SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
 [target.'cfg(unix)'.dependencies]

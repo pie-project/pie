@@ -53,17 +53,16 @@ use std::path::{Path, PathBuf};
 /// Where a `PtirCaps` is built, and the three fields each one must still be
 /// stating as `false`.
 ///
-/// Paths are relative to the repository root. Every one was verified by reading
-/// the file rather than by matching a directory: the two engine-side adapters
-/// are the in-process shells for `vulkan` and `wgpu`, while the three
-/// `driver-*` entries are what the out-of-process ABI reports.
-const SITES: &[&str] = &[
-    "crates/driver-cuda/src/serve/load.rs",
-    "crates/driver-vulkan/src/shell.rs",
-    "crates/driver-metal/src/serve/load.rs",
-    "crates/engine/src/driver/backend/vulkan.rs",
-    "crates/engine/src/driver/backend/wgpu.rs",
-];
+/// Paths are relative to the repository root, and every one was verified by
+/// reading the file rather than by matching a directory.
+///
+/// FOUR SITES STOOD HERE and R3 left one. `driver-vulkan/src/shell.rs` and
+/// `driver-metal/src/serve/load.rs` are out of the workspace until P5 and
+/// are not scanned because they are not built; the two engine-side adapters
+/// (`backend/{vulkan,wgpu}.rs`) are deleted outright. Whoever brings a
+/// shader plane back owes this list its row: the fields are `false` on the
+/// floor, so a driver that advertises one is claiming a tap nothing serves.
+const SITES: &[&str] = &["crates/driver-cuda/src/serve/load.rs"];
 
 /// The three fields, and the harness name each one gates.
 const FIELDS: &[(&str, &str)] = &[

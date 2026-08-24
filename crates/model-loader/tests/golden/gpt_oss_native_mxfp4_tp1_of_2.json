@@ -1,5 +1,4 @@
 {
-  "compiler_version": 0,
   "target": {
     "backend": "Cuda",
     "tp_rank": 1,

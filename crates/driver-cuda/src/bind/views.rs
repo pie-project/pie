@@ -69,6 +69,14 @@ pub struct FireStreams {
     /// prefill fills at fire time. Distinct from a prep-published plan value,
     /// which the launch path's own `raised` map answers first.
     pub prefill_plan_cache: *mut c_void,
+    /// `"fa2.decode"` — the decode SCHEDULE `raise_attn_plans` raised for
+    /// this fire: workspaces stamped inside the plan-update fence, the
+    /// variant the lane stated, `window_left = -1`.
+    ///
+    /// It reached the walk as a loose argument until the fa2 points became
+    /// claim bodies, because the walk's one reader was a hand-written arm
+    /// that could be handed anything. A body has only the key.
+    pub decode_plan_cache: *mut c_void,
 }
 
 impl FireStreams {
@@ -117,10 +125,11 @@ pub struct FireViews {
     // was keyed by were the legacy trace's.
     //
     // `"moe.expert_weights"` IS THEREFORE A NAMED REFUSAL, not a deletion:
-    // `moe_ptrs` still carves the `_ptrs`/`_scales_ptrs`/`_bias_ptrs` arrays
-    // at load, the kernels still take the view, and the one thing missing is
-    // the join from a STATEMENT to its bank — which a `Program`'s statement
-    // carries in `Op::weights` and nothing has read yet. The MoE SKUs are not
+    // the kernels still take the view, and the one thing missing is the join
+    // from a STATEMENT to its bank — which a `Program`'s statement carries in
+    // `Op::weights` and nothing has read yet. (`fire::moe_ptrs`, which carved
+    // the `_ptrs`/`_scales_ptrs`/`_bias_ptrs` arrays at load, is gone with the
+    // rest of the legacy MoE leg.) The MoE SKUs are not
     // servable through this driver today for other reasons as well (a3b and
     // dsv4 both refuse lanes), so a refusal by name is the honest answer
     // until the first of them resolves.
@@ -213,27 +222,34 @@ impl FireViews {
     /// One runtime object's address, by the vocabulary name the trace minted
     /// it under.
     ///
-    /// # THE SEAM: nothing calls this yet
+    /// # This is the door a `#[claims]` body opens
     ///
-    /// `bind::resolve_arg` used to, on every `Arg::Raised` of every lowered
-    /// launch. The walk that replaced it reaches the two objects it needs
-    /// DIRECTLY — `baker::fire::Fire::pages` indexes [`Self::kv`] and
-    /// `Fire::recurrent` indexes [`Self::recurrent`], both by the layer the
-    /// statement names — because `baker::points_shim` is a hand-written
-    /// placeholder for `#[claims]`'s generated dispatch and a hand-written
-    /// arm can index a vector.
+    /// `bind::resolve_arg` used to call it, on every `Arg::Raised` of every
+    /// lowered launch; R2 deleted that walk and left this function with no
+    /// caller, naming the generated dispatch as its target. THAT IS NOW THE
+    /// CALLER, through one indirection: a raise is declared by KEY
+    /// (`kernels::raises::Struct<KvCache>`), a claim body asks its `Ctx` for
+    /// the key (`Ctx::raised::<Fa2Decode>()`), and `impl Answered for
+    /// FireViews` below hands the ask straight here with no layer.
     ///
-    /// The generated dispatch cannot: a raise is declared by KEY
-    /// (`kernels::raises::Struct<KvCache>`), and a generator emitting an arm
-    /// for an arbitrary point has only that key to resolve with. So this
-    /// function is the target, [`ANSWERED`] is the vocabulary it must cover,
-    /// and the mask and score views have no reader today for the same
-    /// reason: no arm of the placeholder shim takes them. `None` is a refusal at the bind ([`RaisedUnbound`]), never a
-    /// null: the names this returns `None` for — `"moe.banks"`,
-    /// `"gemm.groups"`, the `dsv4.*` state, `"mtp.pending_hidden"` — are
-    /// objects this driver does not STAGE yet (nothing allocates their banks
-    /// or slabs), and a refusal that names the key is the honest answer until
-    /// something does.
+    /// NO LAYER, AND THAT IS THE SPLIT. The two per-layer pools are the ones
+    /// a STATEMENT names (`Op::cache`), so they arrive through the `Cache`
+    /// mark and `BoundOp::pages`/`recurrent` — `baker::fire::Fire`'s own
+    /// indexing of [`Self::kv`] and [`Self::recurrent`]. What comes through
+    /// the key door is exactly what no statement names: the fire's
+    /// schedules, its host CSR mirrors, its mask, its streams. A key asked
+    /// with no layer against a per-layer object therefore refuses here
+    /// rather than defaulting to layer zero.
+    ///
+    /// [`ANSWERED`] is the vocabulary this must cover. `None` is a refusal at
+    /// the bind ([`RaisedUnbound`]), never a null: the names this returns
+    /// `None` for — `"moe.banks"`, `"gemm.groups"`, the `dsv4.*` state,
+    /// `"mtp.pending_hidden"` — are objects this driver does not STAGE yet
+    /// (nothing allocates their banks or slabs), and a refusal that names the
+    /// key is the honest answer until something does. The one key whose null
+    /// is an ANSWER is `"row_valid"`, and the CALLER says so: a body asks for
+    /// it through `Ctx::staged`, which reads `None` as the null every
+    /// appending kernel tests for.
     ///
     /// [`RaisedUnbound`]: super::BindRefusal::RaisedUnbound
     #[must_use]
@@ -264,8 +280,43 @@ impl FireViews {
             "fa2.prefill" => of(self.streams.prefill_plan_cache.cast_const()),
             "qo_indptr.host" => of(self.streams.qo_indptr_host.cast::<c_void>()),
             "kv_page_indptr.host" => of(self.streams.kv_page_indptr_host.cast::<c_void>()),
+            // THE DECODE SCHEDULE, ANSWERED BY KEY. It was withheld here for
+            // one measured reason, and that reason retired with the legacy
+            // walk: there used to be TWO decode schedules whenever a stack
+            // kept one per layer kind, and picking between them needed the
+            // window on the statement's `LaunchSpec`, which a key does not
+            // carry. A `Program` is ONE LANE and `Baked::attn_ask` raises the
+            // schedule that lane's statements ask for — refusing the lane
+            // outright when two of them ask for different ones ("states two
+            // decode attention schedules and this driver raises one"). So
+            // there is exactly one per fire, this key names it, and the
+            // ambiguity that made a one-valued answer dangerous is a
+            // load-time refusal instead.
+            "fa2.decode" => of(self.streams.decode_plan_cache.cast_const()),
+            // THE STREAMS, THROUGH THE SAME DOOR. A stream is a raise whose
+            // payload is a plane rather than a struct (`kernels_cuda::views`
+            // declares `RowValid` and `RequestOfToken` beside the view
+            // structs), and a body that needs one needs it for the reason a
+            // body needs a schedule: no statement carries it. The SHAPE is
+            // not answered and is not asked for — every kernel that reads one
+            // of these indexes it by the row it is already on.
+            "row_valid" | "request_of_token" | "positions" | "token_ids" | "qo_indptr" => {
+                self.streams.named(name).map(|p| p.cast_const())
+            }
             _ => None,
         }
+    }
+}
+
+/// The by-key door, as the floor spells it: `Ctx::raised::<R>()` asks for
+/// `R::KEY` and this is what answers.
+///
+/// NO LAYER CROSSES IT, for [`FireViews::raised`]'s reason — the per-layer
+/// pools ride the `Cache` mark, which a statement names and `BoundOp`
+/// resolves. Everything a claim body pulls off `self` is fire-wide.
+impl kernels::raises::Answered for FireViews {
+    fn raised(&self, key: &'static str) -> Option<*const c_void> {
+        Self::raised(self, key, None)
     }
 }
 
@@ -365,15 +416,20 @@ fn recurrent_view(g: &GdnCtx, layer: usize) -> RecurrentView {
 }
 
 /// Every runtime name this driver ANSWERS — streams through
-/// [`FireStreams::named`], objects through [`FireViews::raised`], the fa2
-/// preps through the resolver's raise map. The rebirth of
-/// `every_plane_is_answered`: a test walks every catalogued SKU's
-/// `plan.runtime` against this list, so a text minting a name nothing
-/// answers fails the build, not the fire.
+/// [`FireStreams::named`], objects through [`FireViews::raised`], both
+/// reachable from a claim body by key through `impl Answered`.
 ///
-/// The gate walks it BOTH WAYS. A name here that no catalogued text mints is
-/// a claim nothing exercises, and it fails the same test — see the note where
-/// `"fa2.decode"` used to sit for what an unexercised entry costs.
+/// THE CENSUS AND NOT A GATE, since R2: the test that walked every catalogued
+/// SKU's `plan.runtime` against this list died with `plan.runtime`, and a
+/// baker `Plan` mints no runtime names at all — a body asks for what it needs
+/// by the key its `Raise` declares, and an unanswered key is a refusal with
+/// the key in it. What the list is for now is reading: one place that says
+/// what a fire of this driver can be asked for.
+///
+/// `"fa2.decode"` IS ON IT AGAIN. It was struck when the legacy walk could
+/// keep two decode schedules and a key could not say which; `Baked::attn_ask`
+/// refuses a lane that asks for two, so one fire has one, and
+/// [`FireViews::raised`] says so at the arm.
 pub const ANSWERED: &[&str] = &[
     // streams
     "positions",
@@ -389,25 +445,9 @@ pub const ANSWERED: &[&str] = &[
     "attention_mask",
     "attn.score",
     "fa2.prefill",
+    "fa2.decode",
     "qo_indptr.host",
     "kv_page_indptr.host",
-    // `"fa2.decode"` STOOD HERE, and it was the only entry in this list that
-    // no arm of `raised()` could answer -- a text minting it would have
-    // passed `every_runtime_name_is_answered` and then refused at the fire,
-    // which is the exact failure this list exists to move earlier.
-    //
-    // It is not an oversight and it is not unstaged either: the driver owns
-    // the object (`FireScratch::decode_plan`, and a second one in
-    // `decode_plan_full`), it just does not deliver it by name. There are TWO
-    // decode schedules whenever a stack keeps one per layer kind, and picking
-    // between them needs the WINDOW on the statement's `LaunchSpec`, which
-    // `bind::attn_plan` reads and a raise key does not carry. A one-valued
-    // answer here would hand half the launches the other kind's schedule --
-    // silently, and only on the stacks that keep two.
-    //
-    // So the decode plan travels the attn-plan channel, and this list does
-    // not claim otherwise. If a text ever does mint `"fa2.decode"`, the gate
-    // now fails by name and this note is the answer to why.
 ];
 
 /// Runtime names this driver KNOWS but deliberately refuses until their

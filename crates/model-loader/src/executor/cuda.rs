@@ -221,6 +221,14 @@ impl Drop for CudaArena {
 /// (`PIE_LOADER_DEVICE_TRANSFORMS=0` turns them off). Defaulted ON since
 /// that is what this module exists for; the switch exists to bisect a
 /// numerical disagreement against the host executor without a rebuild.
+///
+/// THE `PIE_LOADER_` PREFIX IS NOT THIS CRATE'S, and the name is kept anyway.
+/// It was the C ABI's namespace, and that ABI is gone — but the variable
+/// outlived it as a knob somebody ships: `driver-cuda`'s `Boot` parses it into
+/// `[driver] device_transforms` and has a test pinning every false spelling.
+/// Renaming it would break a live, configured switch to tidy a prefix, in a
+/// crate that cannot see the two places it is read. It is one name, spelled
+/// twice, and this sentence is cheaper than the churn.
 fn device_transforms_enabled() -> bool {
     !matches!(
         std::env::var("PIE_LOADER_DEVICE_TRANSFORMS").as_deref(),
@@ -559,48 +567,42 @@ fn declined(symbol: &str, fired: Result<(), kernels_cuda::Refusal>) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::passes::tile::{
-        CUDA_CAST_FP32_TO_BF16, CUDA_QUANTIZE_BF16_TO_FP8, CUDA_QUANTIZE_BF16_TO_MXFP4,
-        CUDA_SCALE_ROWS_BF16,
-    };
+    use crate::plan::passes::tile::{CUDA_CAST_FP32_TO_BF16, CUDA_SCALE_ROWS_BF16};
 
-    /// Every symbol the compiler may name is a row this build can FIRE.
+    /// Every symbol the compiler may name is a PATH this build calls.
     ///
-    /// The constants live in `plan::passes::tile` so a CUDA plan
-    /// compiles on a machine with no CUDA, which means nothing there can
-    /// check them; this is the other half, catching a renamed or
-    /// removed row here instead of at load time.
+    /// The constants live in `plan::passes::tile` so a CUDA plan compiles on
+    /// a machine with no CUDA, which means nothing there can check them; this
+    /// is the other half, catching a renamed transform here instead of at
+    /// load time.
     ///
-    /// Asks `routine()` rather than scanning a table: a symbol it
-    /// answers for has a host program the dispatch will actually reach,
-    /// which is what this file's four launches need to be true.
+    /// THE PATH IS THE BINDING AND THE STRING IS ITS SPELLING. `dispatch`
+    /// above MATCHES these two strings and then calls the two functions by
+    /// path, so what can drift is the spelling, not the call. The macro binds
+    /// the function item — which is what makes a rename a compile error here
+    /// — and composes the string out of the same tokens, so the two cannot
+    /// disagree without this failing.
     ///
-    /// TWO OF THE FOUR ARE NOT ROUTINES, and the split is the point. A
-    /// `Routine` is what a TRACE states, and no trace states a load-time
-    /// weight transform — so `kernels-cuda` holds the two quantisers as
-    /// plain `unsafe fn`s. Their names are checked by the COMPILER at
-    /// `encode_mxfp4`/`encode_fp8` instead, which is a stronger check than
-    /// this one and needs no list; what stays here is the pair whose string
-    /// still has to resolve against a registry.
+    /// This replaced a lookup in `kernels_cuda::routine(symbol)`, the by-name
+    /// registry the routine layer carried. The registry is deleted; the
+    /// question it was asked survives, and the compiler answers more of it.
+    ///
+    /// THE OTHER TWO ARE NOT LAUNCHES AT ALL: `quantize_bf16_to_mxfp4_*` and
+    /// `quantize_bf16_to_fp8_*` are load-time weight transforms that
+    /// `kernels-cuda` holds as plain `unsafe fn`s, and their names are
+    /// checked by the COMPILER at `encode_mxfp4`/`encode_fp8`, which is a
+    /// stronger check than this one and needs no list.
     #[test]
-    fn every_symbol_the_plan_may_name_is_a_row_this_build_can_fire() {
-        for symbol in [CUDA_CAST_FP32_TO_BF16, CUDA_SCALE_ROWS_BF16] {
-            assert!(
-                kernels_cuda::routine(symbol).is_some(),
-                "the loader may compile a plan naming `{symbol}`, and \
-                 `kernels-cuda` has no routine for it"
-            );
+    fn every_symbol_the_plan_may_name_is_a_path_this_build_calls() {
+        macro_rules! spelled {
+            ($ns:ident :: $f:ident) => {{
+                // THE PATH, RESOLVED. A rename that missed the constant
+                // stops this line from compiling.
+                let _ = kernels_cuda::$ns::$f::<kernels_cuda::jit::abi::bf16>;
+                concat!(stringify!($ns), "::", stringify!($f))
+            }};
         }
-
-        // The other half of the same claim: a plan may name these two, and
-        // nothing in `kernels-cuda`'s registry answers for either. If one
-        // ever gains a `#[routine]`, it belongs in the loop above.
-        for symbol in [CUDA_QUANTIZE_BF16_TO_MXFP4, CUDA_QUANTIZE_BF16_TO_FP8] {
-            assert!(
-                kernels_cuda::routine(symbol).is_none(),
-                "`{symbol}` is a registry row again; move it into the loop \
-                 above, which is the check its string then needs"
-            );
-        }
+        assert_eq!(CUDA_CAST_FP32_TO_BF16, spelled!(quant::cast_fp32_to));
+        assert_eq!(CUDA_SCALE_ROWS_BF16, spelled!(quant::scale_rows));
     }
 }

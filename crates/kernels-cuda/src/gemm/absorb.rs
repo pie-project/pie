@@ -1,5 +1,4 @@
 use core::ffi::c_void;
-use kernels_macros::routine;
 
 use crate::jit::Ctx;
 use crate::jit::abi::Tensor;
@@ -80,7 +79,7 @@ unsafe fn absorb(
     absorb_check(status, what);
 }
 
-#[routine(driver, canon = "mla.absorb_q")]
+#[allow(clippy::too_many_arguments)]
 pub fn mla_absorb_q_to_latent_bf16(
     ctx: &Ctx<'_>,
     q_nope: In<Tensor<c_void>>,
@@ -144,7 +143,7 @@ pub fn mla_absorb_q_to_latent_bf16(
     Ok(())
 }
 
-#[routine(driver, canon = "mla.absorb_out")]
+#[allow(clippy::too_many_arguments)]
 pub fn mla_absorb_latent_to_v_bf16(
     ctx: &Ctx<'_>,
     attn_latent: In<Tensor<c_void>>,

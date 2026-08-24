@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | 1 | Rust | [`driver_cuda::bind::abi::KvCacheScheme`], `driver_cuda::dtype::DType` |
 //! | 2 | host C++ | the ARCHIVE crate's `attn/kv_cache_view.hpp`, `tensor.hpp` |
-//! | 3 | device | `kernels-cuda/kernels/attn/attention_naive_paged.cuh` |
+//! | 3 | device | `kernels-cuda/kernels/attn/kv_paged.cuh` |
 //!
 //! **The driver fills a view from (1) and NVRTC's kernel switches on (3), so
 //! (1) → (3) is the live pair.** For most of this migration the only
@@ -137,7 +137,7 @@ fn mirrors(what: &str, rust: &[(String, u8)], device: &[(String, u8)]) {
     }
 }
 
-const DEVICE: &str = "crates/kernels-cuda/kernels/attn/attention_naive_paged.cuh";
+const DEVICE: &str = "crates/kernels-cuda/kernels/attn/kv_paged.cuh";
 
 /// The KV cache scheme, Rust against device.
 ///

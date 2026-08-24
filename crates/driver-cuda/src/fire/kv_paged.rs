@@ -1,8 +1,9 @@
 //! What is left of `attn/kv_paged.cu`'s host side: three launchers plus a
-//! conversion. A throw is not a decline — `Walk::refuses` forbids silent fallback.
+//! conversion. A decline (`CopyKvCells`/`PageView`) is an empty extent and
+//! says which; a `Refusal` is the JIT's, and neither is a silent fallback.
 
-use kernels_cuda::ArgValue;
 use kernels_cuda::attn::{KvDType, KvLayer, KvScheme};
+use kernels_cuda::{ArgValue, Refusal};
 
 use crate::bind::abi::{KvCacheLayerView, KvCacheScheme};
 use crate::dtype::DType;
@@ -74,9 +75,13 @@ pub enum CopyDecline {
 /// Correct as a raw copy since the cache is post-RoPE — positions live in the
 /// per-beam mask, not the stored slot.
 ///
+/// # Errors
+///
+/// The JIT's own decline, if the instantiation will not compile, load or launch.
+///
 /// # Panics
 ///
-/// If the cache isn't native bf16, or the kernel table and driver disagree.
+/// If the cache isn't native bf16 — a caller contract, not a decline.
 ///
 /// # Safety
 ///
@@ -89,14 +94,14 @@ pub unsafe fn copy_kv_cells_bf16(
     src_off: *const u32,
     n: i32,
     stream: *mut std::ffi::c_void,
-) -> CopyKvCells {
+) -> Result<CopyKvCells, Refusal> {
     // Scheme is checked before extent, so a quantised cache is wrong regardless of `n`.
     assert!(
         layer.is_native_bf16(),
         "attn::copy_kv_cells_bf16 requires native bf16 KV cache"
     );
     if n <= 0 {
-        return CopyKvCells::Declined(CopyDecline::NoCells);
+        return Ok(CopyKvCells::Declined(CopyDecline::NoCells));
     }
 
     let instantiation = if layer.hnd_layout {
@@ -121,8 +126,8 @@ pub unsafe fn copy_kv_cells_bf16(
         ArgValue::I32(layer.head_dim),
     ];
 
-    super::hand::fire("attn/kv_paged.cuh", instantiation, launch, &values, stream);
-    CopyKvCells::Launched
+    super::hand::fire("attn/kv_paged.cuh", instantiation, launch, &values, stream)?;
+    Ok(CopyKvCells::Launched)
 }
 
 /// Whether a page-view build ran. `#[must_use]` for `fire/gemv.rs`' reason.
@@ -151,6 +156,10 @@ pub enum PageViewDecline {
 /// `keep_pages` pages of each request — a sliding-window layer reading a full
 /// cache without copying it. One block of 256.
 ///
+/// # Errors
+///
+/// The JIT's own decline, if the instantiation will not compile, load or launch.
+///
 /// # Safety
 ///
 /// Every pointer is a device address live across the launch, on the caller's `stream`.
@@ -163,13 +172,13 @@ pub unsafe fn build_window_page_view(
     dst_indices: *mut u32,
     r: i32,
     stream: *mut std::ffi::c_void,
-) -> PageView {
+) -> Result<PageView, Refusal> {
     // Split so the caller learns which extent was empty.
     if r <= 0 {
-        return PageView::Declined(PageViewDecline::NoRequests);
+        return Ok(PageView::Declined(PageViewDecline::NoRequests));
     }
     if keep_pages <= 0 {
-        return PageView::Declined(PageViewDecline::NoKeptPages);
+        return Ok(PageView::Declined(PageViewDecline::NoKeptPages));
     }
     let launch = kernels_cuda::jit::Launch::grid([1, 1, 1], [256, 1, 1]).smem(0);
     let values = [
@@ -186,14 +195,18 @@ pub unsafe fn build_window_page_view(
         launch,
         &values,
         stream,
-    );
-    PageView::Launched
+    )?;
+    Ok(PageView::Launched)
 }
 
 /// `build_full_split_view`: describes one request's page span as `splits`
 /// consecutive sub-requests, so a long prefill is attended in pieces against
 /// one page table. 32 threads (`LaunchRule::SingleWarp`), since the body is a
 /// serial walk with only one thread active past the first step.
+///
+/// # Errors
+///
+/// The JIT's own decline, if the instantiation will not compile, load or launch.
 ///
 /// # Safety
 ///
@@ -209,12 +222,12 @@ pub unsafe fn build_full_split_view(
     dst_last: *mut u32,
     src_indices: *const u32,
     stream: *mut std::ffi::c_void,
-) -> PageView {
+) -> Result<PageView, Refusal> {
     if splits <= 0 {
-        return PageView::Declined(PageViewDecline::NoSplits);
+        return Ok(PageView::Declined(PageViewDecline::NoSplits));
     }
     if page_size <= 0 {
-        return PageView::Declined(PageViewDecline::NoPageSize);
+        return Ok(PageView::Declined(PageViewDecline::NoPageSize));
     }
     let launch = kernels_cuda::jit::Launch::grid([1, 1, 1], [32, 1, 1]).smem(0);
     // Operand order is the `__global__`'s: `src_indices` comes last, not beside `src_indptr`.
@@ -234,6 +247,6 @@ pub unsafe fn build_full_split_view(
         launch,
         &values,
         stream,
-    );
-    PageView::Launched
+    )?;
+    Ok(PageView::Launched)
 }

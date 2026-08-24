@@ -13,7 +13,7 @@
 //!   * 0 — pie can boot here. Warnings are allowed: a missing GPU is a fact
 //!     about the machine, not a broken installation.
 //!   * 1 — it cannot. Reserved for what actually stops a boot: an unparseable
-//!     config, or a config asking for a driver this binary was not built with.
+//!     config, or a config asking for a driver this binary does not have.
 
 use std::path::Path;
 use std::process::Command;
@@ -139,22 +139,7 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
                 } else {
                     // A driver you did not build is not a fault until the
                     // config asks for it -- which the config section checks.
-                    // The cargo feature, which is NOT the driver name with
-                    // its underscore swapped: `cuda_native` builds from
-                    // `driver-cuda`, and the derived spelling named a feature
-                    // that does not exist.
-                    let feature = match *name {
-                        "cuda_native" => "driver-cuda",
-                        "metal" => "driver-metal",
-                        "vulkan" => "driver-vulkan",
-                        "wgpu" => "driver-wgpu",
-                        other => other,
-                    };
-                    (
-                        name.to_string(),
-                        format!("not compiled (build with --features {feature})"),
-                        Status::Warn,
-                    )
+                    (name.to_string(), absent_because(name), Status::Warn)
                 }
             })
             .collect(),
@@ -306,13 +291,32 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
         (
             "model".into(),
             format!(
-                "{} asks for the {kind} driver, which this binary was not built with",
-                worker.model.name
+                "{} asks for the {kind} driver: {}",
+                worker.model.name,
+                absent_because(kind)
             ),
             Status::Fail,
         )
     });
     out
+}
+
+/// Why a driver flavor this binary does not have is missing.
+///
+/// TWO reasons, and only one of them is a build choice. CUDA is absent
+/// because a feature was off, and the feature carries the CUDA runtime ABI
+/// in its name -- there is no version-less `driver-cuda` to advise. The three
+/// shader flavors are absent because no build of pie hosts them: their crates
+/// left the workspace and no feature would bring one back. Advice that would
+/// not work is worse than no advice, which is the distinction
+/// `worker::driver_ffi` draws between its two error messages.
+fn absent_because(name: &str) -> String {
+    match name {
+        "cuda_native" => {
+            "not compiled — build with `--features driver-cuda-13` (or `-12`)".to_string()
+        }
+        shader => format!("retired — no build of pie hosts `driver-{shader}`; it returns at P5"),
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

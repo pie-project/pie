@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use image::{DynamicImage, imageops::FilterType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

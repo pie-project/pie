@@ -17,6 +17,23 @@
 //! same checkpoint to thrash, and one of them would be found much later than
 //! the other.
 //!
+//! # Who reads this today, measured
+//!
+//! ONE backend, and it is out of the workspace: `driver-metal`'s
+//! `loader/slab.rs` is the only consumer of anything here, and its own doc
+//! saying this is "shared with CUDA rather than restated" is ahead of the
+//! facts — no CUDA path names this module. `release` and `evictions` have no
+//! caller at all outside the tests below.
+//!
+//! It was considered for relocation into `driver-metal` beside its reader and
+//! kept, for two reasons that are about evidence rather than tidiness. The
+//! tests below RUN, in `cargo test -p model-loader`, and `driver-metal` does
+//! not compile — moving the file would convert five checked properties into
+//! unchecked text. And this module imports nothing from the rest of the crate
+//! and nothing imports it, so what it costs the loader is its own length; what
+//! it would cost a driver is the second eviction rule the paragraph above
+//! exists to prevent.
+//!
 //! The rule: a free slot always beats a used one (free slots have age 0, and
 //! nothing else ever does), ties go to the lowest slot id, and among used
 //! slots the least recently touched loses. Slots pinned by the batch in

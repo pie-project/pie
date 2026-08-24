@@ -34,22 +34,12 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl ForwardPlan {
-    pub fn depth_windowed(&self, op: &Op) -> bool {
-        self.depth_window && op.layer.is_some()
-    }
-
-    pub fn depth_prefix_plan(&self, op: &Op) -> bool {
-        if !self.depth_windowed(op) {
-            return false;
-        }
-        let OpKind::Launch { kernel, .. } = &op.kind else {
-            return false;
-        };
-        crate::kernels::Backend::of_family(&self.family)
-            .and_then(|b| crate::kernels::stated_in(b, kernel))
-            .is_some_and(|k| k.depth_prefix_plan)
-    }
-
+    // `depth_windowed` AND `depth_prefix_plan` STOOD HERE. The second asked
+    // `KernelSig::depth_prefix_plan` — whether a launch inside a depth window
+    // plans over the whole prefix — and the first existed to answer it. The
+    // last reader of either was the legacy driver's depth walk, which went
+    // with `model_compiler::lower` at R3; R4e measured zero callers and the
+    // column they read went with them.
     pub fn layer_ops(&self, l: u32) -> impl Iterator<Item = &Op> {
         self.ops.iter().filter(move |op| op.layer == Some(l))
     }

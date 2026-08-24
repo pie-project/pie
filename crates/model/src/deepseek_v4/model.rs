@@ -114,6 +114,44 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
+/// ways, with `..d` saying that everything else is replicated.
+///
+/// The attention heads and both intermediates. `q_lora` and `o_lora` do not
+/// divide: `q_down` and `o_up` sit on the replicated side of the two
+/// projections that DO cut (`q_up` expands the lora into the head fan,
+/// `o_down` contracts the head fan back into it), and `o_down`'s partial
+/// rows are exactly what the `dist.all_reduce` immediately after it sums.
+/// The hyper-connection stack (`streams`) is a factor of the residual width,
+/// which the reduce closes over and no rank holds a piece of.
+///
+/// THE COMPRESSED PLANE CUTS WITH THE HEADS, and it is the reason `kv_down`
+/// carries a mark at all. This family's cache row is `[1, heads * head_dim]`
+/// — one plane per token serving as both k and v — so it is per-head, and a
+/// rank attending its own `heads / world` slice of the query fan must hold
+/// the matching slice of the plane. A plane replicated whole beside a cut
+/// query fan would need a HEAD OFFSET at the fire, which no statement here
+/// carries.
+///
+/// A SEAM THIS CUT DOES NOT CLOSE: `kv_norm` is a whole-row `norm.rmsnorm`
+/// over that now-cut plane, and a root-mean-square over a row split across
+/// ranks is a cross-rank sum that no point in this tree states. Every other
+/// norm this text applies is either over a replicated row (`q_norm` on the
+/// lora, the hyper norms on the stack) or per head
+/// (`norm.rmsnorm_no_scale` at `head_dim`), so this is the one. The fix is a
+/// model-truth question — DeepSeek normalizes the compressed latent, and
+/// whether this plane's norm is per head is a checkpoint's answer, and no
+/// dsv4 checkpoint is cached.
+fn per_rank<const TP: usize>(d: Dims) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+    Dims {
+        heads: cut("heads", d.heads),
+        dense_inter: cut("dense inter", d.dense_inter),
+        moe_inter: cut("moe inter", d.moe_inter),
+        ..d
+    }
+}
+
 impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
     pub fn base() -> Self {
         assemble(Dims {
@@ -130,6 +168,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
 }
 
 fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP> {
+    let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
     let mult = d.streams as u64;
     let q_w = d.heads as u64 * d.head_dim as u64;
@@ -157,8 +196,11 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                 q_down: Tensor::sym(n("q_down"), [q_lora, hidden]),
                 q_norm: norm("q_norm", q_lora),
                 q_up: Tensor::sym(n("q_up"), [q_w, q_lora]).columns(),
-                kv_down: Tensor::sym(n("kv_down"), [q_w, hidden]),
-                kv_norm: norm("kv_norm", q_w),
+                kv_down: Tensor::sym(n("kv_down"), [q_w, hidden]).columns(),
+                kv_norm: Norm {
+                    weight: Tensor::sym(n("kv_norm"), [q_w]).columns(),
+                    eps: d.norm_eps,
+                },
                 o_down: Tensor::sym(n("o_down"), [o_lora, q_w]).rows(),
                 o_up: Tensor::sym(n("o_up"), [hidden, o_lora]),
                 sink: Tensor::sym(n("attn_sink"), [d.heads as u64]).columns(),
@@ -180,7 +222,7 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                 Mlp::Routed {
                     router: Tensor::sym(n("router"), [d.experts as u64, hidden]),
                     bias: Tensor::sym(n("router_bias"), [d.experts as u64]),
-                    gate_up: Tensor::sym(n("experts_gate_up"), [d.experts as u64, 2 * moe_inter, hidden]).packed([moe_inter, moe_inter]),
+                    gate_up: Tensor::sym(n("experts_gate_up"), [d.experts as u64, 2 * moe_inter, hidden]).bank([moe_inter, moe_inter]),
                     down: Tensor::sym(n("experts_down"), [d.experts as u64, hidden, moe_inter]).rows(),
                     experts: d.experts,
                     top_k: d.top_k,

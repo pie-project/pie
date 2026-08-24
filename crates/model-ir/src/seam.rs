@@ -104,83 +104,20 @@ pub const OUT: Def = Def {
     sink: None,
 };
 
-pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
-    let mut problems = Vec::new();
-    for stmt in &plan.seams {
-        let Some(def) = by_name(&stmt.seam) else {
-            problems.push(format!(
-                "{}: states seam `{}`, which no seam! signature declares",
-                plan.family, stmt.seam
-            ));
-            continue;
-        };
-        let (Some(pos), Some(at)) = (def.position, stmt.op) else {
-            continue;
-        };
-        let at = at as usize;
-
-        let Some(seen) = plan.ops.get(at + 1).map(|op| op.inputs.clone()) else {
-            continue;
-        };
-        for &v in &seen {
-            let produced_at = plan.ops.iter().position(|op| op.outputs.contains(&v));
-            match produced_at {
-                None => problems.push(format!(
-                    "{}: seam `{}` sees value {v}, which no op produces",
-                    plan.family, def.name
-                )),
-                Some(from) => {
-                    if !admits(plan, &plan.ops[from].kind, pos.after) {
-                        problems.push(format!(
-                            "{}: seam `{}` must sit after {:?}, but value {v} \
-                             comes from {}",
-                            plan.family,
-                            def.name,
-                            pos.after,
-                            producer_name(&plan.ops[from].kind),
-                        ));
-                    }
-                    for (i, op) in plan.ops.iter().enumerate().take(at).skip(from + 1) {
-                        if !op.inputs.contains(&v) {
-                            continue;
-                        }
-                        if admits(plan, &op.kind, pos.before) {
-                            problems.push(format!(
-                                "{}: seam `{}` must sit before {:?}, but op \
-                                 {i} consumes value {v} first — different \
-                                 arithmetic, not a reordering",
-                                plan.family, def.name, pos.before
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    problems
-}
-
-fn admits(plan: &crate::trace::ForwardPlan, kind: &crate::trace::OpKind, roles: &[&str]) -> bool {
-    let crate::trace::OpKind::Launch { kernel, .. } = kind else {
-        return roles.contains(&kind_name(kind));
-    };
-    let claim = crate::kernels::Backend::of_family(&plan.family)
-        .and_then(|b| crate::kernels::claim_of(b, kernel));
-    for role in roles {
-        if let Some(c) = claim
-            && (c == *role || c.split('.').next() == Some(role))
-        {
-            return true;
-        }
-        if kernel.strip_prefix("canon::") == Some(role) {
-            return true;
-        }
-        if *role == "matmul" && kernel.starts_with("gemm::") {
-            return true;
-        }
-    }
-    false
-}
+// `check_plan` AND ITS THREE HELPERS STOOD HERE — the seam-ordering walk
+// over `crate::trace::ForwardPlan`: does each seam sit after the op whose
+// value it observes and before the next op that consumes it. It read a
+// statement's role through `kernels::claim_of`, which read
+// `KernelSig::canon`.
+//
+// It went with its subject. `ForwardPlan` is the LEGACY traced form and
+// `TraceBuilder::finish` was the only thing that ever called this; R3 deleted
+// `model-dsl-legacy`'s `Trace`, which was the only thing that ever built a
+// `TraceBuilder`. A check with no plan to check is not a check.
+//
+// THE DEFS BELOW ARE NOT LEGACY and stay: `model_dsl::forward` records `IN`
+// and `OUT` by name on every traced plan, and `driver-cuda`/`baker-smoke`
+// both find the logits by asking for `OUT.name`.
 
 pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &RECURRENT, &OUT];
 
@@ -188,22 +125,4 @@ pub fn by_name(name: &str) -> Option<&'static Def> {
     ALL.iter().copied().find(|d| d.name == name)
 }
 
-fn producer_name(kind: &crate::trace::OpKind) -> String {
-    match kind {
-        crate::trace::OpKind::Launch { kernel, .. } => kernel.clone(),
-        other => kind_name(other).to_string(),
-    }
-}
 
-fn kind_name(kind: &crate::trace::OpKind) -> &'static str {
-    use crate::trace::OpKind as K;
-    match kind {
-        K::Launch { .. } => "Launch",
-        K::Guard { .. } => "Guard",
-        K::Peel { .. } => "Peel",
-        K::HookSite { .. } => "HookSite",
-        K::Select { .. } => "Select",
-        K::LmHead { .. } => "LmHead",
-        _ => "other",
-    }
-}

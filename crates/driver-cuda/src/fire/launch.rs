@@ -507,17 +507,17 @@ fn arena_for(
 /// # What it borrows, and what it owns
 ///
 /// Everything it needs is already built by the time it is called, and it is
-/// all borrowed: `views` (this fire's KV pages, recurrent slabs and runtime
-/// planes), the stream and cuBLAS handle, the fa2 decode schedule through
-/// `decode_plan`, and `logits` for the landing the delivery reads. It owns
-/// exactly one thing: the arena, which is pooled.
+/// all borrowed: `views` (this fire's KV pages, recurrent slabs, runtime
+/// planes and raised schedules), the stream and cuBLAS handle, and `logits`
+/// for the landing the delivery reads. It owns exactly one thing: the arena,
+/// which is pooled.
 ///
-/// `decode_plan` is the fa2 decode schedule `raise_attn_plans` raised for
-/// THIS fire — stamped workspaces, the variant as the lane stated it,
-/// `window_left = -1`. Reused rather than replanned: `baker-smoke` carried
-/// its own `DecodePlanCache` because it had no driver to ask, and planning a
-/// second one here would be a second 48 MB workspace and a second answer to
-/// a question the fire already answered.
+/// The fa2 decode schedule rides `views.streams.decode_plan_cache` — what
+/// `raise_attn_plans` raised for THIS fire, with stamped workspaces, the
+/// variant as the lane stated it and `window_left = -1`. Reused rather than
+/// replanned: `baker-smoke` carried its own `DecodePlanCache` because it had
+/// no driver to ask, and planning a second one here would be a second 48 MB
+/// workspace and a second answer to a question the fire already answered.
 ///
 /// # The `Ok(usize)` is the step count
 #[allow(clippy::too_many_arguments)]
@@ -534,7 +534,6 @@ fn baker_fire(
     rows: usize,
     requests: usize,
     sampled_rows: &[u32],
-    decode_plan: *mut std::ffi::c_void,
     cublas: *mut std::ffi::c_void,
     raw_stream: *mut std::ffi::c_void,
 ) -> Result<usize, crate::bind::RunRefusal> {
@@ -570,7 +569,18 @@ fn baker_fire(
     // SAFETY: `raw_stream` is this fire's stream and `cublas` is the handle
     // bound to it at create — which is exactly what `Ctx::with_cublas` asks
     // of its caller.
-    let cx = unsafe { kernels_cuda::jit::Ctx::on(raw_stream).with_cublas(cublas) };
+    //
+    // `with_raised(views)` IS THE STAGING DOOR. A claim body pulls what the
+    // statement does not carry off its own `Ctx` — the fa2 schedules, the
+    // host CSR mirrors, the mask, the fire's streams — and `FireViews`
+    // answers each by the key its `Raise` declares
+    // (`bind::views::FireViews::raised`). This is the caller R2 left that
+    // function waiting for.
+    let cx = unsafe {
+        kernels_cuda::jit::Ctx::on(raw_stream)
+            .with_cublas(cublas)
+            .with_raised(views)
+    };
     let fire = crate::baker::fire::Fire {
         plan: &baked.plan,
         program,
@@ -581,8 +591,6 @@ fn baker_fire(
         requests: requests_i,
         banks: &baked.banks,
         views,
-        geom: &baked.geom,
-        decode_plan: decode_plan.cast(),
     };
 
     for (i, step) in program.steps.iter().enumerate() {
@@ -1002,8 +1010,13 @@ fn gdn_context(
             v_d: shape.v_d,
             conv_dim: shape.conv_dim,
             conv_k: shape.conv_k,
-            // mamba's B/C group count, off the statement.
-            n_groups: shape.n_groups,
+            // mamba's B/C group count. ZERO, and stated here rather than
+            // carried: no `#[points]` declaration in the catalog states a
+            // group count (the mamba row that would is not in this tree),
+            // and the legacy catalog's `RecurrentShape` set it to 0 for
+            // every family it shipped. A number nothing states is a zero
+            // written where a reader can see it, not a field to thread.
+            n_groups: 0,
             // Still one base per model layer: pooling changed where a base
             // comes from, not what a launch is handed.
             conv_state: (0..gdn_state.is_linear.len())
@@ -1052,8 +1065,7 @@ fn kv_pools_for(
     // refuses the unbuilt styles at the door; this match is the other half.
     match dep.kv {
         model::deployment::KvStyle::Paged => {}
-        model::deployment::KvStyle::Mla { .. }
-        | model::deployment::KvStyle::CompressedPlane { .. } => {
+        model::deployment::KvStyle::Latent { .. } => {
             return Err(PIE_STATUS_UNSUPPORTED);
         }
     }
@@ -1190,7 +1202,7 @@ fn kv_and_arrays(
     // want the same two numbers.
     let (kv_heads_i, head_dim_i) = (
         i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
-        i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
+        i32::try_from(model.deployment.shape.head_dim_kernel).unwrap_or(0),
     );
     let layers = kv_pools_for(
         kv,
@@ -1427,11 +1439,12 @@ struct SeamPins {
 /// The two that stayed are the ones a RUNTIME OBJECT carries, and both are
 /// the driver's own policy rather than any statement's:
 ///
-/// * `"attention_mask"` — published on every fire, because with nothing
-///   custom staged the resident form is the plan's own causal mask. A
-///   caller's mask is REFUSED outright, because no arm of the shim reads
-///   one and attending causally over a supplied mask looks like a right
-///   answer — see the refusal below.
+/// * `"attention_mask"` — published on every fire: the CALLER'S mask when
+///   the frame carries one, and the plan's own causal mask when it does
+///   not. Which planner runs is the only difference; the plane, the CSR and
+///   the view are the same either way, and `MaskView::enabled` stays the
+///   POINTER'S PRESENCE, so a claim body reading the view through
+///   `FireViews::raised` gets this fire's own mask rather than a null.
 /// * `"attn.score"` — the per-request CSR of observed rows plus the
 ///   boot-configured window (`ScoreView`). The sink BLOCK is still sized and
 ///   allocated around that CSR, and its score/folded halves have no writer
@@ -1483,32 +1496,44 @@ fn publish_seam_pins(
         }
     };
 
-    // A CALLER'S MASK IS REFUSED, AND THE REASON MOVED. It used to be
-    // refused only when its table did not describe the fire's rows; a
-    // well-formed one was staged and the masked attention arm read it. There
-    // is no masked arm: `baker::points_shim` answers no point that takes
-    // the mask operand, so a staged mask would be staged and IGNORED and the
-    // request would get plain causal attention — which is the exact failure
-    // the old refusal existed to prevent, one level up. So the refusal is now
-    // the presence of the flag.
+    // A CALLER'S MASK IS SERVED, AND THE REFUSAL MOVED TO THE LANE. What
+    // stood here refused the FLAG — because `attention.masked` had no arm to
+    // read a staged mask with, so staging one meant staging it and attending
+    // causally anyway. It has one now (a claim body reading the raise door;
+    // the mask is not an operand), so the question is no longer whether this
+    // driver can serve a mask but whether THIS TEXT states an arm that does:
+    // `baker::word_of` asks that when it picks the lane, and refuses there,
+    // naming the text. By this line the lane already reads a mask.
     //
-    // What un-refuses it: a point that declares the mask operand, an arm in
-    // the shim, and this block staging `element_mask::from_words` again. Two
-    // of those three already exist.
-    if step.plan.has_user_mask {
-        eprintln!(
-            "[driver-cuda] launch: this frame sets `has_user_mask` and no \
-             statement of this lane reads an attention mask, so the mask \
-             would be staged and ignored and the request would be answered \
-             causally. Refusing rather than answering the wrong question."
-        );
-        return Err(PIE_STATUS_UNSUPPORTED);
-    }
-    // The resident causal form, published unconditionally: `MaskView::enabled`
-    // is the pointer's presence, so a claim body that reads the view through
-    // `FireViews::raised` gets this fire's own mask rather than a null.
-    let element_mask =
-        crate::fire::page_mask::element_mask::plan_causal(qo_indptr, kv_indptr, kv_lens, page_size);
+    // The two planners' `None` mean opposite things, which is why this is a
+    // branch and not a fallback. `plan_causal` returning `None` is an empty
+    // fire with nothing to publish — a null `MaskView`, which every fa2 arm
+    // reads as "no mask". `from_words` returning `None` is the fire's rows
+    // and the caller's table DISAGREEING, and falling back to causal there is
+    // the one answer that would look right, so it is a refusal.
+    let element_mask = if step.plan.has_user_mask {
+        let words = step.plan.bitmask_words();
+        let Some(planned) = crate::fire::page_mask::element_mask::from_words(
+            qo_indptr,
+            kv_indptr,
+            kv_lens,
+            page_size,
+            &words.request_indptr,
+            &words.word_indptr,
+            &words.words,
+        ) else {
+            eprintln!(
+                "[driver-cuda] launch: this frame's mask table does not describe \
+                 its rows — a row count, a bitset shorter than its own KV extent, \
+                 or more mask bytes than a fire may hold. Refusing rather than \
+                 attending causally, which is what a fallback would look like."
+            );
+            return Err(PIE_STATUS_UNSUPPORTED);
+        };
+        Some(planned)
+    } else {
+        crate::fire::page_mask::element_mask::plan_causal(qo_indptr, kv_indptr, kv_lens, page_size)
+    };
     let (d_mask, d_mask_indptr) = match element_mask {
         None => (core::ptr::null(), core::ptr::null()),
         Some(p) => {
@@ -1967,7 +1992,7 @@ pub(crate) fn step_impl(
         eprintln!("[driver-cuda] launch: no lane is built; nothing has been loaded");
         PIE_STATUS_INVALID_ARGUMENT
     })?;
-    let program = match baked.lane(class) {
+    let program = match baked.lane(class, step.plan.has_user_mask) {
         Ok((_, p)) => p,
         Err(why) => {
             eprintln!("[driver-cuda] launch: {why}");
@@ -2189,6 +2214,7 @@ pub(crate) fn step_impl(
             core::ptr::null()
         },
         prefill_plan_cache: prefill_plan,
+        decode_plan_cache: decode_plan,
     };
     let views = crate::bind::views::FireViews::build(Some(&attn), gdn_ctx.as_ref(), streams);
 
@@ -2213,7 +2239,6 @@ pub(crate) fn step_impl(
         rows,
         requests,
         &sampled_rows,
-        decode_plan,
         cublas_handle,
         raw_stream,
     );

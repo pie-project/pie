@@ -32,11 +32,13 @@ const FAMILIES: &[&str] = &[
 /// thing this test exists to catch.
 fn budget() -> BTreeMap<&'static str, usize> {
     [
-        // Two `use kernels_cuda::tower::gemma4_* as *_tower` imports, reaching
-        // the two walks -- the only two launcher references this file makes,
-        // not a dispatch branch. `PieEncodeDesc` is still gemma-shaped;
-        // generalising that ABI is what lowers this to one.
-        ("serve/encode.rs", 2),
+        // `serve/encode.rs` STOOD HERE at two -- the pair of
+        // `use kernels_cuda::tower::gemma4_* as *_tower` imports the towers
+        // were launched through. R3 deleted the tower binding (no catalog
+        // import table produces a tower's weights, so there was nothing
+        // resident to bind), and the file is at zero: a ceiling for a
+        // permission nothing uses is what
+        // `no_budget_line_outlives_what_it_was_for` catches.
         // THE TOWER BUDGETS ARE GONE, and their absence is the record.
         //
         // `tower/mod.rs` (3), `tower/gemma4_vision.rs` (1),
@@ -81,23 +83,17 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // does not exist is exactly the stale permission
         // `no_budget_line_outlives_what_it_was_for` catches.
         //
-        // ONE ROW: `baker::BRIDGE`'s `("qwen3.5-0.8b-base",
-        // "qwen35-d0.8b-bf16-kv-bf16")`.
+        // `baker/mod.rs` STOOD HERE at one, and the row it was budgeted for
+        // was `baker::BRIDGE`'s `("qwen3.5-0.8b-base",
+        // "qwen35-d0.8b-bf16-kv-bf16")` — the one place this driver was
+        // allowed to know a checkpoint's name, because the two catalogues
+        // did not share an id space and something had to hold the pairing.
         //
-        // It is a DATA row, not a dispatch branch, and it is the one place
-        // this driver is allowed to know a checkpoint's name — the two
-        // catalogues do not share an id space, so something has to hold the
-        // pairing, and holding it in one auditable table beats deriving it
-        // from a fuzzy match on a family name (`"qwen3.5-4b"` and
-        // `"qwen35-d3b-bf16-kv-bf16"` are close enough to pair by accident
-        // and are different models). The mention is the KEY of a lookup, and
-        // nothing branches on it: `sku_for` compares for equality and
-        // answers a string.
-        //
-        // It has been over budget since W1 landed the table and this line is
-        // the argument that was owed then. It falls to zero when the id
-        // spaces merge, which is the fix and is not this test's.
-        ("baker/mod.rs", 1),
+        // Its own note said the ceiling "falls to zero when the id spaces
+        // merge, which is the fix and is not this test's". R3 is that fix:
+        // there is one catalog, `model::identify` matches a snapshot against
+        // the import tables and answers the SKU itself, and the bridge is
+        // deleted. So the line goes with it.
     ]
     .into_iter()
     .collect()

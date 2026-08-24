@@ -31,7 +31,6 @@ use crate::types::{Encoding, Visibility};
 /// is a bug this catches, which it would not be if verification re-read the
 /// full plan beside it.
 pub struct PlanView<'a> {
-    pub compiler_version: u64,
     pub files: Vec<FileView<'a>>,
     pub sources: Vec<SourceView<'a>>,
     pub tensors: Vec<TensorView<'a>>,
@@ -223,7 +222,6 @@ pub fn verify(
     contract: Option<&ContractView<'_>>,
 ) -> Result<Certificate, Vec<Violation>> {
     let mut found = Vec::new();
-    check_compiler_version(plan, &mut found);
     check_schedule(plan, &mut found);
     check_coverage(plan, &mut found);
     check_files(plan, &mut found);
@@ -239,24 +237,6 @@ pub fn verify(
         files: plan.files.len(),
         source_bytes: plan.sources.iter().map(|source| source.span_bytes).sum(),
     })
-}
-
-/// The plan was compiled by *this* build of the loader.
-///
-/// A tautology on the compile path — the plan came from the same library a
-/// moment ago — and kept anyway, because `compiler_version` is the field that
-/// stops being one the day a plan reaches `verify` from anywhere but a
-/// `compile` call in the same process. The `version` field that used to sit
-/// beside it was removed: a monotonic layout number cannot say anything a
-/// source hash does not, and it said it about a struct C++ reads by layout.
-fn check_compiler_version(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
-    let expected = crate::plan::compiler_version();
-    if plan.compiler_version != expected {
-        found.push(Violation::plan(format!(
-            "plan compiler version {:#x} does not match loader version {expected:#x}",
-            plan.compiler_version
-        )));
-    }
 }
 
 /// The schedule must be a permutation of the instructions.
@@ -515,7 +495,7 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
 /// # Why this did not exist before
 ///
 /// Verification used to run only on the MARSHALLED plan — the POD form a C++
-/// driver held — and `model-loader-capi::view::verify_marshalled` was the only
+/// driver held — and model-loader-capi::view::verify_marshalled was the only
 /// way in. Its own doc explained the choice: "Verification runs *here*, on the
 /// marshalled bytes, and nowhere else. There is no path that verifies the Rust
 /// plan directly, and that is the point: a bug in the marshalling is in scope
@@ -590,7 +570,6 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
     }
 
     PlanView {
-        compiler_version: plan.compiler_version,
         files,
         sources,
         tensors,

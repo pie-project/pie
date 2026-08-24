@@ -1,6 +1,15 @@
-//! Differential proof for the five `store/` layers ported in one pass:
-//! MLA geometry, DSV4 compressor geometry, recurrent-state addressing, swap
-//! copy planning, and the planner profile key.
+//! Differential proof for the `store/` layers ported in one pass:
+//! recurrent-state addressing, swap copy planning, and the planner profile
+//! key.
+//!
+//! TWO OF THE FIVE ARE RETIRED. `MLA geometry` and `DSV4 compressor geometry`
+//! swept `layout::mla_geometry` and `layout::compressed_plane_geometry`, both
+//! deleted with the MLA and compressed-plane pools they sized — no production
+//! reader, and `Deployment::of` refuses every MLA/latent SKU by name. Their
+//! rows are NOT re-blessed out of the golden, which the warning on
+//! [`GOLDEN_FNV1A64`] forbids for good reason: they were the transcript's
+//! PREFIX, and FNV-1a chains, so [`RETIRED_PREFIX_FNV1A64`] carries the hash
+//! state they left and the surviving sweep still ends at the C++'s own value.
 //!
 //! Same protocol as the other parity harnesses -- build the real C++ as an
 //! oracle, sweep both over one grid, require byte-identical output, pin the
@@ -15,8 +24,6 @@
 //!
 //! | fragment | lifted from |
 //! |---|---|
-//! | `mla.inc` | `MlaCache::page_buffers` |
-//! | `dsv4.inc` | `compressor_coff`, `dsv4_compress_bytes_per_token` |
 //! | `rec_strides.inc` | the three stride accessors in `recurrent_state_cache.hpp` |
 //! | `rec_addr.inc` | `conv_state`, `recurrent_state_raw`, `mtp_pending_hidden` |
 //! | `swap_helpers.inc` | `check_pairs`, `page_addr`, `submit_batch` |
@@ -56,23 +63,30 @@
 //! distinguish a full-attention layer (no state, an expected answer) from an
 //! out-of-range index (a caller bug) exactly where the C++ does.
 
-use driver_cuda::dtype::DType;
-use driver_cuda::layout::compressed_plane_geometry::{compress_bytes_per_token, compressor_coff};
-use driver_cuda::layout::mla_geometry::MlaGeometry;
 use driver_cuda::layout::profile_key::{KEY_FIELDS, ProfileKey, StoredField};
 use driver_cuda::layout::recurrent_layout::{RecurrentShape, RecurrentStateLayout};
 use driver_cuda::layout::swap_plan::{Direction, Pool, PoolGeometry, SwapPlan};
 use std::fmt::Write as _;
 
-/// FNV-1a 64 of the **C++ oracle's** stdout.
+/// FNV-1a 64 of the **C++ oracle's** whole stdout, all five layers.
 const GOLDEN_FNV1A64: u64 = 0x05ae_9b51_0c01_1d57;
 /// Byte count of the same output.
 const GOLDEN_BYTES: usize = 2_132_663;
 /// Row count, as a guard on the grid rather than on the values.
 const GOLDEN_ROWS: usize = 80_235;
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+/// The hash state, bytes and rows the two retired layers left.
+///
+/// Not a second golden: the C++ printed `MLA` and `DSV4` first, so hashing
+/// the surviving three FROM this state reaches [`GOLDEN_FNV1A64`] exactly and
+/// they stay pinned to the C++ rather than to themselves. Taken by chaining
+/// the full transcript this file rendered while all five layers were green.
+const RETIRED_PREFIX_FNV1A64: u64 = 0x4f81_f3c1_f8fc_ed4e;
+const RETIRED_PREFIX_BYTES: usize = 36_828;
+const RETIRED_PREFIX_ROWS: usize = 1_322;
+
+/// FNV-1a 64 continued from `h`, so a transcript can be hashed in pieces.
+fn fnv1a64_from(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -80,58 +94,9 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-// ---------------------------------------------------------------------------
-// MLA page geometry
-// ---------------------------------------------------------------------------
-fn render_mla(o: &mut String) {
-    for (code, dt) in [(0, DType::Bf16), (1, DType::Fp16)] {
-        for np in [1u32, 2, 8, 64, 4096] {
-            for ps in [1u32, 16, 32, 64, 128] {
-                for r in [1u32, 64, 128, 512, 576] {
-                    for q in [1u32, 16, 64, 128, 192] {
-                        let g = MlaGeometry::new(4, np, ps, r, q, dt).expect("shape is valid");
-                        let [ckv, kpe] = g.page_buffer_bytes();
-                        let _ = writeln!(o, "MLA\t{code}\t{np}\t{ps}\t{r}\t{q}\t{ckv}\t{kpe}");
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DSV4 compressor geometry
-// ---------------------------------------------------------------------------
-const RATIO_SETS: [&[i32]; 12] = [
-    &[],
-    &[0],
-    &[1],
-    &[2],
-    &[4],
-    &[8],
-    &[-1],
-    &[2, 4],
-    &[4, 4, 4],
-    &[0, 2, 0, 4],
-    &[1, 2, 3, 4, 5, 6, 7, 8],
-    &[4, 0, -3, 16],
-];
-
-fn render_dsv4(o: &mut String) {
-    for rs in RATIO_SETS {
-        for hd in [1u32, 16, 64, 128, 192, 576] {
-            let _ = write!(
-                o,
-                "DSV4\t{}\t{hd}\t{}",
-                rs.len(),
-                compress_bytes_per_token(rs, hd)
-            );
-            for &r in rs {
-                let _ = write!(o, "\t{r}:{}", compressor_coff(r));
-            }
-            o.push('\n');
-        }
-    }
+/// The same, from the empty state — what the swap sweep hashes its pools with.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_from(0xcbf2_9ce4_8422_2325, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +498,6 @@ fn render_profile(o: &mut String) {
 
 fn render() -> String {
     let mut o = String::with_capacity(GOLDEN_BYTES + 8192);
-    render_mla(&mut o);
-    render_dsv4(&mut o);
     render_recurrent(&mut o);
     render_recurrent_oob(&mut o);
     render_swap(&mut o);
@@ -543,7 +506,7 @@ fn render() -> String {
 }
 
 #[test]
-fn all_five_store_layers_are_byte_identical_to_the_cpp_original() {
+fn every_store_layer_is_byte_identical_to_the_cpp_original() {
     // `tri` deliberately provokes panics; without this the transcript is
     // buried in backtrace noise.
     let previous = std::panic::take_hook();
@@ -552,13 +515,14 @@ fn all_five_store_layers_are_byte_identical_to_the_cpp_original() {
     std::panic::set_hook(previous);
 
     assert_eq!(
-        out.len(),
+        out.len() + RETIRED_PREFIX_BYTES,
         GOLDEN_BYTES,
-        "output length drifted from the C++ oracle ({} vs {GOLDEN_BYTES} bytes)",
-        out.len()
+        "output length drifted from the C++ oracle ({} vs {} bytes)",
+        out.len() + RETIRED_PREFIX_BYTES,
+        GOLDEN_BYTES
     );
     assert_eq!(
-        fnv1a64(out.as_bytes()),
+        fnv1a64_from(RETIRED_PREFIX_FNV1A64, out.as_bytes()),
         GOLDEN_FNV1A64,
         "output differs from the C++ oracle. Rebuild it per this file's module \
          docs and diff, but do NOT update the constant to match Rust -- the \
@@ -573,15 +537,13 @@ fn the_grid_still_covers_every_layer_it_claims_to() {
     let out = render();
     std::panic::set_hook(previous);
 
-    assert_eq!(out.lines().count(), GOLDEN_ROWS);
+    assert_eq!(out.lines().count() + RETIRED_PREFIX_ROWS, GOLDEN_ROWS);
     let count = |k: &str| {
         out.lines()
             .filter(|l| l.starts_with(&format!("{k}\t")))
             .count()
     };
     for kind in [
-        "MLA",
-        "DSV4",
         "RECSTRIDE",
         "RECADDR",
         "RECMTP",
@@ -598,8 +560,6 @@ fn the_grid_still_covers_every_layer_it_claims_to() {
             "no {kind} rows: a whole layer stopped being exercised"
         );
     }
-    assert_eq!(count("MLA"), 2 * 5 * 5 * 5 * 5);
-    assert_eq!(count("DSV4"), RATIO_SETS.len() * 6);
     assert_eq!(count("SWAPCASE"), SWAP_CASES.len() * 4);
     assert_eq!(count("KEYJSON"), GPU_NAMES.len() * 3 * 3);
     assert_eq!(
@@ -628,8 +588,6 @@ fn every_layer_produces_varying_output() {
         v.len()
     };
     for (kind, min) in [
-        ("MLA", 100),
-        ("DSV4", 20),
         ("RECSTRIDE", 100),
         ("RECADDR", 100),
         ("SWAPHASH", 20),

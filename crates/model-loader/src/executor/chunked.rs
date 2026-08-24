@@ -30,6 +30,12 @@
 //! how bytes reach an arena. A driver holding its own [`ArenaBacking`] impl is
 //! a second place the seam is described; the CUDA one moved here for that
 //! reason and this is the same argument.
+//!
+//! It is also not only `driver-metal`'s any more, whatever the history says:
+//! `tests/arena_transforms.rs` builds a segmented arena out of [`Chunked`] and
+//! runs the same transforms through it that the flat host arena runs, which is
+//! how a chunk boundary falling inside a tensor gets checked at all. Moving
+//! this file to the driver would take that test's subject with it.
 
 use std::borrow::Cow;
 use std::ptr::NonNull;

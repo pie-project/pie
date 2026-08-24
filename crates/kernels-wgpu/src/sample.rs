@@ -1,9 +1,7 @@
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 
-#[routine]
 pub fn argmax_logits(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,

@@ -1,7 +1,6 @@
 use kernels::Grid;
 use kernels::points::Scalar;
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
 use crate::plane::{self, Handle};
 use crate::routine::{
@@ -54,12 +53,11 @@ fn head_row_grid(threads: u32, heads: i32, rows: i32) -> Result<[u32; 3], Refusa
 /// `norm/rms.metal`'s whole-row norm, and the only place its entrypoint is
 /// named.
 ///
-/// FOUR POINTS AND A ROUTINE FIRE THIS ONE LAUNCH, which is why it is a
-/// function rather than four copies of itself in the impl below: `rmsnorm`,
+/// FOUR POINTS FIRE THIS ONE LAUNCH, which is why it is a function rather
+/// than four copies of itself in the impl below: `rmsnorm`,
 /// `rmsnorm_per_head`, `rmsnorm_plus_one` and `rmsnorm_per_head_plus_one`
 /// differ in the AXIS and in `plus_one` and in nothing else. The parameters
-/// are bare numbers because the impl bodies hold bare numbers; the routine
-/// unwraps its marks and calls the same fn.
+/// are bare numbers because the impl bodies hold bare numbers.
 #[allow(clippy::too_many_arguments)]
 fn rms_row(
     ctx: &Ctx<'_>,
@@ -89,243 +87,6 @@ fn rms_row(
     )
 }
 
-// INLINED into impl Norm; dies with the routine layer.
-#[routine(canon = "norm.rmsnorm", out(out = like(x)))]
-pub fn rms_single_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    rms_row(ctx, x, w, out, *eps, *axis, *w_stride, *plus_one, *gain, *rows)
-}
-
-#[routine]
-pub fn rms_strided_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let row_pitch = x.width;
-    let rows = *rows;
-    let t = rms_threads(*axis)?;
-    if rows <= 0 {
-        return Err(Refusal::Empty { what: "rows" });
-    }
-    let lanes = t.checked_mul(rows.unsigned_abs()).ok_or(Refusal::Grid {
-        what: "axis threads rows",
-        at: i64::from(t) * i64::from(rows),
-    })?;
-    ctx.fire(
-        Fire::at("norm/rms.metal", "rms_strided_row_bfloat16")
-            .apply(Grid::of([lanes, 1, 1], [t, 1, 1])),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            row_pitch.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn rms_strided_head_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let row_pitch = x.width;
-
-    let heads = if *axis > 0 { row_pitch / *axis } else { 0 };
-    let rows = *rows;
-    let t = rms_threads(*axis)?;
-    ctx.fire(
-        Fire::at("norm/rms.metal", "rms_strided_head_row_bfloat16")
-            .apply(Grid::of(head_row_grid(t, heads, rows)?, [t, 1, 1])),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            row_pitch.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(x)))]
-pub fn rms_residual(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    r: In<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis_size: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-
-    let axis = x.width;
-    let rows = *rows;
-    let (lanes, group) = rms_grid(width, axis, rows)?;
-    ctx.fire(
-        Fire::at("norm/rms.metal", "rms_residual_bfloat16").apply(Grid::of(lanes, group)),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis_size.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            r.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(x)))]
-pub fn rms_residual_scaled(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    r: In<Tensor<bf16>>,
-    s: In<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis_size: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-
-    let axis = x.width;
-    let rows = *rows;
-    let (lanes, group) = rms_grid(width, axis, rows)?;
-    ctx.fire(
-        Fire::at("norm/rms.metal", "rms_residual_scaled_bfloat16").apply(Grid::of(lanes, group)),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis_size.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            r.arg(),
-            s.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer.
-#[routine(out(out = like(x)))]
-pub fn vnorm_single_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    let (lanes, group) = rms_grid(width, *axis, rows)?;
-    ctx.fire(
-        Fire::at("norm/vector.metal", "vnorm_single_row_bfloat16").apply(Grid::of(lanes, group)),
-        &[x.arg(), out.arg(), eps.arg(), axis.arg()],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer.
-#[routine(canon = "norm.rmsnorm_gated")]
-pub fn gated_rms(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    z: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    vd: Const<i32>,
-    heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let heads = *heads;
-    let rows = *rows;
-    let t = head_width(*vd)?;
-    ctx.fire(
-        Fire::at("norm/gated_rms.metal", "gated_rms_bfloat16")
-            .apply(Grid::of(head_row_grid(t, heads, rows)?, [t, 1, 1])),
-        &[x.arg(), z.arg(), w.arg(), out.arg(), eps.arg(), vd.arg()],
-    )
-}
-
-#[routine]
-pub fn gated_rms_strided(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    z: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    vd: Const<i32>,
-    heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let heads = *heads;
-    let row_pitch = x.width;
-    let rows = *rows;
-    let t = head_width(*vd)?;
-    ctx.fire(
-        Fire::at("norm/gated_rms.metal", "gated_rms_strided_bfloat16")
-            .apply(Grid::of(head_row_grid(t, heads, rows)?, [t, 1, 1])),
-        &[
-            x.arg(),
-            z.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            vd.arg(),
-            row_pitch.arg(),
-        ],
-    )
-}
-
 fn head_width(vd: i32) -> Result<u32, Refusal> {
     if vd <= 0 {
         return Err(Refusal::Empty { what: "vd" });
@@ -340,85 +101,13 @@ fn head_width(vd: i32) -> Result<u32, Refusal> {
     Ok(vd.unsigned_abs())
 }
 
-// INLINED into impl Norm; dies with the routine layer.
-#[routine(out(out = like(x)))]
-pub fn layer_scalar_mul(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    scalar: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at("norm/layer_scalar.metal", "layer_scalar_mul_bfloat16")
-            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
-        &[x.arg(), scalar.arg(), out.arg()],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer.
-#[routine(canon = "norm.residual_add", out(out = like(x)))]
-pub fn residual_add(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    residual: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at("norm/residual_add.metal", "residual_add_bfloat16")
-            .apply(Grid::of(elementwise(width, rows)?, [256, 1, 1])),
-        &[x.arg(), residual.arg(), out.arg()],
-    )
-}
-
-#[routine]
-pub fn residual_add_strided(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    residual: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    row_pitch: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at("norm/residual_add.metal", "residual_add_strided_bfloat16")
-            .apply(Grid::of(elementwise_rows(width, rows)?, [256, 1, 1])),
-        &[x.arg(), residual.arg(), out.arg(), row_pitch.arg()],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer.
-#[routine(canon = "norm.add_bias", out(out = like(out)))]
-pub fn add_bias(
-    ctx: &Ctx<'_>,
-    out: InOut<Tensor<bf16>>,
-    bias: Const<Tensor<bf16>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = out.width;
-    let rows = *rows;
-    let lanes = elementwise_rows(width, rows)?;
-    ctx.fire(
-        Fire::at("norm/add_bias.metal", "add_bias_bfloat16")
-            .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
-        &[out.arg(), bias.arg(), width.arg()],
-    )
-}
-
 // ── the `rms_*` scalars, named ──────────────────────────────────────────
 //
 // `norm/rms.metal` takes five words beside its three buffers and a
 // delegation has to state all five. Three of them are the same number for
 // every statement a `points` declaration can make, and they are constants
-// here rather than literals at eight call sites so that what each one MEANS
-// is written once.
+// here rather than literals at the four call sites so that what each one
+// MEANS is written once.
 
 /// `w_stride`: the shader reads `w[w_stride * i]`. A bank this plane is
 /// handed is contiguous — the strided reading was MLX's, for a weight
@@ -433,7 +122,8 @@ const ABSOLUTE_BANK: u32 = 0;
 /// MLX folds it.
 const OFFSET_BANK: u32 = 1;
 
-/// `gain`: an extra whole-tensor factor the fused sandwich norms carry. A
+/// `gain`: an extra whole-tensor factor `norm/rms.metal`'s fused sandwich
+/// arms carry. A
 /// `points` statement states its scale as `norm.scale` or
 /// `norm.mul_scalar` — its own point, with its own operand — so every claim
 /// here passes the identity.

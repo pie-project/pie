@@ -15,9 +15,14 @@
 //! A **runtime** is that same model already laid out for one target — a
 //! particular backend, quantization and MoE lowering. There can be many, they
 //! are all derivable from the archive, and deleting one costs a rebuild and
-//! nothing else. `<key>` is [`model_loader::cache_key::artifact_cache_key`],
-//! so two targets cannot land on the same file and an artifact cannot be
-//! served for a target it was not built for.
+//! nothing else. `<key>` named the target the artifact was built for, so two
+//! targets could not land on the same file.
+//!
+//! NOTHING IN THIS BUILD WRITES ONE. The only producer was `pie model build`,
+//! deleted in R3, and the key it stemmed the filename from was deleted with
+//! this crate's last reader of it. What survives here is the *reading* half —
+//! a store an older pie wrote still lists its runtimes rather than going
+//! partly invisible — and it is why the vocabulary is documented at all.
 //!
 //! This replaced a flat directory of `<name>.zt` beside `<name>-optimized.zt`,
 //! where the relationship between an archive and its build was a name suffix,
@@ -71,20 +76,14 @@ pub fn archive_path(name: &str) -> PathBuf {
     model_dir(name).join(ARCHIVE_FILE)
 }
 
-/// `$PIE_HOME/models/<name>/runtime/`.
-pub fn runtime_dir(name: &str) -> PathBuf {
-    model_dir(name).join(RUNTIME_DIR)
-}
-
-/// `$PIE_HOME/models/<name>/runtime/<key>.zt` — where `pie model build` writes.
-///
-/// `key` is the artifact cache key, so the path *is* the statement of what the
-/// artifact was built for. Two backends, two quantizations or two MoE
-/// lowerings of the same model get different keys and therefore different
-/// files, where the old `<name>-optimized.zt` gave them all one.
-pub fn runtime_path(name: &str, key: &str) -> PathBuf {
-    runtime_dir(name).join(format!("{key}.zt"))
-}
+// `runtime_dir(name)` and `runtime_path(name, key)` STOOD HERE: the two path
+// constructors a `pie model build` used to write `<name>/runtime/<key>.zt`
+// with. That command is deleted, so nothing in this build constructs either
+// path, and the cache key the second one spelled its stem from went with it.
+// [`RUNTIME_DIR`] and [`read_runtimes`] stay, because reading is the half that
+// still has a job: an operator may hold a directory an older pie wrote, and
+// `pie model list` reports whatever is actually there -- which, in this build,
+// is nothing.
 
 /// One per-target build of a model.
 pub struct Runtime {
@@ -555,10 +554,6 @@ mod tests {
         let model = model_dir("qwen--qwen3-0.6b");
         assert_eq!(model.parent().unwrap(), dir());
         assert_eq!(archive_path("qwen--qwen3-0.6b"), model.join("archive.zt"));
-        assert_eq!(runtime_dir("qwen--qwen3-0.6b"), model.join("runtime"));
-        assert_eq!(
-            runtime_path("qwen--qwen3-0.6b", "0123456789abcdef"),
-            model.join("runtime").join("0123456789abcdef.zt")
-        );
+        assert_eq!(model.join(RUNTIME_DIR), model.join("runtime"));
     }
 }

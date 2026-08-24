@@ -20,9 +20,10 @@ crate-type = ["rlib"]
 [features]
 # Default = no embedded backend feature. Enable `driver-cuda-12` /
 # `driver-cuda-13` (Linux/NVIDIA -- the number is the CUDA runtime ABI this
-# binary will LOAD), `driver-metal` (macOS), `driver-vulkan` (anywhere with a
-# loader and an ICD) or `driver-wgpu` (anywhere with an adapter) to reach a
-# device; with none of them, this crate builds and serves nothing locally.
+# binary will LOAD) to reach a device; without it, this crate builds and
+# serves nothing locally. The three shader flavors (`driver-metal`,
+# `driver-vulkan`, `driver-wgpu`) left the workspace with R3 and return at
+# P5 — see the root manifest's `exclude`.
 #
 # There used to be a third: an always-linked `driver-dummy` selected at
 # runtime, plus a `driver-dummy = []` no-op kept for older build commands.
@@ -38,19 +39,6 @@ default = []
 _driver-cuda = ["engine/_driver-cuda"]
 driver-cuda-12 = ["_driver-cuda", "engine/driver-cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "engine/driver-cuda-13"]
-driver-metal = ["engine/driver-metal"]
-# The pure-Rust Vulkan driver. Portable rather than vendor-specific, so it is
-# a flavor a machine can have alongside either of the two above -- and without
-# this line the `pie` binary could not reach it at all, however complete the
-# driver was.
-driver-vulkan = ["engine/driver-vulkan"]
-# The WebGPU shell, portable one step further than that. `driver-vulkan`
-# builds anywhere and needs a loader and an ICD to RUN; this one needs neither,
-# because its whole closure is pure Rust and `kernels-wgpu` ships the shaders
-# inside the rlib -- so turning it on cannot fail to build for want of a
-# toolchain on any host cargo runs on. It still wants an adapter to serve,
-# which is why it is opt-in like the other three.
-driver-wgpu = ["engine/driver-wgpu"]
 nixl = ["dep:transport", "transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
@@ -162,9 +150,12 @@ tempfile = "3"
 # there is no log. Finding one such fault meant patching an `eprintln!` into
 # another crate; this is that, once.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tensor-ir = { path = "../tensor-ir" }
+# `tensor-ir` STOOD HERE and no test in this crate ever named it: the single
+# occurrence was `cuda_canaries.rs` quoting `tensor_ir::validate`'s refusal
+# TEXT in a `//!` census, which is prose about another crate's message and
+# needs no edge. `[build-dependencies]` stood below it with no entries, which
+# is a section header for a `build.rs` this crate does not have.
 
-[build-dependencies]
 # `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a
 # signal. Unix-only; the sweep is a no-op elsewhere.
 [target.'cfg(unix)'.dependencies]

@@ -126,7 +126,7 @@ def run(args: argparse.Namespace):
     # request's output budget. vLLM's harness once indexed prompts absolutely
     # and budgets by measured-window index; with an odd --warmup the
     # mixed-phase parity flipped and every unequal-budget shape was silently
-    # invalidated (CONTENTION_FOLLOWUP.md §20.45).
+    # invalidated (CONTENTION_FOLLOWUP.md §20.45 -- doc not in tree).
     all_sampling = [
         base_sampling
         if request_max_tokens(args, i) == args.max_tokens

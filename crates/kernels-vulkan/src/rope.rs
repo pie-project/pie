@@ -1,8 +1,14 @@
-use crate::routine::{Bind, Const, Ctx, Fire, In, InOut, Tensor, bf16};
+use crate::routine::{Bind, Ctx, Fire, In, InOut};
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
-fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+/// The rotation's grid: one lane per channel PAIR, per head, per row.
+///
+/// `neox.slang` pairs channel `i` with `i + rotary/2`, so the x extent is
+/// half the rotary width and not the whole of it — the one place on this
+/// plane where a grid axis is not the extent it walks. The head count is
+/// the row over the head width, which is the derivation every per-head
+/// point here makes.
+pub fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if rotary <= 0 {
         return Err(Refusal::Empty { what: "rotary" });
     }
@@ -29,228 +35,6 @@ fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 
         width.unsigned_abs() / head_dim.unsigned_abs(),
         rows.unsigned_abs(),
     ])
-}
-
-#[routine(out(x = like(x)))]
-pub fn neox_decode(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    base: Const<f32>,
-    head_dim: Const<i32>,
-    rotary: Const<i32>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let position = positions.ptr;
-    let width = x.width;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_decode_bfloat16", ctx.best()),
-            "neox_decode_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            base.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Rope; dies with the routine layer. (rope.full, rope.partial, rope.partial_q)
-#[routine(canon = "rope.full", out(x = like(x)))]
-pub fn neox_mb(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    base: Const<f32>,
-    head_dim: Const<i32>,
-    rotary: Const<i32>,
-    positions: In<Tensor<i32>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let position = positions.ptr;
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_mb_bfloat16", ctx.best()),
-            "neox_mb_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            base.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-#[routine(out(x = like(x)))]
-pub fn neox_freqs_decode(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    head_dim: Const<i32>,
-    mscale: Const<f32>,
-    rotary: Const<i32>,
-    rope_freqs: In<Tensor<f32>>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let inv_freq = rope_freqs.ptr;
-
-    let position = positions.ptr;
-    let width = x.width;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_freqs_decode_bfloat16", ctx.best()),
-            "neox_freqs_decode_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            inv_freq.arg(),
-            head_dim.arg(),
-            mscale.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Rope; dies with the routine layer. (rope.yarn)
-#[routine(out(x = like(x)))]
-pub fn neox_freqs_mb(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    head_dim: Const<i32>,
-    mscale: Const<f32>,
-    rotary: Const<i32>,
-    rope_freqs: In<Tensor<f32>>,
-    positions: In<Tensor<i32>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let inv_freq = rope_freqs.ptr;
-
-    let position = positions.ptr;
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_freqs_mb_bfloat16", ctx.best()),
-            "neox_freqs_mb_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            inv_freq.arg(),
-            head_dim.arg(),
-            mscale.arg(),
-        ],
-    )
-}
-
-#[routine(out(x = like(x)))]
-pub fn neox_prop_decode(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    base: Const<f32>,
-    head_dim: Const<i32>,
-    rotary: Const<i32>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let position = positions.ptr;
-    let width = x.width;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_prop_decode_bfloat16", ctx.best()),
-            "neox_prop_decode_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            base.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-#[routine(out(x = like(x)))]
-pub fn neox_prop_mb(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    base: Const<f32>,
-    head_dim: Const<i32>,
-    rotary: Const<i32>,
-    positions: In<Tensor<i32>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let position = positions.ptr;
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_prop_mb_bfloat16", ctx.best()),
-            "neox_prop_mb_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            base.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-#[routine(out(x = like(x)))]
-pub fn neox_strided(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    scale: Const<f32>,
-    base: Const<f32>,
-    head_dim: Const<i32>,
-    rotary: Const<i32>,
-    row_pitch: Const<i32>,
-    positions: In<Tensor<i32>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let position = positions.ptr;
-    let width = x.width;
-    let rows = *rows;
-    if *row_pitch < width {
-        return Err(Refusal::Narrow {
-            what: "row_pitch is narrower than the row it strides over",
-            at: i64::from(*row_pitch),
-        });
-    }
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("neox_strided_bfloat16", ctx.best()),
-            "neox_strided_bfloat16",
-        )
-        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[
-            x.arg(),
-            position.arg(),
-            scale.arg(),
-            base.arg(),
-            head_dim.arg(),
-            row_pitch.arg(),
-        ],
-    )
 }
 
 /// The `Rope` family, claimed. Four of five points land; the fifth is a
@@ -430,9 +214,9 @@ const NOT_NEOX: Refusal = Refusal::Absent {
 /// One `neox_mb_bfloat16` launch over one rectangle: the arithmetic every
 /// claimed point of this family is made of.
 ///
-/// A free function and not a method, because it is the transcription of
-/// [`neox_mb`]'s dispatch and nothing else — the branch on `interleaved`,
-/// the `log2` the push block wants, and the grid the shader addresses.
+/// A free function and not a method, because it is the whole of what the
+/// four claimed points share — the branch on `interleaved`, the `log2` the
+/// push block wants, and the grid the shader addresses.
 fn neox<T: kernels::points::Scalar>(
     ctx: &Ctx<'_>,
     x: InOut<crate::points::Handle<T>>,

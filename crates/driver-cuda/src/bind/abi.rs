@@ -1,6 +1,17 @@
 //! The types a launcher takes that are neither scalars nor pointers: one
-//! `#[repr(C)]` mirror per C++ record. Sizes, alignments, offsets and member
-//! counts are checked against the real header by `tests/launch_abi.rs`.
+//! `#[repr(C)]` mirror per C++ record.
+//!
+//! NOTHING CHECKS THESE LAYOUTS, and there is nothing left to check them
+//! against. This line claimed sizes, alignments, offsets and member counts
+//! were proven against the real header by `tests/launch_abi.rs`: that test is
+//! deleted, its subject was a row's OPERAND LIST rather than any struct's
+//! layout, and both C++ trees a header could come from
+//! (`crates/driver-cuda/csrc` and the archive crate's `csrc/src`) are gone —
+//! `tests/oracle_census.rs` is the record. Every reader of the two records
+//! below is Rust. `#[repr(C)]` stays because a mirror with an unspecified
+//! layout is not a mirror, not because a second compiler agrees with it: a
+//! check written against a stub written here could only pass, and R3's law
+//! for that is that it would not be a check.
 
 use core::ffi::{c_int, c_void};
 
@@ -23,8 +34,8 @@ pub enum KvCacheScheme {
     Fp4Block = 4,
 }
 
-/// One layer's KV storage, as a kernel sees it. Field order is the C++'s:
-/// the mirror is checked positionally.
+/// One layer's KV storage, as a kernel sees it. Field order is the C++
+/// record's, kept as written; the module note says what does not check it.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct KvCacheLayerView {

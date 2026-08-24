@@ -14,9 +14,9 @@
 //!
 //! Every one of those is deleted. A `model_compiler::program::Program` states
 //! its own operands, its own results and the point each statement calls, and
-//! `baker::points_shim`/`baker::staging` are the one crossing from a stated
-//! point to a launcher. There is no launch list to bind, no column to join
-//! and no fact to ask for.
+//! `kernels_cuda::points_dispatch`/`baker::staging` are the one crossing from
+//! a stated point to a launcher. There is no launch list to bind, no column to
+//! join and no fact to ask for.
 //!
 //! # What is left, and why each stayed
 //!

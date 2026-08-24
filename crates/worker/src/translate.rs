@@ -144,7 +144,6 @@ fn build_model(
 
     Ok(::engine::bootstrap::ModelConfig {
         name: m.name.clone(),
-        arch_name: group0_caps.arch_name,
         model_id: group0_caps.model_id,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,

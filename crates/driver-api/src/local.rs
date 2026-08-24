@@ -358,8 +358,9 @@ pub const PIE_REGION_GENERATED_VALID: u32 = 1 << 1;
 // It is deliberately *not* PTIR. A driver reading this table never sees a
 // container, a sidecar, a hash to check, or a wire format to parse — those are
 // the compiler's business, and the compiler has already validated all of them
-// (`ptir-refactor.md` §2.3). Records are flat and POD; nested `Pie*Slice`
-// fields point at host-owned arrays that outlive the registration call.
+// (`ptir-refactor.md` §2.3 — doc not in tree). Records are flat and POD;
+// nested `Pie*Slice` fields point at host-owned arrays that outlive the
+// registration call.
 
 /// Where a value comes from. Mirrors `tensor_ir` value sources.
 pub const PIE_VALUE_CONST: u8 = 0;

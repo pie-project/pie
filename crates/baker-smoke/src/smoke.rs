@@ -264,6 +264,7 @@ fn run() -> Result<(), String> {
 
     let mut pools = Pools::new();
     pools.build(&plan, &geom, pages, qo_indptr.ptr(), row_valid.ptr(), stream)?;
+
     println!(
         "  caches: {} kv row(s) at {pages} x {PAGE_SIZE}-token page(s), {} state slab(s)",
         pools.kv.len(),
@@ -289,6 +290,17 @@ fn run() -> Result<(), String> {
     let attn_float = Slab::zeroed(ATTN_FLOAT_BYTES, stream)?;
     let attn_int = Slab::zeroed(ATTN_INT_BYTES, stream)?;
     let mut decode_plan = Box::new(DecodePlanCache::new());
+    // THE STAGING DOOR, and the box above is why it can be opened once. A
+    // claim body pulls what no statement carries off its own `Ctx` by the key
+    // the `Raise` declares (`Ctx::raised`), and the schedule is replanned into
+    // THIS box every fire — a `Box`'s address does not move when its contents
+    // are rewritten, so the answer is stable for the whole run while the
+    // schedule inside it is not.
+    let staged = Staged {
+        decode_plan: (&raw const *decode_plan).cast::<c_void>(),
+        row_valid: row_valid.ptr().cast_const(),
+    };
+    let ctx = ctx.with_raised(&staged);
 
     let out = plan
         .seams
@@ -342,11 +354,6 @@ fn run() -> Result<(), String> {
             banks: &banks,
             runtime: &runtime,
             pools: &pools,
-            geom: &geom,
-            decode_plan: &*decode_plan,
-            first_token: 0,
-            qo_indptr: qo_indptr.ptr(),
-            row_valid: row_valid.ptr(),
         };
         for (i, step) in program.steps.iter().take(total).enumerate() {
             let op = &plan.ops[step.op as usize];
@@ -457,15 +464,23 @@ fn run() -> Result<(), String> {
 // ── The plan side ───────────────────────────────────────────────────────
 
 /// The fact word a ONE-TOKEN fire sets, computed off `plan.facts` rather
-/// than assumed: bit `i` is `plan.facts[i]`, and `qo_one` is the only fact
-/// a qwen trace declares. A SKU that declared more would set the ones a
-/// one-token query implies and leave the rest clear, which is what this
-/// match says and why an unknown fact is a refusal instead of a zero.
+/// than assumed: bit `i` is `plan.facts[i]`. A SKU that declares more sets
+/// the ones a one-token query implies and leaves the rest clear, which is
+/// what this match says and why an unknown fact is a refusal instead of a
+/// zero.
+///
+/// `masked` IS FALSE AND NOT UNKNOWN. This smoke builds its own request —
+/// one token, greedy, no mask buffer staged anywhere in this file — so the
+/// fire it is about to make carries no custom mask, and saying so is stating
+/// what the harness does rather than guessing what a serving request might.
+/// It is what puts gemma's FUSED arm on the lane: the text splits on
+/// `qo_one & !masked` and the tier-2 statement rides the true side.
 fn decode_word(plan: &Plan) -> u64 {
     let mut word = 0u64;
     for (bit, fact) in plan.facts.iter().enumerate() {
         let holds = match fact.as_str() {
             "qo_one" => true,
+            "masked" => false,
             other => panic!(
                 "`{other}` is a fact this smoke does not know how to answer \
                  for a one-token fire; name it here or the lane is a guess"
@@ -561,9 +576,21 @@ struct Recurrent {
 impl Geometry {
     fn of(plan: &Plan, program: &Program) -> Result<Geometry, String> {
         let find = |kernel: &str| plan.ops.iter().find(|o| o.kernel == kernel);
-        let width_of = |what: &str, id: u32| match program.slots[id as usize] {
-            Slot::Arena { width, .. } => Ok(width),
-            ref other => Err(format!("`{what}` lives at {other:?}")),
+        // AN ALIAS IS THE RECTANGLE IT NAMES, which is what `Fire::rect`
+        // already says one step lower: on a lane where a merge has exactly
+        // one surviving arm the value IS that arm, so a width read through
+        // one is the arm's width. Gemma is the SKU that needs it — its
+        // decode reads `merge![qf, qr]`, and the fused arm being the only
+        // survivor is precisely what makes the merged value an alias.
+        let width_of = |what: &str, id: u32| {
+            let mut at = id as usize;
+            loop {
+                match program.slots[at] {
+                    Slot::Arena { width, .. } => return Ok(width),
+                    Slot::Alias(to) => at = to as usize,
+                    ref other => return Err(format!("`{what}` lives at {other:?}")),
+                }
+            }
         };
         // THE DECODE STATEMENT, either spelling. A text that merges an
         // attention leg with its own sink states `decode_lse` — the same
@@ -920,20 +947,23 @@ struct Fire<'a> {
     banks: &'a BTreeMap<String, Bank>,
     runtime: &'a BTreeMap<String, Rect>,
     pools: &'a Pools,
-    geom: &'a Geometry,
-    decode_plan: *const DecodePlanCache,
-    /// The fire's write origin, a SCALAR smuggled through the pointer
-    /// channel: the appender reads `first_token.ptr as i32`
-    /// (`kernels-cuda/src/attn/mod.rs:2423`) and the driver answers the same
-    /// way (`driver-cuda/src/bind/views.rs:93`). Zero is a real origin, and
-    /// the only one a fire with no peel split ever has.
-    first_token: i32,
-    qo_indptr: *mut c_void,
-    row_valid: *mut c_void,
 }
 
 impl Fire<'_> {
     /// Where a value lives, chasing merges to the arm that survives.
+    ///
+    /// AN OFFSET IS SHARED, NOT OWNED. The walk gives values whose lives do
+    /// not overlap the same bytes (`model_compiler::program::carve`), so a
+    /// rectangle is this value's only between the steps
+    /// `program::spans` says it is live. Every read below is one of the two
+    /// the walk allows: the step that is running, and the `out` seam the
+    /// walk holds open to fire end. `--probe`/`--trace` digest an op's result
+    /// immediately after that op fires, which is inside its own span; a
+    /// digest taken later would be somebody else's row.
+    ///
+    /// ONE ROW, so this reads `offset` flat where the driver reads
+    /// `offset * rows` — the same layout, at the one row count where the
+    /// value-major and per-row readings coincide.
     fn rect(&self, v: ValueId) -> Rect {
         match &self.program.slots[v as usize] {
             // THE ROW FACTOR MULTIPLIES THE FIRE'S ROWS, and that is the
@@ -979,14 +1009,6 @@ impl Fire<'_> {
             .unwrap_or_else(|| panic!("no bank named `{name}` is on the device"))
     }
 
-    fn p32(op: &Op, at: usize) -> u32 {
-        u32::try_from(op.params[at]).expect("a param wider than u32")
-    }
-
-    fn pf32(op: &Op, at: usize) -> f32 {
-        f32::from_bits(Self::p32(op, at))
-    }
-
     /// The result rectangle of an `InOut` point, with the operand's bytes
     /// already in it. See `dev::copy` for why the copy is not optional.
     fn inout(&self, from: Rect, to: Rect) -> Result<Rect, Refusal> {
@@ -1003,7 +1025,12 @@ impl Fire<'_> {
             // list into `kernels_cuda::points_dispatch`; what stays here is
             // the half a table cannot write -- the `BoundOp` impl below,
             // which says where THIS executor's rectangles live.
-            Call::Point(point) => {
+            //
+            // AND A TIER-2 STATEMENT THE SAME WAY: the generated file carries
+            // an arm for the plane's inherent surface in the same match, so
+            // the only thing this had to know about tier-2 was that there is
+            // nothing to know. A refusal stood here.
+            Call::Point(point) | Call::Tier2(point) => {
                 // `ctx` is a shared reference and Copy: taking it out first
                 // is what lets the bound statement borrow `self`.
                 let ctx = self.ctx;
@@ -1011,11 +1038,6 @@ impl Fire<'_> {
                 kernels_cuda::points_dispatch::dispatch(ctx, &bound)
             }
             Call::Symbol(symbol) => self.symbol(symbol, op),
-            Call::Tier2(statement) => Err(Refusal::Absent {
-                what: Box::leak(
-                    format!("a tier-2 shim for `{statement}`; this SKU states none").into_boxed_str(),
-                ),
-            }),
         }
     }
 
@@ -1041,101 +1063,8 @@ impl Fire<'_> {
     }
 
     // ── The staging shim: the routines that keep their own `canon`. ─────
-    #[allow(clippy::too_many_lines)]
-    fn symbol(&mut self, symbol: &str, op: &Op) -> Result<(), Refusal> {
-        let ctx = self.ctx;
-        let g = self.geom;
+    fn symbol(&mut self, symbol: &str, _op: &Op) -> Result<(), Refusal> {
         match symbol {
-            // The appender's three runtime planes. `first_token` is a scalar
-            // in the pointer channel and `row_valid` is one BYTE per row --
-            // both declared `In<Tensor<i32>>` and both read as something
-            // else, which is the prefix-agreement the two legs of
-            // `attn::write_kv_to_pages` are pinned to
-            // (`kernels-cuda/src/attn/mod.rs:2384-2396`).
-            "attn::write_kv_to_pages" => {
-                let (k, v) = (self.input(op, 0), self.input(op, 1));
-                let pages = self.pages(op)?.raised();
-                kernels_cuda::attn::kv_paged::write_kv_to_pages_bf16(
-                    ctx,
-                    rin(k),
-                    rin(v),
-                    pages,
-                    Const::new(g.kv_heads),
-                    Const::new(g.head_dim),
-                    In { ptr: self.first_token as usize as *const i32, rows: 0, width: 0 },
-                    In { ptr: self.qo_indptr.cast(), rows: 1, width: 2 },
-                    In { ptr: self.row_valid.cast(), rows: self.rows, width: 1 },
-                )
-            }
-
-            // ONE ARM FOR BOTH DECODE SPELLINGS, because the second is the
-            // first with one more result. `attention.decode_lse` keeps the
-            // per-row log-sum-exp so a text can merge the leg with something
-            // else — gpt-oss merges it with its attention SINK — and
-            // `dispatch_attention_flashinfer_decode_lse` is literally
-            // `dispatch_attention_flashinfer_decode` with `Some(lse)`
-            // (`attn/fa2/mod.rs:1439-1461`). The staging is identical, so it
-            // is written once and the `lse` slot is the only branch.
-            "attn::dispatch_attention_flashinfer_decode"
-            | "attn::dispatch_attention_flashinfer_decode_lse" => {
-                let (q, o) = (self.input(op, 0), self.output(op, 0));
-                let lse = (symbol == "attn::dispatch_attention_flashinfer_decode_lse")
-                    .then(|| rout(self.output(op, 1)));
-                let pages = self.pages(op)?.raised();
-                // The statement's window param is `Option<u32>` flattened by
-                // `Stmt::window`, which spells `None` as `0`
-                // (`model-dsl/src/record.rs:133-135`). flashinfer spells the
-                // same absence `-1`, and the driver passes `-1` for every
-                // qwen fire (`driver-cuda/src/fire/launch.rs:3209`).
-                //
-                // A NON-ZERO WINDOW IS `w - 1`, and that is read off the two
-                // kernels rather than assumed. flashinfer's window predicate
-                // is `kv_idx + qo_len + window_left >= kv_len + qo_idx`
-                // (`flashinfer/attention/variants.cuh:89`); a query at
-                // absolute position `p = kv_len - qo_len + qo_idx` therefore
-                // keeps `kv_idx >= p - window_left`, which is `window_left +
-                // 1` keys counting itself. The naive paged kernel spells the
-                // same thing arithmetically -- `kv < kv_lim - 1 -
-                // window_left` is dropped
-                // (`attn/attention_naive_paged.cuh:409`). A text's `window`
-                // is the HF number and counts the query's own key: gemma's
-                // 512 means `kv_idx > p - 512`, so `window_left = 511`.
-                //
-                // LEGACY IS OFF BY ONE HERE and the A/B could not see it:
-                // `model-legacy/src/gemma_4/project.rs:353-361` passes
-                // `sliding_window` itself as `window_left`, which shows one
-                // key too many, and every gemma A/B in this tree prefills
-                // seven tokens -- a prompt shorter than the window never
-                // reaches the predicate.
-                let window_left = match Self::p32(op, 0) {
-                    0 => -1,
-                    w => i32::try_from(w - 1).map_err(|_| Refusal::Wide {
-                        what: "the sliding window this statement states",
-                        at: i64::from(w),
-                        max: i64::from(i32::MAX),
-                    })?,
-                };
-                // The point declares no soft cap, so the statement states
-                // none, and zero is what "no cap" spells at this routine
-                // (`decode_arm`, `kernels-cuda/src/attn/fa2/mod.rs:1069`).
-                let logits_soft_cap = 0.0f32;
-                let sm_scale = Self::pf32(op, 2);
-                kernels_cuda::attn::fa2::dispatch_attention_flashinfer_decode(
-                    ctx,
-                    rin(q),
-                    In { ptr: self.decode_plan, rows: 0, width: 0 },
-                    rout(o),
-                    Const::new(window_left),
-                    Const::new(logits_soft_cap),
-                    Const::new(sm_scale),
-                    pages,
-                    // `None` where the statement declares no `lse` result:
-                    // that lane states one attention leg and nothing merges
-                    // partials across it.
-                    lse,
-                )
-            }
-
             other => Err(Refusal::Absent {
                 what: Box::leak(
                     format!("a staging shim for `{other}`; this executor states none").into_boxed_str(),
@@ -1144,6 +1073,35 @@ impl Fire<'_> {
         }
     }
 
+}
+
+/// What this executor stages, by the key each object's `Raise` declares —
+/// `driver-cuda/src/bind/views.rs::FireViews`'s half, at the scale of one row
+/// and one page.
+///
+/// TWO KEYS AND NOT THE VOCABULARY, deliberately: a smoke that answered a key
+/// it does not really stage would be handing a body a pointer to nothing. The
+/// decode lane of every SKU this binary fires wants the decode schedule and
+/// the row-validity plane; a lane that wants a prefill plan or a dsv4 slab
+/// refuses HERE, with the key in the message, which is exactly what the
+/// driver does for the same keys.
+struct Staged {
+    /// `"fa2.decode"` — the schedule, replanned per fire into a stable box.
+    decode_plan: *const c_void,
+    /// `"row_valid"` — one BYTE per row. A body asks for this through
+    /// `Ctx::staged`, where a null reads as "every row is valid"; this
+    /// executor always has one, so the null never happens here.
+    row_valid: *const c_void,
+}
+
+impl kernels::raises::Answered for Staged {
+    fn raised(&self, key: &'static str) -> Option<*const c_void> {
+        match key {
+            "fa2.decode" => Some(self.decode_plan),
+            "row_valid" => Some(self.row_valid),
+            _ => None,
+        }
+    }
 }
 
 // ── One statement, bound ────────────────────────────────────────────────

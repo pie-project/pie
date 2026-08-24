@@ -1,15 +1,17 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::routine::{
-    Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
-};
-use crate::views::{AttnMask, AttnSplit, KvCache};
+use crate::routine::{Bind, Ctx, Fire, In, InOut, Out, elementwise, elementwise_rows};
+use crate::views::KvCache;
 use kernels::BindMut;
-use kernels::raises::Struct;
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
-fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
+/// The arm a head width picks, as an index into a schedule's own name list.
+///
+/// A width off the list is a `Refusal` and not a compile error: the arm is
+/// chosen at the fire and the module was stamped at build time, so asking
+/// for a width no `// pie:instantiate` line covers has to fail here or not
+/// at all. The lists themselves are in the `Attention` block's header.
+pub fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
     points
         .iter()
         .position(|d| *d == head_dim)
@@ -19,7 +21,12 @@ fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
         })
 }
 
-fn vector_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+/// The VECTOR schedule's grid: one lane per channel, per (head, row).
+///
+/// `sdpa_paged.slang`'s unsplit and combine arms declare
+/// `[numthreads(PIE_HEAD_DIM, 1, 1)]`, so a group IS the head width and the
+/// x extent is that width times the head count. Rows ride y.
+pub fn vector_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if q_heads <= 0 {
         return Err(Refusal::Empty {
             what: "query heads",
@@ -38,6 +45,23 @@ fn vector_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refus
     Ok([x, rows.unsigned_abs(), 1])
 }
 
+/// How many KV splits a decode of this shape should run: the flash-decode
+/// policy, and the one host CHOICE in this file.
+///
+/// Every other `pub` fn here derives a grid from numbers a statement or a
+/// shader already fixed. This one decides: it wants about
+/// `TARGET_GROUPS` workgroups in flight, will not cut the key range finer
+/// than `KEYS_PER_SPLIT` keys a split, caps at `MOST`, and floors the
+/// answer to a power of two because the combine folds pairs. `1` means
+/// unsplit and is the answer whenever the shape is already wide enough,
+/// whenever the history is short, or whenever `PIE_NO_FLASH_DECODE` is set
+/// — which is how a bisect turns the whole split path off.
+///
+/// ITS READER IS THE DRIVER, NOT A BODY HERE. `driver-vulkan` calls this
+/// when it stages [`crate::views::SplitView`], and the claimed `decode`
+/// reads the answer back off `splits`. So the policy is upstream of the
+/// launch on purpose: the partials plane has to be allocated before the
+/// fire that writes it.
 #[must_use]
 pub fn decode_splits(history_bucket: i32, q_heads: i32, rows: i32) -> i32 {
     const TARGET_GROUPS: i64 = 2048;
@@ -65,7 +89,16 @@ pub fn decode_splits(history_bucket: i32, q_heads: i32, rows: i32) -> i32 {
     1 << (63 - want.leading_zeros() as i64).min(30)
 }
 
-fn split_grid(head_dim: i32, q_heads: i32, rows: i32, splits: i32) -> Result<[u32; 3], Refusal> {
+/// The SPLIT schedule's grid: [`vector_grid`] with the KV splits on z.
+///
+/// Each split reads its own slice of the key range and writes one partial;
+/// the combine that follows takes [`vector_grid`] because it folds them.
+pub fn split_grid(
+    head_dim: i32,
+    q_heads: i32,
+    rows: i32,
+    splits: i32,
+) -> Result<[u32; 3], Refusal> {
     if splits <= 0 {
         return Err(Refusal::Empty { what: "splits" });
     }
@@ -73,7 +106,14 @@ fn split_grid(head_dim: i32, q_heads: i32, rows: i32, splits: i32) -> Result<[u3
     Ok([x, y, splits.unsigned_abs()])
 }
 
-fn tiled_grid(q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+/// The TILED schedule's grid: one 32x32 workgroup per (head, 32-row tile).
+///
+/// THE ROW AXIS IS TILED BY 32 where the vector schedule takes rows one at
+/// a time, which is the whole difference between the two — a tiled arm
+/// walks the pool once for a block of queries. Both `sdpa_paged.slang`'s
+/// tiled arms and `sdpa_paged_mma.slang` declare `[numthreads(32, 32, 1)]`,
+/// so the two multiplies below are that group's two extents.
+pub fn tiled_grid(q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if q_heads <= 0 {
         return Err(Refusal::Empty {
             what: "query heads",
@@ -100,7 +140,9 @@ fn tiled_grid(q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     Ok([x, y, 1])
 }
 
-fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal> {
+/// The per-head cut's grid: `x` walks a head's channels, `y` the heads,
+/// `z` the token rows. What `kv_write.slang` and `gate.slang` address.
+pub fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal> {
     if head_dim <= 0 {
         return Err(Refusal::Empty {
             what: "the head width",
@@ -117,1121 +159,6 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
         heads.unsigned_abs(),
         depth.unsigned_abs(),
     ])
-}
-
-// INLINED into impl Layout; dies with the routine layer. (layout.split_qkv)
-#[routine(canon = "layout.split_qkv", out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
-pub fn split_qkv_bf16(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<bf16>>,
-    q: Out<Tensor<bf16>>,
-    k: Out<Tensor<bf16>>,
-    v: Out<Tensor<bf16>>,
-    q_width: Const<u32>,
-    kv_width: Const<u32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let packed_width = packed.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("split_qkv_bf16", ctx.best()),
-            "split_qkv_bf16",
-        )
-        .apply(elementwise_rows(packed_width, rows)?),
-        &[
-            packed.arg(),
-            q.arg(),
-            k.arg(),
-            v.arg(),
-            q_width.arg(),
-            kv_width.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Gate; dies with the routine layer. (gate.sigmoid_mul)
-#[routine(canon = "gate.sigmoid_mul", out(attn = like(attn)))]
-pub fn gate(
-    ctx: &Ctx<'_>,
-    attn: InOut<Tensor<bf16>>,
-    gate: In<Tensor<bf16>>,
-    row_stride: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = attn.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("gate_bfloat16", ctx.best()),
-            "gate_bfloat16",
-        )
-        .apply(elementwise_rows(width, rows)?),
-        &[attn.arg(), gate.arg(), row_stride.arg()],
-    )
-}
-
-// INLINED into impl Layout; dies with the routine layer. (layout.split_q_gate)
-#[routine(canon = "layout.split_q_gate")]
-pub fn q_gate_split(
-    ctx: &Ctx<'_>,
-    qg: In<Tensor<bf16>>,
-    q_out: Out<Tensor<bf16>>,
-    gate_out: Out<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    qg_row_stride: Const<i32>,
-    out_row_stride: Const<i32>,
-    q_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("q_gate_split_bfloat16", ctx.best()),
-            "q_gate_split_bfloat16",
-        )
-        .apply(head_grid(*head_dim, *q_heads, rows)?),
-        &[
-            qg.arg(),
-            q_out.arg(),
-            gate_out.arg(),
-            head_dim.arg(),
-            qg_row_stride.arg(),
-            out_row_stride.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn kv_append(
-    ctx: &Ctx<'_>,
-    k_new: In<Tensor<bf16>>,
-    v_new: In<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let k_cache = kvc.keys;
-    let v_cache = kvc.values;
-    let pos = positions.ptr;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("kv_append_bfloat16", ctx.best()),
-            "kv_append_bfloat16",
-        )
-        .apply(head_grid(*head_dim, *heads, 1)?),
-        &[
-            k_new.arg(),
-            v_new.arg(),
-            k_cache.arg_mut(),
-            v_cache.arg_mut(),
-            pos.arg(),
-            head_dim.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer. (attention.kv_append)
-#[routine(canon = "attention.kv_append")]
-pub fn kv_append_paged(
-    ctx: &Ctx<'_>,
-    k_new: In<Tensor<bf16>>,
-    v_new: In<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    n_kv_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    tokens: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-    let w_page = kvc.write_page;
-    let w_off = kvc.write_offset;
-    let tokens = *tokens;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("kv_append_paged_bfloat16", ctx.best()),
-            "kv_append_paged_bfloat16",
-        )
-        .apply(head_grid(*head_dim, *n_kv_heads, tokens)?),
-        &[
-            k_new.arg(),
-            v_new.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            head_dim.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            w_page.arg(),
-            w_off.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer. (attention.logit_softcap)
-#[routine(out(out = like(logits)))]
-pub fn logit_softcap(
-    ctx: &Ctx<'_>,
-    logits: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    cap: Const<f32>,
-) -> Result<(), Refusal> {
-    let n = out.rows.saturating_mul(out.width);
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("logit_softcap_bfloat16", ctx.best()),
-            "logit_softcap_bfloat16",
-        )
-        .apply(elementwise(n, 1)?),
-        &[logits.arg(), out.arg(), cap.arg()],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer. (attention.decode)
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_decode(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>,
-    split: In<Struct<AttnSplit>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    if split.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the split policy this statement names",
-        });
-    }
-    let sv = unsafe { &*split.ptr };
-    let partials = sv.partials;
-    let rows = *rows;
-    let splits = sv.splits;
-    let at = head_point(*head_dim, &[64, 128, 256, 512])?;
-    if splits <= 1 {
-        return ctx.fire(
-            Fire::at(
-                crate::routine::module_path(
-                    [
-                        "sdpa_paged_decode_bfloat16_d_64",
-                        "sdpa_paged_decode_bfloat16_d_128",
-                        "sdpa_paged_decode_bfloat16_d_256",
-                        "sdpa_paged_decode_bfloat16_d_512",
-                    ][at],
-                    ctx.best(),
-                ),
-                [
-                    "sdpa_paged_decode_bfloat16_d_64",
-                    "sdpa_paged_decode_bfloat16_d_128",
-                    "sdpa_paged_decode_bfloat16_d_256",
-                    "sdpa_paged_decode_bfloat16_d_512",
-                ][at],
-            )
-            .apply(vector_grid(*head_dim, *q_heads, rows)?),
-            &[
-                queries.arg(),
-                k_pages.arg_mut(),
-                v_pages.arg_mut(),
-                out.arg(),
-                gqa_factor.arg(),
-                position_ids.arg(),
-                req_of_token.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                page_size.arg(),
-                n_kv_heads.arg(),
-                scale.arg(),
-                attention_mask.arg(),
-                attention_mask_stride.arg(),
-                attention_mask_enabled.arg(),
-                window.arg(),
-            ],
-        );
-    }
-    flash_decode(
-        ctx,
-        Flash {
-            split: [
-                "sdpa_paged_decode_split_bfloat16_d_64",
-                "sdpa_paged_decode_split_bfloat16_d_128",
-                "sdpa_paged_decode_split_bfloat16_d_256",
-                "sdpa_paged_decode_split_bfloat16_d_512",
-            ][at],
-            combine: [
-                "sdpa_paged_decode_combine_bfloat16_d_64",
-                "sdpa_paged_decode_combine_bfloat16_d_128",
-                "sdpa_paged_decode_combine_bfloat16_d_256",
-                "sdpa_paged_decode_combine_bfloat16_d_512",
-            ][at],
-            sinks: None,
-        },
-        queries.ptr,
-        k_pages,
-        v_pages,
-        out.ptr,
-        gqa_factor,
-        position_ids,
-        req_of_token,
-        kv_page_indices,
-        kv_page_indptr,
-        page_size,
-        *n_kv_heads,
-        *scale,
-        attention_mask,
-        attention_mask_stride,
-        attention_mask_enabled,
-        *window,
-        partials,
-        *head_dim,
-        *q_heads,
-        rows,
-        splits,
-    )
-}
-
-struct Flash {
-    split: &'static str,
-    combine: &'static str,
-    sinks: Option<(Tensor<bf16>, &'static str)>,
-}
-
-fn flash_decode(
-    ctx: &Ctx<'_>,
-    which: Flash,
-    queries: Tensor<bf16>,
-    k_pages: Tensor<bf16>,
-    v_pages: Tensor<bf16>,
-    out: Tensor<bf16>,
-    gqa_factor: i32,
-    position_ids: Tensor<i32>,
-    req_of_token: Tensor<i32>,
-    kv_page_indices: Tensor<u32>,
-    kv_page_indptr: Tensor<u32>,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: Tensor<u8>,
-    attention_mask_stride: u32,
-    attention_mask_enabled: Tensor<u8>,
-    window: i32,
-    partials: Tensor<f32>,
-    head_dim: i32,
-    q_heads: i32,
-    rows: i32,
-    splits: i32,
-) -> Result<(), Refusal> {
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path(which.split, ctx.best()),
-            which.split,
-        )
-        .apply(split_grid(head_dim, q_heads, rows, splits)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            partials.arg_mut(),
-        ],
-    )?;
-
-    let mut args = vec![out.arg_mut()];
-    let entrypoint = match which.sinks {
-        Some((sinks, module)) => {
-            args.push(sinks.arg());
-            module
-        }
-        None => which.combine,
-    };
-    args.push(partials.arg_mut());
-    args.push(splits.arg());
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path(entrypoint, ctx.best()),
-            entrypoint,
-        )
-        .apply(vector_grid(head_dim, q_heads, rows)?),
-        &args,
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_decode_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    sinks: Const<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>,
-    split: In<Struct<AttnSplit>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    if split.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the split policy this statement names",
-        });
-    }
-    let sv = unsafe { &*split.ptr };
-    let partials = sv.partials;
-    let rows = *rows;
-    let splits = sv.splits;
-    head_point(*head_dim, &[64])?;
-    if splits > 1 {
-        return flash_decode(
-            ctx,
-            Flash {
-                split: "sdpa_paged_decode_split_bfloat16_d_64",
-                combine: "sdpa_paged_decode_combine_bfloat16_d_64",
-                sinks: Some((*sinks, "sdpa_paged_decode_combine_sink_bfloat16_d_64")),
-            },
-            queries.ptr,
-            k_pages,
-            v_pages,
-            out.ptr,
-            gqa_factor,
-            position_ids,
-            req_of_token,
-            kv_page_indices,
-            kv_page_indptr,
-            page_size,
-            *n_kv_heads,
-            *scale,
-            attention_mask,
-            attention_mask_stride,
-            attention_mask_enabled,
-            *window,
-            partials,
-            *head_dim,
-            *q_heads,
-            rows,
-            splits,
-        );
-    }
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("sdpa_paged_decode_sink_bfloat16_d_64", ctx.best()),
-            "sdpa_paged_decode_sink_bfloat16_d_64",
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer. (attention.prefill, attention.masked)
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_tiled(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path(
-                [
-                    "sdpa_paged_tiled_bfloat16_d_64",
-                    "sdpa_paged_tiled_bfloat16_d_128",
-                    "sdpa_paged_tiled_bfloat16_d_256",
-                    "sdpa_paged_tiled_bfloat16_d_512",
-                ][head_point(*head_dim, &[64, 128, 256, 512])?],
-                ctx.best(),
-            ),
-            [
-                "sdpa_paged_tiled_bfloat16_d_64",
-                "sdpa_paged_tiled_bfloat16_d_128",
-                "sdpa_paged_tiled_bfloat16_d_256",
-                "sdpa_paged_tiled_bfloat16_d_512",
-            ][head_point(*head_dim, &[64, 128, 256, 512])?],
-        )
-        .apply(tiled_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_tiled_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    sinks: Const<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("sdpa_paged_tiled_sink_bfloat16_d_64", ctx.best()),
-            "sdpa_paged_tiled_sink_bfloat16_d_64",
-        )
-        .apply(tiled_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks.arg(),
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn sdpa_paged_tiled_strided(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-
-    let q_row_pitch = ctx.param(5)?;
-
-    let o_row_pitch = ctx.param(6)?;
-    head_point(*head_dim, &[256])?;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("sdpa_paged_tiled_strided_bfloat16_d_256", ctx.best()),
-            "sdpa_paged_tiled_strided_bfloat16_d_256",
-        )
-        .apply(tiled_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            n_rows.arg(),
-            q_row_pitch.arg(),
-            o_row_pitch.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_mma(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("sdpa_paged_mma_bfloat16_d_64", ctx.best()),
-            "sdpa_paged_mma_bfloat16_d_64",
-        )
-        .apply(tiled_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_mma_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    sinks: Const<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("sdpa_paged_mma_sink_bfloat16_d_64", ctx.best()),
-            "sdpa_paged_mma_sink_bfloat16_d_64",
-        )
-        .apply(tiled_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks.arg(),
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_vector_decode(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    scale: Const<f32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    n_kv_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keys = kvc.keys;
-    let values = kvc.values;
-
-    let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 {
-        *q_heads / n_kv_heads
-    } else {
-        0
-    };
-    let n = out.width;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    let v_head_stride = kvc.head_stride;
-    let v_seq_stride = kvc.seq_stride;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path(
-                [
-                    "sdpa_vector_decode_bfloat16_d_64",
-                    "sdpa_vector_decode_bfloat16_d_128",
-                    "sdpa_vector_decode_bfloat16_d_256",
-                ][head_point(*head_dim, &[64, 128, 256])?],
-                ctx.best(),
-            ),
-            [
-                "sdpa_vector_decode_bfloat16_d_64",
-                "sdpa_vector_decode_bfloat16_d_128",
-                "sdpa_vector_decode_bfloat16_d_256",
-            ][head_point(*head_dim, &[64, 128, 256])?],
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            keys.arg(),
-            values.arg(),
-            out.arg(),
-            gqa_factor.arg(),
-            n.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-            v_head_stride.arg(),
-            v_seq_stride.arg(),
-            scale.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn sdpa_vector_decode_swa(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    q_row_stride: Const<i32>,
-    o_row_stride: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    n_kv_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keys = kvc.keys;
-    let values = kvc.values;
-
-    let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 {
-        *q_heads / n_kv_heads
-    } else {
-        0
-    };
-    let n = out.width;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    let v_head_stride = kvc.head_stride;
-    let v_seq_stride = kvc.seq_stride;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path(
-                [
-                    "sdpa_vector_decode_swa_bfloat16_d_256",
-                    "sdpa_vector_decode_swa_bfloat16_d_512",
-                ][head_point(*head_dim, &[256, 512])?],
-                ctx.best(),
-            ),
-            [
-                "sdpa_vector_decode_swa_bfloat16_d_256",
-                "sdpa_vector_decode_swa_bfloat16_d_512",
-            ][head_point(*head_dim, &[256, 512])?],
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            keys.arg(),
-            values.arg(),
-            out.arg(),
-            gqa_factor.arg(),
-            n.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-            v_head_stride.arg(),
-            v_seq_stride.arg(),
-            scale.arg(),
-            window.arg(),
-            q_row_stride.arg(),
-            o_row_stride.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn sdpa_vector_decode_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    sinks: Const<Tensor<bf16>>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    q_row_stride: Const<i32>,
-    o_row_stride: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    n_kv_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keys = kvc.keys;
-    let values = kvc.values;
-
-    let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 {
-        *q_heads / n_kv_heads
-    } else {
-        0
-    };
-    let n = out.width;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    let v_head_stride = kvc.head_stride;
-    let v_seq_stride = kvc.seq_stride;
-    let rows = *rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("sdpa_vector_decode_sink_bfloat16_d_64", ctx.best()),
-            "sdpa_vector_decode_sink_bfloat16_d_64",
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            keys.arg(),
-            values.arg(),
-            out.arg(),
-            sinks.arg(),
-            gqa_factor.arg(),
-            n.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-            v_head_stride.arg(),
-            v_seq_stride.arg(),
-            scale.arg(),
-            window.arg(),
-            q_row_stride.arg(),
-            o_row_stride.arg(),
-        ],
-    )
 }
 
 /// Everything a paged attention entrypoint on this plane reads that no
@@ -1267,9 +194,9 @@ impl Fired {
     fn of(ctx: &Ctx<'_>, kv: &crate::views::PagedKvView) -> Result<Self, Refusal> {
         use crate::points::Staged;
 
-        // SEAM: the two per-fire token streams. A `#[routine]` takes each
-        // as an ordinary `In<Tensor<i32>>` that the lowering splices into
-        // the statement's input column; a point declares no such column.
+        // SEAM: the two per-fire token streams. The lowered path splices
+        // each into the statement's input column and resolves it there; a
+        // point declares no such column.
         let positions = ctx.stream::<i32>("positions")?;
         let request_of_token = ctx.stream::<i32>("request_of_token")?;
         // SEAM: two residents that are not `Cache` slots. `AttnMask` is
@@ -1295,11 +222,9 @@ impl Fired {
 ///
 /// # The five that land are one launch each, under five seams
 ///
-/// `decode`, `prefill`, `masked`, `logit_softcap` and `kv_append` are
-/// transcriptions of `sdpa_paged_decode`, `sdpa_paged_tiled`,
-/// `logit_softcap` and `kv_append_paged` below, with the `Const<i32>` runs
-/// those routines take replaced by what a bound statement carries. Four of
-/// the five then need [`Fired`], which is where this plane's staging story
+/// `decode`, `prefill`, `masked`, `logit_softcap` and `kv_append` fire
+/// `sdpa_paged_decode_*`, `sdpa_paged_tiled_*`, `logit_softcap_bfloat16`
+/// and `kv_append_paged_bfloat16`. Four of the five then need [`Fired`], which is where this plane's staging story
 /// is honest: the mask, the split policy, the two token streams and the
 /// pool's head geometry are all real objects the driver already builds and
 /// none of them is reachable by NAME. `logit_softcap` needs none of it and
@@ -1330,15 +255,66 @@ impl Fired {
 /// * `attention.merge_lse` — the consumer of an lse, absent for the same
 ///   reason as the producers.
 /// * `attention.sink` — this plane's sinks are FUSED
-///   (`sdpa_paged_decode_sink`, `sdpa_paged_tiled_sink`,
-///   `sdpa_paged_mma_sink`), taking the sink bank as a fifth binding
-///   inside the attention. The point is the POST-HOC correction: rescale
-///   an output against an lse a previous reading left. With no lse there
-///   is nothing to rescale against, so the fused entrypoints are
-///   unreachable from the declared points — they are a tier-2 surface this
-///   plane has and the floor does not name.
+///   (`sdpa_paged_decode_sink_*`, `sdpa_paged_tiled_sink_*`,
+///   `sdpa_paged_mma_sink_*`, `sdpa_vector_decode_sink_*`), taking the sink
+///   bank as a trailing binding inside the attention. The point is the
+///   POST-HOC correction: rescale an output against an lse a previous
+///   reading left. With no lse there is nothing to rescale against, so the
+///   fused entrypoints are unreachable from the declared points — they are
+///   a tier-2 surface this plane has and the floor does not name.
+///
+///   THE SPLIT PATH FOLDS ITS SINK IN THE COMBINE, and it is a different
+///   module rather than the same one with an extra binding: a split decode
+///   under sinks fires `sdpa_paged_decode_split_bfloat16_d_64` and then
+///   `sdpa_paged_decode_combine_sink_bfloat16_d_64`, because the sink term
+///   belongs to the online softmax's final normalisation and each split
+///   holds only part of it.
 /// * `attention.kv_append_shared` — dsv4's one-plane append. Every
 ///   `kv_append` instantiation here writes a key plane and a value plane.
+///
+/// # The arms behind the seam, and the schedule each rides
+///
+/// This is the capital the routine layer was carrying: which head widths
+/// each arm is stamped at, and which grid it takes. The launches themselves
+/// were sixteen transcriptions of one staging — unwrap the pool row and the
+/// mask view, divide `q_heads` by `n_kv_heads` for the GQA factor, bind the
+/// mask triple and the window — and the two bodies below already write that
+/// staging from what a statement carries. The table is what they could not
+/// re-derive.
+///
+/// | arm (`_bfloat16_d_<w>`) | file | `<w>` | grid |
+/// |---|---|---|---|
+/// | `sdpa_paged_decode` | `attn/sdpa_paged.slang` | 64, 128, 256, 512 | [`vector_grid`] |
+/// | `sdpa_paged_decode_split` | `attn/sdpa_paged.slang` | 64, 128, 256, 512 | [`split_grid`] |
+/// | `sdpa_paged_decode_combine` | `attn/sdpa_paged.slang` | 64, 128, 256, 512 | [`vector_grid`] |
+/// | `sdpa_paged_decode_sink` | `attn/sdpa_paged.slang` | 64 | [`vector_grid`] |
+/// | `sdpa_paged_decode_combine_sink` | `attn/sdpa_paged.slang` | 64 | [`vector_grid`] |
+/// | `sdpa_paged_tiled` | `attn/sdpa_paged.slang` | 64, 128, 256, 512 | [`tiled_grid`] |
+/// | `sdpa_paged_tiled_sink` | `attn/sdpa_paged.slang` | 64 | [`tiled_grid`] |
+/// | `sdpa_paged_tiled_strided` | `attn/sdpa_paged.slang` | 256 | [`tiled_grid`] |
+/// | `sdpa_paged_mma` | `attn/sdpa_paged_mma.slang` | 64 | [`tiled_grid`] |
+/// | `sdpa_paged_mma_sink` | `attn/sdpa_paged_mma.slang` | 64 | [`tiled_grid`] |
+/// | `sdpa_vector_decode` | `attn/sdpa_vector.slang` | 64, 128, 256 | [`vector_grid`] |
+/// | `sdpa_vector_decode_swa` | `attn/sdpa_sliding.slang` | 256, 512 | [`vector_grid`] |
+/// | `sdpa_vector_decode_sink` | `attn/sdpa_sliding.slang` | 64 | [`vector_grid`] |
+///
+/// THE `mma` ARM IS NOT A TIER OF THE TILED ONE. `module_path` walks
+/// `Capability::PREFERENCE` for ONE entrypoint name, stepping down to the
+/// module actually stamped; `sdpa_paged_mma_bfloat16_d_64` is a SEPARATE
+/// name whose shader uses cooperative matrices, so nothing in the tier walk
+/// can reach it from `sdpa_paged_tiled_bfloat16_d_64`. Choosing it is a
+/// capability test a body makes, and `Capability::Coopmat`'s `requires()`
+/// is the four device features that make it legal.
+///
+/// The three `_p32` decode arms are stamped against a page size of 32 and
+/// `PIE_FAST_FULL`; nothing has ever fired one from Rust, and a body that
+/// wants them tests `kv.page_size` rather than a head width.
+///
+/// `sdpa_vector_decode*` reads the cache as one CONTIGUOUS slab through
+/// `head_stride` and `seq_stride`, with no page indirection at all. That is
+/// not the pool `attention.decode` states, and `driver-vulkan`'s `views::kv`
+/// answers both strides as ZERO on a paged fire — so these three are not a
+/// fallback for the paged arms, they are a different cache.
 #[kernels_macros::claims]
 impl kernels::points::Attention for Ctx<'_> {
     fn decode<T: kernels::points::Scalar>(
@@ -1405,11 +381,10 @@ impl kernels::points::Attention for Ctx<'_> {
             );
         }
 
-        // THE SPLIT READING, TRANSCRIBED RATHER THAN DELEGATED. `flash_decode`
-        // below takes this plane's shader `Tensor<bf16>` in eleven positions;
-        // a claim body holds `Handle<T>` marks, so wrapping it would mean a
-        // conversion layer between two spellings of one descriptor index.
-        // The two launches are short and the pair is the arithmetic.
+        // THE SPLIT READING, IN FULL. Each split reads its own slice of the
+        // key range into `partials`; the combine folds them at
+        // [`vector_grid`]. The two launches are short and the pair is the
+        // arithmetic.
         let split = [
             "sdpa_paged_decode_split_bfloat16_d_64",
             "sdpa_paged_decode_split_bfloat16_d_128",

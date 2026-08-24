@@ -157,8 +157,8 @@ use driver_api::local::{
     ChannelBinding, InstanceBinding, PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_EXTERN_NONE,
     PIE_CHANNEL_HOST_ROLE_READER, PIE_RS_FLAG_RESET, PIE_STATUS_OK,
 };
-use driver_api::{ChannelRegistrationPlan, FrameSubmission, InstanceBindingPlan, LaunchPlan,
-    StepSubmission};
+use driver_api::{ChannelRegistrationPlan, EncodedMask, FrameSubmission, InstanceBindingPlan,
+    LaunchPlan, StepSubmission};
 use driver_cuda::serve::Shell;
 
 /// Qwen3.5-0.8B's vocabulary. Restated rather than read off the caps
@@ -872,4 +872,227 @@ fn the_last_prompt_row_matches_the_transformers_oracle() {
             "probe token {t}: ours {ours} vs HF {hf}",
         );
     }
+}
+
+/// **The mask gate**: a user attention mask is refused BY THE TEXT, and the
+/// same shell answers the causal fire on either side of the refusal.
+///
+/// # What this gate is, and what it deliberately is not
+///
+/// It is not "a masked fire answers". No catalog row can produce one, which
+/// is the finding this test records rather than the one it hides:
+///
+/// * `masked` is a fact exactly ONE family declares (`gemma_4`'s `Facts`).
+///   Every other text has one attention arm and it is causal.
+/// * gemma-4 does not reach a fire on this driver at all -- `Deployment::of`
+///   refuses the checkpoint at `load_model` ("more than one kv plane width
+///   across its layers", the 256/512 split between its sliding and global
+///   layers).
+/// * and past that, gemma's masked statements carry its 512-wide window,
+///   which `attention.masked`'s claim body refuses BY NAME
+///   (`kernels-cuda/src/attn.rs`): the masked arm reads the mask and nothing
+///   else, so serving both would lose one of the two orderings.
+///
+/// So what CHANGED is which answer this driver refuses with, and that is
+/// what this asserts. The refusal used to be the FLAG: `has_user_mask` set
+/// was refused before the lane was even picked, on the grounds that no arm
+/// read a staged mask. One does now -- `attention.masked` is a claim body
+/// reading the raise door, and `publish_seam_pins` stages
+/// `element_mask::from_words` for a frame that carries a table. So the
+/// question moved to `baker::word_of`, where the lane is picked: a text with
+/// no `masked` fact cannot express the request, and the refusal says that.
+///
+/// # Why the sandwich
+///
+/// The mask refusal is per-FRAME and lands before a byte is allocated. A
+/// fire on each side of it, from the SAME shell, is what says the refusal
+/// left no state behind -- no half-grown pool, no consumed ring cell, no
+/// stranded completion. The two argmaxes are the ones a two-token chain
+/// gives, so a refusal that had quietly advanced the KV would move them.
+#[test]
+fn a_user_mask_is_refused_by_the_text_and_not_by_the_flag() {
+    let _gpu = gpu_guard();
+    let Some(_dev) = device_or_skip("baker user mask") else {
+        return;
+    };
+    let Some(snap) = snapshot() else {
+        eprintln!("skipped: no cached {CACHE_DIR}");
+        return;
+    };
+
+    let broker = CompletionBroker::new();
+    let mut d = Shell::open(boot(&snap).as_bytes(), broker.clone()).expect("the driver creates");
+    let load = driver_api::ModelLoadDesc {
+        snapshot_dir: snap.clone(),
+        runtime_quant: String::new(),
+        mxfp4_moe: driver_api::Mxfp4MoeRequest::Auto,
+        component: driver_api::ModelComponent::Full,
+    };
+    d.load_model(&load).expect("the snapshot loads");
+
+    let ch = ChannelRegistrationPlan {
+        driver_id: 0,
+        channel_id: 1,
+        shape: vec![VOCAB as u32],
+        dtype: PIE_CHANNEL_DTYPE_F32,
+        host_role: PIE_CHANNEL_HOST_ROLE_READER,
+        seeded: false,
+        extern_dir: PIE_CHANNEL_EXTERN_NONE,
+        capacity: CAPACITY,
+        reader_wait_id: 3,
+        writer_wait_id: 4,
+        extern_name: Vec::new(),
+    };
+    let chb: ChannelBinding = d.register_channel(&ch).expect("the channel registers");
+    let program_id = d
+        .register_program(&driver_api::ProgramRegistration {
+            program_hash: 0x00A5_C0DE,
+            ..Default::default()
+        })
+        .expect("the program registers");
+    let binding: InstanceBinding = d
+        .bind_instance(&InstanceBindingPlan {
+            driver_id: 0,
+            program_id,
+            requested_instance_id: 0,
+            pacing_wait_id: 0,
+            channel_ids: vec![1],
+            seed_values: Vec::new(),
+            geometry_class: driver_api::GeometryClass::Host,
+        })
+        .expect("the instance binds");
+    let instance_ids = vec![binding.instance_id];
+
+    // One page holds both tokens, so nothing grows mid-test and a refusal
+    // that had allocated would show up as a moved argmax rather than as an
+    // allocator complaint.
+    let all_pages: Vec<u32> = vec![0];
+
+    // One decode fire. `masked` decides whether the frame carries the
+    // attention-mask table, and NOTHING ELSE about it changes: same token,
+    // same page, same CSR -- so the only thing the driver can be answering
+    // differently is the mask.
+    let fire = |d: &mut Shell, kv_len: u32, token: u32, position: u32, first: bool, masked: bool| {
+        let mut cell = driver_api::local::TerminalCell::pending();
+        let cell_ptr: *mut driver_api::local::TerminalCell = &mut cell;
+        // A decode row attends its whole context: `kv_len` true cells, which
+        // is `[0, kv_len]` as runs (an empty false run, then the trues). It
+        // is deliberately the CAUSAL answer -- the point is that a mask which
+        // asks for nothing extra is refused all the same, because the refusal
+        // is about what the TEXT can express and not about what the mask says.
+        let (masks, mask_indptr) = if masked {
+            (
+                vec![EncodedMask::new(vec![0, kv_len], u64::from(kv_len))],
+                vec![0, 1],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let step = StepSubmission {
+            plan: LaunchPlan {
+                token_ids: vec![token],
+                position_ids: vec![position],
+                kv_page_indices: all_pages.clone(),
+                kv_page_indptr: vec![0, 1],
+                kv_last_page_lens: vec![kv_len],
+                qo_indptr: vec![0, 1],
+                rs_slot_ids: vec![0],
+                rs_slot_flags: vec![if first { PIE_RS_FLAG_RESET } else { 0 }],
+                has_user_mask: masked,
+                masks,
+                mask_indptr,
+                ..Default::default()
+            },
+            roster_rows: vec![0],
+            sub_batch_indptr: vec![0, 1],
+            sub_batch_class: vec![driver_api::local::PIE_GEOMETRY_CLASS_HOST],
+            terminal_cells: vec![cell_ptr],
+            ..Default::default()
+        };
+        let frame = FrameSubmission {
+            instance_ids: instance_ids.clone(),
+            required_kv_pages: 1,
+            steps: vec![step],
+            ..Default::default()
+        };
+        let (target, completion) = broker.launch_completion(1);
+        let status = d
+            .launch(&frame, target)
+            .map_or_else(|s| s, |()| PIE_STATUS_OK);
+        if status != PIE_STATUS_OK {
+            return status;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(settled) = completion.check() {
+                settled.expect("the fire completed");
+                return PIE_STATUS_OK;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fire never completed",
+            );
+            std::thread::yield_now();
+        }
+    };
+
+    let words = chb.word_base as *mut u64;
+    let mut consumed = 0u64;
+    let mut advance = || -> u32 {
+        // SAFETY: as `leg`'s `argmax_of` -- the mirror is `cell_bytes *
+        // (capacity + 1)` of host memory the registration allocated, and
+        // `% CELLS` keeps the read inside it.
+        let cell = unsafe {
+            std::slice::from_raw_parts(
+                (chb.mirror_base as *const f32).add((consumed % CELLS) as usize * VOCAB),
+                VOCAB,
+            )
+        };
+        let got = cell
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(t, _)| t as u32)
+            .expect("a non-empty vocabulary");
+        consumed += 1;
+        // SAFETY: `word_base` is the channel's four-word control block,
+        // published by the registration and alive for the channel's life.
+        unsafe { words.write_volatile(consumed) };
+        got
+    };
+
+    // 1. The causal fire, which is the one this SKU can serve.
+    assert_eq!(
+        fire(&mut d, 1, PROMPT[0], 0, true, false),
+        PIE_STATUS_OK,
+        "the unmasked fire is accepted",
+    );
+    let first = advance();
+
+    // 2. The same fire with a mask. `qwen35-d0.8b` states one attention arm
+    //    and it is causal, so the lane cannot carry the request.
+    assert_ne!(
+        fire(&mut d, 2, PROMPT[1], 1, false, true),
+        PIE_STATUS_OK,
+        "a text that states no `masked` fact must refuse a masked frame \
+         rather than attend causally over it, which is the one wrong answer \
+         that looks right",
+    );
+
+    // 3. And the shell still serves. A refusal that had grown a pool or
+    //    advanced the KV would move this argmax off the chain's second
+    //    token; it is the one `the_baker_lane_generates_the_banked_eight_
+    //    tokens` walks through on its way to `BANKED`.
+    assert_eq!(
+        fire(&mut d, 2, PROMPT[1], 1, false, false),
+        PIE_STATUS_OK,
+        "the shell serves the causal fire after refusing the masked one",
+    );
+    let second = advance();
+    eprintln!("masked-gate argmaxes: {first} then {second}");
+    assert_ne!(
+        first, second,
+        "two positions of a real chain, not one answer repeated",
+    );
+    drop(d);
 }

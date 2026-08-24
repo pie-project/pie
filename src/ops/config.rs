@@ -349,28 +349,6 @@ fn driver_kind(file: &toml::Value) -> worker::config::DriverKind {
 /// at all follow from it, so guessing the other one would offer a reader
 /// fields their build cannot honour.
 fn default_driver_kind() -> worker::config::DriverKind {
-    #[cfg(all(feature = "driver-metal", not(feature = "_driver-cuda")))]
-    {
-        return worker::config::DriverKind::Metal;
-    }
-    #[cfg(all(
-        feature = "driver-vulkan",
-        not(feature = "_driver-cuda"),
-        not(feature = "driver-metal")
-    ))]
-    {
-        return worker::config::DriverKind::Vulkan;
-    }
-    #[cfg(all(
-        feature = "driver-wgpu",
-        not(feature = "_driver-cuda"),
-        not(feature = "driver-metal"),
-        not(feature = "driver-vulkan")
-    ))]
-    {
-        return worker::config::DriverKind::Wgpu;
-    }
-    #[allow(unreachable_code)]
     worker::config::DriverKind::CudaNative
 }
 

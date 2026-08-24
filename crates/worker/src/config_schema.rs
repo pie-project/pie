@@ -141,13 +141,18 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
     out
 }
 
-/// The option struct a driver kind parses `[model.driver.options]` into.
-fn options_struct(driver: DriverKind) -> &'static str {
+/// The option struct a driver kind parses `[model.driver.options]` into, or
+/// `None` for a kind no build hosts.
+///
+/// `None` is what makes the listing honest. The three retired kinds named
+/// option structs here after R3 deleted the drivers that read them, so
+/// `pie config list` went on advertising sixteen `driver.*` knobs — twelve
+/// under `metal`, three under `vulkan`, one under `wgpu` — that no build
+/// would have obeyed. A key is listed when a seam reads it.
+fn options_struct(driver: DriverKind) -> Option<&'static str> {
     match driver {
-        DriverKind::CudaNative => "CudaNativeDriverOptions",
-        DriverKind::Metal => "MetalDriverOptions",
-        DriverKind::Vulkan => "VulkanDriverOptions",
-        DriverKind::Wgpu => "WgpuDriverOptions",
+        DriverKind::CudaNative => Some("CudaNativeDriverOptions"),
+        DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => None,
     }
 }
 
@@ -202,7 +207,13 @@ fn walk(
         // `options` is the one field whose shape depends on another field's
         // value, so it is the one place the walk consults the driver kind.
         let nested = if field.ty == "toml::Table" {
-            Some(options_struct(driver).to_string())
+            // No struct, no keys, and the untyped table itself is not one
+            // either: a kind no build hosts parses nothing out of
+            // `[model.driver.options]`, so nothing under it is settable.
+            let Some(inner) = options_struct(driver) else {
+                continue;
+            };
+            Some(inner.to_owned())
         } else {
             let inner = field
                 .ty
@@ -263,9 +274,7 @@ fn default_values(driver: DriverKind) -> toml::Value {
     }
     let options = match driver {
         DriverKind::CudaNative => defaults_of::<crate::config::CudaNativeDriverOptions>(&empty),
-        DriverKind::Metal => defaults_of::<crate::config::MetalDriverOptions>(&empty),
-        DriverKind::Vulkan => defaults_of::<crate::config::VulkanDriverOptions>(&empty),
-        DriverKind::Wgpu => defaults_of::<crate::config::WgpuDriverOptions>(&empty),
+        DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => None,
     };
     if let (Some(options), Some(driver_table)) = (
         options,
@@ -304,7 +313,7 @@ mod tests {
         // has a blind spot -- which is how a parse that quietly broke would
         // otherwise present itself.
         let listed: std::collections::BTreeSet<String> =
-            keys(DriverKind::Metal).into_iter().collect();
+            keys(DriverKind::CudaNative).into_iter().collect();
 
         fn collect(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
             let Some(table) = value.as_table() else {
@@ -321,7 +330,7 @@ mod tests {
             }
         }
         let mut serialized = Vec::new();
-        collect(&default_values(DriverKind::Metal), "", &mut serialized);
+        collect(&default_values(DriverKind::CudaNative), "", &mut serialized);
 
         let missing: Vec<String> = serialized
             .iter()
@@ -335,30 +344,26 @@ mod tests {
     }
 
     #[test]
-    fn the_driver_decides_which_option_keys_exist() {
+    fn a_kind_no_build_hosts_advertises_no_option_keys() {
         // `[model.driver.options]` is untyped until the driver kind names the
-        // struct it parses into.
+        // struct it parses into -- and three of the four kinds name none, so
+        // the listing offers an operator nothing under them. It offered
+        // sixteen keys across the three -- `driver.total_pages`,
+        // `driver.kv_pages`, `driver.kv_cache_dtype` among them -- for
+        // drivers that leave `pie serve` refusing the config by name before
+        // one of them is read.
         let cuda = keys(DriverKind::CudaNative);
-        let metal = keys(DriverKind::Metal);
-        let vulkan = keys(DriverKind::Vulkan);
-        let wgpu = keys(DriverKind::Wgpu);
         assert!(cuda.contains(&"driver.gpu_mem_utilization".to_string()));
-        assert!(!metal.contains(&"driver.gpu_mem_utilization".to_string()));
-        assert!(metal.contains(&"driver.total_pages".to_string()));
-        // The two portable shells both state `kv_pages` and NEITHER states
-        // `kernels`. Vulkan used to: it named a directory of compiled SPIR-V,
-        // which invited an operator to point a driver at a `target/` tree.
-        // Both backends now carry their kernels in the rlib, so the key that
-        // told them apart is gone from the one that had it rather than added
-        // to the one that did not.
-        assert!(vulkan.contains(&"driver.kv_pages".to_string()));
-        assert!(!vulkan.contains(&"driver.kernels".to_string()));
-        assert!(wgpu.contains(&"driver.kv_pages".to_string()));
-        assert!(!wgpu.contains(&"driver.kernels".to_string()));
-        // And the knobs the configured drivers have that this one does not --
-        // see `WgpuDriverOptions` for what each would have meant.
-        assert!(!wgpu.contains(&"driver.kv_cache_dtype".to_string()));
-        assert!(!wgpu.contains(&"driver.total_pages".to_string()));
+        for retired in [DriverKind::Metal, DriverKind::Vulkan, DriverKind::Wgpu] {
+            let listed = keys(retired);
+            assert!(
+                listed.iter().all(|key| cuda.contains(key)),
+                "{retired:?} lists a key the hosted driver does not: {listed:?}"
+            );
+            for key in ["kv_pages", "total_pages", "kv_cache_dtype", "kernels"] {
+                assert!(!listed.contains(&format!("driver.{key}")));
+            }
+        }
     }
 
     #[test]

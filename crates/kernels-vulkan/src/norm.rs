@@ -1,14 +1,13 @@
-use crate::routine::{
-    Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
-};
+use crate::routine::{Bind, Const, Ctx, Fire, In, InOut, Out, elementwise, elementwise_rows};
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
-fn per_row(rows: i32) -> Result<[u32; 3], Refusal> {
-    per_axis(1, 1, rows)
-}
-
-fn per_axis(width: i32, axis: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+/// The whole-row norm's grid: one 256-wide workgroup per `axis`-wide slice.
+///
+/// `rms.slang` addresses `row_base = group.x * axis_size`, so the slice
+/// count is the row over the stated axis and the workgroup is 256 lanes
+/// cooperating on one reduction. A dispatch here is in TOTAL THREADS, which
+/// is why the product is multiplied out rather than handed over as groups.
+pub fn per_axis(width: i32, axis: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if width <= 0 {
         return Err(Refusal::Empty { what: "width" });
     }
@@ -33,7 +32,12 @@ fn per_axis(width: i32, axis: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     Ok([lanes, 1, 1])
 }
 
-fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+/// The per-head norm's grid: one 256-wide workgroup per (head, row).
+///
+/// Where [`per_axis`] multiplies the slices out onto x, this spreads them
+/// over y and z — the shape `gated_rms.slang` and `rms_strided*` address,
+/// which read the head off `group.y` because their rows are not dense.
+pub fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if heads <= 0 {
         return Err(Refusal::Empty { what: "heads" });
     }
@@ -43,432 +47,10 @@ fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     Ok([256, heads.unsigned_abs(), rows.unsigned_abs()])
 }
 
-// INLINED into impl Norm; dies with the routine layer. (norm.rmsnorm, norm.rmsnorm_per_head, norm.rmsnorm_plus_one, norm.rmsnorm_per_head_plus_one)
-#[routine(canon = "norm.rmsnorm", out(out = like(x)))]
-pub fn rms_single_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("rms_single_row_bfloat16", ctx.best()),
-            "rms_single_row_bfloat16",
-        )
-        .apply(per_axis(width, *axis, rows)?),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn rms_strided_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let row_pitch = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("rms_strided_row_bfloat16", ctx.best()),
-            "rms_strided_row_bfloat16",
-        )
-        .apply(per_row(rows)?),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            row_pitch.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn rms_strided_head_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let row_pitch = x.width;
-
-    let heads = if *axis > 0 { row_pitch / *axis } else { 0 };
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("rms_strided_head_row_bfloat16", ctx.best()),
-            "rms_strided_head_row_bfloat16",
-        )
-        .apply(per_head_row(heads, rows)?),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            row_pitch.arg(),
-        ],
-    )
-}
-
-fn per_head_row_rotating(
-    heads: i32,
-    rows: i32,
-    rotary: i32,
-    axis: i32,
-) -> Result<[u32; 3], Refusal> {
-    if rotary <= 0 {
-        return Err(Refusal::Empty { what: "rotary" });
-    }
-    if rotary % 2 != 0 {
-        return Err(Refusal::Narrow {
-            what: "rotary",
-            at: i64::from(rotary),
-        });
-    }
-    if axis > 0 && rotary > axis {
-        return Err(Refusal::Wide {
-            what: "rotary",
-            at: i64::from(rotary),
-            max: i64::from(axis),
-        });
-    }
-    per_head_row(heads, rows)
-}
-
-#[routine]
-pub fn rms_rope(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    row_pitch: Const<i32>,
-    rotary: Const<i32>,
-    scale: Const<f32>,
-    base_or_mscale: Const<f32>,
-    positions: In<Tensor<i32>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let position = positions.ptr;
-    let axis_of = *axis;
-    let pitch_of = *row_pitch;
-    let rotary_of = *rotary;
-    let rows = *rows;
-
-    let heads = if axis_of > 0 { pitch_of / axis_of } else { 0 };
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("rms_rope_bfloat16", ctx.best()),
-            "rms_rope_bfloat16",
-        )
-        .apply(per_head_row_rotating(heads, rows, rotary_of, axis_of)?),
-        &[
-            x.arg(),
-            w.arg(),
-            position.arg(),
-            eps.arg(),
-            axis.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            row_pitch.arg(),
-            rotary.arg(),
-            scale.arg(),
-            base_or_mscale.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(x)))]
-pub fn rms_residual(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    r: In<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis_size: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-
-    let axis = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("rms_residual_bfloat16", ctx.best()),
-            "rms_residual_bfloat16",
-        )
-        .apply(per_axis(width, axis, rows)?),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis_size.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            r.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(x)))]
-pub fn rms_residual_scaled(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    r: In<Tensor<bf16>>,
-    s: In<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis_size: Const<i32>,
-    w_stride: Const<u32>,
-    plus_one: Const<u32>,
-    gain: Const<f32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-
-    let axis = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("rms_residual_scaled_bfloat16", ctx.best()),
-            "rms_residual_scaled_bfloat16",
-        )
-        .apply(per_axis(width, axis, rows)?),
-        &[
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            axis_size.arg(),
-            w_stride.arg(),
-            plus_one.arg(),
-            gain.arg(),
-            r.arg(),
-            s.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer. (norm.rmsnorm_no_scale)
-#[routine(out(out = like(x)))]
-pub fn vnorm_single_row(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    axis_size: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-
-    let axis = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("vnorm_single_row_bfloat16", ctx.best()),
-            "vnorm_single_row_bfloat16",
-        )
-        .apply(per_axis(width, axis, rows)?),
-        &[x.arg(), out.arg(), eps.arg(), axis_size.arg()],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer. (norm.rmsnorm_gated, norm.rmsnorm_gated_by)
-#[routine(canon = "norm.rmsnorm_gated")]
-pub fn gated_rms(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    z: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    vd: Const<i32>,
-    heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let heads = *heads;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("gated_rms_bfloat16", ctx.best()),
-            "gated_rms_bfloat16",
-        )
-        .apply(per_head_row(heads, rows)?),
-        &[x.arg(), z.arg(), w.arg(), out.arg(), eps.arg(), vd.arg()],
-    )
-}
-
-#[routine]
-pub fn gated_rms_strided(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    z: In<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    eps: Const<f32>,
-    vd: Const<i32>,
-    heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let heads = *heads;
-    let row_pitch = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("gated_rms_strided_bfloat16", ctx.best()),
-            "gated_rms_strided_bfloat16",
-        )
-        .apply(per_head_row(heads, rows)?),
-        &[
-            x.arg(),
-            z.arg(),
-            w.arg(),
-            out.arg(),
-            eps.arg(),
-            vd.arg(),
-            row_pitch.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer. (norm.scale)
-#[routine(out(out = like(x)))]
-pub fn layer_scalar_mul(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    scalar: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("layer_scalar_mul_bfloat16", ctx.best()),
-            "layer_scalar_mul_bfloat16",
-        )
-        .apply(elementwise(width, rows)?),
-        &[x.arg(), scalar.arg(), out.arg()],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer. (norm.residual_add)
-#[routine(canon = "norm.residual_add", out(out = like(x)))]
-pub fn residual_add(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    residual: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("residual_add_bfloat16", ctx.best()),
-            "residual_add_bfloat16",
-        )
-        .apply(elementwise(width, rows)?),
-        &[x.arg(), residual.arg(), out.arg()],
-    )
-}
-
-#[routine]
-pub fn residual_add_strided(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<bf16>>,
-    residual: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    row_pitch: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = x.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("residual_add_strided_bfloat16", ctx.best()),
-            "residual_add_strided_bfloat16",
-        )
-        .apply(elementwise_rows(width, rows)?),
-        &[x.arg(), residual.arg(), out.arg(), row_pitch.arg()],
-    )
-}
-
-// INLINED into impl Norm; dies with the routine layer. (norm.add_bias)
-#[routine(canon = "norm.add_bias", out(out = like(out)))]
-pub fn add_bias(
-    ctx: &Ctx<'_>,
-    out: InOut<Tensor<bf16>>,
-    bias: Const<Tensor<bf16>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = out.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            crate::routine::module_path("add_bias_bfloat16", ctx.best()),
-            "add_bias_bfloat16",
-        )
-        .apply(elementwise_rows(width, rows)?),
-        &[out.arg(), bias.arg(), width.arg()],
-    )
-}
-
 /// The `Norm` family, claimed. Ten of twelve points land as LAUNCHERS —
-/// `.wiki/baker.md`'s endpoint shape, where the impl method fires and no
-/// `#[routine]` stands under it — and the two absences are stated rather
-/// than left to be counted.
+/// `.wiki/baker.md`'s endpoint shape, where the impl method fires and
+/// nothing stands under it — and the two absences are stated rather than
+/// left to be counted.
 ///
 /// # One kernel, four points
 ///
@@ -495,9 +77,26 @@ pub fn add_bias(
 /// and `rms.slang`'s `row_base` is `group.x * axis_size` — so the whole-row
 /// forms pass `axis = width` and the per-head forms pass `axis = head_dim`,
 /// and in both readings the ROWS come off the operand's own rectangle. The
-/// `rows: Const<i32>` every `#[routine]` below takes is gone with the
-/// routine: W10's law is that an executor hands a kernel dense rectangles,
-/// and a dense rectangle knows how many rows it has.
+/// retired routine layer took a `rows: Const<i32>` beside every one of
+/// these launches; W10's law is that an executor hands a kernel dense
+/// rectangles, and a dense rectangle knows how many rows it has.
+///
+/// # A FUSED ARM THE FLOOR'S DECOMPOSITION DOES NOT REACH
+///
+/// `norm/rms_rope.slang` stamps six entrypoints that do the norm AND the
+/// rotation in one launch, over the geometric, tabulated and proportional
+/// frequency readings and their decode cuts. No point names one: the floor
+/// declares `norm.rmsnorm` and the `Rope` family separately and both land
+/// here, so the fused arm is a PERFORMANCE reading of a decomposition this
+/// plane can already fire — unlike [`crate::ssm`]'s fusion, which is a
+/// decomposition disagreement and blocks every point of its family. It
+/// becomes reachable when a text may name a fused point, which
+/// `.wiki/baker.md` reserves for tier-2.
+///
+/// The same reading covers the four strided arms (`rms_strided_row`,
+/// `rms_strided_head_row`, `gated_rms_strided`, `residual_add_strided`):
+/// they take a row pitch, a mark carries a dense rectangle, and W10's law
+/// is that an executor hands a kernel dense rectangles.
 ///
 /// # Two points stay on the floor's default body
 ///

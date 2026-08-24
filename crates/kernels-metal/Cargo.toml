@@ -30,10 +30,13 @@ default = []
 native = []
 
 [dependencies]
-# The routine registry — see the workspace table for why this one.
-linkme = { workspace = true }
-inventory = { workspace = true }
-# `#[routine]`, which builds each row beside its own `fn`.
+# `linkme` AND `inventory` STOOD HERE, and they were the routine registry: a
+# `distributed_slice` of `Routine<Metal>` filled by 99 `#[routine]` fns. The
+# launches are `#[claims]` methods now, and the two `canon` rows that
+# outlived them are `CANON`, four lines in `src/lib.rs`.
+#
+# `#[claims]`, which states the points this plane answers beside the impl
+# that answers them.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }
 

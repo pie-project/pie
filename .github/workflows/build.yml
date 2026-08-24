@@ -16,7 +16,7 @@ on:
         type: string
         default: "nightly"
       desktop:
-        description: "Build the desktop GPU artifacts (macOS arm64 Metal + Windows x86_64 native CUDA)"
+        description: "Build the desktop GPU artifacts (Windows x86_64 native CUDA; the macOS arm64 Metal leg is quarantined until P5)"
         type: boolean
         default: true
       cuda_manylinux:
@@ -74,8 +74,10 @@ jobs:
           fi
 
   # =========================================================================
-  # Desktop GPU artifacts — macOS arm64 (Metal) + Windows x86_64 (native
-  # CUDA). The Linux CUDA artifacts come from the cuda-manylinux job below.
+  # Desktop GPU artifacts. Windows x86_64 (native CUDA) is the one leg that
+  # builds today; the macOS arm64 (Metal) leg is quarantined in the matrix
+  # below, with the reason and what restoring it takes. The Linux CUDA
+  # artifacts come from the cuda-manylinux job below.
   # =========================================================================
   desktop:
     if: inputs.desktop
@@ -85,16 +87,51 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - label: aarch64-macos-metal
-            # macos-15 gets Xcode 16 with libc++ 17, which has
-            # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
-            # libc++ 15, which doesn't.
-            runner: macos-15
-            platform: macos
-            triple: aarch64-apple-darwin
-            archive: tar.gz
-            backend: metal
-            features: driver-metal
+          # ── `aarch64-macos-metal` STOOD HERE, QUARANTINED (R3) ───────────
+          #
+          # The leg built `cargo build -p pie --features driver-metal` on
+          # `macos-15` and shipped `pie-aarch64-macos-metal.tar.gz`. It cannot
+          # build: R3 put `crates/driver-metal` in the root manifest's
+          # `exclude` -- it was one of the last consumers of `model-legacy` and
+          # `model_compiler::lower`, both deleted -- and with the crate out of
+          # the workspace, `pie` no longer declares a `driver-metal` feature to
+          # forward. `--features driver-metal` is a hard cargo error, so this
+          # leg failed before it compiled a line, and `fail-fast: false` meant
+          # the Windows leg beside it went on publishing while this one went
+          # red into a log nobody reads.
+          #
+          # QUARANTINED, not deleted, and not silently: the leg is a whole
+          # release artifact, and a matrix entry that merely vanishes is
+          # indistinguishable from a platform someone decided to drop.
+          #
+          # WHAT IT COSTS WHILE IT STANDS HERE. `scripts/install.sh` maps
+          # darwin/aarch64 to exactly `pie-aarch64-macos-metal.tar.gz` and
+          # `README.md` publishes that installer as the way in. Until this leg
+          # returns, macOS installs resolve against whatever the last
+          # successful run left on the rolling release, and a `--clobber`
+          # upload never refreshes it. The installer is deliberately left
+          # alone: teaching it to refuse macOS would be this quarantine
+          # spreading, and the asset it names is the one that comes back.
+          #
+          # IT COMES BACK AT P5 with the crate, as the root `Cargo.toml`'s
+          # `exclude` and `ci.yml`'s shader-plane note both say. Restoring it
+          # is this entry, unchanged, once `pie` declares the feature again:
+          #
+          #     - label: aarch64-macos-metal
+          #       # macos-15 gets Xcode 16 with libc++ 17, which has
+          #       # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
+          #       # libc++ 15, which doesn't.
+          #       runner: macos-15
+          #       platform: macos
+          #       triple: aarch64-apple-darwin
+          #       archive: tar.gz
+          #       backend: metal
+          #       features: driver-metal
+          #
+          # The `platform == 'macos'` steps below (the `brew install cmake
+          # ninja libomp` one, and the `TARGET_ROOT` branch in Package) are
+          # left in place for the same reason: they are this leg's other half
+          # and they cost nothing while no leg selects them.
           - label: x86_64-windows-cuda
             runner: windows-large-x64
             platform: windows

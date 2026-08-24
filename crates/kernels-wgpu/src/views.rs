@@ -2,10 +2,16 @@
 //!
 //! Identity in `kernels::runtime`, carrier HERE, answer in `driver-wgpu` —
 //! the split `kernels::raises` documents, applied to the resident objects.
-//! A routine takes one as `In<Struct<KvCache>>`: positional, counted by
-//! `arity_problem`, visible in the derived column. The fields below replace
-//! the `ctx.ask` keys named beside each; the driver builds one view per
-//! (fire, layer) instead of answering the keys one at a time.
+//! The fields below replace the `ctx.ask` keys named beside each; the driver
+//! builds one view per (fire, layer) instead of answering the keys one at a
+//! time.
+//!
+//! TWO IDENTITIES, NOT FIVE. `KvCache`, `AttnMask` and `AttnSplit` stood here
+//! too, one `In<Struct<..>>` per raise, because a launcher stated its whole
+//! input on the operand column and took the three separately. A point states
+//! operands and scalars only, so a body reaches exactly one object the driver
+//! built for this fire — [`AttnFire`] for attention, [`RecurrentState`] for
+//! the mixers — and the three view STRUCTS survive as fields of the first.
 //!
 //! CUDA's `PagedKvView` holds pointers; a shader plane's holds what its asks
 //! carried — `Tensor<E>` binding handles and the strides beside them. Same
@@ -13,11 +19,12 @@
 
 use kernels::shader::{Tensor, Usize, bf16};
 
-/// `In<Struct<KvCache>>` — the paged KV cache, one view per (fire, layer).
+/// The paged KV cache, one view per (fire, layer); reached as
+/// [`AttnFireView::kv`].
 ///
 /// Field per retired key. On this plane the cache planes are binding
 /// handles, so there is no null write half: a fire that appends nothing
-/// never fires a routine that names `write_page`.
+/// never fires an entrypoint that names `write_page`.
 #[derive(Debug, Clone, Copy)]
 pub struct PagedKvView {
     /// `keys::KvKeys` — the key plane.
@@ -54,7 +61,7 @@ pub struct RecurrentView {
     pub new_conv_state: Tensor<f32>,
 }
 
-/// `In<Struct<AttnMask>>` — the custom-mask triple.
+/// The custom-mask triple; reached as [`AttnFireView::mask`].
 ///
 /// `enabled` is a per-request byte plane on this plane, not a bool: the
 /// shader reads it per row, which is what `keys::AttentionMaskEnabled`
@@ -70,24 +77,16 @@ pub struct MaskView {
 }
 
 kernels::resident!(
-    /// The paged KV cache. Tier-1: `kernels::runtime::TIER1` names it.
-    KvCache = "kv_cache" => PagedKvView
-);
-kernels::resident!(
     /// The recurrent-state slabs. Tier-1.
     RecurrentState = "recurrent_state" => RecurrentView
 );
-kernels::resident!(
-    /// The custom-mask triple. Per-fire, staged by the driver.
-    AttnMask = "attention_mask" => MaskView
-);
 
-/// `In<Struct<AttnSplit>>` — the driver's decode split policy: how many
-/// KV splits this fire's decode runs, and the partials plane the split
-/// form folds. `splits <= 1` is the unsplit reading and the partials
-/// handle is then never read. What `keys::AttnSplits`/`keys::AttnPartials`
-/// (vulkan) and the optional `keys::AttnScratch` (wgpu) asked; metal fires
-/// unsplit and its driver answers `splits: 1`.
+/// The driver's decode split policy; reached as [`AttnFireView::split`]. How
+/// many KV splits this fire's decode runs, and the partials plane the split
+/// form folds. `splits <= 1` is the unsplit reading and the partials handle
+/// is then never read. What `keys::AttnSplits`/`keys::AttnPartials` (vulkan)
+/// and the optional `keys::AttnScratch` (wgpu) asked; metal fires unsplit and
+/// its driver answers `splits: 1`.
 #[derive(Debug, Clone, Copy)]
 pub struct SplitView {
     /// The partials/scratch plane, `[splits, rows, heads, head_dim + 1]`-ish
@@ -97,23 +96,19 @@ pub struct SplitView {
     pub splits: i32,
 }
 
-kernels::resident!(
-    /// The decode split policy. Driver-owned, per fire.
-    AttnSplit = "attn.split_policy" => SplitView
-);
-
 /// `Cache<Self::Pages>` — the paged KV row AND the per-fire staging every
 /// sdpa arm on this plane reads.
 ///
-/// # Why the points layer needs a wider view than the routine layer
+/// # Why the points layer needs a wider view than the launchers did
 ///
-/// A `#[routine]` states its whole input on the operand column, so
-/// `attn::sdpa_paged_decode` takes FIVE raises and tensors the statement does
-/// not carry — `kvc`, `positions`, `request_of_token`, `maskv`, `split` — and
-/// the driver answers each one separately. A POINT states operands and
-/// scalars only (`.wiki/baker.md`: "Plane staging never appears in a
-/// declaration — the body pulls it from `self`"), and `attention.decode`
-/// declares exactly `q`, the pool row, `window`, `head_dim`, `sm_scale`, `o`.
+/// A launcher stated its whole input on the operand column, so the paged
+/// decode took FIVE raises and tensors the statement does not carry — the
+/// pool row, `positions`, `request_of_token`, the mask triple, the split
+/// policy — and the driver answered each one separately. A POINT states
+/// operands and scalars only (`.wiki/baker.md`: "Plane staging never appears
+/// in a declaration — the body pulls it from `self`"), and
+/// `attention.decode` declares exactly `q`, the pool row, `window`,
+/// `head_dim`, `sm_scale`, `o`.
 ///
 /// On cuda the body pulls the rest off `self`, because `Ctx` is a struct with
 /// an env behind it. On this plane `Ctx` is `dyn Encode` and has no env, so
@@ -134,12 +129,13 @@ kernels::resident!(
 ///   is stated here, by the POOL, which is the party that chose it when the
 ///   slab was allocated. `attention.prefill` declares its own `kv_heads` and
 ///   the two must agree; a body that finds them disagreeing refuses.
-/// * **The capability tier is NOT here.** `sdpa_paged_mma` needs
-///   `Capability::Matrix` and `sdpa_paged_tiled` does not, and that is a
-///   DEVICE fact, not a fire's. It belongs on `Encode` — a
+/// * **The capability tier is NOT here.** `attn/sdpa_paged_mma.wgsl` needs
+///   `Capability::Matrix` and `sdpa_paged.wgsl`'s tiled arm does not, and
+///   that is a DEVICE fact, not a fire's. It belongs on `Encode` — a
 ///   `fn capability(&self) -> Capability` — so a body can branch on it the
 ///   way cuda's bodies branch on `Ctx::device()`. Until then every prefill
-///   claim fires the tiled arm and says so.
+///   claim fires the tiled arm and says so; [`crate::attn::mma`] is the other
+///   arm, written and waiting for the branch.
 #[derive(Debug, Clone, Copy)]
 pub struct AttnFireView {
     /// The pool row itself, unchanged.

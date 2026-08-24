@@ -11,8 +11,12 @@ use driver_api::local::PIE_STATUS_DRIVER_ERROR;
 pub struct Shell {
     /// What this device is, parsed once at create from the capabilities JSON.
     pub(crate) facts: driver_api::DeviceFacts,
-    /// `[model] config` from the boot TOML, for snapshots with no embedded config.
-    pub(crate) boot_config: Option<std::path::PathBuf>,
+    // `boot_config` STOOD HERE — `[model] config`, the path to a
+    // `config.json` for snapshots that embedded none. The LEGACY LOAD
+    // CONTRACT was its only reader: `Encoding::from_config_json` parsed it to
+    // tell the contract how the numbers were stored. R3 deleted the contract;
+    // the SKU's text states its own dtypes and `produce` reads the checkpoint
+    // through the import table, so this driver parses no `config.json` at all.
     /// `[model] id` from the boot TOML, or `None` to read the tensors.
     pub(crate) boot_model_id: Option<String>,
     /// Does this driver hand completions to a stream callback and return before
@@ -674,62 +678,32 @@ pub(crate) struct InstanceEntry {
     pub seeds: Vec<(u64, Vec<u8>)>,
 }
 
-/// What a successful `load_model` leaves behind: the parsed config and every
-/// weight resident on the device, keyed by checkpoint (and fused trace) name.
+/// What a successful `load_model` leaves behind: which SKU this is, the
+/// pool geometry read off its plan, and the caps that were published from
+/// both. The WEIGHTS are not here — they are `baker::Baked::banks`, produced
+/// through the SKU's import table and held by the lane that fires them.
 pub(crate) struct LoadedModel {
-    /// The catalog row this checkpoint matched, by id — a `&'static str` that
-    /// reaches `DriverCapabilities::model_id` and the host's chat template.
+    /// The catalog SKU this checkpoint matched — a `&'static str` that
+    /// reaches `DriverCapabilities::model_id` and, through it, the host's
+    /// chat template. One id space since R3: this is the same string
+    /// `model::catalog()` files the row under.
     pub id: &'static str,
-    /// What this checkpoint is, derived once at load. Carries no family name by
-    /// design, so the fire path cannot special-case on one.
+    /// What this checkpoint is, read once at load off the same `Plan` the
+    /// lane's program is built from. Carries no family name by design, so
+    /// the fire path cannot special-case on one.
     pub deployment: model::deployment::Deployment,
     /// The caps JSON `load_model` answered with; owned like `Shell::caps`.
     pub load_caps: Vec<u8>,
-    /// Every tensor the plan named, as an arena span not an allocation: a resident plan
-    /// lays the model out contiguously, so a weight is an offset into one buffer.
-    pub weights: std::collections::BTreeMap<String, crate::weights::stage::WeightSpan>,
-    /// The arena, and anything the plan published outside it. Held so the spans
-    /// above stay valid; never indexed.
-    #[allow(dead_code)]
-    pub owned: Vec<crate::device::DeviceBuffer>,
-    /// Trace-name renames onto checkpoint names (`layer.3.attn_norm` →
-    /// `model.layers.3.input_layernorm.weight`) — a row here, not a second copy.
-    pub aliases: std::collections::BTreeMap<String, String>,
-    /// The per-layer `layer_scalar` [1] tensors, read to host once at load: the
-    /// fused sandwich norm's multiplier. Empty where wiring names none.
-    pub layer_scalars: Vec<f32>,
     /// The group this rank's weights were sharded for, carried from the shell so
     /// a family's facts and its load plan cannot disagree on rank width.
     pub(crate) tp_size: u32,
 }
 
-impl LoadedModel {
-    /// The device pointer for a name — the live half of the executor's
-    /// `Resolver::weight`. Checkpoint names, fused names and aliases all answer.
-    #[allow(dead_code)]
-    pub(crate) fn weight(&self, name: &str) -> Option<*const std::ffi::c_void> {
-        // EVERY NAME THE LOAD HOLDS, once. A miss names what was wanted; only
-        // this names what is there, and the difference between the two is
-        // where a trace and a load contract stopped agreeing.
-        if std::env::var_os("PIE_TRACE_WEIGHTS").is_some() {
-            use std::sync::Once;
-            static DUMP: Once = Once::new();
-            DUMP.call_once(|| {
-                for k in self.weights.keys() {
-                    eprintln!("[held] {k}");
-                }
-                for (k, v) in &self.aliases {
-                    eprintln!("[alias] {k} -> {v}");
-                }
-            });
-        }
-        if let Some(b) = self.weights.get(name) {
-            return Some(b.ptr.cast_const());
-        }
-        let target = self.aliases.get(name)?;
-        self.weights.get(target).map(|b| b.ptr.cast_const())
-    }
-}
+// `LoadedModel::{weights, owned, aliases, layer_scalars}` and the `weight()`
+// resolver STOOD HERE — the LEGACY LOAD CONTRACT's arena and its name map.
+// `model::produce` reads the checkpoint through the SKU's own import table
+// now and `baker::Baked::banks` is the only weight map a fire touches, so a
+// second residency with a second spelling has nothing left to answer for.
 
 /// The facts a scheduler reads. Storage facts import from `StorageTarget::for_backend` so
 /// they can't drift; `native_mxfp4_moe` false is a trap — a native MXFP4 *GEMM* (an unported

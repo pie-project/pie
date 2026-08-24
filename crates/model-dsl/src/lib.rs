@@ -230,8 +230,14 @@ pub mod seam {
         }
     }
 
-    pub fn at<S: Sees>(def: Def, sees: S, layer: u32) {
+    /// Mark one seam where the text stands.
+    ///
+    /// NO LAYER ARGUMENT, and that is the same rule the statements follow:
+    /// a seam is recorded at whatever layer the text's `inputs.layers(..)`
+    /// loop is on, so `Seam::layer` comes off the loop and the mixers stop
+    /// taking an `l` they only ever passed through to here.
+    pub fn at<S: Sees>(def: Def, sees: S) {
         let values = sees.values();
-        values[0].rec.seam(def.name, &values, Some(layer));
+        values[0].rec.seam(def.name, &values);
     }
 }

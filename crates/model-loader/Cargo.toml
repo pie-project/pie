@@ -22,8 +22,10 @@ path = "src/lib.rs"
 default = ["testkit"]
 
 # The parts of this crate that exist to *check* the loader rather than to be
-# the loader: the differential oracle and the CPU plan executor the
-# `model-loader` tool replays with.
+# the loader: the differential oracle plans are replayed against. (It said "and
+# the CPU plan executor the `model-loader` tool replays with" -- that executor
+# was promoted out of `testkit` when it became `pie model import`'s production
+# path, and this crate declares no `[[bin]]`, so there is no such tool.)
 #
 # On by default so `cargo build` and `cargo test` work unasked.
 # `worker/Cargo.toml` turns it off, which is also the check: if the load path
@@ -36,16 +38,31 @@ testkit = []
 #
 # OFF by default, and the default is the load-bearing one: without it this
 # crate's whole dependency set is `half`/`ztensor`/`serde`/`thiserror`, and
-# `pie model convert` builds and runs on a machine with no CUDA toolkit. That
+# `pie model import` builds and runs on a machine with no CUDA toolkit. That
 # is not a nicety — it is what makes the host executor the reference the
 # device answer is checked against.
+#
+# WHO TURNS THIS ON, MEASURED: exactly one target in the tree, and it is a
+# test. `cargo test -p driver-cuda --features cuda-13,abi --test
+# gpu_load_transforms` is the only build that reaches `executor::cuda`, plus
+# this crate's own `tests/gpu_transform_parity.rs` under `--features cuda-13`.
+# No `src/` path in any driver constructs a `CudaArena`: `driver-cuda` names
+# this crate twice, for a `From<Error>` impl and for `CUDA_TILE_MAP_MASK`, and
+# neither reaches the arena.
+#
+# The code stays anyway, and the reason is not sentiment. It is the ONLY
+# device-side answer to a load transform in this tree, and the gated test is
+# what holds it bit-identical to the host executor that every other load uses
+# as its reference. Deleting it would delete the comparison, not just the
+# arm — and the arm is what a driver binds the day it stops staging every
+# `Cast`/`Scale`/`Encode` back through the host.
 #
 # **NO `kernels-cuda/native`, AND THAT IS THE POINT OF THIS FEATURE NOW.** The
 # feature belonged to the ahead-of-time archive crate, deleted at `85c6c674b`.
 # It was here because the four transforms were `extern "C" pie_k_*` symbols
 # that only `libpie_kernels_cuda.a` defined, so turning device transforms on
 # meant turning nvcc and CMake on with them — in the one crate whose
-# toolkit-free build is what makes `pie model convert` portable, and whose
+# toolkit-free build is what makes `pie model import` portable, and whose
 # every consumer therefore inherited a CUDA toolchain requirement it had no
 # use for. The four call sites now go through `kernels-cuda`'s generated
 # `api`, which is NVRTC at run time and a text file at build time, so
@@ -134,7 +151,9 @@ thiserror = "2.0"
 # encoding it cannot perform. Dev-dependencies are not built for `cargo
 # build`, so this keeps zstd-sys out of every shipped binary.
 ztensor = { workspace = true, features = ["zstd"] }
-# A dev-only cycle, which cargo permits: the golden and verifier tests check
-# the *marshalled* view of a plan, and the marshalling lives in the ABI crate
-# above this one. The lib itself must never depend on it — that is the whole
-# point of the split.
+# A SECOND DEV-DEPENDENCY STOOD HERE, introduced by a comment about "a dev-only
+# cycle, which cargo permits" onto the ABI crate whose marshalled plan view the
+# golden and verifier tests checked. That crate is deleted, the dependency line
+# went with it, and the comment did not — leaving a paragraph explaining a
+# split between this crate and one that does not exist. There is no cycle and
+# nothing to marshal: a plan is verified as a Rust value, in `verify.rs`.

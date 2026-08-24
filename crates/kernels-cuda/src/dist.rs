@@ -1,9 +1,7 @@
 use crate::jit::Ctx;
 use crate::jit::abi::Tensor;
-use crate::jit::abi::bf16;
 use kernels::Refusal;
-use kernels::routine::{In, InOut, Out};
-use kernels_macros::routine;
+use kernels::routine::InOut;
 
 fn no_nccl(what: &'static str) -> Refusal {
     let _ = what;
@@ -15,66 +13,24 @@ fn no_nccl(what: &'static str) -> Refusal {
     }
 }
 
-/// The `Dist` family, claimed. The point quantifies over `T: Scalar` and the
-/// routine below is spelled at `bf16`, so the body reaches past it to the
-/// element-blind helper both share rather than casting a `*mut T` into a
-/// `*mut bf16` it is not: the communicator takes an address and a count.
+/// The `Dist` family, claimed. The point quantifies over `T: Scalar` and a
+/// communicator takes an address and a count, so nothing here reads an
+/// element: the rectangle is checked and the above-crossover arm refuses.
 #[kernels_macros::claims]
 impl kernels::points::Dist for Ctx<'_> {
     fn all_reduce<T: kernels::points::Scalar>(&self, buf: InOut<Tensor<T>>) -> Result<(), Refusal> {
-        let r = buf.all("out_width(0)")?;
-        all_reduce_in_place(self, r.ptr.cast(), i64::from(r.elements()))
+        buf.all("out_width(0)")?;
+        Err(no_nccl("all_reduce"))
     }
 }
 
-#[routine(whole, canon = "dist.all_reduce", out(buf = like(buf)))]
-pub fn all_reduce_bf16(ctx: &Ctx<'_>, buf: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
-    let r = buf.all("out_width(0)")?;
-    all_reduce_in_place(ctx, r.ptr.cast(), i64::from(r.elements()))
-}
-
-pub fn all_reduce_in_place(
-    _ctx: &Ctx<'_>,
-    _buf: *mut core::ffi::c_void,
-    _elems: i64,
-) -> Result<(), Refusal> {
-    Err(no_nccl("all_reduce"))
-}
-
-#[routine(whole, out(dst = like(src)))]
-pub fn all_reduce_bf16_out(
-    ctx: &Ctx<'_>,
-    src: In<Tensor<bf16>>,
-    dst: Out<Tensor<bf16>>,
-) -> Result<(), Refusal> {
-    let d = dst.all("out_width(0)")?;
-    all_reduce_out_of_place(ctx, src.ptr.cast(), d.ptr.cast(), i64::from(d.elements()))
-}
-
-pub fn all_reduce_out_of_place(
+/// The out-of-place arm [`crate::comm`] falls back to when its one-shot
+/// plane declines.
+pub(crate) fn all_reduce_out_of_place(
     _ctx: &Ctx<'_>,
     _src: *const core::ffi::c_void,
     _dst: *mut core::ffi::c_void,
     _elems: i64,
 ) -> Result<(), Refusal> {
     Err(no_nccl("all_reduce_out"))
-}
-
-#[routine(whole)]
-pub fn all_gather_bf16(
-    ctx: &Ctx<'_>,
-    src: In<Tensor<bf16>>,
-    dst: Out<Tensor<bf16>>,
-) -> Result<(), Refusal> {
-    let s = src.all("in_width(0)")?;
-    all_gather(ctx, s.ptr.cast(), dst.ptr.cast(), i64::from(s.elements()))
-}
-
-pub fn all_gather(
-    _ctx: &Ctx<'_>,
-    _src: *const core::ffi::c_void,
-    _dst: *mut core::ffi::c_void,
-    _elems_per_rank: i64,
-) -> Result<(), Refusal> {
-    Err(no_nccl("all_gather"))
 }

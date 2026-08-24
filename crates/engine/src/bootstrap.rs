@@ -135,14 +135,15 @@ pub struct RuntimeConfig {
 
 pub struct ModelConfig {
     pub name: String,
-    pub arch_name: String,
     /// Catalog id the driver loaded, as it reported it.
     ///
-    /// This is what the chat template is chosen by. `arch_name` beside it
-    /// still selects the vision front-end, which is a different question
-    /// on a different axis — a family, not a checkpoint. Empty from a
-    /// driver not yet on the catalog, and `register` says so rather than
-    /// guessing a template.
+    /// The only model fact this bundle carries, and every other one is read
+    /// off the row it names: the chat template, the two numbers, and the
+    /// family label the vision and speech front-ends dispatch on. `arch_name`
+    /// STOOD beside it, copied off the driver's capabilities, which left the
+    /// sampler following the row while the processor followed the driver.
+    /// Empty from a driver not yet on the catalog, and `register` says so
+    /// rather than guessing a template.
     pub model_id: String,
     pub kv_page_size: usize,
     /// The tokenizer file, for a model served from a HuggingFace snapshot.
@@ -289,7 +290,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let ModelConfig {
         name,
-        arch_name,
         model_id,
         kv_page_size,
         tokenizer_path,
@@ -400,7 +400,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     };
     model::register(
         name.clone(),
-        &arch_name,
         &model_id,
         kv_page_size as u32,
         rs_caps,

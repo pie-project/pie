@@ -12,16 +12,10 @@ profile-fire = ["worker/profile-fire"]
 
 # Which backends the embedded engine can host.
 #
-# `default` keeps what this wheel has always built, so nothing that builds it
-# today changes. What is new is that the OTHER three are reachable:
-# `maturin build --no-default-features --features driver-wgpu` produces a wheel
-# whose `pie.server.Server` hosts WebGPU, which is what the curated inferlet
-# harness needs to measure a backend other than CUDA.
-#
-# They were not reachable before, and the comment on the `worker` dependency
-# said they were -- "Build the embedded drivers into the Python engine so
-# `pie.server.Server` can host the same local flavors as `pie serve`". `pie
-# serve` can host four; this wheel could host one.
+# `default` keeps what this wheel has always built. The three shader flavors
+# (`driver-metal`, `driver-vulkan`, `driver-wgpu`) STOOD HERE and went with
+# R3, which took those drivers out of the workspace until their baker
+# executors land (P5). What is left is what `pie serve` itself can host: CUDA.
 # The CUDA default is a GUESS, and it is spelled out here so that it is a
 # greppable one. It used to read `driver-cuda`, which resolved to the 13 ABI
 # three manifests away; a wheel built for a CUDA 12 box got no error, only a
@@ -31,9 +25,6 @@ profile-fire = ["worker/profile-fire"]
 default = ["driver-cuda-13"]
 driver-cuda-12 = ["worker/driver-cuda-12"]
 driver-cuda-13 = ["worker/driver-cuda-13"]
-driver-metal = ["worker/driver-metal"]
-driver-vulkan = ["worker/driver-vulkan"]
-driver-wgpu = ["worker/driver-wgpu"]
 
 [lib]
 name = "pie_engine"

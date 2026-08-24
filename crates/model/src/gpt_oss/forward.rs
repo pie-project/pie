@@ -31,8 +31,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
         let ids = inputs.token_ids();
         let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
 
-        for (l, w) in m.layers.iter().enumerate() {
-            let l = l as u32;
+        for (_, w) in inputs.layers(&m.layers) {
             let at = &w.attn;
             let d = at.head_dim;
             let pages = inputs.kv(&at.kv);
@@ -41,7 +40,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
             let q = kernels::norm::add_bias(&at.q_bias, &kernels::gemm::matmul(&x, &at.q_proj));
             let k = kernels::norm::add_bias(&at.k_bias, &kernels::gemm::matmul(&x, &at.k_proj));
             let v = kernels::norm::add_bias(&at.v_bias, &kernels::gemm::matmul(&x, &at.v_proj));
-            seam::at(seam::ATTN_QV, (&q, &v), l);
+            seam::at(seam::ATTN_QV, (&q, &v));
 
             // NeoX pairing, and the YaRN block unpacked: a builder mirrors its
             // declaration one parameter at a time, and a struct is not a slot.
@@ -60,7 +59,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
                 false,
             );
             kernels::attention::kv_append(&k, &v, &pages);
-            seam::at(seam::ATTN_Q, (&q,), l);
+            seam::at(seam::ATTN_Q, (&q,));
 
             let win = at.kind.window();
             let (dq, p) = q.split(&Facts::qo_one());
@@ -81,9 +80,9 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
                     kernels::attention::sink(&o, &lse, &at.sinks, d)
                 },
             ];
-            seam::at(seam::ATTN_OUT, (&a,), l);
+            seam::at(seam::ATTN_OUT, (&a,));
 
-            let o = kernels::gemm::attention_landing(&a, &at.o_proj, l);
+            let o = kernels::gemm::attention_landing(&a, &at.o_proj);
             let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
             y = kernels::norm::residual_add(&kernels::norm::add_bias(&at.o_bias, &o), &y);
 

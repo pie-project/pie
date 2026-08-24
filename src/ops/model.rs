@@ -1,10 +1,17 @@
-//! `pie model { list | info | import | build | remove }` — the models pie serves.
+//! `pie model { list | info | import | remove }` — the models pie serves.
 //!
 //! `list` and `info` read the artifact store ([`crate::local::store`]) with the
 //! HF snapshot cache beside it, because "what do I have" and "where did it come
-//! from" are one question. The two that produce an artifact are big enough to
-//! own a file each: [`import`] normalizes any checkpoint into a `.zt`, and
-//! [`build`] runs the family-aware transforms a serve boot would do.
+//! from" are one question. [`import`] is big enough to own a file: it fetches a
+//! checkpoint and normalizes it into a `.zt`.
+//!
+//! `build` STOOD BESIDE IT — "author the family contract, run the load
+//! transforms offline, write the runtime tensors" — and R3 deleted it with the
+//! contract it authored. Every transform it ran was
+//! `model_legacy::contract::author`'s, for a load path that no longer exists:
+//! the driver produces its weights from the checkpoint through the SKU's own
+//! import table at load, so there is nothing to precompute and no artifact
+//! shape to precompute it into.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -18,7 +25,6 @@ use clap::Subcommand;
 use crate::local::hf::runtime_snapshot_allow_patterns;
 use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
-pub mod build;
 pub mod import;
 
 #[derive(Subcommand, Debug)]
@@ -43,20 +49,6 @@ pub enum ModelCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Precompute a serve boot: author the family contract, run the load
-    /// transforms offline, write the runtime tensors as a `.zt` artifact.
-    //
-    // `optimize` until this rename. It shared a verb with what is now `pie
-    // config tune`, which tunes the *machine*, and the two were far enough
-    // apart that the help text had to carry a "not to be confused with" line
-    // -- a name that needs a disclaimer is the wrong name. This one builds a
-    // thing, so it is `build`.
-    //
-    // No alias. The old spelling was kept as one on the theory that the
-    // published docs taught it; they do not -- `website/` does not mention
-    // this command under either name, and the only references anywhere are
-    // four lines of migration narrative in `.wiki/plan/`.
-    Build(build::BuildArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<Answer> {
@@ -67,7 +59,6 @@ pub fn run(cmd: ModelCmd) -> Result<Answer> {
         // one verb now; `import` fetches when the source is remote.
         ModelCmd::Import(args) => import::run(args),
         ModelCmd::Remove { name, yes } => remove(name, yes),
-        ModelCmd::Build(args) => build::run(args),
     }
 }
 
@@ -91,11 +82,29 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 // Pie-compatibility check
 // -----------------------------------------------------------------------------
 
-/// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
-/// `model_type` against [`model::ingest::arch_for_model_type`]. Returns
-/// `(true, arch_name)` when supported, `(false, "unsupported type:
-/// <model_type>")` when not, or `(false, "no config")` when the
-/// snapshot is missing or unreadable.
+/// Does the snapshot beside this repo hold a checkpoint some catalog SKU can
+/// be built from?
+///
+/// # What this used to ask, and why it does not any more
+///
+/// It read `config.json`'s `model_type` and looked it up in
+/// `model_legacy::ingest`'s `MODEL_TYPES` table — a hand-kept list of the HF
+/// strings the legacy contract had a naming pass for. R3 deleted the table
+/// with the contract, and there is nothing to replace it WITH, because the
+/// new catalog never asks a config what a model is. It asks the TENSORS:
+/// `model::identify` matches a snapshot's names and its `embed` depth against
+/// the import tables production is about to read, and that is the same
+/// question a driver settles at load.
+///
+/// So this asks that question instead, one step earlier and against the
+/// checkpoint headers rather than a document about them. `Snapshot::at`
+/// header-parses without reading a byte of payload, so listing a cache of
+/// twenty repos costs twenty header reads.
+///
+/// Returns `(true, sku)` for a checkpoint that matches a row, and
+/// `(false, why)` for one that does not — carrying `model::Unmatched`'s own
+/// account, so "no safetensors here" and "two rows match it" read
+/// differently.
 fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let snapshots = repo_dir.join("snapshots");
     let snapshot = match std::fs::read_dir(&snapshots) {
@@ -106,34 +115,17 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
         Err(_) => None,
     };
     let Some(snap) = snapshot else {
-        return (false, "no config".to_string());
+        return (false, "no snapshot".to_string());
     };
-    let cfg_path = snap.join("config.json");
-    let Ok(text) = std::fs::read_to_string(&cfg_path) else {
-        return (false, "no config".to_string());
+    let Some(reader) = model::snapshot::Snapshot::at(snap) else {
+        return (false, "no safetensors".to_string());
     };
-    let Ok(json): serde_json::Result<serde_json::Value> = serde_json::from_str(&text) else {
-        return (false, "no config".to_string());
-    };
-    let model_type = json
-        .get("text_config")
-        .or_else(|| json.get("llm_config"))
-        .and_then(|v| v.get("model_type"))
-        .or_else(|| json.get("model_type"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if model_type.is_empty() {
-        return (false, "no config".to_string());
-    }
-    // The table used to live here, "kept in sync with the model_type strings
-    // the C++ drivers recognise" by hand -- and it had drifted, naming three
-    // architectures no row in this build advertises. It now sits beside the
-    // rows it is a fact about, in `model::ingest`, where the import passes
-    // that turn a `model_type` into a naming table read the same entries and
-    // a test refuses an entry no generation answers to.
-    match model::ingest::arch_for_model_type(model_type) {
-        Some(pie) => (true, pie.to_string()),
-        None => (false, format!("unsupported type: {model_type}")),
+    match model::identify(&|name| reader.shape_of(name)) {
+        Ok(sku) => (true, sku.to_string()),
+        Err(model::Unmatched::Ambiguous { skus }) => {
+            (false, format!("matches {} SKUs", skus.len()))
+        }
+        Err(model::Unmatched::NoRow { .. }) => (false, "no SKU".to_string()),
     }
 }
 
@@ -687,38 +679,26 @@ mod tests {
         assert!(parse_repo_id("a/b/c").is_err());
     }
 
+    /// A directory with no snapshot, and one with a snapshot but no
+    /// safetensors, are different answers.
+    ///
+    /// The three `compat_check_*` tests that STOOD HERE wrote a
+    /// `config.json` naming a `model_type` and asserted the legacy table's
+    /// answer. There is no table: what the check asks now is whether a
+    /// checkpoint's TENSORS match an import row, so a fixture for the
+    /// positive case is a real safetensors header — which is
+    /// `model`'s own test surface, not this command's.
     #[test]
-    fn compat_check_finds_arch() {
+    fn compat_check_reports_what_it_could_not_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let snap = tmp.path().join("snapshots").join("abc123");
-        std::fs::create_dir_all(&snap).unwrap();
-        std::fs::write(snap.join("config.json"), r#"{"model_type": "qwen3"}"#).unwrap();
-        let (ok, info) = check_pie_compatibility(tmp.path());
-        assert!(ok);
-        assert_eq!(info, "qwen3");
-    }
-
-    #[test]
-    fn compat_check_unsupported_arch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let snap = tmp.path().join("snapshots").join("abc");
-        std::fs::create_dir_all(&snap).unwrap();
-        std::fs::write(
-            snap.join("config.json"),
-            r#"{"model_type": "totally-fake-arch"}"#,
-        )
-        .unwrap();
-        let (ok, info) = check_pie_compatibility(tmp.path());
-        assert!(!ok);
-        assert!(info.contains("totally-fake-arch"), "got: {info}");
-    }
-
-    #[test]
-    fn compat_check_missing_config() {
-        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_pie_compatibility(tmp.path()),
+            (false, "no snapshot".to_string()),
+        );
         std::fs::create_dir_all(tmp.path().join("snapshots").join("abc")).unwrap();
-        let (ok, info) = check_pie_compatibility(tmp.path());
-        assert!(!ok);
-        assert_eq!(info, "no config");
+        assert_eq!(
+            check_pie_compatibility(tmp.path()),
+            (false, "no safetensors".to_string()),
+        );
     }
 }

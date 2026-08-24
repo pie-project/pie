@@ -207,53 +207,49 @@ fn weighted_sum_folds_the_fan_out_back_to_one_row_per_token() {
 /// a routed slot's `top_k` sub-rows sit contiguous inside its own column --
 /// which is the legacy staging's `[tokens, top_k, width]` rectangle to the
 /// byte. Measured rather than asserted about: the pitch must cover every
-/// slot's whole footprint, and offsets must not overlap.
+/// routed slot's WHOLE footprint, fan-out included.
+///
+/// WHAT THIS NO LONGER ASSERTS is that two slots never overlap. They do, on
+/// purpose: values whose lives do not touch share bytes, which is what took
+/// a3b's pitch from 7.67 MB to 489 KB. The disjointness that still holds is
+/// the liveness-aware one, and `arena_liveness.rs` is where it is checked --
+/// here the question is only whether the routed factor was paid for.
 #[test]
 fn the_row_pitch_carries_every_routed_row() {
     let plan = traced();
     let lanes = model_compiler::program::programs(&plan).expect("a3b binds");
 
     for lane in &lanes {
-        let mut spans: Vec<(u64, u64)> = lane
+        let routed: Vec<(u64, u64)> = lane
             .slots
             .iter()
             .filter_map(|s| match s {
                 Slot::Arena {
                     offset,
-                    rows,
+                    rows: rows @ Rows::FireTimes(_),
                     width,
                     dtype,
                 } => Some((*offset, rows.factor() * width * dtype.size())),
                 _ => None,
             })
             .collect();
-        assert!(!spans.is_empty(), "a lane that allocates nothing");
-        spans.sort_unstable();
-        for pair in spans.windows(2) {
-            let (at, bytes) = pair[0];
-            assert!(at + bytes <= pair[1].0, "two arena slots overlap");
+        assert!(!routed.is_empty(), "a3b mints routed slots");
+        for (at, bytes) in &routed {
+            assert!(
+                at + bytes <= lane.row_pitch,
+                "the row pitch does not cover a routed slot's fan-out"
+            );
         }
-        let (last, bytes) = *spans.last().expect("a non-empty arena");
-        assert!(
-            last + bytes <= lane.row_pitch,
-            "the row pitch does not cover its own last slot"
-        );
-
-        // And the fan-out is really paid for: a routed hidden row's column is
-        // `top_k` times the bytes of the folded row it becomes.
-        let routed = lane
-            .slots
+        // And the fan-out is really paid for: the widest routed column is
+        // `top_k` sub-rows of its own width and not one.
+        let widest = routed
             .iter()
-            .filter(|s| {
-                matches!(
-                    s,
-                    Slot::Arena {
-                        rows: Rows::FireTimes(_),
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert!(routed > 0, "a3b mints routed slots");
+            .map(|(_, bytes)| *bytes)
+            .max()
+            .expect("a routed slot");
+        assert!(
+            widest >= u64::from(TOP_K) * INTER * 2,
+            "a routed column narrower than one route's row times `top_k`"
+        );
     }
 }

@@ -155,7 +155,7 @@ impl kernels::shader::Lang for Wgpu {
     const IN_PACKED: &'static str = "u32";
 }
 
-pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16, f16};
+pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16};
 
 pub use kernels::shader::{elementwise, elementwise_rows};
 
@@ -166,8 +166,6 @@ impl kernels::routine::Answers<Wgpu> for Ctx<'_> {
         Encode::resolve(self, ty, source)
     }
 }
-
-pub type Routine = kernels::routine::Routine<Wgpu>;
 
 pub use kernels::routine::{Const, Fire, In, InOut, Out};
 

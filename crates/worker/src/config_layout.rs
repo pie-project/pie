@@ -355,8 +355,7 @@ mod tests {
     #[test]
     fn a_bare_model_array_says_what_replaced_it() {
         let file: toml::Table =
-            toml::from_str("[[model]]\nname = \"default\"\nmodel = \"Qwen/Qwen3-0.6B\"\n")
-                .unwrap();
+            toml::from_str("[[model]]\nname = \"default\"\nmodel = \"Qwen/Qwen3-0.6B\"\n").unwrap();
         let err = reshape(file).unwrap_err().to_string();
         assert!(err.contains("[model]"), "got: {err}");
     }

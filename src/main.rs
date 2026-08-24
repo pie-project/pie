@@ -49,7 +49,7 @@ enum Command {
     /// `pie run chat-completion -- --prompt "The capital of France is"`.
     Run(ops::run::RunArgs),
 
-    /// The models pie serves (list / info / import / build / remove).
+    /// The models pie serves (list / info / import / remove).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,

@@ -1,6 +1,5 @@
 use crate::jit::{Ctx, Launch, aligned16};
 use kernels::{Bind, Fire};
-use kernels_macros::routine;
 
 use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
@@ -28,11 +27,6 @@ fn route_rows(rows: i32, width: i32) -> Launch {
     )
 }
 
-#[must_use]
-const fn elementwise(n: u32) -> Launch {
-    Launch::flat(n, BLOCK)
-}
-
 pub(crate) fn stated<P>(view: Result<Region<P>, Refusal>) -> Result<Region<P>, Refusal> {
     match view {
         Err(refusal) => Err(this_family(refusal)),
@@ -48,9 +42,8 @@ const fn this_family(refusal: Refusal) -> Refusal {
     }
 }
 
-/// A stated width as the routines here spell one. A declaration states `u32`
-/// because a width is not negative; a routine takes `i32` because the device
-/// text does.
+/// A stated width as the launches here spell one. A declaration states `u32`
+/// because a width is not negative; the device text takes `i32`.
 fn stated_width(width: u32, what: &'static str) -> Result<i32, Refusal> {
     i32::try_from(width).map_err(|_| Refusal::Wide {
         what,
@@ -87,16 +80,18 @@ fn as_bf16_out<T: kernels::points::Scalar>(y: Out<Tensor<T>>) -> Out<Tensor<bf16
     }
 }
 
-/// The `Layout` family, claimed. Every point in it. Three bodies are
-/// delegations to the routine that already fires the point — the stated
-/// widths ride the declaration because the STATEMENT states them and its
-/// results are sized from them, while the routines read the same numbers
-/// back off the rectangles they were handed. `split_q_gate` is the one that
-/// passes a width through: the per-head interleave is a pitch no half's
-/// rectangle carries.
+/// The `Layout` family, claimed. Every point in it, and every body is the
+/// launch itself.
 ///
-/// `layout.select` IS A LAUNCHER HERE, not a delegation, and for the
-/// reason `norm.scale` is one: no legacy caller reaches it. Gemma's relay was
+/// THREE OF THE FOUR CUTS DROP THE STATED WIDTH, and the asymmetry is the
+/// declaration's rather than an oversight: `split_qkv` and `split_rows`
+/// divide at a boundary BOTH halves carry, so the launch reads the same
+/// number back off the rectangles the statement sized from it, while
+/// `split_q_gate` passes its width through because a per-head interleave is
+/// a pitch no half's rectangle holds.
+///
+/// `layout.select` reads its stated width too, and for a third reason.
+/// Gemma's relay was
 /// TRANSPOSED to `[layers, rows, ple_dim]` in the legacy prologue
 /// (`transpose_bf16_nld_to_lnd`) so that a layer's slice was a whole
 /// contiguous plane and `dsl::select` was a rebase with no kernel behind it.
@@ -187,21 +182,47 @@ impl kernels::points::Layout for Ctx<'_> {
         k: Out<Tensor<T>>,
         v: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        // Stated and unread: `split_qkv_bf16` takes the two halves' widths
-        // off `q` and `k`, which the statement sized from these very
-        // numbers.
+        // Stated and unread: the launch takes the two halves' widths off `q`
+        // and `k`'s own rectangles, which the statement sized from these
+        // very numbers.
         let _ = (q_width, kv_width);
         if !cuts_bf16::<T>() {
             return Err(Refusal::Absent {
                 what: "layout.split_qkv",
             });
         }
-        crate::driver_internal::split_qkv_bf16(
-            self,
+        let (packed, q, k, v) = (
             as_bf16_in(packed),
             as_bf16_out(q),
             as_bf16_out(k),
             as_bf16_out(v),
+        );
+        let q_rect = q.all("the q half")?;
+        let k_rect = k.all("the k half")?;
+        let (q_dim, kv_dim) = (q_rect.width, k_rect.width);
+        if q_dim <= 0 && kv_dim <= 0 {
+            return Err(Refusal::Empty {
+                what: "q_dim and kv_dim",
+            });
+        }
+        let width = q_dim.max(kv_dim).unsigned_abs();
+        self.fire(
+            Fire::at(
+                "attn/split_packed.cuh",
+                "::pie::attn::split_qkv<::pie::bf16>",
+            )
+            .apply(Launch::grid(
+                [width.div_ceil(BLOCK), q_rect.rows.unsigned_abs(), 1],
+                [BLOCK, 1, 1],
+            )),
+            &[
+                packed.arg(),
+                q.arg(),
+                k.arg(),
+                v.arg(),
+                q_dim.arg(),
+                kv_dim.arg(),
+            ],
         )
     }
 
@@ -218,12 +239,37 @@ impl kernels::points::Layout for Ctx<'_> {
                 what: "layout.split_q_gate",
             });
         }
-        crate::driver_internal::split_q_gate_bf16(
-            self,
-            as_bf16_in(packed),
-            as_bf16_out(q),
-            as_bf16_out(gate),
-            Const::new(head_dim),
+        let (packed, q, gate) = (as_bf16_in(packed), as_bf16_out(q), as_bf16_out(gate));
+        let q_rect = q.all("the query half")?;
+        if head_dim <= 0 {
+            return Err(Refusal::Unstated {
+                what: "the head pitch a q/gate split grids by",
+            });
+        }
+        if q_rect.width % head_dim != 0 {
+            return Err(Refusal::Unstated {
+                what: "a q/gate half whose width is not whole heads",
+            });
+        }
+        let (n, num_heads) = (q_rect.rows, q_rect.width / head_dim);
+        let block = if head_dim < 128 { 64 } else { 128 };
+        self.fire(
+            Fire::at(
+                "layout/deinterleave.cuh",
+                "::pie::layout::split_q_gate<::pie::bf16>",
+            )
+            .apply(Launch::grid(
+                [n.unsigned_abs(), num_heads.unsigned_abs(), 1],
+                [block, 1, 1],
+            )),
+            &[
+                packed.arg(),
+                q.arg(),
+                gate.arg(),
+                n.arg(),
+                num_heads.arg(),
+                head_dim.arg(),
+            ],
         )
     }
 
@@ -234,15 +280,32 @@ impl kernels::points::Layout for Ctx<'_> {
         left: Out<Tensor<T>>,
         right: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        // Stated and unread, as above: `split_bf16_rows` divides where the
-        // two halves' own rectangles say it divides.
+        // Stated and unread, as above: the launch divides where the two
+        // halves' own rectangles say it divides.
         let _ = width;
         if !cuts_bf16::<T>() {
             return Err(Refusal::Absent {
                 what: "layout.split_rows",
             });
         }
-        split_bf16_rows(self, as_bf16_in(x), as_bf16_out(left), as_bf16_out(right))
+        let (src, left, right) = (as_bf16_in(x), as_bf16_out(left), as_bf16_out(right));
+        let left_half = stated(left.all("left_dim or right_dim"))?;
+        let right_half = stated(right.all("left_dim or right_dim"))?;
+        let (left_dim, right_dim) = (left_half.stride, right_half.stride);
+        self.fire(
+            Fire::at(
+                "layout/deinterleave.cuh",
+                "::pie::layout::split_rows<::pie::bf16>",
+            )
+            .apply(route_rows(left_half.rows, left_dim.0)),
+            &[
+                src.arg(),
+                left.arg(),
+                right.arg(),
+                left_dim.arg(),
+                right_dim.arg(),
+            ],
+        )
     }
 
     /// `y = table[.., layer * width .. (layer + 1) * width]`, per row.
@@ -314,212 +377,6 @@ impl kernels::points::Layout for Ctx<'_> {
     }
 }
 
-#[routine(canon = "layout.split_rows")]
-pub fn split_bf16_rows(
-    ctx: &Ctx<'_>,
-    src: In<Tensor<bf16>>,
-    left: Out<Tensor<bf16>>,
-    right: Out<Tensor<bf16>>,
-) -> Result<(), Refusal> {
-    let left_half = stated(left.all("left_dim or right_dim"))?;
-    let right_half = stated(right.all("left_dim or right_dim"))?;
-    let n = left_half.rows;
-
-    let left_dim = left_half.stride;
-    let right_dim = right_half.stride;
-    ctx.fire(
-        Fire::at(
-            "layout/deinterleave.cuh",
-            "::pie::layout::split_rows<::pie::bf16>",
-        )
-        .apply(route_rows(n, left_dim.0)),
-        &[
-            src.arg(),
-            left.arg(),
-            right.arg(),
-            left_dim.arg(),
-            right_dim.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, out(b_out = rows(ba) x half(ba)), out(a_out = rows(ba) x half(ba)))]
-pub fn split_qwen_gdn_ba<T>(
-    ctx: &Ctx<'_>,
-    ba: In<Tensor<T>>,
-    b_out: Out<Tensor<T>>,
-    a_out: Out<Tensor<T>>,
-) -> Result<(), Refusal> {
-    let half = stated(b_out.all("v_h"))?;
-    let n = half.rows;
-    let v_h = half.stride;
-    ctx.fire(
-        Fire::at(
-            "layout/deinterleave.cuh",
-            crate::jit::symbol(&format!("::pie::layout::split_qwen_gdn_ba<{}>", T::CPP)),
-        )
-        .apply(route_rows(n, v_h.0)),
-        &[ba.arg(), b_out.arg(), a_out.arg(), v_h.arg()],
-    )
-}
-
-#[routine(bf16, internal)]
-pub fn deinterleave_rows<T>(
-    ctx: &Ctx<'_>,
-    fused: In<Tensor<T>>,
-    gate_out: Out<Tensor<T>>,
-    up_out: Out<Tensor<T>>,
-) -> Result<(), Refusal> {
-    let gate = stated(gate_out.all("h"))?;
-    let rows = gate.rows;
-    let h = gate.stride;
-    ctx.fire(
-        Fire::at(
-            "layout/deinterleave.cuh",
-            crate::jit::symbol(&format!("::pie::layout::deinterleave_rows<{}>", T::CPP)),
-        )
-        .apply(route_rows(rows, h.0)),
-        &[fused.arg(), gate_out.arg(), up_out.arg(), h.arg()],
-    )
-}
-
-#[routine(bf16, internal)]
-pub fn deinterleave_vec<T>(
-    ctx: &Ctx<'_>,
-    fused: In<Tensor<T>>,
-    gate_out: Out<Tensor<T>>,
-    up_out: Out<Tensor<T>>,
-) -> Result<(), Refusal> {
-    let gate = stated(gate_out.all("i"))?;
-    let i = gate.elements();
-    if i <= 0 {
-        return Err(Refusal::Empty { what: "i" });
-    }
-    ctx.fire(
-        Fire::at(
-            "layout/deinterleave.cuh",
-            crate::jit::symbol(&format!("::pie::layout::deinterleave_vec<{}>", T::CPP)),
-        )
-        .apply(elementwise(i.unsigned_abs())),
-        &[fused.arg(), gate_out.arg(), up_out.arg(), i.arg()],
-    )
-}
-
-#[routine(internal)]
-pub fn concat_bf16_rows(
-    ctx: &Ctx<'_>,
-    left: In<Tensor<bf16>>,
-    right: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-) -> Result<(), Refusal> {
-    let left_half = stated(left.all("left_dim or right_dim"))?;
-    let right_half = stated(right.all("left_dim or right_dim"))?;
-    let rows = out.rows;
-    let left_dim = left_half.stride;
-    let right_dim = right_half.stride;
-    ctx.fire(
-        Fire::at(
-            "layout/deinterleave.cuh",
-            "::pie::layout::concat_rows<::pie::bf16>",
-        )
-        .apply(route_rows(rows, left_dim.0)),
-        &[
-            left.arg(),
-            right.arg(),
-            out.arg(),
-            left_dim.arg(),
-            right_dim.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gather_bf16_rows(
-    ctx: &Ctx<'_>,
-    src: In<Tensor<u16>>,
-    dst: Out<Tensor<u16>>,
-    sampling_indices: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    let row_indices = sampling_indices.ptr;
-
-    let dense = stated(dst.all("width"))?;
-    let num_dst_rows = dense.rows;
-    let width = dense.stride;
-    ctx.fire(
-        Fire::at(
-            "layout/gather_rows.cuh",
-            "::pie::layout::gather_rows<::pie::u16>",
-        )
-        .apply(route_rows(num_dst_rows, width.0)),
-        &[src.arg(), row_indices.arg(), dst.arg(), width.arg()],
-    )
-}
-
-#[routine]
-pub fn transpose_bf16_nld_to_lnd(
-    ctx: &Ctx<'_>,
-    src: In<Tensor<u16>>,
-    dst: Out<Tensor<u16>>,
-    dim: Const<i32>,
-) -> Result<(), Refusal> {
-    let dim = *dim;
-
-    let source = stated(src.all("width"))?;
-    let n = source.rows;
-    let width = source.width;
-
-    if dim <= 0 {
-        return Err(Refusal::Empty { what: "ple_dim" });
-    }
-    if width % dim != 0 {
-        return Err(Refusal::Narrow {
-            what: "the row is not a whole number of PLE planes",
-            at: i64::from(width),
-        });
-    }
-    let layers = width / dim;
-    let total = usize::try_from(n).unwrap_or(0)
-        * usize::try_from(layers).unwrap_or(0)
-        * usize::try_from(dim).unwrap_or(0);
-    ctx.fire(
-        Fire::at(
-            "layout/gather_rows.cuh",
-            "::pie::layout::transpose_nld_to_lnd<::pie::u16>",
-        )
-        .apply(elementwise(u32::try_from(total).unwrap_or(u32::MAX))),
-        &[
-            src.arg(),
-            dst.arg(),
-            n.arg(),
-            layers.arg(),
-            dim.arg(),
-            total.arg(),
-        ],
-    )
-}
-
-#[routine(internal)]
-pub fn copy_if_valid_slot(
-    ctx: &Ctx<'_>,
-    src: In<Tensor<u8>>,
-    dst: Out<Tensor<u8>>,
-    bytes: Const<usize>,
-    slot_ids: In<Tensor<i32>>,
-    request: Const<usize>,
-) -> Result<(), Refusal> {
-    ctx.fire(
-        Fire::at("layout/slot_ops.cuh", "::pie::layout::copy_if_valid_slot")
-            .apply(Launch::grid([1, 1, 1], [256, 1, 1])),
-        &[
-            src.arg(),
-            dst.arg(),
-            bytes.arg(),
-            slot_ids.arg(),
-            request.arg(),
-        ],
-    )
-}
-
 const fn threads_for(head_dim: i32) -> u32 {
     if head_dim < 256 {
         head_dim.unsigned_abs()
@@ -528,84 +385,6 @@ const fn threads_for(head_dim: i32) -> u32 {
     }
 }
 
-#[routine(untraced, internal)]
-pub fn envelope_merge_written(
-    ctx: &Ctx<'_>,
-    k_curr: In<Tensor<bf16>>,
-    w_page: In<Tensor<u32>>,
-    w_off: In<Tensor<u32>>,
-    row_valid: crate::jit::abi::MaybeConst<u8>,
-    env_min: Out<Tensor<bf16>>,
-    env_max: Out<Tensor<bf16>>,
-    num_tokens: i32,
-    num_kv_heads: i32,
-    head_dim: i32,
-) -> Result<(), Refusal> {
-    const FUSE_MAX_TOKENS: i32 = 128;
-
-    let launch = Launch::grid(
-        [num_tokens.unsigned_abs(), num_kv_heads.unsigned_abs(), 1],
-        [threads_for(head_dim), 1, 1],
-    );
-
-    if num_tokens <= FUSE_MAX_TOKENS {
-        return ctx.fire(
-            Fire::at(
-                "layout/envelope.cuh",
-                "::pie::layout::merge_written_fused<::pie::i32(0)>",
-            )
-            .apply(launch),
-            &[
-                k_curr.arg(),
-                w_page.arg(),
-                w_off.arg(),
-                row_valid.arg(),
-                env_min.arg(),
-                env_max.arg(),
-                num_tokens.arg(),
-                num_kv_heads.arg(),
-                head_dim.arg(),
-            ],
-        );
-    }
-
-    ctx.fire(
-        Fire::at(
-            "layout/envelope.cuh",
-            "::pie::layout::reset_started_pages<::pie::i32(0)>",
-        )
-        .apply(launch),
-        &[
-            w_page.arg(),
-            w_off.arg(),
-            row_valid.arg(),
-            env_min.arg(),
-            env_max.arg(),
-            num_tokens.arg(),
-            num_kv_heads.arg(),
-            head_dim.arg(),
-        ],
-    )?;
-    ctx.fire(
-        Fire::at(
-            "layout/envelope.cuh",
-            "::pie::layout::merge_written<::pie::i32(0)>",
-        )
-        .apply(launch),
-        &[
-            k_curr.arg(),
-            w_page.arg(),
-            row_valid.arg(),
-            env_min.arg(),
-            env_max.arg(),
-            num_tokens.arg(),
-            num_kv_heads.arg(),
-            head_dim.arg(),
-        ],
-    )
-}
-
-#[routine(untraced, internal)]
 pub fn envelope_seed_empty(
     ctx: &Ctx<'_>,
     env_min: Out<Tensor<bf16>>,
@@ -634,8 +413,8 @@ pub fn envelope_seed_empty(
     )
 }
 
-#[routine(untraced, internal)]
-pub fn envelope_update_appended(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn envelope_update_appended(
     ctx: &Ctx<'_>,
     k_pages: In<Tensor<bf16>>,
     qo_indptr: In<Tensor<u32>>,
@@ -680,53 +459,6 @@ const VEC_WIDTH: i32 = 8;
 #[must_use]
 pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(weight.cast()) && aligned16(y.cast())
-}
-
-// INLINED into impl Layout; dies with the routine layer. Kept only because
-// `model-dsl-legacy`'s generated `cuda::embed_bf16` still names this type.
-#[routine]
-pub fn embed_bf16(
-    ctx: &Ctx<'_>,
-    weight: Const<Tensor<bf16>>,
-    y: Out<Tensor<bf16>>,
-    token_ids: In<Tensor<i32>>,
-    vocab: Const<i32>,
-) -> Result<(), Refusal> {
-    let token_ids = token_ids.ptr;
-
-    let vocab = *vocab;
-    const EMBED_BLOCK: u32 = 256;
-
-    let dst = stated(y.all("hidden"))?;
-    let num_tokens = dst.rows;
-
-    let hidden = dst.stride;
-
-    let vec = vectorisable(hidden.0, weight.v, dst.ptr.cast_const());
-    let per_row = if vec { hidden.0 / VEC_WIDTH } else { hidden.0 };
-    let total = i64::from(num_tokens) * i64::from(per_row);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let blocks = ((total + i64::from(EMBED_BLOCK) - 1) / i64::from(EMBED_BLOCK)) as u32;
-    let instantiation = if vec {
-        "::pie::layout::embed<\
-                                      ::pie::true_type::value>"
-    } else {
-        "::pie::layout::embed<::pie::false_type::value>"
-    };
-
-    ctx.fire(
-        Fire::at("layout/embed.cuh", instantiation)
-            .apply(Launch::grid([blocks, 1, 1], [EMBED_BLOCK, 1, 1])),
-        &[
-            token_ids.arg(),
-            weight.arg(),
-            dst.ptr.arg(),
-            hidden.arg(),
-            vocab.arg(),
-            num_tokens.arg(),
-            per_row.arg(),
-        ],
-    )
 }
 
 // `derived_name_is` STOOD HERE: a `const fn` byte-comparison of two `&str`,

@@ -3635,15 +3635,29 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// The four shapes `Execution` replaced five functions with still build.
+    /// The three shapes `Execution` offers still build, and the live one is the
+    /// third.
     ///
-    /// Two of them are `pie model import`'s and `pie model build`'s, whose
-    /// closures capture locals mutably WHILE a `&mut` sink is held by the same
-    /// builder — the one thing about the chain that can fail to borrow-check,
-    /// and the one thing this crate's own tests would otherwise never try. The
-    /// binary that writes them cannot be compiled from here (it does not build
-    /// on this branch, for reasons that predate it), so the shapes are pinned
-    /// where they can be.
+    /// THE LIVE SHAPE IS `streaming().sink().progress()`, and `pie model
+    /// import` is the only production caller of any of them — twice, once for
+    /// the spool and once for the merge. Its progress closure captures locals
+    /// mutably WHILE a `&mut` sink is held by the same builder, which is the
+    /// one thing about the chain that can fail to borrow-check.
+    ///
+    /// It said "four shapes", named `pie model build` as the second caller, and
+    /// added that the binary writing them "cannot be compiled from here (it does
+    /// not build on this branch)". None of the three was true. There are three
+    /// shapes, not four. `pie model build` is deleted, not unbuildable — R3
+    /// retired it with the load contract its transforms authored. And the
+    /// binary that does write the live shape is `pie`, a workspace member that
+    /// `cargo check --workspace` compiles like any other.
+    ///
+    /// The first two shapes are pinned here because pinning them costs three
+    /// lines and NOTHING IN PRODUCTION EXERCISES THEM: bare `run()` and
+    /// `arena().sink()` are read by this crate's own tests and by
+    /// `driver-metal`, which is out of the workspace. They are public API, so
+    /// the borrow-check property is worth a caller somewhere, and here is the
+    /// only place it currently has one that runs.
     #[test]
     fn every_caller_shape_of_the_builder_compiles() {
         let (dir, plan) = fixture();

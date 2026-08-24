@@ -2,10 +2,10 @@
 //!
 //! Identity in `kernels::runtime`, carrier HERE, answer in `driver-metal` —
 //! the split `kernels::raises` documents, applied to the resident objects.
-//! A routine takes one as `In<Struct<KvCache>>`: positional, counted by
-//! `arity_problem`, visible in the derived column. The fields below replace
-//! the `ctx.ask` keys named beside each; the driver builds one view per
-//! (fire, layer) instead of answering the keys one at a time.
+//! A claim body reaches one through the `Cache<Struct<KvCache>>` mark its
+//! point declares. The fields below replace the `ctx.ask` keys named beside
+//! each; the driver builds one view per (fire, layer) instead of answering
+//! the keys one at a time.
 //!
 //! CUDA's `PagedKvView` holds pointers; a shader plane's holds what its asks
 //! carried — `Tensor<E>` binding handles and the strides beside them. Same
@@ -17,7 +17,7 @@ use kernels::shader::{Tensor, Usize, bf16};
 ///
 /// Field per retired key. On this plane the cache planes are binding
 /// handles, so there is no null write half: a fire that appends nothing
-/// never fires a routine that names `write_page`.
+/// never reaches `write_page`.
 #[derive(Debug, Clone, Copy)]
 pub struct PagedKvView {
     /// `keys::KvKeys` — the key plane.

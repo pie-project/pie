@@ -1,9 +1,8 @@
 use kernels::BindMut;
-use kernels_macros::routine;
 
 use crate::points::{Payload, absent, at_bf16};
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16};
-use crate::views::{AttnFire, AttnFireView, AttnMask, AttnSplit, KvCache};
+use crate::routine::{Bind, Ctx, Fire, In, InOut, Out};
+use crate::views::{AttnFire, AttnFireView};
 use kernels::raises::Struct;
 use kernels::routine::{Cache, Refusal};
 use kernels::shader::{elementwise, elementwise_rows};
@@ -200,1216 +199,6 @@ pub(crate) fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3
     ])
 }
 
-// INLINED into impl Layout; dies with the routine layer.
-#[routine(canon = "layout.split_qkv", out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
-pub fn split_qkv_bf16(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<bf16>>,
-    q: Out<Tensor<bf16>>,
-    k: Out<Tensor<bf16>>,
-    v: Out<Tensor<bf16>>,
-    q_width: Const<u32>,
-    kv_width: Const<u32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let packed_width = packed.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at("attn/split_qkv.wgsl", "split_qkv_bf16")
-            .apply(elementwise_rows(packed_width, rows)?),
-        &[
-            packed.arg(),
-            q.arg(),
-            k.arg(),
-            v.arg(),
-            q_width.arg(),
-            kv_width.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Gate; dies with the routine layer.
-#[routine(canon = "gate.sigmoid_mul", out(attn = like(attn)))]
-pub fn gate(
-    ctx: &Ctx<'_>,
-    attn: InOut<Tensor<bf16>>,
-    gate: In<Tensor<bf16>>,
-    row_stride: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let width = attn.width;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at("attn/gate.wgsl", "gate_bfloat16").apply(elementwise_rows(width, rows)?),
-        &[attn.arg(), gate.arg(), row_stride.arg()],
-    )
-}
-
-// INLINED into impl Layout; dies with the routine layer.
-#[routine(canon = "layout.split_q_gate")]
-pub fn q_gate_split(
-    ctx: &Ctx<'_>,
-    qg: In<Tensor<bf16>>,
-    q_out: Out<Tensor<bf16>>,
-    gate_out: Out<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    qg_row_stride: Const<i32>,
-    out_row_stride: Const<i32>,
-    q_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let rows = *rows;
-    ctx.fire(
-        Fire::at("attn/gate.wgsl", "q_gate_split_bfloat16")
-            .apply(head_grid(*head_dim, *q_heads, rows)?),
-        &[
-            qg.arg(),
-            q_out.arg(),
-            gate_out.arg(),
-            head_dim.arg(),
-            qg_row_stride.arg(),
-            out_row_stride.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn kv_append(
-    ctx: &Ctx<'_>,
-    k_new: In<Tensor<bf16>>,
-    v_new: In<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let k_cache = kvc.keys;
-    let v_cache = kvc.values;
-    let pos = positions.ptr;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    ctx.fire(
-        Fire::at("attn/kv_write.wgsl", "kv_append_bfloat16")
-            .apply(head_grid(*head_dim, *heads, 1)?),
-        &[
-            k_new.arg(),
-            v_new.arg(),
-            k_cache.arg_mut(),
-            v_cache.arg_mut(),
-            pos.arg(),
-            head_dim.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer.
-#[routine(canon = "attention.kv_append")]
-pub fn kv_append_paged(
-    ctx: &Ctx<'_>,
-    k_new: In<Tensor<bf16>>,
-    v_new: In<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    n_kv_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    tokens: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let page_size = kvc.page_size;
-    // The metal twin's guard, for the metal twin's reason: this grid is heads
-    // by tokens and never consults the page size, so a view built over a store
-    // with no pool -- where the pooled numbers come back as zero -- plans a
-    // full write in which every token divides to page zero, offset zero, and
-    // every layer overwrites the one before it on a single row. See
-    // `kernels_metal::attn::kv_append_paged`, where the same hole was found by
-    // a driver test that had been asserting this refusal against a routine
-    // unable to make it.
-    if page_size <= 0 {
-        return Err(Refusal::Empty {
-            what: "the KV page size",
-        });
-    }
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-    let w_page = kvc.write_page;
-    let w_off = kvc.write_offset;
-    let tokens = *tokens;
-    ctx.fire(
-        Fire::at("attn/kv_write.wgsl", "kv_append_paged_bfloat16").apply(head_grid(
-            *head_dim,
-            *n_kv_heads,
-            tokens,
-        )?),
-        &[
-            k_new.arg(),
-            v_new.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            head_dim.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            w_page.arg(),
-            w_off.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer.
-#[routine(out(out = like(logits)))]
-pub fn logit_softcap(
-    ctx: &Ctx<'_>,
-    logits: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    cap: Const<f32>,
-) -> Result<(), Refusal> {
-    let n = out.rows.saturating_mul(out.width);
-    ctx.fire(
-        Fire::at("attn/logit_softcap.wgsl", "logit_softcap_bfloat16").apply(elementwise(n, 1)?),
-        &[logits.arg(), out.arg(), cap.arg()],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer.
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_decode(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>,
-    split: In<Struct<AttnSplit>>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let sinks = ctx.absent()?;
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let rows = *rows;
-    let point = head_point(*head_dim, &[64, 128, 256, 512])?;
-
-    let workgroups = rows.saturating_mul(*q_heads);
-    // The split policy is the DRIVER's answer now: `splits <= 1` (or a
-    // saturated device) fires the unsplit form, exactly what the optional
-    // `keys::AttnScratch` ask used to decide by presence.
-    let scratch = if workgroups < 128 && !split.ptr.is_null() {
-        let sv = unsafe { &*split.ptr };
-        (sv.splits > 1).then_some(sv.partials)
-    } else {
-        None
-    };
-
-    let Some(scratch) = scratch else {
-        return ctx.fire(
-            Fire::at(
-                "attn/sdpa_paged.wgsl",
-                [
-                    "sdpa_paged_decode_bfloat16_d_64",
-                    "sdpa_paged_decode_bfloat16_d_128",
-                    "sdpa_paged_decode_bfloat16_d_256",
-                    "sdpa_paged_decode_bfloat16_d_512",
-                ][point],
-            )
-            .apply(paged_decode_grid(*head_dim, *q_heads, rows)?),
-            &[
-                queries.arg(),
-                k_pages.arg_mut(),
-                v_pages.arg_mut(),
-                out.arg(),
-                gqa_factor.arg(),
-                position_ids.arg(),
-                req_of_token.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                page_size.arg(),
-                n_kv_heads.arg(),
-                scale.arg(),
-                attention_mask.arg(),
-                attention_mask_stride.arg(),
-                attention_mask_enabled.arg(),
-                window.arg(),
-                sinks,
-            ],
-        );
-    };
-
-    // EIGHT, AND THE NUMBER BARELY MATTERS -- THE BRANCH ABOVE IT DOES.
-    //
-    // Swept on an M4 Pro against `what_a_decode_costs_at_length`, a
-    // 512-key qwen3-0.6b decode:
-    //
-    // | splits | 4 | 8 | 16 | none (`scratch = None`) |
-    // | --- | --- | --- | --- | --- |
-    // | ms | 9.859 | 9.828 | 9.784 | **12.348** |
-    // | tok/s | 101.4 | 101.8 | 102.2 | **81.0** |
-    //
-    // Four to sixteen is 0.8%, which is this harness's own repeatability,
-    // so the count is on a flat and 8 is not a tuned number.
-    //
-    // RE-SWEPT AFTER `PIE_KR` WENT 8 -> 2, on the theory that halving the
-    // workgroup memory would let more splits stay resident and move the
-    // optimum. Six interleaved rounds of 8/16/32, means over the six:
-    //
-    // | splits | 8 | 16 | 32 |
-    // | --- | --- | --- | --- |
-    // | ms | **9.311** | 9.421 | 9.324 |
-    //
-    // Still flat, and still flat by more than the spread WITHIN a setting
-    // (8 ran 9.187 to 9.475 across its six). The theory was wrong and the
-    // constant stays. What the sweep did find is that the harness had lost
-    // its repeatability -- see `what_a_decode_costs_at_length`, which now
-    // takes 200 samples instead of 40 for exactly this reason. Taking the
-    // OTHER branch -- one dispatch instead of a split and a merge -- is 26%
-    // worse, and that is the result worth keeping.
-    //
-    // It is worth keeping because it contradicts the obvious arithmetic.
-    // A decode's rectangles were believed to cost a flat ~19.6 us each
-    // (`device.rs` explains why Metal serializes them), so the merge pass
-    // looked like a pure 19.6 us a layer, 0.55 ms a token, that split-K has
-    // to earn back.
-    //
-    // Both of those numbers were later measured marginally -- duplicate a
-    // fire, read the increase -- and both were wrong. The merge costs 12.9
-    // us, not 19.6, so split-K's toll is 0.36 ms a token rather than 0.55.
-    // And the split itself costs **92.1 us**, which makes this pair 2.94 ms
-    // of a 9.83 ms token: the single largest thing in a decode after the
-    // weights themselves, and about 4x its own 0.64 ms of traffic. The
-    // conclusion below still stands, but the arithmetic that made it
-    // surprising was doubly generous. Reading
-    // the attention's bytes -- about 1 MB a layer at 512 keys -- against
-    // this part's bandwidth says the work inside is ~6 us, less than the
-    // dispatch that carries it, and on that arithmetic splitting cannot pay.
-    //
-    // The arithmetic is wrong because the unsplit grid is `rows * q_heads` =
-    // 16 workgroups, and 16 workgroups on a 20-core part is not a bandwidth
-    // problem, it is a LATENCY one: each of the 16 walks all 512 keys in
-    // series with nothing to overlap it. Splitting turns one 512-key walk
-    // into eight 64-key walks that run at once. The extra dispatch costs
-    // 0.55 ms a token and the parallelism returns 3.1 ms of it.
-    //
-    // So do not price a decode dispatch by its bytes, and do not assume
-    // every decode rectangle is floor. Hardly any of the expensive ones
-    // are, which is exactly why the `workgroups < 128` test above exists --
-    // and why the split kernel, not the dispatch count, is where this
-    // backend's remaining decode time sits.
-    // # WHAT THE GPU'S OWN CLOCK SAYS ABOUT THIS KERNEL, AND WHAT IT DOES NOT
-    //
-    // `PIE_WGPU_STAMP` (see `driver-wgpu/src/device.rs`) times each launch with
-    // a timestamp query instead of by subtraction. On a 512-key decode it
-    // prices this dispatch at **98.4 us and 32.2% of the token's GPU time**,
-    // the largest single kernel in a decode by a factor of one and a half over
-    // the biggest `qmv`. The 92.1 us below was measured marginally, by
-    // duplicating a fire and reading the increase; two instruments with nothing
-    // in common agree to 7%, so that number is now as solid as anything here.
-    //
-    // AND THE LARGEST KERNEL TURNED OUT TO BE A LADDER. A third of that 98 us
-    // was `log2(64) = 6` levels of workgroup-memory reduction, once per four
-    // keys, and the `@subgroup` tier of `sdpa_paged.wgsl` replaces them with
-    // register exchanges. **0.54 ms a token, 5.7%, three interleaved rounds,
-    // every one a win**, and this kernel's share falls from 31% to 26%. The
-    // file's own note had recorded the opposite -- "the barrier COUNT is not
-    // the cost, what the tree costs is its ADDS" -- from a sound measurement
-    // on llvmpipe, where a workgroup runs on one thread and a barrier is
-    // nearly free. See that note for the correction and the arithmetic that
-    // forced it.
-    //
-    // BOTH KNOBS WERE RE-SWEPT AFTERWARDS, because a kernel that went from
-    // eight barriers a block to two is not the kernel either of them was
-    // chosen against. Neither moved.
-    //
-    // `PIE_KR`, the keys a lane stages before reducing, two interleaved rounds
-    // and a rebuild between every cell:
-    //
-    // ```text
-    //   PIE_KR       1       2       4
-    //   round 1    8.908   9.613   9.787   ms a token
-    //   round 2    9.242   9.653   9.792
-    // ```
-    //
-    // Monotone and steep, exactly as `sdpa_paged.wgsl`'s `PIE_KL` table found
-    // before the ladder came out. That table's diagnosis was "hold less
-    // state", and it is now confirmed to be about RESIDENCY rather than about
-    // the barriers it was competing with: taking six barriers a block away did
-    // not make deeper staging affordable.
-    //
-    // `PIE_SPLITS`, four interleaved rounds -- and this one changed SHAPE even
-    // though it did not change VALUE:
-    //
-    // ```text
-    //   splits       4       8      16      32
-    //   round 1    9.311   9.160   9.060   9.298   ms a token
-    //   round 2    9.321   9.120   8.966   9.348
-    //   round 3            9.186   9.166
-    //   round 4            9.082   9.196
-    // ```
-    //
-    // The old sweep read flat from 4 to 32 and this one has a basin: 4 and 32
-    // each cost about 2%, which is outside the ~1.7% repeatability, while 8
-    // and 16 differ by 0.4% and TRADE PLACES between rounds 3 and 4. So 8 and
-    // 16 are a tie and the shipped 8 stays -- but the flat is gone, which is
-    // what a kernel whose per-workgroup serial work just shrank should look
-    // like. Quoting 16 as a win off the first two rounds would have been the
-    // fourth rule's whole point.
-    //
-    // THE SWEEP IT CANNOT DO, and this is worth as much as the number. The
-    // same table, read across `PIE_SPLITS`, appears to say that four splits
-    // costs 178 us where eight costs 112 -- 66 us x 28 layers = 1.85 ms, a
-    // fifth of a token. Measured end to end, interleaved, 200 samples:
-    //
-    // | | 8 | 4 | 8 | 4 |
-    // | --- | --- | --- | --- | --- |
-    // | p50 ms | 9.626 | 9.685 | 9.622 | 9.716 |
-    //
-    // **0.7%, or 0.07 ms.** Twenty-six times smaller than the table implied,
-    // and in agreement with the old 40-sample sweep below rather than with the
-    // new instrument. The reason is composition, not the clock: `[cost]` sums
-    // over a ONE-SECOND WINDOW, this bench's context grows from 512 to 717 keys
-    // across its 205 decodes, and a slower setting advances fewer tokens per
-    // window -- so the two columns are means over different key counts and are
-    // not the same measurement.
-    //
-    // FIXED, AND THE FIX IS THE POINT: `PIE_WGPU_STAMP=<n>` cuts the report on
-    // a FIRE COUNT instead of on wall time, so window `k` covers the same
-    // tokens under every setting whatever each took to reach them. Re-swept at
-    // 50 fires a window, the bench's own three decode windows, total ms of
-    // split across 1400 launches apiece:
-    //
-    // | window | 1 | 2 | 3 |
-    // | --- | --- | --- | --- |
-    // | 8 splits | 122.0 | 147.3 | 155.9 |
-    // | 4 splits | 132.4 | 148.4 | 160.6 |
-    // | | +8.5% | +0.7% | +3.0% |
-    //
-    // Which is the 0.7% the end-to-end run measured, not the 1600% the
-    // wall-clock window invented. The instrument now agrees with the harness
-    // it contradicted, and that agreement is what makes it usable for the
-    // kernels this bench cannot resolve at all.
-    //
-    // The same windows also show this kernel's share climbing 31.7% -> 33.8%
-    // -> 35.2% as the context grows 512 -> 717, which is the growth the broken
-    // window was aliasing against.
-    //
-    // So eight stays, and now on both numbers.
-    //
-    // RE-SWEPT A THIRD TIME, after a block stopped carrying `PIE_KB` keys and
-    // started carrying `PIE_KB * PIE_DP` of them -- 4 becoming 8 at `d_128` --
-    // because that is the quantity this knob divides the history into. Two
-    // interleaved rounds, 200 samples:
-    //
-    // ```text
-    //   splits       4       8      16
-    //   round 1    7.515   7.451   7.645   ms a token
-    //   round 2    7.608   7.445   7.596
-    // ```
-    //
-    // Eight wins both rounds and the BASIN HAS SHARPENED: 16 was a tie a
-    // sitting ago and now costs 2.2%, while 4 costs 1.6%. That is the shape a
-    // doubled block should produce -- sixteen splits of a 512-key history is
-    // 32 keys each, which is four blocks, and the tail of a split that rounds
-    // up to whole blocks is a bigger fraction of it than it was. The knob has
-    // not moved in three sweeps and its optimum is now the sharpest it has
-    // been, which is the more useful half of the result.
-    //
-    // FOURTH SWEEP, on a token a third smaller than any of the three above and
-    // with the stamping OFF -- a sweep run under `PIE_WGPU_PROBE` +
-    // `PIE_WGPU_STAMP` read 13.03 / 13.56 / 13.98 / 14.07 ms at 4 / 8 / 16 /
-    // 32 against a 7.5 ms baseline, monotone the wrong way and ~75% inflated,
-    // and was discarded. Plain medians, three interleaved rounds:
-    //
-    // | PIE_SPLITS | round 1 | round 2 | round 3 | mean | cost |
-    // | --- | --- | --- | --- | --- | --- |
-    // | 4 | 7.509 | 7.498 | 7.472 | 7.493 | +0.7% |
-    // | 8 | 7.453 | 7.442 | 7.415 | 7.437 | |
-    // | 16 | 7.644 | 7.688 | 7.642 | 7.658 | +3.0% |
-    //
-    // Eight wins all three rounds with no overlap. Four sweeps, four times the
-    // same answer, on tokens from 9.8 ms to 7.4 ms. This knob is closed.
-    //
-    // A PROBE KNOB, and eight is the shipped value. Read from the environment
-    // rather than compiled in because `splits` is a runtime argument to the
-    // kernel and a grid dimension, so nothing has to be rebuilt to move it --
-    // which matters now that `PIE_WGPU_STAMP` can price this one kernel to the
-    // microsecond instead of asking a 9.8 ms token to show a 0.8% difference.
-    let splits = std::env::var("PIE_SPLITS")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(8);
-
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged.wgsl",
-            [
-                "sdpa_paged_decode_split_bfloat16_d_64",
-                "sdpa_paged_decode_split_bfloat16_d_128",
-                "sdpa_paged_decode_split_bfloat16_d_256",
-                "sdpa_paged_decode_split_bfloat16_d_512",
-            ][point],
-        )
-        .apply(paged_split_grid(*head_dim, *q_heads, rows, splits)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            ctx.absent()?,
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks,
-            scratch.arg_mut(),
-            splits.arg(),
-        ],
-    )?;
-
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged.wgsl",
-            [
-                "sdpa_paged_decode_merge_bfloat16_d_64",
-                "sdpa_paged_decode_merge_bfloat16_d_128",
-                "sdpa_paged_decode_merge_bfloat16_d_256",
-                "sdpa_paged_decode_merge_bfloat16_d_512",
-            ][point],
-        )
-        .apply(paged_merge_grid(*head_dim, *q_heads, rows)?),
-        &[
-            ctx.absent()?,
-            ctx.absent()?,
-            ctx.absent()?,
-            out.arg(),
-            gqa_factor.arg(),
-            ctx.absent()?,
-            ctx.absent()?,
-            ctx.absent()?,
-            ctx.absent()?,
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            ctx.absent()?,
-            attention_mask_stride.arg(),
-            ctx.absent()?,
-            window.arg(),
-            ctx.absent()?,
-            scratch.arg_mut(),
-            splits.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_decode_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    sinks: Const<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    rows: Const<i32>,
-    split: In<Struct<AttnSplit>>,
-) -> Result<(), Refusal> {
-    // The sink form fires unsplit on this plane; the policy is stated
-    // for table equality and read by the decode form alone.
-    let _ = split;
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let rows = *rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged.wgsl",
-            "sdpa_paged_decode_sink_bfloat16_d_64",
-        )
-        .apply(paged_decode_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks.arg(),
-        ],
-    )
-}
-
-// INLINED into impl Attention; dies with the routine layer.
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_tiled(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let sinks = ctx.absent()?;
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged.wgsl",
-            [
-                "sdpa_paged_tiled_bfloat16_d_64",
-                "sdpa_paged_tiled_bfloat16_d_128",
-                "sdpa_paged_tiled_bfloat16_d_256",
-                "sdpa_paged_tiled_bfloat16_d_512",
-            ][head_point(*head_dim, &[64, 128, 256, 512])?],
-        )
-        .apply(tiled_grid(*q_heads, *head_dim, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks,
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_tiled_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    sinks: Const<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged.wgsl",
-            "sdpa_paged_tiled_sink_bfloat16_d_64",
-        )
-        .apply(tiled_grid(*q_heads, *head_dim, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks.arg(),
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn sdpa_paged_tiled_strided(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let sinks = ctx.absent()?;
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-
-    let q_row_pitch = ctx.param(5)?;
-
-    let o_row_pitch = ctx.param(6)?;
-    head_point(*head_dim, &[256])?;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged.wgsl",
-            "sdpa_paged_tiled_strided_bfloat16_d_256",
-        )
-        .apply(tiled_grid(*q_heads, *head_dim, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks,
-            n_rows.arg(),
-            q_row_pitch.arg(),
-            o_row_pitch.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_mma(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let sinks = ctx.absent()?;
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at("attn/sdpa_paged_mma.wgsl", "sdpa_paged_mma_bfloat16_d_64")
-            .apply(mma_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks,
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_paged_mma_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    n_kv_heads: Const<i32>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    sinks: Const<Tensor<bf16>>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    positions: In<Tensor<i32>>,
-    request_of_token: In<Tensor<i32>>,
-    maskv: In<Struct<AttnMask>>,
-    n_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    if maskv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the mask view this statement names",
-        });
-    }
-    let maskv = unsafe { &*maskv.ptr };
-    let page_size = kvc.page_size;
-
-    let k_pages = kvc.keys;
-    let v_pages = kvc.values;
-
-    let gqa_factor = if *n_kv_heads > 0 {
-        *q_heads / *n_kv_heads
-    } else {
-        0
-    };
-    let position_ids = positions.ptr;
-    let req_of_token = request_of_token.ptr;
-    let kv_page_indices = kvc.page_indices;
-    let kv_page_indptr = kvc.page_indptr;
-    let attention_mask = maskv.mask;
-    let attention_mask_stride = maskv.stride;
-    let attention_mask_enabled = maskv.enabled;
-    let n_rows = *n_rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_paged_mma.wgsl",
-            "sdpa_paged_mma_sink_bfloat16_d_64",
-        )
-        .apply(mma_grid(*q_heads, n_rows)?),
-        &[
-            queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
-            out.arg(),
-            gqa_factor.arg(),
-            position_ids.arg(),
-            req_of_token.arg(),
-            kv_page_indices.arg(),
-            kv_page_indptr.arg(),
-            page_size.arg(),
-            n_kv_heads.arg(),
-            scale.arg(),
-            attention_mask.arg(),
-            attention_mask_stride.arg(),
-            attention_mask_enabled.arg(),
-            window.arg(),
-            sinks.arg(),
-            n_rows.arg(),
-        ],
-    )
-}
-
-#[routine(out(out = like(queries)))]
-pub fn sdpa_vector_decode(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    scale: Const<f32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    n_kv_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keys = kvc.keys;
-    let values = kvc.values;
-
-    let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 {
-        *q_heads / n_kv_heads
-    } else {
-        0
-    };
-    let n = out.width;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    let v_head_stride = kvc.head_stride;
-    let v_seq_stride = kvc.seq_stride;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_vector.wgsl",
-            [
-                "sdpa_vector_decode_bfloat16_d_64",
-                "sdpa_vector_decode_bfloat16_d_128",
-                "sdpa_vector_decode_bfloat16_d_256",
-            ][head_point(*head_dim, &[64, 128, 256])?],
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            keys.arg(),
-            values.arg(),
-            out.arg(),
-            gqa_factor.arg(),
-            n.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-            v_head_stride.arg(),
-            v_seq_stride.arg(),
-            scale.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn sdpa_vector_decode_swa(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    q_row_stride: Const<i32>,
-    o_row_stride: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    n_kv_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keys = kvc.keys;
-    let values = kvc.values;
-
-    let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 {
-        *q_heads / n_kv_heads
-    } else {
-        0
-    };
-    let n = out.width;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    let v_head_stride = kvc.head_stride;
-    let v_seq_stride = kvc.seq_stride;
-    let rows = *rows;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_sliding.wgsl",
-            [
-                "sdpa_vector_decode_swa_bfloat16_d_256",
-                "sdpa_vector_decode_swa_bfloat16_d_512",
-            ][head_point(*head_dim, &[256, 512])?],
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            keys.arg(),
-            values.arg(),
-            out.arg(),
-            gqa_factor.arg(),
-            n.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-            v_head_stride.arg(),
-            v_seq_stride.arg(),
-            scale.arg(),
-            window.arg(),
-            q_row_stride.arg(),
-            o_row_stride.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn sdpa_vector_decode_sink(
-    ctx: &Ctx<'_>,
-    queries: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>,
-    sinks: Const<Tensor<bf16>>,
-    scale: Const<f32>,
-    window: Const<i32>,
-    head_dim: Const<i32>,
-    q_heads: Const<i32>,
-    q_row_stride: Const<i32>,
-    o_row_stride: Const<i32>,
-    kvc: In<Struct<KvCache>>,
-    n_kv_heads: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if kvc.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the kv view this statement names",
-        });
-    }
-    let kvc = unsafe { &*kvc.ptr };
-    let keys = kvc.keys;
-    let values = kvc.values;
-
-    let n_kv_heads = *n_kv_heads;
-    let gqa_factor = if n_kv_heads > 0 {
-        *q_heads / n_kv_heads
-    } else {
-        0
-    };
-    let n = out.width;
-    let k_head_stride = kvc.head_stride;
-    let k_seq_stride = kvc.seq_stride;
-    let v_head_stride = kvc.head_stride;
-    let v_seq_stride = kvc.seq_stride;
-    let rows = *rows;
-    head_point(*head_dim, &[64])?;
-    ctx.fire(
-        Fire::at(
-            "attn/sdpa_sliding.wgsl",
-            "sdpa_vector_decode_sink_bfloat16_d_64",
-        )
-        .apply(vector_grid(*head_dim, *q_heads, rows)?),
-        &[
-            queries.arg(),
-            keys.arg(),
-            values.arg(),
-            out.arg(),
-            sinks.arg(),
-            gqa_factor.arg(),
-            n.arg(),
-            k_head_stride.arg(),
-            k_seq_stride.arg(),
-            v_head_stride.arg(),
-            v_seq_stride.arg(),
-            scale.arg(),
-            window.arg(),
-            q_row_stride.arg(),
-            o_row_stride.arg(),
-        ],
-    )
-}
-
 /// The fire's attention view, or a refusal naming the pool row.
 ///
 /// The one unsafe read in this file's points layer: `Cache<Struct<AttnFire>>`
@@ -1555,8 +344,10 @@ fn paged_run(
 /// and the fast arm is unreachable through a point.
 ///
 /// **SEAM (P5):** `Encode` grows `fn capability(&self) -> Capability`. Then
-/// `prefill` reads it and takes `mma_grid` at `Capability::Matrix` with
-/// `head_dim == 64`, exactly as `driver-wgpu`'s program builder picks today.
+/// `prefill` reads it and calls [`mma`] instead of `tiled` at
+/// `Capability::Matrix` with `head_dim == 64`, exactly as `driver-wgpu`'s
+/// program builder picks today. That launcher is written and kept below for
+/// the purpose; the branch is the only missing line.
 #[kernels_macros::claims]
 impl kernels::points::Attention for Ctx<'_> {
     /// One query row per request against the pool row's pages.
@@ -1566,11 +357,11 @@ impl kernels::points::Attention for Ctx<'_> {
     /// Below 128 workgroups a decode is LATENCY-bound rather than
     /// bandwidth-bound — sixteen workgroups each walking 512 keys in series
     /// with nothing to overlap them — so the fire splits the key history
-    /// eight ways and merges the partials. Measured four times on an M4 Pro
-    /// (`attn::sdpa_paged_decode`'s note carries all four sweeps): taking the
-    /// OTHER branch costs 26%, and the split count itself has been flat-then-
-    /// basined at eight through a `PIE_KR` change, a `PIE_KL` change and a
-    /// doubled key block.
+    /// eight ways and merges the partials. Measured four times on an M4 Pro,
+    /// and all four sweeps sit on the `PIE_SPLITS` knob below where they were
+    /// taken: taking the OTHER branch costs 26%, and the split count itself
+    /// has been flat-then-basined at eight through a `PIE_KR` change, a
+    /// `PIE_KL` change and a doubled key block.
     ///
     /// The policy is the DRIVER's to publish and this body's to read:
     /// `SplitView::splits <= 1` (a saturated device, or a shell that does not
@@ -1650,11 +441,204 @@ impl kernels::points::Attention for Ctx<'_> {
             );
         };
 
-        // A PROBE KNOB, and eight is the shipped value — read from the
-        // environment rather than compiled in because `splits` is a runtime
-        // argument AND a grid dimension, so nothing has to be rebuilt to move
-        // it. Four sweeps on tokens from 9.8 ms to 7.4 ms have answered
-        // eight every time; see `attn::sdpa_paged_decode`.
+        // EIGHT, AND THE NUMBER BARELY MATTERS -- THE `workgroups < 128`
+        // BRANCH ABOVE IT DOES.
+        //
+        // Swept on an M4 Pro against `what_a_decode_costs_at_length`, a
+        // 512-key qwen3-0.6b decode:
+        //
+        // | splits | 4 | 8 | 16 | none (`scratch = None`) |
+        // | --- | --- | --- | --- | --- |
+        // | ms | 9.859 | 9.828 | 9.784 | **12.348** |
+        // | tok/s | 101.4 | 101.8 | 102.2 | **81.0** |
+        //
+        // Four to sixteen is 0.8%, which is this harness's own repeatability,
+        // so the count is on a flat and 8 is not a tuned number.
+        //
+        // RE-SWEPT AFTER `PIE_KR` WENT 8 -> 2, on the theory that halving the
+        // workgroup memory would let more splits stay resident and move the
+        // optimum. Six interleaved rounds of 8/16/32, means over the six:
+        //
+        // | splits | 8 | 16 | 32 |
+        // | --- | --- | --- | --- |
+        // | ms | **9.311** | 9.421 | 9.324 |
+        //
+        // Still flat, and still flat by more than the spread WITHIN a setting
+        // (8 ran 9.187 to 9.475 across its six). The theory was wrong and the
+        // constant stays. What the sweep did find is that the harness had lost
+        // its repeatability -- see `what_a_decode_costs_at_length`, which now
+        // takes 200 samples instead of 40 for exactly this reason. Taking the
+        // OTHER branch -- one dispatch instead of a split and a merge -- is 26%
+        // worse, and that is the result worth keeping.
+        //
+        // It is worth keeping because it contradicts the obvious arithmetic.
+        // A decode's rectangles were believed to cost a flat ~19.6 us each
+        // (`device.rs` explains why Metal serializes them), so the merge pass
+        // looked like a pure 19.6 us a layer, 0.55 ms a token, that split-K has
+        // to earn back.
+        //
+        // Both of those numbers were later measured marginally -- duplicate a
+        // fire, read the increase -- and both were wrong. The merge costs 12.9
+        // us, not 19.6, so split-K's toll is 0.36 ms a token rather than 0.55.
+        // And the split itself costs **92.1 us**, which makes this pair 2.94 ms
+        // of a 9.83 ms token: the single largest thing in a decode after the
+        // weights themselves, and about 4x its own 0.64 ms of traffic. The
+        // conclusion below still stands, but the arithmetic that made it
+        // surprising was doubly generous. Reading
+        // the attention's bytes -- about 1 MB a layer at 512 keys -- against
+        // this part's bandwidth says the work inside is ~6 us, less than the
+        // dispatch that carries it, and on that arithmetic splitting cannot pay.
+        //
+        // The arithmetic is wrong because the unsplit grid is `rows * q_heads` =
+        // 16 workgroups, and 16 workgroups on a 20-core part is not a bandwidth
+        // problem, it is a LATENCY one: each of the 16 walks all 512 keys in
+        // series with nothing to overlap it. Splitting turns one 512-key walk
+        // into eight 64-key walks that run at once. The extra dispatch costs
+        // 0.55 ms a token and the parallelism returns 3.1 ms of it.
+        //
+        // So do not price a decode dispatch by its bytes, and do not assume
+        // every decode rectangle is floor. Hardly any of the expensive ones
+        // are, which is exactly why the `workgroups < 128` test above exists --
+        // and why the split kernel, not the dispatch count, is where this
+        // backend's remaining decode time sits.
+        // # WHAT THE GPU'S OWN CLOCK SAYS ABOUT THIS KERNEL, AND WHAT IT DOES NOT
+        //
+        // `PIE_WGPU_STAMP` (see `driver-wgpu/src/device.rs`) times each launch with
+        // a timestamp query instead of by subtraction. On a 512-key decode it
+        // prices this dispatch at **98.4 us and 32.2% of the token's GPU time**,
+        // the largest single kernel in a decode by a factor of one and a half over
+        // the biggest `qmv`. The 92.1 us below was measured marginally, by
+        // duplicating a fire and reading the increase; two instruments with nothing
+        // in common agree to 7%, so that number is now as solid as anything here.
+        //
+        // AND THE LARGEST KERNEL TURNED OUT TO BE A LADDER. A third of that 98 us
+        // was `log2(64) = 6` levels of workgroup-memory reduction, once per four
+        // keys, and the `@subgroup` tier of `sdpa_paged.wgsl` replaces them with
+        // register exchanges. **0.54 ms a token, 5.7%, three interleaved rounds,
+        // every one a win**, and this kernel's share falls from 31% to 26%. The
+        // file's own note had recorded the opposite -- "the barrier COUNT is not
+        // the cost, what the tree costs is its ADDS" -- from a sound measurement
+        // on llvmpipe, where a workgroup runs on one thread and a barrier is
+        // nearly free. See that note for the correction and the arithmetic that
+        // forced it.
+        //
+        // BOTH KNOBS WERE RE-SWEPT AFTERWARDS, because a kernel that went from
+        // eight barriers a block to two is not the kernel either of them was
+        // chosen against. Neither moved.
+        //
+        // `PIE_KR`, the keys a lane stages before reducing, two interleaved rounds
+        // and a rebuild between every cell:
+        //
+        // ```text
+        //   PIE_KR       1       2       4
+        //   round 1    8.908   9.613   9.787   ms a token
+        //   round 2    9.242   9.653   9.792
+        // ```
+        //
+        // Monotone and steep, exactly as `sdpa_paged.wgsl`'s `PIE_KL` table found
+        // before the ladder came out. That table's diagnosis was "hold less
+        // state", and it is now confirmed to be about RESIDENCY rather than about
+        // the barriers it was competing with: taking six barriers a block away did
+        // not make deeper staging affordable.
+        //
+        // `PIE_SPLITS`, four interleaved rounds -- and this one changed SHAPE even
+        // though it did not change VALUE:
+        //
+        // ```text
+        //   splits       4       8      16      32
+        //   round 1    9.311   9.160   9.060   9.298   ms a token
+        //   round 2    9.321   9.120   8.966   9.348
+        //   round 3            9.186   9.166
+        //   round 4            9.082   9.196
+        // ```
+        //
+        // The old sweep read flat from 4 to 32 and this one has a basin: 4 and 32
+        // each cost about 2%, which is outside the ~1.7% repeatability, while 8
+        // and 16 differ by 0.4% and TRADE PLACES between rounds 3 and 4. So 8 and
+        // 16 are a tie and the shipped 8 stays -- but the flat is gone, which is
+        // what a kernel whose per-workgroup serial work just shrank should look
+        // like. Quoting 16 as a win off the first two rounds would have been the
+        // fourth rule's whole point.
+        //
+        // THE SWEEP IT CANNOT DO, and this is worth as much as the number. The
+        // same table, read across `PIE_SPLITS`, appears to say that four splits
+        // costs 178 us where eight costs 112 -- 66 us x 28 layers = 1.85 ms, a
+        // fifth of a token. Measured end to end, interleaved, 200 samples:
+        //
+        // | | 8 | 4 | 8 | 4 |
+        // | --- | --- | --- | --- | --- |
+        // | p50 ms | 9.626 | 9.685 | 9.622 | 9.716 |
+        //
+        // **0.7%, or 0.07 ms.** Twenty-six times smaller than the table implied,
+        // and in agreement with the old 40-sample sweep below rather than with the
+        // new instrument. The reason is composition, not the clock: `[cost]` sums
+        // over a ONE-SECOND WINDOW, this bench's context grows from 512 to 717 keys
+        // across its 205 decodes, and a slower setting advances fewer tokens per
+        // window -- so the two columns are means over different key counts and are
+        // not the same measurement.
+        //
+        // FIXED, AND THE FIX IS THE POINT: `PIE_WGPU_STAMP=<n>` cuts the report on
+        // a FIRE COUNT instead of on wall time, so window `k` covers the same
+        // tokens under every setting whatever each took to reach them. Re-swept at
+        // 50 fires a window, the bench's own three decode windows, total ms of
+        // split across 1400 launches apiece:
+        //
+        // | window | 1 | 2 | 3 |
+        // | --- | --- | --- | --- |
+        // | 8 splits | 122.0 | 147.3 | 155.9 |
+        // | 4 splits | 132.4 | 148.4 | 160.6 |
+        // | | +8.5% | +0.7% | +3.0% |
+        //
+        // Which is the 0.7% the end-to-end run measured, not the 1600% the
+        // wall-clock window invented. The instrument now agrees with the harness
+        // it contradicted, and that agreement is what makes it usable for the
+        // kernels this bench cannot resolve at all.
+        //
+        // The same windows also show this kernel's share climbing 31.7% -> 33.8%
+        // -> 35.2% as the context grows 512 -> 717, which is the growth the broken
+        // window was aliasing against.
+        //
+        // So eight stays, and now on both numbers.
+        //
+        // RE-SWEPT A THIRD TIME, after a block stopped carrying `PIE_KB` keys and
+        // started carrying `PIE_KB * PIE_DP` of them -- 4 becoming 8 at `d_128` --
+        // because that is the quantity this knob divides the history into. Two
+        // interleaved rounds, 200 samples:
+        //
+        // ```text
+        //   splits       4       8      16
+        //   round 1    7.515   7.451   7.645   ms a token
+        //   round 2    7.608   7.445   7.596
+        // ```
+        //
+        // Eight wins both rounds and the BASIN HAS SHARPENED: 16 was a tie a
+        // sitting ago and now costs 2.2%, while 4 costs 1.6%. That is the shape a
+        // doubled block should produce -- sixteen splits of a 512-key history is
+        // 32 keys each, which is four blocks, and the tail of a split that rounds
+        // up to whole blocks is a bigger fraction of it than it was. The knob has
+        // not moved in three sweeps and its optimum is now the sharpest it has
+        // been, which is the more useful half of the result.
+        //
+        // FOURTH SWEEP, on a token a third smaller than any of the three above and
+        // with the stamping OFF -- a sweep run under `PIE_WGPU_PROBE` +
+        // `PIE_WGPU_STAMP` read 13.03 / 13.56 / 13.98 / 14.07 ms at 4 / 8 / 16 /
+        // 32 against a 7.5 ms baseline, monotone the wrong way and ~75% inflated,
+        // and was discarded. Plain medians, three interleaved rounds:
+        //
+        // | PIE_SPLITS | round 1 | round 2 | round 3 | mean | cost |
+        // | --- | --- | --- | --- | --- | --- |
+        // | 4 | 7.509 | 7.498 | 7.472 | 7.493 | +0.7% |
+        // | 8 | 7.453 | 7.442 | 7.415 | 7.437 | |
+        // | 16 | 7.644 | 7.688 | 7.642 | 7.658 | +3.0% |
+        //
+        // Eight wins all three rounds with no overlap. Four sweeps, four times the
+        // same answer, on tokens from 9.8 ms to 7.4 ms. This knob is closed.
+        //
+        // A PROBE KNOB, and eight is the shipped value. Read from the environment
+        // rather than compiled in because `splits` is a runtime argument to the
+        // kernel and a grid dimension, so nothing has to be rebuilt to move it --
+        // which matters now that `PIE_WGPU_STAMP` can price this one kernel to the
+        // microsecond instead of asking a 9.8 ms token to show a 0.8% difference.
         let splits = std::env::var("PIE_SPLITS")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
@@ -1966,6 +950,73 @@ fn tiled<T: kernels::points::Scalar>(
             // The tiled arm takes the row count as a SCALAR as well as
             // through the grid: its y extent is rows rounded up to whole
             // tiles, so the tail tile needs to know where the rows stop.
+            rows.arg(),
+        ],
+    )
+}
+
+/// The cooperative-matrix twin of `tiled`, which no point can reach yet.
+///
+/// THE ONLY LAUNCHER LEFT IN THIS CRATE THAT NO CLAIM CALLS, and it is here
+/// on purpose. `attn/sdpa_paged_mma.wgsl` is the same prefill window at 2.4x
+/// on an M4 Pro (`Capability::Matrix`'s own doc carries the measurement), and
+/// the reason `prefill` fires `tiled` instead is not a dim it could branch on
+/// — it is a property of the ADAPTER, and a `dyn Encode` cannot be asked.
+///
+/// **SEAM (P5):** `Encode` grows `fn capability(&self) -> Capability`. Then
+/// `prefill` and `masked` read it and call THIS instead of `tiled` at
+/// `Capability::Matrix` with `head_dim == 64`, which is exactly the choice
+/// `driver-wgpu`'s program builder made by hand. One `if`; nothing else here
+/// moves.
+///
+/// The operand run and the trailing `(window, sinks, rows)` are `tiled`'s
+/// verbatim — both shaders read `sdpa_paged.wgsl`'s column — and the grid is
+/// the difference: `mma_grid`'s 32 and 8 are the MMA body's staging extents
+/// and are load-bearing where the tiled arm's never were. See its doc.
+pub fn mma<T: kernels::points::Scalar>(
+    ctx: &Ctx<'_>,
+    q: In<Payload<T>>,
+    o: Out<Payload<T>>,
+    view: &AttnFireView,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+) -> Result<(), Refusal> {
+    let head_dim = width_of(head_dim, "the head width this attention states")?;
+    let window = width_of(window, "the sliding window this attention states")?;
+    let q_heads = heads_of(q.width, head_dim, "the query rectangle's row")?;
+    let kv_heads = view.kv_heads;
+    let rows = q.rows;
+    head_point(head_dim, &[64])?;
+    let run = paged_run(
+        view,
+        q.arg(),
+        o.arg(),
+        gqa(q_heads, kv_heads),
+        kv_heads,
+        sm_scale,
+    );
+    ctx.fire(
+        Fire::at("attn/sdpa_paged_mma.wgsl", "sdpa_paged_mma_bfloat16_d_64")
+            .apply(mma_grid(q_heads, rows)?),
+        &[
+            run[0],
+            run[1],
+            run[2],
+            run[3],
+            run[4],
+            run[5],
+            run[6],
+            run[7],
+            run[8],
+            run[9],
+            run[10],
+            run[11],
+            run[12],
+            run[13],
+            run[14],
+            window.arg(),
+            absent(ctx)?,
             rows.arg(),
         ],
     )

@@ -262,6 +262,29 @@ kernels::raise!(
     KvPageIndptrHost = "kv_page_indptr.host" => u32
 );
 
+kernels::raise!(
+    /// THE FIRE'S ROW VALIDITY as a raise, one BYTE per token row.
+    ///
+    /// The same plane [`PagedKvView::row_valid`] carries for the points that
+    /// name a cache row — declared again here for the ones that do NOT.
+    /// `pool.boundary_decode` states positions and a ratio and no pool at
+    /// all, and the kernel behind it still has to skip a graph-padding row.
+    /// Null is the ordinary answer and means every row is valid, which every
+    /// kernel that reads this tests for, so a body asks through
+    /// `Ctx::staged` and never through `Ctx::raised`.
+    RowValid = "row_valid" => u8
+);
+
+kernels::raise!(
+    /// Which request each token row belongs to, `[rows]` of `i32`.
+    ///
+    /// A FIRE FACT WITH NO SLOT: it is derivable from the query CSR and the
+    /// driver derives it there (`fire/launch.rs` walks `qo_indptr` when the
+    /// lane names it), but a kernel handed one row at a time cannot do the
+    /// search, so the plane is staged. `pool.attention_lse` is its reader.
+    RequestOfToken = "request_of_token" => i32
+);
+
 /// `In<Struct<AttnScore>>` — the attention-score observation the driver
 /// keeps: the per-request CSR of observed rows and the window each keeps.
 /// Both are the FIRE's (the CSR is staged per fire; the window is

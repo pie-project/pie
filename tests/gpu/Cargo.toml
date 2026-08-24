@@ -24,13 +24,6 @@ doctest = false
 default = []
 driver-cuda-12 = ["pie/driver-cuda-12"]
 driver-cuda-13 = ["pie/driver-cuda-13"]
-# The Vulkan analogue. Same composition root, a different embedded driver --
-# and the only one of the two that runs on a machine without CUDA installed.
-driver-vulkan = ["pie/driver-vulkan"]
-# The WebGPU analogue. Asks the platform for an adapter rather than naming
-# one, and takes its weights from the same `$PIE_HOME` cache `pie serve` reads
-# -- so a gate needs no artifact env var, only a model the cache already has.
-driver-wgpu = ["pie/driver-wgpu"]
 
 [dev-dependencies]
 # The composition root. These tests boot the same `run_standalone` a `pie

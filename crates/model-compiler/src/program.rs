@@ -5,6 +5,20 @@
 //! call answers the point. The fire's own row count stays symbolic; a
 //! value's FACTOR over it ([`Rows`]), its width and its dtype are settled
 //! here, per point, from the walk's rules.
+//!
+//! ## Two halves: what a rectangle IS, and where it SITS
+//!
+//! `out_sizes` answers the first — the width table, read off the
+//! declarations and the builders. `carve` answers the second, and it does
+//! it by LIVENESS: a value's rectangle is needed from the step that writes it
+//! to the last step that reads it ([`spans`]), and two values whose steps
+//! never coincide are given the same bytes. That is the difference between a
+//! pitch that is the sum of everything a lane ever mints and one that is the
+//! lane's busiest instant — gemma4-31b's row went from 21.8 MiB to 1 MiB,
+//! qwen35-d0.8b's from 2.45 MiB to 487 KiB, and every lane of every
+//! catalogue row lands exactly on the bound. [`clashes`] is the invariant's
+//! guard, because a slab shared with the wrong value does not fault: it
+//! computes.
 
 use model_ir::kernels::Backend;
 use model_ir::plan::{Cond, Op, Param, Plan, ValueDef, ValueId};
@@ -18,8 +32,21 @@ pub struct Program {
     pub steps: Vec<Step>,
     /// Indexed by [`ValueId`].
     pub slots: Vec<Slot>,
-    /// Bytes of arena per fire row — the no-reuse MVP layout: every arena
-    /// slot's row sits at `row * row_pitch + offset`.
+    /// Bytes of arena one fire row needs.
+    ///
+    /// THE OFFSETS REUSE. Two values this lane never holds live at the same
+    /// step share bytes (`carve`), so the pitch is the arena's busiest
+    /// instant and not the sum of everything the lane ever mints. What a
+    /// slot's offset means to an executor is unchanged, and so is the
+    /// arena's size: `rows * row_pitch`.
+    ///
+    /// The reading is VALUE-MAJOR and both executors read it that way: value
+    /// `V` owns `[offset * rows, offset * rows + bytes * rows)` and its rows
+    /// sit `width` elements apart inside it, because the marks a kernel is
+    /// handed carry no stride. That is a uniform scaling of the per-row
+    /// layout by `rows`, so it preserves exactly the disjointness (and the
+    /// sharing) this walk assigned, and every rectangle stays inside
+    /// `rows * row_pitch`.
     pub row_pitch: u64,
 }
 
@@ -48,7 +75,7 @@ pub enum Slot {
     /// Staged by the driver from the fire's own data, by name
     /// (`token_ids`, `positions`, `qo_indptr`).
     Runtime(String),
-    /// A rectangle in the fire's arena: `row * program.row_pitch + offset`,
+    /// A rectangle in the fire's arena at `offset * rows`,
     /// `rows.factor() * width` elements of `dtype` per FIRE row.
     ///
     /// THE PITCH STAYS PER FIRE ROW. A [`Rows::FireTimes`] slot keeps its
@@ -57,6 +84,12 @@ pub enum Slot {
     /// routed rows sit `width` elements apart. That is the legacy staging's
     /// `[tokens, top_k, width]` rectangle to the byte — the same buffer,
     /// said in the terms the plan can state.
+    ///
+    /// AN OFFSET IS NOT PRIVATE. Values whose lives do not overlap are given
+    /// the same bytes on purpose; what a slot owns is its offset for the
+    /// steps [`spans`] says it is live, and nothing outside those steps may
+    /// read it. The one reader past the walk is the `out` seam, and the
+    /// spans hold it open to fire end for exactly that reason.
     Arena {
         offset: u64,
         rows: Rows,
@@ -67,6 +100,23 @@ pub enum Slot {
     Alias(ValueId),
     /// An effect or an op this lane never runs: nothing to address.
     Absent,
+}
+
+impl Slot {
+    /// The bytes ONE FIRE ROW of this slot occupies, the routed factor
+    /// included — zero for anything that is not a rectangle of the arena.
+    ///
+    /// What a kernel actually touches, before the 16 the carve rounds a
+    /// reservation up to.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Slot::Arena {
+                rows, width, dtype, ..
+            } => rows.factor() * width * dtype.size(),
+            Slot::Runtime(_) | Slot::Alias(_) | Slot::Absent => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,36 +401,288 @@ fn bind(plan: &Plan, at: usize, lane: &crate::sweep::Lane) -> Result<Program, Re
         });
     }
 
-    // THE NO-REUSE MVP: every rectangle this lane mints keeps its own column
-    // of the row, in value order. Merges alias and allocate nothing.
-    //
-    // A ROUTED SLOT PAYS FOR ALL ITS ROWS HERE, once: `row_pitch` is bytes
-    // per FIRE row, so a `FireTimes(k)` column is `k` sub-rows wide and the
-    // pitch carries the whole fan-out. Nothing downstream multiplies again.
-    let mut cursor = 0u64;
-    for slot in &mut slots {
-        if let Slot::Arena {
-            offset,
-            rows,
-            width,
-            dtype,
-        } = slot
-        {
-            *offset = align16(cursor);
-            cursor = *offset + rows.factor() * *width * dtype.size();
-        }
-    }
+    let spans = spans_over(plan, &steps, &slots);
+    let row_pitch = carve(&mut slots, &spans);
 
     Ok(Program {
         words: lane.words.clone(),
         steps,
         slots,
-        row_pitch: align16(cursor),
+        row_pitch,
     })
 }
 
 fn align16(bytes: u64) -> u64 {
     (bytes + 15) & !15
+}
+
+/// The steps one value must survive, in the lane's own issue order.
+///
+/// `first` is the step that writes it and `last` the last step that reads
+/// it, both inclusive — so a value with no reader at all still spans the one
+/// step that minted it, because the launch writes through the pointer either
+/// way.
+///
+/// INCLUSIVE IS THE WHOLE SAFETY ARGUMENT, and it is what makes the `InOut`
+/// question answer itself. A statement at step `s` reads its operands and
+/// writes its results in the same launch: the operand's span ends at `s`,
+/// the result's begins at `s`, and the two touch — so the allocator can
+/// never hand one the other's bytes. That is the right answer for an
+/// ordinary point (the kernel is still reading `x` while it writes `y`) and
+/// it is the only available answer for an `InOut` one, where whether the
+/// launch may alias its own operand is a fact about the kernel's indexing
+/// that no plan states. A plan that WANTS the aliasing says so the way it
+/// already can — a merge, which allocates nothing and shares by
+/// construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub first: u32,
+    pub last: u32,
+}
+
+impl Span {
+    /// Are both values live at some common step?
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+}
+
+/// The step at which each value's rectangle is born and the last step that
+/// reads it, indexed by [`ValueId`] — `None` for a value this lane gives no
+/// rectangle.
+///
+/// The lane's answer, not the plan's: a value's span is measured over the
+/// steps THIS lane runs, which is why it is derived from `program.steps`
+/// rather than from `plan.ops`.
+#[must_use]
+pub fn spans(plan: &Plan, program: &Program) -> Vec<Option<Span>> {
+    spans_over(plan, &program.steps, &program.slots)
+}
+
+fn spans_over(plan: &Plan, steps: &[Step], slots: &[Slot]) -> Vec<Option<Span>> {
+    // ONE STEP PAST THE WALK. The driver's delivery reads the `out` seam
+    // AFTER the last step has been issued (`driver-cuda/src/fire/launch.rs`
+    // repitches `fire.rect(baked.out)` into the logits buffer;
+    // `baker-smoke` reads the same rectangle the same way), so the value it
+    // names is live at a time no statement occupies. Giving that time an
+    // index rather than a special case is what keeps the rule one sentence:
+    // the logits column is simply live longer than any step.
+    let end = u32::try_from(steps.len()).expect("a lane of fewer steps than u32 counts");
+    let mut spans: Vec<Option<Span>> = vec![None; slots.len()];
+    for (at, step) in steps.iter().enumerate() {
+        let at = u32::try_from(at).expect("a step index inside the lane");
+        let op = &plan.ops[step.op as usize];
+        // OPERANDS AND RESULTS AT THE SAME INSTANT, which is the inclusive
+        // reading [`Span`] argues for. An effect (`attention.kv_append`)
+        // states no result and still holds its operands open here.
+        for v in op.inputs.iter().chain(op.outputs.iter()) {
+            touch(slots, &mut spans, *v, at);
+        }
+    }
+    // THE DELIVERY TAIL. Every value the `out` seam names lives to `end`.
+    // Only that seam: the other seams a plan carries (`attn.q`, `attn.out`,
+    // `recurrent`) are trace-time attach points, and an adapter that takes
+    // one becomes STATEMENTS in the plan — which this walk already sees. A
+    // rule that pinned every seam open would be paying for readers that do
+    // not exist, and would hold one activation per layer live across the
+    // whole stack.
+    for seam in plan.seams.iter().filter(|s| s.seam == model_ir::seam::OUT.name) {
+        for &v in &seam.values {
+            let v = root(slots, v) as usize;
+            if matches!(slots[v], Slot::Arena { .. }) {
+                // `first: 0` covers the value no step of this lane writes —
+                // which cannot happen for a seam this lane binds, and is the
+                // safe reading if it ever did.
+                spans[v].get_or_insert(Span { first: 0, last: end }).last = end;
+            }
+        }
+    }
+    // EVERY RECTANGLE ENDS UP WITH A SPAN, so that nothing downstream has to
+    // decide what an absent one means. One cannot be absent — `bind` mints a
+    // rectangle only for a statement this lane runs, and a statement this
+    // lane runs is a step whose results are touched above — and if one ever
+    // were, holding it open across the whole lane is the reading that cannot
+    // be wrong.
+    for (id, slot) in slots.iter().enumerate() {
+        if matches!(slot, Slot::Arena { .. }) {
+            spans[id].get_or_insert(Span { first: 0, last: end });
+        }
+    }
+    spans
+}
+
+fn touch(slots: &[Slot], spans: &mut [Option<Span>], v: ValueId, at: u32) {
+    // A MERGE IS ITS ARM'S LIFE, NOT ITS OWN. Reading the merged value reads
+    // the surviving arm's rectangle, so the read lands on the arm — which is
+    // how an alias extends the life of what it points at.
+    let v = root(slots, v) as usize;
+    if !matches!(slots[v], Slot::Arena { .. }) {
+        return;
+    }
+    match &mut spans[v] {
+        Some(span) => {
+            span.first = span.first.min(at);
+            span.last = span.last.max(at);
+        }
+        None => spans[v] = Some(Span { first: at, last: at }),
+    }
+}
+
+/// The rectangle an alias finally names. `bind` already collapses chains, so
+/// this is one hop in practice and a loop for the reader's sake.
+fn root(slots: &[Slot], mut v: ValueId) -> ValueId {
+    for _ in 0..=slots.len() {
+        match slots[v as usize] {
+            Slot::Alias(to) => v = to,
+            _ => return v,
+        }
+    }
+    panic!("a cycle of aliases");
+}
+
+/// Give every rectangle an offset, sharing bytes between values that are
+/// never live together, and answer the row pitch that covers them all.
+///
+/// # Why greedy-by-size, and how close it gets
+///
+/// The lower bound is the arena's busiest instant: the total bytes live at
+/// whichever step holds the most ([`live_bound`]). Reaching it exactly is
+/// dynamic storage allocation, which is NP-hard in general — but these
+/// intervals are a transformer's, which is to say a few long-lived residuals
+/// crossing a long chain of short-lived scratch, and placing the big blocks
+/// first leaves gaps the small ones drop into. The measured tables sit ON
+/// the bound for every catalogue row, so nothing more elaborate has earned
+/// its way in.
+///
+/// # Deterministic, and that is a requirement
+///
+/// The same plan must lay out the same way on every host: a program is
+/// cached, compared and fired by offsets. So the order is a TOTAL one —
+/// bytes descending, then birth step, then value id — and never a hash's.
+fn carve(slots: &mut [Slot], spans: &[Option<Span>]) -> u64 {
+    // A ROUTED SLOT PAYS FOR ALL ITS ROWS HERE, once: `row_pitch` is bytes
+    // per FIRE row, so a `FireTimes(k)` column is `k` sub-rows wide and the
+    // pitch carries the whole fan-out. Nothing downstream multiplies again.
+    //
+    // Sizes are rounded to 16 so that a freed hole is 16-aligned too, which
+    // is what keeps every offset aligned with no separate padding pass.
+    let mut order: Vec<(u64, Span, usize)> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| matches!(slot, Slot::Arena { .. }))
+        .map(|(id, slot)| {
+            let span = spans[id].expect("`spans` answers every arena slot");
+            (align16(slot.bytes()), span, id)
+        })
+        .collect();
+    order.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.first.cmp(&b.1.first))
+            .then(a.2.cmp(&b.2))
+    });
+
+    let mut placed: Vec<(u64, u64, Span)> = Vec::with_capacity(order.len());
+    let mut blockers: Vec<(u64, u64)> = Vec::new();
+    let mut pitch = 0u64;
+    for (bytes, span, id) in order {
+        // The lowest offset no value live beside this one already holds:
+        // walk the blockers in address order, stepping past each one that
+        // starts before the gap under consideration closes.
+        blockers.clear();
+        blockers.extend(
+            placed
+                .iter()
+                .filter(|(_, _, live)| live.overlaps(span))
+                .map(|(at, size, _)| (*at, at + size)),
+        );
+        blockers.sort_unstable();
+        let mut at = 0u64;
+        for (from, to) in &blockers {
+            if *from >= at + bytes {
+                break;
+            }
+            at = at.max(*to);
+        }
+        let Slot::Arena { offset, .. } = &mut slots[id] else {
+            unreachable!("only arena slots are ordered")
+        };
+        *offset = at;
+        placed.push((at, bytes, span));
+        pitch = pitch.max(at + bytes);
+    }
+    pitch
+}
+
+/// The busiest instant: the most bytes this lane holds live at any one step,
+/// each rounded to the 16 an offset has to sit on.
+///
+/// THE FLOOR NO LAYOUT CAN BEAT, and the number the reuse is measured
+/// against — [`Program::row_pitch`] sitting ON it is the whole claim, and it
+/// does on every lane of every catalogue row today.
+#[must_use]
+pub fn live_bound(plan: &Plan, program: &Program) -> u64 {
+    let spans = spans(plan, program);
+    let sized: Vec<(Span, u64)> = program
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| matches!(slot, Slot::Arena { .. }))
+        .map(|(id, slot)| {
+            let span = spans[id].expect("`spans` answers every arena slot");
+            (span, align16(slot.bytes()))
+        })
+        .collect();
+    let end = u32::try_from(program.steps.len()).unwrap_or(u32::MAX);
+    (0..=end)
+        .map(|at| {
+            sized
+                .iter()
+                .filter(|(span, _)| span.first <= at && at <= span.last)
+                .map(|(_, bytes)| *bytes)
+                .sum()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every pair of values this lane holds live at one step whose rectangles
+/// nevertheless share a byte.
+///
+/// THE ARENA'S WHOLE INVARIANT, and cheap enough to keep as its guard. A
+/// reused slab does not fault when it is wrong — the addresses stay inside
+/// the block and the launches all succeed — so the only thing that catches a
+/// layout mistake is arithmetic, either this or a checkpoint's logits.
+/// Empty on every program `bind` builds.
+#[must_use]
+pub fn clashes(plan: &Plan, program: &Program) -> Vec<(ValueId, ValueId)> {
+    let spans = spans(plan, program);
+    // THE BYTES A KERNEL TOUCHES, not the 16-rounded reservation: a pair that
+    // shared only padding would be a carve this walk never produces, and
+    // reporting it would name a clash no launch can see.
+    let live: Vec<(ValueId, Span, u64, u64)> = program
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| match slot {
+            Slot::Arena { offset, .. } => Some((
+                u32::try_from(id).ok()?,
+                spans[id].expect("`spans` answers every arena slot"),
+                *offset,
+                slot.bytes(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut found = Vec::new();
+    for (i, (a, a_span, a_at, a_bytes)) in live.iter().enumerate() {
+        for (b, b_span, b_at, b_bytes) in &live[i + 1..] {
+            if a_span.overlaps(*b_span) && *a_at < b_at + b_bytes && *b_at < a_at + a_bytes {
+                found.push((*a, *b));
+            }
+        }
+    }
+    found
 }
 
 /// Which arm of a merge survives on this lane, if any.

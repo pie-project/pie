@@ -390,7 +390,7 @@ fn pack(
 }
 
 /// Stack under a NEW leading axis -- what turns per-expert banks into the
-/// one `[experts, ...]` tensor an `.experts()` weight declares.
+/// one `[experts, ..]` tensor a routed bank declares.
 fn stack(
     sources: &[Source],
     read: &dyn Fn(&str) -> Option<HostTensor>,

@@ -204,7 +204,8 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
 /// Measured, by flipping exactly that policy: `pie model import` of
 /// `qwen2.5-0.5b-instruct-q4_0.gguf` with blocked schemes preserved is
 /// **269 MiB in 153 ms** instead of 946 MiB in 1 s, and `pie model build
-/// --backend cuda` over the result **succeeded**, writing a runtime artifact
+/// --backend cuda` over the result **succeeded** (that command is since
+/// deleted; the hole it exposed is not), writing a runtime artifact
 /// holding 169 `GgufQ4_0` tensors for a device with no kernel that reads one.
 /// It compiled, it validated, and it was wrong. That is the hole, and the
 /// prize on the other side of it — 3.5x on disk — is large enough that the

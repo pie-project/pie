@@ -26,7 +26,7 @@ use crate::embedded_driver::{DriverCapabilities, DriverOptions};
 use crate::executor::ExecutorServer;
 use crate::link::control::{self, ControlLink};
 use crate::link::{gateway, partner, topology};
-use crate::preflight::{self, ResolvedFlavor};
+use crate::preflight;
 use crate::translate::{self, GroupDriver, ModelDrivers};
 use crate::{client_server, lifecycle, weights};
 
@@ -378,6 +378,18 @@ struct LoadedPartnerMetadata {
     hidden_size: u32,
 }
 
+/// THE DRIVER'S SELF-REPORT, DELIBERATELY, WHERE `register` READS THE ROW.
+///
+/// `arch_name`, `vocab_size` and `max_model_len` are all stated on
+/// `model::serve::ROWS`, and the engine's own `register` reads them there —
+/// but this is not a statement of what the model IS. It is the token two
+/// workers compare before they trade KV pages, and what has to agree is what
+/// the two DRIVERS loaded, not what the two catalogs say. Substituting the
+/// row would fold in a table both binaries already share, which discriminates
+/// nothing, and would make the one divergence worth catching — a driver
+/// reporting a width its row does not state — invisible. `activation_dtype`
+/// and `hidden_size` in the same hash have no row column at all, which is the
+/// same fact from the other side: this is the driver's answer, whole.
 fn model_identity(
     user_cfg: &config::Config,
     caps: &DriverCapabilities,
@@ -539,7 +551,7 @@ fn load_model_drivers(
 
     let (driver_groups, snapshot_dir, metadata) = {
         let m = &user_cfg.model;
-        let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
+        let flavor = preflight::resolve_flavor(m.driver.kind, &m.name)?;
 
         let world_size = m.driver.device.len();
         let tp_degree = if m.driver.tensor_parallel_size == 0 {
@@ -552,9 +564,9 @@ fn load_model_drivers(
 
         #[allow(unreachable_patterns)]
         if tp_degree > 1 {
-            match resolved {
+            match flavor {
                 #[cfg(feature = "_driver-cuda")]
-                ResolvedFlavor::Embedded(Flavor::Cuda) => {}
+                Flavor::Cuda => {}
                 _ => anyhow::bail!(
                     "model {:?}: tensor_parallel_size={tp_degree} is only \
                      supported for cuda_native",
@@ -563,24 +575,22 @@ fn load_model_drivers(
             }
         }
 
-        let ResolvedFlavor::Embedded(flavor) = resolved;
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
         apply_embedded_calibration(&mut embedded_base_opts, user_cfg.server.calibrate_planner);
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
-        // WHICH LAY-OUT OF IT, if the store holds one already built for this
-        // boot. A miss is not an error: an archive is servable as it stands,
-        // and all a miss costs is the family transforms `pie model build`
-        // exists to move offline. See `weights::prefer_runtime`.
-        let resolved_model = weights::prefer_runtime(
-            resolved_model,
-            &weights::Request {
-                backend: flavor.as_str().to_string(),
-                component: format!("{component:?}").to_lowercase(),
-                tp_size: tp_degree,
-            },
-        );
+        // A SECOND STEP STOOD HERE -- weights::prefer_runtime, which asked
+        // whether the store already held a `<name>/runtime/` artifact built for
+        // this exact boot and bound it instead of the archive. Nothing in this
+        // build writes that directory: its sole producer was the offline
+        // `pie model build`, which R3 retired with the load contract its
+        // transforms authored, so the lookup could only ever miss. It is deleted
+        // rather than left as a no-op that reads like a live cache. The archive
+        // is general form and is servable as it stands; what a runtime bought
+        // was moving the family transforms offline, and that returns when a
+        // command writes one again.
+        //
         // Lifted once, here, in one open. The drivers get the compiled model
         // config beside their bootstrap TOML; the runtime gets the whole of it.
         // Nobody downstream re-opens the artifact or re-decides what it is —
@@ -1019,7 +1029,7 @@ async fn assemble_distributed<C: ControlLink>(
               would be a parameter list with a name"
 )]
 #[cfg_attr(
-    not(any(feature = "_driver-cuda", feature = "driver-metal")),
+    not(feature = "_driver-cuda"),
     allow(
         unused_variables,
         unreachable_code,
@@ -1135,12 +1145,7 @@ fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
         opts.verbose = verbose;
     }
 
-    #[cfg(feature = "driver-metal")]
-    if let DriverOptions::Metal(opts) = options {
-        opts.verbose = verbose;
-    }
-
-    #[cfg(not(any(feature = "_driver-cuda", feature = "driver-metal")))]
+    #[cfg(not(feature = "_driver-cuda"))]
     let _ = (options, verbose);
 }
 

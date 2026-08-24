@@ -53,7 +53,9 @@ pub struct WriteTensor<'a> {
 /// back as `Raw(U8)` with its type gone.
 ///
 /// Measured on `pie model build --backend cuda --quant fp8 --fp8-native` from
-/// `Qwen--Qwen3-0.6B.zt`, before and after: **196 tensors** carried no logical
+/// `Qwen--Qwen3-0.6B.zt` (a command R3 deleted -- the finding stands, the
+/// recipe cannot be re-run as written), before and after: **196 tensors**
+/// carried no logical
 /// type, the artifacts differ by 2,940 bytes of metadata and **not one byte of
 /// payload**, and the erasure *propagates* — re-authoring a type-erased
 /// artifact writes another one, because the reader answers `U8` and the writer
@@ -234,7 +236,7 @@ fn zero_tensor(packing: &str) -> Value {
 /// Writes a checkpoint one tensor at a time, payloads in chunks.
 ///
 /// The streaming face of [`write_zt`], for callers whose payloads should never
-/// all be resident at once — `pie model convert` copies multi-gigabyte
+/// all be resident at once — `pie model import` copies multi-gigabyte
 /// tensors straight from the source checkpoint through a bounded buffer.
 /// Canonical form requires objects in ascending name order; [`write_zt`] sorts
 /// for its caller, this type trusts its caller to add in order.

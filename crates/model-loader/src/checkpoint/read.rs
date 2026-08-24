@@ -191,7 +191,7 @@ fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
 /// `.zt` are single-file and state it by being one file.
 ///
 /// The order below is the order a snapshot is likely to hold: a `.zt`
-/// artifact (what `pie model convert` writes), else the canonical HF
+/// artifact (what `pie model import` writes), else the canonical HF
 /// safetensors layout, else GGUF.
 /// The bytes of the metadata object named `path`, or `None` if the checkpoint
 /// has no such object.

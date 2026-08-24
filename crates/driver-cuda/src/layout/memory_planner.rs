@@ -8,9 +8,6 @@ use super::planner_policy as policy;
 use super::profile_cache::Lookup;
 use super::profile_key::{ProfileKey, ProfileShape};
 
-/// Every candidate layout must hold at least this much KV, independent of the request cap.
-pub const MIN_KV_TOKENS_FLOOR: u64 = 32768;
-
 /// Relative budget change past which a measured profile stops describing this machine.
 pub const BUDGET_TOLERANCE: f64 = 0.05;
 
@@ -832,7 +829,9 @@ pub fn plan(
                         reason = "mirrors the C++'s ceil() through double"
                     )]
                     let horizon_floor = (f64::from(r) * min_kv_horizon).ceil() as u64;
-                    let min_kv_tokens = MIN_KV_TOKENS_FLOOR.min(kv_tokens).max(horizon_floor);
+                    let min_kv_tokens = policy::MIN_KV_TOKENS_FLOOR
+                        .min(kv_tokens)
+                        .max(horizon_floor);
                     if kv_tokens < min_kv_tokens {
                         continue;
                     }
@@ -988,7 +987,8 @@ fn no_viable_layout(
                 `pie config tune` on this machine";
     } else if let Some(have_tokens) = budget.checked_div(per_kv_token_bytes) {
         // Unpinned failures usually mean weights left too little budget for the KV floor.
-        let need_bytes = MIN_KV_TOKENS_FLOOR * per_kv_token_bytes;
+        let floor = policy::MIN_KV_TOKENS_FLOOR;
+        let need_bytes = floor * per_kv_token_bytes;
         let current_used = mem.total_bytes - mem.free_bytes;
         let safety = reserves(mem.total_bytes);
         // Round utilization advice up so the suggested value clears the floor.
@@ -1001,7 +1001,7 @@ fn no_viable_layout(
         };
         why += &format!(
             ". KV needs {} KiB/token, so this budget holds ~{have_tokens} tokens, short of \
-             the {MIN_KV_TOKENS_FLOOR} a layout wants before its decode width is the binding \
+             the {floor} a layout wants before its decode width is the binding \
              term. Raise [driver] gpu_mem_utilization (>= {need_util:.2} here), shrink the \
              weights (`kv_cache_dtype`/quantization), or add a GPU",
             per_kv_token_bytes / 1024

@@ -1,15 +1,10 @@
 use crate::jit::abi::Tensor;
-use crate::jit::abi::{bf16, f16};
+use crate::jit::abi::bf16;
 use crate::jit::{Ctx, Launch};
-use crate::views::ExpertWeights;
 use kernels::Refusal;
-use kernels::raises::Struct;
-use kernels::routine::{Asks, Const, In, InOut, Out};
+use kernels::routine::{Const, In, InOut, Out};
 use kernels::{Bind, Fire};
-use kernels_macros::routine;
 
-use core::ffi::c_void;
-use core::ptr::NonNull;
 
 pub mod transcode {
 
@@ -109,15 +104,6 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     )
 }
 
-fn slab(n: u32) -> Launch {
-    const SLAB_VEC: u32 = 8;
-
-    const SLAB_GRID_MAX: u32 = 1024;
-
-    let units = if n >= SLAB_VEC { n / SLAB_VEC } else { n };
-    Launch::per_row(units.div_ceil(BLOCK).clamp(1, SLAB_GRID_MAX), BLOCK)
-}
-
 fn extent(symbol: &str, n: usize) -> u32 {
     let Ok(elems) = u32::try_from(n) else {
         panic!(
@@ -129,8 +115,7 @@ fn extent(symbol: &str, n: usize) -> u32 {
     elems
 }
 
-#[routine(bf16)]
-pub fn cast_fp32_to<T>(
+pub fn cast_fp32_to<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     src_fp32: In<Tensor<f32>>,
     dst_bf16: Out<Tensor<T>>,
@@ -151,8 +136,7 @@ pub fn cast_fp32_to<T>(
     )
 }
 
-#[routine(bf16, out(buf_bf16 = like(buf_bf16)))]
-pub fn scale_rows<T>(
+pub fn scale_rows<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     buf_bf16: InOut<Tensor<T>>,
     l_bf16: In<Tensor<T>>,
@@ -177,37 +161,7 @@ pub fn scale_rows<T>(
     )
 }
 
-#[routine]
-pub fn bf16_to_fp16(
-    ctx: &Ctx<'_>,
-    in_bf16: In<Tensor<bf16>>,
-    out_fp16: Out<Tensor<f16>>,
-) -> Result<(), Refusal> {
-    let count = i64::from(out_fp16.rows) * i64::from(out_fp16.width);
-    if count <= 0 {
-        return Err(Refusal::Empty {
-            what: "the output rectangle",
-        });
-    }
-    let Ok(grid) = u32::try_from(count) else {
-        return Err(Refusal::Narrow {
-            what: "the output rectangle in one 32-bit launch extent",
-            at: count,
-        });
-    };
-    let launch = slab(grid);
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_wna16.cuh",
-            "::pie::quant::bf16_to_narrow<::pie::f16>",
-        )
-        .apply(launch),
-        &[in_bf16.arg(), out_fp16.arg(), count.arg()],
-    )
-}
-
-#[routine(bf16)]
-pub fn dequant_fp8_e4m3_to<T>(
+pub fn dequant_fp8_e4m3_to<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     fp8_in: In<Tensor<u8>>,
     bf16_out: Out<Tensor<T>>,
@@ -227,7 +181,6 @@ pub fn dequant_fp8_e4m3_to<T>(
     )
 }
 
-#[routine]
 pub fn dequant_fp8_e4m3_to_bf16_per_channel(
     ctx: &Ctx<'_>,
     fp8_in: In<Tensor<u8>>,
@@ -247,7 +200,6 @@ pub fn dequant_fp8_e4m3_to_bf16_per_channel(
     )
 }
 
-#[routine]
 pub fn dequant_fp8_e4m3_to_bf16_per_group(
     ctx: &Ctx<'_>,
     fp8_in: In<Tensor<u8>>,
@@ -275,8 +227,7 @@ pub fn dequant_fp8_e4m3_to_bf16_per_group(
     )
 }
 
-#[routine(bf16)]
-pub fn dequant_mxfp4_to<T>(
+pub fn dequant_mxfp4_to<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     packed: In<Tensor<u8>>,
     block_scale: In<Tensor<u8>>,
@@ -292,92 +243,6 @@ pub fn dequant_mxfp4_to<T>(
         )
         .apply(launch),
         &[packed.arg(), block_scale.arg(), out.arg(), in_dim.arg()],
-    )
-}
-
-#[routine(bf16)]
-pub fn dequant_wna16_int4b8_to<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<i32>>,
-    scale: In<Tensor<T>>,
-    out: Out<Tensor<T>>,
-    group_size: Const<i32>,
-    out_dim: Const<i32>,
-    in_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    const fn elementwise_rows(rows: u32, width: u32) -> Launch {
-        Launch::grid([rows, width.div_ceil(BLOCK), 1], [BLOCK, 1, 1])
-    }
-
-    let (out_dim, in_dim) = (*out_dim, *in_dim);
-    if in_dim % 8 != 0 {
-        return Err(Refusal::Narrow {
-            what: "in_dim's tail past the last whole packed int32 word of 8 int4 values",
-            at: i64::from(in_dim % 8),
-        });
-    }
-    if in_dim % *group_size != 0 {
-        return Err(Refusal::Narrow {
-            what: "in_dim's tail past the last whole scale group",
-            at: i64::from(in_dim % *group_size),
-        });
-    }
-    let launch = elementwise_rows(out_dim.unsigned_abs(), in_dim.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_wna16.cuh",
-            crate::jit::symbol(&format!("::pie::quant::dequant_wna16_int4b8<{}>", T::CPP)),
-        )
-        .apply(launch),
-        &[
-            packed.arg(),
-            scale.arg(),
-            out.arg(),
-            in_dim.arg(),
-            group_size.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn mxfp4_scales_to_marlin_e8m0(
-    ctx: &Ctx<'_>,
-    raw: In<Tensor<u8>>,
-    out: Out<Tensor<u8>>,
-    source_rows: Const<i32>,
-    source_row_offset: Const<i32>,
-    valid_rows: Const<i32>,
-    source_stride_groups: Const<i32>,
-    source_group_offset: Const<i32>,
-    source_groups: Const<i32>,
-    row_select: Const<i32>,
-    selected_rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let selected_rows = *selected_rows;
-    let target_groups = out.width;
-    let total = selected_rows
-        .unsigned_abs()
-        .saturating_mul(target_groups.unsigned_abs());
-    let launch = elementwise(total);
-    ctx.fire(
-        Fire::at(
-            "quant/mxfp4_marlin.cuh",
-            "::pie::quant::mxfp4_scales_to_marlin_e8m0<::pie::u8>",
-        )
-        .apply(launch),
-        &[
-            raw.arg(),
-            out.arg(),
-            source_rows.arg(),
-            source_row_offset.arg(),
-            selected_rows.arg(),
-            valid_rows.arg(),
-            source_stride_groups.arg(),
-            source_group_offset.arg(),
-            source_groups.arg(),
-            target_groups.arg(),
-            row_select.arg(),
-        ],
     )
 }
 
@@ -568,293 +433,6 @@ pub unsafe fn quantize_bf16_to_fp8_e4m3_per_token_group(
             k.arg(),
             group_size.arg(),
             n_groups.arg(),
-        ],
-    )
-}
-
-const fn routed_qmv_quad(routes: u32, width: u32) -> Launch {
-    const MXFP4_DECODE_BLOCK: u32 = 128;
-
-    const MXFP4_ROWS_PER_WARP: u32 = 4;
-
-    let tile = (MXFP4_DECODE_BLOCK / WARP) * MXFP4_ROWS_PER_WARP;
-    Launch::grid(
-        [routes, width.div_ceil(tile), 1],
-        [MXFP4_DECODE_BLOCK, 1, 1],
-    )
-}
-
-const fn routed_qmv(routes: u32, width: u32) -> Launch {
-    Launch::grid([routes, width.div_ceil(BLOCK / WARP), 1], [BLOCK, 1, 1])
-}
-
-fn routes_of(num_tokens: i32, top_k: i32) -> Result<u32, Refusal> {
-    if top_k <= 0 {
-        return Err(Refusal::Empty {
-            what: "the routed fanout",
-        });
-    }
-    Ok(num_tokens
-        .unsigned_abs()
-        .saturating_mul(top_k.unsigned_abs()))
-}
-
-fn per_route(width: i32, top_k: i32) -> Result<i32, Refusal> {
-    if top_k <= 0 {
-        return Err(Refusal::Empty {
-            what: "the routed fanout",
-        });
-    }
-    if width <= 0 {
-        return Err(Refusal::Empty {
-            what: "the routed row",
-        });
-    }
-    if width % top_k != 0 {
-        return Err(Refusal::Narrow {
-            what: "the row is not a whole number of routes",
-            at: i64::from(width),
-        });
-    }
-    Ok(width / top_k)
-}
-
-fn mxfp4_axis(what: &'static str, axis: i32) -> Result<(), Refusal> {
-    if axis <= 0 {
-        return Err(Refusal::Empty { what });
-    }
-    if axis % 32 != 0 {
-        return Err(Refusal::Narrow {
-            what,
-            at: i64::from(axis),
-        });
-    }
-    Ok(())
-}
-
-fn wna16_axis(what: &'static str, axis: i32, group_size: i32) -> Result<(), Refusal> {
-    if axis <= 0 {
-        return Err(Refusal::Empty { what });
-    }
-    if group_size % 8 != 0 {
-        return Err(Refusal::Narrow {
-            what: "the quantisation group size",
-            at: i64::from(group_size),
-        });
-    }
-    if axis % 8 != 0 || axis % group_size != 0 {
-        return Err(Refusal::Narrow {
-            what,
-            at: i64::from(axis),
-        });
-    }
-    Ok(())
-}
-
-#[routine]
-pub fn mxfp4_moe_gate_up_decode_bf16(
-    ctx: &Ctx<'_>,
-    topk_idx: In<Tensor<i32>>,
-    act: In<Tensor<f16>>,
-    _packed_bank: Const<Tensor<u8>>,
-    gate_out: Out<Tensor<bf16>>,
-    up_out: Out<Tensor<bf16>>,
-    glu_limit: Const<f32>,
-    glu_alpha: Const<f32>,
-    ew: In<Struct<ExpertWeights>>,
-) -> Result<(), Refusal> {
-    if ew.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the expert-weight view this statement names",
-        });
-    }
-    let ew = unsafe { &*ew.ptr };
-
-    let packed_ptrs = ew.ptrs;
-    let glu_limit = *glu_limit;
-    let glu_alpha = *glu_alpha;
-
-    let scale_ptrs = ew.scale_ptrs;
-    let gate_bias_ptrs = ctx.absent()?;
-    let up_bias_ptrs = ctx.absent()?;
-    let top_k = topk_idx.width;
-    let intermediate = per_route(gate_out.width, top_k)?;
-    let routes = routes_of(topk_idx.rows, top_k)?;
-    mxfp4_axis("hidden", act.width)?;
-
-    let x = act.all("hidden")?;
-    let launch = routed_qmv_quad(routes, intermediate.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_fp4.cuh",
-            "::pie::quant::mxfp4_moe_gate_up_decode<::pie::i32(4)>",
-        )
-        .apply(launch),
-        &[
-            x.ptr.arg(),
-            topk_idx.arg(),
-            packed_ptrs.arg(),
-            scale_ptrs.arg(),
-            gate_bias_ptrs,
-            up_bias_ptrs,
-            gate_out.arg(),
-            up_out.arg(),
-            Option::<NonNull<f16>>::None.arg(),
-            glu_limit.arg(),
-            glu_alpha.arg(),
-            top_k.arg(),
-            x.stride.arg(),
-            intermediate.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn mxfp4_moe_down_decode_bf16(
-    ctx: &Ctx<'_>,
-    topk_idx: In<Tensor<i32>>,
-    act: In<Tensor<f16>>,
-    _packed_bank: Const<Tensor<u8>>,
-    out: Out<Tensor<bf16>>,
-    ew: In<Struct<ExpertWeights>>,
-) -> Result<(), Refusal> {
-    if ew.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the expert-weight view this statement names",
-        });
-    }
-    let ew = unsafe { &*ew.ptr };
-
-    let packed_ptrs = ew.ptrs;
-
-    let scale_ptrs = ew.scale_ptrs;
-    // The ARRAY, not the plane: the kernel's first act on it is
-    // `bias_ptrs[expert]`. Reading the `_bias` plane's own base here read
-    // eight bytes of bf16 bias data as an address — CUDA 700 at gpt-oss's
-    // first routed layer, sticky. The view's field is the `_bias_ptrs`
-    // carve, which is the fix carried on the operand channel.
-    let bias_ptrs = ew.bias_ptrs;
-
-    let top_k = topk_idx.width;
-    let hidden = per_route(out.width, top_k)?;
-    let intermediate = per_route(act.width, top_k)?;
-    let routes = routes_of(topk_idx.rows, top_k)?;
-    mxfp4_axis("intermediate", intermediate)?;
-
-    let launch = routed_qmv_quad(routes, hidden.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_fp4.cuh",
-            "::pie::quant::mxfp4_moe_down_decode<::pie::i32(4)>",
-        )
-        .apply(launch),
-        &[
-            act.arg(),
-            topk_idx.arg(),
-            packed_ptrs.arg(),
-            scale_ptrs.arg(),
-            bias_ptrs.arg(),
-            out.arg(),
-            hidden.arg(),
-            intermediate.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn wna16_gate_up_decode_bf16(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<f16>>,
-    topk_idx: In<Tensor<i32>>,
-    gate_packed_ptrs: Const<Tensor<i32>>,
-    gate_scale_ptrs: Const<Tensor<c_void>>,
-    up_packed_ptrs: Const<Tensor<i32>>,
-    up_scale_ptrs: Const<Tensor<c_void>>,
-    gate_out: Out<Tensor<bf16>>,
-    up_out: Out<Tensor<bf16>>,
-    group_size: Const<i32>,
-) -> Result<(), Refusal> {
-    let group_size = *group_size;
-    let top_k = topk_idx.width;
-    let routes = routes_of(topk_idx.rows, top_k)?;
-    wna16_axis("hidden", act.width, group_size)?;
-
-    if gate_out.width <= 0 {
-        return Err(Refusal::Empty {
-            what: "the routed row",
-        });
-    }
-
-    let x = act.all("hidden")?;
-    let gate = gate_out.all("the routed row")?;
-    let launch = routed_qmv(routes, gate.width.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_wna16.cuh",
-            "::pie::quant::wna16_gate_up_decode<::pie::i32(0)>",
-        )
-        .apply(launch),
-        &[
-            x.ptr.arg(),
-            topk_idx.arg(),
-            gate_packed_ptrs.arg(),
-            gate_scale_ptrs.arg(),
-            up_packed_ptrs.arg(),
-            up_scale_ptrs.arg(),
-            gate.ptr.arg(),
-            up_out.arg(),
-            top_k.arg(),
-            x.stride.arg(),
-            gate.stride.arg(),
-            group_size.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn wna16_down_decode_bf16(
-    ctx: &Ctx<'_>,
-    act: In<Tensor<f16>>,
-    topk_idx: In<Tensor<i32>>,
-    down_packed_ptrs: Const<Tensor<i32>>,
-    down_scale_ptrs: Const<Tensor<c_void>>,
-    out: Out<Tensor<bf16>>,
-    group_size: Const<i32>,
-) -> Result<(), Refusal> {
-    let group_size = *group_size;
-    const fn routed_qmv_transposed(routes: u32, width: u32) -> Launch {
-        Launch::grid([width.div_ceil(BLOCK / WARP), routes, 1], [BLOCK, 1, 1])
-    }
-
-    let top_k = topk_idx.width;
-    let routes = routes_of(topk_idx.rows, top_k)?;
-    wna16_axis("intermediate", act.width, group_size)?;
-
-    if out.width <= 0 {
-        return Err(Refusal::Empty {
-            what: "the routed row",
-        });
-    }
-
-    let x = act.all("intermediate")?;
-    let y = out.all("the routed row")?;
-    let launch = routed_qmv_transposed(routes, y.width.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_wna16.cuh",
-            "::pie::quant::wna16_down_decode<::pie::i32(0)>",
-        )
-        .apply(launch),
-        &[
-            x.ptr.arg(),
-            topk_idx.arg(),
-            down_packed_ptrs.arg(),
-            down_scale_ptrs.arg(),
-            y.ptr.arg(),
-            top_k.arg(),
-            y.stride.arg(),
-            x.stride.arg(),
-            group_size.arg(),
         ],
     )
 }

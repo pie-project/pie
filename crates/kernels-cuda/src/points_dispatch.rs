@@ -1,5 +1,6 @@
-//! GENERATED — do not edit. One arm per point this plane CLAIMS, read off
-//! `kernels::points`' slot lists and this crate's `*_CLAIMS` tables.
+//! GENERATED — do not edit. One arm per point this plane ANSWERS: the tier-1
+//! points it CLAIMS, read off `kernels::points`' slot lists and this crate's
+//! `*_CLAIMS` tables, and its TIER-2 surface, read off `TIER2_POINTS`.
 //!
 //! The generator is `tests/points_dispatch_is_current/generator.rs`;
 //! `cargo test -p kernels-cuda --test points_dispatch_is_current` refuses a
@@ -15,9 +16,17 @@
 //! needs that a statement does not carry is STAGING, and staging is not this
 //! file's job.
 //!
-//! 66 claimed point(s). An unclaimed point keeps its family's default
-//! body — a measured backlog row — and gets no arm here, so a lane that
-//! states one refuses with the point named rather than one call deeper.
+//! 79 claimed point(s) and 1 tier-2 point(s). An unclaimed
+//! tier-1 point keeps its family's default body — a measured backlog row —
+//! and gets no arm here, so a lane that states one refuses with the point
+//! named rather than one call deeper. A tier-2 point cannot be unclaimed: the
+//! inherent method that declares it is the claim.
+//!
+//! ONE MATCH FOR BOTH TIERS, which is what `.wiki/baker.md` draws, and the
+//! two name spaces cannot collide inside it: a tier-1 point is
+//! `family.method` and carries a dot, an inherent method cannot. A lane
+//! reaches the first as `Call::Point` and the second as `Call::Tier2`, having
+//! stripped the `cuda::` gate the plan spells it with.
 #![cfg_attr(rustfmt, rustfmt::skip)]
 // The families whose points are claimed change as the plane grows; the
 // prelude does not.
@@ -28,13 +37,115 @@ use kernels::bound::{Axis, BoundOp, Site};
 // on the one and turbofishes the other, exactly as an element axis matches
 // on `Axis` and turbofishes `bf16`.
 use kernels::points::{Form, Mxfp4};
-use kernels::points::{Attention, Dist, Gate, Gemm, Hc, Index, Layout, Mla, Mlp, Moe, Norm, Rope, Ssm};
+use kernels::points::{Attention, Dist, Gate, Gemm, Hc, Index, Layout, Mla, Mlp, Moe, Norm, Pool, Rope, Ssm};
 use kernels::routine::Refusal;
 
 use crate::jit::Ctx;
 use crate::jit::abi::bf16;
 
-/// Fire one bound statement through this plane's claims.
+/// Every point this plane claims, with the slot its element axis is read off
+/// and the elements that axis is instantiated at.
+///
+/// THE MATCH BELOW, ENUMERABLE. An executor that wants to know before it
+/// fires whether a lane's every statement will resolve cannot walk a
+/// `match`; it walks this. `None` is a point that quantifies over nothing and
+/// resolves by name alone.
+pub const CLAIMED: &[(&str, Option<Site>, &[Axis])] = &[
+    ("norm.rmsnorm", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.rmsnorm_per_head", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.rmsnorm_plus_one", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.rmsnorm_per_head_plus_one", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.rmsnorm_no_scale", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.rmsnorm_gated", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.rmsnorm_gated_by", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.residual_add", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.add_bias", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.mul_scalar", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("norm.scale", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mlp.swiglu", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mlp.swiglu_clamp", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mlp.swiglu_clamp_alpha", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mlp.geglu_tanh", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mlp.geglu_tanh_packed", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mlp.situ", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("gemm.matmul", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("gemm.lm_head", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("gemm.attention_landing", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("dist.all_reduce", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("rope.full", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("rope.partial", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("rope.partial_q", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("rope.partial_last", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("rope.yarn", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.topk_softmax", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.topk_sigmoid", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.topk_sqrt_softplus", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.matmul_select", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.matmul_select_bias", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.weighted_sum", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("moe.sigmoid_gate_add", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("gate.sigmoid_mul", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("layout.embed", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("layout.split_qkv", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("layout.split_q_gate", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("layout.split_rows", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("layout.select", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.causal_conv1d", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.causal_conv1d_chunked", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.gdn_prep", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.gated_delta", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.gated_delta_chunked", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.kda_step", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("ssm.kda_chunked", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.decode", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.prefill", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.masked", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.decode_lse", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.prefill_lse", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.sink", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.merge_lse", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.logit_softcap", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.kv_append", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("attention.kv_append_shared", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.latents", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.latents_rope", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.split_q_b", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.absorb_q", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.absorb_out", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.kv_append", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.attention_decode", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.attention_prefill", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.attention_decode_selected", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("mla.attention_prefill_selected", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("index.layernorm_rope", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("index.rope", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("index.topk", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("index.kv_append", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("pool.boundary_decode", None, &[Axis::Bf16, Axis::F32]),
+    ("pool.boundary_prefill", None, &[Axis::Bf16, Axis::F32]),
+    ("pool.gather", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("pool.kv_append", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("pool.attention_lse", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("hc.expand", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("hc.rmsnorm_f32", Some(Site::In(0)), &[Axis::Bf16, Axis::F32]),
+    ("hc.gates", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+    ("hc.fold", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+];
+
+/// The same, for this plane's TIER-2 surface — the points an inherent method
+/// on `Ctx` both declares and claims.
+///
+/// A SECOND TABLE AND NOT A COLUMN ON THE FIRST, because the two answer
+/// different questions asked by different call variants. `CLAIMED` answers
+/// "does this plane claim the tier-1 point this lane routed as
+/// `Call::Point`"; this answers the same of a `Call::Tier2`. A row in the
+/// wrong table would be a row no call can reach.
+pub const TIER2: &[(&str, Option<Site>, &[Axis])] = &[
+    ("qkv_fused_qknorm_rope_vnorm_write", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32]),
+];
+
+/// Fire one bound statement through this plane's claims and its tier-2
+/// surface.
 pub fn dispatch<'p, B>(ctx: &Ctx<'p>, op: &B) -> Result<(), Refusal>
 where
     B: BoundOp<Plane = Ctx<'p>>,
@@ -280,6 +391,31 @@ where
             _ => Err(Refusal::Absent { what: "`ssm.kda_chunked`, at an element or repr this plane does not instantiate" }),
         },
         // ── attention ──
+        "attention.decode" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.decode::<bf16>(op.tin::<bf16>(0)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.decode::<f32>(op.tin::<f32>(0)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`attention.decode`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.prefill" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.prefill::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.prefill::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`attention.prefill`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.masked" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.masked::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.masked::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`attention.masked`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.decode_lse" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.decode_lse::<bf16>(op.tin::<bf16>(0)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?, op.tout::<f32>(1)?),
+            Axis::F32 => ctx.decode_lse::<f32>(op.tin::<f32>(0)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?, op.tout::<f32>(1)?),
+            _ => Err(Refusal::Absent { what: "`attention.decode_lse`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.prefill_lse" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.prefill_lse::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<bf16>(0)?, op.tout::<f32>(1)?),
+            Axis::F32 => ctx.prefill_lse::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<f32>(0)?, op.tout::<f32>(1)?),
+            _ => Err(Refusal::Absent { what: "`attention.prefill_lse`, at an element or repr this plane does not instantiate" }),
+        },
         "attention.sink" => match op.dtype(Site::Out(0))? {
             Axis::Bf16 => ctx.sink::<bf16>(op.tinout::<bf16>(0, 0)?, op.tin::<f32>(1)?, op.tconst::<bf16>(0)?, op.u32(0)?),
             Axis::F32 => ctx.sink::<f32>(op.tinout::<f32>(0, 0)?, op.tin::<f32>(1)?, op.tconst::<f32>(0)?, op.u32(0)?),
@@ -294,6 +430,11 @@ where
             Axis::Bf16 => ctx.logit_softcap::<bf16>(op.tinout::<bf16>(0, 0)?, op.f32(0)?),
             Axis::F32 => ctx.logit_softcap::<f32>(op.tinout::<f32>(0, 0)?, op.f32(0)?),
             _ => Err(Refusal::Absent { what: "`attention.logit_softcap`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.kv_append" => match op.dtype(Site::In(0))? {
+            Axis::Bf16 => Attention::kv_append::<bf16>(ctx, op.tin::<bf16>(0)?, op.tin::<bf16>(1)?, op.pages()?),
+            Axis::F32 => Attention::kv_append::<f32>(ctx, op.tin::<f32>(0)?, op.tin::<f32>(1)?, op.pages()?),
+            _ => Err(Refusal::Absent { what: "`attention.kv_append`, at an element or repr this plane does not instantiate" }),
         },
         "attention.kv_append_shared" => match op.dtype(Site::In(0))? {
             Axis::Bf16 => ctx.kv_append_shared::<bf16>(op.tin::<bf16>(0)?, op.pages()?),
@@ -331,6 +472,16 @@ where
             Axis::F32 => Mla::kv_append::<f32>(ctx, op.tin::<f32>(0)?, op.tin::<f32>(1)?, op.pages()?),
             _ => Err(Refusal::Absent { what: "`mla.kv_append`, at an element or repr this plane does not instantiate" }),
         },
+        "mla.attention_decode" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.attention_decode::<bf16>(op.tin::<bf16>(0)?, op.tin::<bf16>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.attention_decode::<f32>(op.tin::<f32>(0)?, op.tin::<f32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`mla.attention_decode`, at an element or repr this plane does not instantiate" }),
+        },
+        "mla.attention_prefill" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.attention_prefill::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.tin::<bf16>(2)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.attention_prefill::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.tin::<f32>(2)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`mla.attention_prefill`, at an element or repr this plane does not instantiate" }),
+        },
         "mla.attention_decode_selected" => match op.dtype(Site::Out(0))? {
             Axis::Bf16 => ctx.attention_decode_selected::<bf16>(op.tin::<bf16>(0)?, op.tin::<bf16>(1)?, op.tin::<i32>(2)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?),
             Axis::F32 => ctx.attention_decode_selected::<f32>(op.tin::<f32>(0)?, op.tin::<f32>(1)?, op.tin::<i32>(2)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?),
@@ -362,6 +513,24 @@ where
             Axis::F32 => Index::kv_append::<f32>(ctx, op.tin::<f32>(0)?, op.pages()?),
             _ => Err(Refusal::Absent { what: "`index.kv_append`, at an element or repr this plane does not instantiate" }),
         },
+        // ── pool ──
+        "pool.boundary_decode" => ctx.boundary_decode(op.tin::<i32>(0)?, op.u32(0)?, op.tout::<i32>(0)?, op.tout::<i32>(1)?),
+        "pool.boundary_prefill" => ctx.boundary_prefill(op.tin::<i32>(0)?, op.tin::<i32>(1)?, op.u32(0)?, op.tout::<i32>(0)?, op.tout::<i32>(1)?),
+        "pool.gather" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.gather::<bf16>(op.tin::<i32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.gather::<f32>(op.tin::<i32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`pool.gather`, at an element or repr this plane does not instantiate" }),
+        },
+        "pool.kv_append" => match op.dtype(Site::In(0))? {
+            Axis::Bf16 => Pool::kv_append::<bf16>(ctx, op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.tin::<i32>(2)?, op.pages()?),
+            Axis::F32 => Pool::kv_append::<f32>(ctx, op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.tin::<i32>(2)?, op.pages()?),
+            _ => Err(Refusal::Absent { what: "`pool.kv_append`, at an element or repr this plane does not instantiate" }),
+        },
+        "pool.attention_lse" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.attention_lse::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<bf16>(0)?, op.tout::<f32>(1)?),
+            Axis::F32 => ctx.attention_lse::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<f32>(0)?, op.tout::<f32>(1)?),
+            _ => Err(Refusal::Absent { what: "`pool.attention_lse`, at an element or repr this plane does not instantiate" }),
+        },
         // ── hc ──
         "hc.expand" => match op.dtype(Site::Out(0))? {
             Axis::Bf16 => ctx.expand::<bf16>(op.tin::<bf16>(0)?, op.u32(0)?, op.tout::<bf16>(0)?),
@@ -383,11 +552,18 @@ where
             Axis::F32 => ctx.fold::<f32>(op.tin::<f32>(0)?, op.tin::<f32>(1)?, op.tin::<f32>(2)?, op.tin::<f32>(3)?, op.tout::<f32>(0)?),
             _ => Err(Refusal::Absent { what: "`hc.fold`, at an element or repr this plane does not instantiate" }),
         },
+        // ── tier-2, inherent on Ctx ──
+        "qkv_fused_qknorm_rope_vnorm_write" => match op.dtype(Site::Out(0))? {
+            Axis::Bf16 => ctx.qkv_fused_qknorm_rope_vnorm_write::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.tconst::<bf16>(0)?, op.f32(0)?, op.tconst::<bf16>(1)?, op.f32(1)?, op.pages()?, op.u32(2)?, op.u32(3)?, op.f32(4)?, op.tout::<bf16>(0)?),
+            Axis::F32 => ctx.qkv_fused_qknorm_rope_vnorm_write::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.tconst::<f32>(0)?, op.f32(0)?, op.tconst::<f32>(1)?, op.f32(1)?, op.pages()?, op.u32(2)?, op.u32(3)?, op.f32(4)?, op.tout::<f32>(0)?),
+            _ => Err(Refusal::Absent { what: "`qkv_fused_qknorm_rope_vnorm_write`, at an element or repr this plane does not instantiate" }),
+        },
         _ => Err(Refusal::Absent {
             // The point is the CALLER's — it handed this the statement and
             // can name it in the report. `Refusal` carries `&'static str`
             // and a generated arm has no name to leak.
-            what: "a point this plane does not claim; see the family's `*_CLAIMS`",
+            what: "a point this plane does not claim; see the family's `*_CLAIMS`, \
+                   or `TIER2_POINTS` for an inherent one",
         }),
     }
 }

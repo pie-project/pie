@@ -3,13 +3,15 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::error::Error;
 use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
 
-pub fn dump_load_plan_json(plan: &LoadPlan) -> Result<String, Error> {
-    serde_json::to_string_pretty(plan)
-        .map_err(|err| Error::Internal(format!("load-plan dump failed: {err}")))
-}
+// `dump_load_plan_json` STOOD HERE: `serde_json::to_string_pretty(plan)`, one
+// line, wrapped so a caller could name the failure. It had none -- not in this
+// crate, not in a driver, not in a test. A plan is `Serialize`, so anyone who
+// wants its full text can write that line where they need it, and the golden
+// tests already do exactly that. What survives below is the surface that is
+// actually read: `describe` for the boot log, `plan_stats_json` for the
+// operator-facing shape.
 
 /// The plan's own name for an instruction.
 ///
@@ -84,8 +86,9 @@ struct PlanStats<'a> {
 /// A compiled plan's shape as JSON: the counts plus instruction and transform
 /// histograms.
 ///
-/// This is the small operator-facing dump, not [`dump_load_plan_json`]'s full
-/// serialization of every instruction.
+/// The small operator-facing dump. It is deliberately not the whole plan: the
+/// counts are what a human reads, and a plan that must be read instruction by
+/// instruction is `Serialize` and can be dumped by whoever needs that.
 pub fn plan_stats_json(plan: &LoadPlan) -> String {
     let mut instruction_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut tile_map_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();

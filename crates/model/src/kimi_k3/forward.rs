@@ -48,9 +48,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
         let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
         let mut blocks: Vec<Value> = Vec::new();
 
-        for (l, w) in m.layers.iter().enumerate() {
-            let l = l as u32;
-
+        for (_, w) in inputs.layers(&m.layers) {
             if let Some(b) = &w.res_blend {
                 blocks.push(y.clone());
                 y = kernels::norm::res_blend(&y, &blocks, &b.norm, &b.proj);
@@ -58,8 +56,8 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
 
             let x = kernels::norm::rmsnorm(&y, &w.mixer_norm.weight, w.mixer_norm.eps);
             let o = match &w.mixer {
-                Mixer::Mla(a) => mla_mixer(&x, &inputs, a, l),
-                Mixer::Kda(k) => kda_mixer(&x, &inputs, k, l),
+                Mixer::Mla(a) => mla_mixer(&x, &inputs, a),
+                Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
             let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
             y = kernels::norm::residual_add(&o, &y);
@@ -124,7 +122,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
     }
 }
 
-fn mla_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Mla<W1>, l: u32) -> Value {
+fn mla_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Mla<W1>) -> Value {
     let pages = inputs.kv(&a.kv);
     let q_a = kernels::gemm::matmul(x, &a.q_a_proj);
     let q_a = kernels::norm::rmsnorm(&q_a, &a.q_a_norm.weight, a.q_a_norm.eps);
@@ -149,7 +147,7 @@ fn mla_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Mla<W1>, l: 
         a.qk_nope_head_dim,
         a.v_head_dim,
     );
-    seam::at(seam::ATTN_Q, (&q,), l);
+    seam::at(seam::ATTN_Q, (&q,));
 
     let one = Facts::qo_one();
     let (dq, p) = q.split(&one);
@@ -177,16 +175,16 @@ fn mla_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Mla<W1>, l: 
         None => o,
         Some(g) => kernels::gate::sigmoid_mul(&o, &kernels::gemm::matmul(x, g)),
     };
-    kernels::gemm::attention_landing(&o, &a.o_proj, l)
+    kernels::gemm::attention_landing(&o, &a.o_proj)
 }
 
-fn kda_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, k: &Kda<W1>, l: u32) -> Value {
+fn kda_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, k: &Kda<W1>) -> Value {
     let conv = inputs.state(&k.conv_state);
     let delta = inputs.state(&k.delta_state);
     let qkv = kernels::gemm::matmul(x, &k.qkv);
     let f = kernels::gemm::matmul(&kernels::gemm::matmul(x, &k.f_a), &k.f_b);
     let b = kernels::gemm::matmul(x, &k.b);
-    seam::at(seam::RECURRENT, (&qkv,), l);
+    seam::at(seam::RECURRENT, (&qkv,));
 
     let one = Facts::qo_one();
     let (qkv_d, qkv_p) = qkv.split(&one);
@@ -208,6 +206,6 @@ fn kda_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, k: &Kda<W1>, l: 
 
     let g = kernels::gemm::matmul(x, &k.gate);
     let o = kernels::norm::rmsnorm_gated_by(&core, &g, &k.o_norm.weight, k.heads, k.o_norm.eps);
-    seam::at(seam::ATTN_OUT, (&o,), l);
+    seam::at(seam::ATTN_OUT, (&o,));
     kernels::gemm::matmul(&o, &k.o_proj)
 }

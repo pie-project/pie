@@ -1,13 +1,15 @@
 //! What this plane is to a `kernels::points` declaration.
 //!
 //! `.wiki/baker.md`'s endpoint shape, brought to wgpu: a family method's
-//! body IS the launcher, and the `#[routine]` fns beside it are the legacy
-//! driver's by-name reach and nothing else. The impl blocks live in the
-//! family files — `norm.rs`, `mlp.rs`, `rope.rs`, `moe.rs`, `layout.rs`,
-//! `attn.rs`, `ssm.rs`, `quant.rs` — so `#[claims]` puts each `*_CLAIMS`
-//! table beside the shaders it is a claim about. This file is the three
-//! things every one of them needs: the payload a mark carries, the `Plane`
-//! impl that names it, and the families this plane has NO shader for.
+//! body IS the launcher, and there is nothing else left. The `#[routine]`
+//! fns that stood beside these blocks were the legacy driver's by-name
+//! reach; that driver left the workspace at R3 and the 104 rows went with
+//! it. The impl blocks live in the family files — `norm.rs`, `mlp.rs`,
+//! `rope.rs`, `moe.rs`, `layout.rs`, `attn.rs`, `ssm.rs`, `quant.rs` — so
+//! `#[claims]` puts each `*_CLAIMS` table beside the shaders it is a claim
+//! about. This file is the three things every one of them needs: the payload
+//! a mark carries, the `Plane` impl that names it, and the families this
+//! plane has NO shader for.
 //!
 //! # The Ctx is a trait object, and that is the first seam
 //!
@@ -74,16 +76,16 @@ impl<V: ShaderValue> kernels::BindMut<V> for Handle {
 ///
 /// # Why this is not `kernels::shader::Tensor<E>`
 ///
-/// The routine layer's `Tensor<E>` is keyed on `shader::Element`, which is a
+/// `kernels::shader::Tensor<E>` is keyed on `shader::Element`, which is a
 /// SPELLING — what a WGSL binding says it holds. A point is keyed on
 /// `points::Scalar`, which is an AXIS — what a dispatch matches over. The two
 /// sets overlap but neither contains the other (`Element` has no `i64`;
 /// `Scalar` has no notion of a WGSL type), and a generic associated type
 /// bounded by one cannot be written in terms of the other without a
 /// type-level map the floor does not have. So the points layer gets its own
-/// carrier and the routine layer keeps its own, and they meet where a body
-/// binds a view's field beside its own operands — both hand the same
-/// `ArgValue::Buffer` to the same fire.
+/// carrier and the view structs keep the shader spelling, and the two meet
+/// where a body binds a view's field beside its own operands — both hand the
+/// same `ArgValue::Buffer` to the same fire.
 #[derive(Debug)]
 pub struct Payload<T>(PhantomData<T>);
 
@@ -185,8 +187,8 @@ pub(crate) fn absent(ctx: &Ctx<'_>) -> Result<ArgValue, Refusal> {
 /// What a mark carries on this plane, as the declaration floor asks it.
 ///
 /// * `Tensor<T>` — a binding handle plus the axis ([`Payload`]).
-/// * `Recurrent` — the GDN/mamba slab pair this plane's ssm routines already
-///   take as `In<Struct<RecurrentState>>`, unchanged.
+/// * `Recurrent` — the GDN/mamba slab pair, [`crate::views::RecurrentView`]
+///   unchanged.
 /// * `Pages` — [`crate::views::AttnFire`], which is `PagedKvView` PLUS the
 ///   per-fire staging every sdpa arm reads. See that type for the seam.
 impl kernels::points::Plane for Ctx<'_> {

@@ -9,7 +9,7 @@
 //!
 //! # Why the payload is a wrapper and not `kernels::shader::Tensor`
 //!
-//! Every routine in this crate takes `In<Tensor<bf16>>` — the shader
+//! Every launch in this crate takes `In<Tensor<bf16>>` — the shader
 //! crate's handle, parameterised by an `Element` marker that carries the
 //! METAL SPELLING of the type. `Plane::Tensor<T>` is parameterised by
 //! `T: Scalar`, which says a type is pointer-shaped and says nothing about
@@ -146,7 +146,7 @@ impl<R: kernels::points::Repr> ConstRun for Planes<R> {
 /// What this plane is to a declaration.
 ///
 /// `Ctx<'a>` is `dyn Encode + 'a` here where cuda's is a struct, and the
-/// impl lands on the trait object for the reason every routine takes one:
+/// impl lands on the trait object for the reason every launch takes one:
 /// the encoder is what a fire talks to, and `driver-metal` is what
 /// implements it. Nothing else about the mapping differs from cuda's — the
 /// two pool views are the ones `views.rs` already declares with
@@ -218,17 +218,18 @@ impl Elem for bfloat {
 /// * NOTHING IMPLEMENTS `BoundOp` FOR THIS PLANE. The trait's accessors
 ///   hand back marks over `Plane::Tensor<T>`, so the implementor is
 ///   whatever owns the arena and the pools, and on this plane that is
-///   `driver-metal`'s baker executor — which does not exist (the retirement
-///   program's R2 has this crate's driver quarantined until it does). The
+///   `driver-metal`'s baker executor — which does not exist (R3 took this
+///   crate's driver out of the workspace until it does; P5 is the return). The
 ///   accessors themselves translate cleanly: `tin`/`tout`/`tconst` want a
 ///   handle and a rectangle, which is exactly what `ArgValue::Shaped`
 ///   already carries, and `recurrent`/`pages` want the two raises
 ///   `views.rs` already builds per (fire, layer).
-/// * THE GENERATOR IS CUDA-SHAPED. `kernels-cuda/tests/generator/mod.rs`
-///   spells `crate::jit::Ctx` and `crate::jit::abi::bf16` into the file it
-///   writes; making it emit for a second plane is parameterising it over
-///   the receiver type, the element module and the family list, and that is
-///   a change to a cuda test target rather than to this crate.
+/// * THE GENERATOR IS CUDA-SHAPED.
+///   `kernels-cuda/tests/points_dispatch_is_current/generator.rs` spells
+///   `crate::jit::Ctx` and `crate::jit::abi::bf16` into the file it writes;
+///   making it emit for a second plane is parameterising it over the
+///   receiver type, the element module and the family list, and that is a
+///   change to a cuda test target rather than to this crate.
 ///
 /// So the claim table stands alone here: `model_ir::kernels::point_claims`
 /// reports it and `sweep::resolve` counts it, which is the measurement this
@@ -332,7 +333,7 @@ pub fn write_half<E: Element>(x: InOut<Tensor<E>>) -> Out<Tensor<E>> {
     }
 }
 
-/// A stated width, as the `i32` every routine in this crate takes.
+/// A stated width, as the `i32` every shader in this tree takes.
 ///
 /// The declarations spell geometry `u32` because a width is not negative;
 /// the shaders take `int` because a grid helper refuses a non-positive

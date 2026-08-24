@@ -119,6 +119,31 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
+/// ways, with `..d` saying that everything else is replicated.
+///
+/// BOTH KV HEAD COUNTS, because this family alternates two attention
+/// geometries down one tower and each states its own fan: the sliding layers
+/// take `kv_heads` at `head_dim` and the full-attention ones
+/// `global_kv_heads` at `global_head_dim`. Cutting one and not the other
+/// would shard half a tower.
+///
+/// `q_heads` is shared by both kinds and cuts once. The two head widths and
+/// `global_rotary_dim` are one head's own extents and do not divide, and
+/// neither does the per-layer embedding tower (`ple_dim`, its table and its
+/// projections): PLE is read per token out of a table every rank holds, and
+/// a cut of it would be a cut of the residual it is added to.
+fn per_rank<const TP: usize>(d: Dims) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+    Dims {
+        q_heads: cut("q_heads", d.q_heads),
+        kv_heads: cut("kv_heads", d.kv_heads),
+        global_kv_heads: cut("global_kv_heads", d.global_kv_heads),
+        intermediate: cut("intermediate", d.intermediate),
+        ..d
+    }
+}
+
 impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
     pub fn e4b() -> Self {
         assemble(Dims {
@@ -158,6 +183,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
 }
 
 fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP> {
+    let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
     let full_at = |l: u32| l % d.full_every == d.full_every - 1;
     let shared_at = |l: u32| l >= d.layers - d.shared_tail;

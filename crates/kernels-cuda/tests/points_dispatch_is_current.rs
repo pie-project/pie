@@ -50,24 +50,28 @@ fn points_dispatch_is_current() {
     );
 }
 
-/// The committed file answers EVERY point the plane claims, and answers no
+/// The committed file answers EVERY point the plane answers, and answers no
 /// point it does not.
 ///
 /// The freshness test above proves the file is what the generator writes;
 /// this proves the generator did not drop a claim on the way out. It is the
-/// half of "the tables are the source of truth" that IS checkable — a family
-/// missing from `generator::families()` is invisible to both, and the
+/// half of "the tables are the source of truth" that IS checkable — a surface
+/// missing from `generator::surfaces()` is invisible to both, and the
 /// generator's own header says so.
+///
+/// BOTH TIERS, because both get an arm in the one match: a tier-1 point this
+/// plane claims, and every point of its tier-2 surface — which is all of
+/// them, an inherent method being its own claim.
 #[test]
 fn every_claim_has_an_arm() {
     let file = std::fs::read_to_string(at()).expect("the committed dispatch");
     let mut missing: Vec<&str> = Vec::new();
     let mut claimed: Vec<&str> = Vec::new();
-    for f in generator::families() {
-        for point in f.claims {
-            claimed.push(point);
-            if !file.contains(&format!("        {point:?} =>")) {
-                missing.push(point);
+    for surface in generator::surfaces() {
+        for point in surface.arms() {
+            claimed.push(point.name);
+            if !file.contains(&format!("        {:?} =>", point.name)) {
+                missing.push(point.name);
             }
         }
     }
@@ -84,4 +88,38 @@ fn every_claim_has_an_arm() {
     let extra: Vec<&&str> = arms.iter().filter(|a| !claimed.contains(a)).collect();
     assert!(extra.is_empty(), "dispatched and not claimed: {extra:?}");
     assert_eq!(arms.len(), claimed.len(), "one arm per claim, and no arm twice");
+}
+
+/// Every `CANON` row names a point this plane DOES NOT claim.
+///
+/// `model_compiler::sweep::resolve` asks the claim tables first and
+/// `kernels_cuda::CANON` second, so a row for a point the plane claims is
+/// unreachable — a line that reads as a live answer and is never consulted.
+/// A row for a point the FLOOR does not declare is worse: nothing will ever
+/// ask for it, and a typo in the family half looks exactly like a backlog.
+///
+/// This replaced `kernels::canon::ROLES`, a closed list of family prefixes
+/// the `#[routine]` attribute asserted its `canon` column against at build
+/// time. A prefix list could only catch a misspelled FAMILY; the point
+/// tables catch a misspelled point, a point that moved, and a row that
+/// stopped being a backlog because the plane grew a claim for it.
+#[test]
+fn every_canon_row_is_an_unclaimed_point() {
+    let mut declared: Vec<&str> = Vec::new();
+    let mut claimed: Vec<&str> = Vec::new();
+    for surface in generator::surfaces() {
+        declared.extend(surface.declares().iter().map(|p| p.name));
+        claimed.extend(surface.arms().into_iter().map(|p| p.name));
+    }
+    for (claim, symbol) in kernels_cuda::CANON {
+        assert!(
+            declared.contains(claim),
+            "`CANON` answers `{claim}` with `{symbol}`, and no family declares that point"
+        );
+        assert!(
+            !claimed.contains(claim),
+            "`CANON` answers `{claim}`, which this plane CLAIMS -- the claim wins at \
+             resolution and this row is never read"
+        );
+    }
 }

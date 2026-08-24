@@ -3,7 +3,6 @@ use crate::jit::{ArgValue, Ctx, Launch, aligned16};
 use kernels::Fire;
 use kernels::Refusal;
 use kernels::routine::{Const, In, Out};
-use kernels_macros::routine;
 
 const WARPS: u32 = 4;
 
@@ -24,8 +23,8 @@ fn unroll_depth(ctx: &Ctx<'_>) -> i32 {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-#[routine(internal)]
-pub fn gemv_bf16(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemv_bf16(
     ctx: &Ctx<'_>,
     weight: Const<Tensor<std::ffi::c_void>>,
     act: In<Tensor<std::ffi::c_void>>,

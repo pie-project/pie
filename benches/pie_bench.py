@@ -303,76 +303,6 @@ def build_config(args: argparse.Namespace):
             driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
-    elif args.driver == "metal":
-        # Apple Silicon. The Metal driver sizes its own heap from the
-        # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
-        # `gpu_mem_utilization` has nowhere to go; the batching caps are the
-        # only tunables it reads.
-        driver_options = {}
-        # Same key, same name, both backends -- the switch is a residency trade
-        # an operator makes about a model, not a backend detail.
-        if getattr(args, "stream_routed_experts", False):
-            driver_options["stream_routed_experts"] = True
-        # The bounded form of the same trade, and the only one that can admit a
-        # checkpoint bigger than the machine: streaming maps the bank and every
-        # mapped page is wired, so it moves bytes off the heap without capping
-        # them, while a slab caps them and pays a submit-and-wait per layer.
-        if getattr(args, "expert_slab_mb", 0):
-            driver_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
-        if getattr(args, "max_forward_tokens", 0):
-            driver_options["max_forward_tokens"] = args.max_forward_tokens
-        if getattr(args, "max_forward_requests", 0):
-            driver_options["max_forward_requests"] = args.max_forward_requests
-        if getattr(args, "total_pages", 0):
-            driver_options["total_pages"] = args.total_pages
-        # `--max-model-len` is the cross-engine context knob (llama.cpp takes
-        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
-        # engine it means ONE REQUEST's context. The Metal driver's knob is
-        # the whole fleet's ring -- it is one shared linear ring, not a
-        # per-request allocation -- so the fair translation multiplies by the
-        # fleet the client will actually offer. Sending the per-request number
-        # straight through would hand a 16-way run 128 tokens per request and
-        # measure a starved engine against unstarved ones.
-        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
-        driver_options["max_model_len"] = args.max_model_len * fleet
-    elif args.driver == "vulkan":
-        # Vulkan, anywhere there is a loader and an ICD. Its option table is
-        # THREE KEYS -- `kv_pages`, `ready_timeout`, `shutdown_timeout`
-        # (`worker::config::VulkanDriverOptions`) -- and that is not an
-        # oversight to be filled in later: this driver sizes nothing from a
-        # memory fraction and takes no batching caps, so the CUDA-shaped
-        # `gpu_mem_utilization`, `max_forward_tokens` and
-        # `max_forward_requests` have nowhere to go and passing them is a
-        # parse error naming the driver that refused them.
-        #
-        # `total_pages` is spelled `kv_pages` here for the reason the CUDA
-        # comment above gives about Metal: the value IS the pool, not a
-        # ceiling over a number derived from a fraction. `--max-model-len` is
-        # therefore also translated rather than forwarded -- see below.
-        driver_options = {
-            "ready_timeout": f"{int(args.server_startup_timeout)}s",
-        }
-        # `--device` defaults to `cuda:0`, which this driver's config validator
-        # rejects by name. It is not a selector either way -- the shell opens
-        # the first device the loader reports -- but `device` is required of
-        # every driver, so an untouched default is translated rather than
-        # forwarded. An explicit `--device` still wins.
-        if args.device == PIE_BENCH_DEFAULT_DEVICE:
-            device = ["vulkan:0"]
-        if getattr(args, "total_pages", 0):
-            driver_options["kv_pages"] = args.total_pages
-        else:
-            # The page size is the model text's, not a knob, so the honest
-            # translation of a per-request context length into a pool size
-            # needs the page size -- which an offline harness cannot read.
-            # 16 is what every llama-like text in this tree states, and the
-            # fleet multiplier is Metal's argument one line down: a shared
-            # pool divided by a client's concurrency is what each request
-            # actually gets, so sending the per-request number straight
-            # through would measure a starved engine against unstarved ones.
-            fleet = max(1, args.concurrency) if args.mode != "latency" else 1
-            pages = (args.max_model_len * fleet + 15) // 16
-            driver_options["kv_pages"] = max(1, pages)
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -1427,7 +1357,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "metal", "vulkan", "vllm", "sglang",
+                        choices=["cuda_native", "vllm", "sglang",
                                  "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)

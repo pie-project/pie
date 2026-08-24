@@ -1,11 +1,18 @@
-//! Launches a "fire": a driver-declared `Root` instantiation, distinct from a
-//! routine (compiled beside its `.cuh`).
+//! Launches a "fire": one hand-written instantiation of a `.cuh` whose host
+//! side this driver owns, distinct from a point's claim body (compiled beside
+//! its declaration).
 
-use kernels_cuda::ArgValue;
 use kernels_cuda::jit::{Ctx, Launch};
+use kernels_cuda::{ArgValue, Refusal};
 
-/// Launch one instantiation of the file `file` names. Panics if compile,
-/// load or launch fails — per-symbol JIT has no fallback.
+/// Launch one instantiation of the file `file` names.
+///
+/// # Errors
+///
+/// Whatever the JIT declined with — compile, load or launch. Per-symbol JIT
+/// has no fallback, so there is nothing to try instead; what there is, is a
+/// caller. The `panic!` that stood here made a refusal this process's exit,
+/// and a driver's next line is somebody else's request.
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // the stream is borrowed, never read
 pub fn fire(
     file: &'static str,
@@ -13,13 +20,7 @@ pub fn fire(
     launch: Launch,
     values: &[ArgValue],
     stream: *mut std::ffi::c_void,
-) {
+) -> Result<(), Refusal> {
     // SAFETY: `values` are live allocations; `stream` stays valid across the launch.
-    // `Ctx::launch` BECAME `Ctx::fire`, taking the four facts as one `Fire`.
-    let fired = unsafe {
-        Ctx::on(stream).fire(kernels::Fire::at(file, instantiation).apply(launch), values)
-    };
-    if let Err(why) = fired {
-        panic!("{instantiation}: {why}");
-    }
+    unsafe { Ctx::on(stream).fire(kernels::Fire::at(file, instantiation).apply(launch), values) }
 }

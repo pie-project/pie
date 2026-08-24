@@ -8,7 +8,6 @@ pub use kernels::{Bind, Refusal, Region, Stride, Ty};
 
 pub use crate::jit::{Ctx, Launch};
 
-pub use crate::jit::Routine;
 
 pub use crate::jit::ArgValue;
 

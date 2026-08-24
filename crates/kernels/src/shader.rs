@@ -150,12 +150,7 @@ macro_rules! element {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct bf16;
 
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct f16;
-
 element!(bf16, Ty::Bf16s, Ty::Bf16sMut, Bf16);
-element!(f16, Ty::F16s, Ty::F16sMut, F16);
 element!(f32, Ty::F32s, Ty::F32sMut, F32);
 element!(i32, Ty::I32s, Ty::I32sMut, I32);
 element!(u32, Ty::U32s, Ty::U32sMut, U32);
@@ -422,4 +417,3 @@ macro_rules! shader_scalar {
 }
 
 shader_scalar!(bf16, Bf16, Bf16s, Bf16sMut);
-shader_scalar!(f16, F16, F16s, F16sMut);

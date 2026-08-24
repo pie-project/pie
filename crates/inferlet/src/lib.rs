@@ -142,7 +142,8 @@ pub mod grammar {
 /// (animated GIF), [`Audio::from_bytes`](media::Audio) (WAV) — and the host
 /// decodes + preprocesses per the bound model. The returned handle's
 /// `token-count` / `position-span` / `grid` describe how it occupies the
-/// context. No model-specific code lives in the inferlet. See MULTIMODAL.md.
+/// context. No model-specific code lives in the inferlet.
+/// (`MULTIMODAL.md` was the design; doc not in tree.)
 pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }

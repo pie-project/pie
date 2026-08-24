@@ -167,7 +167,7 @@ fn a_strided_regroup_of_blocked_rows_keeps_the_blocks_whole() {
 
 /// One instance of a blocked stack is the instance it names.
 ///
-/// The shape `crates/model/src/qwen_3/import_moe.rs` needs: llama.cpp joins a
+/// The shape a GGUF mixture import needs: llama.cpp joins a
 /// mixture's experts into one `[E, I, H]` tensor and the artifact holds `E`
 /// separate `[I, H]` ones, so the ingest cuts a slab per expert. Every slab
 /// but the first begins at a nonzero offset, which is where a blocked tensor

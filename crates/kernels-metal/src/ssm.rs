@@ -1,13 +1,9 @@
-use kernels::BindMut;
 use kernels::Grid;
 use kernels::points::Scalar;
 use kernels::routine::Refusal;
-use kernels_macros::routine;
 
 use crate::plane::{self, Handle};
-use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
-use crate::views::RecurrentState;
-use kernels::raises::Struct;
+use crate::routine::{Bind, Const, Ctx, Fire, In, Out, bf16};
 
 fn head_rows(rows: i32, v_heads: i32) -> Result<u32, Refusal> {
     if rows <= 0 {
@@ -23,7 +19,12 @@ fn head_rows(rows: i32, v_heads: i32) -> Result<u32, Refusal> {
     })
 }
 
-fn core_grid(rows: i32, v_heads: i32, v_dim: i32) -> Result<[u32; 3], Refusal> {
+/// The recurrence's grid: one simdgroup per value channel, per (row, head).
+///
+/// `gdn_core.metal` walks the state matrix a channel at a time, so the y
+/// extent is the value dimension and the z extent is every (row, head) pair
+/// there is.
+pub fn core_grid(rows: i32, v_heads: i32, v_dim: i32) -> Result<[u32; 3], Refusal> {
     let z = head_rows(rows, v_heads)?;
     if v_dim <= 0 {
         return Err(Refusal::Empty { what: "v_dim" });
@@ -31,19 +32,32 @@ fn core_grid(rows: i32, v_heads: i32, v_dim: i32) -> Result<[u32; 3], Refusal> {
     Ok([32, v_dim.unsigned_abs(), z])
 }
 
-fn prep_grid(rows: i32, v_heads: i32) -> Result<[u32; 3], Refusal> {
+/// The prologue's grid: one simdgroup per (row, head), no channel axis.
+pub fn prep_grid(rows: i32, v_heads: i32) -> Result<[u32; 3], Refusal> {
     Ok([32, 1, head_rows(rows, v_heads)?])
 }
 
-const fn core_group(grid: [u32; 3]) -> [u32; 3] {
+/// The recurrence's threadgroup: FOUR simdgroups deep.
+///
+/// The four cooperate on one channel's state row; the prologue takes
+/// [`simd_group`] because it has no state row to share.
+pub const fn core_group(grid: [u32; 3]) -> [u32; 3] {
     [grid[0], 4, 1]
 }
 
-const fn simd_group(grid: [u32; 3]) -> [u32; 3] {
+/// One simdgroup, the width the grid's x extent already states.
+pub const fn simd_group(grid: [u32; 3]) -> [u32; 3] {
     [grid[0], 1, 1]
 }
 
-fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
+/// The chunked scan's arm, as an index into a nine-name list.
+///
+/// NINE TILINGS AND NOT A PRODUCT, which is why this is a match and not two
+/// axis checks: `ssm/gdn_core.metal` instantiates its prefill scan at the
+/// `(lane width, rows per lane group)` pairs its shared-memory budget admits —
+/// `(16,1) (16,2) (16,4) (32,2) (32,4) (32,8) (4,1) (8,1) (8,2)`, in that
+/// order — and the combinations between them were never compiled.
+pub fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
     match (lanes, vrows) {
         (16, 1) => Ok(0),
         (16, 2) => Ok(1),
@@ -65,7 +79,13 @@ fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
     }
 }
 
-fn scan_grid(v_dim: i32, v_heads: i32, lanes: i32, vrows: i32) -> Result<[u32; 3], Refusal> {
+/// The chunked scan's grid, from the tiling the arm was compiled at.
+///
+/// EACH THREADGROUP OWNS `(32 / lanes) * vrows` CHANNELS — the lane width
+/// divides the simdgroup into that many independent scans and each carries
+/// `vrows` of them — so the channel axis is the value dimension over that
+/// product, and the heads ride z.
+pub fn scan_grid(v_dim: i32, v_heads: i32, lanes: i32, vrows: i32) -> Result<[u32; 3], Refusal> {
     if v_dim <= 0 {
         return Err(Refusal::Empty { what: "v_dim" });
     }
@@ -88,580 +108,6 @@ fn scan_grid(v_dim: i32, v_heads: i32, lanes: i32, vrows: i32) -> Result<[u32; 3
         v_dim.unsigned_abs().div_ceil(per_y),
         v_heads.unsigned_abs(),
     ])
-}
-
-#[routine]
-pub fn gdn_core(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    core_out: Out<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    a_log: Const<Tensor<f32>>,
-    dt_bias: Const<Tensor<bf16>>,
-    a_gate: In<Tensor<bf16>>,
-    b_gate: In<Tensor<bf16>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let rstate = rsv.state;
-    let new_conv_state = rsv.new_conv_state;
-    let rows = *rows;
-    let grid = core_grid(rows, *v_heads, *v_dim)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_core.metal", "gdn_core_bfloat16").apply(Grid::of(grid, core_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            rstate.arg_mut(),
-            core_out.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            a_log.arg(),
-            dt_bias.arg(),
-            a_gate.arg(),
-            b_gate.arg(),
-            new_conv_state.arg_mut(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gdn_core_slotted(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    core_out: Out<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    a_log: Const<Tensor<f32>>,
-    dt_bias: Const<Tensor<bf16>>,
-    a_gate: In<Tensor<bf16>>,
-    b_gate: In<Tensor<bf16>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let rstate = rsv.state;
-    let new_conv_state = rsv.new_conv_state;
-    let slot_ids = rsv.slots;
-    let rows = *rows;
-    let grid = core_grid(rows, *v_heads, *v_dim)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_core.metal", "gdn_core_slotted_bfloat16")
-            .apply(Grid::of(grid, core_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            rstate.arg_mut(),
-            core_out.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            a_log.arg(),
-            dt_bias.arg(),
-            a_gate.arg(),
-            b_gate.arg(),
-            new_conv_state.arg_mut(),
-            slot_ids.arg(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gdn_prep(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    a_log: Const<Tensor<f32>>,
-    dt_bias: Const<Tensor<bf16>>,
-    a_gate: In<Tensor<bf16>>,
-    b_gate: In<Tensor<bf16>>,
-    pre_q: Out<Tensor<f32>>,
-    pre_k: Out<Tensor<f32>>,
-    pre_gate: Out<Tensor<f32>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let new_conv_state = rsv.new_conv_state;
-    let rows = *rows;
-    let grid = prep_grid(rows, *v_heads)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_prep_bfloat16").apply(Grid::of(grid, simd_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            a_log.arg(),
-            dt_bias.arg(),
-            a_gate.arg(),
-            b_gate.arg(),
-            pre_q.arg(),
-            pre_k.arg(),
-            pre_gate.arg(),
-            new_conv_state.arg_mut(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-        ],
-    )
-}
-
-// NOT INLINED, AND NOT THIS POINT ANY MORE. W10 rewrote `ssm.gdn_prep` into
-// one launch over the packed `[b | a]` projection; this routine is the
-// pre-W10 one (conv + norm + widen + gates against a recurrent view, five
-// rectangles out). The `canon` stays because the legacy driver still fires
-// it under that name; `impl Ssm` below claims the point with the launch the
-// declaration actually states.
-#[routine(canon = "ssm.gdn_prep")]
-pub fn gdn_prep_slotted(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    a_log: Const<Tensor<f32>>,
-    dt_bias: Const<Tensor<bf16>>,
-    a_gate: In<Tensor<bf16>>,
-    b_gate: In<Tensor<bf16>>,
-    pre_q: Out<Tensor<f32>>,
-    pre_k: Out<Tensor<f32>>,
-    pre_gate: Out<Tensor<f32>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let new_conv_state = rsv.new_conv_state;
-    let slot_ids = rsv.slots;
-    let rows = *rows;
-    let grid = prep_grid(rows, *v_heads)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_prep_slotted_bfloat16")
-            .apply(Grid::of(grid, simd_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            a_log.arg(),
-            dt_bias.arg(),
-            a_gate.arg(),
-            b_gate.arg(),
-            pre_q.arg(),
-            pre_k.arg(),
-            pre_gate.arg(),
-            new_conv_state.arg_mut(),
-            slot_ids.arg(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gdn_core_recurrent(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    core_out: Out<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    pre_q: In<Tensor<f32>>,
-    pre_k: In<Tensor<f32>>,
-    pre_gate: In<Tensor<f32>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let rstate = rsv.state;
-    let new_conv_state = rsv.new_conv_state;
-    let rows = *rows;
-    let grid = core_grid(rows, *v_heads, *v_dim)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_core_recurrent_bfloat16")
-            .apply(Grid::of(grid, core_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            rstate.arg_mut(),
-            core_out.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            pre_q.arg(),
-            pre_k.arg(),
-            pre_gate.arg(),
-            new_conv_state.arg_mut(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gdn_core_recurrent_slotted(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    core_out: Out<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    pre_q: In<Tensor<f32>>,
-    pre_k: In<Tensor<f32>>,
-    pre_gate: In<Tensor<f32>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let rstate = rsv.state;
-    let new_conv_state = rsv.new_conv_state;
-    let slot_ids = rsv.slots;
-    let rows = *rows;
-    let grid = core_grid(rows, *v_heads, *v_dim)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_core_recurrent_slotted_bfloat16")
-            .apply(Grid::of(grid, core_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            rstate.arg_mut(),
-            core_out.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            pre_q.arg(),
-            pre_k.arg(),
-            pre_gate.arg(),
-            new_conv_state.arg_mut(),
-            slot_ids.arg(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gdn_prep_prefill(
-    ctx: &Ctx<'_>,
-    mixed: In<Tensor<bf16>>,
-    conv_w: Const<Tensor<bf16>>,
-    conv_b: Const<Tensor<bf16>>,
-    a_log: Const<Tensor<f32>>,
-    dt_bias: Const<Tensor<bf16>>,
-    a_gate: In<Tensor<bf16>>,
-    b_gate: In<Tensor<bf16>>,
-    pre_q: Out<Tensor<f32>>,
-    pre_k: Out<Tensor<f32>>,
-    pre_gate: Out<Tensor<f32>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    rsv: In<Struct<RecurrentState>>,
-    n_scan: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let conv_state = rsv.conv_state;
-    let new_conv_state = rsv.new_conv_state;
-    let slot_ids = rsv.slots;
-    let row_pitch = mixed.width;
-    let n_scan = *n_scan;
-    if n_scan <= 0 {
-        return Err(Refusal::Empty { what: "n_scan" });
-    }
-    if row_pitch <= 0 {
-        return Err(Refusal::Empty { what: "row_pitch" });
-    }
-    let grid = prep_grid(n_scan, *v_heads)?;
-    ctx.fire(
-        Fire::at("ssm/gdn_prep.metal", "gdn_prep_prefill_bfloat16")
-            .apply(Grid::of(grid, simd_group(grid))),
-        &[
-            mixed.arg(),
-            conv_state.arg(),
-            conv_w.arg(),
-            conv_b.arg(),
-            a_log.arg(),
-            dt_bias.arg(),
-            a_gate.arg(),
-            b_gate.arg(),
-            pre_q.arg(),
-            pre_k.arg(),
-            pre_gate.arg(),
-            new_conv_state.arg_mut(),
-            slot_ids.arg(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-            row_pitch.arg(),
-            n_scan.arg(),
-        ],
-    )
-}
-
-#[routine]
-pub fn gdn_core_recurrent_prefill(
-    ctx: &Ctx<'_>,
-    pad: In<Tensor<bf16>>,
-    core_out: Out<Tensor<bf16>>,
-    pre_q: In<Tensor<f32>>,
-    pre_k: In<Tensor<f32>>,
-    pre_gate: In<Tensor<f32>>,
-    k_dim: Const<i32>,
-    v_dim: Const<i32>,
-    k_heads: Const<i32>,
-    v_heads: Const<i32>,
-    conv_dim: Const<i32>,
-    conv_k: Const<i32>,
-    q_off: Const<i32>,
-    k_off: Const<i32>,
-    v_off: Const<i32>,
-    eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>,
-    lanes: Const<i32>,
-    vrows: Const<i32>,
-    rsv: In<Struct<RecurrentState>>,
-    n_scan: Const<i32>,
-) -> Result<(), Refusal> {
-    if rsv.ptr.is_null() {
-        return Err(Refusal::Null {
-            what: "the recurrent view this statement names",
-        });
-    }
-    let rsv = unsafe { &*rsv.ptr };
-    let rstate = rsv.state;
-    let slot_ids = rsv.slots;
-
-    let row_pitch = pre_q.width;
-    let n_scan = *n_scan;
-
-    let point = scan_point(*lanes, *vrows)?;
-    if n_scan <= 0 {
-        return Err(Refusal::Empty { what: "n_scan" });
-    }
-    if row_pitch <= 0 {
-        return Err(Refusal::Empty { what: "row_pitch" });
-    }
-    let grid = scan_grid(*v_dim, *v_heads, *lanes, *vrows)?;
-    ctx.fire(
-        Fire::at(
-            "ssm/gdn_prep.metal",
-            [
-                "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
-                "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
-                "gdn_core_recurrent_prefill_bfloat16_l_16_v_4",
-                "gdn_core_recurrent_prefill_bfloat16_l_32_v_2",
-                "gdn_core_recurrent_prefill_bfloat16_l_32_v_4",
-                "gdn_core_recurrent_prefill_bfloat16_l_32_v_8",
-                "gdn_core_recurrent_prefill_bfloat16_l_4_v_1",
-                "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
-                "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
-            ][point],
-        )
-        .apply(Grid::of(grid, simd_group(grid))),
-        &[
-            pad.arg(),
-            pad.arg(),
-            rstate.arg_mut(),
-            core_out.arg(),
-            pad.arg(),
-            pad.arg(),
-            pre_q.arg(),
-            pre_k.arg(),
-            pre_gate.arg(),
-            pad.arg(),
-            slot_ids.arg(),
-            k_dim.arg(),
-            v_dim.arg(),
-            k_heads.arg(),
-            v_heads.arg(),
-            conv_dim.arg(),
-            conv_k.arg(),
-            q_off.arg(),
-            k_off.arg(),
-            v_off.arg(),
-            eps.arg(),
-            inv_sqrt_dk.arg(),
-            row_pitch.arg(),
-            n_scan.arg(),
-        ],
-    )
 }
 
 /// The threadgroup a per-head prologue runs in.
@@ -711,11 +157,12 @@ impl kernels::points::Ssm for Ctx<'_> {
     /// packed `[g_log | beta]` decay row out.
     ///
     /// ONE LAUNCH, AND EXACTLY THE DECLARATION'S SLOTS — which is what makes
-    /// this a claim rather than a `canon` row. `gdn_prep_slotted` above wears
-    /// the same point's name and is a different statement: it takes the
-    /// post-mixer row this declaration has no slot for, reaches a recurrent
-    /// view this declaration does not name, and writes five rectangles where
-    /// this one states one.
+    /// this a claim and not a delegation. `ssm/gdn_prep.metal` still stamps
+    /// the pre-W10 `gdn_prep_slotted` arm that answered this point's name
+    /// through the retired `canon` row, and it is a different statement: it
+    /// takes the post-mixer row this declaration has no slot for, reaches a
+    /// recurrent view this declaration does not name, and writes five
+    /// rectangles where this one states one.
     ///
     /// `qwen_gdn_ba_gates` is the arithmetic with the packing kept, ported
     /// from `kernels-cuda`'s `ssm/gated_delta_net_prep.cuh` slot for slot. It

@@ -5,7 +5,6 @@ use model_dsl::{Plan, Plane};
 pub mod forward;
 pub mod import;
 pub mod model;
-pub mod template;
 
 use import::{import_gguf, import_hf};
 use model::Model;

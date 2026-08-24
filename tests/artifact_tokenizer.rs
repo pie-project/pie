@@ -155,12 +155,12 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
 
     let objects = parse_metadata(std::path::Path::new(&artifact)).unwrap();
     let raw = objects
-        .get(model::encoding::CONFIG_OBJECT)
+        .get(model::serve::encoding::CONFIG_OBJECT)
         .unwrap_or_else(|| {
             panic!(
                 "the artifact carries no {}; it was written before the config was \
                  carried verbatim, or from a source that had none",
-                model::encoding::CONFIG_OBJECT
+                model::serve::encoding::CONFIG_OBJECT
             )
         });
 
@@ -178,7 +178,7 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
     // is carried at all.
     let text = std::str::from_utf8(raw).expect("the carried config is not UTF-8");
     let encoding =
-        model::encoding::Encoding::from_config_json(text).expect("Encoding cannot read it");
+        model::serve::encoding::Encoding::from_config_json(text).expect("Encoding cannot read it");
 
     if let Ok(source) = std::env::var("PIE_TEST_CONFIG") {
         let want = std::fs::read(&source).expect("cannot read PIE_TEST_CONFIG");
@@ -192,7 +192,7 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
 
     eprintln!(
         "{artifact}: carries {} ({} bytes, quant method {:?})",
-        model::encoding::CONFIG_OBJECT,
+        model::serve::encoding::CONFIG_OBJECT,
         raw.len(),
         encoding.method
     );

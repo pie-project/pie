@@ -922,37 +922,8 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     }
 }
 
-const ALL_REDUCE_BF16_ROW: ::kernels::routine::Routine<crate::Plane> = ::kernels::untraced!(
-    crate::Plane,
-    "all_reduce_bf16",
-    all_reduce_bf16,
-    namespace = "comm",
-    whole,
-    driver
-);
-
-#[cfg(not(target_family = "wasm"))]
-#[::linkme::distributed_slice(crate::ROUTINES)]
-static ALL_REDUCE_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> = ALL_REDUCE_BF16_ROW;
-
-#[cfg(target_family = "wasm")]
-::inventory::submit! { crate::Registered(ALL_REDUCE_BF16_ROW) }
-
-const ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW: ::kernels::routine::Routine<crate::Plane> =
-    ::kernels::untraced!(
-        crate::Plane,
-        "all_reduce_residual_rmsnorm_bf16",
-        all_reduce_residual_rmsnorm_bf16,
-        namespace = "comm",
-        whole,
-        driver
-    )
-    .stating(&[Some(::kernels::Source::Alias(1, 0))]);
-
-#[cfg(not(target_family = "wasm"))]
-#[::linkme::distributed_slice(crate::ROUTINES)]
-static ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
-    ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW;
-
-#[cfg(target_family = "wasm")]
-::inventory::submit! { crate::Registered(ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROW) }
+// TWO `untraced!` ROWS STOOD HERE — `comm::all_reduce_bf16` and
+// `comm::all_reduce_residual_rmsnorm_bf16`, submitted into the linkme
+// registry so a driver could reach them by string. `driver-cuda` calls both
+// BY PATH (`fire/all_reduce.rs`), which is the only caller either ever had,
+// and the registry is deleted with the rest of the routine layer.

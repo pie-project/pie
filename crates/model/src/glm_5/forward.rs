@@ -37,10 +37,9 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
         let ids = inputs.token_ids();
         let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
 
-        for (l, w) in m.layers.iter().enumerate() {
-            let l = l as u32;
+        for (_, w) in inputs.layers(&m.layers) {
             let x = kernels::norm::rmsnorm(&y, &w.attn_norm.weight, w.attn_norm.eps);
-            let o = latent_attention(&x, &inputs, &w.attn, l);
+            let o = latent_attention(&x, &inputs, &w.attn);
             let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
             y = kernels::norm::residual_add(&o, &y);
 
@@ -100,7 +99,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
     }
 }
 
-fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l: u32) -> Value {
+fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>) -> Value {
     let pages = inputs.kv(&a.kv);
     let positions = inputs.positions();
 
@@ -108,7 +107,7 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
     let q_a = kernels::norm::rmsnorm(&q_a, &a.q_a_norm.weight, a.q_a_norm.eps);
     let q_b = kernels::gemm::matmul(&q_a, &a.q_b_proj);
     let kv_a = kernels::gemm::matmul(x, &a.kv_a_proj);
-    seam::at(seam::ATTN_QV, (&q_b, &kv_a), l);
+    seam::at(seam::ATTN_QV, (&q_b, &kv_a));
 
     let selection = index_select(x, &q_a, inputs, a, &positions);
 
@@ -140,7 +139,7 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
         a.qk_nope_head_dim,
         a.v_head_dim,
     );
-    seam::at(seam::ATTN_Q, (&q,), l);
+    seam::at(seam::ATTN_Q, (&q,));
 
     let one = Facts::qo_one();
     let (dq, pq) = q.split(&one);
@@ -175,8 +174,8 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
         a.v_head_dim,
         a.qk_nope_head_dim,
     );
-    seam::at(seam::ATTN_OUT, (&v,), l);
-    kernels::gemm::attention_landing(&v, &a.o_proj, l)
+    seam::at(seam::ATTN_OUT, (&v,));
+    kernels::gemm::attention_landing(&v, &a.o_proj)
 }
 
 fn index_select<W1: Dtype>(

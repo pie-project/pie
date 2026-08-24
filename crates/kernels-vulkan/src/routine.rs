@@ -174,22 +174,25 @@ impl kernels::shader::Lang for Vulkan {
     const IN_PACKED: &'static str = "uint";
 }
 
-pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16, f16};
+pub use kernels::shader::Bind;
 
 pub type Ctx<'a> = dyn Encode + 'a;
 
+/// THE COLUMNED DOOR, and the only one this plane has.
+///
+/// `resolve` answers an operand by its POSITION in a lowered statement's
+/// column, which is what the retired routine layer asked with and what
+/// `driver-vulkan`'s `bind::one` still implements. A claim body has no
+/// column, so every seam on [`crate::points::Staged`] is a by-NAME door
+/// this one is the model for.
 impl kernels::routine::Answers<Vulkan> for Ctx<'_> {
     fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         Encode::resolve(self, ty, source)
     }
 }
 
-pub type Routine = kernels::routine::Routine<Vulkan>;
-
 pub use kernels::shader::{elementwise, elementwise_rows};
 
 pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
 pub use crate::module::path as module_path;
-
-pub use kernels::routine::{Answers, Asks};

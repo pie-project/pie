@@ -130,29 +130,96 @@ impl<W: Dtype> Tensor<W> {
         }
     }
 
+    /// A COLUMN-PARALLEL cut: the OUT axis, which is the leading one on
+    /// every weight this catalog states — `[out, in]` for a projection,
+    /// `[out]` for the bias or the per-head scalar beside it.
     #[must_use]
-    pub fn columns(mut self) -> Tensor<W> {
-        self.shard = Shard::Columns;
-        self
+    pub fn columns(self) -> Tensor<W> {
+        self.cut(0, None)
     }
 
+    /// A ROW-PARALLEL cut: the IN axis, which is the trailing one — axis 1
+    /// of an `[out, in]` projection, axis 2 of an `[experts, out, in]` bank.
+    /// The statement that carries it produces PARTIAL rows, which is what the
+    /// `dist.all_reduce` after it sums.
     #[must_use]
-    pub fn rows(mut self) -> Tensor<W> {
-        self.shard = Shard::Rows;
-        self
+    pub fn rows(self) -> Tensor<W> {
+        // `wrapping_sub` on a scalar lands on an axis no shape has, which
+        // `cut` refuses with the tensor's name — the answer a `[]` weight
+        // deserves, and one underflow message fewer.
+        let last = self.shape.len().wrapping_sub(1);
+        self.cut(last, None)
     }
 
+    /// A column-parallel cut of an out axis that is a CONCATENATION —
+    /// `[gate | up]`, `[q | k | v]` — where every segment is cut, so that a
+    /// rank holds half of each and not the whole of the first.
     #[must_use]
-    pub fn packed(mut self, segments: impl IntoIterator<Item = u64>) -> Tensor<W> {
-        self.shard = Shard::Packed(segments.into_iter().collect());
-        self
+    pub fn packed(self, segments: impl IntoIterator<Item = u64>) -> Tensor<W> {
+        self.cut(0, Some(segments.into_iter().collect()))
     }
 
+    /// An expert bank's out axis, which is axis 1: axis 0 is the expert fan,
+    /// and a TENSOR cut does not touch it — every rank scores and holds every
+    /// expert, at a share of each one's width. Takes the segments because
+    /// every routed bank in this catalog that is cut here is a `[gate | up]`
+    /// pair; a bank with one segment says so with one.
     #[must_use]
-    pub fn experts(mut self) -> Tensor<W> {
-        self.shard = Shard::Experts;
+    pub fn bank(self, segments: impl IntoIterator<Item = u64>) -> Tensor<W> {
+        self.cut(1, Some(segments.into_iter().collect()))
+    }
+
+    /// The one place a mark becomes an axis, and the only place that checks
+    /// it: a cut names an axis this tensor has, and a partition of that axis
+    /// covers it exactly.
+    fn cut(mut self, axis: usize, segments: Option<Vec<u64>>) -> Tensor<W> {
+        let extent = *self.shape.get(axis).unwrap_or_else(|| {
+            panic!(
+                "`{}` is {:?} and a cut names axis {axis}",
+                self.name, self.shape,
+            )
+        });
+        let segments = segments.unwrap_or_else(|| vec![extent]);
+        let whole: u64 = segments.iter().sum();
+        assert_eq!(
+            whole, extent,
+            "`{}`: the segments of axis {axis} sum to {whole} and the axis is {extent}",
+            self.name,
+        );
+        self.shard = Shard::Cut {
+            axis: u32::try_from(axis).expect("an axis inside a shape"),
+            segments,
+        };
         self
     }
+}
+
+/// One rank's share of a width a text's shard marks cut `tp` ways.
+///
+/// THE ONLY PLACE A DEGREE IS SPENT. A tensor-parallel catalog row is the
+/// same text at a different `TP`, and what `TP` buys is this: the dims the
+/// marks name come out divided, and every shape, every statement param and
+/// every cache row built from them is this rank's own. Nothing downstream
+/// ever sees the degree again — the plan states sharded widths and the walk
+/// sizes them the way it sizes any others, with no shard rule of its own.
+///
+/// `what` is the dim's name and it is in the panic for the same reason the
+/// catalog's other arithmetic is checked at trace time: a row whose heads do
+/// not divide is a deployment nobody can serve, and finding out at the first
+/// launch of the first fire is finding out in the worst place.
+///
+/// # Panics
+///
+/// `whole` does not divide `tp` ways, or `tp` is zero.
+#[must_use]
+pub fn per_rank(what: &str, whole: u32, tp: usize) -> u32 {
+    let tp = u32::try_from(tp).expect("a world no u32 holds");
+    assert!(tp > 0, "a {tp}-way cut of `{what}`");
+    assert!(
+        whole.is_multiple_of(tp),
+        "`{what}` is {whole} and does not cut {tp} ways",
+    );
+    whole / tp
 }
 
 #[derive(Clone, Debug)]

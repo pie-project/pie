@@ -141,6 +141,43 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
+/// ways, with `..d` saying that everything else is replicated.
+///
+/// Heads and intermediates, and nothing else. A head's own width
+/// (`head_dim`, `k_dim`, `v_dim`) is the same on every rank — it is the
+/// extent a norm and a rope walk, not a count of them — and `hidden`,
+/// `vocab` and `experts` name the widths the reduce closes over, the table
+/// every rank holds whole, and the fan the router scores across.
+///
+/// This is one half of a fact whose other half is the shard mark on each
+/// tensor: `qg_proj`/`k_proj`/`v_proj` cut their out axis (`q_heads`,
+/// `kv_heads`), `o_proj` and `out_proj` cut their in axis, the GDN
+/// projections cut every packed segment (`k_heads`, `v_heads`), and both
+/// feed-forwards cut their intermediate. `model/tests/
+/// a_rank_cut_is_the_shard_column.rs` holds the two halves equal, which is
+/// what keeps them one fact.
+fn per_rank<const TP: usize>(d: Dims) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+    Dims {
+        q_heads: cut("q_heads", d.q_heads),
+        kv_heads: cut("kv_heads", d.kv_heads),
+        k_heads: cut("k_heads", d.k_heads),
+        v_heads: cut("v_heads", d.v_heads),
+        mlp: match d.mlp {
+            MlpDims::Dense { inter } => MlpDims::Dense {
+                inter: cut("inter", inter),
+            },
+            MlpDims::Routed(m) => MlpDims::Routed(MoeDims {
+                inter: cut("moe inter", m.inter),
+                shared_inter: cut("shared inter", m.shared_inter),
+                ..m
+            }),
+        },
+        ..d
+    }
+}
+
 impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
     /// EVERY NUMBER HERE IS A `config.json` KEY of the shipped
     /// `Qwen/Qwen3.5-35B-A3B`, read out of the cached snapshot's
@@ -231,6 +268,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
 }
 
 fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP> {
+    let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
     let attn_at = |l: u32| l % d.attn_every == d.attn_every - 1;
 
@@ -296,8 +334,8 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                 // row-major, and W^T is [K, N]; a [K, N] column-major view
                 // of W^T is exactly W's own memory with leading dimension
                 // K"*. So N is the output width and K the input width.
-                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * m.inter as u64, hidden]).experts(),
-                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, m.inter as u64]).experts(),
+                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * m.inter as u64, hidden]).bank([m.inter as u64, m.inter as u64]),
+                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, m.inter as u64]).rows(),
                 shared_gate_up: Tensor::sym(n("shared_gate_up"), [2 * m.shared_inter as u64, hidden]).packed([m.shared_inter as u64, m.shared_inter as u64]),
                 shared_down: Tensor::sym(n("shared_down"), [hidden, m.shared_inter as u64]).rows(),
                 shared_gate: Tensor::sym(n("shared_gate"), [1, hidden]),

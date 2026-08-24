@@ -4,14 +4,13 @@ pub mod routine;
 
 pub mod jit;
 
-pub mod canon;
 pub mod points;
 pub mod raises;
 pub mod runtime;
 
 pub mod shader;
 
-pub use routine::{Answers, Arg, Asks, Backend, KernelFn, Refusal, Routine};
+pub use routine::{Answers, Arg, Asks, Backend, Refusal};
 
 pub use routine::{Elem, Layout, Region, Stride};
 
@@ -24,39 +23,6 @@ pub enum Cap {
     Scores,
 
     PageMaskSink,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OutRule {
-    #[default]
-    Unstated,
-
-    Like {
-        of: u8,
-    },
-
-    Shaped {
-        rows_of: u8,
-
-        width: OutWidth,
-    },
-
-    Split {
-        of: u8,
-
-        dim_param: u8,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutWidth {
-    Half { of: u8 },
-
-    Of { of: u8 },
-
-    Weight { of: u8 },
-
-    Param { of: u8 },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -192,60 +158,6 @@ impl LaunchRule {
         Self::SingleWarp,
         Self::PerRequest,
     ];
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Unstated => 0,
-            Self::Qmv => 1,
-            Self::Rms => 2,
-            Self::Rope => 3,
-            Self::Elementwise => 4,
-            Self::ElementwiseRows => 5,
-            Self::PerHead => 6,
-            Self::SdpaVector => 7,
-            Self::SdpaTiled => 8,
-            Self::SdpaMma => 9,
-            Self::PerHeadElementwise => 10,
-            Self::GatedRms => 11,
-            Self::RouterLane => 12,
-            Self::RouterSort => 13,
-            Self::RouteRows => 14,
-            Self::RoutedQmv => 15,
-            Self::SplitPacked => 16,
-            Self::Qmm => 17,
-            Self::RecurrentScan => 18,
-            Self::PerRow => 19,
-            Self::PerChannel => 20,
-            Self::ElementwiseIn => 21,
-            Self::RowScores => 22,
-            Self::RowsPerHead => 23,
-            Self::RowsFlat => 24,
-            Self::Slab => 25,
-            Self::Tile16 => 26,
-            Self::AxialRope => 27,
-            Self::WarpTiledScan => 28,
-            Self::PerRowNarrow => 29,
-            Self::PagedScores => 30,
-            Self::PagedScoresDecode => 31,
-            Self::MlaPrepare => 32,
-            Self::RowsPackedHeads => 33,
-            Self::RowsPackedHeadsNarrow => 34,
-            Self::WarpPackedHeads => 35,
-            Self::RoutedQmvTransposed => 36,
-            Self::AltUpStreams => 37,
-            Self::RoutedQmvQuad => 38,
-            Self::Single => 39,
-            Self::SingleWarp => 40,
-            Self::PerRequest => 41,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Axis {
-    pub what: &'static str,
-
-    pub points: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,26 +459,12 @@ impl Ty {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Derived {
-    pub name: &'static str,
-
-    pub nullable: bool,
-}
-
-pub trait Derivation {
-    const DERIVED: &'static [Derived];
-
-    const SOURCES: &'static [Option<Source>];
-}
-
-pub trait Signature {
-    const NAMESPACE: &'static str;
-
-    const NAME: &'static str;
-
-    type Sig;
-}
+// `pub trait Signature` STOOD HERE — `NAMESPACE`, `NAME`, and a `Sig` tuple
+// of a routine's parameter types, implemented by `#[routine]` on every
+// columned row of every plane. Its reader was `model-dsl-legacy`'s
+// `fire::<R>`, which derived a whole statement from the tuple; R3 deleted
+// that crate and R4e's census found the trait read nowhere on any target. A
+// statement's shape comes off the POINT's slot list now.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -615,74 +513,3 @@ pub enum Lit {
     I32(i32),
 }
 
-pub struct KernelSig {
-    pub name: &'static str,
-
-    pub symbol: &'static str,
-
-    pub whole: bool,
-
-    pub depth_prefix_plan: bool,
-
-    pub args: &'static [Ty],
-
-    pub sources: &'static [Option<Source>],
-
-    pub derived: &'static [Derived],
-
-    pub axes: &'static [Axis],
-
-    pub internal: bool,
-
-    pub no_join: bool,
-
-    pub driver: bool,
-
-    pub canon: Option<&'static str>,
-
-    pub point: &'static [&'static str],
-
-    pub out_rule: &'static [OutRule],
-}
-
-impl KernelSig {
-    pub fn covers_point(&self, symbol: &str) -> bool {
-        if self.axes.is_empty() {
-            return false;
-        }
-        let mut rest = symbol;
-        for axis in self.axes.iter().rev() {
-            match axis
-                .points
-                .iter()
-                .find(|point| rest.len() > point.len() && rest.ends_with(**point))
-            {
-                Some(point) => rest = &rest[..rest.len() - point.len()],
-                None => return false,
-            }
-        }
-        rest == self.symbol
-    }
-
-    pub fn entrypoints(&self) -> Vec<String> {
-        let mut out = vec![self.symbol.to_string()];
-        for axis in self.axes {
-            out = out
-                .iter()
-                .flat_map(|stem| {
-                    axis.points
-                        .iter()
-                        .map(move |point| format!("{stem}{point}"))
-                })
-                .collect();
-        }
-        out
-    }
-}
-
-pub fn sig_in(table: &'static [KernelSig], symbol: &str) -> Option<&'static KernelSig> {
-    table
-        .iter()
-        .find(|k| k.symbol == symbol)
-        .or_else(|| table.iter().find(|k| k.covers_point(symbol)))
-}

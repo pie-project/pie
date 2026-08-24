@@ -4,11 +4,8 @@ use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
 use kernels::routine::{Const, In, InOut, Out};
 use kernels::{Bind, Fire};
-use kernels_macros::routine;
 
 const BLOCK: u32 = 256;
-
-const WARP: u32 = 32;
 
 #[must_use]
 const fn elementwise(n: i32) -> Launch {
@@ -23,34 +20,26 @@ const fn elementwise_rows(rows: i32, width: i32) -> Launch {
     )
 }
 
-#[must_use]
-const fn rms(rows: i32) -> Launch {
-    const RMS_SMEM: u32 = (BLOCK / WARP) * 4;
-
-    Launch::per_row(rows.unsigned_abs(), BLOCK).smem(RMS_SMEM)
-}
-
 pub const GPT_OSS_GLU_ALPHA: f32 = 1.702;
 
-/// The `Mlp` family, claimed. Each body is a delegation to the `chunked_*`
-/// routine below that already fires the point — the packed forms read one
-/// `[gate | up]` row and write a row half as wide.
+/// The `Mlp` family, claimed. Every body is the launch itself: one
+/// `__global__` out of `mlp/swiglu.cuh`, one thread block per `BLOCK`-wide
+/// stripe of the result, and the packed forms read one `[gate | up]` row and
+/// write a row half as wide.
 ///
 /// Every body drops the stated `intermediate`. The declaration states it
 /// because the geometry is not derivable from the first `In` (the `Out` is
 /// HALF its width), but the `Out` reaching a body has already been sized by
-/// the `out(y = rows(packed) x half(packed))` rule on the routine, and the
-/// launch reads `y.width` from it. When `#[shape]` replaces those rules the
-/// stated width becomes their input; until then it is recorded and unread.
+/// the sweep's width rule, and the launch reads `y.width` from it. When
+/// `#[shape]` replaces that rule the stated width becomes its input; until
+/// then it is recorded and unread.
 ///
-/// EVERY POINT OF THIS FAMILY IS ANSWERED NOW, and the last absence was a
+/// EVERY POINT OF THIS FAMILY IS ANSWERED, and the last absence was a
 /// MISSING OPERAND SHAPE rather than a missing activation.
 /// `mlp.swiglu_clamp_alpha` stood on the floor's default body because
-/// `gpt_oss_glu` below computes exactly its arithmetic but from gate and up
-/// as two separate rows, and no cuda kernel read the packed form the text
-/// states. `chunked_gpt_oss_glu` is that kernel — `chunked_swiglu_clamp`
-/// beside `swiglu_clamp`, one more time — so the body is a delegation like
-/// the other five.
+/// [`gpt_oss_glu`] computes exactly its arithmetic but from gate and up as
+/// two separate rows, and no cuda kernel read the packed form the text
+/// states. `::pie::mlp::chunked_gpt_oss_glu` is that kernel.
 #[kernels_macros::claims]
 impl kernels::points::Mlp for Ctx<'_> {
     fn swiglu<T: kernels::points::Scalar>(
@@ -60,7 +49,14 @@ impl kernels::points::Mlp for Ctx<'_> {
         y: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         let _ = intermediate;
-        chunked_swiglu(self, packed, y)
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu<{}>", T::CPP)),
+            )
+            .apply(elementwise_rows(y.rows, y.width)),
+            &[packed.arg(), y.arg(), y.width.arg()],
+        )
     }
 
     fn swiglu_clamp<T: kernels::points::Scalar>(
@@ -71,19 +67,25 @@ impl kernels::points::Mlp for Ctx<'_> {
         y: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         let _ = intermediate;
-        chunked_swiglu_clamp(self, packed, y, Const::new(limit))
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu_clamp<{}>", T::CPP)),
+            )
+            .apply(elementwise_rows(y.rows, y.width)),
+            &[packed.arg(), y.arg(), y.width.arg(), limit.arg()],
+        )
     }
 
     /// The clamped swiglu whose sigmoid carries a stated `alpha`, over the
     /// packed row the text states.
     ///
     /// A ROW WHERE THE ACTIVATION HAD TWO PLANES, and that was the whole
-    /// gap: `gpt_oss_glu` computes this arithmetic and has since gpt-oss
+    /// gap: [`gpt_oss_glu`] computes this arithmetic and has since gpt-oss
     /// landed, but from `gate` and `up` as two rectangles, and a text that
     /// projects `[gate | up]` in one matmul has one. The `.cuh` grew
     /// `chunked_gpt_oss_glu` beside it — the same clamp, the same
-    /// `(u + 1) * glu`, the same `expf` — so this body is the delegation
-    /// every other body in this block already is.
+    /// `(u + 1) * glu`, the same `expf` — over the packed indexing.
     fn swiglu_clamp_alpha<T: kernels::points::Scalar>(
         &self,
         packed: In<Tensor<T>>,
@@ -93,7 +95,20 @@ impl kernels::points::Mlp for Ctx<'_> {
         y: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         let _ = intermediate;
-        chunked_gpt_oss_glu(self, packed, y, Const::new(limit), Const::new(alpha))
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                crate::jit::symbol(&format!("::pie::mlp::chunked_gpt_oss_glu<{}>", T::CPP)),
+            )
+            .apply(elementwise_rows(y.rows, y.width)),
+            &[
+                packed.arg(),
+                y.arg(),
+                y.width.arg(),
+                limit.arg(),
+                alpha.arg(),
+            ],
+        )
     }
 
     fn geglu_tanh<T: kernels::points::Scalar>(
@@ -112,7 +127,14 @@ impl kernels::points::Mlp for Ctx<'_> {
         y: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         let _ = intermediate;
-        chunked_geglu_tanh(self, packed, y)
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                crate::jit::symbol(&format!("::pie::mlp::chunked_geglu_tanh<{}>", T::CPP)),
+            )
+            .apply(elementwise_rows(y.rows, y.width)),
+            &[packed.arg(), y.arg(), y.width.arg()],
+        )
     }
 
     fn situ<T: kernels::points::Scalar>(
@@ -124,81 +146,29 @@ impl kernels::points::Mlp for Ctx<'_> {
         y: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         let _ = intermediate;
-        chunked_situ(self, packed, y, Const::new(beta), Const::new(up_cap))
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                crate::jit::symbol(&format!("::pie::mlp::chunked_situ<{}>", T::CPP)),
+            )
+            .apply(elementwise_rows(y.rows, y.width)),
+            &[
+                packed.arg(),
+                y.arg(),
+                y.width.arg(),
+                beta.arg(),
+                up_cap.arg(),
+            ],
+        )
     }
 }
 
-#[routine(bf16, out(y = like(gate)))]
-pub fn swiglu<T>(
-    ctx: &Ctx<'_>,
-    gate: In<Tensor<T>>,
-    up: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-) -> Result<(), Refusal> {
-    let n = y.rows.saturating_mul(y.width);
-
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::swiglu<{}>", T::CPP)),
-        )
-        .apply(elementwise(n)),
-        &[gate.arg(), up.arg(), y.arg(), n.arg()],
-    )
-}
-
-#[routine(bf16, out(y = like(gate)))]
-pub fn swiglu_clamp<T>(
-    ctx: &Ctx<'_>,
-    gate: In<Tensor<T>>,
-    up: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-    limit: Const<f32>,
-) -> Result<(), Refusal> {
-    let limit = *limit;
-
-    let n = y.rows.saturating_mul(y.width);
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::swiglu_clamp<{}>", T::CPP)),
-        )
-        .apply(elementwise(n)),
-        &[gate.arg(), up.arg(), y.arg(), n.arg(), limit.arg()],
-    )
-}
-
-#[routine(bf16, out(y = like(gate)))]
-pub fn situ<T>(
-    ctx: &Ctx<'_>,
-    gate: In<Tensor<T>>,
-    up: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-    beta: Const<f32>,
-    linear_beta: Const<f32>,
-) -> Result<(), Refusal> {
-    let beta = *beta;
-    let linear_beta = *linear_beta;
-    let n = y.rows.saturating_mul(y.width);
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::situ<{}>", T::CPP)),
-        )
-        .apply(elementwise(n)),
-        &[
-            gate.arg(),
-            up.arg(),
-            y.arg(),
-            n.arg(),
-            beta.arg(),
-            linear_beta.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "mlp.geglu_tanh", out(y = like(gate)))]
-pub fn geglu_tanh<T>(
+/// The two-plane tanh-GELU gate.
+///
+/// TWO CALLERS, WHICH IS WHY IT IS A FUNCTION: `Mlp::geglu_tanh` above, and
+/// the gemma vision tower's MLP, which holds bare pointers rather than a
+/// statement's rectangles.
+pub(crate) fn geglu_tanh<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     gate: In<Tensor<T>>,
     up: In<Tensor<T>>,
@@ -215,21 +185,15 @@ pub fn geglu_tanh<T>(
     )
 }
 
-#[routine(dtypes(bf16, f16), out(y = like(x)))]
-pub fn relu2<T>(ctx: &Ctx<'_>, x: In<Tensor<T>>, y: Out<Tensor<T>>) -> Result<(), Refusal> {
-    let n = y.rows.saturating_mul(y.width);
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::relu2<{}>", T::CPP)),
-        )
-        .apply(elementwise(n)),
-        &[x.arg(), y.arg(), n.arg()],
-    )
-}
-
-#[routine(bf16, out(y = like(gate)))]
-pub fn gpt_oss_glu<T>(
+/// gpt-oss's GLU over gate and up as TWO planes, and the second output plane
+/// its fp16 arm writes.
+///
+/// `Mlp::swiglu_clamp_alpha` is the same arithmetic over one packed row and
+/// is the form every text states. This one is the oracle
+/// `tests/swiglu_clamp_alpha.rs` measures that body against — the packed
+/// kernel is the flat kernel's arithmetic with packed indexing around it,
+/// and that is a claim a test checks rather than a comment.
+pub fn gpt_oss_glu<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     gate: In<Tensor<T>>,
     up: In<Tensor<T>>,
@@ -259,147 +223,12 @@ pub fn gpt_oss_glu<T>(
     )
 }
 
-#[routine(bf16, canon = "mlp.swiglu", out(y = rows(packed) x half(packed)))]
-pub fn chunked_swiglu<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-) -> Result<(), Refusal> {
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu<{}>", T::CPP)),
-        )
-        .apply(elementwise_rows(y.rows, y.width)),
-        &[packed.arg(), y.arg(), y.width.arg()],
-    )
-}
-
-#[routine(bf16, out(y = like(y)))]
-pub fn chunked_swiglu_into<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    y: InOut<Tensor<T>>,
-) -> Result<(), Refusal> {
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu<{}>", T::CPP)),
-        )
-        .apply(elementwise_rows(y.rows, y.width)),
-        &[packed.arg(), y.arg(), y.width.arg()],
-    )
-}
-
-#[routine(bf16, canon = "mlp.swiglu_clamp", out(y = rows(packed) x half(packed)))]
-pub fn chunked_swiglu_clamp<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-    limit: Const<f32>,
-) -> Result<(), Refusal> {
-    let limit = *limit;
-
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu_clamp<{}>", T::CPP)),
-        )
-        .apply(elementwise_rows(y.rows, y.width)),
-        &[packed.arg(), y.arg(), y.width.arg(), limit.arg()],
-    )
-}
-
-#[routine(bf16, canon = "mlp.situ", out(y = rows(packed) x half(packed)))]
-pub fn chunked_situ<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-    beta: Const<f32>,
-    linear_beta: Const<f32>,
-) -> Result<(), Refusal> {
-    let beta = *beta;
-    let linear_beta = *linear_beta;
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::chunked_situ<{}>", T::CPP)),
-        )
-        .apply(elementwise_rows(y.rows, y.width)),
-        &[
-            packed.arg(),
-            y.arg(),
-            y.width.arg(),
-            beta.arg(),
-            linear_beta.arg(),
-        ],
-    )
-}
-
-/// gpt-oss's GLU over one packed `[gate | up]` row.
-///
-/// `gpt_oss_glu` BESIDE IT AND NOT INSTEAD OF IT. The flat form takes the
-/// two halves as two planes, which is what the marlin path hands it and what
-/// its `y_fp16` second output exists for; the text states ONE row, and
-/// halving a row on the host would mean minting a second rectangle nothing
-/// declared. So this sits beside it exactly as `chunked_swiglu_clamp` sits
-/// beside `swiglu_clamp` — same `.cuh`, same family, one `__global__` per
-/// operand shape — and `mlp/swiglu.cuh`'s `chunked_gpt_oss_glu` is the flat
-/// kernel's arithmetic transcribed with the packed indexing around it.
-#[routine(bf16, canon = "mlp.swiglu_clamp_alpha", out(y = rows(packed) x half(packed)))]
-pub fn chunked_gpt_oss_glu<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-    limit: Const<f32>,
-    alpha: Const<f32>,
-) -> Result<(), Refusal> {
-    let limit = *limit;
-    let alpha = *alpha;
-
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::chunked_gpt_oss_glu<{}>", T::CPP)),
-        )
-        .apply(elementwise_rows(y.rows, y.width)),
-        &[
-            packed.arg(),
-            y.arg(),
-            y.width.arg(),
-            limit.arg(),
-            alpha.arg(),
-        ],
-    )
-}
-
-#[routine(bf16, canon = "mlp.geglu_tanh_packed", out(y = rows(packed) x half(packed)))]
-pub fn chunked_geglu_tanh<T>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<T>>,
-    y: Out<Tensor<T>>,
-) -> Result<(), Refusal> {
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::chunked_geglu_tanh<{}>", T::CPP)),
-        )
-        .apply(elementwise_rows(y.rows, y.width)),
-        &[packed.arg(), y.arg(), y.width.arg()],
-    )
-}
-
-/// The `Gate` family, claimed. One point, and the delegation crosses a
-/// dtype pin to reach it: `driver_internal::sigmoid_gate_inplace_bf16` is a
-/// host program spelled at bf16, while a point quantifies over `Scalar`, so
-/// the body states the pin as a refusal by name and casts the two addresses
-/// it was handed. That is the whole of cuda's gating today; a second dtype
-/// wants a second spelling of the routine, not a cast here.
-///
-/// The impl lives beside `sigmoid_dot_scalar_gate_add` — the other gate
-/// kernel, and the module the C++ namespace names — rather than in
-/// `driver_internal.rs`, which collects host programs by CALLER. `GATE_CLAIMS`
-/// therefore reads `kernels_cuda::mlp::GATE_CLAIMS`.
+/// The `Gate` family, claimed. One point, and the body crosses a dtype pin
+/// to reach its kernel: `::pie::mlp::sigmoid_gate_inplace` is spelled at
+/// bf16 while a point quantifies over `Scalar`, so the body states the pin
+/// as a refusal by name and casts the two addresses it was handed. That is
+/// the whole of cuda's gating today; a second dtype wants a second
+/// instantiation in the `.cuh`, not a cast here.
 #[kernels_macros::claims]
 impl kernels::points::Gate for Ctx<'_> {
     fn sigmoid_mul<T: kernels::points::Scalar>(
@@ -412,66 +241,24 @@ impl kernels::points::Gate for Ctx<'_> {
                 what: "gate.sigmoid_mul at an element other than bf16",
             });
         }
-        crate::driver_internal::sigmoid_gate_inplace_bf16(
-            self,
-            InOut {
-                ptr: x.ptr.cast::<bf16>(),
-                rows: x.rows,
-                width: x.width,
-            },
-            In {
-                ptr: gate.ptr.cast::<bf16>(),
-                rows: gate.rows,
-                width: gate.width,
-            },
+        let x: InOut<Tensor<bf16>> = InOut {
+            ptr: x.ptr.cast::<bf16>(),
+            rows: x.rows,
+            width: x.width,
+        };
+        let gate: In<Tensor<bf16>> = In {
+            ptr: gate.ptr.cast::<bf16>(),
+            rows: gate.rows,
+            width: gate.width,
+        };
+        let num_elements = x.all("the gated rectangle")?.elements();
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                "::pie::mlp::sigmoid_gate_inplace<::pie::bf16>",
+            )
+            .apply(Launch::flat(num_elements.unsigned_abs(), BLOCK)),
+            &[x.arg(), gate.arg(), num_elements.arg()],
         )
     }
-}
-
-// SUPERSEDED by impl Moe::sigmoid_gate_add, which is not this launch: the
-// point states the gate COLUMN and a separate result, this takes the gate's
-// WEIGHT and folds the dot and the add in place. Kept because
-// `model-dsl-legacy`'s generated `cuda::sigmoid_dot_scalar_gate_add` still
-// names this type; dies with the routine layer.
-#[routine(bf16, out(out = like(out)))]
-pub fn sigmoid_dot_scalar_gate_add<T>(
-    ctx: &Ctx<'_>,
-    x: In<Tensor<T>>,
-    gate_w: Const<Tensor<T>>,
-    out: InOut<Tensor<T>>,
-    y: In<Tensor<T>>,
-) -> Result<(), Refusal> {
-    let row = crate::layout::stated(out.all("the row width"))?;
-    let h = row.stride;
-    ctx.fire(
-        Fire::at(
-            "mlp/swiglu.cuh",
-            crate::jit::symbol(&format!(
-                "::pie::mlp::sigmoid_dot_scalar_gate_add<{}>",
-                T::CPP
-            )),
-        )
-        .apply(rms(row.rows)),
-        &[x.arg(), gate_w.arg(), out.arg(), y.arg(), h.arg()],
-    )
-}
-
-#[routine(bf16, out(x = like(x)))]
-pub fn gaussian_topk<T>(
-    ctx: &Ctx<'_>,
-    x: InOut<Tensor<T>>,
-    std_multiplier: Const<f32>,
-) -> Result<(), Refusal> {
-    let std_multiplier = *std_multiplier;
-
-    let row = crate::layout::stated(x.all("the row width"))?;
-    let dim = row.stride;
-    ctx.fire(
-        Fire::at(
-            "mlp/gaussian_topk.cuh",
-            crate::jit::symbol(&format!("::pie::mlp::gaussian_topk<{}>", T::CPP)),
-        )
-        .apply(rms(row.rows)),
-        &[x.arg(), dim.arg(), std_multiplier.arg()],
-    )
 }

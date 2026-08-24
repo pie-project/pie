@@ -18,7 +18,6 @@
 //! they need its driver-id -> handle registry to reach the `BatchScheduler`.
 
 pub mod backend;
-pub mod boot;
 pub mod channel;
 
 pub use waker;
@@ -27,7 +26,6 @@ pub use backend::{
     DriverBackend, DriverSpec, RemoteDisconnectHandle, RemoteDriver, SchedulerLimits, get_spec,
     open, register_driver_backend, take_driver_backend, unregister_driver,
 };
-pub use boot::BootConfig;
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 
 // The contract, re-exported at the path the engine already reads it from.

@@ -160,7 +160,7 @@ impl kernels::shader::Lang for Metal {
     const IN_PACKED: &'static str = "uint";
 }
 
-pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16, f16};
+pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16};
 
 pub type Ctx<'a> = dyn Encode + 'a;
 
@@ -169,8 +169,6 @@ impl kernels::routine::Answers<Metal> for Ctx<'_> {
         Encode::resolve(self, ty, source)
     }
 }
-
-pub type Routine = kernels::routine::Routine<Metal>;
 
 pub use kernels::shader::{elementwise, elementwise_rows};
 

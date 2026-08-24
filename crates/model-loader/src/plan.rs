@@ -72,10 +72,6 @@ pub fn compile(
     Ok(plan)
 }
 
-pub fn compiler_version() -> u64 {
-    env!("PIE_LOADER_COMPILER_HASH").parse::<u64>().unwrap_or(0)
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
     pub persistent_bytes: u64,
@@ -570,7 +566,15 @@ pub enum StorageInstr {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadPlan {
-    pub compiler_version: u64,
+    // A `compiler_version: u64` STOOD HERE, stamped from a build script that
+    // content-hashed every source file under `src/`. Its stated job was to
+    // auto-invalidate an on-disk plan cache; that cache was cache_key.rs,
+    // which had no callers at all, so the field was a hash nobody compared
+    // against anything. `verify` did check it, and admitted in its own doc that
+    // the check is a tautology as long as the plan reaches it from a `compile`
+    // in the same process -- which is the only way any plan reaches it here. It
+    // comes back with a plan that outlives its process, and needs a build script
+    // again when it does.
     pub target: StorageTarget,
     /// What each plan pass did. Replaces the old `optimizer` report, which
     /// described a no-op pass over an IR that no longer exists.
@@ -631,7 +635,6 @@ pub struct SourceBinding {
 impl LoadPlan {
     pub fn empty(target: StorageTarget) -> Self {
         Self {
-            compiler_version: compiler_version(),
             target,
             passes: Vec::new(),
             files: Vec::new(),

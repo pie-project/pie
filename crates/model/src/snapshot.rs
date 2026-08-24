@@ -146,6 +146,19 @@ impl Snapshot {
         self.files.len()
     }
 
+    /// The extents the header records for `name`, without reading a byte of
+    /// payload.
+    ///
+    /// What identification asks. A tensor's shape is in the header this
+    /// reader already parsed, so answering "is this the 248 320-row embed of
+    /// `qwen35-d0.8b` or the 151 936-row one of `qwen35-d3b`" costs nothing
+    /// and does not count as a `read` — no production row asked for it, and
+    /// [`Snapshot::untaken`] must keep meaning what it means.
+    #[must_use]
+    pub fn shape_of(&self, name: &str) -> Option<Vec<u64>> {
+        self.index.get(name).map(|p| p.shape.clone())
+    }
+
     /// Read one tensor by its canonical name, recording that it was taken.
     #[must_use]
     pub fn read(&self, name: &str) -> Option<HostTensor> {

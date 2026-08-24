@@ -622,14 +622,14 @@ mod tests {
     }
     /// The boot-TOML extraction, isolated: the exact chain `create` runs.
     #[test]
-    fn the_boot_config_extracts() {
-        let boot = "[model]\nconfig = \"/tmp/x.json\"\n";
+    fn the_boot_model_id_extracts() {
+        let boot = "[model]\nid = \"qwen35-d0.8b-bf16-kv-bf16\"\n";
         let v = boot.parse::<toml::Table>().expect("parses");
-        let path = v
+        let id = v
             .get("model")
-            .and_then(|m| m.get("config"))
+            .and_then(|m| m.get("id"))
             .and_then(|d| d.as_str())
             .expect("extracts");
-        assert_eq!(path, "/tmp/x.json");
+        assert_eq!(id, "qwen35-d0.8b-bf16-kv-bf16");
     }
 }

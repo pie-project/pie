@@ -1,5 +1,4 @@
-//! Byte-for-byte parity with the C++ `MlaCache`, `DsV4CompressCache` and
-//! `SwapPool` allocation paths.
+//! Byte-for-byte parity with the C++ `SwapPool` allocation paths.
 //!
 //! The oracle in `tests/oracle/caches/` compiles the real
 //! `store/mla_cache.cpp`, `store/dsv4_compress_cache.cpp` and
@@ -7,6 +6,17 @@
 //! `<cuda_runtime.h>` with recorders, and prints exactly what memory each
 //! path asks for and in what order. This test reproduces the same sweep
 //! against the ports and requires the transcripts to be equal.
+//!
+//! TWO OF THE FOUR SECTIONS ARE RETIRED. `MlaCache::allocate` and
+//! `DsV4CompressCache::allocate` swept `pools::mla_cache` and
+//! `pools::compressed_plane_cache`, both deleted for want of a production
+//! reader — `Deployment::of` refuses every MLA/latent SKU by name, and the
+//! `model_costs` arms that sized these pools went with the legacy walk.
+//! Their rows are NOT re-blessed out of the golden, which would delete the
+//! proof for the half that survives: they were the transcript's PREFIX, and
+//! FNV-1a chains, so [`RETIRED_PREFIX_FNV1A64`] carries the hash state they
+//! left and the surviving sweep still ends at the C++'s own
+//! [`GOLDEN_FNV1A64`].
 //!
 //! `tests/oracle/caches/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`]. The
 //! pinned value is the **C++'s** hash, never this file's: a golden taken from
@@ -20,42 +30,38 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::layout::compressed_plane_geometry::compress_bytes_per_token;
 use driver_cuda::layout::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
-use driver_cuda::pools::compressed_plane_cache::CompressedPlaneLayout;
 use driver_cuda::pools::kv_cache::KvCacheLayout;
-use driver_cuda::pools::mla_cache::MlaCacheLayout;
 use driver_cuda::pools::swap_pool::SwapPoolLayout;
-use driver_cuda::tensor::TensorSpec;
 
-/// FNV-1a 64 of the C++ oracle's transcript.
+/// FNV-1a 64 of the C++ oracle's WHOLE transcript, all four sections.
 ///
 /// Hand-written rather than `DefaultHasher`, whose output is explicitly not
 /// stable across Rust releases.
 const GOLDEN_FNV1A64: u64 = 0x7a6f372d76ac1876;
 
-/// Rows the transcript must contain, so a truncated sweep cannot pass by
-/// accident.
+/// The hash state the two retired sections left, and the rows they wrote.
+///
+/// Not a second golden and not a re-blessing: the C++ transcript began with
+/// `MlaCache` and `DsV4CompressCache`, so hashing the surviving two sections
+/// FROM this state reaches [`GOLDEN_FNV1A64`] exactly, and the swap half is
+/// still pinned to the C++ and not to itself. It was taken by chaining the
+/// full transcript this file rendered while all four sections were green.
+const RETIRED_PREFIX_FNV1A64: u64 = 0x457f_98ee_96c1_717d;
+const RETIRED_PREFIX_ROWS: usize = 52;
+
+/// Rows the whole transcript must contain, so a truncated sweep cannot pass
+/// by accident. [`RETIRED_PREFIX_ROWS`] of them are no longer rendered.
 const GOLDEN_ROWS: usize = 82;
 
 const SEP: char = '\u{1f}';
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64 continued from `h`, so a transcript can be hashed in pieces.
+fn fnv1a64_from(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
-}
-
-fn spec_row(s: &TensorSpec) -> String {
-    let dims = s
-        .shape()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{}[{dims}]={}", s.dtype().name(), s.nbytes())
 }
 
 fn row(out: &mut String, id: &str, fields: &[String]) {
@@ -65,684 +71,6 @@ fn row(out: &mut String, id: &str, fields: &[String]) {
         out.push_str(f);
     }
     out.push('\n');
-}
-
-/// Reproduces the recorder's device-buffer naming.
-///
-/// The recorder hands out `dev0`, `dev1`, ... in allocation order and **only
-/// for allocations with bytes** -- a zero-byte request returns null, exactly
-/// as the real allocator does, and consumes no ordinal. So the name of a
-/// tensor depends on how many non-empty tensors preceded it, which is what
-/// makes the naming a check on the allocation order rather than a label.
-#[derive(Default)]
-struct DevNames {
-    next: usize,
-}
-
-impl DevNames {
-    fn take(&mut self, spec: &TensorSpec) -> String {
-        if spec.nbytes() == 0 {
-            return "null".to_owned();
-        }
-        let n = self.next;
-        self.next += 1;
-        format!("dev{n}+0")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 1. MlaCache::allocate
-// ---------------------------------------------------------------------------
-
-struct MlaCase {
-    label: &'static str,
-    layers: i32,
-    pages: i32,
-    page_size: i32,
-    lora: i32,
-    rope: i32,
-    dtype: DType,
-}
-
-const MLA_CASES: &[MlaCase] = &[
-    MlaCase {
-        label: "tiny",
-        layers: 1,
-        pages: 1,
-        page_size: 1,
-        lora: 1,
-        rope: 1,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "ds3",
-        layers: 61,
-        pages: 512,
-        page_size: 16,
-        lora: 512,
-        rope: 64,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "ds3-fp16",
-        layers: 61,
-        pages: 512,
-        page_size: 16,
-        lora: 512,
-        rope: 64,
-        dtype: DType::Fp16,
-    },
-    MlaCase {
-        label: "kimi",
-        layers: 27,
-        pages: 128,
-        page_size: 64,
-        lora: 576,
-        rope: 64,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "lopsided",
-        layers: 3,
-        pages: 7,
-        page_size: 5,
-        lora: 1,
-        rope: 4096,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "one-layer",
-        layers: 1,
-        pages: 4096,
-        page_size: 1,
-        lora: 512,
-        rope: 64,
-        dtype: DType::Fp16,
-    },
-    MlaCase {
-        label: "bad/layers0",
-        layers: 0,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/pages0",
-        layers: 8,
-        pages: 0,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/psize0",
-        layers: 8,
-        pages: 8,
-        page_size: 0,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/lora0",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 0,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/rope0",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 0,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/layers-1",
-        layers: -1,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/pages-1",
-        layers: 8,
-        pages: -1,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/psize-1",
-        layers: 8,
-        pages: 8,
-        page_size: -1,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/lora-1",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: -1,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/rope-1",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: -1,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/two",
-        layers: 0,
-        pages: 0,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/all",
-        layers: 0,
-        pages: 0,
-        page_size: 0,
-        lora: 0,
-        rope: 0,
-        dtype: DType::Bf16,
-    },
-    MlaCase {
-        label: "bad/fp32",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Fp32,
-    },
-    MlaCase {
-        label: "bad/int8",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Int8,
-    },
-    MlaCase {
-        label: "bad/fp8",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Fp8E4M3,
-    },
-    MlaCase {
-        label: "bad/fp8e5",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Fp8E5M2,
-    },
-    MlaCase {
-        label: "bad/u8",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Uint8,
-    },
-    MlaCase {
-        label: "bad/i32",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Int32,
-    },
-    MlaCase {
-        label: "bad/i64",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Int64,
-    },
-    MlaCase {
-        label: "bad/int4",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Int4Packed,
-    },
-    MlaCase {
-        label: "bad/mxfp4",
-        layers: 8,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Mxfp4Packed,
-    },
-    MlaCase {
-        label: "bad/order",
-        layers: 0,
-        pages: 8,
-        page_size: 8,
-        lora: 8,
-        rope: 8,
-        dtype: DType::Fp32,
-    },
-];
-
-fn render_mla(out: &mut String) {
-    for c in MLA_CASES {
-        let id = format!("mla/{}", c.label);
-        match MlaCacheLayout::plan(c.layers, c.pages, c.page_size, c.lora, c.rope, c.dtype) {
-            Err(e) => row(
-                &mut *out,
-                &id,
-                &["throw".to_owned(), e.to_string(), "allocs=".to_owned()],
-            ),
-            Ok(l) => {
-                let mut names = DevNames::default();
-                let mut allocs = Vec::new();
-                let mut addrs = Vec::new();
-                for (_, _, spec) in l.allocation_order() {
-                    allocs.push(spec_row(spec));
-                    addrs.push(names.take(spec));
-                }
-                let views = [0, c.layers / 2, c.layers - 1]
-                    .iter()
-                    .map(|&li| {
-                        let v = l.layer_view(li as u32).expect("in range");
-                        format!(
-                            "L{}:p{}:s{}:r{}:q{}:ckv{}:kpe{}",
-                            v.layer,
-                            v.num_pages,
-                            v.page_size,
-                            v.kv_lora_rank,
-                            v.qk_rope_head_dim,
-                            addrs[(li * 2) as usize],
-                            addrs[(li * 2 + 1) as usize],
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let pages = [0, c.layers - 1]
-                    .iter()
-                    .flat_map(|&li| {
-                        l.page_buffers()
-                            .into_iter()
-                            .enumerate()
-                            .map(|(b, pb)| {
-                                format!("{}/{}", addrs[(li * 2) as usize + b], pb.page_bytes)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                row(
-                    &mut *out,
-                    &id,
-                    &[
-                        "ok".to_owned(),
-                        format!("allocs={}", allocs.join(",")),
-                        format!("views={}", views.join(",")),
-                        format!("pages={}", pages.join(",")),
-                    ],
-                );
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2. DsV4CompressCache::allocate
-// ---------------------------------------------------------------------------
-
-struct DsCase {
-    label: &'static str,
-    ratios: &'static [i32],
-    layers: i32,
-    head_dim: i32,
-    pages: i32,
-    page_size: i32,
-    fail_at: i32,
-}
-
-const DS_CASES: &[DsCase] = &[
-    DsCase {
-        label: "none",
-        ratios: &[],
-        layers: 8,
-        head_dim: 128,
-        pages: 16,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "all2",
-        ratios: &[2, 2, 2, 2],
-        layers: 4,
-        head_dim: 128,
-        pages: 16,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "all4",
-        ratios: &[4, 4, 4, 4],
-        layers: 4,
-        head_dim: 128,
-        pages: 16,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "mixed",
-        ratios: &[0, 2, 4, 8, 0, 16],
-        layers: 6,
-        head_dim: 64,
-        pages: 8,
-        page_size: 32,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "negatives",
-        ratios: &[-1, 2, -4, 4],
-        layers: 4,
-        head_dim: 64,
-        pages: 8,
-        page_size: 32,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "all-zero-ratios",
-        ratios: &[0, 0],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "all-neg-ratios",
-        ratios: &[-1, -2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "short-ratios",
-        ratios: &[4],
-        layers: 6,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "long-ratios",
-        ratios: &[4, 4, 4, 4, 4, 4],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "zero-layers",
-        ratios: &[4, 4],
-        layers: 0,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "neg-layers",
-        ratios: &[4, 4],
-        layers: -3,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "hd0",
-        ratios: &[4, 2],
-        layers: 2,
-        head_dim: 0,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "hd-neg",
-        ratios: &[4, 2],
-        layers: 2,
-        head_dim: -8,
-        pages: 8,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "pages0",
-        ratios: &[4, 4],
-        layers: 2,
-        head_dim: 64,
-        pages: 0,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "psize0",
-        ratios: &[4, 4],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 0,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "pages-neg",
-        ratios: &[4, 4],
-        layers: 2,
-        head_dim: 64,
-        pages: -1,
-        page_size: 16,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "psize-neg",
-        ratios: &[4, 4],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: -1,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "big",
-        ratios: &[2, 4, 8],
-        layers: 3,
-        head_dim: 192,
-        pages: 64,
-        page_size: 64,
-        fail_at: -1,
-    },
-    DsCase {
-        label: "fail0",
-        ratios: &[2, 2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: 0,
-    },
-    DsCase {
-        label: "fail1",
-        ratios: &[2, 2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: 1,
-    },
-    DsCase {
-        label: "fail2",
-        ratios: &[2, 2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: 2,
-    },
-    DsCase {
-        label: "fail3",
-        ratios: &[2, 2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: 3,
-    },
-    DsCase {
-        label: "fail4",
-        ratios: &[2, 2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: 4,
-    },
-    DsCase {
-        label: "fail-never",
-        ratios: &[2, 2],
-        layers: 2,
-        head_dim: 64,
-        pages: 8,
-        page_size: 16,
-        fail_at: 99,
-    },
-];
-
-fn render_dsv4(out: &mut String) {
-    for c in DS_CASES {
-        let id = format!("dsv4/{}", c.label);
-        let layout =
-            match CompressedPlaneLayout::plan(c.ratios, c.layers, c.head_dim, c.pages, c.page_size)
-            {
-                Err(e) => {
-                    // The oracle prints `what()` for a `std::runtime_error`
-                    // and the fixed tag `length_error` for the `resize` throw,
-                    // whose text is a libstdc++ artifact rather than a
-                    // contract. Which of the two applies is decided by the
-                    // library, via the call name it attached to the error --
-                    // this only reads that back.
-                    let text = if e.call() == "compressed_plane_cache" {
-                        "length_error".to_owned()
-                    } else {
-                        e.to_string()
-                    };
-                    row(
-                        &mut *out,
-                        &id,
-                        &["throw".to_owned(), text, "allocs=".to_owned()],
-                    );
-                    continue;
-                }
-                Ok(l) => l,
-            };
-
-        let mut names = DevNames::default();
-        let mut allocs = Vec::new();
-        let mut addr = std::collections::HashMap::new();
-        for (li, name, spec) in layout.allocation_order() {
-            allocs.push(spec_row(spec));
-            addr.insert((li, name), names.take(spec));
-        }
-
-        // The zeroing pass, replayed through the library's own control flow.
-        // The `break`-on-failure is the library's business, not this test's:
-        // the closure only reports whether the memset "succeeded", exactly as
-        // the recorder does, and never decides what happens next.
-        let mut ops: Vec<String> = Vec::new();
-        let mut seen = 0i32;
-        layout.zero_pass(|li, name, nbytes| {
-            let n = seen;
-            seen += 1;
-            let ok = c.fail_at < 0 || n != c.fail_at;
-            ops.push(format!(
-                "memset {} val=0 len={nbytes} -> {}",
-                addr[&(li, name)],
-                if ok { "ok" } else { "FAIL" }
-            ));
-            if !ok {
-                // The C++ clears the sticky error before moving on, so the
-                // next unrelated CUDA call does not inherit it.
-                ops.push("getlasterror -> 1".to_owned());
-            }
-            ok
-        });
-
-        let layers = (0..c.layers)
-            .map(|li| {
-                let li = li as usize;
-                format!(
-                    "{li}:{}:{}",
-                    if layout.has_layer(li) { "y" } else { "n" },
-                    if layout.has_layer(li) {
-                        layout.state_width(li).to_string()
-                    } else {
-                        "-".to_owned()
-                    }
-                )
-            })
-            .collect::<Vec<_>>();
-
-        row(
-            &mut *out,
-            &id,
-            &[
-                "ok".to_owned(),
-                format!("allocs={}", allocs.join(",")),
-                format!("ops={}", ops.join(",")),
-                format!("psize={}", layout.page_size()),
-                format!("empty={}", if layout.is_empty() { "y" } else { "n" }),
-                format!("layers={}", layers.join(",")),
-                format!(
-                    "bpt={}",
-                    compress_bytes_per_token(c.ratios, c.head_dim.unsigned_abs())
-                ),
-            ],
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,8 +548,6 @@ fn render_swap_for_cache(out: &mut String) {
 #[test]
 fn matches_the_cpp_cache_allocation_transcript() {
     let mut o = String::new();
-    render_mla(&mut o);
-    render_dsv4(&mut o);
     render_swap_uniform(&mut o);
     render_swap_for_cache(&mut o);
 
@@ -1229,9 +555,13 @@ fn matches_the_cpp_cache_allocation_transcript() {
         std::fs::write(&path, &o).expect("write transcript");
     }
 
-    assert_eq!(o.lines().count(), GOLDEN_ROWS, "row count drifted");
     assert_eq!(
-        fnv1a64(o.as_bytes()),
+        o.lines().count() + RETIRED_PREFIX_ROWS,
+        GOLDEN_ROWS,
+        "row count drifted"
+    );
+    assert_eq!(
+        fnv1a64_from(RETIRED_PREFIX_FNV1A64, o.as_bytes()),
         GOLDEN_FNV1A64,
         "transcript diverged from the C++; set CACHES_RUST_OUT and \
          CACHES_ORACLE_OUT and diff them"

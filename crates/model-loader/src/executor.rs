@@ -1,6 +1,6 @@
 //! Executors: run a finished plan.
 //!
-//! This is the production path -- `pie model convert` materializes
+//! This is the production path -- `pie model import` materializes
 //! artifacts through [`host`] -- distinct from the *oracle* it is diffed
 //! against ([`crate::testkit::reference`]), which exists only to
 //! second-guess a plan rather than run one.
@@ -83,7 +83,8 @@ pub enum Residency<'a> {
 /// // A discrete device's arena, and the driver's own sink.
 /// Execution::new(&plan, dir).arena(&mut backing).sink(&mut sink).run()?;
 ///
-/// // `convert`: no arena at all, each tensor streamed out as it finalizes.
+/// // `pie model import`: no arena at all, each tensor streamed out as it
+/// // finalizes. The only one of the three with a production caller.
 /// Execution::new(&plan, dir).streaming().sink(&mut sink).progress(&mut cb).run()?;
 /// ```
 pub struct Execution<'a> {

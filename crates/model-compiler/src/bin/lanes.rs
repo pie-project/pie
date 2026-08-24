@@ -26,7 +26,7 @@ fn main() {
         match &bound[i] {
             Ok(program) => {
                 built += 1;
-                report(program);
+                report(&plan, program);
             }
             Err(refusal) => {
                 refused += 1;
@@ -56,7 +56,7 @@ fn main() {
     }
 }
 
-fn report(program: &Program) {
+fn report(plan: &Plan, program: &Program) {
     let arena = program
         .slots
         .iter()
@@ -67,11 +67,21 @@ fn report(program: &Program) {
         .iter()
         .filter(|s| matches!(s, Slot::Alias(_)))
         .count();
+    // THE BOUND BESIDE THE PITCH. `live_bound` is the arena's busiest
+    // instant — the floor no layout can beat — so a pitch printed without it
+    // says how big the arena is and not whether it is as small as it can be,
+    // which is the only interesting half. `clashes` prints only when it has
+    // something to say, which is never on a program the walk built.
+    let bound = model_compiler::program::live_bound(plan, program);
     println!(
-        "    {} steps, {arena} arena slots, {aliases} aliases, row_pitch {} bytes",
+        "    {} steps, {arena} arena slots, {aliases} aliases, row_pitch {} bytes (bound {bound})",
         program.steps.len(),
         program.row_pitch
     );
+    let clashes = model_compiler::program::clashes(plan, program);
+    if !clashes.is_empty() {
+        println!("    CLASHES: {} live pairs share bytes", clashes.len());
+    }
     let widest = program
         .slots
         .iter()

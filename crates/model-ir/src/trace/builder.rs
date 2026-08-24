@@ -427,13 +427,13 @@ impl TraceBuilder {
             runtime: self.runtime,
         };
 
-        let mut problems = crate::kernels::check_plan(&plan);
-        problems.extend(crate::seam::check_plan(&plan));
-        assert!(
-            problems.is_empty(),
-            "signature violations in this declaration:\n  {}",
-            problems.join("\n  ")
-        );
+        // TWO TRACE-TIME CHECKS STOOD HERE — `kernels::check_plan`'s arity
+        // walk (a statement's operand count against the routine's signature
+        // column) and `seam::check_plan`'s ordering walk. Both read the
+        // legacy `KernelSig` columns and both are deleted; R4e's census
+        // found that the last thing to BUILD a `TraceBuilder` was
+        // `model-dsl-legacy`'s `Trace`, which R3 deleted, so nothing had
+        // reached either walk since.
         plan
     }
 }
