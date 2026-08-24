@@ -48,7 +48,7 @@ pub(crate) fn sg_trace(what: impl FnOnce() -> String) {
 
 /// The fire's class, read off its shape: one row per request is a decode,
 /// anything else is prefill-shaped.
-pub fn fire_class_of(
+pub(crate) fn fire_class_of(
     _step: &driver_api::StepSubmission,
     rows: usize,
     requests: usize,
@@ -626,7 +626,10 @@ fn baker_fire(
         // `j`.
         let identity = sampled_rows.is_empty()
             || (sampled_rows.len() == rows
-                && sampled_rows.iter().enumerate().all(|(i, &r)| r as usize == i));
+                && sampled_rows
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &r)| r as usize == i));
         if !identity {
             eprintln!(
                 "[driver-cuda] fire: this fire samples {} of {rows} rows; the \
@@ -856,7 +859,7 @@ fn gdn_context(
     let mut gdn_ctx: Option<GdnCtx> = None;
     let mut _slot_ids_buf: Option<crate::device::DeviceBuffer> = None;
     if let Some(shape) = dep.recurrent.as_ref() {
-        let (conv_stride, state_stride) = (shape.conv_stride, shape.state_stride);
+        let (conv_stride, state_stride) = (shape.conv_stride_elems, shape.state_stride_elems);
         const GDN_SLOTS: u32 = 8;
         if (*gdn).is_none() {
             // The ported cache owns the layout: it pools the `(conv,
@@ -1072,12 +1075,14 @@ fn kv_pools_for(
     let kv_heads_i = i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0);
     let n = dep.layers;
     // Per-layer geometry, family-decided: gemma-4's two layer kinds disagree
-    // on head dim, and its trailing layers own no pages (they attend through
-    // their source's).
+    // on head dim AND on head count (e4b keeps 2 across both, 31b reads 16 at
+    // 256 and 4 at 512), and its trailing layers own no pages (they attend
+    // through their source's). All three columns come off `Deployment` now;
+    // the head count was `vec![one; n]` until `Deployment::of` read the rows.
     let per_layer = crate::pools::kv_cache::PerLayer {
         head_dim: dep.attention.iter().map(|a| a.head_dim as i32).collect(),
         kv_source_layer: dep.attention.iter().map(|a| a.kv_source as i32).collect(),
-        num_kv_heads: vec![kv_heads_i; n as usize],
+        num_kv_heads: dep.attention.iter().map(|a| a.kv_heads as i32).collect(),
     };
     // One set of pages has one shape, so a layer that reads through another's
     // must share its dims. A violation would not crash — each shared layer
@@ -1156,8 +1161,6 @@ struct FireInputs {
     d_kv_indptr: *const u32,
     d_kv_lens: *const u32,
     d_qo: *const u32,
-    /// The gather list, or null when every row samples and none is stated.
-    d_sampled: *const u32,
     d_w_page: *const u32,
     d_w_off: *const u32,
     /// One byte per row, all ones — the mask the sampler ANDs against.
@@ -1180,10 +1183,6 @@ fn kv_and_arrays(
     alloc: &crate::device::Allocator,
     stream: &crate::device::OwnedStream,
     step: StepArrays<'_>,
-    // Which rows this step reads out (`sampled_rows_of`'s answer), passed in
-    // rather than re-derived so the device gather and the host delivery index
-    // by the same list.
-    sampled_rows: &[u32],
     rows: usize,
     requests: usize,
 ) -> Result<FireInputs, i32> {
@@ -1197,7 +1196,7 @@ fn kv_and_arrays(
         required_kv_pages,
     } = step;
     let need_pages = required_kv_pages.max(kv_indices.iter().copied().max().map_or(1, |m| m + 1));
-    let page_size: i32 = 16;
+    let page_size: i32 = crate::boot::KV_PAGE_SIZE;
     // Re-derived here as well as in `kv_pools_for`: the attention plans below
     // want the same two numbers.
     let (kv_heads_i, head_dim_i) = (
@@ -1226,12 +1225,13 @@ fn kv_and_arrays(
     let d_kv_indptr = fire_arrays.upload_u32(alloc, slot::KV_INDPTR, kv_indptr, stream.as_ref())?;
     let d_kv_lens = fire_arrays.upload_u32(alloc, slot::KV_LENS, kv_lens, stream.as_ref())?;
     let d_qo = fire_arrays.upload_u32(alloc, slot::QO, qo_indptr, stream.as_ref())?;
-    let d_sampled = if sampled_rows.len() == rows {
-        // Every row sampled means no gather is stated.
-        core::ptr::null()
-    } else {
-        fire_arrays.upload_u32(alloc, slot::SAMPLED, sampled_rows, stream.as_ref())?
-    };
+    // A `d_sampled` UPLOAD STOOD HERE, filling `slot::SAMPLED` whenever the
+    // fire did not sample every row, and reaching exactly one destination:
+    // `FireStreams::sampling_indices`, which no door answered for. A fire
+    // that states a gather is refused by `baker_fire` before the pointer
+    // could be read ("this fire samples N of M rows; the lane states no
+    // gather epilogue"), so this was work done for a case that cannot reach
+    // it. `sampled_rows` itself stays: it is what that refusal compares.
 
     // Write targets: each request appends its new tokens at the CSR tail —
     // decode one token at `len - 1`, prefill its whole window ending there.
@@ -1263,14 +1263,47 @@ fn kv_and_arrays(
         d_kv_indptr,
         d_kv_lens,
         d_qo,
-        d_sampled,
         d_w_page,
         d_w_off,
         d_valid,
     })
 }
 
+/// One attention workspace, at the sizes the planner budgets for.
+///
+/// THE SIZES ARE THE BUDGET'S. `raise_attn_plans` allocates one of these per
+/// attention class the lanes state and `Scratch` holds every one of them for
+/// the driver's life, so `CheckpointCosts::attn_float_workspace_bytes`
+/// multiplies its per-workspace figure by the class count
+/// (`baker::Baked::attn_workspaces`). Both call sites wrote the numbers out;
+/// there is one spelling now, and it is the one the budget reads.
+///
+/// # Errors
+///
+/// The device or its pinned staging could not be allocated.
+fn attn_workspace<O: crate::fire::attention_workspace::StagingOps<Event = E>, E>(
+    ops: &mut O,
+) -> Result<crate::fire::attention_workspace::AttentionWorkspace<E>, i32> {
+    use crate::layout::model_costs::{
+        ATTN_FLOAT_WORKSPACE_BYTES, ATTN_INT_WORKSPACE_BYTES, ATTN_PLAN_STAGING_SLOTS,
+    };
+    crate::fire::attention_workspace::AttentionWorkspace::allocate(
+        ops,
+        usize::try_from(ATTN_FLOAT_WORKSPACE_BYTES).unwrap_or(usize::MAX),
+        usize::try_from(ATTN_INT_WORKSPACE_BYTES).unwrap_or(usize::MAX),
+        ATTN_PLAN_STAGING_SLOTS,
+    )
+    .map_err(i32::from)
+}
+
 /// The shapes an attention plan is raised against.
+///
+/// BUILT ONCE PER FIRE AND PASSED TWICE. It was built twice, from the same
+/// six locals, seven lines apart — `raise_attn_plans` and
+/// `publish_seam_pins` each got their own literal. `Copy` is what makes one
+/// enough: every field is a shared slice or an `i32`, so the second pass is
+/// a move of six words and neither callee can change what the other sees.
+#[derive(Clone, Copy)]
 struct PlanGeometry<'a> {
     kv_indptr: &'a [u32],
     kv_lens: &'a [u32],
@@ -1286,20 +1319,20 @@ struct PlanGeometry<'a> {
 /// the driver's lifetime, and returning borrows would keep `state.scratch`
 /// mutably borrowed across the rest of the fire.
 struct AttnPlans {
-    decode_plan: *mut std::ffi::c_void,
-    prefill_plan: *mut std::ffi::c_void,
-    /// The workspace, as launchers take it — the DECODE plan's.
-    workspace: crate::bind::abi::AttentionWorkspaceView,
-    /// The workspace the prefill arm binds — the decode one for a lane that
-    /// states no prefill attention, because it never raised a prefill plan
-    /// and a view of an unplanned workspace is not one a kernel may read.
-    prefill_workspace: crate::bind::abi::AttentionWorkspaceView,
+    /// One raised decode schedule per CLASS the lane states, as the fire's
+    /// view table takes them. A body asks by class
+    /// (`kernels::raises::Class`), so this is a table and not a pointer.
+    decode_plans: Vec<(kernels::raises::Class, *mut std::ffi::c_void)>,
+    /// The same table for the PREFILL cache: one PRE-planned schedule per
+    /// masked class the lane states, or — for a lane that states none — the
+    /// single classless cache the planless leg carves into.
+    prefill_plans: Vec<(kernels::raises::Class, *mut std::ffi::c_void)>,
     /// Does the lane state the flashinfer DECODE dispatch? Read by the score
     /// sink, which sizes a one-wide window for it.
     states_decode_dispatch: bool,
-    /// Does it plan its prefill INSIDE the fire? True when the lane states no
-    /// prefill attention.
-    planless_prefill: bool,
+    /// Does it state `attention.prefill`, which plans INSIDE the fire out of
+    /// the host CSR mirrors? Those mirrors are published for it.
+    states_own_prefill: bool,
 }
 
 /// Allocate the workspaces on first fire, then raise the schedules this
@@ -1312,18 +1345,61 @@ struct AttnPlans {
 /// capture recorded both arms of an attention guard and an arm whose plan was
 /// never raised abandoned the capture. There is no union and no capture: a
 /// `Program` is one lane, its statements are all issued, and
-/// [`Baked::attn_ask`] reads exactly what they ask for. The pair of decode
-/// schedules went with it — see that function for why a second width is a
-/// refusal here rather than a second 48 MB workspace.
+/// [`Baked::attn_ask`] reads exactly what they ask for.
+///
+/// # ONE SCHEDULE PER CLASS, and the workspace is why there is a Vec
+///
+/// The pair of decode schedules the legacy walk kept went with it, and came
+/// back — as a set the lane's own statements measure rather than a pair the
+/// lowering remembered. A FlashInfer plan writes its work list into the
+/// workspace it was raised against, so each class owns one; they are
+/// allocated on the fire that first states the class and kept for the
+/// driver's life, which is what the single pair always did.
+///
+/// A lane's classes are the attention GEOMETRIES its text states — one for
+/// every shipping SKU but gemma-4's two.
+///
+/// # AND THE MASKED ARM READS THE SAME TABLE
+///
+/// The paragraph above was written for decode while the prefill cache below
+/// was still a fixed pair, and gemma's MASKED lane is the same tower saying
+/// the same thing through the other arm: 35 statements at `(256, 512)` beside
+/// 7 at `(512, 0)`, one lane, and a schedule planned at one geometry. So the
+/// two loops are one loop said twice, and what separates them is only which
+/// planner carves the work list.
+///
+/// The classless ANSWER is the seam between them. A decode lane with no decode
+/// statement gets a schedule answered under `Class::ANY` and PLANNED (a null
+/// one would turn a later absence into a fault); a lane with no masked
+/// statement gets a cache answered under `Class::ANY` and only STAMPED,
+/// because its reader — the planless prefill leg — carves it per statement out
+/// of the host CSR mirrors. A lane that states masked therefore publishes no
+/// classless prefill cache at all, and a lane stating both arms would be
+/// refused at the bind by the `"fa2.prefill"` key rather than handed a cache
+/// the other arm replans mid-fire. No text states both: gemma's three-way
+/// `split` is a predicate over the fact word, so the masked lane states
+/// `attention.masked` and neither sibling.
+///
+/// `Class::ANY` IS THE ANSWER'S KEY AND NOT THE ENTRY'S. `scratch` is keyed by
+/// GEOMETRY — a workspace per `(head_dim, window, kv_heads)`, grown across
+/// every lane of the model — so the fallback's entry is shared with a stated
+/// class that happens to be the same geometry. gemma is exactly that case on
+/// the prefill side: its fallback is `(512, 0, kv 2)`, which is its second
+/// masked class, so a masked fire PLANS the entry an unmasked fire STAMPS.
+/// Sound because a `Program` is one lane and a lane states one arm — each fire
+/// (re)carves what it is about to read, which is what both loops do
+/// unconditionally.
 fn raise_attn_plans(
     scratch_slot: &mut Option<FireScratch>,
     model: &LoadedModel,
-    ask: crate::baker::AttnAsk,
+    ask: &crate::baker::AttnAsk,
     geom: PlanGeometry<'_>,
     raw_stream: *mut std::ffi::c_void,
 ) -> Result<AttnPlans, i32> {
+    use crate::baker::DecodeClass;
     use crate::bind::{DecodePlan, PrefillPlan};
-    use crate::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use crate::fire::attention_workspace::LiveStagingOps;
+    use crate::serve::state::{DecodeSchedule, PrefillSchedule};
 
     let PlanGeometry {
         kv_indptr,
@@ -1335,86 +1411,175 @@ fn raise_attn_plans(
     } = geom;
     let mut sops = LiveStagingOps;
     if scratch_slot.is_none() {
-        let ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
-        let prefill_ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
         *scratch_slot = Some(FireScratch {
-            ws,
-            prefill_ws,
-            decode_plan: DecodePlan::new(),
-            prefill_plan: PrefillPlan::new(),
+            decode: Vec::new(),
+            prefill: Vec::new(),
         });
     }
     let scratch = scratch_slot.as_mut().expect("just ensured");
-    let (ws, prefill_ws, decode_plan, prefill_plan) = (
-        &mut scratch.ws,
-        &mut scratch.prefill_ws,
-        &mut scratch.decode_plan,
-        &mut scratch.prefill_plan,
-    );
-    let states_decode_dispatch = ask.decode.is_some();
-    ws.begin_plan_update(&mut sops)?;
+    let states_decode_dispatch = !ask.decode.is_empty();
     let q_heads_i = i32::try_from(model.deployment.shape.q_heads).unwrap_or(0);
-    // `enable_cuda_graph = true` on the raise: the padded batch size stays
-    // constant between fires, which is what the flag buys and what a future
-    // capture of this walk will need. It costs nothing to an eager fire.
-    //
-    // THE STATED VARIANT RIDES ALONG, and dropping it was once a silent
-    // numerics bug: `plan_decode` hardcodes `full_attention_variant = false`,
-    // so a stack with NO sliding window — every llama, qwen3 and mistral —
-    // planned the windowed schedule and every decode ran the wrong kernel.
-    // The lane says which variant it wants and this passes it.
-    //
-    // A lane that states no decode attention still gets a schedule, at the
-    // geometry's own head dim: the plan is cheap, and a null one would turn a
-    // later statement's absence into a fault rather than a refusal.
-    let (d, full) = ask.decode.map_or((head_dim, false), |(d, f)| (d as i32, f));
-    decode_plan.plan_decode_variant(
-        kv_indptr,
-        q_heads_i,
-        kv_heads,
-        d,
-        page_size,
-        ws.view(),
-        raw_stream,
-        true,
-        full,
-        -1,
-    );
-    // A lane that plans its prefill inside the fire states no prefill point.
-    let planless_prefill = ask.prefill.is_none();
-    if let Some(d) = ask.prefill {
-        prefill_ws.begin_plan_update(&mut sops)?;
-        prefill_plan.plan_prefill(
-            qo_indptr,
+
+    // A LANE THAT STATES NO DECODE ATTENTION STILL GETS A SCHEDULE, at the
+    // deployment's own widest head: the plan is cheap, and a null one would
+    // turn a later statement's absence into a fault rather than a refusal.
+    // It is raised under `Class::ANY`, which is the ask nothing makes — a
+    // decode body always names its statement's class — so it is answered only
+    // by a key lookup that finds nothing else.
+    let fallback = DecodeClass {
+        head_dim: head_dim.max(0).unsigned_abs(),
+        window: 0,
+        kv_heads: kv_heads.max(0).unsigned_abs(),
+    };
+    let wanted: Vec<DecodeClass> = if ask.decode.is_empty() {
+        vec![fallback]
+    } else {
+        ask.decode.clone()
+    };
+
+    let mut decode_plans = Vec::with_capacity(wanted.len());
+    for want in wanted {
+        if !scratch.decode.iter().any(|s| s.class == want) {
+            // ONE PER CLASS, WHICH IS WHAT THE PLANNER NOW CHARGES FOR. The
+            // three sizes are `layout::model_costs`' constants rather than
+            // literals: the budget term and the allocation were two spellings
+            // of `32 << 20` that had to agree, with nothing making them.
+            let ws = attn_workspace(&mut sops)?;
+            scratch.decode.push(DecodeSchedule {
+                class: want,
+                ws,
+                plan: DecodePlan::new(),
+            });
+        }
+        let held = scratch
+            .decode
+            .iter_mut()
+            .find(|s| s.class == want)
+            .expect("just ensured");
+        held.ws.begin_plan_update(&mut sops)?;
+        // `enable_cuda_graph = true` on the raise: the padded batch size stays
+        // constant between fires, which is what the flag buys and what a
+        // future capture of this walk will need. It costs nothing to an eager
+        // fire.
+        //
+        // THE STATED VARIANT RIDES ALONG, and dropping it was once a silent
+        // numerics bug: `plan_decode` hardcodes `full_attention_variant =
+        // false`, so a stack with NO sliding window — every llama, qwen3 and
+        // mistral — planned the windowed schedule and every decode ran the
+        // wrong kernel. The class says which variant it wants and this passes
+        // it; `attn::variant_agrees` holds the answer to it at the body.
+        //
+        // `window_left = -1` UNCHANGED, and it is not the class's window: the
+        // decode planner reads that argument in exactly one place, an
+        // env-gated split-kv choice, and the WINDOW the launch attends over is
+        // the statement's own `Const<i32>` (`attn::window_left`). What the
+        // schedule carries about the window is the variant.
+        held.plan.plan_decode_variant(
             kv_indptr,
-            kv_lens,
             q_heads_i,
-            kv_heads,
-            d as i32,
+            i32::try_from(want.kv_heads).unwrap_or(kv_heads),
+            i32::try_from(want.head_dim).unwrap_or(head_dim),
             page_size,
-            prefill_ws.view(),
+            held.ws.view(),
             raw_stream,
             true,
+            want.full(),
             -1,
         );
-        // The fence is the point: `end_plan_update` records the event that
-        // says the schedule upload landed, so a launch cannot read a schedule
-        // that is not there yet.
-        prefill_ws.end_plan_update(&mut sops, raw_stream)?;
+        held.ws.end_plan_update(&mut sops, raw_stream)?;
+        decode_plans.push((
+            if ask.decode.is_empty() {
+                kernels::raises::Class::ANY
+            } else {
+                want.class()
+            },
+            held.plan.as_ptr(),
+        ));
     }
-    ws.end_plan_update(&mut sops, raw_stream)?;
+
+    // THE PREFILL CACHE IS RAISED EITHER WAY, and only PLANNED for the masked
+    // arm. `attention.prefill`'s body plans its own schedule into this cache
+    // per statement (`fa2::plan_own_prefill`), which is why the workspace is
+    // stamped on the leg that does not plan here: a cache with a null
+    // workspace would have the planless leg carving into nothing.
+    //
+    // SO THE LOOP ABOVE, WITH THAT ONE BRANCH IN IT. A lane that states the
+    // masked arm gets one PLANNED schedule per class it states; a lane that
+    // states none gets the one classless STAMPED cache it has always had, at
+    // the same allocation and in the same place.
+    let masked = !ask.masked.is_empty();
+    let wanted: Vec<DecodeClass> = if masked {
+        ask.masked.clone()
+    } else {
+        vec![fallback]
+    };
+
+    let mut prefill_plans = Vec::with_capacity(wanted.len());
+    for want in wanted {
+        if !scratch.prefill.iter().any(|s| s.class == want) {
+            let ws = attn_workspace(&mut sops)?;
+            scratch.prefill.push(PrefillSchedule {
+                class: want,
+                ws,
+                plan: PrefillPlan::new(),
+            });
+        }
+        let held = scratch
+            .prefill
+            .iter_mut()
+            .find(|s| s.class == want)
+            .expect("just ensured");
+        if masked {
+            held.ws.begin_plan_update(&mut sops)?;
+            // `window_left = -1` FOR THE DECODE LOOP'S REASON, and the masked
+            // body holds it to that by name. The prefill planner reads the
+            // argument in exactly one place — the split-kv chunk-size search
+            // — where a shorter effective kv length is the OPTIMISATION and
+            // the whole prefix is the conservative answer; the window the
+            // launch attends over is the statement's own `Const<i32>`, ANDed
+            // with the caller's mask bit in one `LogitsMask`. A schedule
+            // carved for a narrower reading than the launch attends over
+            // would leave the chunks outside it unscheduled, which is silent.
+            //
+            // WHICH IS WHY THE CLASS CARRIES A WINDOW THE PLAN DOES NOT. The
+            // class is the statement's own `(head_dim, window)` — it says
+            // WHICH schedule a body means, and gemma's two masked geometries
+            // are two entries because their statements are two classes.
+            held.plan.plan_prefill(
+                qo_indptr,
+                kv_indptr,
+                kv_lens,
+                q_heads_i,
+                i32::try_from(want.kv_heads).unwrap_or(kv_heads),
+                i32::try_from(want.head_dim).unwrap_or(head_dim),
+                page_size,
+                held.ws.view(),
+                raw_stream,
+                true,
+                -1,
+            );
+            // The fence is the point: `end_plan_update` records the event
+            // that says the schedule upload landed, so a launch cannot read a
+            // schedule that is not there yet.
+            held.ws.end_plan_update(&mut sops, raw_stream)?;
+        } else {
+            held.plan.stamp_workspace(held.ws.view());
+        }
+        prefill_plans.push((
+            if masked {
+                want.class()
+            } else {
+                kernels::raises::Class::ANY
+            },
+            held.plan.as_ptr(),
+        ));
+    }
 
     Ok(AttnPlans {
-        decode_plan: decode_plan.as_ptr(),
-        prefill_plan: prefill_plan.as_ptr(),
-        workspace: ws.view(),
-        prefill_workspace: if planless_prefill {
-            ws.view()
-        } else {
-            prefill_ws.view()
-        },
+        decode_plans,
+        prefill_plans,
         states_decode_dispatch,
-        planless_prefill,
+        states_own_prefill: ask.states_own_prefill,
     })
 }
 
@@ -1477,7 +1642,7 @@ fn publish_seam_pins(
     } else {
         attn_score_window
     };
-    let sink = crate::fire::attn_score::plan_score_sink(
+    let sink = crate::fire::scratch::plan_score_sink(
         kv_indptr,
         kv_lens,
         page_size,
@@ -2026,7 +2191,6 @@ pub(crate) fn step_impl(
         d_kv_indptr,
         d_kv_lens,
         d_qo,
-        d_sampled,
         d_w_page,
         d_w_off,
         d_valid,
@@ -2047,34 +2211,30 @@ pub(crate) fn step_impl(
             qo_indptr,
             required_kv_pages: frame.required_kv_pages,
         },
-        &sampled_rows,
         rows,
         requests,
     )?;
 
     lap("kv+arrays");
+
+    // The six numbers both raises are cut from, read once. See
+    // [`PlanGeometry`] for why one value serves two callees.
+    let geom = PlanGeometry {
+        kv_indptr,
+        kv_lens,
+        qo_indptr,
+        kv_heads: kv_heads_i,
+        head_dim: head_dim_i,
+        page_size,
+    };
+
     // Workspace + plan caches: driver-lifetime, first-launch built.
     let AttnPlans {
-        decode_plan,
-        prefill_plan,
-        workspace: _workspace,
-        prefill_workspace: _prefill_workspace,
+        decode_plans,
+        prefill_plans,
         states_decode_dispatch,
-        planless_prefill,
-    } = raise_attn_plans(
-        &mut state.scratch,
-        model,
-        ask,
-        PlanGeometry {
-            kv_indptr,
-            kv_lens,
-            qo_indptr,
-            kv_heads: kv_heads_i,
-            head_dim: head_dim_i,
-            page_size,
-        },
-        raw_stream,
-    )?;
+        states_own_prefill,
+    } = raise_attn_plans(&mut state.scratch, model, ask, geom, raw_stream)?;
 
     // The walk's arena and the logits landing, both carved HERE rather than
     // at the walk, and the reason is a borrow: the delivery below takes a
@@ -2089,30 +2249,20 @@ pub(crate) fn step_impl(
         .logits(alloc, logits_bytes.max(64))
         .map_err(i32::from)?;
 
-    // The `"request_of_token"` stream, staged only when the plan names it:
-    // row r of request i for every r in `qo_indptr[i]..qo_indptr[i+1]`,
-    // derived here because no wire array carries it.
-    let names_request_of_token = program.slots.iter().any(|slot| {
-        matches!(slot, model_compiler::program::Slot::Runtime(n) if n == "request_of_token")
-    });
-    let d_req_of: *const u32 = if names_request_of_token {
-        let mut req_of: Vec<u32> = vec![0; rows];
-        for (i, w) in qo_indptr.windows(2).enumerate() {
-            for r in w[0]..w[1] {
-                if let Some(slot) = req_of.get_mut(r as usize) {
-                    *slot = u32::try_from(i).unwrap_or(0);
-                }
-            }
-        }
-        state.fire_arrays.upload_u32(
-            alloc,
-            crate::fire::scratch::slot::REQ_OF_TOKEN,
-            &req_of,
-            stream.as_ref(),
-        )?
-    } else {
-        core::ptr::null()
-    };
+    // A `"request_of_token"` DERIVE STOOD HERE, behind
+    // `program.slots.iter().any(|s| matches!(s, Slot::Runtime(n) if n ==
+    // "request_of_token"))` — a guard that cannot be true. `Slot::Runtime`
+    // comes from `ValueDef::Runtime`, which `model-dsl`'s `Recorder::runtime`
+    // is the only producer of, and its seven call sites in the whole tree
+    // spell three names: `token_ids`, `positions`, `qo_indptr`.
+    // `model-compiler` says the same in its own doc. So the block derived
+    // nothing, uploaded nothing, and published a null — every fire, on every
+    // catalog row.
+    //
+    // The name is still ASKED for, by key, from `kernels-cuda`'s
+    // `pool.attention_lse`, and that ask has always met the null and refused.
+    // It still refuses. What is gone is the appearance that some plan could
+    // turn it on.
     let SeamPins {
         d_score_indptr,
         d_mask,
@@ -2123,14 +2273,7 @@ pub(crate) fn step_impl(
         stream,
         model,
         step,
-        PlanGeometry {
-            kv_indptr,
-            kv_lens,
-            qo_indptr,
-            kv_heads: kv_heads_i,
-            head_dim: head_dim_i,
-            page_size,
-        },
+        geom,
         states_decode_dispatch,
         state.boot.attn_score_window,
     )?;
@@ -2193,28 +2336,28 @@ pub(crate) fn step_impl(
     let streams = crate::bind::views::FireStreams {
         positions: d_pos.cast_mut().cast(),
         token_ids: d_ids.cast_mut().cast(),
-        request_of_token: d_req_of.cast_mut().cast(),
         qo_indptr: d_qo.cast_mut().cast(),
         row_valid: d_valid,
-        sampling_indices: d_sampled.cast_mut().cast(),
-        // The fire's write origin. A SCALAR IN THE POINTER CHANNEL, and zero
-        // is the only origin a fire has now that nothing peels it — the peel
-        // was the one thing that ever moved it.
-        first_token: 0,
-        // The planless prefill's two host mirrors, published only on the leg
-        // that walks them.
-        qo_indptr_host: if planless_prefill {
+        // The planless prefill's two host mirrors, published for the lane
+        // that walks them — which is the lane that STATES `attention.prefill`,
+        // not the lane that does not. That polarity was inverted here until
+        // the prefill point's body was read for what it does: it always
+        // carves its own schedule, and a null mirror is the refusal
+        // `plan_own_prefill` opens with. No lane reached it (`baker_serve`
+        // ingests one token at a time and the decode lane states neither),
+        // which is why nothing caught it.
+        qo_indptr_host: if states_own_prefill {
             qo_indptr.as_ptr()
         } else {
             core::ptr::null()
         },
-        kv_page_indptr_host: if planless_prefill {
+        kv_page_indptr_host: if states_own_prefill {
             kv_indptr.as_ptr()
         } else {
             core::ptr::null()
         },
-        prefill_plan_cache: prefill_plan,
-        decode_plan_cache: decode_plan,
+        prefill_plan_caches: prefill_plans,
+        decode_plan_caches: decode_plans,
     };
     let views = crate::bind::views::FireViews::build(Some(&attn), gdn_ctx.as_ref(), streams);
 

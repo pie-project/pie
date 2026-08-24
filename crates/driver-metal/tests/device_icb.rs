@@ -227,265 +227,29 @@ fn read(handle: &driver_metal::device::Handle) -> Vec<u32> {
         .collect()
 }
 
-/// A WHOLE FIRE, recorded once and replayed — and what that saves.
-///
-/// The previous test proves the mechanism on two commands. This one runs it
-/// over the real thing: `llama_like`'s Metal text, 424 dispatches, the same
-/// walk `encode` does every step.
-///
-/// The number it prints is the one `.wiki/driver/graph-metal.md` is about.
-#[test]
-fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
-    use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
-    use driver_metal::device::{Regions, Stepper, record};
-    use driver_metal::lowering::dispatch::table_width;
-    use driver_metal::lowering::dispatch::{Geometry, plan};
-    use driver_metal::lowering::executor::{Frame, Slice};
-    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-    use model::shared::llama_like::forward::llama_like_metal;
-    use model_compiler::lower::{Fire, Row, lower};
-    use model_ir::trace::FireClass;
+// `a_whole_fire_records_and_replays_faster_than_it_encodes` STOOD HERE, with
+// an `Everything` resolver under it, and it is deleted with the walk it
+// measured. It lowered `model::shared::llama_like`'s Metal text through
+// `model_compiler::lower`, planned the 424 launches with
+// `lowering::dispatch::plan(&Geometry, ..)`, answered every name from one
+// generous region through `lowering::executor::Resolver`, and then compared
+// the cost of recording that list against re-encoding it — 39.8 us against
+// 14.87 ms, which is the number `.wiki/driver/graph-metal.md` is about and the
+// reason `Shell::recordings` exists.
+//
+// Every one of those five names is deleted (P5): there is no `lower`, no
+// `Geometry`, no grid planner, no by-name resolver, and no `llama_like`. What
+// replaced them is a `Program` bound at load and walked per fire, so the same
+// measurement is `Baked::of(sku)` -> `baker::walk::Fire::over` -> `encode` ->
+// `commands`, over a catalog row rather than a hand-built text.
+//
+// It is a PORT and not a rename, which is why it is not attempted blind here:
+// the two tests that remain in this file ask the questions a device has to
+// answer (does an ICB execute compute from an MTL4 encoder, and does a
+// recorded command's buffer offset survive past 4 GiB), and both are
+// self-contained. What is missing is the SAVING, and it is missing on a
+// machine that cannot run it either way.
 
-    let Ok(context) = Context::new() else {
-        skipped("no Metal 4 device");
-        return;
-    };
-    let compiler = Compiler::new(&context).expect("a compiler");
-    let mut pipelines = Pipelines::new(std::path::PathBuf::from(
-        std::env::var("PIE_METAL_KERNELS").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../kernels-metal/kernels").to_string()
-        }),
-    ));
-
-    let plan_text = llama_like_metal(
-        &LlamaLikeFacts::qwen3_0_6b(),
-        &LlamaLikeMetalFacts::synthetic(),
-        FireClass::Decode,
-    );
-    let lowered = lower(
-        &plan_text,
-        &[Row {
-            samples: true,
-            ..Row::default()
-        }],
-        Fire {
-            captures_across_splits: false,
-        },
-    )
-    .expect("the text lowers");
-
-    // One big region answers every name, and it is REGISTERED so the
-    // recording can turn an address back into a buffer.
-    let backing = Allocation::new(&context, 256 << 20, "sentinels").expect("a region");
-    let arena =
-        Allocation::new(&context, (lowered.arena_bytes as u64).max(1), "arena").expect("arena");
-    let zeros = Allocation::new(&context, 1 << 20, "fire tables").expect("a region");
-    // SAFETY: freshly allocated, nothing encoded against it.
-    unsafe { zeros.zero(0, zeros.len()).expect("zeroes") };
-    let mut store = Everything {
-        slice: Slice {
-            address: backing.gpu_address(),
-            bytes: 256 << 20,
-        },
-        tables: Slice {
-            address: zeros.gpu_address(),
-            bytes: zeros.len(),
-        },
-    };
-    let frame = Frame {
-        arena: Slice {
-            address: arena.gpu_address(),
-            bytes: arena.len(),
-        },
-    };
-    let geometry = Geometry {
-        q_heads: 16,
-        kv_heads: 8,
-        head_dim: 128,
-        n_experts: 0,
-        experts_per_token: 0,
-        // qwen3-0.6b's checkpoint point, which the affine kernels REFUSE at
-        // zero -- `Narrow { what: "affine group size", at: 0 }`. This rig
-        // predates the field and inherited a default of nothing, which read
-        // as "this fire has no quantised weights" for a fire whose every
-        // projection is 4-bit over groups of 64.
-        group: 64,
-        bits: 4,
-        ..Geometry::default()
-    };
-    let dispatches = plan(&lowered, frame, geometry, &mut store).expect("the fire plans");
-    let params = Params::stage(&context, &dispatches).expect("scalars stage");
-    let argtable = driver_metal::device::ArgumentTable::new(&context, table_width(&dispatches))
-        .expect("an argument table");
-    pipelines
-        .ensure(&context, &compiler, &dispatches)
-        .expect("every symbol compiles");
-
-    let mut regions = Regions::new();
-    regions.add(&backing);
-    regions.add(&zeros);
-    regions.add(&arena);
-    regions.add(params.region());
-    // The stand-in for an operand that addresses nothing -- `dispatch::bind`
-    // answers unfilled slots with address zero, and a recorded command binds
-    // a buffer rather than an address.
-    let nothing = Allocation::new(&context, 1 << 16, "nothing").expect("a region");
-    regions.set_null(&nothing);
-
-    // Lowered, then recorded: `record` no longer knows what a `Dispatch` is,
-    // which is the layering `.wiki/driver/real-metal-north-star.md` §9 asks
-    // for. This test still compares the ICB against the encode below, so the
-    // two walks are held equal by output rather than by reading them.
-    let lowered = commands(&pipelines, &params, &dispatches).expect("the fire lowers");
-    let recording = record(&context, &regions, &lowered).expect("the fire records");
-    assert_eq!(recording.commands(), dispatches.len());
-
-    let mut stepper = Stepper::new(&context).expect("a stepper");
-    // Warm both paths.
-    stepper
-        .run(|e| encode(e, &argtable, &pipelines, &params, &dispatches))
-        .expect("encodes");
-    stepper
-        .run(|e| e.execute_commands(recording.buffer(), 0..recording.commands()))
-        .expect("replays");
-
-    const N: u32 = 10;
-    let mut encoded = std::time::Duration::ZERO;
-    let mut replayed = std::time::Duration::ZERO;
-    for _ in 0..N {
-        encoded += stepper
-            .run(|e| encode(e, &argtable, &pipelines, &params, &dispatches))
-            .expect("encodes")
-            .encode;
-        replayed += stepper
-            .run(|e| e.execute_commands(recording.buffer(), 0..recording.commands()))
-            .expect("replays")
-            .encode;
-    }
-    let (encoded, replayed) = (encoded / N, replayed / N);
-
-    // THE SAME NUMBERS, which is the part that matters. A replay that is fast
-    // and computes something else is the failure this crate spends most of
-    // its tests on -- so encode into a zeroed arena, keep the bytes, replay
-    // into a zeroed arena, and compare.
-    // The sentinel resolver answers every NAME with `backing`, so that is
-    // where this fire's outputs land; the arena holds only what the lowering
-    // assigns itself.
-    let bytes = 1 << 20;
-    let snapshot = |stepper: &mut Stepper, which: &str| -> Vec<u8> {
-        // SEEDED, not zeroed: every sentinel weight is the same region, so a
-        // zeroed one makes the whole fire compute zeros and the comparison
-        // proves nothing. `0x3c` is a small positive bf16.
-        let seed = vec![0x3cu8; bytes];
-        // SAFETY: nothing is encoded against either region between fires.
-        unsafe {
-            arena.zero(0, arena.len()).expect("zeroes");
-            backing.write(0, &seed).expect("seeds");
-        }
-        match which {
-            "encode" => stepper
-                .run(|e| encode(e, &argtable, &pipelines, &params, &dispatches))
-                .expect("encodes"),
-            _ => stepper
-                .run(|e| e.execute_commands(recording.buffer(), 0..recording.commands()))
-                .expect("replays"),
-        };
-        // SAFETY: the fire has retired, so the host owns the bytes.
-        unsafe { std::slice::from_raw_parts(backing.contents().as_ptr().cast::<u8>(), bytes) }
-            .to_vec()
-    };
-    let by_encoding = snapshot(&mut stepper, "encode");
-    let by_replay = snapshot(&mut stepper, "replay");
-    assert_eq!(
-        by_encoding, by_replay,
-        "the recording computes something the encode does not -- the first \
-         {bytes} bytes of the arena differ"
-    );
-    assert!(
-        by_encoding.iter().any(|b| *b != 0),
-        "both paths wrote nothing, so the comparison proved nothing"
-    );
-    println!(
-        "{} dispatches: encode={encoded:?}/fire replay={replayed:?}/fire  ({:.0}x)",
-        dispatches.len(),
-        encoded.as_secs_f64() / replayed.as_secs_f64().max(1e-9)
-    );
-    assert!(
-        replayed < encoded,
-        "a replay that is not cheaper than the encode it replaces is the whole \
-         proposition failing: encode={encoded:?} replay={replayed:?}"
-    );
-
-    // ---- the fallback is one failure, not four ----
-    //
-    // `submit` used to end in `.ok()`, so every way of failing to record
-    // meant "encode instead". Three of the four are bugs, and swallowing
-    // them is the worst available outcome: the answers stay RIGHT and the
-    // step gets 374x slower, so nothing ever reports it.
-    //
-    // The fire above records, so this is the same fire with one thing wrong
-    // at a time.
-
-    // Swallowed. An operand in no registered allocation is a deployment that
-    // has not registered its regions -- un-optimised, not broken, because
-    // the encode path binds addresses and does not care.
-    let unregistered = Regions::new();
-    let err = record(&context, &unregistered, &lowered)
-        .expect_err("nothing is registered, so nothing resolves to a buffer");
-    assert!(
-        matches!(err, driver_metal::Error::Unrecordable { .. }),
-        "an unresolvable operand is the ONE case a caller may swallow, and it \
-         has to be able to tell: got {err:?}"
-    );
-
-    // NOT swallowed. `pipelines.ensure` ran above; a symbol with no pipeline
-    // after it means the plan drifted from what was compiled, which is a bug
-    // that must reach the caller rather than becoming a slow success.
-    let empty = Pipelines::new(std::path::PathBuf::from("/nonexistent"));
-    let err = commands(&empty, &params, &dispatches)
-        .expect_err("an empty cache has no pipeline for any symbol");
-    assert!(
-        !matches!(err, driver_metal::Error::Unrecordable { .. }),
-        "a missing pipeline is drift, not an un-registered region -- reporting \
-         it as `Unrecordable` puts it back in the `.ok()` that hid it: got {err:?}"
-    );
-}
-
-/// Answers every name with one generous region — this test is about host
-/// cost, and `model_bind.rs` owns whether the names resolve.
-struct Everything {
-    slice: driver_metal::lowering::executor::Slice,
-    /// The fire's tables, ZEROED and kept separate from the weights. A page
-    /// CSR of seeded bytes walks pages until the GPU is abandoned -- measured,
-    /// a 60-second timeout.
-    tables: driver_metal::lowering::executor::Slice,
-}
-
-impl driver_metal::lowering::executor::Resolver for Everything {
-    fn weight(&mut self, _: &str) -> Option<driver_metal::lowering::executor::Slice> {
-        Some(self.slice)
-    }
-    fn named(
-        &mut self,
-        _: model_ir::trace::ValueId,
-    ) -> Option<driver_metal::lowering::executor::Slice> {
-        Some(self.slice)
-    }
-    fn kv(&mut self, _: u16, _: bool) -> Option<driver_metal::lowering::executor::Slice> {
-        Some(self.slice)
-    }
-    fn fire(
-        &mut self,
-        _: driver_metal::lowering::executor::FireTable,
-    ) -> Option<driver_metal::lowering::executor::Slice> {
-        Some(self.tables)
-    }
-    fn pool(&mut self, _: driver_metal::lowering::executor::FireTable) -> Option<u32> {
-        Some(128)
-    }
-}
-
-/// **Does a recorded command's buffer offset survive past 4 GiB?**
 ///
 /// The third question, and it was asked because a real checkpoint answered
 /// it the hard way. `a_replayed_fire_over_real_weights_agrees_with_the_encoded_one`

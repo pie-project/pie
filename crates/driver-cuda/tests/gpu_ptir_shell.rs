@@ -37,7 +37,7 @@ use driver_api::completion::CompletionBroker;
 use driver_api::local::{
     ChannelBinding, InstanceBinding, PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32,
     PIE_CHANNEL_EXTERN_NONE, PIE_CHANNEL_HOST_ROLE_READER, PIE_CHANNEL_HOST_ROLE_WRITER,
-    TerminalCell,
+    PIE_RS_FLAG_RESET, TerminalCell,
 };
 use driver_api::{
     ChannelRegistrationPlan, FrameSubmission, GeometryClass, InstanceBindingPlan, LaunchPlan,
@@ -58,21 +58,47 @@ use common::gpu_guard;
 /// Lanes the program reduces over.
 const LANES: u32 = 8;
 
-/// The cached Qwen3-0.6B snapshot, if this box has one.
+/// The cached snapshot both GPU tests here load a model out of — the same
+/// catalog row `tests/baker_serve.rs` uses.
+const CACHE_DIR: &str = "models--Qwen--Qwen3.5-0.8B-Base";
+
+/// The cached checkpoint this test loads a model from, if this box has one.
 ///
 /// A MODEL IS REQUIRED and that is not incidental: `register_program`
 /// compiles only `if plan.executable && state.model.is_some()`, and
 /// `run_program` is called from inside the model fire. So a program with
 /// no model behind it is registered and never compiled — which is what
 /// the first draft of this test measured, silently, in 0.00s.
+///
+/// IT USED TO NAME `models--Qwen--Qwen3-0.6B`, AND THAT IS WHY BOTH TESTS
+/// WERE RED. R3 replaced the guessing loader with `model::catalog()`, and
+/// the catalog does not ship a Qwen3-0.6B row — so on a box that HAS that
+/// snapshot the skip guard passed, `load_model` reached
+/// `baker::identify` and answered "this checkpoint matches no SKU this
+/// build ships". The skip and the load disagreed about what a usable
+/// checkpoint is. [`CACHE_DIR`] is the row `baker_serve` loads, so the
+/// two GPU tests that need a model now ask for the same one.
 fn qwen3_snapshot() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let snaps = std::path::PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
-    std::fs::read_dir(&snaps).ok()?.find_map(|e| {
-        let p = e.ok()?.path();
-        p.join("model.safetensors").is_file().then_some(p)
-    })
+        .join(".cache/huggingface/hub")
+        .join(CACHE_DIR)
+        .join("snapshots");
+    // A SHARD INDEX COUNTS, which is `tests/baker_serve.rs`'s predicate and
+    // not what this used to ask. `Qwen3.5-0.8B-Base` ships as
+    // `model.safetensors-00001-of-00001.safetensors` beside an index, so a
+    // finder that only accepted a single `model.safetensors` skipped a
+    // snapshot that is sitting right there — the second half of the same
+    // disagreement the doc above records.
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|e| {
+            let p = e.path();
+            (p.join("model.safetensors").is_file()
+                || p.join("model.safetensors.index.json").is_file())
+            .then_some(p)
+        })
 }
 
 /// The one-stage epilogue this test registers: read the channel, take an
@@ -225,7 +251,7 @@ impl Endpoint {
 fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     let _gpu = gpu_guard();
     let Some(snap) = qwen3_snapshot() else {
-        eprintln!("skipping: no cached Qwen3-0.6B");
+        eprintln!("skipping: no cached {CACHE_DIR}");
         return;
     };
     // The snapshot carries its own `config.json`, and that is all
@@ -340,6 +366,14 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
             kv_page_indptr: vec![0, 1],
             kv_last_page_lens: vec![1],
             qo_indptr: vec![0, 1],
+            // A HYBRID SKU WANTS A SLOT PER REQUEST, and the catalog row
+            // this test loads is one: `fire::launch` refuses by name
+            // ("hybrid fire without rs_slot_ids") before it allocates
+            // anything. `RESET` because this is the request's first token
+            // and it inherits no recurrent state. Same two lines
+            // `serve::load::synthetic_fire` carries, for the same reason.
+            rs_slot_ids: vec![0],
+            rs_slot_flags: vec![PIE_RS_FLAG_RESET],
             ..Default::default()
         },
         roster_rows: vec![0],
@@ -400,7 +434,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
 fn every_request_in_a_frame_samples_its_own_row() {
     let _gpu = gpu_guard();
     let Some(snap) = qwen3_snapshot() else {
-        eprintln!("skipping: no cached Qwen3-0.6B");
+        eprintln!("skipping: no cached {CACHE_DIR}");
         return;
     };
     let boot = format!(
@@ -513,6 +547,10 @@ fn every_request_in_a_frame_samples_its_own_row() {
             kv_page_indptr: vec![0, 1, 2],
             kv_last_page_lens: vec![1, 1],
             qo_indptr: vec![0, 1, 2],
+            // One recurrent slot per request, `RESET` on both — see the
+            // sibling test above.
+            rs_slot_ids: vec![0, 1],
+            rs_slot_flags: vec![PIE_RS_FLAG_RESET; 2],
             ..Default::default()
         },
         roster_rows: vec![0, 1],

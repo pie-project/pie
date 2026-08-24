@@ -79,9 +79,15 @@
 // ships RMSNormGated weights in fp32 alongside bf16 activations, and that is
 // the checkpoint's fact, not the element type's.
 //
-// # There is a CuTile ALTERNATIVE beside this file, and it is FASTER
+// # There WAS a CuTile ALTERNATIVE beside this file, and it was FASTER
 //
-// `rmsnorm_tile.cuh` is the twin: about forty lines against this file's 747,
+// The twelve tile headers were deleted, because the five `pub static ROOT`s
+// in `src/tile.rs` that named them had no reader anywhere and the numbers
+// below could not be re-derived on any machine this crate runs on. What
+// follows is kept as the record of a measurement, not as a description of
+// the tree; `git log -- kernels/tile/` has the text.
+//
+// `rmsnorm_tile.cuh` was the twin: about forty lines against this file's 747,
 // no block reduction, no `__shared__`, no warp shuffle, no launcher.
 // Numerically IDENTICAL -- worst relative error 0.0000, not "within
 // tolerance" -- and faster:
@@ -116,8 +122,9 @@
 // `tileiras`, and this crate loads NVRTC 13.0.88. So these twelve kernels
 // are the fallback on every machine today, and would remain the fallback on
 // any machine whose toolchain is older -- which is what makes the twin an
-// addition rather than a removal. `moe/moe_grouped_gemm_tile.cuh` states
-// the toolchain floor in full.
+// addition rather than a removal -- and then the addition was never made:
+// `moe/moe_grouped_gemm_tile.cuh`, which stated the toolchain floor in full,
+// is gone with the rest of them.
 //
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -518,8 +525,9 @@ __global__ void rmsnorm_residual_add(
 /// us/call in gemma-4-26B's decode -- 8% of the step -- against 2.51 for the
 /// vectorized plain norm.
 ///
-/// There is also a CuTile ALTERNATIVE to the scalar form beside this file,
-/// `rmsnorm_rasr_tile.cuh`, measured at 2.41 us against 4.33 at one row and
+/// There was also a CuTile ALTERNATIVE to the scalar form beside this file,
+/// `rmsnorm_rasr_tile.cuh` -- deleted with the other eleven, and recorded
+/// here rather than in the tree -- measured at 2.41 us against 4.33 at one row and
 /// 12.86 against 24.71 at 2,048 -- 1.8x and 1.9x. It reads each operand once
 /// into a tile and does all three passes in registers, which is the direct
 /// fix for the dependent-load chain this note is about. It is bit-identical

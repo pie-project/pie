@@ -312,3 +312,92 @@ template <typename T>
       uint3, uint3);
 
 instantiate_rope_freqs(bfloat16, bfloat)
+
+template <typename T>
+[[kernel]] void rope_neox_last_mb(
+    device T* x                       [[buffer(0)]],
+    const device int* position        [[buffer(1)]],
+    const constant float& base        [[buffer(2)]],
+    const constant int& head_dim      [[buffer(3)]],
+    const constant int& interleaved   [[buffer(4)]],
+    uint3 pos  [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
+  const int i = int(pos.x);
+  const int h = int(pos.y);
+  const int m = int(pos.z);
+  const int n_head = int(grid.y);
+  const int rope_half = int(grid.x);
+  const int rotary = 2 * rope_half;
+  const int offset = head_dim - rotary;
+
+  const float d = 2.0f * static_cast<float>(i) / static_cast<float>(rotary);
+  const float inv_freq = exp2(-d * base);
+  const float theta = static_cast<float>(position[m]) * inv_freq;
+  const float costheta = fast::cos(theta);
+  const float sintheta = fast::sin(theta);
+
+  const int row_base = (m * n_head + h) * head_dim + offset;
+  const int i1 = interleaved != 0 ? row_base + 2 * i : row_base + i;
+  const int i2 = interleaved != 0 ? i1 + 1 : i1 + rope_half;
+  const float x1 = static_cast<float>(x[i1]);
+  const float x2 = static_cast<float>(x[i2]);
+  x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
+  x[i2] = static_cast<T>(x1 * sintheta + x2 * costheta);
+}
+
+#define instantiate_rope_neox_last_mb(name, itype)               \
+  template [[host_name("neox_last_mb_" #name)]]                  \
+  [[kernel]] void rope_neox_last_mb<itype>(                      \
+      device itype*, const device int*, const constant float&,   \
+      const constant int&, const constant int&, uint3, uint3);
+
+instantiate_rope_neox_last_mb(bfloat16, bfloat)
+
+template <typename T>
+[[kernel]] void rope_neox_yarn_mb(
+    device T* x                       [[buffer(0)]],
+    const device int* position        [[buffer(1)]],
+    const constant float& base        [[buffer(2)]],
+    const constant int& head_dim      [[buffer(3)]],
+    const constant float& factor      [[buffer(4)]],
+    const constant float& low_dim     [[buffer(5)]],
+    const constant float& high_dim    [[buffer(6)]],
+    const constant float& mscale      [[buffer(7)]],
+    const constant int& interleaved   [[buffer(8)]],
+    uint3 pos  [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
+  const int i = int(pos.x);
+  const int h = int(pos.y);
+  const int m = int(pos.z);
+  const int n_head = int(grid.y);
+  const int half_hd = int(grid.x);
+
+  const float d = 2.0f * static_cast<float>(i) / static_cast<float>(head_dim);
+  const float base_freq = exp2(-d * base);
+  const float denom =
+      high_dim == low_dim ? high_dim + 1e-3f - low_dim : high_dim - low_dim;
+  const float ramp =
+      metal::clamp((static_cast<float>(i) - low_dim) / denom, 0.0f, 1.0f);
+  const float freq = base_freq * ((1.0f - ramp) + ramp / factor);
+  const float theta = static_cast<float>(position[m]) * freq;
+  const float costheta = fast::cos(theta) * mscale;
+  const float sintheta = fast::sin(theta) * mscale;
+
+  const int row_base = (m * n_head + h) * head_dim;
+  const int i1 = interleaved != 0 ? row_base + 2 * i : row_base + i;
+  const int i2 = interleaved != 0 ? i1 + 1 : i1 + half_hd;
+  const float x1 = static_cast<float>(x[i1]);
+  const float x2 = static_cast<float>(x[i2]);
+  x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
+  x[i2] = static_cast<T>(x1 * sintheta + x2 * costheta);
+}
+
+#define instantiate_rope_neox_yarn_mb(name, itype)               \
+  template [[host_name("neox_yarn_mb_" #name)]]                  \
+  [[kernel]] void rope_neox_yarn_mb<itype>(                      \
+      device itype*, const device int*, const constant float&,   \
+      const constant int&, const constant float&,                \
+      const constant float&, const constant float&,              \
+      const constant float&, const constant int&, uint3, uint3);
+
+instantiate_rope_neox_yarn_mb(bfloat16, bfloat)

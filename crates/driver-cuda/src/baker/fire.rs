@@ -1,9 +1,14 @@
 //! One baker fire: the walk, and where every value it touches lives.
 //!
-//! `baker-smoke/src/smoke.rs:824-1000` is the spec. What changes on the way
-//! into the driver is exactly the four things the smoke said it was
-//! standing in for, and each is marked `REUSED:` where the driver's own
-//! machinery took over:
+//! `baker-smoke`'s `Fire` — its `rect`/`input`/`output`/`weight`/`step`
+//! block in `smoke.rs` — is the spec. BY NAME AND NOT BY LINE, because the
+//! range this cited (`smoke.rs:824-1000`) had drifted onto `Pools::hold`,
+//! which is a different thing entirely: a citation across a crate boundary
+//! that a rustfmt run can invalidate is a citation that will be wrong.
+//!
+//! What changes on the way into the driver is exactly the four things the
+//! smoke said it was standing in for, and each is marked `REUSED:` where the
+//! driver's own machinery took over:
 //!
 //! | the smoke's | the driver's |
 //! |---|---|
@@ -20,8 +25,8 @@
 use core::ffi::c_void;
 use std::collections::BTreeMap;
 
+use kernels::plane::{Cache, Refusal};
 use kernels::raises::Struct;
-use kernels::routine::{Cache, Refusal};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::views::{KvCache, RecurrentState};
 use model_compiler::program::{Call, Dt, Program, Slot};
@@ -184,21 +189,28 @@ impl<'a> Fire<'a> {
     ///   not the buffer's length: the appender reads
     ///   `num_requests = qo_indptr.rows` (`kernels-cuda/src/attn/mod.rs:2415`),
     ///   which is what `bind/mod.rs:2206` puts there from `lowered.arg_rows`.
-    /// * `row_valid` — one BYTE per row, declared `In<Tensor<i32>>` and cast
-    ///   to `*const u8` inside the routine. The declared element is a
-    ///   fiction the DECLARATION carries and the buffer must not.
+    ///
+    /// # Three names, because three names is what the floor can mint
+    ///
+    /// A `row_valid` ARM STOOD BESIDE THEM — one BYTE per row, declared
+    /// `In<Tensor<i32>>` and cast to `*const u8` inside the routine — and
+    /// this function is reached only from `Slot::Runtime(name)`, one line
+    /// away in `rect`. `Slot::Runtime` comes from `ValueDef::Runtime`, whose
+    /// only producer in the tree is `model-dsl`'s `Recorder::runtime`, and
+    /// its seven call sites spell exactly the three names above. So the arm
+    /// was unreachable as a SLOT.
+    ///
+    /// `"row_valid"` is very much alive as a KEY: `kernels-cuda`'s appending
+    /// kernels ask for it through `Ctx::staged::<RowValid>()`, which arrives
+    /// at `bind::views::FireViews::raised` and never here. The two doors take
+    /// different vocabularies, and this one's is the smaller.
     fn runtime(&self, name: &str) -> Result<Rect, Refusal> {
-        let ptr = self
-            .views
-            .streams
-            .named(name)
-            .ok_or(Refusal::Absent {
-                what: "a runtime plane this fire does not stage",
-            })?;
+        let ptr = self.views.streams.named(name).ok_or(Refusal::Absent {
+            what: "a runtime plane this fire does not stage",
+        })?;
         let (rows, width, dt) = match name {
             "token_ids" | "positions" => (self.rows, 1, Dt::I32),
             "qo_indptr" => (self.requests, self.requests + 1, Dt::I32),
-            "row_valid" => (self.rows, 1, Dt::U8),
             _ => {
                 return Err(Refusal::Unstated {
                     what: "the rectangle this runtime plane wears",
@@ -311,13 +323,9 @@ impl<'a> Fire<'a> {
     /// a second spelling of a number the plan states.
     pub(crate) fn recurrent(&self, op: &Op) -> Result<Cache<Struct<RecurrentState>>, Refusal> {
         let layer = self.layer(op)?;
-        let view = self
-            .views
-            .recurrent
-            .get(layer)
-            .ok_or(Refusal::Absent {
-                what: "a recurrent slab for the layer this statement names",
-            })?;
+        let view = self.views.recurrent.get(layer).ok_or(Refusal::Absent {
+            what: "a recurrent slab for the layer this statement names",
+        })?;
         Ok(Cache {
             ptr: core::ptr::from_ref(view),
         })
@@ -389,8 +397,7 @@ impl<'a> Fire<'a> {
         })
     }
 
-    /// One step: the generated dispatch, the staging table, or a refusal
-    /// naming the statement.
+    /// One step: the generated dispatch, or a refusal naming the statement.
     pub(crate) fn step(&self, at: u32, call: &Call) -> Result<(), Refusal> {
         let op = &self.plan.ops[at as usize];
         match call {
@@ -413,17 +420,39 @@ impl<'a> Fire<'a> {
             // spells. A SHIM STOOD HERE: "a tier-2 shim; this driver states
             // none", refused at load and at fire, and gemma's fused decode
             // arm was unreachable for as long as it did.
-            Call::Point(point) | Call::Tier2(point) => {
-                kernels_cuda::points_dispatch::dispatch(
-                    self.ctx,
-                    &super::bound::Bound {
-                        fire: self,
-                        op,
-                        point,
-                    },
-                )
-            }
-            Call::Symbol(symbol) => super::staging::symbol(self, symbol, op),
+            Call::Point(point) | Call::Tier2(point) => kernels_cuda::points_dispatch::dispatch(
+                self.ctx,
+                &super::bound::Bound {
+                    fire: self,
+                    op,
+                    point,
+                },
+            ),
+            // AND THE STAGING SHIM IS GONE. `baker::staging` was a file whose
+            // whole body was this refusal — five arms at W10, four retired by
+            // R4b, and a `Box::leak` of the symbol name into a `&'static str`
+            // so the last one could still print it. The arms left the way
+            // arms leave: `ssm.gdn_prep`, `ssm.gated_delta` and
+            // `layout.embed` became claim bodies that state their own
+            // operands, and `attn::write_kv_to_pages` and
+            // `attn::dispatch_attention_flashinfer_decode` got a `Ctx` door
+            // instead (`bind::views::FireViews`).
+            //
+            // Two canon symbols still reach this arm across the whole catalog
+            // — `hc.collapse` and `norm.res_blend`, both argued in
+            // `kernels/src/points.rs`, both waiting on something the floor
+            // does not have (a `Vararg` mark; a producer for the head-gate
+            // logits no text writes). They are refused BY NAME AND AT LOAD
+            // now: `baker::resolve::check` reads this variant and reports the
+            // symbol, and `serve::load::report_lane` turns that into a
+            // refused `load_model` when it stands in the decode lane. A
+            // sixty-line file to say the same thing one fire later, without
+            // the name, was the thing check-then-bind exists to delete.
+            Call::Symbol(_) => Err(Refusal::Absent {
+                what: "a staging shim for a canon symbol: the statement's operands \
+                       are not the routine's, and this driver states no shim. \
+                       `baker::resolve` names the symbol at load",
+            }),
         }
     }
 }

@@ -83,23 +83,26 @@ impl Shell {
             pool.resize(&mut self.stepper, need)?;
         }
 
-        let (Some(model), Some(pool)) = (self.model.as_ref(), self.pool.as_ref()) else {
+        let (Some(baked), Some(weights), Some(pool)) = (
+            self.baked.as_ref(),
+            self.weights.as_ref(),
+            self.pool.as_ref(),
+        ) else {
             return Err(Error::Unserved {
                 what: "launch",
-                message: "no checkpoint is loaded. `load_model` stages the tensors every \
-                          fire's operands address."
+                message: "no checkpoint is loaded. `load_model` traces the lane and \
+                          stages the tensors every fire's operands address."
                     .to_string(),
             });
         };
 
         // Which stack layers are linear-attention ones, in stack order.
-        // Copied out of the deployment because the slab closure below cannot
-        // hold a borrow of it across the fire, and it is a list of thirty
-        // integers.
-        let rs_layers: Vec<u32> = self
+        // Copied out of the deployment because the pool view built per fire
+        // cannot hold a borrow of it, and it is a list of thirty integers.
+        let rs_layers: Vec<u32> = baked
             .deployment
+            .recurrent
             .as_ref()
-            .and_then(|d| d.recurrent.as_ref())
             .map(|r| r.linear_layers.clone())
             .unwrap_or_default();
 
@@ -120,105 +123,28 @@ impl Shell {
             })?;
         }
 
-        // THE ROW that was identified at load, and what that load OBSERVED.
-        let (row, binding) = self.text_row.ok_or_else(|| Error::Unserved {
-            what: "launch",
-            message: "no row. `load_model` identifies one from the tensors and \
-                      records what its weights arrived as; a fire before a load \
-                      has nothing to trace."
-                .to_string(),
-        })?;
-        // The fire's geometry, off the SAME projection the pool was sized
-        // from — read once here, because a deployment does not change between
-        // the steps of a frame.
+        // `dispatch::Geometry` STOOD HERE and was fourteen numbers a fire
+        // could not read off anything else: the head counts, the affine point
+        // the bytes arrived in, the router's fan, gemma-4's second attention
+        // shape. Every one of them was an input to a GRID PLANNER, which read
+        // a `kernel!` row's launch rule and decided how many threads a launch
+        // took — and there is no such planner. A claim body computes its own
+        // grid from the operands it was handed, and the numbers it cannot
+        // derive are the ones its POINT DECLARES, arriving on the statement's
+        // own params run.
         //
-        // `head_dim_alloc()` and not `head_dim`: phi-3's heads are 96 wide and
-        // run on the 128-wide kernel, so a dispatch stating the checkpoint's
-        // width addresses two thirds of the buffer the pool allocated.
+        // What is left of the geometry is the POOL's, and it goes on
+        // `baker::KvGeometry`: three numbers the allocator settled, read by
+        // the claim bodies through the view a `Cache` mark carries.
         //
-        // The mixture counts come from the two places that hold them, and
-        // from NEITHER of them twice. This literal used to write `0` into
-        // both with a comment saying `geometry_from_deployment` refuses a
-        // routed mixture outright — true when it was written, and no longer:
-        // that refusal was lifted the day the row started stating its top-k,
-        // and this line did not hear about it. The cost was not a wrong
-        // answer, it was an honest-looking one: `router_lanes` refuses
-        // `Empty { what: "n_experts" }` at fire creation, which is where
-        // gemma-4-26b-a4b and gpt-oss-20b both stopped.
-        //
-        // `n_experts` is the ROW's load-time answer and rides on
-        // `LoadShape`, which is where `serve/load.rs` already reads it from
-        // to build the pool's decode geometry. It is asked of the row again
-        // here rather than copied onto the `Deployment` beside
-        // `experts_per_token`, because a second statement of one measurement
-        // is what `model/tests/deployment_is_read.rs` exists to prevent —
-        // gemma-4's `k_eq_v` was exactly that, stated by thirteen
-        // projections and read by nobody, and it ended in deletion.
-        //
-        // `experts_per_token` is the FIRE-time half and is the row's
-        // projection, so it comes off the deployment. The split is the
-        // catalog's own: whether a bank has 128 experts changes which
-        // tensors exist, and how many of them a token visits changes only
-        // which kernels run.
-        let geometry = {
-            let d = self.deployment.as_ref().ok_or_else(|| Error::Unserved {
-                what: "launch",
-                message: "no deployment. The row projects one at load and every \
-                          consumer reads that projection."
-                    .to_string(),
-            })?;
-            let shape = pool.shape();
-            crate::lowering::dispatch::Geometry {
-                q_heads: d.shape.q_heads,
-                kv_heads: d.shape.kv_heads,
-                head_dim: d.shape.head_dim_alloc(),
-                n_experts: row.load_shape().n_experts,
-                experts_per_token: d.shape.experts_per_token,
-                // What the BYTES arrived in, the one pair a catalog row
-                // cannot state: `mlx-community` publishes one model at g64/b4
-                // and at g128/b8 and the two pack to identical extents, so
-                // `Loaded::affine_point` asks the tensors instead.
-                group: binding.quant_group,
-                bits: binding.quant_bits,
-                // gemma-4's SECOND attention shape, read off the POOL rather
-                // than re-derived. `batch::geometry` derives it once, with a
-                // refusal for an irregular schedule, and `load` hands the
-                // result to the pool -- which has sized its pages per layer
-                // from it ever since that stack was supported. The lowering
-                // read one width for the whole fire, so half the attention
-                // layers composed a symbol the trace had not stated and
-                // refused `Misspelled`: pages laid out at one width, read by
-                // a kernel instantiated at the other.
-                //
-                // `metal_kernel_refusal` checks BOTH widths against this
-                // backend's SDPA axis at load, so a stack that reaches here
-                // has two dispatchable ones and nothing is left to decline.
-                //
-                // Every other deployment leaves all three zero, which
-                // `Geometry::heads_at` reads as "one shape".
-                global_head_dim: shape.global_head_dim,
-                global_kv_heads: shape.global_kv_heads,
-                full_attn_every: shape.full_attn_every,
-                // The gate's own affine point, which `observed` read off the
-                // checkpoint by name and states only when it differs. Zero
-                // on every row but gpt-oss, and zero is what `facts_of`
-                // reads as "one point serves this fire".
-                router_group: binding.router_quant_group,
-                router_bits: binding.router_quant_bits,
-                // The LINEAR layers' pair, from the recurrent shape the row
-                // published -- `(0, 0)` for every stack that states none,
-                // which `recurrent_at` reads as "the attention pair serves".
-                v_heads: d
-                    .recurrent
-                    .as_ref()
-                    .map_or(0, |r| r.v_h.max(0).unsigned_abs()),
-                v_dim: d
-                    .recurrent
-                    .as_ref()
-                    .map_or(0, |r| r.v_d.max(0).unsigned_abs()),
-            }
-        };
-        let named = std::collections::HashMap::new();
+        // `text_row` went with it. A plane is NAMED at load
+        // (`Backend::Metal`), so there is no per-fire door onto a different
+        // text and nothing for a driver's own measurements to select with.
+
+        // A `named: HashMap<&str, Slice>` STOOD HERE and was the legacy
+        // walk's weight table, joined by CHECKPOINT name. A fire binds
+        // `weights.banks` — keyed by the name the PLAN names — straight into
+        // `baker::walk::Fire::over`, so there is no second table and no join.
 
         // ONE timeline for the whole frame, so a step is QUEUED while the
         // previous one runs. `Stepper` waits for the step two back, because
@@ -295,46 +221,40 @@ impl Shell {
                     break;
                 }
             };
-            let s = crate::lowering::frame::Step {
+            let s = crate::baker::frame::Step {
                 token_ids: &plan.token_ids,
                 qo_indptr: &plan.qo_indptr,
-                region_row_indptr: &step.region_row_indptr,
-                region_sig: &step.region_sig,
-                region_k: &step.region_k,
                 sampling_indices: &plan.sampling_indices,
                 sampling_indptr: &plan.sampling_indptr,
             };
-            let class = crate::lowering::frame::fire_class(&s);
-            // THE ROW'S OWN TEXT for this fire class, and the driver's only
-            // door to one.
+            let class = crate::baker::frame::fire_class(&s);
+            // THE LANE THIS FIRE RUNS, picked by fact word off the programs
+            // bound at LOAD.
             //
-            // The refusal is carried rather than summarized, the way
-            // `driver-cuda/src/fire/launch.rs` carries it: `Error: From<Refusal>`
-            // maps `Unsupported` and `Malformed` onto this driver's own
-            // `Unserved`, so what reaches the operator is the row's sentence.
+            // No lowering, no cache, no closure. The legacy path called
+            // `binding::text(row, class, &binding)` here — a fresh
+            // `ForwardPlan` per fire shape, flattened by
+            // `model_compiler::lower` and memoised because deriving a
+            // decode's graph cost 0.81 ms of a 4.9 ms step. `program::bound`
+            // ran once at load and answered every lane the text states, so
+            // what is left is a lookup.
             //
-            // CACHED by the fire shape: both halves — the plan and the
-            // lowering — are pure functions of things that do not change
-            // between the steps of a generation. The closure is why a refusal
-            // is still propagated on a miss and not paid for on a hit.
-            let planned = self
-                .lowerings
-                .for_step(class, &s, || {
-                    crate::model::binding::text(row, class, &binding)
-                })
-                .map_err(|why| match why {
-                    crate::lowering::cached::Miss::Plan(refusal) => Error::from(refusal),
-                    crate::lowering::cached::Miss::Lower(why) => Error::Program {
-                        message: format!("step did not lower: {why:?}"),
-                    },
+            // MASKED IS FALSE and it is a refusal rather than an omission:
+            // this driver stages no custom mask (`Frame` carries none and
+            // `bind::tables` writes the enable plane as zeros), so a text
+            // that branches on `masked` would be handed its unmasked arm,
+            // which is the right lane for the frame it is actually given.
+            let (_word, program) = baked
+                .lane(class, false)
+                .map_err(|message| Error::Unserved {
+                    what: "launch",
+                    message,
                 })?;
-            let lowered = &planned.lowered;
             // The gather's index list, in the fire's own numbering: the
             // wire's numbers are request-local and the gather's must not be.
-            let sampled =
-                crate::lowering::frame::sampled_rows(&s).map_err(|why| Error::Program {
-                    message: format!("step did not lower: {why:?}"),
-                })?;
+            let sampled = crate::baker::frame::sampled_rows(&s).map_err(|why| Error::Program {
+                message: format!("this step's read-out: {why}"),
+            })?;
 
             // Every CSR invariant, checked BEFORE the pool is touched.
             //
@@ -461,7 +381,6 @@ impl Shell {
                     page_size: pool.shape().page_size,
                     kv_write_page: &w_page,
                     kv_write_offset: &w_off,
-                    rope_frequencies: &self.inv_freq,
                     // The FIRE's rows, translated from the request-local
                     // numbering the wire uses. See `sampled_rows`.
                     sampling_indices: &sampled,
@@ -483,66 +402,81 @@ impl Shell {
             // tables region is real, resident, and never written through.
             self.regions.add(staged.region());
             self.regions.set_null(staged.region());
-            let tables = |which| staged.at(which);
 
-            let names = crate::lowering::resolve::Names::mlx();
-            // The KV pages a statement's state reference resolves through. A
-            // closure, because the map is portable and the pool is not.
-            let pages = |layer: u16, values: bool| {
-                pool.layer(u32::from(layer)).map(|l| {
-                    let h = if values { &l.v } else { &l.k };
-                    crate::lowering::executor::Slice {
-                        address: h.gpu_address(),
-                        // THIS layer's, not the pool's: full-attention layers
-                        // hold a different page size from sliding ones, and an
-                        // over-stated length is one attention reads past.
-                        bytes: pool.shape().layer_bytes_at(u32::from(layer)),
-                    }
-                })
-            };
-            // The recurrent planes a statement's slab reference resolves
-            // through. `layer` counts LINEAR layers, which is the numbering
-            // the text's `GdnSlab` uses and not the stack's -- a hybrid's
-            // third stack layer can be its first linear one.
+            // ── WHAT THIS FIRE ADDRESSES BESIDE ITS ARENA. ──
             //
-            // `conv_state` and `new_conv_state` are two DISTINCT planes: the
-            // kernel reads the window while shifting it, from different
-            // threadgroups, so the shifted one cannot land where the taps are
-            // being read from. `Pool::carry_forward` makes the second the
-            // first again once the fire retires.
-            let slabs = |layer: u16, which: &'static str| {
-                let pool = self.recurrent.as_ref()?;
-                // Stack index in, linear ordinal out. The text names the
-                // layer it IS -- qwen3.6's gated-DeltaNet layers are 0, 1, 2,
-                // 4, 5, 6, 8, ... -- and the pool allocated one plane per
-                // linear layer with nothing between them, so layer 4 is plane
-                // 3. Allocating a plane per STACK layer would have made the
-                // two indices agree and thrown away a quarter of the pool on
-                // full-attention layers that have no state at all.
-                let ord = rs_layers.iter().position(|&x| x == u32::from(layer))?;
-                let l = pool.layer(u32::try_from(ord).ok()?)?;
-                let (region, bytes) = match which {
-                    "conv_state" => (&l.conv, pool.shape().conv_bytes_per_layer()),
-                    "new_conv_state" => (&l.new_conv, pool.shape().conv_bytes_per_layer()),
-                    "recurrent_state" => (&l.state, pool.shape().state_bytes_per_layer()),
-                    _ => return None,
-                };
-                Some(crate::lowering::executor::Slice {
-                    address: region.gpu_address(),
-                    bytes,
-                })
+            // Three kinds of byte a `Program`'s slots cannot name: the
+            // runtime planes the scheduler decided, the page translation it
+            // chose, and the pools that outlive the fire. `baker::Pools` is
+            // the one door onto all three, and this is the driver's answer to
+            // it — plain regions, so that the walk itself never meets a Metal
+            // type.
+            //
+            // `Names::mlx()` STOOD HERE, with a `Store` built over it: a
+            // TRACE-NAME to CHECKPOINT-NAME map, because the legacy load
+            // staged tensors under the file's own names and the text asked
+            // for its own. `model::produce` answers with the names the plan's
+            // params carry, so there is one name space and nothing to map.
+            let staging = FireStaging {
+                pool,
+                recurrent: self.recurrent.as_ref(),
+                rs_layers: &rs_layers,
+                staged: &staged,
             };
-            let mut store = crate::lowering::resolve::Store::new(names, &model.tensors, &named)
-                .with_kv(&pages)
-                .with_slabs(&slabs)
-                .with_fire(&tables)
-                // The plan's runtime streams, so a text's `positions` binds
-                // the table this fire just staged rather than missing by id.
-                .with_runtime(&planned.streams)
-                // The shape the pool was allocated at, where the attention
-                // kernels' strides come from. Without it a store answers zero,
-                // and a zero seq stride is every scan step reading one token.
-                .with_pool(pool.shape());
+
+            // THE FIRE'S OWN COUNTS, which the plan deliberately does not
+            // hold: how many rows a fire carries is decided when the
+            // scheduler batches, and `qo_indptr`'s segment count IS the
+            // request count (the appender reads it that way).
+            let rows = u32::try_from(plan.token_ids.len()).unwrap_or(u32::MAX);
+            let requests = u32::try_from(plan.qo_indptr.len().saturating_sub(1)).unwrap_or(0);
+
+            // ── THE ARENA, LEASED BEFORE THE WALK. ──
+            //
+            // The walk resolves every rectangle to an ADDRESS inside it, so
+            // the lease has to exist first; `fire::run::submit` takes the
+            // same one rather than allocating, which is what makes it
+            // impossible to plan against one arena and bind another.
+            let arena = self.scratch.take(
+                &self.context,
+                (program.row_pitch * u64::from(rows)).max(1),
+                "activation arena",
+            )?;
+            // SAFETY: freshly leased; nothing is encoded against it yet.
+            // Zeroed because a slot no kernel writes otherwise holds whatever
+            // the ring handed over.
+            unsafe { arena.zero(0, arena.len())? };
+
+            let fire = crate::baker::walk::Fire::over(
+                &baked.plan,
+                program,
+                crate::baker::walk::Extent {
+                    arena: crate::baker::Slice {
+                        address: arena.gpu_address(),
+                        bytes: arena.len(),
+                    },
+                    rows: i32::try_from(rows).unwrap_or(i32::MAX),
+                    requests: i32::try_from(requests).unwrap_or(i32::MAX),
+                    layers: baked.deployment.layers as usize,
+                },
+                &weights.banks,
+                &staging,
+            );
+            let encoder = crate::baker::encode::Encoder::over(&fire.bindings, &fire.cursor);
+            fire.walk(&encoder).map_err(Error::from)?;
+            let dispatches = encoder.finish();
+            let blits = fire.blits.borrow().clone();
+            // The read-out is the `out` seam's own rectangle, which the walk
+            // sized like every other value. It travels with the fire because
+            // the `Fire` is dropped at the end of this iteration.
+            let readout = fire.rect(baked.out).ok().map(|r| Readout {
+                offset: r.slice.address.saturating_sub(arena.gpu_address()),
+                rows: r.rows,
+                width: r.width,
+                bytes: r.dt.size(),
+            });
+            drop(fire);
+
             let mut machine = crate::fire::run::Machine {
                 context: &self.context,
                 compiler: &self.compiler,
@@ -552,23 +486,9 @@ impl Shell {
                 regions: &mut self.regions,
                 recordings: Some(&mut self.recordings),
             };
-            let fire = crate::fire::run::submit(&mut machine, lowered, geometry, &mut store)
-                .map_err(|e| {
-                    // A fire that could not bind names them all: a checkpoint
-                    // missing one tensor is usually missing a family of them,
-                    // and stopping at the first costs a round trip each.
-                    let missed = store.missed();
-                    if missed.is_empty() {
-                        e
-                    } else {
-                        Error::Unserved {
-                            what: "launch",
-                            message: format!("{e}; unresolved names: {missed:?}"),
-                        }
-                    }
-                })?;
-            // Committed, not waited for. `lowered` is dropped at the end of
-            // this iteration, so the read-out's shape travels with the fire.
+            let fire = crate::fire::run::submit(&mut machine, arena, &dispatches, &blits)?;
+            // Committed, not waited for. The `Fire` is dropped at the end
+            // of this iteration, so the read-out's shape travels with it.
             //
             // `staged` travels with it, and that is not tidiness: a fire's
             // tables are a LEASE from `self.scratch`, returned to the pool
@@ -579,7 +499,7 @@ impl Shell {
                 step,
                 InFlight {
                     fire,
-                    readout: lowered.readout,
+                    readout,
                     _tables: staged,
                 },
             ));
@@ -634,9 +554,10 @@ impl Shell {
 struct InFlight {
     /// The timeline value to wait on, and the arena to read out.
     fire: crate::fire::run::InFlight,
-    /// The read-out's shape, which travels with the fire because `lowered` is
-    /// dropped at the end of the iteration that encoded it.
-    readout: Option<model_compiler::lower::Readout>,
+    /// The read-out's shape, which travels with the fire because the `Fire`
+    /// that computed it is dropped at the end of the iteration that encoded
+    /// it.
+    readout: Option<Readout>,
     /// The fire's tables, HELD and never read again.
     ///
     /// Not tidiness: a fire's tables are a LEASE from `Shell::scratch`,
@@ -785,22 +706,23 @@ fn run_programs(
 /// bytes are reinterpreted anyway and a widening reinterpretation is a copy.
 /// bf16 → f32 is exact: the low sixteen bits are zero.
 fn read_logits(
-    arena: &crate::device::Handle,
-    readout: Option<model_compiler::lower::Readout>,
+    arena: &crate::fire::scratch::Lease,
+    readout: Option<Readout>,
 ) -> Option<(Vec<f32>, u32, u32)> {
     let r = readout?;
-    let span = r.rows as usize * r.vocab as usize * r.bytes as usize;
-    if r.at + span > arena.len() as usize {
+    let bytes = usize::try_from(r.bytes).ok()?;
+    let at = usize::try_from(r.offset).ok()?;
+    let span = r.rows as usize * r.width as usize * bytes;
+    if at + span > arena.len() as usize {
         return None;
     }
     // SAFETY: the arena is `StorageModeShared`, so its contents are host
     // addressable, and the caller waits on the fire (`stepper.wait_for`)
     // before reading. The wait is what makes the read valid, so a caller that
     // stops waiting has to stop calling this.
-    let raw = unsafe {
-        std::slice::from_raw_parts(arena.contents().cast::<u8>().as_ptr().add(r.at), span)
-    };
-    let values = match r.bytes {
+    let raw =
+        unsafe { std::slice::from_raw_parts(arena.contents().cast::<u8>().as_ptr().add(at), span) };
+    let values = match bytes {
         2 => raw
             .chunks_exact(2)
             .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
@@ -811,7 +733,97 @@ fn read_logits(
             .collect(),
         _ => return None,
     };
-    Some((values, r.rows, r.vocab))
+    Some((values, r.rows.unsigned_abs(), r.width.unsigned_abs()))
+}
+
+/// Where a fire's logits are, as an offset into its own arena.
+///
+/// `model_compiler::lower::Readout` STOOD HERE and was the lowering's answer
+/// to the same question: an offset, a row count, a vocab width and an element
+/// size, computed while flattening the text. The walk answers it with the
+/// `out` seam's own slot — the same rectangle every other value gets, sized
+/// by the same rule — so this is a `Rect` with its address expressed relative
+/// to the arena it is a span of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Readout {
+    /// Bytes into the fire's arena.
+    offset: u64,
+    /// Rows the fire read out.
+    rows: i32,
+    /// The logits width — the model's vocabulary, as the plan sized it.
+    width: i32,
+    /// Bytes per element, from the slot's own dtype.
+    bytes: u64,
+}
+
+/// What this fire addresses beside its arena: the pools, the page
+/// translation, and the planes the scheduler staged.
+///
+/// THE DRIVER'S ANSWER TO `baker::Pools`, and the reason the walk itself
+/// never meets a Metal type. Every method here turns a device object into a
+/// plain `(address, bytes)`; the executor reads regions and mints handles,
+/// and what is behind them is this struct's business alone.
+struct FireStaging<'a> {
+    pool: &'a crate::pools::kv::Pool,
+    recurrent: Option<&'a crate::pools::recurrent::Pool>,
+    /// Which STACK layers are linear-attention ones, in stack order.
+    ///
+    /// The pool allocated one plane per LINEAR layer with nothing between
+    /// them, and a text names the layer it IS — qwen3.6's gated-DeltaNet
+    /// layers are 0, 1, 2, 4, 5, 6, 8, … — so layer 4 is plane 3. Allocating
+    /// a plane per stack layer would have made the two indices agree and
+    /// thrown away a quarter of the pool on full-attention layers that have
+    /// no state at all.
+    rs_layers: &'a [u32],
+    staged: &'a crate::bind::tables::Staged,
+}
+
+impl crate::baker::Pools for FireStaging<'_> {
+    fn kv(&self, layer: u32, values: bool) -> Option<crate::baker::Slice> {
+        self.pool.layer(layer).map(|l| {
+            let h = if values { &l.v } else { &l.k };
+            crate::baker::Slice {
+                address: h.gpu_address(),
+                // THIS layer's, not the pool's: full-attention layers hold a
+                // different page size from sliding ones, and an over-stated
+                // length is one attention reads past.
+                bytes: self.pool.shape().layer_bytes_at(layer),
+            }
+        })
+    }
+
+    fn slab(&self, layer: u32, which: crate::baker::Slab) -> Option<crate::baker::Slice> {
+        let pool = self.recurrent?;
+        let ord = self.rs_layers.iter().position(|&x| x == layer)?;
+        let l = pool.layer(u32::try_from(ord).ok()?)?;
+        // `conv` and `new_conv` are two DISTINCT planes: the kernel reads the
+        // window while shifting it, from different threadgroups, so the
+        // shifted one cannot land where the taps are being read from.
+        // `Pool::carry_forward` makes the second the first again once the
+        // fire retires.
+        let (region, bytes) = match which {
+            crate::baker::Slab::Conv => (&l.conv, pool.shape().conv_bytes_per_layer()),
+            crate::baker::Slab::NewConv => (&l.new_conv, pool.shape().conv_bytes_per_layer()),
+            crate::baker::Slab::State => (&l.state, pool.shape().state_bytes_per_layer()),
+        };
+        Some(crate::baker::Slice {
+            address: region.gpu_address(),
+            bytes,
+        })
+    }
+
+    fn kv_geometry(&self) -> crate::baker::KvGeometry {
+        let shape = self.pool.shape();
+        crate::baker::KvGeometry {
+            page_size: i32::try_from(shape.page_size).unwrap_or(0),
+            seq_stride: u64::from(shape.kv_heads) * u64::from(shape.head_dim),
+            head_stride: u64::from(shape.page_size) * u64::from(shape.head_dim),
+        }
+    }
+
+    fn table(&self, which: crate::baker::FireTable) -> Option<crate::baker::Slice> {
+        self.staged.at(which)
+    }
 }
 
 /// Which rows of a fire's read-out belong to batch member `member`.

@@ -17,7 +17,6 @@ pub(crate) mod load;
 pub(crate) mod state;
 pub(crate) mod transfer;
 
-pub use crate::fire::launch::fire_class_of;
 pub use state::Shell;
 
 /// The GQA group sizes this build's decode instantiates.
@@ -219,11 +218,16 @@ impl Shell {
                     }
                 }
                 load_impl(self, &desc.snapshot_dir)?;
-                let model = self.model.as_ref().expect("load_impl stored the model");
-                serde_json::from_slice(&model.load_caps).map_err(|error| {
-                    eprintln!("[driver-cuda] load_model: capabilities JSON: {error}");
-                    PIE_STATUS_DRIVER_ERROR
-                })
+                // A CLONE AND NOT A ROUND TRIP. This deserialised the caps
+                // out of bytes `load_impl` had just serialised, and mapped a
+                // parse error that cannot occur to `DRIVER_ERROR`.
+                // `LoadedModel::caps` is the document itself now.
+                Ok(self
+                    .model
+                    .as_ref()
+                    .expect("load_impl stored the model")
+                    .caps
+                    .clone())
             },
         )
     }
@@ -303,7 +307,15 @@ impl Shell {
             move || {
                 use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
 
-                const MAX_RING: u64 = 64;
+                // THE ONE `program::run` LAYS THE RING OUT BY, not a second
+                // 64. `full` is indexed `full[channel * MAX_RING + slot]`
+                // with that stride whatever a channel's capacity is, so a
+                // registration admitted against a LOCAL ceiling that had
+                // drifted above it would index the neighbour's flags —
+                // silently, and only for the channels past the real pitch.
+                // `program::run`'s doc already called itself "the single
+                // source"; this is the reader that was not reading it.
+                let max_ring = u64::from(crate::program::MAX_RING);
                 let state = self;
                 let desc = plan;
                 if state.channels.contains_key(&desc.channel_id)
@@ -327,7 +339,7 @@ impl Shell {
                     }
                 };
                 let ring = u64::from(desc.capacity) + 1;
-                if wire_bytes == 0 || ring > MAX_RING {
+                if wire_bytes == 0 || ring > max_ring {
                     return Err(PIE_STATUS_INVALID_ARGUMENT);
                 }
                 let Some(mirror_bytes) = wire_bytes.checked_mul(ring) else {

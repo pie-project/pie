@@ -8,8 +8,6 @@ pub trait Base {
 
 pub trait SfBase: Base {}
 
-pub trait GgufBase: Base {}
-
 pub enum SfBf16 {}
 
 impl Base for SfBf16 {
@@ -17,14 +15,6 @@ impl Base for SfBf16 {
 }
 
 impl SfBase for SfBf16 {}
-
-pub enum GgufBf16 {}
-
-impl Base for GgufBf16 {
-    const NAME: &'static str = "gguf-bf16";
-}
-
-impl GgufBase for GgufBf16 {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Import {
@@ -41,14 +31,10 @@ pub struct Row {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     Copy(String),
-    /// The (1 + w) norm fold; the canonical weight is plain.
-    PlusOne(String),
     /// Concatenate along the output axis.
     Pack(Vec<Source>),
     /// Stack under a new leading axis.
     Stack(Vec<Source>),
-    /// A `[1]` tensor from a scalar the checkpoint stores beside `name`.
-    ScalarOf(String),
     /// Ungroup `groups`-way interleaving ALONG ONE AXIS into contiguous
     /// segments: `g0 g1 g0 g1 ...` becomes `g0 g0 ... g1 g1 ...`, once for
     /// every position of whatever axes precede it.
@@ -138,10 +124,6 @@ pub fn copy(name: impl Into<String>) -> Source {
     Source::Copy(name.into())
 }
 
-pub fn plus_one(name: impl Into<String>) -> Source {
-    Source::PlusOne(name.into())
-}
-
 impl From<String> for Source {
     fn from(name: String) -> Source {
         Source::Copy(name)
@@ -168,10 +150,6 @@ where
     Source::Stack(sources.into_iter().map(Into::into).collect())
 }
 
-pub fn scalar_of(name: impl Into<String>) -> Source {
-    Source::ScalarOf(name.into())
-}
-
 pub fn deinterleave(name: impl Into<String>, axis: u32, groups: u32) -> Source {
     Source::Deinterleave(name.into(), axis, groups)
 }
@@ -183,11 +161,13 @@ pub fn squeeze(name: impl Into<String>, axis: u32) -> Source {
 /// One shipping import point: which SKU it produces, which checkpoint flavor
 /// it reads, and the production run the CLI may execute for it.
 ///
-/// The SKU alone does not key this table -- Gemma files the same SKU twice,
-/// once from safetensors and once from GGUF -- so `base` is a column and not
-/// merely a field of whatever `make` returns. A lookup that had to run the
-/// closure to learn which flavor it just built would be choosing after the
-/// work, which is the wrong order.
+/// `base` IS A COLUMN and not merely a field of whatever `make` returns: a
+/// lookup that had to run the closure to learn which flavor it just built
+/// would be choosing after the work, which is the wrong order. Every row
+/// says `safetensors-bf16` today — gemma used to file each SKU twice, once
+/// from GGUF, and that leg went because nothing could run it — but the
+/// column is what a second flavor arrives through, and it is what all three
+/// drivers filter on (`READABLE_BASE`) to say which they can read.
 #[derive(Clone, Copy)]
 pub struct ImportRow {
     pub sku: &'static str,
@@ -197,6 +177,17 @@ pub struct ImportRow {
 
 /// State one shipping import point per row. The first type argument of the
 /// production fn is its [`Base`], which is what puts the flavor in the key.
+///
+/// # THE DEGREE IS NOT SPELLED HERE, and the trailing `_` is why
+///
+/// A production fn's last generic parameter is the rank-cut degree its model
+/// carries (`const TP: usize`), and this expands to `_` for it — inferred
+/// from the model value in the same row. That is not a shortcut: a `-tp2`
+/// import point differs from its sibling's by the MODEL it is given and by
+/// nothing else, because a checkpoint holds the same bytes however a
+/// deployment cuts them. Writing the degree in the turbofish as well would
+/// state it twice in one line, with the two free to disagree — the fault the
+/// whole tensor-parallel column was rebuilt to make impossible.
 #[macro_export]
 macro_rules! allow_import {
     ($( $f:ident::<$b:ty $(, $t:ty)* $(,)?> => ($sku:literal, $m:expr $(,)?) ),+ $(,)?) => {
@@ -204,7 +195,7 @@ macro_rules! allow_import {
             $crate::load::ImportRow {
                 sku: $sku,
                 base: <$b as $crate::load::Base>::NAME,
-                make: || $f::<$b $(, $t)*>(&$m),
+                make: || $f::<$b $(, $t)*, _>(&$m),
             }
         ),+ ];
     };

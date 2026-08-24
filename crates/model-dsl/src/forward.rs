@@ -1,14 +1,14 @@
 //! The class traits, one per state semantics, mirroring
-//! `crates/inferlet/wit/{forward, forward-hybrid, forward-recurrent}.wit`.
+//! `crates/inferlet/wit/{forward, forward-hybrid}.wit`.
 
 use std::marker::PhantomData;
 
 use model_ir::plan::{CacheRow, Plan};
 
-use crate::declare::{CacheRef, HybridSpec, KvSpec, StateSpec};
+use crate::Plane;
+use crate::declare::{CacheRef, HybridSpec, KvSpec};
 use crate::facts::{Classify, FactWord};
 use crate::record::{Recorder, Value};
-use crate::Plane;
 
 pub trait Forward {
     type Facts: Classify;
@@ -22,18 +22,15 @@ pub trait ForwardHybrid {
     fn forward(&self, inputs: HybridInput<Self::Facts>) -> Value;
 }
 
-pub trait ForwardRecurrent {
-    type Facts: Classify;
-    fn caches(&self) -> StateSpec;
-    fn forward(&self, inputs: RecurrentInput<Self::Facts>) -> Value;
-}
-
 pub fn trace<M: Forward>(name: &str, m: &M, plane: Plane) -> Plan {
     let caches = m.caches();
     let rows = caches
         .rows
         .iter()
-        .map(|r| CacheRow::Kv { name: r.name.clone(), row: r.row.clone() })
+        .map(|r| CacheRow::Kv {
+            name: r.name.clone(),
+            row: r.row.clone(),
+        })
         .collect();
     let rec = Recorder::new(name, plane, <M::Facts as FactWord>::NAMES, rows);
     rec.seam(model_ir::seam::IN.name, &[]);
@@ -53,7 +50,10 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, plane: Plane) -> Plan {
     let rows = caches
         .kv
         .iter()
-        .map(|r| CacheRow::Kv { name: r.name.clone(), row: r.row.clone() })
+        .map(|r| CacheRow::Kv {
+            name: r.name.clone(),
+            row: r.row.clone(),
+        })
         .chain(caches.state.iter().map(|r| CacheRow::State {
             name: r.name.clone(),
             slab: r.slab.clone(),
@@ -62,26 +62,6 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, plane: Plane) -> Plan {
     let rec = Recorder::new(name, plane, <M::Facts as FactWord>::NAMES, rows);
     rec.seam(model_ir::seam::IN.name, &[]);
     let logits = m.forward(HybridInput {
-        rec: rec.clone(),
-        plane,
-        caches,
-        _facts: PhantomData,
-    });
-    rec.seam(model_ir::seam::OUT.name, &[&logits]);
-    drop(logits);
-    rec.finish()
-}
-
-pub fn trace_recurrent<M: ForwardRecurrent>(name: &str, m: &M, plane: Plane) -> Plan {
-    let caches = m.caches();
-    let rows = caches
-        .rows
-        .iter()
-        .map(|r| CacheRow::State { name: r.name.clone(), slab: r.slab.clone() })
-        .collect();
-    let rec = Recorder::new(name, plane, <M::Facts as FactWord>::NAMES, rows);
-    rec.seam(model_ir::seam::IN.name, &[]);
-    let logits = m.forward(RecurrentInput {
         rec: rec.clone(),
         plane,
         caches,
@@ -190,7 +170,9 @@ impl<F> Input<F> {
             "`{}` is not a kv row the model's caches() declares",
             r.name
         );
-        Pages { name: r.name.clone() }
+        Pages {
+            name: r.name.clone(),
+        }
     }
 }
 
@@ -234,7 +216,9 @@ impl<F> HybridInput<F> {
             "`{}` is not a kv row the model's caches() declares",
             r.name
         );
-        Pages { name: r.name.clone() }
+        Pages {
+            name: r.name.clone(),
+        }
     }
 
     #[must_use]
@@ -244,50 +228,8 @@ impl<F> HybridInput<F> {
             "`{}` is not a state row the model's caches() declares",
             r.name
         );
-        State { name: r.name.clone() }
-    }
-}
-
-pub struct RecurrentInput<F> {
-    rec: Recorder,
-    plane: Plane,
-    caches: StateSpec,
-    _facts: PhantomData<F>,
-}
-
-impl<F> RecurrentInput<F> {
-    #[must_use]
-    pub fn cuda(&self) -> bool {
-        matches!(self.plane, Plane::Cuda)
-    }
-
-    #[must_use]
-    pub fn token_ids(&self) -> Value {
-        self.rec.runtime("token_ids")
-    }
-
-    /// The tower, layer by layer. [`Layers`] is where the statements made
-    /// inside this loop get their `Op::layer`.
-    pub fn layers<'a, T>(&'a self, ws: &'a [T]) -> Layers<'a, T> {
-        Layers {
-            rec: &self.rec,
-            ws: ws.iter(),
-            next: 0,
+        State {
+            name: r.name.clone(),
         }
-    }
-
-    #[must_use]
-    pub fn positions(&self) -> Value {
-        self.rec.runtime("positions")
-    }
-
-    #[must_use]
-    pub fn state(&self, r: &CacheRef) -> State {
-        assert!(
-            self.caches.rows.iter().any(|row| row.name == r.name),
-            "`{}` is not a state row the model's caches() declares",
-            r.name
-        );
-        State { name: r.name.clone() }
     }
 }

@@ -1,35 +1,33 @@
-//! Lower a supergraph plan: sweep the fact words, dedup surviving
-//! behaviors into lanes, and join role points against the plane's claims.
+//! Sweep a supergraph plan's fact words and dedup the surviving behaviors
+//! into lanes.
+//!
+//! # `resolve` STOOD HERE, and it was the second derivation of one truth
+//!
+//! `Resolution`, `Lowered` and `lower` went with it. `resolve` walked each
+//! distinct kernel a plan states and asked three questions in order — is this
+//! a plane-gated tier-2 statement, does the plane's `#[claims]` table carry
+//! the point, does a `canon` row spell a symbol for it — and
+//! `program::call_of` asked exactly the same three, in the same order, with
+//! its own header admitting it: *"mirroring `sweep::resolve`"*.
+//!
+//! Two derivations of one truth is bad enough; these two were not equally
+//! expressive, and the LIVE one was the poorer. `Resolution` separated
+//! `violations` (a `cuda::` statement on a plane that does not declare it —
+//! a refused plan) from `unresolved` (the honest backlog), while `call_of`
+//! answered an `Option` and collapsed both into `Why::Unclaimed`. Every
+//! driver and the width walk call `call_of`; `resolve` and everything built
+//! on it existed for `bin/lanes.rs` and nothing else. So the driver acted on
+//! the poorer answer and a report binary read the richer one.
+//!
+//! `program::call_for` is the three-way answer now, `program::Why` grew
+//! `WrongPlane`, and `bin/lanes.rs` formats the report it used to be handed.
 
-use model_ir::kernels::Backend;
 use model_ir::plan::Plan;
-
-pub struct Lowered {
-    pub lanes: Vec<Lane>,
-    pub resolution: Resolution,
-}
 
 /// One behavior class: the fact words it serves and the ops that survive.
 pub struct Lane {
     pub words: Vec<u64>,
     pub ops: Vec<u32>,
-}
-
-pub struct Resolution {
-    /// role point -> the plane symbol its claim answers with.
-    pub resolved: Vec<(String, String)>,
-    /// Stated role points no routine of this plane claims — the backlog.
-    pub unresolved: Vec<String>,
-    /// A plane-gated symbol stated on the wrong plane; a refused plan.
-    pub violations: Vec<String>,
-}
-
-#[must_use]
-pub fn lower(plan: &Plan) -> Lowered {
-    Lowered {
-        lanes: lanes(plan),
-        resolution: resolve(plan),
-    }
 }
 
 #[must_use]
@@ -47,53 +45,11 @@ pub fn lanes(plan: &Plan) -> Vec<Lane> {
             .collect();
         match lanes.iter_mut().find(|lane| lane.ops == ops) {
             Some(lane) => lane.words.push(word),
-            None => lanes.push(Lane { words: vec![word], ops }),
+            None => lanes.push(Lane {
+                words: vec![word],
+                ops,
+            }),
         }
     }
     lanes
-}
-
-#[must_use]
-pub fn resolve(plan: &Plan) -> Resolution {
-    let mut resolution = Resolution {
-        resolved: Vec::new(),
-        unresolved: Vec::new(),
-        violations: Vec::new(),
-    };
-    let mut seen: Vec<&str> = Vec::new();
-    for op in &plan.ops {
-        let kernel = op.kernel.as_str();
-        if seen.contains(&kernel) {
-            continue;
-        }
-        seen.push(kernel);
-        // THE `cuda::` PREFIX IS THE PLANE GATE AND NOTHING ELSE. A tier-2
-        // statement is legal on one plane, so a plan on any other states a
-        // lowering violation; on that plane the gate has done its job and
-        // what is left is the point's own name, which is what the plane's
-        // `TIER2_POINTS` spells and what `Call::Tier2` carries. Answered
-        // `tier2::` and not a bare symbol, because a bare symbol is what a
-        // `canon` row answers with and the two reach the driver by different
-        // doors — this one through the generated dispatch, that one through a
-        // staging shim.
-        if let Some(point) = kernel.strip_prefix("cuda::") {
-            if plan.plane == Backend::Cuda {
-                resolution
-                    .resolved
-                    .push((kernel.to_string(), format!("tier2::{point}")));
-            } else {
-                resolution.violations.push(kernel.to_string());
-            }
-            continue;
-        }
-        if model_ir::kernels::point_claims(plan.plane).contains(&kernel) {
-            resolution.resolved.push((kernel.to_string(), format!("points::{kernel}")));
-            continue;
-        }
-        match model_ir::kernels::canon_symbol(plan.plane, kernel) {
-            Some(symbol) => resolution.resolved.push((kernel.to_string(), symbol.to_string())),
-            None => resolution.unresolved.push(kernel.to_string()),
-        }
-    }
-    resolution
 }

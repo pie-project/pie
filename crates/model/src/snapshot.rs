@@ -197,8 +197,10 @@ impl Snapshot {
 /// the `.weight` leaf a `nn.Linear` adds. A tensor that is not a `.weight`
 /// -- gpt-oss's `.bias` rows, gemma's `layer_scalar` -- keeps its leaf,
 /// which is exactly what the tables spell.
-#[must_use]
-pub fn canon(hf: &str) -> String {
+///
+/// PRIVATE: the index this builds is the crate's answer, and the normalising
+/// rule is how it is built rather than something a caller re-runs.
+fn canon(hf: &str) -> String {
     let mut s = hf;
     for p in ["model.language_model.", "model.text_model.", "model."] {
         if let Some(rest) = s.strip_prefix(p) {

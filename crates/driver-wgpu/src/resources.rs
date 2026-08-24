@@ -57,7 +57,7 @@ use crate::binding::{FireTable, Resolve};
 #[cfg(feature = "native")]
 use crate::device::{Buffer, Device, Failed, Move};
 #[cfg(feature = "native")]
-use model_ir::trace::ValueId;
+use model_ir::plan::ValueId;
 
 /// What a deployment decided about its cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -765,8 +765,8 @@ impl Frame {
     /// requests: a request may read out more than one of its rows, and the
     /// gather's output is one row per READOUT.
     ///
-    /// **A whole fire may not use this**, and [`crate::turns::Serving::step`]
-    /// does not. The texts spell their epilogue as plain launches, so the head
+    /// **A whole fire may not use this**, and `turns::Serving::step` did not.
+    /// The texts spell their epilogue as plain launches, so the head
     /// runs over the token window whatever the sampling says; a step therefore
     /// tells the lowering every row samples and stages the identity, and the
     /// number that matters there is the ROW count. This stays because it is what
@@ -777,37 +777,23 @@ impl Frame {
         self.sampling_indices.len()
     }
 
-    /// The rows to lower this fire against.
-    ///
-    /// The lowering takes a per-row `samples` flag and the tables take a list of
-    /// indices, and the two are the same claim said twice. Producing both from
-    /// one place is what keeps a fire whose gather reads row 2 from being
-    /// lowered as a fire whose row 2 does not sample — which lowers to a plan
-    /// with no gather in it at all, and passes.
-    #[must_use]
-    pub fn seriation(&self) -> Vec<model_compiler::lower::Row> {
-        let mut rows = vec![model_compiler::lower::Row::default(); self.rows()];
-        // A request contributing more than one row is a prefill, and
-        // `multi_token` is how the lowering is told. It matters here and not
-        // only in the attention: `n_requests` is the count of rows that are NOT
-        // multi-token, maxed with the count that sample, and a prefill whose
-        // rows all claimed to be single-token would size the epilogue for one
-        // readout per TOKEN.
-        for &of in &self.request_of_token {
-            let many = self.request_of_token.iter().filter(|&&r| r == of).count() > 1;
-            for (row, &owner) in rows.iter_mut().zip(&self.request_of_token) {
-                if owner == of {
-                    row.multi_token = many;
-                }
-            }
-        }
-        for &at in &self.sampling_indices {
-            if let Some(row) = rows.get_mut(at as usize) {
-                row.samples = true;
-            }
-        }
-        rows
-    }
+    // `seriation` STOOD HERE and left with the lowering it fed.
+    //
+    // It answered "the rows to lower this fire against" as a
+    // `Vec<model_compiler::lower::Row>`: one row per token, `multi_token` set
+    // for every row of a request contributing more than one, and `samples` set
+    // for every index in `sampling_indices`. The lowering took a per-row
+    // `samples` flag and the tables take a list of indices, and the two are the
+    // same claim said twice -- producing both from one place is what kept a
+    // fire whose gather reads row 2 from being lowered as a fire whose row 2
+    // does not sample, which lowers to a plan with no gather in it at all, and
+    // passes.
+    //
+    // `model_compiler::lower::Row` is deleted, so there is no second spelling
+    // left to keep in step. [`Self::sampling_indices`] and
+    // [`Self::request_of_token`] are still the two facts it derived from, and
+    // whoever states a walk's rows owes the same derivation from the same
+    // place.
 }
 
 /// The driver's own memory for one fire.
@@ -896,8 +882,9 @@ impl Pool {
     /// Telling a demand that can never be met apart from one that cannot be
     /// met now. A scheduler that waits on the first waits forever; one that
     /// drops the second drops work it had correctly admitted.
-    /// [`crate::shell::Shell::launch`] is the one caller, and it answers
-    /// `Impossible` above this number and grows below it.
+    /// `shell::Shell::launch` was the one caller, and it answered `Impossible`
+    /// above this number and grew below it; it STOOD in `shell`, which the
+    /// legacy-walk cut deleted whole.
     ///
     /// # What bounds a pool here, and it is not the heap
     ///
@@ -960,7 +947,8 @@ impl Pool {
     ///
     /// The pages that survive keep their contents, at the same page numbers. A
     /// shrink drops the tail; the caller owes the check that nobody holds a page
-    /// in it, which [`crate::shell::Shell::resize_pool`] makes.
+    /// in it, which `shell::Shell::resize_pool` made before it went with the
+    /// legacy walk.
     ///
     /// # Errors
     ///
@@ -1276,8 +1264,8 @@ impl Pool {
     /// Apply the engine's `copy_kv` plan: a list of whole-page moves and a list
     /// of single-row cells.
     ///
-    /// This is the SHAPE the engine speaks, and [`crate::shell::Shell::fork`] is
-    /// the shape a conversation has; they are different verbs on purpose. The
+    /// This is the SHAPE the engine speaks, and `shell::Shell::fork` was the
+    /// shape a conversation has; they are different verbs on purpose. The
     /// engine's prefix cache knows which physical page it wants where and does
     /// not have a conversation id to name; a fork knows the conversation and not
     /// the pages. Both end at [`Pool::copy_rows`].
@@ -1679,11 +1667,12 @@ impl RecurrentPool {
     /// prompt into a fresh seat is genuinely zeros and therefore RIGHT, and for
     /// every continuation after it is one step stale.
     ///
-    /// `whether_the_fused_decode_computes_the_step_its_own_operands_imply`
-    /// caught it by walking the step twice: the same CPU reference reproduced
-    /// the decode to 1.2e-7 when fed `conv_state` and reproduced the prefill to
-    /// 1.0e-7 when fed `new_conv_state`. The kernel was faithful to what it was
-    /// handed and was handed the stale plane.
+    /// The oracle that caught it STOOD HERE and walked the step twice: the
+    /// same CPU reference reproduced the decode to 1.2e-7 when fed
+    /// `conv_state` and reproduced the prefill to 1.0e-7 when fed
+    /// `new_conv_state`. The kernel was faithful to what it was handed and was
+    /// handed the stale plane. It is deleted with the serving suite it lived
+    /// in.
     ///
     /// # Why the whole plane, and why not a swap
     ///
@@ -1765,14 +1754,14 @@ pub struct Model<'a> {
     /// a null carry — see [`crate::binding::Resolve::slab`] for why that
     /// distinction is not fussiness.
     pub recurrent: Option<&'a RecurrentPool>,
-    /// The plan's runtime streams, value id → fire table.
-    ///
-    /// The no-ask channel's staged half: a text's `positions` is a NAMED
-    /// value like a seam's, and this is what tells the two apart at
-    /// [`Resolve::named`]. Per plan, because value ids are the plan's own
-    /// numbering — the step that builds this `Model` builds it from the plan
-    /// it is about to fire.
-    pub runtime: &'a crate::runtime::Streams,
+    // `runtime: &crate::runtime::Streams` STOOD HERE — value id → the fire
+    // table a plan's runtime stream stages in, consulted ahead of the seam
+    // stand-in by `named` below. It read its ids off a `ForwardPlan`, and
+    // nothing had built one since R3: `Streams::of` had no caller and this
+    // struct has no constructor, so the precedence it established was
+    // between one live population and one empty one. `baker/walk.rs`'s
+    // `runtime` answers a stream by NAME, per statement, and is what the
+    // executor actually fires through.
 }
 
 #[cfg(feature = "native")]
@@ -1784,14 +1773,11 @@ impl Resolve for Model<'_> {
     }
 
     fn named(&self, value: ValueId) -> Option<&Buffer> {
-        // A runtime STREAM binds the fire's own staged table; everything
-        // else named is a seam value and keeps the stand-in the seam sized.
-        // The two id populations are disjoint by construction — the trace
-        // mints runtime values, the seam publishes its own — so there is no
-        // precedence to get wrong, only a lookup that misses.
-        if let Some(which) = self.runtime.table_of(value) {
-            return Resolve::table(self.pool, which);
-        }
+        // A NAMED VALUE IS A SEAM VALUE HERE, and the stand-in is the one the
+        // seam sized. A runtime stream never arrives through this door on
+        // this driver: the walk answers one by name against the fire's own
+        // staged tables, which is where the `Streams` translation this used
+        // to consult first went.
         self.weights.named(value)
     }
 
@@ -1871,6 +1857,9 @@ mod tests {
     /// The two stride numbers a row asks for are the only pair that agrees with
     /// [`Shape::slot`].
     ///
+    /// It also pins the one number a `Shape` must answer `None` for; see the
+    /// tail of the body.
+    ///
     /// `KvHeadStride` and `KvSeqStride` are handed to the shader as scalars and
     /// the shader adds them to an index. Swapping them produces a cache that is
     /// self-consistent — every append and every read uses the same wrong
@@ -1898,6 +1887,20 @@ mod tests {
             shape.number(FireNumber::KvPageSize),
             Some(shape.page_size),
             "the page size is the pool's and not the fire's"
+        );
+        // AND THE ONE NUMBER A SHAPE MUST NOT ANSWER. A mask rectangle is as
+        // wide as the widest row of the FIRE that supplied it, and a `Shape`
+        // outlives every fire it serves -- so answering here at all would hand
+        // a row's mask the PREVIOUS fire's pitch, which indexes real bytes and
+        // reads a neighbour's mask rather than faulting. `Pool::number`
+        // overrides it from what the pool last staged; this is the half that
+        // can be asserted without a device.
+        assert_eq!(
+            shape.number(FireNumber::AttentionMaskStride),
+            None,
+            "a shape answered the mask stride, which is the fire's number and \
+             not the shape's -- see `Pool::number` for the override this is \
+             the other half of"
         );
     }
 
@@ -2296,30 +2299,11 @@ mod tests {
         );
     }
 
-    /// The seriation says the same thing the sampling table does.
-    #[test]
-    fn the_seriation_and_the_sampling_table_are_one_claim() {
-        let shape = shape();
-        let frame = Frame::of(
-            shape,
-            &[
-                Request::of(vec![0, 1, 2], vec![1]),
-                Request::of(vec![0], vec![9]),
-            ],
-        )
-        .expect("stageable");
-        let rows = frame.seriation();
-        assert_eq!(rows.len(), frame.rows());
-        for (at, row) in rows.iter().enumerate() {
-            assert_eq!(
-                row.samples,
-                frame.sampling_indices.contains(&(at as u32)),
-                "row {at} disagrees about sampling"
-            );
-        }
-        // The first request contributes three rows, so it is a prefill and its
-        // rows say so; the second contributes one and does not.
-        assert!(rows[0].multi_token && rows[1].multi_token && rows[2].multi_token);
-        assert!(!rows[3].multi_token);
-    }
+    // `the_seriation_and_the_sampling_table_are_one_claim` STOOD HERE and left
+    // with `Frame::seriation`. It built a two-request frame -- one prefill of
+    // three tokens and one decode of one -- and held the seriation's per-row
+    // `samples` flag against `Frame::sampling_indices` row by row, then checked
+    // that the prefill's three rows were `multi_token` and the decode's one was
+    // not. There is no `model_compiler::lower::Row` to derive, so the two
+    // spellings it compared are now one.
 }

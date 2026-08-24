@@ -14,7 +14,7 @@
 //!
 //! Every one of those is deleted. A `model_compiler::program::Program` states
 //! its own operands, its own results and the point each statement calls, and
-//! `kernels_cuda::points_dispatch`/`baker::staging` are the one crossing from
+//! `kernels_cuda::points_dispatch` is the one crossing from
 //! a stated point to a launcher. There is no launch list to bind, no column to
 //! join and no fact to ask for.
 //!
@@ -40,7 +40,6 @@ pub mod abi;
 pub mod views;
 
 use std::ffi::c_void;
-
 
 /// FlashInfer's decode plan cache, owned in Rust. A raw pointer, not a `Box`:
 /// [`Self::as_ptr`] is `const`, and a `*mut` keeps this `!Send`.
@@ -81,36 +80,15 @@ impl DecodePlan {
 
     /// Run FlashInfer's decode planner over the fire's HOST page indptr, inside
     /// the workspace's `begin_plan_update`/`end_plan_update` fence.
-    // Safe by design: the view's pointers are the workspace's own.
-    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
-    pub fn plan_decode(
-        &mut self,
-        kv_page_indptr_h: &[u32],
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        workspace: crate::bind::abi::AttentionWorkspaceView,
-        stream: *mut c_void,
-        enable_cuda_graph: bool,
-        window_left: i32,
-    ) {
-        self.plan_decode_variant(
-            kv_page_indptr_h,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            workspace,
-            stream,
-            enable_cuda_graph,
-            false,
-            window_left,
-        );
-    }
-
-    /// [`Self::plan_decode`] with `full_attention_variant` exposed: gemma-4
-    /// plans TWO decode caches, its layer kinds disagreeing on head dim.
+    ///
+    /// `full_attention_variant` is a PARAMETER and was once a wrapper's
+    /// hard-coded `false`. That wrapper — `plan_decode`, zero callers — is
+    /// deleted, and the note at its one-time caller (`fire::launch`'s
+    /// `raise_attn_plans`) records why it had to be: it "hardcodes
+    /// `full_attention_variant = false`, so a stack with NO sliding window
+    /// planned the windowed schedule and every decode ran the wrong kernel".
+    /// gemma-4 plans TWO decode caches, its layer kinds disagreeing on head
+    /// dim, and it is the reason the flag has to be visible here.
     ///
     /// # Panics
     ///
@@ -235,12 +213,21 @@ impl PrefillPlan {
         unsafe { &mut *self.cache }
     }
 
-    /// The planned cache, for a caller that fires the dispatch itself — the
-    /// ViT tower, which holds no [`DispatchCtx`] for `bind::service` to serve.
-    #[must_use]
-    pub fn cache(&self) -> &kernels_cuda::attn::fa2::plan::PrefillPlanCache {
-        // SAFETY: as `DecodePlan::get`; `&self` proves no `&mut` is live.
-        unsafe { &*self.cache }
+    /// The carve, stamped, with NO plan run in it.
+    ///
+    /// The planless prefill leg is why this exists apart from
+    /// [`Self::plan_prefill`], which stamps the same four fields on its way
+    /// into the planner: `attention.prefill`'s body carves its own schedule
+    /// out of this cache at fire time (`fa2::plan_own_prefill` reads the two
+    /// pointers AND the two sizes), so a lane that states only that point
+    /// still needs the workspace on the cache — and used to get a zeroed one,
+    /// which is a planner told it has no room.
+    pub fn stamp_workspace(&mut self, workspace: crate::bind::abi::AttentionWorkspaceView) {
+        let cache = self.get();
+        cache.int_workspace = workspace.int_buffer;
+        cache.float_workspace = workspace.float_buffer;
+        cache.int_workspace_bytes = workspace.int_bytes;
+        cache.float_workspace_bytes = workspace.float_bytes;
     }
 
     /// Run FlashInfer's prefill planner over the fire's HOST CSRs, bracketed
@@ -266,52 +253,32 @@ impl PrefillPlan {
         enable_cuda_graph: bool,
         window_left: i32,
     ) {
-        self.plan_prefill_variant(
-            qo_indptr_h,
-            kv_page_indptr_h,
-            kv_last_page_lens_h,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            workspace,
-            stream,
-            enable_cuda_graph,
-            window_left,
-            PrefillPlanFlags {
-                full_attention_variant: false,
-                hnd_layout: false,
-                causal_mask: true,
-                custom_mask: false,
-                wants_prefill_score: false,
-            },
-        );
-    }
-
-    /// [`Self::plan_prefill`] with the five variant flags exposed, for a
-    /// caller that needs a non-causal plan (the ViT is bidirectional).
-    ///
-    /// # Panics
-    ///
-    /// If the planner declines.
-    // Safe by design like the seam methods.
-    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
-    pub fn plan_prefill_variant(
-        &mut self,
-        qo_indptr_h: &[u32],
-        kv_page_indptr_h: &[u32],
-        kv_last_page_lens_h: &[u32],
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        workspace: crate::bind::abi::AttentionWorkspaceView,
-        stream: *mut c_void,
-        enable_cuda_graph: bool,
-        window_left: i32,
-        flags: PrefillPlanFlags,
-    ) {
         use kernels_cuda::attn::fa2::plan as fa2;
+
+        // THE FIVE FLAGS, HERE, BECAUSE ONE CALLER SETS ALL FIVE THE SAME WAY.
+        //
+        // `plan_prefill_variant` STOOD BETWEEN THIS AND `fa2::plan_prefill`,
+        // taking the flags so "a caller that needs a non-causal plan (the ViT
+        // is bidirectional)" could reach them. That caller does not exist —
+        // R3 deleted the tower and `serve::encode` is a refusal by name now —
+        // so the wrapper had exactly one caller, this function, passing this
+        // literal. Two entry points, one behaviour, and the second one's
+        // stated reason retired with the tower.
+        //
+        // The STRUCT stays, and stays named, because its own doc argues for
+        // it and the argument is still true: `fa2::plan_prefill` ends in five
+        // adjacent positional `bool`s, and `causal_mask` in `hnd_layout`'s
+        // slot plans a causal ViT. Building it here keeps that a compile
+        // error while removing the door nobody comes through.
+        let flags = PrefillPlanFlags {
+            full_attention_variant: false,
+            hnd_layout: false,
+            // TRUE, and this driver states no other kind: every lane it fires
+            // is a decoder's.
+            causal_mask: true,
+            custom_mask: false,
+            wants_prefill_score: false,
+        };
 
         let _ = (stream, kv_last_page_lens_h);
         // See `DecodePlan::plan_decode_variant`. The prefill cache carries the
@@ -427,7 +394,6 @@ pub struct AttnCtx {
     /// The OBSERVATION window the score sink keeps, parsed once and carried.
     pub score_window: u32,
 }
-
 
 /// The fire's GDN context: the per-layer conv/recurrent state slabs, the
 /// request→slot indirection and the head geometry, assembled once per fire.

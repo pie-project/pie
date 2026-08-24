@@ -240,6 +240,217 @@ instantiate_router_topk(bfloat16, bfloat, bfloat)
 // plane -- `Moe::topk_softmax` fires the unscaled one.
 instantiate_router_topk(f32w_bfloat16, bfloat, float)
 
+// ── The two RANKED routers ───────────────────────────────────────────────────
+//
+// `router_topk` above ranks the logits and publishes a SOFTMAX over the k it
+// picked. These two rank a TRANSFORM of the logits and publish that transform
+// itself: there is no exponential and no shared denominator, so a row's k
+// weights sum to whatever they sum to and `renormalize` is what decides
+// whether that sum is divided out.
+//
+//   router_topk_sigmoid          w = sigmoid(x)
+//   router_topk_sqrt_softplus    w = sqrt(log(1 + exp(x))), ranked with a bias
+//
+// THREE KERNELS AND NOT ONE TEMPLATE, and the duplication is deliberate. The
+// selection scan below is `router_topk`'s, lane for lane, because it is the
+// same scan; what differs is a transform, a denominator and -- for the third
+// -- an operand. Folding them would put a `WEIGHT_FORM` enum in front of the
+// one loop in this file whose correctness is a matter of which lane wins, and
+// a router that picks the wrong expert is a wrong answer that reads as text.
+//
+// THE BIAS SHIFTS THE RANKING AND NOT THE WEIGHT. `sqrt_softplus`'s
+// correction bias is DeepSeek's, and it is added to the value the scan
+// compares and NOT to the value published -- which is why the published
+// weight is recomputed from the logit at the chosen expert rather than
+// carried out of the scan. Swapping the two reweights every expert by its own
+// bias, and the model still produces text.
+//
+// A ROW WHOSE FAN-OUT EXCEEDS ITS EXPERT COUNT parks its spare slots on
+// expert 0 with weight zero. Repeating the last winner would double-count it
+// in the fold, and leaving the slot unwritten hands the combine whatever the
+// arena held -- an id that indexes a bank out of bounds.
+
+inline float router_sigmoid(float x) {
+  return 1.0f / (1.0f + metal::exp(-x));
+}
+
+[[kernel]] void router_topk_sigmoid(
+    const device bfloat* logits    [[buffer(0)]],
+    device int* expert_ids         [[buffer(1)]],
+    device float* expert_weights   [[buffer(2)]],
+    const constant uint& n_experts         [[buffer(3)]],
+    const constant uint& experts_per_token [[buffer(4)]],
+    const constant uint& renormalize       [[buffer(5)]],
+    const constant float& scaling          [[buffer(6)]],
+    uint3 lid3    [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tgsize  [[threads_per_threadgroup]],
+    uint3 tgid    [[threadgroup_position_in_grid]]) {
+  const uint lid = lid3.x;
+  const uint n = n_experts;
+  const uint k = min(experts_per_token, kRouterMaxTopK);
+  const uint picks = min(k, n);
+  const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
+  constexpr float NEG_INF = -3.0e38f;
+
+  const uint row = tgid.y;
+  logits += size_t(row) * size_t(n);
+  expert_ids += size_t(row) * size_t(k);
+  expert_weights += size_t(row) * size_t(k);
+
+  // Sigmoid is monotone, so ranking the gate and ranking the logit choose the
+  // same experts. It is taken here anyway rather than after the scan: this is
+  // the shape the biased router beside it needs, and one scan written twice
+  // over two different `v` is worse than one scan written twice over the same.
+  float v = lid < n ? router_sigmoid(float(logits[lid])) : NEG_INF;
+
+  threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup uint part_i[kRouterMaxSimdgroups];
+  threadgroup uint winner_of_round;
+
+  for (uint r = 0; r < picks; ++r) {
+    const float m = simd_max(v);
+    const uint w = simd_min(v == m ? lid : 0xFFFFFFFFu);
+    if (simd_lid == 0) {
+      part_v[simd_gid] = m;
+      part_i[simd_gid] = w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+      float best = NEG_INF;
+      uint best_i = 0u;
+      for (uint sg = 0; sg < n_simd; ++sg) {
+        if (part_v[sg] > best) {
+          best = part_v[sg];
+          best_i = part_i[sg];
+        }
+      }
+      expert_ids[r] = int(best_i);
+      winner_of_round = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == winner_of_round) v = NEG_INF;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lid == 0) {
+    float sum = 0.0f;
+    for (uint r = 0; r < picks; ++r) {
+      const float w = router_sigmoid(float(logits[uint(expert_ids[r])]));
+      expert_weights[r] = w;
+      sum += w;
+    }
+    for (uint r = picks; r < k; ++r) {
+      expert_ids[r] = 0;
+      expert_weights[r] = 0.0f;
+    }
+    const float scale = (renormalize != 0u && sum > 0.0f) ? scaling / sum : scaling;
+    for (uint r = 0; r < k; ++r) expert_weights[r] *= scale;
+  }
+}
+
+/// `sqrt(log(1 + exp(x)))`, saturated at zero.
+///
+/// The `x > 20` branch is not an optimisation. `exp(x)` overflows to inf a
+/// little past 88 and `log(1 + inf)` is inf, so one large logit would route
+/// with an infinite weight and renormalize every other expert to zero; past
+/// 20 the two expressions agree to far inside bf16 anyway.
+///
+/// `log(1 + exp(x))` and not cuda's `log1pf(expf(x))`: MSL's math library has
+/// no `log1p`. The two differ only where `exp(x)` falls under the float
+/// epsilon -- below about x = -17 -- and there this returns exactly zero
+/// where cuda returns `sqrt(exp(x))`. That is an expert the ranking has
+/// already put last; the correction bias is the one thing that could promote
+/// it, and a weight of 0 against one of 2e-4 is the same contribution to the
+/// fold.
+inline float sqrt_softplus(float x) {
+  const float sp = x > 20.0f ? x : metal::log(1.0f + metal::exp(x));
+  return metal::sqrt(max(sp, 0.0f));
+}
+
+[[kernel]] void router_topk_sqrt_softplus(
+    const device bfloat* logits    [[buffer(0)]],
+    const device float* correction [[buffer(1)]],
+    device int* expert_ids         [[buffer(2)]],
+    device float* expert_weights   [[buffer(3)]],
+    const constant uint& n_experts         [[buffer(4)]],
+    const constant uint& experts_per_token [[buffer(5)]],
+    const constant uint& renormalize       [[buffer(6)]],
+    const constant float& scaling          [[buffer(7)]],
+    uint3 lid3    [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tgsize  [[threads_per_threadgroup]],
+    uint3 tgid    [[threadgroup_position_in_grid]]) {
+  const uint lid = lid3.x;
+  const uint n = n_experts;
+  const uint k = min(experts_per_token, kRouterMaxTopK);
+  const uint picks = min(k, n);
+  const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
+  constexpr float NEG_INF = -3.0e38f;
+
+  const uint row = tgid.y;
+  logits += size_t(row) * size_t(n);
+  expert_ids += size_t(row) * size_t(k);
+  expert_weights += size_t(row) * size_t(k);
+
+  // The RANKED value. `correction` is one float per expert and shared by every
+  // row, so it is indexed by the lane and not by the row.
+  float v = lid < n ? sqrt_softplus(float(logits[lid])) + correction[lid] : NEG_INF;
+
+  threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup uint part_i[kRouterMaxSimdgroups];
+  threadgroup uint winner_of_round;
+
+  for (uint r = 0; r < picks; ++r) {
+    const float m = simd_max(v);
+    const uint w = simd_min(v == m ? lid : 0xFFFFFFFFu);
+    if (simd_lid == 0) {
+      part_v[simd_gid] = m;
+      part_i[simd_gid] = w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+      float best = NEG_INF;
+      uint best_i = 0u;
+      for (uint sg = 0; sg < n_simd; ++sg) {
+        if (part_v[sg] > best) {
+          best = part_v[sg];
+          best_i = part_i[sg];
+        }
+      }
+      expert_ids[r] = int(best_i);
+      winner_of_round = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == winner_of_round) v = NEG_INF;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lid == 0) {
+    float sum = 0.0f;
+    for (uint r = 0; r < picks; ++r) {
+      // THE PUBLISHED WEIGHT, WITHOUT THE BIAS. Recomputed from the logit at
+      // the chosen expert, which is the same expression the scan evaluated
+      // minus the term that only ever belonged to the ranking.
+      const float w = sqrt_softplus(float(logits[uint(expert_ids[r])]));
+      expert_weights[r] = w;
+      sum += w;
+    }
+    for (uint r = picks; r < k; ++r) {
+      expert_ids[r] = 0;
+      expert_weights[r] = 0.0f;
+    }
+    const float scale = (renormalize != 0u && sum > 0.0f) ? scaling / sum : scaling;
+    for (uint r = 0; r < k; ++r) expert_weights[r] *= scale;
+  }
+}
+
 // One lane per expert during the prefix scan, so this is the widest expert
 // count this shape serves. `shared_kernels::kRouterMaxExperts` is the same
 // number and the geometry refuses anything above it.
@@ -428,6 +639,40 @@ constant constexpr uint kMaxExperts = 1024;
     const uint pitch = x_pitch != 0u ? x_pitch : width;
     out[uint(gid.y) * width + gid.x] =
         sel < 0 ? bfloat(0) : x[(uint(sel) / k) * pitch + gid.x];
+}
+
+/// Sum a token's k expert outputs, weighted by the router, reading them where
+/// they were WRITTEN.
+///
+/// `y` is `[rows * k, width]` in (token, slot) order -- one row per route, in
+/// the order the routes were chosen -- so slot `e` of token `n` is at row
+/// `n * k + e` and there is no permutation to consult. That is the whole
+/// difference between this and `combine_sorted` below, and it is why the two
+/// are two kernels: every sorted family binds an inverse permutation, and a
+/// caller whose rows were never moved should not carry a buffer it would only
+/// fill with the identity.
+///
+/// The weights are FLOAT. `Moe::weighted_sum` declares them
+/// `In<Tensor<f32>>`, because a router weight is a probability and the fold
+/// multiplies in float on every plane; `combine_sorted`'s are bf16 because
+/// that is the element the legacy driver has always staged them at.
+[[kernel]] void expert_combine(
+    const device bfloat* y             [[buffer(0)]],
+    const device float* expert_weights [[buffer(1)]],
+    device bfloat* out                 [[buffer(2)]],
+    const constant uint& width             [[buffer(3)]],
+    const constant uint& experts_per_token [[buffer(4)]],
+    uint2 gid                          [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  const uint row = gid.y;
+  const uint k = experts_per_token;
+  const size_t base = size_t(row) * size_t(k);
+  float acc = 0.0f;
+  for (uint e = 0; e < k; ++e) {
+    const size_t at = base + size_t(e);
+    acc += expert_weights[at] * float(y[at * size_t(width) + size_t(c)]);
+  }
+  out[size_t(row) * size_t(width) + size_t(c)] = static_cast<bfloat>(acc);
 }
 
 /// Sum a token's k expert outputs, weighted by the router's softmax, reading

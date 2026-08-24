@@ -438,23 +438,6 @@ driver-api = { path = "../driver-api" }
 # being one document and no readers: a model's numbers are `const` rows
 # in `model::catalog`, checked against the corpus by
 # `model/tests/catalog_differential.rs`.
-# THE HEIR OF `every_plane_is_answered` NEEDS THE SAME GATE ITS SIBLINGS HAVE.
-#
-# It reads `driver_cuda::bind::views::ANSWERED`, and `bind` is `#[cfg]`'d on
-# `_cuda` — so with no feature the target does not merely skip, it FAILS TO
-# COMPILE, and the job it broke is the one whose entire premise is that this
-# crate has a half that is correct without a GPU: "cargo test (driver-cuda,
-# portable half, no feature at all)". Every other `_cuda` test target in this
-# file carries the stanza; this one arrived without it, which is the cheapest
-# way for a new gate to turn a green job red.
-#
-# It still RUNS, in both ABI jobs, because `cuda-12` and `cuda-13` each imply
-# `_cuda`. What the stanza buys is that the featureless job stops trying to
-# build a module that is not there.
-[[test]]
-name = "attn_score_parity"
-required-features = ["_cuda"]
-
 
 [[test]]
 name = "attn_ws_parity"
@@ -506,10 +489,6 @@ name = "portable_half"
 
 [[test]]
 name = "gpu_smoke"
-required-features = ["_cuda"]
-
-[[test]]
-name = "gpu_vmm"
 required-features = ["_cuda"]
 
 [[test]]
@@ -597,6 +576,12 @@ required-features = ["_cuda"]
 # `[[test]]` block header above: that is exactly how a green job goes red.
 [[test]]
 name = "baker_serve"
+required-features = ["_cuda", "abi"]
+
+[[test]]
+# The three banked argmaxes, fired through the shell. Was `baker-smoke`,
+# a second executor over the same kernels; see the test's own head.
+name = "banked_argmaxes"
 required-features = ["_cuda", "abi"]
 
 

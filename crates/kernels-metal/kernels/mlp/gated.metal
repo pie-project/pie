@@ -11,6 +11,11 @@
 //
 // The third earns its model name and keeps it: it bakes gpt-oss's asymmetric
 // clamp, its `alpha` and its `(up + 1)` term, which is nobody else's SwiGLU.
+//
+// `mlp/packed.metal` holds the OTHER contract -- `(packed, out, I, ..)`, one
+// row cut into halves by the kernel rather than by the caller. It is a second
+// file and not a sixth entrypoint here for the reason this header opens with:
+// the operands are what a file is one of.
 
 #include <metal_stdlib>
 

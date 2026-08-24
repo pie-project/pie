@@ -250,9 +250,11 @@ __global__ void quant_per_channel(
 
 /// INT8 back to `T`, flat, with the row recovered from the linear index.
 ///
-/// Templated on the WIDE side rather than the narrow one: there is no fp8
-/// twin of this kernel to unify with -- `dequant_fp8.cuh` holds the fp8
-/// dequantisers and they are row-shaped, not flat.
+/// Templated on the WIDE side rather than the narrow one: there was no fp8
+/// twin of this kernel to unify with. `quant/dequant_fp8.cuh` held the fp8
+/// dequantisers, they were row-shaped rather than flat, and the file is gone
+/// -- its only Rust namers were the seven launchers `gemm/quant.rs` alone
+/// read.
 template <class T>
 __global__ void dequant_int8_per_channel(
     const i8* __restrict__ W,

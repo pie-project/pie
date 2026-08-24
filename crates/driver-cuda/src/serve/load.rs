@@ -10,6 +10,7 @@ use crate::fire::scratch::Scratch;
 use driver_api::CompletionBroker;
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT,
+    PIE_STATUS_UNSUPPORTED,
 };
 
 /// Stand the shell up.
@@ -152,23 +153,30 @@ const FUSED_WORLD_SIZE: u32 = 2;
 /// MiB, the 16-byte multiple, the NCCL crossover) is `CustomAllReduce::can_handle`'s,
 /// answered per fire.
 ///
-/// # THE SEAM R2 LEFT, RE-MEASURED
+/// # THE SEAM R2 LEFT, RE-MEASURED — AND NOW A BACKLOG ROW
 ///
-/// **Nothing reduces through the plane this admits**, and the reason is no
-/// longer the missing statement R2 named. `dist.all_reduce` IS a point
-/// (`kernels::points::Dist`), every model text states it at `TP > 1`, and the
-/// generated dispatch answers it — with `kernels_cuda::dist`'s claim, whose
-/// body refuses every call because `cudarc` is built without its `nccl`
-/// feature. `fire::all_reduce` is kept whole (the P2P plane, the rendezvous,
-/// the resident buffers) and is a SECOND implementation that no claim body
-/// reaches: `all_reduce_bf16` there is called from nowhere in this crate.
+/// **Nothing reduces through the plane this admits.** `dist.all_reduce` IS a
+/// point (`kernels::points::Dist`) and every model text states it at
+/// `TP > 1`, but `kernels_cuda::dist` CLAIMS NOTHING: the body that used to
+/// sit there could only refuse, so the point sat in `CLAIMED` with two
+/// dispatch arms while a lane read it as RESOLVED. It is withdrawn, and the
+/// six `-tp2` rows carry an honest unresolved row instead.
+///
+/// `fire::all_reduce` is kept whole (the P2P plane, the rendezvous, the
+/// resident buffers) and is NOT a second implementation of the collective —
+/// it holds no launch at all. `kernels_cuda::comm` is the only launcher and
+/// this file's plane is the only producer of the `comm::Plane` it reads;
+/// they are two halves of one thing with the join unbuilt.
+/// `kernels_cuda::dist`'s header carries the measurement: three missing
+/// wires, of which `register_buffer` is the one that must be a setup step
+/// every rank runs unconditionally.
 ///
 /// A note rather than a refusal because the failure it guards against cannot
-/// happen through that path: a rank admitted here meets `Refusal::Absent` at
-/// its first reduction, loudly, instead of returning its shard as the answer.
-/// `CAN_LAUNCH` is `true` now, so the first check below no longer turns every
-/// `tp_size > 1` away, and THIS function stays where the missing wire — a
-/// claim body that reaches the resident plane — has to be checked for.
+/// happen through that path: with the point unclaimed, a `-tp2` SKU is now
+/// refused AT LOAD with the op named — check-then-bind — instead of a rank
+/// returning its shard as if it were the whole answer. `CAN_LAUNCH` is `true`
+/// now, so the first check below no longer turns every `tp_size > 1` away,
+/// and THIS function stays where the missing wire has to be checked for.
 ///
 /// # Errors
 ///
@@ -303,16 +311,19 @@ impl Drop for Shell {
         }
         if let Some(mut scratch) = shell.scratch.take() {
             let mut sops = crate::fire::attention_workspace::LiveStagingOps;
-            scratch.ws.release(&mut sops);
-            // `AttentionWorkspace` has no working `Drop` (CUDA calls need
-            // `&mut O`), so an unreleased workspace is a pinned-host leak.
-            scratch.prefill_ws.release(&mut sops);
-            // The peel tail's own workspace, released for the same reason.
-
-            drop(scratch.decode_plan);
-
-            drop(scratch.prefill_plan);
-
+            // ONE PER CLASS, and every one released: `AttentionWorkspace` has
+            // no working `Drop` (CUDA calls need `&mut O`), so an unreleased
+            // workspace is a pinned-host leak — and a two-geometry tower
+            // holds two OF EACH, since gemma states two masked geometries the
+            // way it states two decode ones.
+            for mut held in scratch.decode.drain(..) {
+                held.ws.release(&mut sops);
+                drop(held.plan);
+            }
+            for mut held in scratch.prefill.drain(..) {
+                held.ws.release(&mut sops);
+                drop(held.plan);
+            }
         }
     }
 }
@@ -362,7 +373,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // a scheduler admitting requests against a driver that cannot answer one.
     state.baker = None;
     let alloc = crate::device::Allocator::new();
-    let baked = crate::baker::load(sku, snapshot, &alloc).map_err(|why| {
+    let baked = crate::baker::load(sku, snapshot, state.tp_rank, &alloc).map_err(|why| {
         crate::Error::unsupported("load_model", format!("`{sku}` did not build: {why}"))
     })?;
 
@@ -405,14 +416,29 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // equality, so a plane built for the previous checkpoint declines (or
     // mis-reduces) the next one's fused fires. Safe to drop — ranks rebuild.
     state.all_reduce = None;
+    // BEFORE THE MODEL IS STORED, not after. This used to store a
+    // `LoadedModel` with empty caps, call the planner (which read the
+    // half-built model back off the shell), and patch the field — so there
+    // was a window in which `state.model` was a model with no advertised
+    // rectangle. The planner needs three facts, and passing them is shorter
+    // than a placeholder.
+    //
+    // The workspace count is the LANE's, which is why it comes from here:
+    // `baked` is built and `state.baker` is not set until the report below.
+    // See `Baked::attn_workspaces`.
+    let caps = capabilities(
+        state,
+        snapshot,
+        &deployment,
+        state.tp_size,
+        row.id,
+        baked.attn_workspaces(),
+    )?;
     state.model = Some(LoadedModel {
         id: row.id,
         deployment,
-        load_caps: Vec::new(),
-        tp_size: state.tp_size,
+        caps,
     });
-    let caps = capabilities_json(state, snapshot)?;
-    state.model.as_mut().expect("just stored").load_caps = caps;
 
     // The P2P plane, built once here — not in `create`: its stride is baked at
     // construction, so it needs the checkpoint's `hidden` and the advertised
@@ -427,10 +453,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         let max_tokens = state
             .model
             .as_ref()
-            .and_then(|m| {
-                serde_json::from_slice::<driver_api::DriverCapabilities>(&m.load_caps).ok()
-            })
-            .and_then(|c| i32::try_from(c.max_forward_tokens).ok())
+            .and_then(|m| i32::try_from(m.caps.max_forward_tokens).ok())
             .unwrap_or(0);
         match build_tp_plane(
             state.tp_size,
@@ -451,9 +474,22 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     }
 
     // The lane's own report, now that the caps are published: a refused or
-    // partly-bound lane is a MEASUREMENT and is printed rather than hidden.
-    report_lane(&baked);
+    // partly-bound lane is a MEASUREMENT and is printed rather than hidden —
+    // AND, for the decode lane, it is a REFUSAL. See [`report_lane`] for why
+    // that one lane and not the others.
+    report_lane(&baked)
+        .map_err(|why| crate::Error::unsupported("load_model: check-then-bind", why))?;
     state.baker = Some(baked);
+
+    // THE COMPILE BILL, PAID HERE. Everything above is the load: the
+    // Programs are built, the pools are sized, the caps are published —
+    // and the kernels those Programs fire are still uncompiled, because a
+    // claim body's NVRTC instantiation is built on FIRST FIRE. Measured on
+    // qwen35-d0.8b with a cold cubin cache: 19 instantiations and 0.63 s,
+    // charged to the first token of a fresh serve, against a decode of
+    // 80 ms. `baker::resolve`'s header named this seam and could not close
+    // it from outside the bodies; [`warm_lane`] closes it from inside.
+    warm_lane(state)?;
 
     // The calibration sweep fires the ORDINARY path, so it goes after the
     // lane it fires: a sweep run before the lane was built would measure a
@@ -464,13 +500,203 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     Ok(())
 }
 
-/// Report what the lane resolved.
+/// Compile every kernel this SKU's lanes fire, before serving is announced.
 ///
-/// Split out of `load_impl` so the happy path there stays short and the
-/// reporting lives beside the thing it reports on. It cannot fail: a lane
-/// with nothing armed is refused by [`crate::baker::load`] itself, before
-/// any pool has been sized against it.
-fn report_lane(baked: &crate::baker::Baked) {
+/// # The warm arm IS the fire arm
+///
+/// `baker::resolve::check` answers two of the three load-time questions —
+/// does the plane claim the point, and at the element the witness rides —
+/// and states why it cannot answer the third: a claim body builds its own
+/// JIT symbol out of the operands it was handed, so nothing outside the
+/// body can name the instantiation without restating the construction.
+///
+/// The census says restating could not be exact either. Of the nineteen
+/// instantiations a qwen decode compiles, twelve are static given the point
+/// and its element axis; the other SEVEN are picked inside the body from
+/// facts no dispatch table holds — the fa2 schedule's arm and the widths
+/// `merge_states` reads off it, the gdn recurrence's three-arm shape
+/// branch, the KV view's layout byte, gemv's split-k pick and the device's
+/// unroll depth, `layout.embed`'s vectorisability — and those seven carry
+/// **79 % of the compile milliseconds**. A generated warm table would
+/// either miss them or compile every arm of every candidate set. The
+/// per-row figures are in `kernels_cuda::jit::warm`.
+///
+/// So this warms by FIRING, with the launches suppressed:
+/// `kernels_cuda::jit::warm::pass` puts the plane in a mode where every
+/// `Ctx::fire` resolves its instantiation and returns without launching,
+/// and the walk underneath is `fire::launch::step_impl` — the ordinary one,
+/// unchanged. Nothing runs on the device, nothing is written, and what gets
+/// compiled is exactly what this SKU's lanes fire at these shapes.
+///
+/// # One shape, because one shape is what this driver fires
+///
+/// One request of one token: `admit` reads that as `FireClass::Decode` and
+/// `Baked::lane` answers the `qo_one` lane, which is the only lane a fire
+/// through this driver reaches today. TWO NEIGHBOURS STAY COLD AND ARE
+/// NAMED rather than probed at a shape that would be refused:
+///
+/// * a MULTI-TOKEN prefill — `baker_fire` refuses one, because the default
+///   read-out is a request's last row and the lane states no gather
+///   epilogue, so `baker_serve`'s own prompt legs fire token by token;
+/// * a MASKED lane — `Baked::lane` picks it off the caller's
+///   `has_user_mask`, and a probe would have to carry an `EncodedMask`
+///   table describing rows it invented.
+///
+/// Both compile at their first fire, which is what they do today. A probe
+/// this driver declines is REPORTED and not refused: a warm that could not
+/// build a batch has learned nothing about the kernels.
+///
+/// # A compile error refuses the load
+///
+/// That is the whole point of moving the bill. Under a warm pass there is
+/// no launch, so an instantiation that did not stand up did not compile or
+/// did not load — and a driver that announced the model anyway would report
+/// it at token 1, to a caller that had already been told the model was up.
+fn warm_lane(state: &mut Shell) -> Result<(), i32> {
+    use crate::serve::state::{InstanceEntry, ProgramEntry};
+
+    let Some(model) = state.model.as_ref() else {
+        return Ok(());
+    };
+    let caps = &model.caps;
+    let page_size = i32::try_from(caps.kv_page_size)
+        .unwrap_or(crate::boot::KV_PAGE_SIZE)
+        .max(1);
+    let total_pages = caps.total_pages;
+    if caps.max_forward_tokens == 0 || total_pages == 0 {
+        eprintln!("[driver-cuda] warm: the advertised rectangle is empty");
+        return Ok(());
+    }
+
+    // ONE probe instance and one probe program, exactly as the calibration
+    // sweep builds them, and removed again below: a warm leaves the shell
+    // as it found it.
+    let probe_program = state.next_id;
+    state.next_id += 1;
+    state.programs.insert(
+        probe_program,
+        ProgramEntry {
+            program_hash: 0,
+            emitter_version: 0,
+        },
+    );
+    let probe_instance = state.next_id;
+    state.next_id += 1;
+    state.instances.insert(
+        probe_instance,
+        InstanceEntry {
+            program_id: probe_program,
+            geometry_class: driver_api::local::PIE_GEOMETRY_CLASS_HOST,
+            channel_ids: Vec::new(),
+            seeds: Vec::new(),
+        },
+    );
+    let instances = [probe_instance];
+
+    let decode = crate::layout::calibrate::Point {
+        max_forward_tokens: 1,
+        max_forward_requests: 1,
+    };
+    let pass = kernels_cuda::jit::warm::pass();
+    let declined = synthetic_fire(state, decode, &instances, page_size, total_pages).err();
+    let warmed = pass.close();
+
+    state.instances.remove(&probe_instance);
+    state.programs.remove(&probe_program);
+
+    // THE PROBE'S OWN STATUS IS A MEASUREMENT, and two of its three answers
+    // are not about this lane at all.
+    //
+    // `synthetic_fire` declines a shape before it fires one:
+    // `INVALID_ARGUMENT` for a probe with no request to build, `EXHAUSTED`
+    // for a footprint past the KV pool. Both say the RECTANGLE was refused —
+    // the pool is small, the caps are narrow — and a warm that could not
+    // build a batch has learned nothing about the kernels, which is what the
+    // header above promised to report rather than refuse.
+    //
+    // `UNSUPPORTED` is the other kind, and it was swallowed with the rest.
+    // It is what `fire::launch::step_impl` answers when the WALK refused: no
+    // lane serves the decode word, `attn_ask` cannot be built, or
+    // `baker_fire` returned a `Refusal` — an unclaimed point, a bank the
+    // banks map does not hold, a rectangle the slot walk did not size. Every
+    // one of those is a property of this checkpoint on this plane and is
+    // true of token 1 exactly as it is true of the probe. A load that
+    // printed it and answered `Ok` is the check-then-bind violation
+    // [`report_lane`] closes from the other side: `resolve::check` reads the
+    // CENSUS, this reads the FIRE, and the second catches what no table out
+    // here can name.
+    if let Some(status) = declined {
+        if status == PIE_STATUS_UNSUPPORTED {
+            return Err(i32::from(crate::Error::unsupported(
+                "load_model: warm",
+                "the decode probe this SKU's own lane fires was REFUSED by the \
+                 walk; the line above names the step. Serving would accept the \
+                 model and refuse every request against it",
+            )));
+        }
+        eprintln!(
+            "[driver-cuda] warm: the decode probe declined the rectangle \
+             ({status}); this lane's kernels compile at their first fire"
+        );
+    }
+    eprintln!(
+        "[driver-cuda] warm: {} instantiation(s) resolved in {:.0} ms",
+        warmed.resolved.len(),
+        warmed.ms(),
+    );
+    if warmed.refused.is_empty() {
+        return Ok(());
+    }
+    for refusal in &warmed.refused {
+        eprintln!("[driver-cuda] warm: {refusal}");
+    }
+    Err(i32::from(crate::Error::unsupported(
+        "load_model: warm",
+        format!(
+            "{} device instantiation(s) this lane fires will not compile or \
+             will not load; see the lines above",
+            warmed.refused.len(),
+        ),
+    )))
+}
+
+/// Report what every lane resolved, and REFUSE the load when the decode
+/// lane did not.
+///
+/// # This is where check-then-bind is enforced
+///
+/// `.wiki/baker.md` states the rule and [`crate::baker::resolve`] restates
+/// it — *"refusals land at load with the op named, never mid-fire"* — and
+/// until this function returned its measurement the rule was three doc
+/// comments and no gate. [`crate::baker::resolve::check`] has exactly one
+/// caller, here, and its result was dropped: a lane naming a point this
+/// plane does not claim printed four lines to stderr and `load_model`
+/// answered `Ok`. That is precisely the failure the pass exists to prevent
+/// — a driver with its capabilities published and a scheduler admitting
+/// requests against a lane that refuses every one of them.
+///
+/// # The DECODE lane, and only it
+///
+/// A gap in any OTHER lane stays a report, and that is not a softening: it
+/// is [`crate::baker::Baked::lanes`]' own argument, made where the field is
+/// declared. `qwen35-d0.8b`'s PREFILL leg states `ssm.gated_delta_chunked`,
+/// which no cuda routine claims yet, while its decode leg states none of
+/// it — and this driver serves that SKU today, one token per fire. Refusing
+/// it for a lane no fire reaches would refuse a checkpoint that works. The
+/// masked lane is the same case from the other side: `Baked::lane` picks it
+/// off the caller's `has_user_mask`, so a frame carrying no mask never asks
+/// for it, and a frame that does is refused BY NAME at `admit` instead.
+///
+/// What the decode lane cannot be is PARTLY bound. It is the lane every
+/// fire through this driver takes, so a gap in it is a refusal at token 1
+/// with certainty rather than a risk.
+///
+/// # Errors
+///
+/// The decode lane has at least one call this plane cannot answer. The
+/// message names every one of them with the first op that asked — which is
+/// what `check` deduplicates for.
+fn report_lane(baked: &crate::baker::Baked) -> Result<(), String> {
     eprintln!(
         "[driver-cuda] baker: `{}` traced — {} facts {:?}, {} params, {} caches, {} ops",
         baked.plan.name,
@@ -480,6 +706,16 @@ fn report_lane(baked: &crate::baker::Baked) {
         baked.plan.caches.len(),
         baked.plan.ops.len(),
     );
+    // The word an unmasked decode selects, read off the same door a fire
+    // reads it off (`Baked::lane`) so the gate cannot pick a different lane
+    // than the fire will. `Err` is a plan whose facts this driver cannot
+    // answer at all, which `admit` refuses by name at the first fire; there
+    // is no decode lane to gate, so this reports and does not refuse.
+    let decode_word = baked
+        .lane(model_ir::trace::FireClass::Decode, false)
+        .ok()
+        .map(|(word, _)| word);
+    let mut refusal: Option<String> = None;
     for (at, lane) in baked.lanes.iter().enumerate() {
         match lane {
             Err(r) => eprintln!(
@@ -498,22 +734,41 @@ fn report_lane(baked: &crate::baker::Baked) {
                         program.row_pitch,
                         program.slots.len(),
                     );
-                } else {
-                    // CHECK-THEN-BIND: every gap, with the op named, at
-                    // load. This is the whole point of the pass.
-                    eprintln!(
-                        "[driver-cuda] baker: lane {at} (words {:?}) has {} \
-                         unresolved call(s):",
-                        program.words,
+                    continue;
+                }
+                // CHECK-THEN-BIND: every gap, with the op named, at load.
+                // This is the whole point of the pass.
+                let serves_decode = decode_word.is_some_and(|w| program.words.contains(&w));
+                eprintln!(
+                    "[driver-cuda] baker: lane {at} (words {:?}) has {} \
+                     unresolved call(s){}:",
+                    program.words,
+                    gaps.len(),
+                    if serves_decode {
+                        " and IS THE DECODE LANE"
+                    } else {
+                        ""
+                    },
+                );
+                for gap in &gaps {
+                    eprintln!("[driver-cuda] baker:   {gap}");
+                }
+                if serves_decode && refusal.is_none() {
+                    refusal = Some(format!(
+                        "the decode lane of `{}` (lane {at}) has {} call(s) this \
+                         plane cannot answer: {}",
+                        baked.sku,
                         gaps.len(),
-                    );
-                    for gap in &gaps {
-                        eprintln!("[driver-cuda] baker:   {gap}");
-                    }
+                        gaps.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ));
                 }
             }
         }
     }
+    refusal.map_or(Ok(()), Err)
 }
 
 /// The calibration sweep: time the reachable fire shapes and cache the fastest
@@ -529,11 +784,7 @@ fn calibrate_planner(state: &mut Shell) {
     };
     // The ceiling is what the driver just advertised: sweeping above it would
     // measure shapes no scheduler will send.
-    let Ok(caps) = serde_json::from_slice::<driver_api::DriverCapabilities>(&model.load_caps)
-    else {
-        eprintln!("[driver-cuda] calibrate: the caps did not parse; nothing to sweep around");
-        return;
-    };
+    let caps = &model.caps;
     let ceiling = Ceiling {
         max_forward_tokens: i32::try_from(caps.max_forward_tokens).unwrap_or(0),
         max_forward_requests: i32::try_from(caps.max_forward_requests).unwrap_or(0),
@@ -542,14 +793,56 @@ fn calibrate_planner(state: &mut Shell) {
         eprintln!("[driver-cuda] calibrate: the advertised rectangle is empty");
         return;
     }
-    let page_size = i32::try_from(caps.kv_page_size).unwrap_or(16).max(1);
+    let page_size = i32::try_from(caps.kv_page_size)
+        .unwrap_or(crate::boot::KV_PAGE_SIZE)
+        .max(1);
     let total_pages = caps.total_pages;
     let template = crate::layout::profile_key::ProfileShape {
-        policy_profile: "generic".to_owned(),
+        // EMPTY MEANS "DO NOT PIN THE POLICY", AND `"generic"` MEANT "PIN A
+        // POLICY NOTHING HAS". `select` filters candidates with
+        // `if !m.policy_profile.is_empty() && c.policy_profile != m.policy_profile`,
+        // and every candidate carries one of `policy::policy_profiles`' four
+        // names — `latency`, `balanced`, `throughput`, `capacity`. `generic`
+        // is not one of them and never was, so the filter discarded the whole
+        // lattice on any boot that got this far. The sweep does not vary the
+        // policy, so it has measured nothing about it and pins nothing.
+        policy_profile: String::new(),
         kv_page_size: page_size,
-        max_forward_tokens: ceiling.max_forward_tokens,
+        // THE TOKEN AXIS IS NOT PINNED, BECAUSE THIS SWEEP CANNOT MEASURE IT.
+        //
+        // `select` compares a pinned `max_forward_tokens` against a
+        // candidate's `max_workspace_tokens` — a PREFILL width. What the
+        // ladder can actually fire on this driver is the diagonal `N == R`:
+        // `R` requests of one token each, which is a decode. Every off-diagonal
+        // point is `N/R > 1` tokens per request, a multi-token prefill, and
+        // `baker_fire` refuses one because the lane states no gather epilogue.
+        //
+        // So a winner's `max_forward_tokens` is just its request count wearing
+        // the other axis' name, and pinning it asked for a candidate whose
+        // prefill workspace is 512 tokens on a driver advertising 8192 — no
+        // candidate matched and the planner said so, by name, every boot. The
+        // REQUEST count is the thing the sweep genuinely measured (13918 tok/s
+        // at R=512 against 5339 at R=32, on an L40S), so it is the only thing
+        // pinned. Zero is `select`'s own "unmeasured" value: it guards both
+        // axes with `> 0`.
+        max_forward_tokens: 0,
         max_forward_requests: ceiling.max_forward_requests,
-        budget_bytes: 0,
+        // THE BUDGET THIS SHAPE WAS MEASURED AGAINST, which was a literal
+        // zero. `profile_cache::planner_budget_bytes`' own doc says the
+        // value is "published for the calibrator" — and the calibrator never
+        // read it, so the getter had no source reader at all.
+        //
+        // Zero is not neutral here. `memory_planner::select` guards a stored
+        // shape with `if m.budget_bytes > 0 { ...drift... }`, so a zero SKIPS
+        // the guard: a rectangle measured with 40 GiB free would be applied
+        // verbatim to a boot with 8 GiB, which is exactly the case that
+        // guard's paragraph — and its "re-run `pie config tune`" advice — is
+        // written about. Another check that could only pass.
+        //
+        // `plan` publishes the figure at its first statement and `plan` has
+        // already run: the caps this function reads its ceiling out of are
+        // its output.
+        budget_bytes: crate::layout::profile_cache::planner_budget_bytes(),
     };
 
     /// Times one point by firing a synthetic batch of that shape. `None` for a
@@ -582,11 +875,27 @@ fn calibrate_planner(state: &mut Shell) {
         }
     }
 
+    // THE SAME FOUR DEVICE FIELDS THE READER LOOKS UP WITH — see
+    // [`device_props`] for what four literal zeros here used to cost. A
+    // device this cannot bind writes the zeros it used to write always,
+    // which the reader will simply miss on: a key that describes no machine
+    // is the honest thing to store when the machine could not be read.
+    let props = crate::device::Device::bind(state.device_ordinal)
+        .as_ref()
+        .map_or_else(
+            |_| crate::layout::memory_planner::DeviceProps {
+                name: String::new(),
+                major: 0,
+                minor: 0,
+                sm_count: 0,
+            },
+            device_props,
+        );
     let key = crate::layout::profile_key::ProfileKey {
-        gpu_name: String::new(),
-        compute_major: 0,
-        compute_minor: 0,
-        sm_count: 0,
+        gpu_name: props.name.clone(),
+        compute_major: props.major,
+        compute_minor: props.minor,
+        sm_count: props.sm_count,
         kv_cache_dtype: state.kv_format.name().to_owned(),
         tp_size: i32::try_from(state.tp_size).unwrap_or(1),
         // The row, not its family: keyed on the id keys the model; the four
@@ -662,11 +971,21 @@ fn calibrate_planner(state: &mut Shell) {
         "[driver-cuda] calibrate: winner N={} R={}",
         cal.shape.max_forward_tokens, cal.shape.max_forward_requests
     );
+    // `sweep` writes BOTH axes of the winner over the template, so the token
+    // pin the template deliberately left at zero comes back. Cleared again
+    // here, for the reason written at the template: the token axis is the
+    // request count wearing another name, and `select` reads it as a prefill
+    // width. The `samples` below still carry both, so nothing is lost from
+    // the RECORD — only from the PIN.
+    let shape = crate::layout::profile_key::ProfileShape {
+        max_forward_tokens: 0,
+        ..cal.shape.clone()
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
     match crate::layout::profile_cache::ProfileCache::discover("") {
-        Ok(c) => match c.store(&key, &cal.shape, &cal.samples, now) {
+        Ok(c) => match c.store(&key, &shape, &cal.samples, now) {
             Ok(()) => eprintln!("[driver-cuda] calibrate: stored at {}", c.path().display()),
             Err(e) => eprintln!("[driver-cuda] calibrate: the winner could not be stored: {e:?}"),
         },
@@ -695,7 +1014,9 @@ fn synthetic_fire(
     if reqs == 0 {
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
-    let page = usize::try_from(page_size).unwrap_or(16).max(1);
+    let page = usize::try_from(page_size)
+        .unwrap_or(crate::boot::KV_PAGE_SIZE.unsigned_abs() as usize)
+        .max(1);
     // Pages this batch needs if every request runs alone. A footprint past the
     // pool is not a candidate — cheaper to refuse here than in the allocator.
     let pages_each = per.div_ceil(page);
@@ -705,8 +1026,6 @@ fn synthetic_fire(
     }
 
     let mut roster_rows = Vec::with_capacity(reqs);
-    let mut sub_batch_indptr = Vec::with_capacity(reqs + 1);
-    let mut sub_batch_class = Vec::with_capacity(reqs);
     let mut token_ids = Vec::with_capacity(reqs * per);
     let mut position_ids = Vec::with_capacity(reqs * per);
     let mut kv_page_indices = Vec::with_capacity(pages_total);
@@ -715,13 +1034,29 @@ fn synthetic_fire(
     let mut qo_indptr = Vec::with_capacity(reqs + 1);
     let mut cells = Vec::with_capacity(reqs);
 
-    sub_batch_indptr.push(0u32);
+    // ONE SUB-BATCH SPANNING EVERY REQUEST, AND THAT IS WHAT A FRAME LOOKS
+    // LIKE. This built one sub-batch PER REQUEST — `[0, 1, 2, .., R]` with
+    // `R` class entries — and `admit` refuses more than one ("one sub-batch
+    // per step today", `fire::launch`), so EVERY probe of more than one
+    // request was declined before a byte was allocated. A real two-request
+    // decode frame is `sub_batch_indptr: [0, 2]` with a single class entry;
+    // `baker_serve`'s `two_batched_requests_match_the_banked_rows` is the
+    // shape this now mirrors.
+    //
+    // WHAT IT COST: the entire calibration sweep. Every ladder point with
+    // `R > 1` died here, and every point with `R == 1` is `N >= 32` tokens
+    // of one request — a multi-token prefill, which `baker_fire` refuses
+    // because the lane states no gather epilogue. So the sweep declined all
+    // eighty points on qwen35-d0.8b and `store` was never once reached: the
+    // profile cache had no writer at all, which is a second and independent
+    // reason `Selector::Profiled` could not fire. Both are fixed here.
+    let sub_batch_indptr = vec![0u32, u32::try_from(reqs).unwrap_or(0)];
+    let sub_batch_class = vec![driver_api::local::PIE_GEOMETRY_CLASS_HOST];
+
     kv_page_indptr.push(0u32);
     qo_indptr.push(0u32);
     for r in 0..reqs {
         roster_rows.push(u32::try_from(r).unwrap_or(0));
-        sub_batch_indptr.push(u32::try_from(r + 1).unwrap_or(0));
-        sub_batch_class.push(driver_api::local::PIE_GEOMETRY_CLASS_HOST);
         for t in 0..per {
             // Token zero for every row: the sweep times a shape and every
             // kernel is dense, so the token in a slot changes nothing.
@@ -740,6 +1075,15 @@ fn synthetic_fire(
     let cell_ptrs: Vec<*mut driver_api::local::TerminalCell> =
         cells.iter_mut().map(|c| c as *mut _).collect();
 
+    // A RECURRENT FAMILY WANTS A SLOT PER REQUEST, and a probe that carried
+    // none was refused by name (`fire::launch`: "hybrid fire without
+    // rs_slot_ids") — which is every hybrid SKU, so neither the sweep nor
+    // the warm below could fire one. The probe takes the low slots and
+    // RESETs each before it runs, so it inherits nothing; it runs at load,
+    // where no request holds a slot yet.
+    let rs_slot_ids: Vec<u32> = (0..u32::try_from(reqs).unwrap_or(1)).collect();
+    let rs_slot_flags = vec![driver_api::local::PIE_RS_FLAG_RESET; reqs];
+
     let step = driver_api::StepSubmission {
         plan: driver_api::LaunchPlan {
             token_ids,
@@ -748,6 +1092,8 @@ fn synthetic_fire(
             kv_page_indptr,
             kv_last_page_lens,
             qo_indptr,
+            rs_slot_ids,
+            rs_slot_flags,
             ..Default::default()
         },
         roster_rows,
@@ -779,8 +1125,44 @@ fn synthetic_fire(
 // by the legacy names. R3 deletes the contract, so there is no arena for
 // either to wire: `model::produce` reads the checkpoint through the import
 // table and `baker::Baked::banks` is the only weight map a fire touches. The
-// per-expert arrays came with it — `baker::staging` builds them from the
+// per-expert arrays came with it — the MoE claim body builds them from the
 // produced bank, which is where they belong, beside the bank they slice.
+
+/// The device facts the profile cache is KEYED on, spelled once.
+///
+/// # Two spellings were half the bug
+///
+/// [`crate::layout::profile_key::ProfileKey`] has twelve fields and
+/// `ProfileKey::matches` requires all twelve equal — a missing field is a
+/// mismatch, not a wildcard, which is the right rule for a cache of
+/// MEASUREMENTS: a shape timed on another card describes another machine.
+/// Four of the twelve are this device's, and the two halves of the loop
+/// built them separately. The reader (`memory_planner::select`) took them
+/// off the `DeviceProps` `capabilities_json` fills from
+/// `cudaDeviceGetAttribute`; the writer ([`calibrate_planner`]) wrote
+/// `compute_major: 0, compute_minor: 0, sm_count: 0` — the value a device
+/// that could not be interrogated would carry.
+///
+/// So on every real GPU three of the twelve fields disagreed, every stored
+/// measurement missed on the next boot, and `Selector::Profiled` was
+/// unreachable — while `memory_planner`'s own comment said the key was
+/// built "unconditionally so calibration writes the same key serving later
+/// reads". That sentence is true now because there is one function and both
+/// halves call it; it cannot drift again without a compile error.
+///
+/// `name` is deliberately empty rather than `cudaDeviceProp::name`: this
+/// driver never reads the string and the reader has never filled it. It is
+/// in the key because the C++ schema this is a port of has it, and two
+/// empty strings compare equal.
+fn device_props(device: &crate::device::Device) -> crate::layout::memory_planner::DeviceProps {
+    let (major, minor) = device.compute_capability().unwrap_or((0, 0));
+    crate::layout::memory_planner::DeviceProps {
+        name: String::new(),
+        major,
+        minor,
+        sm_count: device.sm_count().unwrap_or(0),
+    }
+}
 
 /// What `load_model` answers: a `driver_api::DriverCapabilities` document.
 ///
@@ -790,31 +1172,35 @@ fn synthetic_fire(
 /// covers the KV pool and the fire's activations; the activation share is a
 /// fifth (the C++'s rule of thumb), not a computed arena, because no fire has
 /// been lowered yet.
-fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Vec<u8>, i32> {
+fn capabilities(
+    state: &Shell,
+    snapshot: &std::path::Path,
+    deployment: &model::deployment::Deployment,
+    model_tp: u32,
+    model_id: &'static str,
+    attn_workspaces: u32,
+) -> Result<driver_api::DriverCapabilities, i32> {
     use crate::layout::memory_planner::{
-        DeviceMemory, DeviceProps, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
-        ProfileSource, ShapeKnees, plan,
+        DeviceMemory, ModelCosts, ModelShape, NoProfiles, PlannerConfig, ProfileSource, ShapeKnees,
+        plan,
     };
     use crate::layout::model_costs::{CheckpointCosts, DiskProfiles};
 
-    let model = state.model.as_ref().expect("the model is stored");
     // No `HfConfig` read: a program and this driver fire off the same row, so
-    // they can't be two models. Cloned because the planner wants `state` back.
-    let deployment = model.deployment.clone();
-    let model_tp = model.tp_size;
-    // Copied out (`&'static str`) to end the borrow of `state` before the planner.
-    let model_id = model.id;
+    // they can't be two models. The three facts arrive as arguments now — see
+    // the call site for why they are not read back off a half-built
+    // `state.model`.
     let device = crate::device::Device::bind(state.device_ordinal)?;
     let (free, total) = device.memory_info()?;
-    let (major, minor) = device.compute_capability().unwrap_or((0, 0));
     let cfg = PlannerConfig {
         gpu_mem_utilization: 0.90,
         memory_profile: "auto".to_owned(),
         max_forward_tokens: 0,
         max_forward_requests: 0,
-        // Pinned, a coupling not a preference: the fire path builds 16-token
-        // pages, so sweeping page sizes would answer a geometry it never builds.
-        kv_page_size: 16,
+        // Pinned, a coupling not a preference: the fire path builds
+        // `KV_PAGE_SIZE`-token pages, so sweeping page sizes would answer a
+        // geometry it never builds.
+        kv_page_size: crate::boot::KV_PAGE_SIZE.unsigned_abs(),
         // The driver's own format, so the planner sizes the pages it allocates:
         // a bf16 planner under-counts a quantized cache up to 4x.
         kv_cache_dtype: state.kv_format.name().to_owned(),
@@ -831,7 +1217,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     };
     // The row's own numbers, so the pool the planner sizes and the one the fire
     // builds share one shape — a second parse could leave the pool pages short.
-    let costs = CheckpointCosts::new(&deployment, model_tp);
+    let costs = CheckpointCosts::new(deployment, model_tp, attn_workspaces);
     let shape = ModelShape {
         hidden_size: i32::try_from(deployment.shape.hidden).unwrap_or(0),
         num_hidden_layers: i32::try_from(deployment.layers).unwrap_or(0),
@@ -840,12 +1226,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         head_dim_kernel: i32::try_from(deployment.shape.head_dim_kernel).unwrap_or(0),
         model_id: model_id.to_owned(),
     };
-    let props = DeviceProps {
-        name: String::new(),
-        major,
-        minor,
-        sm_count: device.sm_count().unwrap_or(0),
-    };
+    let props = device_props(&device);
     let mem = DeviceMemory {
         free_bytes: free as u64,
         total_bytes: total as u64,
@@ -870,6 +1251,21 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     for note in &planned.notes {
         eprintln!("[driver-cuda] {note}");
     }
+    // WHICH ARM PICKED THE RECTANGLE, SAID OUT LOUD. `Selector` reaches the
+    // outside world only through `Planned::verbose_summary` and
+    // `introspection_report`, and this driver calls neither — so a boot that
+    // took a MEASUREMENT off the profile cache looked exactly like a boot
+    // that scored the lattice, and the only way the cache ever spoke was to
+    // complain. That is what made "never hits" survivable for as long as it
+    // did: there was nothing to notice.
+    eprintln!(
+        "[driver-cuda] load_model: planner picked N={} R={} page {} ({}), by {:?}",
+        planned.plan.max_workspace_tokens,
+        planned.plan.max_requests,
+        planned.plan.kv_page_size,
+        planned.policy_profile,
+        planned.selector,
+    );
 
     // Pages against what the arena leaves, not the full budget: `Scratch` keeps
     // the arena, seam buffers and descriptor arrays for the driver's life — a
@@ -916,7 +1312,8 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     let caps = driver_api::DriverCapabilities {
         abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
         total_pages: u32::try_from(total_pages).unwrap_or(u32::MAX),
-        kv_page_size: u32::try_from(planned.plan.kv_page_size).unwrap_or(16),
+        kv_page_size: u32::try_from(planned.plan.kv_page_size)
+            .unwrap_or(crate::boot::KV_PAGE_SIZE.unsigned_abs()),
         // The lattice's answer, not a stated ceiling: the arena is sized for
         // exactly this rectangle — a wider fire has no workspace.
         max_forward_tokens: u32::try_from(planned.plan.capacity.max_forward_tokens).unwrap_or(0),
@@ -969,7 +1366,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // needs to generate a kernel for it.
         codegen_backend: String::new(),
     };
-    serde_json::to_vec(&caps).map_err(|_| PIE_STATUS_DRIVER_ERROR)
+    Ok(caps)
 }
 
 /// Adopt one non-empty launch package and compile what it generates.

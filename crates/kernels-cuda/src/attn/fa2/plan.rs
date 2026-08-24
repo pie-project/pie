@@ -10,8 +10,6 @@ use kernels::Refusal;
 
 use crate::jit::PinnedBytes;
 
-use super::dispatch::PrefillDispatch;
-
 #[must_use]
 pub enum Planned {
     Full,
@@ -117,15 +115,12 @@ pub struct DecodePlanCache {
     pub static_kv_tile_indices: Vec<i32>,
     pub static_o_indptr: Vec<i32>,
     pub indptr_h_buf: Vec<i32>,
-    /// The int workspace this plan was planned against — the carve the
-    /// driver stamps when it raises the cache. Was `keys::AttnWorkspaceInt`.
+
     pub int_workspace: *mut core::ffi::c_void,
-    /// Its float half. Was `keys::AttnWorkspaceFloat`.
+
     pub float_workspace: *mut core::ffi::c_void,
 }
 
-// NOT DERIVED: the two carve pointers have no `Default` of their own, and
-// null is exactly what an unraised cache should say there.
 impl Default for DecodePlanCache {
     fn default() -> Self {
         Self {
@@ -215,23 +210,16 @@ pub struct PrefillPlanCache {
     pub kv_h_buf: Vec<i32>,
     pub cta_tile_q: u32,
     pub int_base_bytes: usize,
-    /// The int workspace this plan was planned against — the carve the
-    /// driver stamps when it raises the cache. Was
-    /// `keys::AttnPrefillWorkspaceInt` on the planned path and
-    /// `keys::AttnWorkspaceInt` on the planless one.
+
     pub int_workspace: *mut core::ffi::c_void,
-    /// Its float half. Was `keys::AttnPrefillWorkspaceFloat` /
-    /// `keys::AttnWorkspaceFloat`.
+
     pub float_workspace: *mut core::ffi::c_void,
-    /// The int carve's size, which the planless prefill plans against. Was
-    /// `keys::AttnWorkspaceIntBytes`.
+
     pub int_workspace_bytes: usize,
-    /// The float carve's size. Was `keys::AttnWorkspaceFloatBytes`.
+
     pub float_workspace_bytes: usize,
 }
 
-// NOT DERIVED: the two carve pointers have no `Default` of their own, and
-// null is exactly what an unraised cache should say there.
 impl Default for PrefillPlanCache {
     fn default() -> Self {
         Self {
@@ -666,12 +654,6 @@ pub fn plan_prefill(
     Planned::Full
 }
 
-/// # Safety
-///
-/// `int_buffer + int_base_bytes` must address at least `bytes.len()` bytes
-/// of device memory, and `stream` must be a live stream in the current
-/// context. Nothing here can check either: the destination arrives as a
-/// `u64` precisely because it is not a pointer this side may dereference.
 pub unsafe fn upload_int_plan(
     bytes: &[u8],
     int_buffer: u64,
@@ -700,27 +682,4 @@ pub struct PlanUpload<'a> {
     pub bytes: &'a [u8],
     pub int_buffer: u64,
     pub int_base_bytes: usize,
-}
-
-/// # Safety
-///
-/// [`upload_int_plan`]'s, plus `dispatch` must hold device pointers that
-/// are still mapped and still describe the geometry the plan was measured
-/// against. `stream` must be live for both the upload and the launch.
-pub unsafe fn fire_prefill<P: lattice::PrefillBlock>(
-    dispatch: &mut PrefillDispatch<P>,
-    upload: PlanUpload<'_>,
-    stream: *mut c_void,
-) -> Result<(), Refusal> {
-    unsafe {
-        upload_int_plan(
-            upload.bytes,
-            upload.int_buffer,
-            upload.int_base_bytes,
-            stream,
-        )?;
-    }
-
-    let ctx = unsafe { crate::jit::Ctx::on(stream) };
-    lattice::prefill(&ctx, dispatch.at, &dispatch.params)
 }

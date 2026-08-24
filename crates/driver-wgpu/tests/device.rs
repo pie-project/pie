@@ -212,9 +212,14 @@ fn the_runner_states_whether_it_has_a_device() {
     // which arrived from the NVIDIA side and did not move this line. That is the
     // pin working: an added test is a deliberate act and so is moving the number,
     // and the one that was not moved was found by the one that was.
+    //
+    // 25 -> 20 when the legacy walk went. Five gated tests left with it: the
+    // four `one_launch`/`fire_one` refusals and the ported-routine fire, all
+    // of which drove a `model_compiler::lower::Lowered` through a real device.
+    // See the note where they stood, further down this file.
     assert_eq!(
-        gated, 25,
-        "{gated} test(s) in this file are gated on `adapter()`, not the 25 \
+        gated, 20,
+        "{gated} test(s) in this file are gated on `adapter()`, not the 20 \
          this was measured against. If you added or removed one, say so here; \
          otherwise the scan has lost its needle and the line printed above is \
          not a count of anything."
@@ -1970,12 +1975,17 @@ fn the_fallback_knob_reaches_the_second_adapter_through_open() {
 ///
 /// What that cost, before it was found:
 ///
-/// * `serving.rs`'s `the_tiled_gemm_answers_the_way_the_vector_kernel_does_at_a_partial_tile`
-///   failed with *"the submission of 452 launches: the device did not answer
-///   within 30s"* -- which is not a timeout, it is a software rasterizer.
-/// * `hybrid_probe.rs`'s `which_of_the_mlps_kernels_carries_the_odd_row_nan`
-///   PASSED, attributing an odd-row NaN that the 4090 does not produce, while
-///   the same test run alone found the fire finite and failed.
+/// (Both suites named below STOOD HERE and are deleted with the lowering they
+/// drove; the ICD exhaustion they exposed is a property of the machine and
+/// outlives them.)
+///
+/// * `serving.rs`'s tiled-GEMM-against-vector-kernel comparison at a partial
+///   tile failed with *"the submission of 452 launches: the device did not
+///   answer within 30s"* -- which is not a timeout, it is a software
+///   rasterizer.
+/// * `hybrid_probe.rs`'s odd-row NaN bisection PASSED, attributing an odd-row
+///   NaN that the 4090 does not produce, while the same test run alone found
+///   the fire finite and failed.
 ///
 /// Both are the same sentence: a suite long enough to exhaust the ICD stops
 /// measuring the machine it is running on, and says nothing about it.
@@ -2122,525 +2132,42 @@ fn every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter() {
     );
 }
 
-/// One launch over `symbol`, with one weight operand.
-///
-/// The smallest plan `serve::fire` will look at: one rectangle, a 256-byte
-/// arena, and an operand that exists so the resolver in these tests is
-/// something `fire` could reach. Shared by the three refusals below, which
-/// differ only in what they point it at.
-fn one_launch(symbol: &str) -> model_compiler::lower::Lowered {
-    model_compiler::lower::Lowered {
-        launches: vec![model_compiler::lower::Launch {
-            kernel: 0,
-            rows: 0..4,
-            layers: 0..1,
-            op: 11,
-            args: 0..1,
-            params: 0..0,
-            peel: None,
-            cond: model_compiler::lower::Launch::NO_COND,
-        }],
-        kernels: vec![symbol.to_owned()],
-        rectangles: 1,
-        arena_bytes: 256,
-        value_offset: Vec::new(),
-        value_owner: Vec::new(),
-        epilogue_gather: usize::MAX,
-        epilogue_norm: usize::MAX,
-        args: vec![model_compiler::lower::Arg::Weight(
-            "model.layers.0.mlp.down_proj.weight".to_owned(),
-        )],
-        // Zero is "no opinion", which is what a weight has: it is not measured
-        // in rows of the batch, so there is nothing for a backend to override
-        // the launch's own rectangle with.
-        arg_rows: vec![0],
-        structural: Vec::new(),
-        residue: Vec::new(),
-        params: Vec::new(),
-        preps: Vec::new(),
-        n_requests: 1,
-        conds: Vec::new(),
-        readout: None,
-    }
-}
-
-/// A resolver that panics if anything asks it for anything.
-struct NothingResolves;
-
-impl driver_wgpu::binding::Resolve for NothingResolves {
-    type Buffer = Buffer;
-    fn weight(&self, name: &str) -> Option<&Buffer> {
-        unreachable!("`fire` asked for the weight `{name}` of a plan it should have refused first")
-    }
-    fn named(&self, value: model_ir::trace::ValueId) -> Option<&Buffer> {
-        unreachable!(
-            "`fire` asked for the named value {value:?} of a plan it should have refused first"
-        )
-    }
-}
-
-/// `serve::fire` over [`one_launch`], against whatever module store is given.
-fn fire_one<M: driver_wgpu::serve::Modules>(
-    device: &Device,
-    modules: &M,
-    lowered: &model_compiler::lower::Lowered,
-) -> Result<driver_wgpu::serve::Fired, driver_wgpu::serve::Unfired> {
-    let arena = device.zeroed(256).expect("a 256-byte arena");
-    let mut pipelines = Pipelines::default();
-    // The bytes `fire` copies out with the work are the readout's, which this
-    // fixture's plan does not state; the count is what it is checking.
-    driver_wgpu::serve::fire(
-        device,
-        &mut pipelines,
-        modules,
-        lowered,
-        driver_wgpu::serve::Fire {
-            arena: driver_wgpu::binding::Arena {
-                buffer: &arena,
-                bytes: 256,
-            },
-            resolver: &NothingResolves,
-            geometry: driver_wgpu::dispatch::Geometry {
-                q_heads: 16,
-                kv_heads: 8,
-                head_dim: 128,
-                rotary_dims: 128,
-                n_experts: 0,
-                experts_per_token: 0,
-                ..Default::default()
-            },
-            tier: Capability::Baseline,
-            one_at_a_time: false,
-            // The whole plan: this fires a real text and reads its answer,
-            // where a prefix is for finding where one goes wrong.
-            prefix: None,
-        },
-    )
-    .map(|(fired, _)| fired)
-}
-
-/// A launch naming a symbol no module has is refused BY THAT NAME, and refused
-/// before anything is resolved.
-///
-/// `Unfired::NoModule` sat on the census of refusals no test names — see
-/// `every_refusal_this_crate_builds_is_one_a_test_names` — in its "reachable
-/// and untested" group, which is the group worth closing. Reachable it is: a
-/// plan carries kernel names as strings, and a table that renames a row
-/// without renaming its shader produces exactly this.
-///
-/// **The resolver here panics if it is asked for anything**, and the honest
-/// account of that is worth more than the guard. It was written claiming to
-/// prove that `fire` looks up every DISTINCT module before it resolves an
-/// operand — and then the claim was checked, by pointing this same fixture at
-/// a symbol the tree DOES have. It does not fire either: the planner refuses
-/// first, with
-///
-/// ```text
-/// launch 0 (`rms_single_row_bfloat16`): operand 0: the row names an operand
-/// this statement does not state
-/// ```
-///
-/// so the resolver is unreachable from this fixture whatever the ordering is,
-/// and the `unreachable!` could never have failed. **The control is the
-/// variant assertion below**, which catches an inversion as a wrong `Unfired`
-/// rather than as a panic. The resolver stays because a guard that cannot fire
-/// still costs nothing and still documents the expectation; it is described
-/// here as what it is rather than as what it looked like.
-#[test]
-fn a_launch_naming_a_symbol_no_module_has_is_refused_before_anything_resolves() {
-    let Some((device, _held)) = adapter() else {
-        return;
-    };
-
-    const MISSING: &str = "rms_single_row_bfloat16_but_spelled_wrong";
-    assert!(
-        pick(&Embedded, MISSING, Capability::Baseline).is_none(),
-        "this test is only about a missing module if the module is missing"
-    );
-
-    // A real operand, so that the resolver above is something `fire` WOULD
-    // reach. With no args it could never be called and the `unreachable!`
-    // would prove nothing -- which is what this test said it proved until the
-    // claim was checked.
-    let lowered = one_launch(MISSING);
-
-    let refused =
-        fire_one(&device, &Embedded, &lowered).expect_err("a symbol no module has cannot fire");
-
-    match &refused {
-        driver_wgpu::serve::Unfired::NoModule { at, symbol } => {
-            assert_eq!(*at, 0, "the launch index, and there is one launch");
-            assert_eq!(symbol, MISSING, "the refusal names the symbol it wanted");
-        }
-        other => panic!("expected `NoModule`, got `{other}`"),
-    }
-    assert!(
-        refused.to_string().contains(MISSING),
-        "and the MESSAGE names it too, which is the whole point of the variant \
-         carrying the string: {refused}"
-    );
-}
-
-/// A module the WGSL front end cannot read is refused by the module's name.
-///
-/// `Unfired::Unreadable` is what `reflect::declared` failing becomes, and it
-/// is reachable without inventing anything exotic: [`Modules`] is a one-method
-/// trait, so a store that hands back text `naga` will not parse is four lines.
-///
-/// It matters more than it looks. The embedded tree is generated — includes
-/// spliced, `//#if` arms resolved, defines substituted — and an expansion that
-/// produces text no front end accepts is a build-time mistake that arrives at
-/// runtime. This is the refusal that has to name WHICH entrypoint, because the
-/// generated source is not what anyone wrote and the symbol is the only handle
-/// back to the file that produced it.
-#[test]
-fn a_module_the_front_end_cannot_read_is_refused_by_the_entrypoint_that_named_it() {
-    let Some((device, _held)) = adapter() else {
-        return;
-    };
-
-    struct NotWgsl;
-    impl driver_wgpu::serve::Modules for NotWgsl {
-        // THE FIRE PATH'S LOOKUP, which a body reaches through `Fire::at`.
-        // Same prose here as at `source` below: what is under test is what a
-        // front end does with text that is not WGSL, and both lookups have to
-        // hand it the same non-shading language for the refusal to be the
-        // one this names.
-        fn at(&self, _file: &str, _entrypoint: &str, _tier: Capability) -> Option<String> {
-            Some("this is prose, not a shading language".to_owned())
-        }
-
-        fn source(&self, _entrypoint: &str, _tier: Capability) -> Option<String> {
-            Some("this is prose, not a shading language".to_owned())
-        }
-    }
-
-    const SYMBOL: &str = "rms_single_row_bfloat16";
-    let refused = fire_one(&device, &NotWgsl, &one_launch(SYMBOL))
-        .expect_err("text that is not WGSL cannot be reflected, let alone fired");
-
-    match &refused {
-        driver_wgpu::serve::Unfired::Unreadable { at, symbol, .. } => {
-            assert_eq!(*at, 0, "the launch index, and there is one launch");
-            assert_eq!(symbol, SYMBOL, "the refusal names the entrypoint it read");
-        }
-        other => panic!("expected `Unreadable`, got `{other}`"),
-    }
-    assert!(
-        refused.to_string().contains(SYMBOL),
-        "and the message names it, which is the only handle back to the file \
-         whose expansion produced the text: {refused}"
-    );
-}
-
-/// A row whose operands the statement does not state is refused before the
-/// device is touched.
-///
-/// `Unfired::Unplannable` carries an [`Undispatchable`] from the planner, and
-/// this is the cheapest way to reach one: a real entrypoint, a real module,
-/// and a plan that hands it an operand its kernel row does not declare.
-///
-/// This refusal was met by accident while checking a different test's guard —
-/// pointing a fixture built for `NoModule` at a symbol the tree DOES have
-/// produced it immediately — which is the only reason it is cheap. It had sat
-/// in the census's "needs a fire built to fail in one specific way" group on
-/// the assumption that building one was the expensive part.
-#[test]
-fn a_row_whose_operands_the_statement_does_not_state_is_unplannable() {
-    let Some((device, _held)) = adapter() else {
-        return;
-    };
-
-    const SYMBOL: &str = "rms_single_row_bfloat16";
-    assert!(
-        pick(&Embedded, SYMBOL, Capability::Baseline).is_some(),
-        "this test needs the module to be FOUND, or it is testing `NoModule`"
-    );
-
-    let refused = fire_one(&device, &Embedded, &one_launch(SYMBOL))
-        .expect_err("an operand the statement does not state cannot be planned");
-
-    match &refused {
-        driver_wgpu::serve::Unfired::Unplannable { at, symbol, .. } => {
-            assert_eq!(*at, 0, "the launch index, and there is one launch");
-            assert_eq!(
-                symbol, SYMBOL,
-                "the refusal names the row it could not plan"
-            );
-        }
-        other => panic!("expected `Unplannable`, got `{other}`"),
-    }
-    let said = refused.to_string();
-    assert!(
-        said.contains(SYMBOL) && said.contains("operand"),
-        "and it says which operand of which symbol, because a planner refusal \
-         naming neither is a bug report nobody can act on: {said}"
-    );
-}
-
-/// Every way a read-out can be refused, and each says which.
-///
-/// The four `Unread` variants were the rest of the census's "reachable and
-/// untested" group, kept there by the same estimate that kept the `Unfired`
-/// three — that reaching them meant building a fire. It does not.
-/// `serve::logits` takes a device, a buffer and a `Lowered`, and every one of
-/// its refusals is decided from the `Readout` the plan states. No dispatch is
-/// involved and nothing has to have run.
-///
-/// `Refused` is the one worth the paragraph. Its check is deliberately made
-/// against `lowered.arena_bytes` and NOT against the buffer, so that a caller
-/// who allocated a larger arena than the plan asked for is still told when a
-/// range runs off the plan's own end. The consequence is that a plan claiming
-/// a bigger arena than the buffer it is handed passes the range check and is
-/// refused by the DEVICE instead — which is exactly the split this test pins,
-/// because the two refusals mean different things to a caller: one is a
-/// malformed plan and the other is a device that would not answer.
-#[test]
-fn the_four_ways_a_read_out_is_refused_each_say_which() {
-    let Some((device, _held)) = adapter() else {
-        return;
-    };
-
-    let readout = |at: usize, rows: u32, vocab: u32, bytes: u32| model_compiler::lower::Readout {
-        at,
-        rows,
-        vocab,
-        bytes,
-    };
-    // The plan is otherwise irrelevant: `logits` reads the exit and the arena
-    // size and nothing else.
-    let with = |exit: Option<model_compiler::lower::Readout>, arena_bytes: usize| {
-        let mut low = one_launch("rms_single_row_bfloat16");
-        low.readout = exit;
-        low.arena_bytes = arena_bytes;
-        low
-    };
-
-    let arena = device.zeroed(256).expect("a 256-byte arena");
-
-    // 1. No exit at all. A text that computes something other than a
-    //    distribution is a legitimate text; the caller asked the wrong thing.
-    match driver_wgpu::serve::logits(&device, &arena, &with(None, 256), &[]) {
-        Err(driver_wgpu::serve::Unread::NoExit) => {}
-        other => panic!("expected `NoExit`, got {other:?}"),
-    }
-
-    // 2. A range that runs off the arena the LOWERING sized.
-    match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 64, 4)), 256), &[]) {
-        Err(driver_wgpu::serve::Unread::PastArena { at, extent, arena }) => {
-            assert_eq!((at, extent, arena), (0, 1024, 256));
-        }
-        other => panic!("expected `PastArena`, got {other:?}"),
-    }
-
-    // 3. A width this crate does not widen. Two and four are bf16 and f32;
-    //    everything else is a plan this reader cannot honour, and guessing
-    //    would read two elements as one.
-    for odd in [1u32, 3, 8] {
-        match driver_wgpu::serve::logits(
-            &device,
-            &arena,
-            &with(Some(readout(0, 1, 4, odd)), 256),
-            &[],
-        ) {
-            Err(driver_wgpu::serve::Unread::Width(b)) => assert_eq!(b, odd),
-            other => panic!("expected `Width({odd})`, got {other:?}"),
-        }
-    }
-
-    // 4. The device would not give the bytes back: a plan whose arena is
-    //    bigger than the buffer it was handed passes the range check above and
-    //    is refused here instead.
-    let refused = driver_wgpu::serve::logits(
-        &device,
-        &arena,
-        &with(Some(readout(0, 4, 256, 4)), 1 << 20),
-        &[],
-    );
-    match refused {
-        Err(driver_wgpu::serve::Unread::Refused(why)) => assert!(
-            !why.to_string().is_empty(),
-            "a device refusal that says nothing is the shape this whole error \
-             surface exists to avoid"
-        ),
-        other => panic!("expected `Refused`, got {other:?}"),
-    }
-
-    // And the four read differently, which is the point of there being four.
-    let said: Vec<String> = [
-        driver_wgpu::serve::Unread::NoExit,
-        driver_wgpu::serve::Unread::PastArena {
-            at: 0,
-            extent: 1024,
-            arena: 256,
-        },
-        driver_wgpu::serve::Unread::Width(3),
-    ]
-    .iter()
-    .map(std::string::ToString::to_string)
-    .collect();
-    assert_eq!(
-        said.iter().collect::<std::collections::BTreeSet<_>>().len(),
-        said.len(),
-        "two of these refusals print the same thing: {said:?}"
-    );
-}
-
-/// The first ported routine runs on a real adapter and computes what it says.
-///
-/// `the_first_ported_routine_asks_for_the_grid_its_row_asked_for` proves the
-/// body asks for the same GRID the row's `LaunchRule` asked for. This proves
-/// the rest of the path: that a `kernels-wgpu` routine, dispatched through
-/// `driver_wgpu::encode::Encoder`, reaches the adapter and produces the
-/// numbers gemma's PLE join is defined to produce.
-///
-/// Nothing in `kernels-wgpu` can do this — it names no adapter — and nothing
-/// in the table shape needed it, because the driver assembled the dispatch and
-/// the row only described it. In the routine shape the body IS the dispatch,
-/// so the body is what has to be run.
-#[test]
-fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
-    let Some((device, _held)) = adapter() else {
-        return;
-    };
-
-    /// Two bf16 in one `u32`, low half first — the shader's own packing.
-    fn pack(lo: f32, hi: f32) -> u32 {
-        (lo.to_bits() >> 16) | ((hi.to_bits() >> 16) << 16)
-    }
-    /// The low and high bf16 of a word, widened.
-    fn unpack(word: u32) -> (f32, f32) {
-        (
-            f32::from_bits((word & 0xffff) << 16),
-            f32::from_bits((word >> 16) << 16),
-        )
-    }
-
-    const WORDS: usize = 512;
-    let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
-
-    let proj: Vec<u32> = (0..WORDS)
-        .map(|i| {
-            #[allow(clippy::cast_precision_loss)]
-            pack(i as f32 * 0.5, i as f32 * -0.25)
-        })
-        .collect();
-    let token: Vec<u32> = (0..WORDS)
-        .map(|i| {
-            #[allow(clippy::cast_precision_loss)]
-            pack(i as f32 * 0.125, 1.0)
-        })
-        .collect();
-
-    let bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
-    let proj_b = device.buffer(&bytes(&proj)).expect("proj");
-    let token_b = device.buffer(&bytes(&token)).expect("token");
-    let out_b = device
-        .zeroed(u64::try_from(WORDS * 4).expect("fits"))
-        .expect("out");
-    // `PleCombineParams { inv_sqrt2: f32, n: u32 }`.
-    let mut params = inv_sqrt2.to_le_bytes().to_vec();
-    params.extend_from_slice(&u32::try_from(WORDS).expect("fits").to_le_bytes());
-    let params_b = device.buffer(&params).expect("params");
-
-    let mut pipelines = Pipelines::default();
-    // THE PARAMS BLOCK IS HANDLE ZERO, because `Handles` mints in ask order
-    // and `ctx.params()` is the first thing this body asks for. The operands
-    // the caller states are handles 1..3, so `held` is laid out to match.
-    let held = [&params_b, &proj_b, &token_b, &out_b];
-    // WHAT THE BODY ASKS FOR, ANSWERED. `Env` left the parameter list, and
-    // then the `ctx.ask` channel it also used left too: the per-layer table
-    // is `ctx.params()`, but the row count is a `Const<i32>` mark on the
-    // signature now rather than a `keys::Rows` ask -- so this launch states
-    // its rectangle whole through the operands and the trailing mark, and
-    // the encoder answers only handles and the packed scalar run.
-    let handles =
-        core::cell::RefCell::new(driver_wgpu::lowering::hold::Handles::undivided(&[], &[]));
-    let facts = driver_wgpu::lowering::hold::facts(
-        "ple_combine_bfloat16",
-        // One row of `WORDS` elements: the body's `lanes` is `width * rows`,
-        // and the launch this test measures is the flat one it always was.
-        1,
-        driver_wgpu::dispatch::Geometry::default(),
-        1,
-        u32::try_from(WORDS).expect("fits"),
-        u32::try_from(WORDS).expect("fits"),
-    );
-    let encoder = driver_wgpu::encode::Encoder::new(
-        &device,
-        &mut pipelines,
-        &Embedded,
-        Capability::Baseline,
-        &held,
-    )
-    .answering(&handles, facts);
-
-    let width = i32::try_from(WORDS).expect("fits");
-    kernels_wgpu::layout::ple_combine(
-        &encoder,
-        // The marks are FAT now: an operand carries the rectangle the
-        // statement gave it, which is where the body reads its own pitch.
-        // `Width` came off 337 parameter lists exactly because the operand
-        // beside it already implied it.
-        kernels::In {
-            ptr: kernels_wgpu::routine::Tensor::new(1),
-            rows: 1,
-            width,
-        },
-        kernels::In {
-            ptr: kernels_wgpu::routine::Tensor::new(2),
-            rows: 1,
-            width,
-        },
-        kernels::Out {
-            ptr: kernels_wgpu::routine::Tensor::new(3),
-            rows: 1,
-            width,
-        },
-        // The scale came OFF the params block and onto the signature. It is
-        // still the same word 0 of the same uniform run once the binder has
-        // packed it -- `params` above is built by hand for exactly that
-        // reason -- but the routine now states it rather than trusting the
-        // caller to have laid it out.
-        kernels::routine::Const { v: inv_sqrt2 },
-        // ROWS is a mark now too. `keys::Rows` retired with the whole named
-        // vocabulary, and every routine that used to ask for it takes it as
-        // a `Const<i32>` on its signature. One row is the launch this test
-        // states, so `1` is the honest value here.
-        kernels::routine::Const { v: 1_i32 },
-    )
-    .expect("the routine dispatches on this adapter");
-
-    let got = device
-        .read_at(&out_b, 0, u64::try_from(WORDS * 4).expect("fits"))
-        .expect("readback");
-    let words: Vec<u32> = got
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-
-    let mut checked = 0usize;
-    for (i, word) in words.iter().enumerate() {
-        let (glo, ghi) = unpack(*word);
-        let (plo, phi) = unpack(proj[i]);
-        let (tlo, thi) = unpack(token[i]);
-        // The reference rounds to bf16 the way the shader does -- to nearest,
-        // ties to even -- and the comparison is exact rather than within a
-        // tolerance. A first draft TRUNCATED, and this test caught it: at word
-        // 1's high half the shader said 0.53125 and the truncating reference
-        // said 0.52734375. `pie_pack_bf16` rounds, and a reference that did
-        // not would have made every ported kernel look wrong by a half-ulp.
-        let want = |a: f32, b: f32| {
-            let bits = ((a + b) * inv_sqrt2).to_bits();
-            let round = 0x7fff + ((bits >> 16) & 1);
-            f32::from_bits((bits.wrapping_add(round)) & 0xffff_0000)
-        };
-        assert_eq!(glo, want(plo, tlo), "word {i}, low half");
-        assert_eq!(ghi, want(phi, thi), "word {i}, high half");
-        checked += 2;
-    }
-    assert_eq!(checked, WORDS * 2, "every half of every word was compared");
-}
+// SIX ITEMS STOOD HERE, and all six read a `model_compiler::lower::Lowered`.
+//
+// `one_launch(symbol)` built the smallest plan `serve::fire` would look at --
+// one rectangle, a 256-byte arena, one weight operand -- and `fire_one` drove
+// it through a real device. Four tests shared them:
+//
+// * `a_launch_naming_a_symbol_no_module_has_is_refused_before_anything_
+//   resolves`
+// * `a_module_the_front_end_cannot_read_is_refused_by_the_entrypoint_that_
+//   named_it`
+// * `a_row_whose_operands_the_statement_does_not_state_is_unplannable`
+// * `the_four_ways_a_read_out_is_refused_each_say_which`
+//
+// Each one asked the same question at a different door: that a fire refuses BY
+// NAME, naming the launch index as well as the symbol, rather than dispatching
+// something plausible. The last one is the one worth restating, because it was
+// four refusals compared against each other: a read-out with no exit, one
+// running past the arena the plan sized, one at an element width that is
+// neither two nor four, and one the device would not read back -- and it
+// asserted the four printed DIFFERENTLY, since a caller gets only the string.
+//
+// The sixth is `the_first_ported_routine_runs_on_this_adapter_and_averages_
+// two_streams`, and it went for a second reason on top of the first. It fired
+// `kernels_wgpu::layout::ple_combine` through `driver_wgpu::encode::Encoder`
+// onto a real adapter and compared 512 words against a host reference,
+// checking BOTH halves of every bf16 pair exactly rather than within a
+// tolerance -- which caught a reference that TRUNCATED where the shader ROUNDS
+// to nearest, ties to even (at word 1's high half the shader said 0.53125 and
+// the truncating reference said 0.52734375). `kernels_wgpu::layout` is a
+// `#[claims] impl` now and states no `ple_combine` routine at all, so there is
+// no body left to fire; and the encoder it used had to be handed a
+// `lowering::hold::Handles` to answer through, which is deleted too.
+//
+// The rounding rule is the part that must not be lost: a reference that
+// truncates makes every ported kernel look wrong by a half-ulp, and
+// `pie_pack_bf16` rounds.
 
 /// Two `read_write` bindings into one buffer are LEGAL, and this is the whole
 /// reason the shader tree declares no `read` storage binding.
@@ -2755,10 +2282,10 @@ fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Disjoint is the ordinary case, an arena launch's input and output.
 /// IDENTICAL is the in-place case a kernel authors, where invocation `i`
 /// reads and writes element `i`. Partial overlap is what no kernel authors,
-/// and no real plan raises it —
-/// `a_run_of_decodes_derives_one_lowering_and_says_the_same_thing` and
-/// `a_real_fire_is_one_command_buffer_and_shadows_nothing` run 452-launch
-/// fires through `check_bindable` and come back clean.
+/// and no real plan raised it: two 452-launch fleet fires STOOD HERE in
+/// `tests/serving.rs` and put every rectangle through `check_bindable`,
+/// coming back clean. Both are deleted with the lowering that built those
+/// fires, so what is left holding this is the three cases below.
 ///
 /// Neither sibling has this check. Both bind the arena both ways without
 /// comment and would run the race.

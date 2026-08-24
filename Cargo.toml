@@ -62,6 +62,23 @@ members = [
     # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
     # not carry its tests.
     "crates/driver",
+    # `baker-walk` STOOD HERE, and it was the half of a baker executor that is
+    # not a plane: the walk over a `Program`, the bound statement, the frame's
+    # numbering, the load-time resolve. It was extracted because metal's and
+    # wgpu's copies came out 96% identical.
+    #
+    # IT DID NOT REMOVE THE DUPLICATION, it moved it. `driver-cuda/src/baker/`
+    # never joined -- it kept its own `bound.rs` and `resolve.rs` defining the
+    # same `axis`, `bank_axis`, `rides`, `check`, `witness_dt`, `dtype_of` and
+    # `claimed`, in that order -- and `baker-smoke` held a third copy of the
+    # first three. So the crate was the one copy for two of four sites, and
+    # the price of that sharing was a second trait: `Fires<'p>` exists only to
+    # carry the lifetime invariance of `dyn Encode + 'a` across two planes,
+    # and a driver whose `Ctx` is concrete needs no such thing.
+    #
+    # Two of three or none. Each shader shell owns its walk now, in its own
+    # `src/walk/`, which is the honest-duplication rule this tree already
+    # applies to the kernels themselves.
     # The CUDA shell. It was `driver-cuda-new` while the C++ `driver-cuda`
     # still existed, on the same terms the Metal one was, and took the name
     # when that one went. Unlike either C++ shell it builds ANYWHERE:
@@ -71,15 +88,80 @@ members = [
     # outside `default-members` all the same -- linking a CUDA shell into a
     # sweep should be a choice, and that is the rule the siblings follow.
     "crates/driver-cuda",
-    # The baker executor's smoke: one decode step of a catalog SKU fired out
-    # of a `model_compiler::program::Program`, on a real GPU, against real
-    # weights. A member so it shares this lockfile; outside `default-members`
-    # because it links a CUDA shell, which is `driver-cuda`'s rule above.
-    "crates/baker-smoke",
-    # `driver-metal`, `driver-vulkan` and `driver-wgpu` STOOD HERE. They are
-    # out of the workspace entirely as of R3 -- not members, not path deps of
-    # any member, and named in `exclude` below so cargo cannot re-adopt them.
-    # See that note for why and for when they come back.
+    # `baker-smoke` STOOD HERE: one decode step of a catalog SKU fired out of
+    # a `model_compiler::program::Program`, on a real GPU, against real
+    # weights. It reached `kernels-cuda` DIRECTLY -- it named no `driver_cuda`
+    # symbol and did not depend on the crate -- so it was a second executor
+    # over one set of kernels, with its own pools, staging, binding and fire,
+    # 1,740 lines of it in one file. Two executors drift, and only one of them
+    # was ever measured against a checkpoint.
+    #
+    # What it alone held was the gate: three banked argmaxes, one of them
+    # gpt-oss-20b's, which no other test fired. That moved to
+    # `driver-cuda/tests/banked_argmaxes.rs`, where it runs through the shell
+    # that actually serves. `scripts/banked-argmaxes.sh` runs it.
+    # The Metal shell, BACK AT P5 with a baker executor. R3 put it in
+    # `exclude` and named the condition for its return -- "a `#[claims] impl`
+    # for its plane and a `Program` walk of its own" -- and it has both:
+    # `kernels-metal` claims 22 points across all 14 families, and
+    # `driver-metal/src/baker/` walks a `model_compiler::program::Program`
+    # through the dispatch generated from those claims.
+    #
+    # A MEMBER AND NOT A DEFAULT MEMBER, and the choice is measured rather
+    # than inherited. The crate's device half is gated behind `metal-4`, which
+    # `compile_error!`s off an Apple target, so a `cargo check --workspace`
+    # sweep on Linux compiles the PORTABLE half -- the executor, the layout
+    # arithmetic, the envelope -- and that half is green everywhere. What
+    # keeps it out of `default-members` is the rule its two siblings already
+    # follow: `driver-cuda` sits outside because linking a
+    # device shell into an unqualified `cargo test` should be a choice, and a
+    # crate whose serving half only exists on macOS is the same choice said
+    # louder. `cargo check -p driver-metal --all-targets` is what CI runs, and
+    # the macOS job adds `--features metal-4`.
+    "crates/driver-metal",
+    # The WebGPU shell, BACK AT P5b on the same terms. `kernels-wgpu` claims 21
+    # points across all 14 families and `driver-wgpu/src/baker/` walks a
+    # `model_compiler::program::Program` through the dispatch generated from
+    # them.
+    #
+    # A MEMBER AND NOT A DEFAULT MEMBER, and this one had the best case of the
+    # three for being a default member -- which is why the argument is written
+    # out rather than inherited.
+    #
+    # The case FOR: unlike `driver-cuda` (which links a CUDA shell) and
+    # `driver-metal` (whose device half `compile_error!`s off Apple), this
+    # crate's `default = []` pulls in NO GPU API at all. `wgpu` is behind
+    # `native`, so an unqualified `cargo test` would build `naga` and pure Rust
+    # and would link nothing -- and the half it would cover is the whole baker
+    # executor, since `Ctx` is `dyn Encode` and `baker/` names no `wgpu` type.
+    #
+    # The case AGAINST, which wins on two counts. The first is the rule its
+    # three siblings already follow, stated at `driver-cuda` above: linking --
+    # or in this case BUILDING -- a device shell into an unqualified sweep
+    # should be a choice. A reader who finds `driver-cuda` and
+    # `driver-metal` outside the list and `driver-wgpu` inside it has to
+    # discover that the difference is a feature default rather than a mistake,
+    # and a rule with one exception is a rule people stop trusting.
+    #
+    # The second is measured, and it makes the case FOR collapse. This crate's
+    # DEV-dependencies name `wgpu` unconditionally -- `tests/cooperative.rs`
+    # opens its own adapter and an integration test cannot reach a
+    # `[dependencies]` entry, so the edge is restated in `[dev-dependencies]`
+    # with no `optional`. `cargo tree -p driver-wgpu -e normal,dev` at DEFAULT
+    # features prints `wgpu v30.0.1` under it. A default member is a member of
+    # `cargo test`, `cargo test` builds test targets, and a test target links
+    # every dev-dependency -- so a sweep would carry the whole wgpu closure
+    # whatever `default = []` says, and the feature default does not buy what
+    # the case above claims for it.
+    #
+    # `cargo check -p driver-wgpu --all-targets` is what CI runs, and a machine
+    # with an adapter adds `--features native`.
+    "crates/driver-wgpu",
+    # `driver-vulkan` STOOD BESIDE THEM and is still out of the workspace
+    # entirely -- not a member, not a path dep of any member, and named in
+    # `exclude` below so cargo cannot re-adopt it. It comes back on the same
+    # terms these two did: an executor. `kernels-vulkan` carries 32 claims and
+    # that driver has no walk.
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
     # THE catalog, singular since R3 -- there were two registries here
@@ -119,8 +201,7 @@ members = [
     "crates/model-ir",
     # The authoring eDSL: typed weight handles, tape-carrying values, and the
     # backend-neutral role points (`kernels`) a model text states, which the
-    # planes answer with claims. `crates/model` is the reader it exists for;
-    # `baker-smoke` takes it to drive the same catalog on a real device, and
+    # planes answer with claims. `crates/model` is the reader it exists for and
     # `model-compiler` takes it as a DEV edge so its width table can be
     # measured against the shipping texts rather than a fixture.
     "crates/model-dsl",
@@ -152,6 +233,10 @@ members = [
     # about: a proc macro is a compiler plugin, so no `syn` reaches an
     # artifact and the "no dependencies" line still holds where it meant to.
     "crates/kernels-macros",
+    # The dispatch generator, restored as a tool. `kernels*` carries no tests
+    # any more, so the check that says three generated files are still a
+    # function of their claim tables has to live somewhere that may have one.
+    "crates/points-dispatch",
     # The JIT-native shape of the CUDA half: the table, the device sources
     # carried in the binary, and the runtime that NVRTC-compiles and fires
     # them. No CMake, no archive, no `links` key -- a kernel is text, so
@@ -259,6 +344,7 @@ default-members = [
     "crates/kernels-metal",
     "crates/kernels-vulkan",
     "crates/kernels-wgpu",
+    "crates/points-dispatch",
     "crates/tensor-ir",
     "crates/tensor-dsl",
     "crates/tensor-compiler",
@@ -267,27 +353,27 @@ default-members = [
     "tests/gpu",
 ]
 exclude = [
-    # ── THE SHADER PLANES ARE OUT OF THE WORKSPACE (R3) ────────────────────
+    # ── ONE SHADER PLANE IS STILL OUT OF THE WORKSPACE (R3) ────────────────
     #
     # `driver-metal`, `driver-vulkan` and `driver-wgpu` were the last
-    # consumers of `model-legacy` and `model_compiler::lower`, and R3 deletes
-    # both. They cannot be brought forward without their baker executors,
+    # consumers of `model-legacy` and `model_compiler::lower`, and R3 deleted
+    # both. They could not be brought forward without their baker executors,
     # which is P5 ("Shader planes — impl the families for metal/vulkan/wgpu
-    # Ctx; the tier-1 law's other half"), so they stay in tree and stay
+    # Ctx; the tier-1 law's other half"), so they stayed in tree and stayed
     # UNBUILT: no member path-depends on one, and `exclude` is what keeps
     # cargo from re-adopting them (a path dependency inside the workspace
     # directory becomes a member automatically, which is why deleting the
     # three `engine` dependency lines was the actual cut).
     #
+    # `driver-metal` CAME BACK at P5a and `driver-wgpu` at P5b, on exactly
+    # those terms — see their lines in `members`. `driver-vulkan` waits for the
+    # same thing: `kernels-vulkan` carries 32 claims and that driver has no
+    # walk.
+    #
     # `kernels-metal`, `kernels-vulkan` and `kernels-wgpu` are NOT here. They
     # compile green, they carry the claim tables P5 is measured against, and
     # nothing in them reads a legacy declaration.
-    #
-    # THEY COME BACK AT P5, as members and as default members, when each has a
-    # `#[claims] impl` for its plane and a `Program` walk of its own.
-    "crates/driver-metal",
     "crates/driver-vulkan",
-    "crates/driver-wgpu",
     "tests/inferlets",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
     # THIS manifest when cargo walks up from a worktree's excluded package

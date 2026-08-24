@@ -1,18 +1,17 @@
-# ── THIS MANIFEST DOES NOT RESOLVE, AND THAT IS THE QUARANTINE (R3) ─────
+# ── THIS MANIFEST RESOLVES AGAIN (P5b) ─────────────────────────────────
 #
-# `driver-wgpu` is in the root workspace's `exclude` list and no member
-# path-depends on it, because it was one of the last three consumers of
-# `model-legacy` and `model_compiler::lower` — both deleted. The
-# `model-legacy` edge below therefore points at a directory that is not
-# there.
+# R3 put `driver-wgpu` in the root workspace's `exclude` list and left this
+# file pointing at `../model-legacy`, a directory that was not there. The note
+# that stood here said why a dangling path was the honest state: the crate was
+# not being repaired, it was being REWRITTEN, and editing the line to a crate
+# the source could not use would have been "a manifest that resolves and a
+# build that does not, which is a worse lie than a dangling path."
 #
-# It is left standing rather than deleted because the crate is not being
-# repaired, it is being REWRITTEN: P5 ("Shader planes — impl the families for
-# metal/vulkan/wgpu Ctx") gives this driver a `#[claims] impl` for its plane
-# and a `Program` walk of its own, and what it will depend on then is
-# `crates/model`, exactly as `driver-cuda` does now. Editing the line to a
-# crate this source cannot use would be a manifest that resolves and a build
-# that does not, which is a worse lie than a dangling path.
+# The rewrite happened. P5b gave this driver `src/baker/` -- a `Program` walk
+# of its own through the dispatch generated from `kernels-wgpu`'s 21 claims --
+# so what it depends on now is `crates/model`, exactly as `driver-cuda` and
+# `driver-metal` do. Every legacy edge below is gone: `model-legacy`,
+# `model-dsl-legacy`, `model-loader` and `model_compiler::lower`.
 
 [package]
 name = "driver-wgpu"
@@ -42,26 +41,34 @@ path = "src/lib.rs"
 # sets `unsafe_code = "forbid"`, and they cannot keep it because every `ash`
 # entry point and every `objc2` message send is unsafe by construction.
 #
-# This crate CAN keep it, and `lib.rs` says so with `#![forbid(unsafe_code)]` --
-# `wgpu` is a safe API, so the whole crate is safe Rust including the device
-# half. The table is still restated by hand rather than taken whole, because
-# taking it would put the forbid in a manifest where a reader looking for the
-# crate's guarantees does not pass; the ratchets and the forbid belong next to
-# each other, in `lib.rs`, where the argument for them is.
+# This crate CAN keep it, and `lib.rs` says so -- `wgpu` is a safe API, so the
+# whole crate is safe Rust including the device half. The table is still
+# restated by hand rather than taken whole, because taking it would put the
+# ratchet in a manifest where a reader looking for the crate's guarantees does
+# not pass; the ratchets belong next to each other, in `lib.rs`, where the
+# argument for them is.
 
 [features]
 # No default, for the reason `driver-metal/Cargo.toml` states at length: a
 # default has to be turned OFF to reach the portable half, and a check that can
 # be skipped will be.
 #
-# The split is a THIRD one, and the difference is the point. `driver-metal`
-# splits on what a COMPILER will accept -- no Linux host can build an `objc2`
-# message send. `driver-vulkan` splits on what needs a GPU to be PRESENT, since
-# `ash` is a loader that builds anywhere. Here BOTH halves build anywhere AND
-# the shader front end runs anywhere: `naga` is Rust, so this crate parses the
-# WGSL it will dispatch, reads off its workgroup and its bindings, and checks
-# them against the row -- with no adapter, no driver and no SDK. `native` gates
-# only what needs an ADAPTER to answer.
+# The split is a THIRD one, and the difference is the point -- and P5b made it
+# sharper rather than softer. `driver-metal` splits on what a COMPILER will
+# accept: no Linux host can build an `objc2` message send, so its device half
+# is unreachable here and the portable half is all a Linux sweep can carry.
+# `driver-vulkan` splits on what needs a GPU to be PRESENT, since `ash` is a
+# loader that builds anywhere. Here BOTH halves build anywhere AND the shader
+# front end runs anywhere: `naga` is Rust, so this crate parses the WGSL it
+# will dispatch, reads off its workgroup and its bindings, and checks them
+# against the row -- with no adapter, no driver and no SDK. `native` gates only
+# what needs an ADAPTER to answer.
+#
+# What P5b added to that argument: the BAKER EXECUTOR is in the portable half.
+# `baker/` names no `wgpu` type at all -- `Ctx` is `dyn Encode`, so the walk,
+# the marks, the bound statement and the resolve pass are all checkable with no
+# adapter in the process. That is metal's design restated, and here it means a
+# featureless `cargo test -p driver-wgpu` covers the executor whole.
 default = []
 
 # The device half: `wgpu`, an adapter, a queue, real pipelines.
@@ -75,22 +82,47 @@ native = ["dep:wgpu"]
 # ignore a `-sys` crate.
 driver-api = { path = "../driver-api", default-features = false }
 
+# THE HALF OF THE BAKER EXECUTOR THAT IS NOT THIS PLANE: the walk over a
+# `Program`, the bound statement a generated dispatch reads, the frame's
+# numbering and the load-time resolve pass. `src/baker/plane.rs` is this
+# crate's answer to its two traits, and the five modules left in `src/baker/`
+# are the ones that MEASURABLY differ from `driver-metal`'s -- the region, the
+# staging, the views, and the two that plan a dispatch.
+#
+# It needs no adapter, no toolkit and no OS, so it is a workspace default
+# member and its tests run in an unqualified sweep. This crate's whole baker
+# executor is in the portable half for the same reason it is: `Ctx` is
+# `dyn Encode`, so nothing on that path names a `wgpu` type.
+
 # The launch vocabulary. `LaunchRule` is the same enum both siblings match on,
 # and that sharing is load-bearing rather than tidy: the three shells disagree
 # about the GRID and must not disagree about which rule a row names.
 kernels = { path = "../kernels" }
 
-# The WebGPU signature table, the launch ABI, and the WGSL sources themselves.
-# No feature to select: that crate has none, because WGSL is not a build
-# product. `entrypoint_source` is what `src/reflect.rs` parses, so the shader
-# tree is a dependency of the PORTABLE half here where `kernels-vulkan`'s `.spv`
-# tree is a dependency of a build script.
+# The WebGPU signature table, the launch ABI, the WGSL sources themselves --
+# and, since P5b, `points_dispatch`: the generated data->type crossing this
+# driver's walk fires every statement through. No feature to select: that crate
+# has none, because WGSL is not a build product. `entrypoint_source` is what
+# `src/reflect.rs` parses, so the shader tree is a dependency of the PORTABLE
+# half here where `kernels-vulkan`'s `.spv` tree is a dependency of a build
+# script.
 kernels-wgpu = { path = "../kernels-wgpu" }
 
-# The plan a driver executes: `Lowered`, `Launch`, `Arg`. `src/binding.rs`
-# turns those into bind-group entries, so this is a real dependency and not a
-# testing one -- the same shape both siblings have, for the same reason.
-# `model-ir` beside it for the traced form those name.
+# THE CATALOG, and the edge that replaced the quarantine. `src/baker/mod.rs`
+# reads a row (`model::serve::row`), traces it for THIS PLANE
+# (`model::trace_of(sku)(Backend::Wgpu)`), sizes the tower off the same plan
+# (`model::deployment::Deployment::of`) and produces the weights a plan names
+# (`model::produce`). This is `driver-metal`'s edge, taken for its reasons: one
+# catalog, and a driver that names a plane rather than observing a binding.
+model = { path = "../model" }
+
+# The plan a driver executes. `model_compiler::program::{Program, bound}` is
+# what `baker::Baked` holds a lane of and what `baker::walk` steps through;
+# `model-ir` beside it for the traced `Plan` those name.
+#
+# `model_compiler::lower` STOOD HERE and is deleted -- it was this crate's one
+# hard-broken edge at R3, and `src/binding.rs`, `src/dispatch.rs` and
+# `src/lowering/` reached it. The walk replaced all three readers.
 model-compiler = { path = "../model-compiler" }
 model-ir = { path = "../model-ir" }
 
@@ -146,34 +178,6 @@ wgpu = { version = "30", default-features = false, features = [
     "metal",
     "dx12",
 ] }
-# TEST-ONLY: `tests/arena.rs` states a declaration (`model_dsl::metal::
-# affine_gemm_point`) so the lowering under test is one the surface really
-# produces. `src/` reaches no authoring type, which is why this is a dev edge.
-model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
-# `tests/arena.rs` and `tests/checkpoint.rs`: real models to lower, so that the
-# offsets, the symbols and the scalar runs under test are the ones
-# `model-compiler` actually assigns rather than ones a test invented. Every
-# other test in this crate builds its `Lowered` by hand, which checks that the
-# binder agrees with the test.
-#
-# `default-features = false` drops `chat`, which is a tokenizer and three image
-# decoders no file here names. `contract` IS taken, and only
-# `tests/checkpoint.rs` needs it: that feature carries `catalog::identify`,
-# `contract::author` and `boot::compile_load_plan_for` -- the conversion from a
-# publisher's tensor names to the ones a plan states, which is the thing
-# `src/names.rs` claims to translate and which cannot be measured without
-# compiling a real contract against a real checkpoint. There is no `forward`
-# feature to ask for any more -- it was deleted, and the forward texts are
-# ungated. Dev-only, so `tests/pure.rs` (which drops dev kinds) is untouched by
-# it, and nothing in `src/` reads a checkpoint.
-model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
-
-# `tests/checkpoint.rs` only: the tensor names and extents a real snapshot
-# states, which is the one place a weight's SIZE exists -- `Arg::Weight`
-# carries a name and no width. A dev-dependency and not a real one on purpose,
-# the same way `driver-vulkan` takes it: a driver that depended on a checkpoint
-# FORMAT would be a driver that could not simply be handed bytes.
-model-loader = { path = "../model-loader" }
 
 # `tests/pure.rs` only: reading what `cargo metadata` says the resolver did, so
 # that "this crate is pure Rust" is asked of the closure rather than of a
@@ -181,6 +185,15 @@ model-loader = { path = "../model-loader" }
 # being pure Rust is the entire reason this backend exists beside CUDA and
 # Metal -- so the test that asks it is not optional furniture.
 serde_json = "1.0"
+
+# `model-legacy`, `model-dsl-legacy` AND `model-loader` STOOD HERE, and all
+# three left with the tests that named them. The first two are deleted crates
+# (R3). `model-loader` is alive and is deliberately NOT taken back:
+# `tests/checkpoint.rs` wanted it for a snapshot's tensor names and extents,
+# and `driver-metal` dropped the same edge at P5a for the reason that applies
+# here unchanged -- a driver that depended on a checkpoint FORMAT would be a
+# driver that could not simply be handed bytes. What a plan's params are is
+# `model::produce`'s answer now, and `baker::join` is where it is checked.
 
 # Neither an adapter nor a shader compiler: it asks the resolver what this
 # crate depends on. Ungated on purpose -- the constraint it checks is about the
@@ -214,16 +227,19 @@ name = "pure"
 name = "device"
 required-features = ["native"]
 
-# The one suite that needs a real MODEL and not only a real adapter: a
-# checkpoint's weights held under the names a plan binds, fired, and read back.
+# THE FIRST REAL SHADER-PLANE KERNEL FIRE (P5b), and it needs an adapter and
+# nothing else: no checkpoint, no catalog row, no lane. One claim body --
+# `norm.rmsnorm`, which this plane DOES claim -- driven through the generated
+# dispatch and the baker walk onto the L40S, and its output compared against a
+# host reference computed in f64. Same stanza and the same skip protocol as
+# `device` above.
 #
-# Same stanza as `device` above and for the same reasons, including the note
-# about landing together. What it adds is a SECOND thing that can be absent:
-# `device` skips when no adapter answers, and this skips when no adapter
-# answers OR no snapshot on this machine is the model it serves. A build box
-# has neither and says so on its way past.
+# It is a separate target from `device` because the question is a different
+# one. `device` asks whether this crate's device half works; this asks whether
+# the BAKER PATH does -- statement -> `BoundOp` -> generated dispatch -> claim
+# body -> `Encode::fire` -> a real WGSL dispatch -> numbers that are right.
 [[test]]
-name = "serving"
+name = "device_fire"
 required-features = ["native"]
 
 # The matrix unit, which this crate does not use and can. Same stanza and the
@@ -232,3 +248,10 @@ required-features = ["native"]
 [[test]]
 name = "cooperative"
 required-features = ["native"]
+
+# `[[test]] name = "serving"` STOOD HERE and left with its file. That suite
+# (6,227 lines, 9 of its 32 tests ignored) drove `turns::Serving` through a
+# `model_compiler::lower` lowering of a `model-legacy` forward plan -- three
+# deleted things in one sentence. `baker/` is what serves now, and what tests
+# it on a machine with no adapter is `the_walk_is_the_program`, which needs no
+# stanza because it needs no feature.

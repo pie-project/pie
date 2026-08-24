@@ -1,29 +1,12 @@
-//! Turning a lowering's operands into bind-group entries.
+//! Bind-group arithmetic: ranges, slots, and where a launch's scalars go.
 //!
-//! [`model_compiler::lower`] hands a driver a flat list of [`Arg`]s and says
-//! *"bind these"*. On Metal that is nearly free: `setBuffer:offset:` takes an
-//! address and a byte offset and no length at all, so `driver-metal`'s binder
-//! resolves each operand to its base plus its offset, reports the rest of the
-//! arena as the extent, and is done. The extent is not load-bearing there
-//! because nothing reads it.
-//!
-//! WebGPU has no such call. A `BufferBinding` is a buffer, an offset AND a
-//! size, and all three are validated. So this module has to answer a question
-//! Metal never asked: **how many bytes is this operand?**
-//!
-//! # The extent is in the plan, and it is exact
-//!
-//! It is `rows × width × bytes`: the launch states its row count, and the
-//! operand states its row width and its element size. Measured on the Vulkan
-//! side over every arena operand six real texts produce in both fire classes
-//! -- 14324 of them -- every extent lands inside the arena, and the tightest
-//! fit has **zero** bytes to spare. An operand ends exactly where the arena
-//! does.
-//!
-//! That zero is the useful part. It says the formula is not a lower bound that
-//! happens to be safe, it is the real extent: if it were an under-estimate the
-//! slack would never reach zero, and if it were an over-estimate it would have
-//! run past.
+//! A `BufferBinding` on WebGPU is a buffer, an offset AND a size, and all
+//! three are validated -- where Metal's `setBuffer:offset:` takes an address
+//! and a byte offset and no length at all. So this module answers a question
+//! Metal never asks: **how many bytes is this operand?** [`Bound`] is that
+//! answer once it is checked, [`Slot`] is what one of a module's binding
+//! positions holds, and [`descriptors`] lays a run of slots out against what
+//! the module declares.
 //!
 //! # Why the size matters more here than a length usually does
 //!
@@ -32,8 +15,8 @@
 //! after it, and a kernel indexing past its own rows would read or write a
 //! neighbour. WGSL requires an implementation to bounds-check every access
 //! against the BOUND range, so a real size confines a stray index -- and
-//! confines it to a zero rather than to a fault, which is why an operand bound
-//! too LONG is a silent wrong answer and not a crash.
+//! confines it to a zero rather than to a fault, which is why an operand
+//! bound too LONG is a silent wrong answer and not a crash.
 //!
 //! # The buffer type is not this module's, and how that is arranged
 //!
@@ -48,18 +31,54 @@
 //! newtype declared here because a newtype would either lose the handle -- and
 //! then the device half has to carry a side table from newtype to real buffer
 //! -- or hold one, and then this module is not portable after all. An
-//! associated type costs a generic parameter on five functions and buys a
-//! binder whose every offset, extent and refusal is checkable with
-//! [`Placeholder`] on a machine with no adapter.
+//! associated type costs a generic parameter and buys a binder whose every
+//! offset, extent and refusal is checkable with [`Placeholder`] on a machine
+//! with no adapter.
+//!
+//! # `extent`, `resolve`, `bind` and `params` STOOD HERE
+//!
+//! Four functions, and one deleted type behind all four.
+//! `model_compiler::lower` handed a driver a flat list of `Arg`s and a
+//! `Launch` naming a span of them, and these read that pair: `extent`
+//! measured an operand as `rows * width * bytes`, `resolve` turned one `Arg`
+//! into a [`Bound`], `bind` did every operand of one launch whole-or-not-at-
+//! all, and `params` sliced a `Lowered`'s scalar run for one launch and
+//! handed it to [`params_from`].
+//!
+//! The extent formula was exact rather than safe, and that was worth the
+//! measurement it took: over every arena operand six real texts produced in
+//! both fire classes -- 14324 of them -- every extent landed inside the arena
+//! and the tightest fit had **zero** bytes to spare. An under-estimate would
+//! never have reached zero and an over-estimate would have run past.
+//!
+//! `model_compiler::lower` is deleted, so all four have no statement to read.
+//! What is left is everything that was arithmetic over a BUFFER rather than
+//! over a plan: [`Bound::within`] still applies the same overrun and
+//! alignment rules, [`params_from`] still places a scalar run by what the
+//! MODULE declares, and [`descriptors`] still holds a row's slots against a
+//! module's bindings. A statement's operands reach them through the walk in
+//! `model_compiler::program` now.
+//!
+//! One thing went with `extent` and is not merely moved:
+//! `a_gathers_input_is_measured_by_its_output_and_that_is_the_open_defect`,
+//! a whole `mod gathers` holding one open defect in place. `extent` measured
+//! the rectangle a launch WRITES, and `row_gather` reads another -- its
+//! output is one row per sampled row and its input is the whole stream, both
+//! the same `Arg::Arena`-shaped operand. Narrowed to what it writes, the
+//! input bound one row and the shader read row 31 of the stream; WGSL clamps
+//! that to ZERO rather than faulting, so the gathered row was zeros, the lm
+//! head projected zeros, every logit came out equal and argmax returned the
+//! last index. Measured on a 32-row prefill of Qwen3-0.6B. Nothing here can
+//! reproduce it now -- there is no `Arg` to measure -- and whoever binds a
+//! gather's input on the walk owes the same oracle.
 //!
 //! # What this module does not do
 //!
-//! It resolves operands and places scalars. It does not create a bind group,
-//! allocate the uniform buffer or write it: those need a device, and the whole
-//! point of the split is that the arithmetic does not.
+//! It measures ranges and places scalars. It does not create a bind group,
+//! allocate the uniform buffer or write it: those need a device, and the
+//! whole point of the split is that the arithmetic does not.
 
-use model_compiler::lower::{Arg, Launch, Lowered};
-use model_ir::trace::ValueId;
+use model_ir::plan::ValueId;
 
 /// What binding needs to know about a device allocation.
 ///
@@ -320,9 +339,9 @@ impl<'a, B: Allocation> Bound<'a, B> {
 
 /// Where the operands this crate cannot resolve come from.
 ///
-/// Two of the three [`Arg`] kinds name something the plan does not hold: a
-/// weight by its trace name and a seam value by its id. Both are the driver's
-/// own tables, so both are asked for rather than looked up.
+/// Two of the three operand kinds a plan states name something the plan does
+/// not hold: a weight by its trace name and a seam value by its id. Both are
+/// the driver's own tables, so both are asked for rather than looked up.
 ///
 /// Takes `&self` rather than `&mut self` -- unlike the Metal one, which can
 /// return a copied address -- because a binding borrows the buffer it names,
@@ -501,281 +520,31 @@ pub enum FireTable {
     AttnScratch,
 }
 
-/// The marker a constant rides the weight-name slot under.
-///
-/// Transcribed from `driver-metal`: `dsl::cuda::scalar_mul` puts a scalar in an
-/// operand slot so the launch's arity holds, and states that no binder looks
-/// for it. Metal binds a zero-length region and calls that honest.
-///
-/// This backend cannot. `wgpu` refuses a zero-sized `BufferBinding` --
-/// [`Bound::within`] refuses it as an overrun -- so a slot under this prefix
-/// is one the caller must fill some other way, and saying so is the only
-/// correct answer. It is [`Unbindable::Constant`] rather than a silent empty
-/// range.
-const SCALE_PREFIX: &str = "scale.";
-
-/// Why an operand could not become a bind-group entry.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Unbindable {
-    /// A seam value whose rectangle is larger than the stand-in buffer.
-    PastSeam {
-        /// The value the plan named.
-        value: ValueId,
-        /// Bytes its rectangle covers.
-        extent: u64,
-        /// Bytes the stand-in holds.
-        seam: u64,
-    },
-    /// The plan places a raise and no shader plane binds one.
-    ///
-    /// Not "not yet": a raise is a HOST aggregate a routine body reads to fill
-    /// the block a kernel takes, and this plane's bodies read their parameters
-    /// out of a push range or a storage block. Nothing here has one to hold, so
-    /// a lowering that reached this arm states an operand for a backend that
-    /// cannot have it — a trace built for the wrong plane.
-    NotOnThisPlane {
-        /// The raise, by the word its `raise!` declared.
-        key: String,
-    },
-    /// An arena operand's rectangle runs past the arena the plan sized.
-    ///
-    /// Never seen in a real lowering -- and the tightest real operand ends
-    /// exactly AT the end, so a plan one row wider would land here.
-    PastArena {
-        /// Where in the arena the operand starts.
-        at: usize,
-        /// The rectangle it wanted: `rows × width × bytes`.
-        extent: u64,
-        /// What the plan said the arena holds.
-        arena: u64,
-    },
-    /// The plan names a weight the resolver does not hold.
-    UnknownWeight(
-        /// The name the plan stated.
-        String,
-    ),
-    /// The plan names a seam value the resolver does not bind.
-    UnknownNamed(
-        /// The value id the plan stated.
-        ValueId,
-    ),
-    /// The slot holds a dispatch constant, not a buffer.
-    ///
-    /// See `SCALE_PREFIX`. The refusal is the finding: there is no binding
-    /// that means "nothing" in WebGPU.
-    Constant(
-        /// The constant's name, with the `scale.` prefix removed.
-        String,
-    ),
-    /// The device cannot address the offset or extent this operand needs.
-    ///
-    /// Carries what [`Bound::within`] said, so an alignment failure and a
-    /// length failure stay distinguishable at the point they are reported.
-    Unaddressable(
-        /// What the range check said.
-        Unaddressable,
-    ),
-}
-
-impl std::fmt::Display for Unbindable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PastSeam {
-                value,
-                extent,
-                seam,
-            } => write!(
-                f,
-                "seam value {value:?} covers {extent} bytes and the stand-in holds {seam}"
-            ),
-            Self::PastArena { at, extent, arena } => {
-                write!(f, "{extent} bytes at {at} runs off an arena of {arena}")
-            }
-            Self::UnknownWeight(name) => write!(f, "no buffer holds the weight `{name}`"),
-            Self::UnknownNamed(value) => write!(f, "no buffer holds the named value {value}"),
-            Self::Constant(name) => {
-                write!(
-                    f,
-                    "`{name}` is a dispatch constant riding a weight slot, not a buffer"
-                )
-            }
-            Self::NotOnThisPlane { key } => write!(
-                f,
-                "the plan places the raise `{key}`, which no shader plane binds"
-            ),
-            Self::Unaddressable(why) => write!(f, "{why}"),
-        }
-    }
-}
-
-impl std::error::Error for Unbindable {}
-
-/// How many bytes one operand of this launch covers.
-///
-/// `None` only for a WEIGHT, whose extent is its tensor's and which the plan
-/// does not carry. Everything else states a rectangle and an element width,
-/// so everything else can be measured.
-///
-/// # It measures the rectangle the launch WRITES, and one kind of statement
-/// reads a different one
-///
-/// `launch.rows` is the output's row space. For every statement in this tree
-/// that is also the input's, so nothing has ever forced the two apart — and
-/// where they part, this is wrong and quietly so. See
-/// `a_gathers_input_is_measured_by_its_output_and_that_is_the_open_defect`,
-/// which pins the arithmetic and names what it costs.
-#[must_use]
-pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
-    match arg {
-        Arg::Arena { width, bytes, .. } => {
-            let rows = u64::from(launch.rows.end - launch.rows.start);
-            // Saturating rather than wrapping: a plan with an absurd width
-            // should produce a refusal below, not a small number that binds.
-            Some(
-                rows.saturating_mul(u64::from(*width))
-                    .saturating_mul(u64::from(*bytes)),
-            )
-        }
-        // A seam value states the same three things an arena operand does --
-        // rows from the launch, `width`, and `bytes` -- so it is measured the
-        // same way. It answered `None` here until `Arg::Named` carried
-        // `bytes`, which is what let a seam value bind a whole buffer without
-        // anyone asking whether the rectangle fit in it.
-        Arg::Named { width, bytes, .. } => {
-            let rows = u64::from(launch.rows.end - launch.rows.start);
-            Some(
-                rows.saturating_mul(u64::from(*width))
-                    .saturating_mul(u64::from(*bytes)),
-            )
-        }
-        // NO RECTANGLE TO MEASURE. A raise is a host aggregate the body
-        // reads whole; it has no rows, no width and no element size, which
-        // is why it is its own `Arg` and not a `Named` with zeros in it.
-        Arg::Raised { .. } => None,
-        Arg::Weight(_) => None,
-    }
-}
-
-/// Resolve one operand into a bind-group range.
-///
-/// `min_offset` is the device's `min_storage_buffer_offset_alignment`, which
-/// the range is checked against here rather than at encode time: an operand
-/// that cannot be addressed is a fact about the plan and the device together,
-/// and the earliest place both are known is here.
-///
-/// # Errors
-///
-/// [`Unbindable`], naming which of the rules could not be applied.
-pub fn resolve<'a, R: Resolve>(
-    arg: &Arg,
-    launch: &Launch,
-    arena: Arena<'a, R::Buffer>,
-    resolver: &'a R,
-    min_offset: u64,
-) -> Result<Bound<'a, R::Buffer>, Unbindable> {
-    match arg {
-        Arg::Arena { at, .. } => {
-            let extent = extent(arg, launch).expect("an arena operand states its rectangle");
-            let at64 = *at as u64;
-            // Checked before `Bound::within` so the refusal names the ARENA.
-            // The buffer may well be larger than the plan's arena, in which
-            // case `Bound::within` would accept a range the plan had no right
-            // to.
-            if at64.saturating_add(extent) > arena.bytes {
-                return Err(Unbindable::PastArena {
-                    at: *at,
-                    extent,
-                    arena: arena.bytes,
-                });
-            }
-            Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
-        }
-        // A raised operand never RESOLVES: the routine binder builds it into
-        // a host view (`lowering::views`) before any handle is minted for
-        // it, so an `Asked::Operand` carrying one is a statement and a
-        // signature that disagree, and the refusal names the word.
-        Arg::Raised { key, .. } => Err(Unbindable::NotOnThisPlane { key: key.clone() }),
-        Arg::Named { value, .. } => {
-            let held = resolver
-                .named(*value)
-                .ok_or(Unbindable::UnknownNamed(*value))?;
-            // THE STAND-IN IS A SIZE, AND IT WAS NEVER CHECKED.
-            //
-            // `Deployment::seam` is documented as "the stand-in buffer's size,
-            // which bounds the largest scalar block a fire can stage" -- a
-            // bound nothing enforced. `Bound::whole` binds the buffer however
-            // small it is, and WGSL bounds-checks every access against the
-            // BOUND range, so a rectangle larger than the seam reads ZEROS
-            // past the end. That is the same silent answer `Source::OutWidth`
-            // produced, arriving by a different door: a plausible tensor, a
-            // fire that succeeds, and a model that says something.
-            //
-            // The seam is 4 MiB by default and the values that ride it are
-            // small, so this refuses nothing the engine builds today. It is
-            // the deployment knob a caller may lower.
-            if let Some(extent) = extent(arg, launch)
-                && extent > held.size()
-            {
-                return Err(Unbindable::PastSeam {
-                    value: *value,
-                    extent,
-                    seam: held.size(),
-                });
-            }
-            Ok(Bound::whole(held))
-        }
-        Arg::Weight(name) => {
-            if let Some(rest) = name.strip_prefix(SCALE_PREFIX) {
-                return Err(Unbindable::Constant(rest.to_owned()));
-            }
-            resolver
-                .weight(name)
-                .map(Bound::whole)
-                .ok_or_else(|| Unbindable::UnknownWeight(name.clone()))
-        }
-    }
-}
-
-/// Resolve every operand of one launch, in the order the plan states them.
-///
-/// # Errors
-///
-/// The first [`Unbindable`] any operand produces, and the index of the operand
-/// that produced it. Nothing partial comes back: a dispatch with some ranges
-/// resolved is a dispatch that would read whatever the bind group happened to
-/// hold in the others, which on a reused group is the previous launch's
-/// operand and not garbage -- so it would look plausible.
-pub fn bind<'a, R: Resolve>(
-    lowered: &Lowered,
-    launch: &Launch,
-    arena: Arena<'a, R::Buffer>,
-    resolver: &'a R,
-    min_offset: u64,
-) -> Result<Vec<Bound<'a, R::Buffer>>, (usize, Unbindable)> {
-    let span = launch.args.start as usize..launch.args.end as usize;
-    let mut bound = Vec::with_capacity(span.len());
-    let covered = launch.rows.end - launch.rows.start;
-    for (i, arg) in lowered.args[span.clone()].iter().enumerate() {
-        // The same widening `lowering::routine::plan` does, for the same
-        // reason: an operand's row space is not always the launch's rectangle,
-        // and `Lowered::arg_rows` is where the lowering says so. Wider only --
-        // a count under the launch's would shrink an operand the launch is
-        // about to write, and catching that overrun is `extent`'s job.
-        let own = lowered.arg_rows.get(span.start + i).copied().unwrap_or(0);
-        let widened;
-        let against = if own > covered {
-            widened = Launch {
-                rows: launch.rows.start..launch.rows.start + own,
-                ..launch.clone()
-            };
-            &widened
-        } else {
-            launch
-        };
-        bound.push(resolve(arg, against, arena, resolver, min_offset).map_err(|e| (i, e))?);
-    }
-    Ok(bound)
-}
+// `const SCALE_PREFIX` AND `pub enum Unbindable` STOOD HERE, and both left
+// with `resolve`, which was the only thing that read one or raised the other.
+//
+// `Unbindable` was why an operand could not become a bind-group entry, in
+// seven variants: `PastSeam` (a seam value whose rectangle is larger than the
+// stand-in buffer), `NotOnThisPlane` (the plan places a RAISE, a host
+// aggregate a routine body reads whole, and no shader plane binds one),
+// `PastArena` (an arena operand's rectangle running past the arena the plan
+// sized -- never seen in a real lowering, and the tightest real operand ended
+// exactly AT the end, so a plan one row wider would have landed there),
+// `UnknownWeight` and `UnknownNamed` (a name the resolver does not hold),
+// `Unaddressable` (carrying what [`Bound::within`] said, so an alignment
+// failure and a length failure stayed distinguishable at the point they were
+// reported), and `Constant`.
+//
+// `Constant` is the one with a rule in it, and the rule outlives the enum.
+// `SCALE_PREFIX` was `"scale."`, the marker a dispatch CONSTANT rode the
+// weight-name slot under: `dsl::cuda::scalar_mul` put a scalar in an operand
+// slot so the launch's arity would hold, and stated that no binder looks for
+// it. Metal binds a zero-length region and calls that honest. **This backend
+// cannot**, because `wgpu` refuses a zero-sized `BufferBinding` --
+// [`Bound::within`] refuses it as an overrun -- so a slot under that prefix is
+// one the caller must fill some other way, and saying so is the only correct
+// answer. Whoever binds an operand next owes that refusal by name rather than
+// a silent empty range.
 
 /// What one of a module's binding slots holds.
 ///
@@ -940,8 +709,10 @@ impl<B: Allocation> PartialEq for Slot<'_, B> {
 // `driver-metal` and `driver-vulkan` deleted their equivalents first. Vulkan
 // took `binding::{reorder, scalars, descriptors, runs, is_buffer_kind, Runs}`
 // and the nine unit tests that only exercised them, leaving `extent`,
-// `resolve`, `bind`, `params` and `params_from` -- which, `descriptors` and
-// `Slot` aside, is exactly what remains here.
+// `resolve`, `bind`, `params` and `params_from`. This file has since gone
+// further than either: those first four read a `model_compiler::lower`
+// statement and left with it, and `params_from` -- with `descriptors` and
+// `Slot` -- is what remains.
 
 /// Which bind-group slot a launch's parameter buffer goes in.
 ///
@@ -1086,26 +857,6 @@ impl core::fmt::Display for Misplaced {
 
 impl core::error::Error for Misplaced {}
 
-/// Place one launch's scalars the way its module wants them.
-///
-/// The MODULE's reading of where the plan's own scalar run goes, and the only
-/// reading left: the row that used to place its own is retired above
-/// [`ParamSlot`], and a routine's scalars are packed and placed by
-/// [`crate::lowering::routine::bind`].
-///
-/// # Errors
-///
-/// [`Misplaced::Count`] when neither of the module's two shapes can hold what
-/// the plan states.
-pub fn params(
-    lowered: &Lowered,
-    launch: &Launch,
-    declared: &crate::reflect::Declared,
-) -> Result<Params, Misplaced> {
-    let stated = &lowered.params[launch.params.start as usize..launch.params.end as usize];
-    params_from(stated, declared)
-}
-
 /// A run of `u32` as little-endian bytes.
 fn words(run: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(run.len() * 4);
@@ -1117,9 +868,21 @@ fn words(run: &[u32]) -> Vec<u8> {
 
 /// Place a run of scalar words by what the MODULE declares.
 ///
-/// The reflection's answer rather than the row's, which is what an unstated row
-/// needs -- and what a stated row falls back to when it names no `Buf` param.
-fn params_from(stated: &[u32], declared: &crate::reflect::Declared) -> Result<Params, Misplaced> {
+/// The reflection's answer rather than a row's, which is what an unstated row
+/// needed -- and what a stated row fell back to when it named no `Buf` param.
+/// It is the only reading left: `params`, which sliced one launch's run out of
+/// a `Lowered` and called this, went with the statement it sliced, and
+/// `lowering::routine::bind`, which packed and placed a routine's scalars,
+/// STOOD in a module this crate no longer has.
+///
+/// # Errors
+///
+/// [`Misplaced::Count`] when neither of the module's two shapes can hold what
+/// the caller states.
+pub fn params_from(
+    stated: &[u32],
+    declared: &crate::reflect::Declared,
+) -> Result<Params, Misplaced> {
     // Asked in this order because the uniform block is the stronger claim: it
     // is the ABI's own home for a scalar run, and a module that declares one of
     // the right width is not also hiding a parameter struct.
@@ -1314,352 +1077,12 @@ pub fn descriptors<'a, B: Allocation>(
 }
 
 #[cfg(test)]
-mod gathers {
-    use super::extent;
-    use model_compiler::lower::{Arg, Launch};
-
-    /// A launch over `rows` rows, with nothing else stated.
-    fn over(rows: u32) -> Launch {
-        Launch {
-            kernel: 0,
-            rows: 0..rows,
-            layers: 0..1,
-            op: 0,
-            args: 0..0,
-            params: 0..0,
-            peel: None,
-            cond: Launch::NO_COND,
-        }
-    }
-
-    /// [`extent`] measures the OUTPUT's rectangle, and a gather reads another.
-    ///
-    /// This is the open half of the lm-head fix, pinned so the diagnosis in
-    /// `turns.rs` cannot rot into prose nobody checks — and so that whoever
-    /// closes it has an oracle that fails when they do.
-    ///
-    /// `row_gather` compacts the rows a fire samples: its OUTPUT is one row
-    /// per sampled row and its INPUT is the whole stream. Both are the same
-    /// `Arg::Arena`-shaped operand, and this measures both by `launch.rows`.
-    /// So the moment the launch is narrowed to what it writes — which is the
-    /// point of narrowing it — the input binds one row and the shader reads
-    /// row 31 of the stream. WGSL clamps that to ZERO rather than faulting, so
-    /// the gathered row is zeros, the lm head projects zeros, every logit is
-    /// equal, and argmax returns the last index.
-    ///
-    /// Measured on a 32-row prefill of Qwen3-0.6B sampling row 31: the input
-    /// wanted 32 * 1024 * 2 bytes and was bound 1 * 1024 * 2.
-    ///
-    /// `KernelSig::whole` is NOT the signal, which is the obvious first guess:
-    /// it means the kernel refuses a row SPLIT inside a peel's regions, which
-    /// is a different question. Nothing in `Arg::Arena` carries a row count of
-    /// its own, so the driver cannot state this locally — the lowering has to.
-    #[test]
-    fn a_gathers_input_is_measured_by_its_output_and_that_is_the_open_defect() {
-        let row = Arg::Arena {
-            at: 65536,
-            width: 1024,
-            bytes: 2,
-        };
-
-        // What the gather's OUTPUT wants when the launch is narrowed: one row.
-        assert_eq!(extent(&row, &over(1)), Some(1024 * 2));
-        // And what its INPUT needs over the same launch: the whole stream.
-        // The two are the same call, so today they cannot differ.
-        assert_eq!(extent(&row, &over(32)), Some(32 * 1024 * 2));
-        assert_ne!(
-            extent(&row, &over(1)),
-            extent(&row, &over(32)),
-            "if these ever agree this test is measuring nothing"
-        );
-
-        // The consequence, as arithmetic: bound one row, the shader's read of
-        // row 31 is 63488 bytes past the end of its binding.
-        let bound = extent(&row, &over(1)).expect("an arena operand measures");
-        let wants = u64::from(31u32) * 1024 * 2;
-        assert!(
-            wants >= bound,
-            "row 31 is inside a one-row binding, so the defect this pins is \
-             gone and the test should be rewritten as the fix's oracle"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
 
     /// A buffer this test can name without an adapter.
     fn buffer(bytes: u64) -> Placeholder {
         Placeholder(bytes)
-    }
-
-    #[derive(Default)]
-    struct Store {
-        weights: BTreeMap<String, Placeholder>,
-        named: BTreeMap<ValueId, Placeholder>,
-    }
-
-    impl Resolve for Store {
-        type Buffer = Placeholder;
-        fn weight(&self, name: &str) -> Option<&Placeholder> {
-            self.weights.get(name)
-        }
-        fn named(&self, value: ValueId) -> Option<&Placeholder> {
-            self.named.get(&value)
-        }
-    }
-
-    /// A launch over `rows` rows with `n` operands starting at zero.
-    fn launch(rows: u32, n: u32) -> Launch {
-        Launch {
-            kernel: 0,
-            rows: 0..rows,
-            layers: 0..1,
-            op: 0,
-            args: 0..n,
-            params: 0..0,
-            peel: None,
-            cond: 0,
-        }
-    }
-
-    /// A seam value of the stated element width, at value id zero.
-    fn seam(width: u32, bytes: u32) -> Arg {
-        named(0, width, bytes)
-    }
-
-    /// A seam value, by id.
-    fn named(value: u32, width: u32, bytes: u32) -> Arg {
-        Arg::Named {
-            value,
-            width,
-            bytes,
-        }
-    }
-
-    #[test]
-    fn an_arena_operands_extent_is_its_rectangle_and_not_one_row() {
-        let arg = Arg::Arena {
-            at: 0,
-            width: 128,
-            bytes: 2,
-        };
-        // The distinction Metal never had to draw: one row is 256 bytes, and a
-        // 64-row prefill launch of the same operand covers 64 times that.
-        assert_eq!(extent(&arg, &launch(1, 1)), Some(256));
-        assert_eq!(extent(&arg, &launch(64, 1)), Some(64 * 256));
-    }
-
-    /// A weight has no rectangle; a SEAM VALUE has one, and states it.
-    ///
-    /// This asserted that neither did, and the seam half was wrong. A weight
-    /// genuinely has none -- its extent is the tensor's, which the plan does
-    /// not carry -- but `Arg::Named` states the same three things
-    /// `Arg::Arena` does. Answering `None` there is what let a seam value
-    /// bind a stand-in buffer without anyone asking whether the rectangle
-    /// fits in it, and WGSL bounds-checking then reads ZEROS past the end.
-    ///
-    /// The four-byte case is asserted because it is the one a driver has
-    /// MEASURED, and because it is the case a plausible shortcut gets wrong.
-    /// `Arg::Named` carried no `bytes` until this change, so the obvious
-    /// reading was "two, like every activation" -- and `driver-vulkan`
-    /// records the real one as a four-row gather over a one-entry `u32`
-    /// table, *"a sixteen-byte read of a four-byte buffer"*. A two-byte
-    /// assumption calls that rectangle eight bytes, fits it in four, and
-    /// reports nothing.
-    #[test]
-    fn a_weight_has_no_rectangle_and_a_seam_value_does() {
-        assert_eq!(extent(&Arg::Weight("w".into()), &launch(1, 1)), None);
-        assert_eq!(
-            extent(&seam(8, 2), &launch(1, 1)),
-            Some(16),
-            "one row of eight bf16 elements"
-        );
-        assert_eq!(
-            extent(&seam(8, 2), &launch(64, 1)),
-            Some(64 * 16),
-            "the rows are the launch's, as for an arena operand"
-        );
-        assert_eq!(
-            extent(&seam(1, 4), &launch(4, 1)),
-            Some(16),
-            "the vulkan case: four u32 rows are sixteen bytes, not eight"
-        );
-    }
-
-    /// A seam value larger than the stand-in is refused, not bound short.
-    ///
-    /// `Deployment::seam` is documented as "the stand-in buffer's size, which
-    /// bounds the largest scalar block a fire can stage" -- and nothing
-    /// enforced the bound. `Bound::whole` binds the buffer however small it
-    /// is, and a rectangle past its end reads zeros: a plausible tensor, a
-    /// fire that succeeds, and a model that says something.
-    ///
-    /// The control is the first assertion: a value that FITS still binds
-    /// whole, so this is about the size and not about the path.
-    #[test]
-    fn a_seam_value_larger_than_the_stand_in_is_refused() {
-        let stand_in = buffer(256);
-        let store = Store {
-            named: [(0u32, stand_in)].into_iter().collect(),
-            ..Store::default()
-        };
-        let arena_buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &arena_buf,
-            bytes: 1 << 20,
-        };
-        // 8 elements x 2 bytes x 16 rows = 256, exactly what the stand-in
-        // holds.
-        let fits = seam(8, 2);
-        assert!(
-            resolve(&fits, &launch(16, 1), arena, &store, 1).is_ok(),
-            "a rectangle the stand-in holds must still bind whole"
-        );
-        // One row more is one row past it.
-        let over = resolve(&fits, &launch(17, 1), arena, &store, 1)
-            .expect_err("a rectangle past the stand-in is not bound short");
-        assert!(
-            matches!(over, Unbindable::PastSeam { .. }),
-            "the refusal names the seam: {over:?}"
-        );
-        // And the width is READ, not assumed: the same rectangle in four-byte
-        // elements is twice the bytes and does not fit. This is the assertion
-        // that fails if `extent` goes back to multiplying by two.
-        let wide = resolve(&seam(8, 4), &launch(16, 1), arena, &store, 1)
-            .expect_err("four-byte elements are twice the bytes");
-        assert!(
-            matches!(wide, Unbindable::PastSeam { .. }),
-            "the element width is read from the plan: {wide:?}"
-        );
-    }
-
-    #[test]
-    fn an_arena_operand_is_bound_at_its_offset_for_its_rectangle() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let arg = Arg::Arena {
-            at: 512,
-            width: 64,
-            bytes: 2,
-        };
-        let store = Store::default();
-        let b = resolve(&arg, &launch(4, 1), arena, &store, 256).expect("bindable");
-        assert_eq!(b.offset(), 512);
-        // Four rows of 64 elements at 2 bytes -- NOT the 512 one row would
-        // give, and not the rest of the arena a whole-buffer binding would.
-        assert_eq!(b.len(), 512);
-        assert!(!b.is_empty());
-        assert_eq!(b.buffer(), &buf);
-    }
-
-    #[test]
-    fn an_operand_whose_rectangle_runs_past_the_arena_is_refused() {
-        let buf = buffer(1 << 20);
-        // The buffer is a megabyte; the PLAN said the arena is 1024 bytes. The
-        // refusal has to come from the plan's number, or a driver holding a
-        // generously sized arena would accept an operand that addresses another
-        // fire's bytes.
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1024,
-        };
-        let arg = Arg::Arena {
-            at: 768,
-            width: 64,
-            bytes: 2,
-        };
-        let err =
-            resolve(&arg, &launch(4, 1), arena, &Store::default(), 256).expect_err("runs past");
-        assert_eq!(
-            err,
-            Unbindable::PastArena {
-                at: 768,
-                extent: 512,
-                arena: 1024
-            }
-        );
-    }
-
-    /// A raise is refused BY NAME, because this plane has nothing to hold it.
-    ///
-    /// # Not "not yet"
-    ///
-    /// `Arg::Raised` is a HOST aggregate -- a routine body reads one to fill
-    /// the block a kernel takes -- and on this plane a body reads its
-    /// parameters out of a push range or a `@group(1)` uniform. There is no
-    /// binding for a raise to become, so a lowering that places one was built
-    /// for a different backend, and the refusal says which word it was.
-    ///
-    /// Written because `every_refusal_this_crate_builds_is_one_a_test_names`
-    /// found this variant in the crate and in nothing that asserts it, which
-    /// is the state where a condition can be inverted with every suite still
-    /// green. The alternative was a line in that test's `UNNAMED` list; a
-    /// refusal one call reaches does not need one.
-    #[test]
-    fn a_raise_is_refused_because_no_shader_plane_here_binds_one() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let arg = Arg::Raised {
-            value: 0,
-            key: "gdn_core".to_string(),
-        };
-        let err = resolve(&arg, &launch(1, 1), arena, &Store::default(), 256).expect_err("a raise");
-        assert_eq!(
-            err,
-            Unbindable::NotOnThisPlane {
-                key: "gdn_core".to_string()
-            },
-            "the refusal carries the word the `raise!` declared, so a trace \
-             built for the wrong plane says which operand gave it away"
-        );
-    }
-
-    /// A misaligned offset is refused BY NAME and never rounded.
-    ///
-    /// 260 is inside the arena and a multiple of 4, so the plan is content and
-    /// Metal would be too. WebGPU's guaranteed
-    /// `min_storage_buffer_offset_alignment` is 256, and `wgpu` answers a
-    /// binding that does not divide it with a validation failure inside the
-    /// encoder -- which is a panic naming a number, not a launch.
-    #[test]
-    fn an_operand_the_device_cannot_address_from_is_refused_as_such() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let arg = Arg::Arena {
-            at: 260,
-            width: 64,
-            bytes: 2,
-        };
-        let err = resolve(
-            &arg,
-            &launch(1, 1),
-            arena,
-            &Store::default(),
-            u64::from(crate::facts::GUARANTEED_STORAGE_ALIGNMENT),
-        )
-        .expect_err("misaligned");
-        assert_eq!(
-            err,
-            Unbindable::Unaddressable(Unaddressable::Unaligned {
-                offset: 260,
-                alignment: 256
-            }),
-            "an offset the device cannot use is not the same refusal as one the \
-             plan oversized"
-        );
     }
 
     /// A zero-length range is an overrun and not an empty binding.
@@ -1686,147 +1109,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_weight_and_a_seam_value_come_from_the_resolver_whole() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let mut store = Store::default();
-        store.weights.insert("layer.3.q_proj".into(), buffer(4096));
-        store.named.insert(7, buffer(64));
-
-        let w = resolve(
-            &Arg::Weight("layer.3.q_proj".into()),
-            &launch(1, 1),
-            arena,
-            &store,
-            256,
-        )
-        .expect("held");
-        // Whole, because the plan does not state a weight's extent and the
-        // tensor's own size is the right answer.
-        assert_eq!((w.offset(), w.len()), (0, 4096));
-
-        let n = resolve(&named(7, 8, 2), &launch(1, 1), arena, &store, 256).expect("bound");
-        assert_eq!((n.offset(), n.len()), (0, 64));
-    }
-
-    #[test]
-    fn a_name_the_resolver_does_not_hold_is_named_in_the_refusal() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let store = Store::default();
-        assert_eq!(
-            resolve(
-                &Arg::Weight("layer.3.q_proj".into()),
-                &launch(1, 1),
-                arena,
-                &store,
-                256
-            )
-            .expect_err("not held"),
-            Unbindable::UnknownWeight("layer.3.q_proj".into())
-        );
-        assert_eq!(
-            resolve(&named(7, 8, 2), &launch(1, 1), arena, &store, 256).expect_err("not bound"),
-            Unbindable::UnknownNamed(7)
-        );
-    }
-
-    /// The one place this backend must refuse where Metal proceeds.
-    #[test]
-    fn a_slot_holding_a_dispatch_constant_cannot_be_a_range_on_this_backend() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        // Metal binds `{address: 0, bytes: 0}` here and calls it honest,
-        // because a zero-length Metal binding is legal and unread. WebGPU has
-        // no such binding, so the honest answer is a refusal that says which
-        // constant the caller still owes.
-        assert_eq!(
-            resolve(
-                &Arg::Weight("scale.rope_theta".into()),
-                &launch(1, 1),
-                arena,
-                &Store::default(),
-                256
-            )
-            .expect_err("a constant is not a range"),
-            Unbindable::Constant("rope_theta".into())
-        );
-    }
-
-    #[test]
-    fn a_launch_binds_whole_or_not_at_all() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let mut store = Store::default();
-        store.weights.insert("held".into(), buffer(64));
-        let lowered = lowered(vec![
-            Arg::Arena {
-                at: 0,
-                width: 8,
-                bytes: 2,
-            },
-            Arg::Weight("held".into()),
-            Arg::Weight("absent".into()),
-        ]);
-
-        let (i, err) =
-            bind(&lowered, &launch(1, 3), arena, &store, 256).expect_err("one is absent");
-        // The index is reported because a refusal that only names the weight
-        // cannot say WHICH slot the dispatch was going to leave stale.
-        assert_eq!(i, 2);
-        assert_eq!(err, Unbindable::UnknownWeight("absent".into()));
-
-        // The same launch minus the absent operand binds all of what remains.
-        assert_eq!(
-            bind(&lowered, &launch(1, 2), arena, &store, 256)
-                .expect("both held")
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn operands_come_back_in_the_order_the_plan_states_them() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        // Three arena operands at distinguishable offsets, all multiples of the
-        // guaranteed 256. Bind-group entries are positional, so an order this
-        // crate rearranged would hand every kernel its inputs shuffled and no
-        // test of one operand would notice.
-        let lowered = lowered(
-            [1024usize, 256, 2048]
-                .into_iter()
-                .map(|at| Arg::Arena {
-                    at,
-                    width: 8,
-                    bytes: 2,
-                })
-                .collect(),
-        );
-        let store = Store::default();
-        let bound = bind(&lowered, &launch(1, 3), arena, &store, 256).expect("bindable");
-        assert_eq!(
-            bound.iter().map(Bound::offset).collect::<Vec<_>>(),
-            [1024, 256, 2048]
-        );
-    }
-
     /// A module declaring a uniform block at the given offsets and `@group(0)`
     /// blocks of the given sizes.
     fn declared(uniform: &[u32], blocks: &[Option<u32>]) -> crate::reflect::Declared {
@@ -1846,27 +1128,13 @@ mod tests {
         }
     }
 
-    /// A `Lowered` whose only content is the scalars under test.
-    fn with_params(words: Vec<u32>) -> Lowered {
-        let mut low = lowered(Vec::new());
-        low.params = words;
-        low
-    }
-
-    fn scalar_launch(n: u32) -> Launch {
-        let mut l = launch(1, 0);
-        l.params = 0..n;
-        l
-    }
-
     #[test]
     fn scalars_the_uniform_block_holds_go_at_the_offsets_the_shader_declares() {
-        let low = with_params(vec![7, 9]);
         // The gap is the point. Packed end to end these would be at 0 and 4;
         // the shader says 0 and 8 -- which is what a `vec2<u32>` after an `i32`
         // gives -- and a driver that packed them would hand the second member's
         // value to whatever sits at 4.
-        let got = params(&low, &scalar_launch(2), &declared(&[0, 8], &[None])).expect("placed");
+        let got = params_from(&[7, 9], &declared(&[0, 8], &[None])).expect("placed");
         assert_eq!(
             got,
             Params::Block {
@@ -1881,16 +1149,10 @@ mod tests {
 
     #[test]
     fn scalars_a_storage_struct_holds_go_to_the_binding_whose_size_matches() {
-        let low = with_params(vec![1, 2, 3]);
         // Three scalars is twelve bytes, and the module declares a 12-byte
         // block at binding 1 -- with an operand after it, which is why the
         // position cannot be derived from the operand count.
-        let got = params(
-            &low,
-            &scalar_launch(3),
-            &declared(&[], &[None, Some(12), None]),
-        )
-        .expect("placed");
+        let got = params_from(&[1, 2, 3], &declared(&[], &[None, Some(12), None])).expect("placed");
         assert_eq!(
             got,
             Params::Block {
@@ -1901,27 +1163,21 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_with_no_scalars_and_a_module_with_no_block_place_nothing() {
-        let low = with_params(Vec::new());
+    fn no_scalars_and_a_module_with_no_block_place_nothing() {
         assert_eq!(
-            params(&low, &scalar_launch(0), &declared(&[], &[None])).expect("placed"),
+            params_from(&[], &declared(&[], &[None])).expect("placed"),
             Params::None
         );
     }
 
     #[test]
     fn scalars_neither_shape_can_hold_are_refused_rather_than_truncated() {
-        let low = with_params(vec![1, 2, 3, 4]);
         // Four scalars; the uniform block holds two and the only sized storage
         // block is twelve bytes. Writing two and leaving the shader to read
         // four is the defect with no symptom -- WGSL's bounds checking returns
         // zeros -- so it has to be a refusal.
-        let err = params(
-            &low,
-            &scalar_launch(4),
-            &declared(&[0, 4], &[None, Some(12)]),
-        )
-        .expect_err("neither fits");
+        let err = params_from(&[1, 2, 3, 4], &declared(&[0, 4], &[None, Some(12)]))
+            .expect_err("neither fits");
         assert_eq!(
             err,
             Misplaced::Count {
@@ -1942,8 +1198,7 @@ mod tests {
     /// member at offset 12 needs a 16-byte buffer, not a 4-byte one.
     #[test]
     fn a_block_with_a_hole_before_its_member_is_not_written_short() {
-        let low = with_params(vec![5]);
-        let got = params(&low, &scalar_launch(1), &declared(&[12], &[None])).expect("placed");
+        let got = params_from(&[5], &declared(&[12], &[None])).expect("placed");
         assert_eq!(
             got,
             Params::Block {
@@ -2066,31 +1321,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    /// A `Lowered` holding nothing but the operands under test.
-    fn lowered(args: Vec<Arg>) -> Lowered {
-        Lowered {
-            // A hand-built lowering states no per-argument rows; zero is "no opinion".
-            arg_rows: Vec::new(),
-            launches: Vec::new(),
-            kernels: Vec::new(),
-            rectangles: 0,
-            arena_bytes: 0,
-            value_offset: Vec::new(),
-            value_owner: Vec::new(),
-            epilogue_gather: usize::MAX,
-            epilogue_norm: usize::MAX,
-            args,
-            structural: Vec::new(),
-            residue: Vec::new(),
-            params: Vec::new(),
-            n_requests: 0,
-            conds: Vec::new(),
-            // A fixture states no attention schedule to raise.
-            preps: Vec::new(),
-            readout: None,
-        }
     }
 }
 

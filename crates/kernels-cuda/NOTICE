@@ -365,157 +365,37 @@ for an unrelated reason (see the XQA section below) and simply gained the new
 prefix. No FlashInfer file contains a changed directive.
 
 
-XQA (NVIDIA), via FlashInfer
-----------------------------
+XQA (NVIDIA), via FlashInfer -- NO LONGER REDISTRIBUTED
+-------------------------------------------------------
 
-    Project:    XQA -- cross/multi-query attention decode kernels
-    Upstream:   https://github.com/flashinfer-ai/flashinfer, csrc/xqa/
-                (NVIDIA-authored; the files themselves speak of matching the
-                TRT-LLM API, and FlashInfer redistributes them under its own
-                Apache-2.0 tree)
-    Version:    v0.6.15 -- the same CPM checkout as above
+    Directory:  kernels/xqa/                           DELETED
     Licence:    Apache License 2.0
     Copyright:  SPDX-FileCopyrightText: Copyright (c) 2023-2025 and
                 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-    Located at: kernels/xqa/
-    Licence at: kernels/xqa/LICENSE
 
-This section is new. The XQA text has been in the tree since the XQA lattice
-landed and its `LICENSE` came with it, but no NOTICE entry named it -- the
-document described FlashInfer's `include/flashinfer/` closure and stopped
-there, and `csrc/xqa/` is a different directory of the same checkout that
-arrived by a different route. Redistributing Apache-2.0 source obliges us to
-carry the licence and say what we changed; the licence was carried, the saying
-was missing. It is below.
+This entry is kept as a record, not as an attribution: nothing under
+`kernels/xqa/` is redistributed by this crate any more. Fourteen files and
+6,977 lines went, together with `kernels/xqa/LICENSE`, the three PIE files
+that were the only things reaching them -- `attn/attention_xqa.cuh`,
+`attn/attention_xqa_mha.cuh` and their two `CONFIGURED` rows -- and the Rust
+lattice above them, `src/attn/xqa.rs`.
 
-### What is carried
+They went for the reason the FP16 header went: measured, not assumed. The
+XQA lattice's whole Rust surface -- `XqaVariant`, `XqaIoHead`, `XQA_ROOTS`,
+`decode_supported` -- had ZERO readers outside its own file, and the twelve
+`XqaIoHead` variants were constructed nowhere at all. `pub` is not
+reachability, and `dead_code` does not fire on a `pub` item in a lib crate,
+so the compiler had nothing to say about 476 lines of Rust holding 7,733
+lines of vendored CUDA past the reachability guard. The guard passed because
+the guard checked whether a file was NAMED, and a `Root::new` literal that
+nothing reads still names one. `tests/every_source_is_reached.rs` gained a
+fourth test, at entry-point granularity, for exactly that gap.
 
-Fourteen files, 6,977 lines, 265,152 bytes:
-
-    barriers.cuh   defines.h     mha.h        mha_stdheaders.cuh   platform.h
-    cuda_hint.cuh  ldgsts.cuh    mhaUtils.cuh mma.cuh              specDec.h
-    mha.cuh        mha_components.cuh         utils.cuh            utils.h
-
-It was fifteen. `hostUtils.h` was deleted -- see "What was changed" below --
-and the counts above are the tree as it now stands, re-derived rather than
-adjusted. Two earlier figures were wrong and both are worth keeping, because
-they failed the same way. `274,966 bytes` was 36 bytes under the truth for the
-fifteen-file tree it described; nothing had a second derivation to disagree
-with it. `265,143 bytes` was 4 bytes over the truth for THIS tree, and it went
-stale for a better reason than a bad measurement -- a later commit edited one
-line of `mha.cuh` and no count was re-run. That edit is the fourth bullet
-under "What was changed" below.
-
-The byte figure counts OUR `// PIE:` prose along with upstream's text, so it
-moves whenever a marker is reworded and not only when code changes -- it went
-265,139 to 265,152 when `mha.cuh`'s header note was corrected to admit the
-edit above. The LINE figure is the stabler of the two and is the one a marker
-is written to preserve: a marker added on its own line shifts every `mha.cu:N`
-citation below it, which is why the `AccType{}` change carries none. Re-derive
-both with
-
-    find kernels/xqa -type f ! -name LICENSE -exec cat {} + | wc -lc
-
-Not carried, and deliberately: `gmma.cuh`, `gmma_impl.cuh`, `mha_sm90.cu`,
-`mla_sm120.cu`, `mla_sm120.cuh`, `tensorMap.cpp`, `tensorMap.h`, `tma.h`,
-`xqa_wrapper.cu`. The first five are sm_90/sm_120 TMA and GMMA paths this
-crate does not build; the rest are host code -- a `.cpp` and a `.cu` wrapper
-whose job (tensor-map construction, kernel launch) is Rust's here, in
-`driver-cuda/src/fire/xqa.rs`.
-
-### What was changed
-
-**Four of the fourteen files differ from upstream at all; the other ten are
-byte-identical.** Those four are `mha.cuh`, `mha_components.cuh`,
-`mhaUtils.cuh` and `utils.h`.
-
-  * `mha.cu` is carried as **`mha.cuh`**. It is a rename and nothing else.
-    This crate holds no translation units -- a `.cu` is an ahead-of-time TU
-    for nvcc and there is no nvcc here -- and the rename is free because
-    nothing includes it by its upstream name. Every `mha.cu:N` citation in
-    this repo is against upstream; `mha.cuh:N` means our copy. The file's own
-    header note gives the offset both ways and it is arithmetic, not memory:
-    upstream `mha.cu` is 3,051 lines, this file is 2,853, and the note names
-    the two insertions above every live citation -- its own 23 lines at `:18`
-    and a 3-line include marker at upstream `:28`, so upstream `:409` is
-    `:435` here and `:2757` is `:2783`. (This sentence used to read `3,093 -
-    3,051 = 42`, which was the arithmetic BEFORE the host tail came out: 3,093
-    was our line count then, not upstream's. The note in the file was updated
-    with the strip and this quotation of it was not.)
-  * The host tail of `mha.cuh` is **deleted**, not guarded. It used to sit
-    under one `#ifndef GENERATE_CUBIN` of ours -- `configureKernel`,
-    `launchMHAFlashInfer`, and with them `cudaMemcpyFromSymbol`,
-    `cudaFuncSetAttribute` and `cudaLaunchKernelEx`. Upstream guards its *own*
-    host launcher `launchMHA` exactly this way at `mha.cu:2820`; that tail was
-    FlashInfer's downstream addition and they never guarded it. Both are gone
-    now, along with upstream's `throw std::runtime_error("not implemented")`
-    under `#if USE_INPUT_KV`. The replacement is `driver-cuda/src/fire/xqa.rs`
-    and always was.
-  * **`mha.cuh:1455` reads `result.fill(AccType{})` where upstream writes
-    `AccType{0, 0}`**, in `smemFp16ArraySum`. This is the only change in
-    either tree that REPLACES upstream's bytes in place, and the only one that
-    carries NO `// PIE:` marker. Everywhere else our text is added beside
-    upstream's rather than over it -- `attention/mla.cuh`'s two `.template`
-    sites keep upstream's spelling inside the `#ifndef` and put ours in an
-    `#else`, which is why step 1 can still recover the file -- or it removes
-    text a marker names. Here upstream's spelling is simply not there. It was
-    made at `2af552a24`, while getting XQA's device half to compile at all,
-    and no ledger was re-run for it.
-
-    It is OUR shim that made it necessary, not upstream. `AccType` is
-    `mha::conditional_t<useFp32Acc, float2, InputElem2>`, and for the bf16
-    lattice `INPUT_ELEM2` is `__nv_bfloat162` (`xqa/defines.h:41`), which
-    `csrc/shim/cuda_bf16.h:262` aliases to the prelude's `device::bf16x2` --
-    `struct { bf16 x; bf16 y; }`, whose element type declares its
-    constructors `explicit` on purpose so that a stray `bf16 b = 0;` is
-    refused. A braced `{0, 0}` copy-initialises each member and therefore
-    cannot see an `explicit` constructor, while NVIDIA's own `__nv_bfloat162`
-    takes it. `AccType{}` value-initialises and is zero for both arms. That is
-    the reason `2af552a24` records and the type definitions corroborate; it
-    was not compiled against NVIDIA's headers to check the converse.
-
-    It costs 4 bytes and no lines, which is exactly why the byte column caught
-    it and the line column did not. A rebase must re-apply it;
-    `MODIFICATIONS` carries it as a numbered modification for that reason.
-  * `utils.h` loses `checkCuda` and `checkCu`, two host error checkers that
-    `throw std::runtime_error`. `utils.h` is included by `utils.cuh` and by
-    `mha.h`, so it is genuinely inside the include closure -- but the four
-    call sites were all in the `mha.cuh` host tail above, so after that tail
-    went, nothing called either. They were dead text in a file NVRTC parses,
-    which is the same shape as the four FlashInfer headers.
-  * `xqa/hostUtils.h` is **deleted entirely**: one `inline
-    cudaLaunchConfig_t makeLaunchConfig(...)`, no device text at all, and its
-    only includer was the deleted `mha.cuh` tail.
-  * Five `#include` spellings made tree-relative -- `"mma.cuh"` and
-    `"utils.cuh"` become `"attn/xqa/mma.cuh"` and `"attn/xqa/utils.cuh"` in
-    `mha.cuh`, `mhaUtils.cuh` and `mha_components.cuh`. This is the one change
-    forced by carrying two upstream trees at once: FlashInfer *also* has an
-    `mma.cuh` and a `utils.cuh`, NVRTC has a single flat include namespace
-    keyed on the literal directive string, and a bare `"utils.cuh"` from XQA
-    would otherwise resolve to FlashInfer's. Those five are the only bare
-    spellings either tree shares; the other nine XQA directives name files
-    FlashInfer does not have and were left alone.
-  * 39 `// PIE:` marker lines across those four files -- 28 in `mha.cuh`,
-    6 in `mha_components.cuh`, 3 in `mhaUtils.cuh`, 2 in `utils.h` -- in the
-    same fixed forms used on the FlashInfer side. `grep -rn "// PIE:"
-    kernels/xqa/` finds all 39. It was 48 before the strip, and it went
-    DOWN rather than up: fourteen of the old markers were *inside* the host
-    tail and were deleted with it, and three new `REMOVED` markers replaced
-    them. Markers went up on the FlashInfer side, 33 to 39, and down here, for
-    the same operation. That is the reason to count them rather than reason
-    about them.
-
-Note the shape of the difference from the FlashInfer side of this document:
-there, the changes began as 33 `#ifndef __CUDACC_RTC__` guards; here there
-were **none**. XQA was written to be compiled as a cubin -- it carries
-upstream's own `GENERATE_CUBIN` switch for exactly that, and
-`src/x/xqa.rs`'s `XQA_COMMON_OPTIONS` passes `-DGENERATE_CUBIN=1` (it was
-`src/families/attn.rs`, which the routine port deleted) -- so the JIT needed one
-guard of ours where FlashInfer's host-facing headers needed thirty-three.
-Both counts are now zero on the XQA side and two on the FlashInfer side, and
-what stood behind them is deleted rather than hidden. Diffing XQA against a
-fresh checkout is correspondingly cheap on ten of fourteen files and needs
-`MODIFICATIONS` for the other four.
+`kernels/flashinfer/MODIFICATIONS` still describes the XQA half of the
+internalisation in its own voice. It is FlashInfer's changelog, it records
+what was true when it was written, and a changelog that quietly loses its
+deleted entries is worth less than one that keeps them; the "Where it lives"
+section below has the same shape and the same reason.
 
 
 FP16 (Marat Dukhan / AMD), via FlashInfer -- NO LONGER REDISTRIBUTED
@@ -558,15 +438,16 @@ worth saying plainly: nothing carried has a `cccl` or `cutlass` path, and
 `shim/` holds no file under either, but no probe re-checks that per run.
 
 
-The two LICENSE files
----------------------
+The LICENSE file
+----------------
 
-`kernels/flashinfer/LICENSE` and `kernels/xqa/LICENSE` are
-byte-identical to each other: both are the stock Apache License 2.0 text, 230
-lines, as each upstream ships it. They are kept as two files rather than one
-shared copy because each is the licence *of its own directory* and a rebase
-replaces a directory, not a crate. Neither may be renamed: the carried header
-set in `src/source.rs` deliberately lists no licence or attribution file, so a
-rename is a chance for one to be added to it by mistake -- and a set whose
-entries include 12 KB of Apache-2.0 is a set whose rule no longer means
-anything. The names stay plain so that "not device text" stays obvious.
+`kernels/flashinfer/LICENSE` is the stock Apache License 2.0 text, 230 lines,
+as upstream ships it. It is the licence *of its own directory*, because a
+rebase replaces a directory and not a crate -- which is why there were two of
+these while `kernels/xqa/` was carried, byte-identical to this one and kept
+separate anyway. That one went with its directory; this one stays with its
+own. It may not be renamed: the carried header set is walked from disk by
+`build.rs`, which excludes a file by NAME (`LICENSE`, `MODIFICATIONS`,
+`README.md`), so a rename would put 12 KB of Apache-2.0 into the text NVRTC
+copies per compile. The name stays plain so that "not device text" stays
+obvious.

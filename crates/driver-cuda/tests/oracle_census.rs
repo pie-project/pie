@@ -1,7 +1,7 @@
 //! Which oracles can still be run, and which are descriptions of a run that
 //! can never happen again.
 //!
-//! **Sixteen of the eighteen `run.sh` cannot run** — not "fail for want of a
+//! **Eleven of the thirteen `run.sh` cannot run** — not "fail for want of a
 //! GPU" but cannot run anywhere, because the sources they copy were deleted.
 //! That is worse than a deleted test, because they read as live
 //! infrastructure.
@@ -27,9 +27,10 @@ fn oracle_dir() -> PathBuf {
 /// Why an oracle's `run.sh` cannot run, and the input that proves it.
 ///
 /// `at` is the phase the script dies in, and the two values distinguish a
-/// script that never reaches a compiler from one that does. `store` and
-/// `weight_view` copy only files that exist and then hand the compiler a path
-/// that does not, so a check reading `cp` arguments alone called them alive.
+/// script that never reaches a compiler from one that does. `store` copies
+/// only files that exist and then hands the compiler a path that does not, so
+/// a check reading `cp` arguments alone called it alive. `weight_view` was
+/// the second of that kind and is deleted with its dead directory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dies {
     /// Dies at a `cp` under `set -euo pipefail`, before any compiler runs.
@@ -49,7 +50,7 @@ enum Dies {
     GitRestores,
 }
 
-/// The sixteen, each with the first input its `run.sh` cannot find.
+/// The eleven, each with the first input its `run.sh` cannot find.
 ///
 /// The path is repo-relative and is asserted MISSING. Only the first absent
 /// input is listed, because it is the one `set -e` stops on and listing the
@@ -57,14 +58,8 @@ enum Dies {
 const DEAD: &[(&str, Dies, &str, &str)] = &[
     // ── Cause A: `crates/driver-cuda/csrc` deleted wholesale.
     //
-    // Fourteen of the sixteen. These compiled the driver's own C++ host layer
-    // — workspace planner, KV cache, stage hooks — which is now Rust.
-    (
-        "attn_score",
-        Dies::Cp,
-        "crates/driver-cuda/csrc/src/model/attn_score.cu",
-        "the attention-score observation hook",
-    ),
+    // Ten of the eleven. These compiled the driver's own C++ host layer
+    // — workspace planner, KV cache, the caches — which is now Rust.
     (
         "attn_ws",
         Dies::Cp,
@@ -89,24 +84,12 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
         "crates/driver-cuda/csrc/src/store/kv_cache.cpp",
         "KV cache behaviour under live page allocation",
     ),
-    (
-        "lora_stage",
-        Dies::Cp,
-        "crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp",
-        "LoRA staging order",
-    ),
-    // `lora_stage/run.sh` names TWO missing inputs now, and this row asserts
-    // only the first because the first is where `set -e` stops. The second is
-    // `../llama_like_prepare/stub/`, deleted with that oracle — see
-    // [`RETIRED`]. It matters when the self-retiring direction fires: restore
-    // `llama_like.cpp` and this row reports the oracle may be alive again,
-    // and it will NOT be, because the shared stub tree is still gone. The row
-    // is right that its reason expired; whoever reads the failure needs this
-    // sentence to avoid concluding the script runs.
-    // This row is STILL TRUE and its conclusion is STILL WRONG, which is the
-    // exact inverse of the `lora_stage` note above and the reason both are
-    // written down. The path really is gone from the tree, so the assertion
-    // holds -- but this oracle is not dead. `memory_planner/run.sh` now
+    // This row is STILL TRUE and its conclusion is STILL WRONG, which is why
+    // it is written down. The path really is gone from the tree, so the
+    // assertion holds -- but this oracle is not dead. (The inverse case was
+    // `lora_stage`, whose row said the same thing about a script that would
+    // STILL not run if its source came back, because a second input was also
+    // gone. Its directory is deleted now, and the pairing with it.) `memory_planner/run.sh` now
     // restores the `.cpp`/`.hpp` from `7559e4cea` and builds them against the
     // surviving `stub/` tree with plain `g++` and no CUDA, and it reproduces
     // `GOLDEN_FNV1A64` exactly. Nothing about it needed the deleted tree.
@@ -124,12 +107,6 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
         Dies::GitRestores,
         "crates/driver-cuda/csrc/src/store/memory_planner.cpp",
         "the memory planner's allocation decisions",
-    ),
-    (
-        "page_mask",
-        Dies::Cp,
-        "crates/driver-cuda/csrc/src/model/attn_page_mask.cu",
-        "page-mask construction",
     ),
     (
         "profile_cache",
@@ -150,20 +127,14 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
         "the sideband arena's bump allocation",
     ),
     (
-        "stage_hooks",
-        Dies::Cp,
-        "crates/driver-cuda/csrc/src/model/stage_hooks.hpp",
-        "stage hook firing order",
-    ),
-    (
         "workspace",
         Dies::Cp,
         "crates/driver-cuda/csrc/src/model/workspace.cpp",
         "the model workspace's section offsets",
     ),
-    // The fourteenth of cause A, and the one that hides: its `cp` list is
-    // clean and it dies at `g++`, so it is reached only by looking at
-    // compiler inputs.
+    // The tenth of cause A, and the one that hides: its `cp` list is clean
+    // and it dies at `g++`, so it is reached only by looking at compiler
+    // inputs.
     (
         "store",
         Dies::Compile,
@@ -172,23 +143,18 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     ),
     // ── Cause B: individual archive files retired by this migration.
     //
-    // Two, and the kind that will keep happening: an oracle whose subject is a
-    // HOST source in the kernels tree dies the day that source is ported.
+    // One, and the kind that will keep happening: an oracle whose subject is a
+    // HOST source in the kernels tree dies the day that source is ported. It
+    // was two until `weight_view`'s directory went.
     //
-    // Their path strings are the ARCHIVE crate's — `kernels-cuda` when it was
-    // a CMake+nvcc crate — and are kept verbatim because they are what each
-    // `run.sh` reaches for. Nothing in this tree holds either path now.
+    // Its path string is the ARCHIVE crate's — `kernels-cuda` when it was a
+    // CMake+nvcc crate — and is kept verbatim because it is what the `run.sh`
+    // reaches for. Nothing in this tree holds that path now.
     (
         "cublas_handle",
         Dies::Cp,
         "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
         "cuBLAS handle and workspace lifetime",
-    ),
-    (
-        "weight_view",
-        Dies::Compile,
-        "crates/kernels-cuda/csrc/src/tensor.cpp",
-        "weight view strides over a quantised tensor",
     ),
 ];
 
@@ -215,8 +181,10 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
 /// fail again. [`every_oracle_is_classified`]'s WALK covers them instead:
 /// recreate any of the three with a `run.sh` and it is unclassified. What the
 /// walk does not see is a directory with no `run.sh` — a bare
-/// `llama_like_prepare/stub/`, which `lora_stage/run.sh` still copies and
-/// which is recorded at the `lora_stage` row above.
+/// `llama_like_prepare/stub/`. THE READER THAT MADE THAT MATTER IS GONE:
+/// `lora_stage/run.sh` was the one script still copying that tree, and its
+/// whole directory was deleted with the three other oracles whose parity test
+/// no longer exists. So the stub is now unreferenced as well as unwalked.
 const RETIRED: &[(&str, &str)] = &[
     (
         "llama_like_cfg",
@@ -235,7 +203,7 @@ const RETIRED: &[(&str, &str)] = &[
 /// The two that can still be run, and neither can be run *here*.
 ///
 /// They fall outside the "read but not re-derived" policy in opposite
-/// directions, which is why the policy covers sixteen and not eighteen:
+/// directions, which is why the policy covers eleven and not thirteen:
 ///
 /// - `dtoa` is **runnable anywhere**: it compiles against a vendored
 ///   `nlohmann/json.hpp` and touches no repo C++, so its golden is
@@ -343,7 +311,7 @@ fn every_oracle_is_classified() {
 
     assert_eq!(
         DEAD.len(),
-        16,
+        11,
         "the count in this file's header is part of the finding; update both"
     );
     assert_eq!(on_disk.len(), DEAD.len() + ALIVE.len());

@@ -121,21 +121,6 @@ EXCLUSIONS = {
             "kernels-cuda | grep -c '^Diff'` and `git log "
             "--since='24 hours ago' -- crates/kernels-cuda`."
         ),
-        # Found by this audit, not by a reader: `baker-smoke` had never been
-        # in either gate list, which is the exact shape the docstring above
-        # describes -- a crate that is merely absent looks like a crate that
-        # passes. It is in the CLIPPY list now, at zero warnings; only fmt
-        # excuses it, and only for churn.
-        "baker-smoke": (
-            "22 drifted hunks against 12 commits in the last seven days: "
-            "the crate R4's baker executor is landing in, so it is the "
-            "churn itself rather than a crate that drifted once. Same "
-            "shape as `kernels-cuda` above and the same expiry -- when "
-            "the executor stops moving, run `cargo fmt -p baker-smoke` "
-            "once and delete this entry. Re-measure with `cargo fmt "
-            "--check -p baker-smoke | grep -c '^Diff'` and `git log "
-            "--since='7 days ago' -- crates/baker-smoke`."
-        ),
     },
     "clippy": {
         # Everything not yet at zero warnings. A gate is worth nothing

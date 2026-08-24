@@ -39,63 +39,90 @@ use super::{AttnCtx, GdnCtx};
 /// the same pooled `fire_arrays` slots the fire's arms always read, so a
 /// capture that baked one keeps addressing the slot every later fire
 /// re-uploads into.
-#[derive(Debug, Clone, Copy, Default)]
+/// NOT `Copy` ANY MORE, and the fields that took it away are the reason this
+/// struct exists: a fire raises one attention schedule PER CLASS its lane
+/// states, so the answers to `"fa2.decode"` and `"fa2.prefill"` are small
+/// tables rather than pointers. It is moved once, into [`FireViews::build`],
+/// and read by reference after that.
+#[derive(Debug, Clone, Default)]
 pub struct FireStreams {
     /// `"positions"` — per-token absolute positions, i32.
     pub positions: *mut c_void,
     /// `"token_ids"` — the fire's token ids, i32.
     pub token_ids: *mut c_void,
-    /// `"request_of_token"` — which request each token row belongs to, i32.
-    /// Staged only when the plan names it; null otherwise.
-    pub request_of_token: *mut c_void,
     /// `"qo_indptr"` — the query-window CSR, device copy.
     pub qo_indptr: *mut c_void,
     /// `"row_valid"` — per-row validity, one byte per row.
     pub row_valid: *mut c_void,
-    /// `"sampling_indices"` — the rows a sampling gather collects; null when
-    /// the fire samples every row, which is a REFUSAL for a statement that
-    /// names it (a gather addressing no indices must not bind null).
-    pub sampling_indices: *mut c_void,
-    /// `"first_token"` — the fire's write origin. A SCALAR smuggled through
-    /// the pointer channel: the swept routines read `first_token.ptr as i32`,
-    /// so the answer is the value itself as an address, zero included.
-    pub first_token: i32,
     /// `"qo_indptr.host"` — the HOST qo CSR the planless prefill walks; null
     /// outside the planless leg.
     pub qo_indptr_host: *const u32,
     /// `"kv_page_indptr.host"` — its page-CSR sibling.
     pub kv_page_indptr_host: *const u32,
-    /// `"fa2.prefill"` AS A RUNTIME OBJECT — the plan CACHE the planless
-    /// prefill fills at fire time. Distinct from a prep-published plan value,
-    /// which the launch path's own `raised` map answers first.
-    pub prefill_plan_cache: *mut c_void,
-    /// `"fa2.decode"` — the decode SCHEDULE `raise_attn_plans` raised for
-    /// this fire: workspaces stamped inside the plan-update fence, the
-    /// variant the lane stated, `window_left = -1`.
+    /// `"fa2.prefill"` AS A RUNTIME OBJECT — the plan CACHES the masked arm
+    /// reads and the planless prefill fills at fire time. Distinct from a
+    /// prep-published plan value, which the launch path's own `raised` map
+    /// answers first.
+    ///
+    /// A TABLE FOR [`Self::decode_plan_caches`]'s REASON, and the two are
+    /// indexed alike: a masked lane states one class per attention geometry
+    /// and `raise_attn_plans` pre-plans one schedule per class, so a body asks
+    /// with the `(head_dim, window)` its own statement states. The one entry
+    /// under `Class::ANY` is the planless leg's — a cache stamped rather than
+    /// planned, which is what a lane with no masked arm has always carried,
+    /// and it is published only BY such a lane.
+    pub prefill_plan_caches: Vec<(kernels::raises::Class, *mut c_void)>,
+    /// `"fa2.decode"` — the decode SCHEDULES `raise_attn_plans` raised for
+    /// this fire, one per CLASS the lane states: workspaces stamped inside
+    /// each plan-update fence, the variant the class states, `window_left =
+    /// -1`.
     ///
     /// It reached the walk as a loose argument until the fa2 points became
     /// claim bodies, because the walk's one reader was a hand-written arm
-    /// that could be handed anything. A body has only the key.
-    pub decode_plan_cache: *mut c_void,
+    /// that could be handed anything. A body has the key and the class its
+    /// own statement states, and that pair is what indexes this.
+    pub decode_plan_caches: Vec<(kernels::raises::Class, *mut c_void)>,
 }
 
 impl FireStreams {
     /// The device pointer for one stream name, or `None` for a name this
     /// struct does not carry or a stream the fire did not stage. `None` is a
     /// refusal at the bind (`UnknownNamed`), never a null argument.
+    ///
+    /// # Three names left, and each was unaskable in its own way
+    ///
+    /// `"request_of_token"` was staged only when a `Slot::Runtime` named it,
+    /// and NOTHING CAN MINT THAT NAME: `Recorder::runtime` is the only
+    /// producer of a runtime slot in the tree and its seven call sites spell
+    /// three names — `token_ids`, `positions`, `qo_indptr` — which
+    /// `model-compiler`'s own doc restates. So the guard was always false,
+    /// the pointer always null, and the derive-and-upload block behind it
+    /// never ran. It is asked for by KEY, from `kernels-cuda`'s
+    /// `pool.attention_lse` body, and that ask has always met a null and
+    /// refused; it still does, from one arm further out. Staging it for real
+    /// is a separate change and belongs with the body that wants it.
+    ///
+    /// `"first_token"` was a scalar smuggled through the pointer channel —
+    /// answered as `0 as *mut c_void`, because zero is a real write origin.
+    /// It was written `0` at the single construction site and never anything
+    /// else once the prefill peel left, and the kernel-side `first_token`
+    /// operands do not come from here: `Attention::kv_append` builds its
+    /// origin from a null pointer directly, with its own paragraph on why the
+    /// origin is structurally zero.
+    ///
+    /// `"sampling_indices"` was written from the gather upload and read by
+    /// nobody — neither this door's callers (`Fire::runtime` takes
+    /// `token_ids`/`positions`/`qo_indptr`/`row_valid`; the key door takes
+    /// five names) accepted the name. A fire that states a gather epilogue is
+    /// refused by `baker_fire` before it could matter.
     #[must_use]
     pub fn named(&self, name: &str) -> Option<*mut c_void> {
         let nn = |p: *mut c_void| (!p.is_null()).then_some(p);
         match name {
             "positions" => nn(self.positions),
             "token_ids" => nn(self.token_ids),
-            "request_of_token" => nn(self.request_of_token),
             "qo_indptr" => nn(self.qo_indptr),
             "row_valid" => nn(self.row_valid),
-            "sampling_indices" => nn(self.sampling_indices),
-            // The smuggled scalar: zero is a real origin, so it is answered,
-            // not refused — see the field.
-            "first_token" => Some(self.first_token as usize as *mut c_void),
             _ => None,
         }
     }
@@ -241,9 +268,8 @@ impl FireViews {
     /// with no layer against a per-layer object therefore refuses here
     /// rather than defaulting to layer zero.
     ///
-    /// [`ANSWERED`] is the vocabulary this must cover. `None` is a refusal at
-    /// the bind ([`RaisedUnbound`]), never a null: the names this returns
-    /// `None` for — `"moe.banks"`, `"gemm.groups"`, the `dsv4.*` state,
+    /// `None` IS A REFUSAL, NEVER A NULL. The names this returns `None` for —
+    /// `"moe.banks"`, `"gemm.groups"`, the `dsv4.*` state,
     /// `"mtp.pending_hidden"` — are objects this driver does not STAGE yet
     /// (nothing allocates their banks or slabs), and a refusal that names the
     /// key is the honest answer until something does. The one key whose null
@@ -251,9 +277,18 @@ impl FireViews {
     /// it through `Ctx::staged`, which reads `None` as the null every
     /// appending kernel tests for.
     ///
-    /// [`RaisedUnbound`]: super::BindRefusal::RaisedUnbound
+    /// The match below IS the vocabulary. Two hand-kept lists — `ANSWERED`
+    /// and `UNSTAGED` — used to restate it beside this function, with no
+    /// reader in any src or test since the walk that gated them died, and a
+    /// list that only a human compares against the code it summarises is a
+    /// list that is wrong without saying so.
     #[must_use]
-    pub fn raised(&self, name: &str, layer: Option<u32>) -> Option<*const c_void> {
+    pub fn raised(
+        &self,
+        name: &str,
+        layer: Option<u32>,
+        class: kernels::raises::Class,
+    ) -> Option<*const c_void> {
         let of = |p: *const c_void| (!p.is_null()).then_some(p);
         match name {
             // Per-layer objects: a mint without a layer is a text error and
@@ -273,26 +308,53 @@ impl FireViews {
             // its banks are carved at load, and the statement->bank join is
             // not written. `None` is a refusal at the bind, by name.
             "moe.expert_weights" => None,
-            // The planless prefill's three: the plan cache it fills and the
-            // two host CSR mirrors it walks. Null means this fire did not
-            // stage the planless leg, which is a refusal for a statement
-            // that names it.
-            "fa2.prefill" => of(self.streams.prefill_plan_cache.cast_const()),
+            // THE PREFILL CACHE, ANSWERED THE SAME WAY AND FOR THE SAME
+            // REASON — see the decode arm below, which this is a second
+            // reading of rather than a second mechanism. Two callers ask:
+            // `attention.masked` names the class its own statement states and
+            // reads a PRE-planned schedule, and the planless prefill leg asks
+            // CLASSLESS for a cache it carves itself. They are two entries or
+            // one, never the same one: gemma's masked lane states two masked
+            // geometries and every other lane states none.
+            "fa2.prefill" => self
+                .streams
+                .prefill_plan_caches
+                .iter()
+                .find(|(at, _)| *at == class)
+                .and_then(|(_, p)| of(p.cast_const())),
+            // The planless prefill's other two: the host CSR mirrors it
+            // walks. Null means this fire did not stage the planless leg,
+            // which is a refusal for a statement that names it.
             "qo_indptr.host" => of(self.streams.qo_indptr_host.cast::<c_void>()),
             "kv_page_indptr.host" => of(self.streams.kv_page_indptr_host.cast::<c_void>()),
-            // THE DECODE SCHEDULE, ANSWERED BY KEY. It was withheld here for
-            // one measured reason, and that reason retired with the legacy
-            // walk: there used to be TWO decode schedules whenever a stack
-            // kept one per layer kind, and picking between them needed the
-            // window on the statement's `LaunchSpec`, which a key does not
-            // carry. A `Program` is ONE LANE and `Baked::attn_ask` raises the
-            // schedule that lane's statements ask for — refusing the lane
-            // outright when two of them ask for different ones ("states two
-            // decode attention schedules and this driver raises one"). So
-            // there is exactly one per fire, this key names it, and the
-            // ambiguity that made a one-valued answer dangerous is a
-            // load-time refusal instead.
-            "fa2.decode" => of(self.streams.decode_plan_cache.cast_const()),
+            // THE DECODE SCHEDULE, ANSWERED BY KEY AND CLASS. It was withheld
+            // here for one measured reason: there are TWO decode schedules
+            // whenever a stack keeps one per layer kind, and picking between
+            // them needed the window on the statement's `LaunchSpec`, which a
+            // key does not carry.
+            //
+            // A KEY STILL DOES NOT CARRY IT — the CLASS does. A body reads
+            // `(head_dim, window)` off the statement it is answering and asks
+            // `Ctx::raised_at` with them; `Baked::attn_ask` reads the same two
+            // numbers off the same statements at plan time and
+            // `raise_attn_plans` stages one schedule per distinct pair. So the
+            // ambiguity that made a one-valued answer dangerous is gone, and
+            // it is gone by ANSWERING rather than by the lane refusal that
+            // stood here (`"states two decode attention schedules and this
+            // driver raises one"`).
+            //
+            // AN EXACT MATCH, never a nearest one: a lane whose class table
+            // does not hold the ask refuses with the key, which is what makes
+            // a sliding schedule reaching a global layer a loud failure. The
+            // one entry filed under `Class::ANY` is the fallback schedule a
+            // lane with no decode statement gets, and no body ever asks with
+            // `ANY` for this key.
+            "fa2.decode" => self
+                .streams
+                .decode_plan_caches
+                .iter()
+                .find(|(at, _)| *at == class)
+                .and_then(|(_, p)| of(p.cast_const())),
             // THE STREAMS, THROUGH THE SAME DOOR. A stream is a raise whose
             // payload is a plane rather than a struct (`kernels_cuda::views`
             // declares `RowValid` and `RequestOfToken` beside the view
@@ -300,7 +362,12 @@ impl FireViews {
             // body needs a schedule: no statement carries it. The SHAPE is
             // not answered and is not asked for — every kernel that reads one
             // of these indexes it by the row it is already on.
-            "row_valid" | "request_of_token" | "positions" | "token_ids" | "qo_indptr" => {
+            // `"request_of_token"` STOOD IN THIS LIST and answered `None`
+            // every time, because nothing could stage it — see
+            // `FireStreams::named`. `kernels-cuda`'s `pool.attention_lse`
+            // asks for it and refuses; it now refuses one arm out, with the
+            // same key in the message and no change to any fire.
+            "row_valid" | "positions" | "token_ids" | "qo_indptr" => {
                 self.streams.named(name).map(|p| p.cast_const())
             }
             _ => None,
@@ -314,9 +381,14 @@ impl FireViews {
 /// NO LAYER CROSSES IT, for [`FireViews::raised`]'s reason — the per-layer
 /// pools ride the `Cache` mark, which a statement names and `BoundOp`
 /// resolves. Everything a claim body pulls off `self` is fire-wide.
+///
+/// A CLASS DOES CROSS IT, and it is not a layer wearing a disguise: a class
+/// is the GEOMETRY a statement states, so two layers of one kind share one
+/// answer and the table has as many members as the text has attention
+/// geometries — two, for the one family that states two.
 impl kernels::raises::Answered for FireViews {
-    fn raised(&self, key: &'static str) -> Option<*const c_void> {
-        Self::raised(self, key, None)
+    fn raised(&self, key: &'static str, class: kernels::raises::Class) -> Option<*const c_void> {
+        Self::raised(self, key, None, class)
     }
 }
 
@@ -414,53 +486,3 @@ fn recurrent_view(g: &GdnCtx, layer: usize) -> RecurrentView {
         conv_stride: g.conv_stride_elems,
     }
 }
-
-/// Every runtime name this driver ANSWERS — streams through
-/// [`FireStreams::named`], objects through [`FireViews::raised`], both
-/// reachable from a claim body by key through `impl Answered`.
-///
-/// THE CENSUS AND NOT A GATE, since R2: the test that walked every catalogued
-/// SKU's `plan.runtime` against this list died with `plan.runtime`, and a
-/// baker `Plan` mints no runtime names at all — a body asks for what it needs
-/// by the key its `Raise` declares, and an unanswered key is a refusal with
-/// the key in it. What the list is for now is reading: one place that says
-/// what a fire of this driver can be asked for.
-///
-/// `"fa2.decode"` IS ON IT AGAIN. It was struck when the legacy walk could
-/// keep two decode schedules and a key could not say which; `Baked::attn_ask`
-/// refuses a lane that asks for two, so one fire has one, and
-/// [`FireViews::raised`] says so at the arm.
-pub const ANSWERED: &[&str] = &[
-    // streams
-    "positions",
-    "token_ids",
-    "request_of_token",
-    "qo_indptr",
-    "row_valid",
-    "sampling_indices",
-    "first_token",
-    // objects
-    "kv_cache",
-    "recurrent_state",
-    "attention_mask",
-    "attn.score",
-    "fa2.prefill",
-    "fa2.decode",
-    "qo_indptr.host",
-    "kv_page_indptr.host",
-];
-
-/// Runtime names this driver KNOWS but deliberately refuses until their
-/// staging owners land (`RaisedUnbound`, by name): the moe/gemm pointer
-/// banks and the dsv4/mtp slabs nothing in driver-cuda allocates today.
-pub const UNSTAGED: &[&str] = &[
-    // See `FireViews::raised`: the banks are carved, the join is not.
-    "moe.expert_weights",
-    "moe.banks",
-    "gemm.groups",
-    "dsv4.state_kv",
-    "dsv4.state_score",
-    "dsv4.ape",
-    "dsv4.comp_kv_pages",
-    "mtp.pending_hidden",
-];

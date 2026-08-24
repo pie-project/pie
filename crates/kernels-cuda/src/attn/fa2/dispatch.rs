@@ -1,72 +1,8 @@
 use super::geometry::Device as FaDevice;
-use crate::attn::fa2::params::{PrefillPagedParams, make_prefill_params};
-use crate::attn::fa2::{PrefillArm, PrefillPoint};
 
 use super::plan::{DecodePlanCache, PrefillPlanCache};
 
-use crate::attn::fa2::params::{Buffers, DecodePlan, Partials, PrefillPlan};
-
-#[must_use]
-#[derive(Clone, Copy, Debug)]
-pub enum Fired<D> {
-    Whole(D),
-    Split(D, Partials),
-    Declined(Decline),
-}
-
-impl<D> Fired<D> {
-    pub fn dispatch(&self) -> Option<&D> {
-        match self {
-            Self::Whole(d) | Self::Split(d, _) => Some(d),
-            Self::Declined(_) => None,
-        }
-    }
-
-    #[must_use]
-    pub fn partials(&self) -> Option<Partials> {
-        match *self {
-            Self::Split(_, p) => Some(p),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decline {
-    Unplanned,
-    CaptureVariantUnsupported,
-    CaptureSinkMissing,
-    Sm90Unported,
-}
-
-impl core::fmt::Display for Decline {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match *self {
-            Self::Unplanned => {
-                write!(
-                    f,
-                    "flashinfer fa2 dispatch: the plan cache is empty; plan before firing"
-                )
-            }
-            Self::CaptureVariantUnsupported => write!(
-                f,
-                "flashinfer fa2 score capture: not instantiated with a logits soft cap \
-                 or a sliding window"
-            ),
-            Self::CaptureSinkMissing => write!(
-                f,
-                "flashinfer fa2 score capture: requires score_out, score_indptr and a \
-                 non-zero window"
-            ),
-            Self::Sm90Unported => write!(
-                f,
-                "flashinfer fa2 prefill: this plan is an SM90 plan and the SM90 launcher \
-                 is not part of this lattice"
-            ),
-        }
-    }
-}
-
+use crate::attn::fa2::params::{DecodePlan, PrefillPlan};
 
 #[must_use]
 pub fn decode_plan_of(cache: &DecodePlanCache, device: FaDevice) -> DecodePlan {
@@ -102,47 +38,5 @@ pub fn prefill_plan_of(cache: &PrefillPlanCache, device: FaDevice) -> PrefillPla
         causal_mask: cache.causal_mask,
         use_sm90: cache.use_sm90,
         valid: cache.valid,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PrefillDispatch<P = PrefillPagedParams> {
-    pub at: PrefillPoint,
-    pub params: P,
-}
-
-pub fn prefill(
-    cache: &PrefillPlanCache,
-    bufs: &Buffers,
-    device: FaDevice,
-    arm: PrefillArm,
-    logits_soft_cap: f32,
-    sm_scale: f32,
-) -> Fired<PrefillDispatch> {
-    fn prefill_plan_usable(cache: &PrefillPlanCache) -> Result<(), Decline> {
-        if !cache.valid {
-            return Err(Decline::Unplanned);
-        }
-        if cache.use_sm90 {
-            return Err(Decline::Sm90Unported);
-        }
-        Ok(())
-    }
-
-    if let Err(why) = prefill_plan_usable(cache) {
-        return Fired::Declined(why);
-    }
-    let plan = prefill_plan_of(cache, device);
-
-    let (params, partials) = make_prefill_params(&plan, bufs, logits_soft_cap, sm_scale);
-
-    let ready = PrefillDispatch {
-        at: super::prefill_at(&plan, arm, params.padded_batch_size),
-        params,
-    };
-    if cache.plan_info.split_kv {
-        Fired::Split(ready, partials)
-    } else {
-        Fired::Whole(ready)
     }
 }

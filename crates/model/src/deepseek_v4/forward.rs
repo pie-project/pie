@@ -1,7 +1,7 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::{kernels, Facts, merge, seam, Classify, Forward, Input, KvSpec, Request, Value};
+use model_dsl::{Classify, Facts, Forward, Input, KvSpec, Request, Value, kernels, merge, seam};
 
-use super::model::{Head, Hyper, Mix, Mlp, Model};
+use super::model::{Hyper, Mix, Mlp, Model};
 
 #[derive(Facts)]
 pub struct Facts {
@@ -35,7 +35,8 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
         let m = self;
         let hy = &m.hyper;
         let ids = inputs.token_ids();
-        let mut streams = kernels::hc::expand(&kernels::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
+        let mut streams =
+            kernels::hc::expand(&kernels::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
 
         for (_, w) in inputs.layers(&m.layers) {
             let at = &w.attn;
@@ -57,7 +58,8 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
 
             let plane = kernels::gemm::matmul(&x, &at.kv_down);
             let plane = kernels::norm::rmsnorm(&plane, &at.kv_norm.weight, at.kv_norm.eps);
-            let plane = kernels::rope::partial_last(&plane, &pos, at.rope_dim, at.head_dim, at.theta, true);
+            let plane =
+                kernels::rope::partial_last(&plane, &pos, at.rope_dim, at.head_dim, at.theta, true);
             kernels::attention::kv_append_shared(&plane, &pages);
 
             let (o, lse) = kernels::attention::prefill_lse(
@@ -74,7 +76,14 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                     let entries = inputs.kv(&p.entries);
                     let (bpos, breq) = boundaries(&inputs, p.ratio);
                     let pooled = kernels::pool::gather(&bpos, &breq, &pages, at.head_dim, p.ratio);
-                    let pooled = kernels::rope::partial_last(&pooled, &pos, at.rope_dim, at.head_dim, at.theta, true);
+                    let pooled = kernels::rope::partial_last(
+                        &pooled,
+                        &pos,
+                        at.rope_dim,
+                        at.head_dim,
+                        at.theta,
+                        true,
+                    );
                     kernels::pool::kv_append(&pooled, &bpos, &breq, &entries);
                     let (po, plse) = kernels::pool::attention_lse(
                         &q,
@@ -93,14 +102,23 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
             seam::at(seam::ATTN_OUT, (&o,));
 
             let o = kernels::gemm::matmul(&o, &at.o_down);
-            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
+            let o = kernels::dist::reduce::<TP>(o);
             let o = kernels::gemm::matmul(&o, &at.o_up);
             streams = kernels::hc::fold(&o, &streams, &post_mix, &comb_mix);
 
             let (x, post_mix, comb_mix) = gate(&streams, &w.mlp_mix, hy);
             let f = match &w.mlp {
-                Mlp::Dense { gate_up, down, inter, limit } => kernels::gemm::matmul(
-                    &kernels::mlp::swiglu_clamp(&kernels::gemm::matmul(&x, gate_up), *inter, *limit),
+                Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                    limit,
+                } => kernels::gemm::matmul(
+                    &kernels::mlp::swiglu_clamp(
+                        &kernels::gemm::matmul(&x, gate_up),
+                        *inter,
+                        *limit,
+                    ),
                     down,
                 ),
                 Mlp::Routed {
@@ -131,23 +149,24 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                     )
                 }
             };
-            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            let f = kernels::dist::reduce::<TP>(f);
             streams = kernels::hc::fold(&f, &streams, &post_mix, &comb_mix);
         }
 
-        let y = kernels::hc::collapse(&streams, &hy.head_scale, &hy.head_base, hy.streams, hy.gate_eps);
+        let y = kernels::hc::collapse(
+            &streams,
+            &hy.head_scale,
+            &hy.head_base,
+            hy.streams,
+            hy.gate_eps,
+        );
         let fin = &m.final_norm;
         let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
-        let logits = match &m.head {
-            Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
-        };
-
-        logits
+        kernels::gemm::lm_head(&x, &m.embed)
     }
 }
 
-fn gate<W1: Dtype>(streams: &Value, mix: &Mix<W1>, hy: &Hyper<W1>) -> (Value, Value, Value) {
+fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     let normed = kernels::hc::rmsnorm_f32(streams, hy.norm_eps);
     kernels::hc::gates(
         &normed,

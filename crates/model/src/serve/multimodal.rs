@@ -50,10 +50,6 @@ impl Default for GemmaImageConfig {
 }
 
 impl GemmaImageConfig {
-    pub fn max_patches(&self) -> u32 {
-        self.max_soft_tokens * self.pooling_kernel_size * self.pooling_kernel_size
-    }
-
     fn resize_unit(&self) -> u32 {
         self.patch_size * self.pooling_kernel_size
     }
@@ -257,6 +253,16 @@ impl QwenVisionConfig {
     }
 }
 
+/// Qwen's 3-D rope positions for one visual span: `[t, h, w]` per merged
+/// patch, the temporal axis advancing by the wider of the two spatial ones.
+///
+/// THE MROPE LEG'S ONE PUBLIC ENTRY, and it has no caller in this tree.
+/// `Processor::mrope_positions` was the wrapper that reached it and had none
+/// either; what carries mrope today is the `uses_mrope` BOOLEAN the engine
+/// stamps on an `Image` for a host->driver path that has not landed
+/// (`engine/src/inferlet/host/media.rs:13` says so). This is the arithmetic
+/// that path will ask for, so it stays as the record of it rather than as a
+/// reader count.
 pub fn qwen_mrope_positions(merged: Grid, anchor: u32) -> Vec<[u32; 3]> {
     let mut out = Vec::with_capacity((merged.t * merged.h * merged.w) as usize);
     let advance = merged.h.max(merged.w);
@@ -269,10 +275,6 @@ pub fn qwen_mrope_positions(merged: Grid, anchor: u32) -> Vec<[u32; 3]> {
         }
     }
     out
-}
-
-pub fn qwen_next_position(merged: Grid, anchor: u32) -> u32 {
-    anchor + merged.t * merged.h.max(merged.w)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,46 +309,6 @@ impl Processor {
 
     pub fn uses_mrope(&self) -> bool {
         matches!(self, Processor::Qwen(_))
-    }
-
-    pub fn pool_factor(&self) -> u32 {
-        match self {
-            Processor::Gemma(c) => c.pooling_kernel_size * c.pooling_kernel_size,
-            Processor::Qwen(c) => c.merge_size * c.merge_size,
-        }
-    }
-
-    pub fn layout_image(&self, w: u32, h: u32) -> VisualSpan {
-        match self {
-            Processor::Gemma(c) => c.layout(w, h),
-            Processor::Qwen(c) => c.layout(h, w, 1),
-        }
-    }
-
-    pub fn layout_video(&self, w: u32, h: u32, num_frames: u32) -> VisualSpan {
-        let frames = num_frames.max(1);
-        match self {
-            Processor::Gemma(c) => {
-                let per = c.layout(w, h);
-                VisualSpan {
-                    token_count: per.token_count * frames,
-                    position_span: per.position_span * frames,
-                    grid: Grid {
-                        t: frames,
-                        h: 1,
-                        w: per.token_count,
-                    },
-                }
-            }
-            Processor::Qwen(c) => c.layout(h, w, frames),
-        }
-    }
-
-    pub fn mrope_positions(&self, span: &VisualSpan, anchor: u32) -> Option<Vec<[u32; 3]>> {
-        match self {
-            Processor::Gemma(_) => None,
-            Processor::Qwen(_) => Some(qwen_mrope_positions(span.grid, anchor)),
-        }
     }
 }
 

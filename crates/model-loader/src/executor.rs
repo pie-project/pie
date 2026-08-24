@@ -11,7 +11,6 @@
 //! soon as the schedule is done with it.
 
 pub mod arena;
-pub mod chunked;
 pub mod iq_grid;
 pub mod sink;
 pub mod walk;

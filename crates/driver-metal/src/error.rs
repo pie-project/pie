@@ -305,19 +305,28 @@ impl From<model::deployment::Refusal> for Error {
     }
 }
 
-/// A shape no Metal kernel here can be launched at.
+/// A statement this plane could not fire.
 ///
 /// Beside the conversion above because it is the same boundary one step
-/// later: a row projects a `Deployment` and this driver then asks whether
-/// its own kernels can take it. A GDN head that is not a multiple of 32
-/// lanes, an affine point off the instantiation grid, an irregular
-/// interleave — every one is a fact about THIS BUILD's kernels rather than
-/// about the checkpoint, so it lands where `Refusal::Unsupported` lands.
-impl From<crate::batch::GeometryRefused> for Error {
-    fn from(e: crate::batch::GeometryRefused) -> Self {
+/// later: a row projects a `Deployment`, the lane binds, and then a claim
+/// body is asked for a launch it does not have — an element it does not
+/// stamp, a grid that came out empty, a bank at a repr no arm instantiates.
+/// Every one of those is a fact about THIS BUILD's kernels rather than about
+/// the checkpoint, so it lands where `Refusal::Unsupported` lands.
+///
+/// `GeometryRefused` STOOD HERE and was the same boundary drawn one layer
+/// too early: a `DecodeGeometry` projected from a catalog row, checked
+/// against a table of instantiated shapes before anything was asked to
+/// launch. There is no such projection and no such table — a claim body
+/// computes its own grid from the operands it was handed and refuses BY NAME
+/// when it cannot — so the refusal now arrives with the statement that
+/// caused it attached, which is what `Refused` carries and the geometry
+/// never could.
+impl From<crate::baker::walk::Refused> for Error {
+    fn from(e: crate::baker::walk::Refused) -> Self {
         Self::Unserved {
-            what: "decode geometry",
-            message: e.0,
+            what: "a statement this plane cannot fire",
+            message: e.to_string(),
         }
     }
 }
@@ -360,20 +369,24 @@ mod tests {
         assert_ne!(unsupported.to_string(), malformed.to_string());
     }
 
-    /// A geometry refusal keeps its sentence and does not gain a second
-    /// prefix.
+    /// A walk refusal names the STATEMENT, which is the whole reason the
+    /// walk carries an op index alongside the plane's own sentence.
     ///
-    /// `GeometryRefused`'s `Display` already stamps `decode geometry:` on
-    /// the front, and `Error::Unserved` stamps `driver-metal: {what}:`.
-    /// Converting through `Display` would produce `driver-metal: decode
-    /// geometry: decode geometry: ...`, which is why this takes the field.
+    /// The failure this guards against is the one the geometry refusal it
+    /// replaced had by construction: a message that says a shape is
+    /// unsupported without saying which of a 900-step program asked for it.
     #[test]
-    fn a_geometry_refusal_is_stamped_once() {
-        let refused =
-            crate::batch::GeometryRefused("linear k_d 96 is not a multiple of 32".to_string());
-        let e: Error = refused.into();
-        let text = e.to_string();
-        assert_eq!(text.matches("decode geometry").count(), 1, "{text}");
-        assert!(text.contains("not a multiple of 32"), "{text}");
+    fn a_walk_refusal_names_the_statement_that_asked() {
+        let refused = crate::baker::walk::Refused {
+            op: 41,
+            kernel: "norm.rmsnorm".to_string(),
+            why: kernels::plane::Refusal::Absent {
+                what: "an operand at an element the point does not state",
+            },
+        };
+        let text = Error::from(refused).to_string();
+        assert!(text.contains("op 41"), "{text}");
+        assert!(text.contains("norm.rmsnorm"), "{text}");
+        assert!(text.contains("does not state"), "{text}");
     }
 }

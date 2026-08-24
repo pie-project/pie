@@ -69,7 +69,7 @@ use cudarc::runtime::sys::{
 // entry points are gone -- their bodies are `gemm::absorb`'s now, called
 // directly below -- and the import outlived them because a test target is not
 // built by `cargo check`.
-use kernels::routine::{Const, In, Out};
+use kernels::plane::{Const, In, Out};
 
 /// The two widths the launchers in this file still ask their context for.
 ///
@@ -96,7 +96,7 @@ struct Facts {
     k: i32,
 }
 
-impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Facts {
+impl kernels::plane::Answers<kernels_cuda::jit::Cuda> for Facts {
     fn resolve(
         &self,
         _ty: kernels::Ty,
@@ -426,7 +426,7 @@ fn transcript() -> Vec<String> {
                 // statement does not restate"*. n and k describe this buffer
                 // perfectly well and neither of them is the statement's to
                 // tell.
-                kernels::routine::Const { v: dw.0 },
+                kernels::plane::Const { v: dw.0 },
                 Out {
                     ptr: dy.0.cast(),
                     rows: m,

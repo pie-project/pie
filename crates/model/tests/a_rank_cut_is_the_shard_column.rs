@@ -208,10 +208,9 @@ fn every_rank_cut_cache_row_narrows_with_its_mixer() {
         for (m, w) in mine.iter().zip(&whole) {
             let (name, m_row, w_row) = match (m, w) {
                 (CacheRow::Kv { name, row }, CacheRow::Kv { row: was, .. }) => (name, row, was),
-                (
-                    CacheRow::State { name, slab },
-                    CacheRow::State { slab: was, .. },
-                ) => (name, slab, was),
+                (CacheRow::State { name, slab }, CacheRow::State { slab: was, .. }) => {
+                    (name, slab, was)
+                }
                 _ => panic!("`{sku}`: a cache row changed kind from `{base}`'s"),
             };
             let m_elems: u64 = m_row.iter().product();

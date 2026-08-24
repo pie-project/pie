@@ -1,6 +1,6 @@
-use kernels::routine::Refusal;
+use kernels::plane::Refusal;
 
-use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
+use crate::plane::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 
 pub fn argmax_logits(
     ctx: &Ctx<'_>,

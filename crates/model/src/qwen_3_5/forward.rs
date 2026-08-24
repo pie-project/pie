@@ -1,5 +1,7 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::{kernels, Facts, merge, seam, Classify, ForwardHybrid, HybridInput, HybridSpec, Request, Value};
+use model_dsl::{
+    Classify, Facts, ForwardHybrid, HybridInput, HybridSpec, Request, Value, kernels, merge, seam,
+};
 
 use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model};
 
@@ -21,7 +23,9 @@ pub struct Facts {
 
 impl Classify for Facts {
     fn of(r: &Request) -> Self {
-        Self { qo_one: r.query_len() == 1 }
+        Self {
+            qo_one: r.query_len() == 1,
+        }
     }
 }
 
@@ -33,11 +37,27 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> 
         for (l, w) in self.layers.iter().enumerate() {
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    c.kv(format!("kv.{l}"), [2, a.kv_heads as u64 * a.head_dim as u64]);
+                    c.kv(
+                        format!("kv.{l}"),
+                        [2, a.kv_heads as u64 * a.head_dim as u64],
+                    );
                 }
+                // THE CONV SLAB IS `[K, C]`, WHICH IS NOT THE ROLLING
+                // WINDOW. `causal_conv1d_update_batched` holds the last
+                // `conv_kernel` input rows oldest-first, convolves over rows
+                // `1..K-1` plus the incoming column, shifts every row down
+                // one and lands the new column at row `K - 1`
+                // (`kernels-cuda/kernels/ssm/causal_conv1d.cuh:396-411`). So
+                // `K - 1` rows are LIVE between fires and row 0 is where the
+                // shift's tail goes -- written every step, read by nothing --
+                // and the rectangle the kernel indexes is `K` rows of `C`
+                // channels. A declaration states the rectangle: this row used
+                // to say `[C, K - 1]`, the live window, which is neither the
+                // extent the pool must allocate nor the axis order the kernel
+                // walks (`state[k * C + c]`, so `C` is the fast axis).
                 Mixer::Gdn(g) => {
                     let conv_ch = (2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim) as u64;
-                    c.state(format!("conv.{l}"), [conv_ch, (g.conv_kernel - 1) as u64]);
+                    c.state(format!("conv.{l}"), [g.conv_kernel as u64, conv_ch]);
                     c.state(
                         format!("delta.{l}"),
                         [g.v_heads as u64, g.k_dim as u64, g.v_dim as u64],
@@ -59,14 +79,19 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> 
                 Mixer::Attn(a) => attn_mixer(&x, &inputs, a),
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
             };
-            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
+            let o = kernels::dist::reduce::<TP>(o);
             y = kernels::norm::residual_add(&o, &y);
 
             let x = kernels::norm::rmsnorm_plus_one(&y, &w.mlp_norm.weight, w.mlp_norm.eps);
             let f = match &w.mlp {
-                Mlp::Dense { gate_up, down, inter } => {
-                    kernels::gemm::matmul(&kernels::mlp::swiglu(&kernels::gemm::matmul(&x, gate_up), *inter), down)
-                }
+                Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                } => kernels::gemm::matmul(
+                    &kernels::mlp::swiglu(&kernels::gemm::matmul(&x, gate_up), *inter),
+                    down,
+                ),
                 Mlp::Routed {
                     router,
                     gate_up,
@@ -79,16 +104,24 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> 
                     inter,
                     shared_inter,
                 } => {
-                    let (routes, weights) =
-                        kernels::moe::topk_softmax(&kernels::gemm::matmul(&x, router), *experts, *top_k);
-                    let hidden =
-                        kernels::mlp::swiglu(&kernels::moe::matmul_select(&x, gate_up, &routes), *inter);
+                    let (routes, weights) = kernels::moe::topk_softmax(
+                        &kernels::gemm::matmul(&x, router),
+                        *experts,
+                        *top_k,
+                    );
+                    let hidden = kernels::mlp::swiglu(
+                        &kernels::moe::matmul_select(&x, gate_up, &routes),
+                        *inter,
+                    );
                     let routed = kernels::moe::weighted_sum(
                         &kernels::moe::matmul_select(&hidden, down, &routes),
                         &weights,
                     );
                     let shared = kernels::gemm::matmul(
-                        &kernels::mlp::swiglu(&kernels::gemm::matmul(&x, shared_gate_up), *shared_inter),
+                        &kernels::mlp::swiglu(
+                            &kernels::gemm::matmul(&x, shared_gate_up),
+                            *shared_inter,
+                        ),
                         shared_down,
                     );
                     kernels::moe::sigmoid_gate_add(
@@ -98,18 +131,16 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> 
                     )
                 }
             };
-            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            let f = kernels::dist::reduce::<TP>(f);
             y = kernels::norm::residual_add(&f, &y);
         }
 
         let fin = &m.final_norm;
         let x = kernels::norm::rmsnorm_plus_one(&y, &fin.weight, fin.eps);
-        let logits = match &m.head {
+        match &m.head {
             Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
             Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
-        };
-
-        logits
+        }
     }
 }
 
@@ -128,7 +159,14 @@ fn attn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Attn<W1>) -
     let (dq, p) = q.split(&Facts::qo_one());
     let o = merge![
         kernels::attention::decode(&dq, &pages, None, d, a.sm_scale),
-        kernels::attention::prefill(&kernels::query_windows(&p), &pages, None, d, a.kv_heads, a.sm_scale),
+        kernels::attention::prefill(
+            &kernels::query_windows(&p),
+            &pages,
+            None,
+            d,
+            a.kv_heads,
+            a.sm_scale
+        ),
     ];
     seam::at(seam::ATTN_OUT, (&o,));
     kernels::gemm::attention_landing(&kernels::gate::sigmoid_mul(&o, &gate), &a.o_proj)
@@ -148,16 +186,36 @@ fn gdn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, g: &Gdn<W1>) -> 
         let (qkv, z) = kernels::layout::split_rows(&qkvz_d, width);
         let qkv = kernels::ssm::causal_conv1d(&qkv, &g.conv, &conv_state, g.conv_kernel);
         let gates = kernels::ssm::gdn_prep(&ba_d, &g.dt_bias, &g.a_log);
-        let core = kernels::ssm::gated_delta(&qkv, &z, &gates, &delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim);
+        let core = kernels::ssm::gated_delta(
+            &qkv,
+            &z,
+            &gates,
+            &delta_state,
+            g.k_heads,
+            g.v_heads,
+            g.k_dim,
+            g.v_dim,
+        );
         (core, z)
     };
     let (core_p, z_p) = {
         let (qkv, z) = kernels::layout::split_rows(&qkvz_p, width);
-        let qkv = kernels::ssm::causal_conv1d_chunked(&kernels::query_windows(&qkv), &g.conv, &conv_state, g.conv_kernel);
+        let qkv = kernels::ssm::causal_conv1d_chunked(
+            &kernels::query_windows(&qkv),
+            &g.conv,
+            &conv_state,
+            g.conv_kernel,
+        );
         let gates = kernels::ssm::gdn_prep(&ba_p, &g.dt_bias, &g.a_log);
         let core = kernels::ssm::gated_delta_chunked(
-            &kernels::query_windows(&qkv), &z, &gates, &delta_state,
-            g.k_heads, g.v_heads, g.k_dim, g.v_dim,
+            &kernels::query_windows(&qkv),
+            &z,
+            &gates,
+            &delta_state,
+            g.k_heads,
+            g.v_heads,
+            g.k_dim,
+            g.v_dim,
         );
         (core, z)
     };

@@ -1,7 +1,5 @@
 use crate::Ty;
-use crate::routine::{Arg, Backend, Refusal};
-
-pub const COUNT: usize = 13;
+use crate::plane::{Arg, Backend, Refusal};
 
 pub trait ShaderValue: Copy {
     fn as_buffer(self) -> Option<u32>;
@@ -66,82 +64,19 @@ pub trait ShaderValue: Copy {
     }
 }
 
-pub trait Lang: Backend {
-    const BUF: &'static str;
-
-    const BUF_MUT: &'static str;
-
-    const I32S: &'static str;
-
-    const U32S: &'static str;
-
-    const U8S: &'static str;
-
-    const F32S: &'static str;
-
-    const F32S_MUT: &'static str;
-
-    const BF16S: &'static str;
-
-    const BF16S_MUT: &'static str;
-
-    const F16S: &'static str;
-
-    const F16S_MUT: &'static str;
-
-    const I32: &'static str;
-
-    const U32: &'static str;
-
-    const F32: &'static str;
-
-    const USIZE: &'static str;
-
-    const IN_PACKED: &'static str;
-}
-
-pub use crate::routine::Bind;
+pub use crate::plane::Bind;
 
 pub trait Element: 'static {
     const TY_CONST: Ty;
 
     const TY_MUT: Ty;
-
-    const SPELL: Spell;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Spell {
-    Bf16,
-
-    F16,
-
-    F32,
-
-    I32,
-
-    U32,
-
-    U8,
-}
-
-const fn spell_read<B: Lang>(s: Spell) -> &'static str {
-    match s {
-        Spell::Bf16 => B::BF16S,
-        Spell::F16 => B::F16S,
-        Spell::F32 => B::F32S,
-        Spell::I32 => B::I32S,
-        Spell::U32 => B::U32S,
-        Spell::U8 => B::U8S,
-    }
 }
 
 macro_rules! element {
-    ($(#[$m:meta])* $name:ty, $ty:expr, $ty_mut:expr, $spell:ident) => {
+    ($(#[$m:meta])* $name:ty, $ty:expr, $ty_mut:expr) => {
         impl Element for $name {
             const TY_CONST: Ty = $ty;
             const TY_MUT: Ty = $ty_mut;
-            const SPELL: Spell = Spell::$spell;
         }
     };
 }
@@ -150,12 +85,12 @@ macro_rules! element {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct bf16;
 
-element!(bf16, Ty::Bf16s, Ty::Bf16sMut, Bf16);
-element!(f32, Ty::F32s, Ty::F32sMut, F32);
-element!(i32, Ty::I32s, Ty::I32sMut, I32);
-element!(u32, Ty::U32s, Ty::U32sMut, U32);
+element!(bf16, Ty::Bf16s, Ty::Bf16sMut);
+element!(f32, Ty::F32s, Ty::F32sMut);
+element!(i32, Ty::I32s, Ty::I32sMut);
+element!(u32, Ty::U32s, Ty::U32sMut);
 
-element!(u8, Ty::U8s, Ty::U8sMut, U8);
+element!(u8, Ty::U8s, Ty::U8sMut);
 
 #[derive(Debug)]
 pub struct Tensor<E: Element> {
@@ -188,12 +123,11 @@ impl<E: Element> Tensor<E> {
     }
 }
 
-impl<B: Lang, E: Element> Arg<B> for Tensor<E>
+impl<B: Backend, E: Element> Arg<B> for Tensor<E>
 where
     B::Value: ShaderValue,
 {
     const TY: Ty = E::TY_CONST;
-    const SPELLING: &'static str = spell_read::<B>(E::SPELL);
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
         value.as_buffer().map(Self::new).ok_or(Refusal::Kind {
@@ -209,13 +143,13 @@ impl<V: ShaderValue, E: Element> Bind<V> for Tensor<E> {
     }
 }
 
-impl<V: ShaderValue, E: Element> crate::routine::BindMut<V> for Tensor<E> {
+impl<V: ShaderValue, E: Element> crate::plane::BindMut<V> for Tensor<E> {
     fn arg_mut(self) -> V {
         V::buffer_mut(self.handle)
     }
 }
 
-impl<E: Element> crate::routine::Elem for Tensor<E> {
+impl<E: Element> crate::plane::Elem for Tensor<E> {
     type Read = Self;
     type Write = Self;
 
@@ -228,14 +162,11 @@ impl<E: Element> crate::routine::Elem for Tensor<E> {
     }
 
     const CPP: &'static str = "";
-    const CPP_CONST: &'static str = "";
-    const CPP_MUT: &'static str = "";
     const TY_CONST: Ty = E::TY_CONST;
     const TY_MUT: Ty = E::TY_MUT;
 }
 
-impl<E: Element> crate::routine::ConstRun for Tensor<E> {
-    const RUN: crate::routine::Claim = crate::routine::Claim::Weight;
+impl<E: Element> crate::plane::ConstRun for Tensor<E> {
     const TY: Ty = E::TY_CONST;
     type Held = Self;
 }
@@ -243,12 +174,11 @@ impl<E: Element> crate::routine::ConstRun for Tensor<E> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usize(pub u64);
 
-impl<B: Lang, V: 'static> Arg<B> for *const V
+impl<B: Backend, V: 'static> Arg<B> for *const V
 where
     B::Value: ShaderValue,
 {
     const TY: Ty = Ty::Raised;
-    const SPELLING: &'static str = "";
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
         value
@@ -261,12 +191,11 @@ where
     }
 }
 
-impl<B: Lang> Arg<B> for Usize
+impl<B: Backend> Arg<B> for Usize
 where
     B::Value: ShaderValue,
 {
     const TY: Ty = Ty::Usize;
-    const SPELLING: &'static str = B::USIZE;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
         value.as_usize().map(Self).ok_or(Refusal::Kind {
@@ -285,12 +214,11 @@ impl<V: ShaderValue> Bind<V> for Usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InPacked(pub u32);
 
-impl<B: Lang> Arg<B> for InPacked
+impl<B: Backend> Arg<B> for InPacked
 where
     B::Value: ShaderValue,
 {
     const TY: Ty = Ty::InPacked;
-    const SPELLING: &'static str = B::IN_PACKED;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
         value.as_u32().map(Self).ok_or(Refusal::Kind {
@@ -332,13 +260,12 @@ fn rectangle(width: i32, rows: i32) -> Result<[u32; 2], Refusal> {
 }
 
 macro_rules! scalar_arg {
-    ($rust:ty, $ty:expr, $read:ident, $make:ident, $spelling:ident) => {
-        impl<B: Lang> Arg<B> for $rust
+    ($rust:ty, $ty:expr, $read:ident, $make:ident) => {
+        impl<B: Backend> Arg<B> for $rust
         where
             B::Value: ShaderValue,
         {
             const TY: Ty = $ty;
-            const SPELLING: &'static str = B::$spelling;
 
             fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
                 value.$read().ok_or(Refusal::Kind { at, want: $ty })
@@ -353,42 +280,13 @@ macro_rules! scalar_arg {
     };
 }
 
-scalar_arg!(i32, Ty::I32, as_i32, i32, I32);
-scalar_arg!(u32, Ty::U32, as_u32, u32, U32);
-scalar_arg!(f32, Ty::F32, as_f32, f32, F32);
+scalar_arg!(i32, Ty::I32, as_i32, i32);
+scalar_arg!(u32, Ty::U32, as_u32, u32);
+scalar_arg!(f32, Ty::F32, as_f32, f32);
 
-/// The two shader elements, as the POINTS floor names them.
-///
-/// # Why this is here and not in a plane crate
-///
-/// A `#[points]` family quantifies over [`crate::points::Scalar`], and a
-/// generated dispatch matches over [`crate::bound::Axis`] and names the
-/// element type in each arm — `ctx.rmsnorm::<bf16>(..)`. Both traits are
-/// this crate's and `bf16`/`f16` are this crate's, so no plane crate can
-/// write these four impls without tripping the orphan rule; every shader
-/// plane would otherwise have to mint a SECOND `bf16` beside this one,
-/// three times over, for no reason but coherence.
-///
-/// The floor already spells `Rides` for `f32`, `i32`, `u32` and `u8`, and
-/// [`crate::bound::Axis`] already spells `Bf16` and `F16` as "the two the
-/// device planes instantiate and no arena mints yet". These impls are that
-/// sentence's missing half and nothing more: no declaration moves, no point
-/// changes arity, and a plane that does not instantiate `bf16` is unaffected.
-///
-/// # `Read` is a pointer that no shader plane dereferences
-///
-/// [`crate::points::Scalar`] demands `Elem<Read = *const Self>` because a
-/// cuda region IS an address. A shader plane's payload is a binding handle,
-/// and it says so in its own `Plane::Tensor<T>` — the associated type carries
-/// the handle, and `T`'s own `Read` is never reached by a body or a bind. So
-/// the pointer below is a SHAPE the bound demands, not a claim that a WGSL
-/// buffer has a host address, and `advance_read` refuses to pretend
-/// otherwise: it returns the pointer unmoved, because a zero-sized marker's
-/// `add` is a no-op and a plane that needed to walk elements would be walking
-/// a handle, not this.
 macro_rules! shader_scalar {
     ($t:ty, $axis:ident, $tc:ident, $tm:ident) => {
-        impl crate::routine::Elem for $t {
+        impl crate::plane::Elem for $t {
             type Read = *const $t;
             type Write = *mut $t;
 
@@ -400,12 +298,7 @@ macro_rules! shader_scalar {
                 write
             }
 
-            /// Empty: this plane has no C++ text for a template argument to
-            /// stand in, which is the spelling `Elem` documents for exactly
-            /// this case.
             const CPP: &'static str = "";
-            const CPP_CONST: &'static str = "";
-            const CPP_MUT: &'static str = "";
             const TY_CONST: Ty = Ty::$tc;
             const TY_MUT: Ty = Ty::$tm;
         }

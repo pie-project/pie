@@ -54,8 +54,11 @@ pub struct Attn<W1: Dtype> {
 ///   __restrict__ A_log`, in the same argument list where `dt_bias` is
 ///   `const T*`.
 /// * `norm` — `norm.rmsnorm_gated` declares `weight:
-///   Const<Self::Tensor<f32>>`, and `kernels-cuda`'s claiming routine
-///   `rmsnorm_gated_fp32_in` takes `Const<Tensor<f32>>`.
+///   Const<Self::Tensor<f32>>`, and the `#[claims]` body that answers it in
+///   `kernels-cuda/src/norm.rs` takes `Const<Tensor<f32>>` and fires
+///   `::pie::norm::rmsnorm_gated_f32_in`. (`#[routine]`
+///   is dead — the routine layer folded into the claim impls — so what was
+///   a "claiming routine" is now just the claim.)
 ///
 /// The shipped 35B-A3B checkpoint agrees from the other side: in an
 /// otherwise BF16 file, `linear_attn.A_log` is F32 and `linear_attn.norm`
@@ -80,6 +83,7 @@ pub struct Gdn<W1: Dtype> {
     pub delta_state: CacheRef,
 }
 
+#[allow(clippy::large_enum_variant)] // a per-layer weight-bank record, built once at trace; boxing buys nothing and costs every reader a deref
 pub enum Mlp<W1: Dtype> {
     Dense {
         gate_up: Tensor<W1>,
@@ -233,21 +237,50 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
     /// import row reads, which `baker_load` counts out loud.
     pub fn a3b() -> Self {
         assemble(Dims {
-            hidden: 2048, layers: 40, attn_every: 4,
-            q_heads: 16, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
-            k_heads: 16, v_heads: 32, k_dim: 128, v_dim: 128, conv_kernel: 4,
-            mlp: MlpDims::Routed(MoeDims { experts: 256, top_k: 8, inter: 512, shared_inter: 512 }),
-            vocab: 248_320, tied: false, norm_eps: 1e-6,
+            hidden: 2048,
+            layers: 40,
+            attn_every: 4,
+            q_heads: 16,
+            kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+            k_heads: 16,
+            v_heads: 32,
+            k_dim: 128,
+            v_dim: 128,
+            conv_kernel: 4,
+            mlp: MlpDims::Routed(MoeDims {
+                experts: 256,
+                top_k: 8,
+                inter: 512,
+                shared_inter: 512,
+            }),
+            vocab: 248_320,
+            tied: false,
+            norm_eps: 1e-6,
         })
     }
 
     pub fn d0_8b() -> Self {
         assemble(Dims {
-            hidden: 1024, layers: 24, attn_every: 4,
-            q_heads: 8, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
-            k_heads: 16, v_heads: 16, k_dim: 128, v_dim: 128, conv_kernel: 4,
+            hidden: 1024,
+            layers: 24,
+            attn_every: 4,
+            q_heads: 8,
+            kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+            k_heads: 16,
+            v_heads: 16,
+            k_dim: 128,
+            v_dim: 128,
+            conv_kernel: 4,
             mlp: MlpDims::Dense { inter: 3584 },
-            vocab: 248_320, tied: true, norm_eps: 1e-6,
+            vocab: 248_320,
+            tied: true,
+            norm_eps: 1e-6,
         })
     }
 
@@ -258,11 +291,23 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
     /// read ship 248 320.
     pub fn d3b() -> Self {
         assemble(Dims {
-            hidden: 2048, layers: 24, attn_every: 4,
-            q_heads: 16, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
-            k_heads: 16, v_heads: 32, k_dim: 128, v_dim: 128, conv_kernel: 4,
+            hidden: 2048,
+            layers: 24,
+            attn_every: 4,
+            q_heads: 16,
+            kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+            k_heads: 16,
+            v_heads: 32,
+            k_dim: 128,
+            v_dim: 128,
+            conv_kernel: 4,
             mlp: MlpDims::Dense { inter: 8192 },
-            vocab: 151_936, tied: true, norm_eps: 1e-6,
+            vocab: 151_936,
+            tied: true,
+            norm_eps: 1e-6,
         })
     }
 }
@@ -272,86 +317,117 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
     let hidden = d.hidden as u64;
     let attn_at = |l: u32| l % d.attn_every == d.attn_every - 1;
 
-    let layers = (0..d.layers).map(|l| {
-        let n = |s: &str| format!("layer.{l}.{s}");
-        let norm = |s: &str, w: u64| Norm { weight: Tensor::sym(n(s), [w]), eps: d.norm_eps };
-        let mixer = if attn_at(l) {
-            let hd = d.head_dim as u64;
-            Mixer::Attn(Attn {
-                q_heads: d.q_heads,
-                kv_heads: d.kv_heads,
-                head_dim: d.head_dim,
-                rotary_dim: d.rotary_dim,
-                theta: d.theta,
-                sm_scale: (d.head_dim as f32).sqrt().recip(),
-                qg_proj: Tensor::sym(n("qg_proj"), [2 * d.q_heads as u64 * hd, hidden]).columns(),
-                k_proj: Tensor::sym(n("k_proj"), [d.kv_heads as u64 * hd, hidden]).columns(),
-                v_proj: Tensor::sym(n("v_proj"), [d.kv_heads as u64 * hd, hidden]).columns(),
-                o_proj: Tensor::sym(n("o_proj"), [hidden, d.q_heads as u64 * hd]).rows(),
-                q_norm: norm("q_norm", hd),
-                k_norm: norm("k_norm", hd),
-                kv: CacheRef::to(format!("kv.{l}")),
-            })
-        } else {
-            let k_w = d.k_heads as u64 * d.k_dim as u64;
-            let v_w = d.v_heads as u64 * d.v_dim as u64;
-            let qkv = 2 * k_w + v_w;
-            let qkvz = qkv + v_w;
-            Mixer::Gdn(Gdn {
-                k_heads: d.k_heads,
-                v_heads: d.v_heads,
-                k_dim: d.k_dim,
-                v_dim: d.v_dim,
-                conv_kernel: d.conv_kernel,
-                in_qkvz: Tensor::sym(n("in_qkvz"), [qkvz, hidden]).packed([k_w, k_w, v_w, v_w]),
-                in_ba: Tensor::sym(n("in_ba"), [2 * d.v_heads as u64, hidden]).packed([d.v_heads as u64, d.v_heads as u64]),
-                conv: Tensor::sym(n("conv"), [qkv, d.conv_kernel as u64]).packed([k_w, k_w, v_w]),
-                dt_bias: Tensor::sym(n("dt_bias"), [d.v_heads as u64]).columns(),
-                a_log: Tensor::<F32>::sym(n("a_log"), [d.v_heads as u64]).columns(),
-                norm: Norm {
-                    weight: Tensor::<F32>::sym(n("gdn_norm"), [d.v_dim as u64]),
-                    eps: d.norm_eps,
+    let layers = (0..d.layers)
+        .map(|l| {
+            let n = |s: &str| format!("layer.{l}.{s}");
+            let norm = |s: &str, w: u64| Norm {
+                weight: Tensor::sym(n(s), [w]),
+                eps: d.norm_eps,
+            };
+            let mixer = if attn_at(l) {
+                let hd = d.head_dim as u64;
+                Mixer::Attn(Attn {
+                    q_heads: d.q_heads,
+                    kv_heads: d.kv_heads,
+                    head_dim: d.head_dim,
+                    rotary_dim: d.rotary_dim,
+                    theta: d.theta,
+                    sm_scale: (d.head_dim as f32).sqrt().recip(),
+                    qg_proj: Tensor::sym(n("qg_proj"), [2 * d.q_heads as u64 * hd, hidden])
+                        .columns(),
+                    k_proj: Tensor::sym(n("k_proj"), [d.kv_heads as u64 * hd, hidden]).columns(),
+                    v_proj: Tensor::sym(n("v_proj"), [d.kv_heads as u64 * hd, hidden]).columns(),
+                    o_proj: Tensor::sym(n("o_proj"), [hidden, d.q_heads as u64 * hd]).rows(),
+                    q_norm: norm("q_norm", hd),
+                    k_norm: norm("k_norm", hd),
+                    kv: CacheRef::to(format!("kv.{l}")),
+                })
+            } else {
+                let k_w = d.k_heads as u64 * d.k_dim as u64;
+                let v_w = d.v_heads as u64 * d.v_dim as u64;
+                let qkv = 2 * k_w + v_w;
+                let qkvz = qkv + v_w;
+                Mixer::Gdn(Gdn {
+                    k_heads: d.k_heads,
+                    v_heads: d.v_heads,
+                    k_dim: d.k_dim,
+                    v_dim: d.v_dim,
+                    conv_kernel: d.conv_kernel,
+                    in_qkvz: Tensor::sym(n("in_qkvz"), [qkvz, hidden]).packed([k_w, k_w, v_w, v_w]),
+                    in_ba: Tensor::sym(n("in_ba"), [2 * d.v_heads as u64, hidden])
+                        .packed([d.v_heads as u64, d.v_heads as u64]),
+                    conv: Tensor::sym(n("conv"), [qkv, d.conv_kernel as u64])
+                        .packed([k_w, k_w, v_w]),
+                    dt_bias: Tensor::sym(n("dt_bias"), [d.v_heads as u64]).columns(),
+                    a_log: Tensor::<F32>::sym(n("a_log"), [d.v_heads as u64]).columns(),
+                    norm: Norm {
+                        weight: Tensor::<F32>::sym(n("gdn_norm"), [d.v_dim as u64]),
+                        eps: d.norm_eps,
+                    },
+                    out_proj: Tensor::sym(
+                        n("out_proj"),
+                        [hidden, d.v_heads as u64 * d.v_dim as u64],
+                    )
+                    .rows(),
+                    conv_state: CacheRef::to(format!("conv.{l}")),
+                    delta_state: CacheRef::to(format!("delta.{l}")),
+                })
+            };
+            let mlp = match &d.mlp {
+                MlpDims::Dense { inter } => Mlp::Dense {
+                    gate_up: Tensor::sym(n("gate_up"), [2 * *inter as u64, hidden])
+                        .packed([*inter as u64, *inter as u64]),
+                    down: Tensor::sym(n("down"), [hidden, *inter as u64]).rows(),
+                    inter: *inter,
                 },
-                out_proj: Tensor::sym(n("out_proj"), [hidden, d.v_heads as u64 * d.v_dim as u64]).rows(),
-                conv_state: CacheRef::to(format!("conv.{l}")),
-                delta_state: CacheRef::to(format!("delta.{l}")),
-            })
-        };
-        let mlp = match &d.mlp {
-            MlpDims::Dense { inter } => Mlp::Dense {
-                gate_up: Tensor::sym(n("gate_up"), [2 * *inter as u64, hidden]).packed([*inter as u64, *inter as u64]),
-                down: Tensor::sym(n("down"), [hidden, *inter as u64]).rows(),
-                inter: *inter,
-            },
-            MlpDims::Routed(m) => Mlp::Routed {
-                router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
-                // `[E, out, in]`, which is what the KERNEL reads and not a
-                // convention picked here. `moe.matmul_select` declares
-                // "`bank` is the `[E, N, K]` stack", and
-                // `moe/moe_grouped_gemm.cuh` indexes it
-                // `weight_base + e*N*K + n*K` with the b-fragment loaded
-                // `col_major` at `ld = K` — its own words: *"W is [N, K]
-                // row-major, and W^T is [K, N]; a [K, N] column-major view
-                // of W^T is exactly W's own memory with leading dimension
-                // K"*. So N is the output width and K the input width.
-                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * m.inter as u64, hidden]).bank([m.inter as u64, m.inter as u64]),
-                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, m.inter as u64]).rows(),
-                shared_gate_up: Tensor::sym(n("shared_gate_up"), [2 * m.shared_inter as u64, hidden]).packed([m.shared_inter as u64, m.shared_inter as u64]),
-                shared_down: Tensor::sym(n("shared_down"), [hidden, m.shared_inter as u64]).rows(),
-                shared_gate: Tensor::sym(n("shared_gate"), [1, hidden]),
-                experts: m.experts,
-                top_k: m.top_k,
-                inter: m.inter,
-                shared_inter: m.shared_inter,
-            },
-        };
-        Layer {
-            mixer,
-            mixer_norm: norm("mixer_norm", hidden),
-            mlp_norm: norm("mlp_norm", hidden),
-            mlp,
-        }
-    }).collect();
+                MlpDims::Routed(m) => Mlp::Routed {
+                    router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
+                    // `[E, out, in]`, which is what the KERNEL reads and not a
+                    // convention picked here. `moe.matmul_select` declares
+                    // "`bank` is the `[E, N, K]` stack", and the body that
+                    // claims it — `moe/moe_dispatch.cuh`'s
+                    // `moe_decode_gemv_body` — indexes
+                    // `weight_base + expert * expert_stride + row * K` under
+                    // `if (row >= N) return;`, so one route's slice is `N`
+                    // rows of `K` contiguous elements: N is the output width
+                    // and K the input width. (The proof USED to cite
+                    // `moe/moe_grouped_gemm.cuh`, which R4a deleted after
+                    // measuring that its `supported` gate caps K at 512 and
+                    // every SKU stating the point contracts deeper — that
+                    // WMMA kernel never ran. The conclusion was right about
+                    // the layout and the witness had never fired.)
+                    gate_up: Tensor::sym(
+                        n("experts_gate_up"),
+                        [m.experts as u64, 2 * m.inter as u64, hidden],
+                    )
+                    .bank([m.inter as u64, m.inter as u64]),
+                    down: Tensor::sym(
+                        n("experts_down"),
+                        [m.experts as u64, hidden, m.inter as u64],
+                    )
+                    .rows(),
+                    shared_gate_up: Tensor::sym(
+                        n("shared_gate_up"),
+                        [2 * m.shared_inter as u64, hidden],
+                    )
+                    .packed([m.shared_inter as u64, m.shared_inter as u64]),
+                    shared_down: Tensor::sym(n("shared_down"), [hidden, m.shared_inter as u64])
+                        .rows(),
+                    shared_gate: Tensor::sym(n("shared_gate"), [1, hidden]),
+                    experts: m.experts,
+                    top_k: m.top_k,
+                    inter: m.inter,
+                    shared_inter: m.shared_inter,
+                },
+            };
+            Layer {
+                mixer,
+                mixer_norm: norm("mixer_norm", hidden),
+                mlp_norm: norm("mlp_norm", hidden),
+                mlp,
+            }
+        })
+        .collect();
 
     Model {
         hidden: d.hidden,
@@ -363,7 +439,10 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
             Head::Bank(Tensor::sym("lm_head", [d.vocab as u64, hidden]))
         },
         layers,
-        final_norm: Norm { weight: Tensor::sym("final_norm", [hidden]), eps: d.norm_eps },
+        final_norm: Norm {
+            weight: Tensor::sym("final_norm", [hidden]),
+            eps: d.norm_eps,
+        },
         _kv: PhantomData,
     }
 }

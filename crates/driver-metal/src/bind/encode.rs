@@ -13,7 +13,7 @@
 //! `driver-cuda`'s executor cannot do: a CUDA launcher is an authored C++
 //! function, so its bridge grows an arm per kernel.
 //!
-//! [`dispatch::plan`]: crate::lowering::dispatch::plan
+//! [`dispatch::plan`]: crate::baker::walk::Fire::walk
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,9 +31,9 @@ use crate::layout::region::Region as _;
 use crate::layout::shader::Request;
 use crate::program::Compiler;
 
-use crate::lowering::dispatch::merge;
-use crate::lowering::dispatch::{Dispatch, pipelines_needed};
-use crate::lowering::executor::Slice;
+use crate::baker::Slice;
+use crate::baker::dispatch::merge;
+use crate::baker::dispatch::{Dispatch, pipelines_needed};
 
 /// The scalars a fire's statements state, in one device buffer.
 ///
@@ -67,7 +67,7 @@ impl Params {
     /// # Errors
     ///
     /// The allocation, or a write past it.
-    pub fn stage(context: &Context, dispatches: &[Dispatch<'_>]) -> Result<Self> {
+    pub fn stage(context: &Context, dispatches: &[Dispatch]) -> Result<Self> {
         Self::stage_in(context, &crate::fire::Scratch::new(), dispatches)
     }
 
@@ -83,27 +83,23 @@ impl Params {
     pub fn stage_in(
         context: &Context,
         scratch: &crate::fire::Scratch,
-        dispatches: &[Dispatch<'_>],
+        dispatches: &[Dispatch],
     ) -> Result<Self> {
-        // Each dispatch's run is as wide as its layout says, because a row
-        // may widen a scalar: `sdpa_vector_decode` reads its strides as
+        // Each dispatch's run is as wide as its slots say, because a body may
+        // widen a scalar: `sdpa_vector_decode` reads its strides as
         // `size_t`, eight bytes, from a channel whose values are `u32`.
-        let width = |d: &Dispatch<'_>| -> usize {
-            if d.params.is_empty() {
-                return 0;
-            }
+        //
+        // A SLOT'S OWN EXTENT IS THE WHOLE OF IT. `ParamSlot::packed` stood
+        // here — a flag saying "this slot is the address of a struct, so its
+        // run is every remaining scalar" — and `baker::encode::lay_out` states
+        // no such slot: a claim body writes its own argument list, so a
+        // struct's fields are scalars like every other scalar and each one
+        // gets its own slot at its own offset. See that function's note on
+        // what the legacy `Planner`'s `Ty::InPacked` carried.
+        let width = |d: &Dispatch| -> usize {
             d.param_slots
                 .iter()
-                .map(|p| {
-                    if p.packed {
-                        // The whole run from this slot's first scalar.
-                        p.at as usize
-                            + (d.params.len() - usize::from(p.value.unwrap_or(0)))
-                                * size_of::<u32>()
-                    } else {
-                        (p.at + p.bytes) as usize
-                    }
-                })
+                .map(|p| (p.at + p.bytes) as usize)
                 .max()
                 .unwrap_or(0)
         };
@@ -126,26 +122,23 @@ impl Params {
             if d.params.is_empty() {
                 continue;
             }
-            // Written per SLOT, widened where the row says. A four-byte value
-            // handed to an eight-byte read would otherwise take the next
-            // scalar as its high half.
+            // Written per SLOT, as many words as the slot is wide. A slot's
+            // WORDS are `bytes / 4` of them starting at `ParamSlot::value`,
+            // which is what makes an eight-byte scalar arrive whole:
+            // `baker::encode::scalar` pushes an `ArgValue::Usize` as its low
+            // word then its high one, so reading only the first and
+            // zero-extending it would hand the kernel a truncated stride and
+            // no refusal anywhere.
             let mut run = vec![0u8; width(d)];
             for p in &d.param_slots {
-                let Some(v) = p.value.and_then(|i| d.params.get(i as usize)) else {
+                let words = (p.bytes as usize).div_ceil(size_of::<u32>());
+                let from = p.value as usize;
+                let Some(value) = d.params.get(from..from + words) else {
                     continue;
                 };
-                let start = p.at as usize;
-                if p.packed {
-                    // Every remaining scalar, in stated order — the struct.
-                    let from = usize::from(p.value.unwrap_or(0));
-                    for (n, value) in d.params[from..].iter().enumerate() {
-                        let at = start + n * size_of::<u32>();
-                        run[at..at + 4].copy_from_slice(&value.to_le_bytes());
-                    }
-                } else if p.bytes == 8 {
-                    run[start..start + 8].copy_from_slice(&u64::from(*v).to_le_bytes());
-                } else {
-                    run[start..start + 4].copy_from_slice(&v.to_le_bytes());
+                for (n, word) in value.iter().enumerate() {
+                    let at = p.at as usize + n * size_of::<u32>();
+                    run[at..at + 4].copy_from_slice(&word.to_le_bytes());
                 }
             }
             // SAFETY: `region` was allocated to hold every run; this one
@@ -238,7 +231,7 @@ impl Pipelines {
         &mut self,
         context: &Context,
         compiler: &Compiler,
-        dispatches: &[Dispatch<'_>],
+        dispatches: &[Dispatch],
     ) -> Result<()> {
         let wanted: Vec<(&'static str, &str, &'static str)> = pipelines_needed(dispatches)
             .into_iter()
@@ -276,7 +269,7 @@ pub fn encode_one(
     pipelines: &Pipelines,
     params: &Params,
     index: usize,
-    dispatch: &Dispatch<'_>,
+    dispatch: &Dispatch,
 ) -> Result<()> {
     let pipeline = pipelines
         .get(dispatch.symbol)
@@ -291,23 +284,18 @@ pub fn encode_one(
     for (slot, arg) in dispatch.args.iter().enumerate() {
         table.bind_address(slot, arg.slice.address)?;
     }
-    // The scalars, at the slots the ROW placed them. Scalar `i` binds at
-    // `base + i * 4`, which serves both spellings in the tree: a packed
-    // `constant RouterParams&` is the address of its first field, and a
-    // separate `const constant int&` is the address of that scalar. A row
-    // stating one `Const { v: 0 }` describes both at once.
+    // The scalars, at the slots the BODY placed them: `baker::encode::lay_out`
+    // walks the claim body's argument list once and the position in that list
+    // IS the argument-table slot, so a scalar binds the address of its own
+    // bits inside this dispatch's staged run.
     //
-    // One slot and not one each, because that is what the shader tree already
-    // does: `moe/route.metal` takes `constant RouterParams&`, `norm/rms.metal`
-    // takes its own struct, and every such struct is a run of `unsigned int`
-    // with no padding. A statement's `params` in stated order IS that struct,
-    // so the address of the run is the address of the struct.
-    //
-    // The alternative — a slot per scalar — was what this did first, and it
-    // serves exactly one kernel: the QKV split, whose shader was written here
-    // and could be written either way. Every kernel that already existed
-    // wanted the packed form, so the packed form is the convention and the
-    // split's shader was changed to match it.
+    // ONE SLOT PER SCALAR, and it used to be one slot for the whole run. The
+    // legacy row path bound a single address and let a `constant RouterParams&`
+    // read the struct off it, because a `kernel!` row could say no more than
+    // "the scalars, in stated order". A claim body writes the argument list
+    // itself, so a struct's fields arrive as separate `ArgValue`s and each
+    // one is a slot — which is why `ParamSlot::packed` is gone and why
+    // nothing here has to know a shader's struct layout.
     if !dispatch.params.is_empty() {
         let base = params.address_of(index).ok_or_else(|| Error::Create {
             what: "dispatch",
@@ -416,7 +404,7 @@ pub fn encode(
     table: &ArgumentTable,
     pipelines: &Pipelines,
     params: &Params,
-    dispatches: &[Dispatch<'_>],
+    dispatches: &[Dispatch],
 ) -> Result<()> {
     let mut hazards = Hazards::default();
     let mut tally: std::collections::BTreeMap<&'static str, usize> = Default::default();
@@ -544,7 +532,7 @@ impl Hazards {
     /// same arena slot, which happens constantly because the arena reuses
     /// offsets. **WAR** is a statement overwriting a slot the previous one is
     /// still reading, which the arena's reuse makes just as reachable.
-    fn races(&self, dispatch: &Dispatch<'_>) -> bool {
+    fn races(&self, dispatch: &Dispatch) -> bool {
         self.why(dispatch).is_some()
     }
 
@@ -571,7 +559,7 @@ impl Hazards {
     /// one dispatch -- which is a model-text change and not an encoder one.
     ///
     /// `PIE_METAL_BARRIER_COUNT=1` prints the tally.
-    fn why(&self, dispatch: &Dispatch<'_>) -> Option<&'static str> {
+    fn why(&self, dispatch: &Dispatch) -> Option<&'static str> {
         if self.reads.len() + self.writes.len() >= Self::CAP {
             return Some("CAP");
         }
@@ -595,7 +583,7 @@ impl Hazards {
         self.writes.clear();
     }
 
-    fn note(&mut self, dispatch: &Dispatch<'_>) {
+    fn note(&mut self, dispatch: &Dispatch) {
         for slice in &dispatch.touches.reads {
             merge(&mut self.reads, *slice);
         }
@@ -620,7 +608,7 @@ fn hits(slice: &Slice, set: &[Slice]) -> bool {
 /// # Why this is here and not in `recording`
 ///
 /// `.wiki/driver/real-metal-north-star.md` §9: **layers point down.**
-/// `gpu::device::recording` used to import `lowering::dispatch::Dispatch`
+/// `gpu::device::recording` used to import `baker::dispatch::Dispatch`
 /// while `gpu::fire::run` imported `Recordings` — a cycle, and an ICB path
 /// that knew what a fire was. What a recording needs is a pipeline, some
 /// addresses and a grid; turning a `Dispatch` into those three is this
@@ -641,7 +629,7 @@ fn hits(slice: &Slice, set: &[Slice]) -> bool {
 pub fn commands<'a>(
     pipelines: &'a Pipelines,
     params: &Params,
-    dispatches: &'a [Dispatch<'a>],
+    dispatches: &'a [Dispatch],
 ) -> Result<Vec<Command<'a>>> {
     let mut hazards = Hazards::default();
     dispatches

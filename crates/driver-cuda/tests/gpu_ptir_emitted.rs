@@ -183,7 +183,8 @@ fn the_hosts_own_emitted_cuda_compiles_in_this_driver() {
         kernels.iter().map(|k| k.source.len()).max().unwrap_or(0)
     );
 
-    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("the driver adopts the package");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA)
+        .expect("the driver adopts the package");
     assert!(
         plan.executable,
         "a greedy epilogue must be executable: {}",

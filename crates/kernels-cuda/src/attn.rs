@@ -7,36 +7,21 @@ use kernels::Refusal;
 
 use crate::jit::abi::Tensor;
 use crate::views::KvCache;
+use kernels::plane::{Cache, Const, In, Out};
 use kernels::raises::Struct;
-use kernels::routine::{Cache, Const, In, Out};
 
 #[allow(unused_imports)]
 use crate::jit::abi::bf16;
-use kernels::routine::InOut;
-// The vocabulary `#[claims]` writes this module's TIER-2 table in — the same
-// five names `#[points]` writes a family's in, because one reader writes both.
-use kernels::points::{Dtype, Mark, Point, Prim, Slot};
-// The floor's plane trait, named so a tier-2 declaration can spell its
-// payloads: `Self::Tensor<T>` is E0223 in an inherent impl, so the slots
-// below say `<Self as Plane>::Tensor<T>` and mean the same thing.
+use kernels::plane::InOut;
+
+use kernels::points::{Dtype, Element, Fan, Mark, Point, Prim, Shape, Slot, Width};
+
 use kernels::points::Plane;
-// SEVEN NAMES STOOD HERE, and none of them was a re-export. `kv_paged`'s
-// five write-KV routines and `qkv_fused`'s two were imported into this
-// module so that the launcher bodies below could call them; those bodies
-// were the ones the marks turned into `#[routine]`s registered from their
-// own modules, and a registry entry is reached by symbol rather than by
-// path. Nothing here names them any more. The routines are untouched and
-// still public where they are defined.
 
 pub mod fa2;
 
-pub mod fa4;
-
 pub mod plan;
 
-pub mod xqa;
-
-/// A stated `u32` as the `i32` the routines take.
 fn width_of(n: u32, what: &'static str) -> Result<i32, Refusal> {
     i32::try_from(n).map_err(|_| Refusal::Wide {
         what,
@@ -45,36 +30,8 @@ fn width_of(n: u32, what: &'static str) -> Result<i32, Refusal> {
     })
 }
 
-/// What "no logit soft cap" spells at every fa2 arm.
-///
-/// The attention points declare no cap, so a statement states none, and this
-/// is the value `decode_arm`/`prefill_arm` read as "take the uncapped arm"
-/// (`> 0.0` is the whole test). A text that wants a cap wants a slot for it;
-/// `attention.logit_softcap` is the separate point that has one.
 const NO_SOFT_CAP: f32 = 0.0;
 
-/// A stated sliding window as flashinfer's `window_left`.
-///
-/// ZERO IS NO WINDOW — that is what the DSL's `.window()` verb records
-/// (`self.int(w.unwrap_or(0))`) and what the declaration states — and
-/// flashinfer spells the same absence `-1`.
-///
-/// A NON-ZERO WINDOW IS `w - 1`, read off both kernels rather than assumed.
-/// flashinfer's window predicate is
-/// `kv_idx + qo_len + window_left >= kv_len + qo_idx`
-/// (`flashinfer/attention/variants.cuh`); a query at absolute position
-/// `p = kv_len - qo_len + qo_idx` therefore keeps `kv_idx >= p - window_left`,
-/// which is `window_left + 1` keys counting itself. The naive paged kernel
-/// spells the same thing arithmetically — `kv < kv_lim - 1 - window_left` is
-/// dropped (`attn/attention_naive_paged.cuh`). A text's `window` is the HF
-/// number and counts the query's own key, so gemma's 512 means
-/// `kv_idx > p - 512` and `window_left = 511`.
-///
-/// LEGACY WAS OFF BY ONE HERE and no A/B in this tree could see it: the
-/// retired `gemma_4/project.rs` passed `sliding_window` itself as
-/// `window_left`, which shows one key too many, and every gemma A/B prefills
-/// seven tokens — a prompt shorter than the window never reaches the
-/// predicate.
 fn window_left(window: u32) -> Result<i32, Refusal> {
     if window == 0 {
         return Ok(-1);
@@ -82,15 +39,6 @@ fn window_left(window: u32) -> Result<i32, Refusal> {
     width_of(window - 1, "the sliding window this statement states")
 }
 
-/// Two accounts of one number, checked before a launch reads rows at the
-/// wrong pitch: what the STATEMENT states, and what the SCHEDULE was planned
-/// at.
-///
-/// They agree by construction wherever the executor reads its ask off the
-/// lane (`driver-cuda`'s `Baked::attn_ask`), which is the only place either
-/// number comes from in a real fire. What this catches is an executor that
-/// raised ONE schedule for a stack that wants two — which is silent
-/// otherwise, and wrong for half the launches.
 fn agrees(planned: i32, stated: u32) -> Result<(), Refusal> {
     if planned == width_of(stated, "a stated head width")? {
         return Ok(());
@@ -102,13 +50,17 @@ fn agrees(planned: i32, stated: u32) -> Result<(), Refusal> {
     })
 }
 
-/// An operand at the one element this plane's fa2 core is written for.
-///
-/// The cast is the whole function and `at_bf16` is what makes it sound: a
-/// `Tensor<T>` and a `Tensor<bf16>` are one address and two rows-and-width,
-/// so re-marking is free once the element has been checked. The bodies that
-/// landed before this one spell it out at each slot; eight new ones in a row
-/// is what made it a name.
+fn variant_agrees(planned_full: bool, window: u32) -> Result<(), Refusal> {
+    if planned_full == (window == 0) {
+        return Ok(());
+    }
+    Err(Refusal::Narrow {
+        what: "the window this statement states is not the reading this fire's \
+               attention schedule was planned for",
+        at: i64::from(window),
+    })
+}
+
 fn as_in<T: kernels::points::Scalar>(r: &In<Tensor<T>>) -> In<Tensor<bf16>> {
     In {
         ptr: r.ptr.cast::<bf16>(),
@@ -117,7 +69,6 @@ fn as_in<T: kernels::points::Scalar>(r: &In<Tensor<T>>) -> In<Tensor<bf16>> {
     }
 }
 
-/// [`as_in`] for a result.
 fn as_out<T: kernels::points::Scalar>(r: &Out<Tensor<T>>) -> Out<Tensor<bf16>> {
     Out {
         ptr: r.ptr.cast::<bf16>(),
@@ -126,10 +77,6 @@ fn as_out<T: kernels::points::Scalar>(r: &Out<Tensor<T>>) -> Out<Tensor<bf16>> {
     }
 }
 
-/// The pool row's row-validity plane, as the `In<Tensor<i32>>` fiction every
-/// appender in this file carries: the routine casts the pointer to
-/// `*const u8` and the buffer must be BYTES. Null is legal and means every
-/// row of this fire is valid.
 fn row_valid_at(view: &crate::views::PagedKvView, rows: i32) -> In<Tensor<i32>> {
     In {
         ptr: view.row_valid.cast::<i32>(),
@@ -138,8 +85,6 @@ fn row_valid_at(view: &crate::views::PagedKvView, rows: i32) -> In<Tensor<i32>> 
     }
 }
 
-/// The fa2 DECODE reading, shared by the two points that differ only in
-/// whether they keep the log-sum-exp.
 #[allow(clippy::too_many_arguments)]
 fn fa2_decode(
     ctx: &Ctx<'_>,
@@ -151,11 +96,13 @@ fn fa2_decode(
     o: Out<Tensor<bf16>>,
     lse: Option<Out<Tensor<f32>>>,
 ) -> Result<(), Refusal> {
-    let plan = ctx.raised::<crate::raises::Fa2Decode>()?;
-    // SAFETY: `Ctx::raised` answers a live object or refuses; an answerer
-    // that returned a null would be claiming to have staged one.
+    let plan = ctx.raised_at::<crate::raises::Fa2Decode>(kernels::raises::Class::attention(
+        head_dim, window,
+    ))?;
+
     let planned = unsafe { &*plan.ptr };
     agrees(planned.head_dim, head_dim)?;
+    variant_agrees(planned.full_attention_variant, window)?;
     fa2::dispatch_attention_flashinfer_decode(
         ctx,
         q,
@@ -169,8 +116,6 @@ fn fa2_decode(
     )
 }
 
-/// The fa2 PREFILL reading — the planless leg, which carves its own schedule
-/// out of the two host CSR mirrors the executor stages.
 #[allow(clippy::too_many_arguments)]
 fn fa2_prefill(
     ctx: &Ctx<'_>,
@@ -196,63 +141,17 @@ fn fa2_prefill(
         ctx.raised::<crate::raises::Fa2Prefill>()?,
         ctx.raised::<crate::views::QoIndptrHost>()?,
         ctx.raised::<crate::views::KvPageIndptrHost>()?,
-        Const::new(width_of(kv_heads, "the kv head count this attention states")?),
+        Const::new(width_of(
+            kv_heads,
+            "the kv head count this attention states",
+        )?),
         Const::new(window_left(window)?),
         lse,
     )
 }
 
-/// The `Attention` family, claimed — ELEVEN OF ELEVEN, and what closed the
-/// last six was a door rather than six kernels.
-///
-/// # The fa2 core was never missing a kernel
-///
-/// Six points sat on the floor's default body until R4b, and every one of
-/// them for the same reason spelled six ways: the launcher wants PLANE
-/// STAGING that no statement carries — the decode schedule, the prefill plan
-/// cache, the two host CSR mirrors the planless prefill walks, the custom
-/// mask, the fire's write origin. `.wiki/baker.md` says where that belongs
-/// ("the body pulls it from `self`") and R2 built the answering half and left
-/// it caller-less: `driver-cuda/src/bind/views.rs::FireViews::raised`
-/// resolves a driver-owned object BY KEY, which is the only handle a
-/// generated arm could ever have.
-///
-/// `Ctx::raised::<Fa2Decode>()` is that handle. A body asks for the key its
-/// `Raise` declares, the executor answers or refuses WITH THE KEY IN IT, and
-/// the statement's own column is untouched — so the declarations below are
-/// exactly the declarations that were already there. Nothing on the floor
-/// moved to make these land.
-///
-/// # The three conventions these bodies pin
-///
-/// * **`window_left = window - 1`** ([`window_left`]), read off both kernels
-///   rather than guessed, and the staging shims that came before refused a
-///   non-zero window rather than choose. Gemma is the only shipping text that
-///   states one.
-/// * **No soft cap.** The points declare none, so the statement states none,
-///   and `0.0` is what "no cap" spells at `decode_arm`/`prefill_arm`. A text
-///   that wants one wants a slot for it.
-/// * **The write origin is zero** ([`kernels::points::Attention::kv_append`]),
-///   and that is a LANE fact, not an assumption — see the body.
 #[kernels_macros::claims]
 impl kernels::points::Attention for Ctx<'_> {
-    /// One query row per request, through the schedule this fire was raised
-    /// on.
-    ///
-    /// THE SCHEDULE IS A RAISE AND NOT AN OPERAND. `fa2::plan::plan_decode`
-    /// runs on the HOST out of the fire's page CSR, stamps two workspaces
-    /// inside a plan-update fence and leaves an int arena the launch reads
-    /// without bounds-checking it — the plan is what bounded it. A body that
-    /// built one would have to copy the device CSR back mid-fire, which is a
-    /// sync a graph capture cannot record, so the executor stages it once per
-    /// fire and this asks for it by name.
-    ///
-    /// THE STATED HEAD WIDTH IS CHECKED AGAINST IT, because they are two
-    /// accounts of one number: the statement states the width its rectangles
-    /// were cut at, the schedule was planned at the width the executor asked
-    /// for. They agree by construction where the executor reads the ask off
-    /// the lane (`Baked::attn_ask`), and a fire where they do not is a fire
-    /// whose q rows are being read at the wrong pitch.
     fn decode<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -275,9 +174,6 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
-    /// [`kernels::points::Attention::decode`], keeping the per-row
-    /// log-sum-exp. ONE BODY AND TWO POINTS, because the routine is literally
-    /// the same call with `Some(lse)`.
     fn decode_lse<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -301,15 +197,6 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
-    /// The prefill window, through the PLANLESS leg.
-    ///
-    /// THIS ONE PLANS ITSELF, and the two host CSR mirrors are why it can.
-    /// `attention_flashinfer_prefill` walks `qo_indptr_host` and
-    /// `kv_page_indptr_host` — host copies of the device CSRs the executor
-    /// already holds, because it built them — and carves its schedule into
-    /// the plan cache it was handed. Three raises, no operand: a host mirror
-    /// of a device buffer is the definition of plane staging, and the
-    /// executor answers all three by key.
     fn prefill<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -336,7 +223,6 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
-    /// [`kernels::points::Attention::prefill`], keeping the log-sum-exp.
     fn prefill_lse<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -364,20 +250,6 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
-    /// The prefill window under the fire's CUSTOM MASK.
-    ///
-    /// THE MASK IS THE ORDERING, AND IT IS THE ONLY ONE. `prefill_custom_arm`
-    /// selects flashinfer's `kCustom` mask mode and the launcher pins
-    /// `window_left = -1` beside it: a byte per `(q, kv)` pair says which
-    /// pairs attend, and a window applied on top would be a second, disagreeing
-    /// source for the same fact. So a statement that states BOTH is refused by
-    /// name rather than served with one of them dropped — gemma's sliding
-    /// layers state a 512-wide window on this point and the mask this executor
-    /// publishes is plain causal, so serving them would silently widen the
-    /// window to the whole prefix.
-    ///
-    /// The stated head width is read by the SCHEDULE and checked against it,
-    /// for [`kernels::points::Attention::decode`]'s reason.
     fn masked<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -389,22 +261,26 @@ impl kernels::points::Attention for Ctx<'_> {
         o: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         at_bf16::<T>("attention.masked at an element other than bf16")?;
-        if window != 0 {
-            return Err(Refusal::Unstated {
-                what: "a custom mask beside a stated sliding window: the masked arm reads \
-                       the mask and nothing else, so one of the two orderings would be lost",
-            });
-        }
-        let plan = self.raised::<crate::raises::Fa2Prefill>()?;
-        // SAFETY: `Ctx::raised` answers a live object or refuses; an answerer
-        // that returned a null would be claiming to have staged one.
+        let plan = self.raised_at::<crate::raises::Fa2Prefill>(
+            kernels::raises::Class::attention(head_dim, window),
+        )?;
+
         let planned = unsafe { &*plan.ptr };
         agrees(planned.head_dim, head_dim)?;
+        if planned.window_left >= 0 {
+            return Err(Refusal::Narrow {
+                what: "this fire's masked prefill schedule was carved for a windowed \
+                       reading; the window rides the launch, so the schedule has to \
+                       cover the whole prefix",
+                at: i64::from(planned.window_left),
+            });
+        }
         fa2::dispatch_attention_flashinfer_prefill_custom(
             self,
             as_in(&q),
             plan,
             as_out(&o),
+            Const::new(window_left(window)?),
             Const::new(NO_SOFT_CAP),
             Const::new(sm_scale),
             self.raised::<crate::views::AttnMask>()?,
@@ -414,33 +290,6 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
-    /// Leave this fire's keys and values in the pool row the statement names.
-    ///
-    /// [`kernels::points::Attention::kv_append_shared`]'s body with two
-    /// planes instead of one, and the two things that kept it off the floor
-    /// are both answered here rather than dodged:
-    ///
-    /// * **The choice.** `attn::write_kv_to_pages` was never a routine — it
-    ///   was an `untraced!` row standing for a choice `Boot::route` made from
-    ///   the checkpoint's KV storage, long after the trace recorded the
-    ///   statement, and a claim cannot delegate to a name that is not a body.
-    ///   A BODY fires with the pool row in hand and `PagedKvView::native_bf16`
-    ///   IS that fact, so the choice happens at the fire, where the fact is.
-    ///   The row is deleted; the two legs it stood for are called directly.
-    ///
-    /// * **The write origin.** `first_token` is how many leading rows a fused
-    ///   producer already left in the pages, and it is ZERO for every
-    ///   statement of this point — not by assumption but because the split
-    ///   that could make it non-zero is a LANE SPLIT. Gemma is the only text
-    ///   with a fused producer, and it states
-    ///   `normed.split(&(Facts::qo_one() & !Facts::masked()))`: a predicate
-    ///   over the fire's FACT WORD, so a lane either takes the fused arm for a
-    ///   layer or takes this one, never both. Measured on the traced plans —
-    ///   gemma-e4b's decode lane carries 20 fused writes and 4 appends and
-    ///   they are disjoint LAYERS, and every other lane carries appends
-    ///   alone. Every row of this fire is therefore this statement's to write,
-    ///   which is what `kv_append_shared` says for dsv4 and what a peel would
-    ///   have to come back to change.
     fn kv_append<T: kernels::points::Scalar>(
         &self,
         k: In<Tensor<T>>,
@@ -462,10 +311,7 @@ impl kernels::points::Attention for Ctx<'_> {
             rows: view.requests,
             width: 1,
         };
-        // THE WRITE ORIGIN IS ZERO, AND IT RIDES A POINTER. Both appenders
-        // declare `first_token: In<Tensor<i32>>` and then read `ptr as i32` —
-        // the mark carries a NUMBER, which is the fiction that operand has
-        // always been. Null is that number's zero.
+
         let origin = In {
             ptr: core::ptr::null::<i32>(),
             rows: 1,
@@ -484,10 +330,6 @@ impl kernels::points::Attention for Ctx<'_> {
                 row_valid_at(view, k.rows),
             )
         } else {
-            // THE SHORTER LEG, and its operand list is this one's prefix by
-            // construction: the quantised appender refuses a non-zero origin
-            // outright and has no partial rows to skip, so `row_valid` is
-            // what hangs off the end and nothing else moves.
             kv_paged::write_kv_to_pages_quantised(
                 self,
                 k,
@@ -501,14 +343,6 @@ impl kernels::points::Attention for Ctx<'_> {
         }
     }
 
-    /// THE REBASE IS THE POINT'S, AND `attn_sink_rescale` IS THE KERNEL
-    /// THAT HAS IT. Two kernels in this crate fold a sink: this one, which
-    /// reads the sink at `T` and multiplies the lse by `ln 2` on the way
-    /// into the sigmoid, and `norm::attn_sink_correction`, which reads it
-    /// at f32 and does not rebase. The declaration says base two and says
-    /// the sink is the checkpoint's element, so there is exactly one of
-    /// them left that answers it; the other keeps its own name for the
-    /// legacy dsv4 text that still calls it and dies with that crate.
     fn sink<T: kernels::points::Scalar>(
         &self,
         o: InOut<Tensor<T>>,
@@ -553,8 +387,7 @@ impl kernels::points::Attention for Ctx<'_> {
     ) -> Result<(), Refusal> {
         let heads = width_of(heads, "the head count this merge states")?;
         let head_dim = width_of(head_dim, "the head width this merge states")?;
-        // `attn/dsv4_compress.cuh`'s grid: one block per (row, head), the
-        // block as wide as a head and clamped into a launchable range.
+
         const COMBINE_BLOCK_MIN: u32 = 32;
         const COMBINE_BLOCK_MAX: u32 = 256;
         self.fire(
@@ -601,44 +434,6 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
-    /// Leave dsv4's ONE plane in the pool row, as both halves of the read.
-    ///
-    /// THE ALIAS IS THE WHOLE BODY. `write_kv` reads `k_curr` and `v_curr`
-    /// and writes `k_pages` and `v_pages` (`attn/kv_paged.cuh:202-203`),
-    /// and the two source planes are `const bf16* __restrict__` that
-    /// NOTHING in the kernel modifies — `restrict` constrains an object
-    /// that is written through a restricted pointer, so two read-only
-    /// pointers to one buffer are the legal reading of it and not a hole
-    /// in it. The two DESTINATIONS stay distinct (a pool's `keys` and
-    /// `values` are separate planes), which is the pair the qualifier is
-    /// actually about. And the alias is the shipped arithmetic rather than
-    /// a new one: the legacy dsv4 text calls
-    /// `write_kv_to_pages(&kv, &kv, ..)` with the same plane in both slots
-    /// (`model-legacy/src/deepseek_v4/forward/mod.rs:198`).
-    ///
-    /// WHY THIS LANDS WHERE [`kernels::points::Attention::kv_append`] DOES
-    /// NOT. The core append's claim sits on an `untraced!` row for two
-    /// reasons (see `WRITE_KV_TO_PAGES_ROW`) and the shared form answers
-    /// both rather than dodging them:
-    ///
-    /// * `first_token` is the fire's WRITE ORIGIN — how many leading rows a
-    ///   fused QKV kernel already left in the pages — and this statement has
-    ///   no fused prefix to skip. dsv4 projects the plane with
-    ///   `gemm.matmul`, normalises it, rotates it and appends the result;
-    ///   every row of it is this point's to write, so the origin is zero
-    ///   BY THE TEXT and not by a resident the driver stages.
-    /// * `attn::write_kv_to_pages` is a DECLARATION STANDING FOR A CHOICE
-    ///   `Boot::route` makes from the checkpoint's KV storage, and a claim
-    ///   cannot delegate to a name that is not a body yet. A BODY fires with
-    ///   the pool row in hand, though, and `PagedKvView::native_bf16` is
-    ///   that same fact — so the choice is made here, at the fire, instead
-    ///   of before the thing it reads exists. That is the plane-side branch
-    ///   `.wiki/baker.md` puts inside a body, on a fact off the pool row
-    ///   rather than off the operands' dims.
-    ///
-    /// The rest is `mla.kv_append`'s reading verbatim: the destination
-    /// arithmetic is the fire's CSR, the page CSR, the last-page lengths and
-    /// the row validity, and every one of those is a `PagedKvView` field.
     fn kv_append_shared<T: kernels::points::Scalar>(
         &self,
         plane: In<Tensor<T>>,
@@ -653,7 +448,7 @@ impl kernels::points::Attention for Ctx<'_> {
             });
         }
         let (kv_heads, head_dim) = head_split(view, plane.width)?;
-        // ONE ADDRESS, TWICE — see this method's header.
+
         let shared = In {
             ptr: plane.ptr.cast::<bf16>(),
             rows: plane.rows,
@@ -664,10 +459,7 @@ impl kernels::points::Attention for Ctx<'_> {
             rows: view.requests,
             width: 1,
         };
-        // THE WRITE ORIGIN IS ZERO, AND IT RIDES A POINTER. Both appenders
-        // declare `first_token: In<Tensor<i32>>` and then read `ptr as i32`
-        // — the mark carries a NUMBER, which is the fiction that operand
-        // has always been. Null is that number's zero.
+
         let origin = In {
             ptr: core::ptr::null::<i32>(),
             rows: 1,
@@ -683,10 +475,6 @@ impl kernels::points::Attention for Ctx<'_> {
                 Const::new(head_dim),
                 origin,
                 csr,
-                // ONE BYTE PER ROW BEHIND AN `In<Tensor<i32>>`, which is the
-                // fiction every appender in this file carries: the routine
-                // casts the pointer to `*const u8` and the buffer must be
-                // bytes. Null is legal and means every row is valid.
                 In {
                     ptr: view.row_valid.cast::<i32>(),
                     rows: plane.rows,
@@ -694,10 +482,6 @@ impl kernels::points::Attention for Ctx<'_> {
                 },
             )
         } else {
-            // THE SHORTER LEG, and its operand list is this one's prefix by
-            // construction (`write_kv_to_pages_bf16`'s own note says why):
-            // the quantised appender has no partial rows to skip, so
-            // `row_valid` is what hangs off the end and nothing else moves.
             kv_paged::write_kv_to_pages_quantised(
                 self,
                 shared,
@@ -712,25 +496,6 @@ impl kernels::points::Attention for Ctx<'_> {
     }
 }
 
-/// A pool row's head geometry, read off the strides it was laid out with.
-///
-/// A SHARED PLANE CARRIES NO HEAD GEOMETRY, which is why the declaration
-/// states none: dsv4's `kv_down` is `[heads * head_dim, hidden]` and what
-/// comes out of it is one rectangle with no seam in it. The POOL knows,
-/// and says so twice — `driver-cuda/src/bind/views.rs::kv_view` computes
-/// `seq_stride` and `head_stride` from the layer's `num_kv_heads` and
-/// `head_dim`, one way round for NHD (a page is
-/// `[page_size, kv_heads, head_dim]`, so a token step crosses every head
-/// and a head is `head_dim`) and the other for HND (a page is
-/// `[kv_heads, page_size, head_dim]`, so a token step IS `head_dim`). The
-/// head width is therefore whichever of the two the layout makes it, and
-/// the count is the appended row's own width over that.
-///
-/// READ OFF THE POOL AND NOT OFF THE TEXT, deliberately. The write has to
-/// agree with the layout the pages were allocated in; a head count taken
-/// from a statement and a pool laid out for another is the failure
-/// `baker::geometry::agrees_with` exists to catch, and here there is
-/// nothing to cross-check against because the statement says nothing.
 fn head_split(view: &crate::views::PagedKvView, row: i32) -> Result<(i32, i32), Refusal> {
     const WHAT: &str = "the head width this pool row's strides spell";
     let wide = if view.layout != 0 {
@@ -842,15 +607,15 @@ const fn scheme_byte(n: i32) -> u8 {
 
 pub mod attention_flashinfer {
     use crate::jit::{Ctx, Launch};
-    use crate::routine::Fire;
+    use kernels::plane::Fire;
 
     use crate::jit::abi::Tensor;
     use kernels::Refusal;
-    use kernels::routine::{In, Out};
+    use kernels::plane::{In, Out};
 
     use kernels::Bind;
 
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn attn_score_fold_heads(
         ctx: &Ctx<'_>,
         scores: In<Tensor<f32>>,
@@ -1267,8 +1032,7 @@ pub mod mla_naive {
         pub num_heads: i32,
         pub sm_scale: f32,
         pub causal: bool,
-        /// The width of one `selection` row — `index.topk`'s stated budget.
-        /// Zero when the fire carries no selection.
+
         pub top_k: i32,
     }
 
@@ -1283,9 +1047,7 @@ pub mod mla_naive {
         pub kv_page_indptr: *const u32,
         pub kv_last_page_lens: *const u32,
         pub o: *mut bf16,
-        /// `index.topk`'s answer: `[total_tokens, top_k]` of `i32`,
-        /// ascending, `-1` past the end. NULL IS LEGAL and means every key —
-        /// which is what the two unselected readings pass.
+
         pub selection: *const i32,
     }
 
@@ -1296,15 +1058,6 @@ pub mod mla_naive {
         Declined(NaiveDecline),
     }
 
-    /// Which arm answers, `selected` saying whether this fire carries an
-    /// `index.topk` list.
-    ///
-    /// THE TENSOR-CORE ARM CANNOT BE SELECTED. `mla_mma_paged_kernel` stages
-    /// `kBK` CONTIGUOUS keys through one `cp.async` copy of `sK`; walking a
-    /// selection would mean gathering the tile, which is a different kernel
-    /// and not a predicate. So a selected fire takes the scalar arm on every
-    /// device, and that is the whole of the branch — no capability is read
-    /// here and none is read by the two selected claims either.
     pub fn plan(shape: NaiveShape, have_indptr: bool, selected: bool) -> NaivePlan {
         pub const MMA_THREADS: u32 = 256;
 
@@ -1558,15 +1311,6 @@ pub mod mla_fa2 {
         pub lse: *mut f32,
     }
 
-    /// The MLA parameter block a launch is handed, laid out from a plan.
-    ///
-    /// # Safety
-    ///
-    /// `buffers` must hold device addresses into the arena the plan was
-    /// measured against: `int_buffer` must reach every offset `plan` states,
-    /// and the float and output pointers must address `shape`'s extents. The
-    /// result borrows none of them -- it is a block of raw addresses -- so they
-    /// must outlive the launch that reads it, not this call.
     #[must_use]
     pub unsafe fn pack(
         plan: &MlaPlanInfo,
@@ -1574,28 +1318,6 @@ pub mod mla_fa2 {
         buffers: Buffers,
         want_lse: bool,
     ) -> MlaParams {
-        /// AN ARENA OFFSET IS BYTES, and this used to apply it as
-        /// ELEMENTS: `base.cast::<T>().offset(o)` walks `o * size_of::<T>()`
-        /// bytes, so every plan address the kernel was handed was four
-        /// times as far in as `attn::plan::mla::plan` had written it.
-        ///
-        /// The offsets are bytes at both ends of the plan.
-        /// `AlignedAllocator::alloc` is handed a SIZE IN BYTES
-        /// (`alloc(4 * MAX_TOTAL_NUM_WORKS, ..)` for an i32 array of
-        /// `MAX_TOTAL_NUM_WORKS`, and `rows * SIZEOF_DTYPE_O * head_dim_o`
-        /// for the partial-output plane), and `Staging::put_i32s` writes at
-        /// the byte offset it returns. `attn::fa2::params::offset_ptr` — the
-        /// same function for the decode and prefill plans, on the path that
-        /// has always fired — is `base.saturating_add(off)` on a raw
-        /// address, which is this.
-        ///
-        /// It survived because NOTHING FIRED IT: MLA has no forward path in
-        /// the legacy driver (`serve/load.rs` refuses `KvStyle::Mla` at
-        /// load), so the first caller of this pack is `W7`'s columned
-        /// routine and the first reader is `tests/mla_paged.rs`, where it
-        /// showed up as an all-zero output — `work_indptr` read four times
-        /// past its array, found zeros, and every cluster concluded it had
-        /// no work.
         unsafe fn offset_ptr<T>(base: *mut u8, offset: i64) -> *mut T {
             unsafe { base.offset(offset as isize).cast::<T>() }
         }
@@ -1693,39 +1415,6 @@ pub enum MlaDispatch {
     Naive(mla_naive::MlaNaive),
 }
 
-/// The latent attention, once, under all four readings that name it.
-///
-/// NOT A ROUTINE ANY MORE, and that is `W7`'s attention half. This was
-/// `#[routine(untraced)]`: a row with NO OPERAND COLUMN, an `unsafe fn`
-/// taking a host `&MlaPlan` and a `MlaLayer` beside the page view, and
-/// answering with a `MlaDispatch` saying which kernel it picked. A row like
-/// that cannot honestly carry a `canon` — there is nothing for a binder to
-/// bind and nothing for a claim to delegate to, which is exactly what
-/// `kernels/src/points.rs` recorded against these four points. The four
-/// readings are `#[claims]` bodies now — each takes the statement's own
-/// operands with the plan as a RAISE — and this is the shared launch they
-/// call. It still answers with its CHOICE, because the device tests and the
-/// benchmarks read which kernel it picked; the four callers drop it.
-///
-/// # The plan
-///
-/// `plan` must have been measured against the same page table this `Ctx`
-/// will answer for: the page indices, the indptrs and the last-page lengths
-/// are read as device addresses without a bound check, because the plan is
-/// what bounded them. That is the `Fa2Decode` contract verbatim, and it is
-/// why the four points stay CLAIM-ONLY rather than gaining bodies — see the
-/// `Mla` impl's header.
-///
-/// `qo_indptr` arrives as a raw device address because its binder differs
-/// per reading: a prefill states its CSR, a decode reads the fire's off the
-/// pool row.
-///
-/// THE SELECTED READINGS DO NOT COME THROUGH HERE. This function's whole
-/// content is the compute-capability branch, and a selection has no branch
-/// to make: `MlaParams` (`attention_mla_fa2.cuh`) carries no selection and
-/// the tensor-core arm cannot walk one, so `mla_naive`'s SCALAR kernel is
-/// the only latent attention in this tree that honours a selection on any
-/// device. [`selected_attention_mla_bf16`] is that one arm.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_attention_mla_bf16(
     ctx: &Ctx<'_>,
@@ -1793,27 +1482,7 @@ pub fn dispatch_attention_mla_bf16(
             what: "a `DISPATCH_SMEM_CONFIG` arm for this device's shared memory per SM",
         });
     };
-    // THE NARROWEST ARM WRITES PAST ITS OWN SHARED STORAGE, measured rather
-    // than suspected. `tests/mla_paged.rs` fired arm 2 — `NUM_STAGES = 1`,
-    // `CTA_TILE_KV = 16`, `QK_SHARD = false` — on an L40S (sm_89, 102 400 B
-    // of smem per SM) and `compute-sanitizer` answered: *"Invalid __shared__
-    // write of size 16 bytes ... Access to 0x17040 is out of bounds"*, at
-    // 94 272 into a 92 672-byte allocation, from every thread of warpgroup
-    // 1. The allocation is not the error: `sizeof(SharedStorage)` for this
-    // arm IS 92 672 (65 536 q_nope + 8 192 q_pe + 16 384 ckv + 2 048 kpe/p
-    // + 512 m_wg), which is the literal `DISPATCH_SMEM_CONFIG` compares
-    // against and the number the launch passes. The overrun is 4 160 bytes
-    // past `kpe_p_smem`'s base, and that union member is the one this arm
-    // squeezes: it is sized `CTA_TILE_KV * max(HEAD_DIM_KPE, CTA_TILE_Q)`
-    // for the KPE tile, while the P tile it shares with is written through
-    // `SWIZZLE_MODE_P`, which drops to `k64B` exactly at `CTA_TILE_KV < 64`.
-    //
-    // THIS IS THE ONLY ARM A ≤147 967-BYTE DEVICE CAN PICK, so the refusal
-    // costs nothing that worked: every latent attention on an L40S-class
-    // part ends in an illegal address that kills the context, and a named
-    // refusal is what the plane owes a caller instead. H100/H200 (227 KB)
-    // take arm 0 and A100 (164 KB) takes arm 1; neither is implicated, and
-    // neither is the sm_100 naive path above.
+
     if mla_fa2::ARMS[arm].cta_tile_kv < 32 {
         return Err(Refusal::Absent {
             what: "a latent attention arm this device can run: the only \
@@ -1853,15 +1522,6 @@ pub fn dispatch_attention_mla_bf16(
     Ok(MlaDispatch::Fa2 { arm })
 }
 
-/// The `MlaLayer` staging, read off the POOL ROW a statement names.
-///
-/// THE LATENT POOL'S TWO PLANES ARE `keys` AND `values`, in the order
-/// `driver-cuda/src/pools/mla_cache.rs` allocates and swaps them: `ckv`
-/// `[pages, page_size, kv_lora_rank]` first, `kpe`
-/// `[pages, page_size, qk_rope_head_dim]` second. One `PagedKvView` serves
-/// both pool shapes because a page plane is a base address and a pitch, and
-/// the two pitches are not the view's — they are the statement's, which is
-/// why they arrive here as arguments.
 fn mla_layer(kvc: &crate::views::PagedKvView, kv_lora_rank: i32, rope_dim: i32) -> MlaLayer {
     MlaLayer {
         ckv_pages: kvc.keys.cast::<c_void>(),
@@ -1872,8 +1532,6 @@ fn mla_layer(kvc: &crate::views::PagedKvView, kv_lora_rank: i32, rope_dim: i32) 
     }
 }
 
-/// The rope half's width, off the query's own rectangle: `q_pe` is
-/// `[tokens, heads * qk_rope_head_dim]` and `heads` is stated.
 fn rope_per_head(q_pe: &In<Tensor<bf16>>, heads: i32) -> Result<i32, Refusal> {
     if heads <= 0 {
         return Err(Refusal::Empty {
@@ -1889,7 +1547,6 @@ fn rope_per_head(q_pe: &In<Tensor<bf16>>, heads: i32) -> Result<i32, Refusal> {
     Ok(q_pe.width / heads)
 }
 
-/// The plan raise, dereferenced, or a refusal naming it.
 fn mla_plan_of(plan: &In<Struct<crate::raises::MlaPlanned>>) -> Result<&MlaPlan, Refusal> {
     if plan.ptr.is_null() {
         return Err(Refusal::Null {
@@ -1899,7 +1556,6 @@ fn mla_plan_of(plan: &In<Struct<crate::raises::MlaPlanned>>) -> Result<&MlaPlan,
     Ok(unsafe { &*plan.ptr })
 }
 
-/// The pool row, dereferenced, or a refusal naming it.
 fn kv_view_of(kvc: &In<Struct<KvCache>>) -> Result<&crate::views::PagedKvView, Refusal> {
     if kvc.ptr.is_null() {
         return Err(Refusal::Null {
@@ -1909,20 +1565,6 @@ fn kv_view_of(kvc: &In<Struct<KvCache>>) -> Result<&crate::views::PagedKvView, R
     Ok(unsafe { &*kvc.ptr })
 }
 
-/// `mla.attention_decode`: one query row per request, in the latent basis.
-///
-/// The fire's CSR comes off the POOL ROW here and not off an operand,
-/// because the declaration states none: a decode reading is one row per
-/// request and the statement carries no window. `PagedKvView::qo_indptr` is
-/// the same buffer `attention_mla_prefill_bf16` takes as its second operand
-/// — the driver stages one per fire and hands it to both.
-/// The MLA decode launch, which `mla.attention_decode` names.
-///
-/// A POINT AND A TEST reach it: the claim above, and
-/// `tests/mla_paged.rs`, which measures the planned leg against the ragged
-/// one and against an unplanned and an unbound view — three refusals a
-/// claim body cannot state on its own, because a raise answers or refuses
-/// before the body runs.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_mla_decode_bf16(
     ctx: &Ctx<'_>,
@@ -1948,9 +1590,6 @@ pub fn attention_mla_decode_bf16(
         o,
         heads,
         sm_scale,
-        // NOT CAUSAL: one query row per request sees the whole cached
-        // prefix, and there is no second row for a mask to order it
-        // against. `attention.decode`'s own dispatch reads the same way.
         false,
         kvc,
         view.qo_indptr as *const u32,
@@ -1960,25 +1599,6 @@ pub fn attention_mla_decode_bf16(
     .map(|_| ())
 }
 
-/// The SELECTED latent attention, on the one arm that can serve it.
-///
-/// NO CAPABILITY BRANCH, and that is the finding rather than a shortcut.
-/// [`dispatch_attention_mla_bf16`] branches because two dense kernels
-/// exist; only ONE latent attention in this tree can take a selection at
-/// all. The FA2 MLA kernel's `MlaParams` carries no selection pointer and
-/// no budget for one, and `mla_mma_paged_kernel` stages `kBK` contiguous
-/// keys through a single `cp.async` copy — a list would have to be gathered
-/// into that tile, which is a different kernel. `mla_naive_paged_kernel`
-/// resolves every key through the page table one at a time, so walking a
-/// list costs it nothing but the indirection, and `mla_naive::plan` declines
-/// the tensor-core arm whenever a selection is present.
-///
-/// So a selected fire runs the scalar kernel on an H100 exactly as it does
-/// on a B200 — SLOWER than the arm a dense fire would take, and correct,
-/// which is the trade a sparse reading is asking for in the first place.
-/// The L40S-class refusal `dispatch_attention_mla_bf16` carries (the
-/// `CTA_TILE_KV = 16` arm that writes past its own `SharedStorage`) does not
-/// reach here at all: that is an FA2 arm and this path never picks one.
 #[allow(clippy::too_many_arguments)]
 fn selected_attention_mla_bf16(
     ctx: &Ctx<'_>,
@@ -1999,16 +1619,10 @@ fn selected_attention_mla_bf16(
             what: "the selection this attention attends over",
         });
     }
-    // THE BUDGET IS THE OPERAND'S OWN WIDTH and is restated nowhere: the
-    // selection is `[tokens, top_k]` and `index.topk` is the only place
-    // `top_k` was ever written down. A statement that restated it could
-    // disagree with the rectangle that was actually written.
+
     let sel = selection.all("the selection this attention attends over")?;
     let top_k = sel.width;
-    // ONE SELECTION ROW PER QUERY ROW. The kernel reads
-    // `selection + t * top_k` for every `t` the output has, so a selection
-    // shorter than the query is a read past the rectangle rather than a
-    // wrong answer — named here, where both rows are in hand.
+
     if sel.rows != o.rows {
         return Err(Refusal::Narrow {
             what: "the selection does not carry one row per query row",
@@ -2055,89 +1669,16 @@ fn selected_attention_mla_bf16(
                 at: i64::from(shape.qk_rope_head_dim),
             },
         }),
-        // The tensor-core arm is declined by `plan` whenever a selection is
-        // present, so this is the scalar one and the match is exhaustive
-        // rather than hopeful.
+
         mla_naive::MlaNaive::LaunchedScalar | mla_naive::MlaNaive::LaunchedMma => Ok(()),
     }
 }
 
-pub mod qkv_fused {
-    
-    
+pub mod qkv_fused {}
 
-    
-    
-
-    
-    
-    
-
-
-}
-
-/// This plane's TIER-2 SURFACE: what one plane can do that no floor states.
-///
-/// `.wiki/baker.md`: *"Tier-2 = an inherent method on `Ctx`. No trait, no
-/// floor entry — an inherent impl can only live in the plane crate, which is
-/// the whole rule."* `#[claims]` reads this block the way it reads a family
-/// impl and writes ONE table for it (`TIER2_POINTS`), because a tier-2 point
-/// is declared and claimed by the same line: there is no obligation to
-/// measure against and so no backlog row it could be.
-///
-/// THE POINT'S NAME IS THE METHOD'S, WITHOUT THE PLANE. A text spells this
-/// statement `cuda::qkv_fused_qknorm_rope_vnorm_write` and the `cuda::`
-/// prefix is the LOWERING'S GATE — `model_compiler::sweep::resolve` files a
-/// violation when another plane's plan states it, and `call_of` strips it on
-/// the way to `Call::Tier2`. Inside this crate there is nothing left to gate,
-/// and a plane crate that spelled its own name in its own table would be
-/// stating the gate a second time. The two name spaces cannot collide in the
-/// generated dispatch's one match either way: a tier-1 point is
-/// `family.method` and carries a dot, an inherent method cannot.
 #[kernels_macros::claims]
 impl Ctx<'_> {
-    /// gemma's fused decode step: ONE launch for the packed QKV row's split,
-    /// both head norms, rope, and the kv write into the pages.
-    ///
-    /// # Why this is tier-2 and not a point
-    ///
-    /// It is not a kernel the floor could ask every plane for. It is a
-    /// FUSION — five points' worth of work (`layout.split_qkv`,
-    /// `rmsnorm.per_head` twice, `rope.full`, `attention.kv_append`) collapsed
-    /// into one launch because this plane has a kernel that does all five in
-    /// registers. A floor entry for it would oblige every plane to either
-    /// write that kernel or carry a backlog row for a fusion it has no reason
-    /// to want, which is precisely the obligation tier-2 exists to not
-    /// create. So gemma's text states it behind `inputs.cuda()` with the
-    /// unfused chain as the else, and both arms are on the traced plan.
-    ///
-    /// # The two epsilons
-    ///
-    /// The statement names two `Norm`s and so states two epsilons; the kernel
-    /// takes ONE and applies it to both head norms. They agree in gemma's
-    /// text by construction (`d.norm_eps`, spelled once and read twice), and
-    /// a statement where they do not is REFUSED BY NAME rather than served
-    /// with one of them dropped — `attention.masked`'s window-beside-a-mask
-    /// precedent, for the same reason: the kernel would silently normalise k
-    /// at q's epsilon and the answer would be plausible and wrong.
-    ///
-    /// # No rope table, by declaration
-    ///
-    /// The `.cuh` behind this takes an optional precomputed rope table and
-    /// dispatches on its null. This declaration states `theta` and no table
-    /// slot, so a table can never arrive and the tableless instantiation is
-    /// the only one reachable — which is why the two `<.., false>` arms are
-    /// spelled here and their `true` siblings are not. A text that wants a
-    /// table wants a slot for it, and adding one is a declaration change that
-    /// regenerates the dispatch.
-    ///
-    /// # The staging
-    ///
-    /// `row_valid` comes off the POOL ROW and not off `Ctx::staged`, which is
-    /// the rule `crate::views::RowValid`'s own header states: a point that
-    /// names a cache row reads the plane the view already carries, and the
-    /// raise is declared for the points that name no row at all. The write
-    /// origin, the page CSR and the request count come from the same view.
+    #[shape(q = [packed.rows, packed.width - 2 * kv_heads * head_dim])]
     #[allow(clippy::too_many_arguments)]
     pub fn qkv_fused_qknorm_rope_vnorm_write<T: kernels::points::Scalar>(
         &self,
@@ -2170,10 +1711,7 @@ impl Ctx<'_> {
             });
         }
         let (packed, q_out) = (as_in(&packed), as_out(&q));
-        // THE Q HEADS ARE THE PACKED ROW LESS THE TWO KV PLANES, which is the
-        // same arithmetic `model_compiler::program` runs to SIZE the result:
-        // the two kv planes go straight into the pages and never reach the
-        // arena, so what is left of the packed row is q.
+
         let width = packed.all("the packed qkv row this write splits")?.width;
         let num_q_heads = (width - 2 * kv_heads * head_dim) / head_dim;
         if num_q_heads <= 0 {
@@ -2193,29 +1731,25 @@ impl Ctx<'_> {
         let w_page = view.write_page as *const u32;
         let w_off = view.write_offset as *const u32;
         let row_valid = view.row_valid;
-        // NO ROPE TABLE AND NO WINDOW PLANE, both by declaration: the kernel
-        // reads a null for each as "compute the angles from `theta`" and "no
-        // per-request window", and neither is a slot this statement carries.
+
         let rope_table = core::ptr::null::<f32>();
         let win = core::ptr::null::<u32>();
         let page_size = view.page_size;
         let hnd_layout = view.layout != 0;
 
-        // THE WARP ARM IS THE NARROW ONE, and its instantiation is the head
-        // width: one warp per (request, head) at a width the kernel has a
-        // register tiling for. Everything else takes the block arm, whose
-        // 128-wide instantiation reads the width as a runtime argument.
         const WARP_BLOCK: u32 = 256;
         const WARPS_PER_BLOCK: u32 = WARP_BLOCK / 32;
         const DECODE_BLOCK: u32 = 128;
         let warped = match head_dim {
-            64 => Some("::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(64), false>"),
-            128 => {
-                Some("::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(128), false>")
-            }
-            256 => {
-                Some("::pie::attn::qkv_decode_qk_norm_rope_write_kv_warp<::pie::i32(256), false>")
-            }
+            64 => Some(
+                "::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(64), false>",
+            ),
+            128 => Some(
+                "::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(128), false>",
+            ),
+            256 => Some(
+                "::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>",
+            ),
             _ => None,
         };
         if let Some(instantiation) = warped {
@@ -2254,9 +1788,12 @@ impl Ctx<'_> {
         self.fire(
             Fire::at(
                 "attn/qkv_fused.cuh",
-                "::pie::attn::qkv_decode_qk_norm_rope_write_kv<::pie::i32(128), false>",
+                "::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false>",
             )
-            .apply(Launch::grid([rows.unsigned_abs(), heads, 1], [DECODE_BLOCK, 1, 1])),
+            .apply(Launch::grid(
+                [rows.unsigned_abs(), heads, 1],
+                [DECODE_BLOCK, 1, 1],
+            )),
             &[
                 packed.arg(),
                 q_out.arg(),
@@ -2285,9 +1822,6 @@ impl Ctx<'_> {
     }
 }
 
-/// One block per row, the block a whole number of warps as wide as the row
-/// asks for, capped at the launch maximum. `attn/dsv4_compress.cuh`'s two
-/// entry-copy kernels are gridded this way and nothing else in this file is.
 #[expect(
     clippy::cast_sign_loss,
     reason = "both are guarded positive by every caller"
@@ -2309,8 +1843,8 @@ pub mod kv_paged {
     use crate::views::KvCache;
     use core::ffi::c_void;
 
+    use kernels::plane::{Const, In, Out};
     use kernels::raises::Struct;
-    use kernels::routine::{Const, In, Out};
     use kernels::{Bind, Fire};
 
     const BLOCK: u32 = 256;
@@ -2339,25 +1873,14 @@ pub mod kv_paged {
         (total_tokens + page_size - 1) / page_size + num_requests
     }
 
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_kv_to_pages_bf16(
         ctx: &Ctx<'_>,
         k_curr: In<Tensor<bf16>>,
         v_curr: In<Tensor<bf16>>,
         kvc: In<Struct<KvCache>>,
         num_kv_heads: Const<i32>,
-        // THE TWO LEGS AGREE BY PREFIX, which is why `first_token` precedes
-        // the CSR here even though the body reads the CSR first.
-        // `attn::write_kv_to_pages` is a declaration standing for a CHOICE:
-        // a model text states the outer name and `Boot::route` picks this
-        // body or `write_kv_to_pages_quantised` from a fact the CHECKPOINT
-        // settles, long after the trace was recorded. One statement therefore
-        // has to bind correctly under either leg, and a `Source` is
-        // POSITIONAL -- so the only arrangement that can work is the one
-        // where the shorter leg's operand list is a prefix of the longer's.
-        // The quantised appender takes no row-validity mask (it refuses a
-        // non-zero write origin outright and has no partial rows to skip), so
-        // `row_valid` is what hangs off the end.
+
         head_dim: Const<i32>,
         first_token: In<Tensor<i32>>,
         qo_indptr: In<Tensor<i32>>,
@@ -2376,7 +1899,7 @@ pub mod kv_paged {
         let has_envelopes = kvc.has_envelopes;
         let k_pages = kvc.keys;
         let v_pages = kvc.values;
-        // The request count is the CSR operand's own row count.
+
         let num_requests = qo_indptr.rows;
         let qo_indptr = qo_indptr.ptr as *const u32;
         let kv_page_indices = kvc.page_indices as *const u32;
@@ -2465,7 +1988,7 @@ pub mod kv_paged {
         Ok(())
     }
 
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_kv_to_pages_quantised(
         ctx: &Ctx<'_>,
         k_curr: In<Tensor<bf16>>,
@@ -2493,7 +2016,7 @@ pub mod kv_paged {
         let v_pages = kvc.values;
         let k_scales = kvc.key_scales as *mut core::ffi::c_void;
         let v_scales = kvc.value_scales as *mut core::ffi::c_void;
-        // The request count is the CSR operand's own row count.
+
         let num_requests = qo_indptr.rows;
         let qo_indptr = qo_indptr.ptr as *const u32;
         let kv_page_indices = kvc.page_indices as *const u32;
@@ -2830,8 +2353,7 @@ pub fn attn_res_blend<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     prefix: In<Tensor<T>>,
     blocks: In<Tensor<T>>,
-    // WEIGHTS, so the statement names them and the chain binds them --
-    // an `In` slot here read operands the text never places.
+
     norm_weight: Const<Tensor<T>>,
     proj_weight: Const<Tensor<T>>,
     out: Out<Tensor<T>>,
@@ -2994,14 +2516,6 @@ pub struct MlaLayer {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct AttnWorkspace {
-    pub float_buffer: *mut c_void,
-    pub float_bytes: usize,
-    pub int_buffer: *mut c_void,
-    pub int_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct MlaPlan {
     pub info: crate::attn::plan::info::MlaPlanInfo,
     pub int_arena: *mut c_void,
@@ -3018,7 +2532,6 @@ pub struct Plan {
     pub requests: i32,
 }
 
-/// A stated width, as a routine's `Const<i32>` asks for it.
 fn width(what: &'static str, v: u32) -> Result<i32, Refusal> {
     i32::try_from(v).map_err(|_| Refusal::Wide {
         what,
@@ -3027,15 +2540,6 @@ fn width(what: &'static str, v: u32) -> Result<i32, Refusal> {
     })
 }
 
-/// The bf16 pin, stated as a refusal BY NAME.
-///
-/// Every routine the three families below delegate to is spelled at bf16 and
-/// nowhere else — the absorbs because cuBLAS is handed `CUDA_R_16BF`
-/// literally, the two index rotations because their `where` clauses ask for
-/// `*const T: Abi`, which holds one pointee at a time. A point quantifies
-/// over `Scalar`, so the claim says the pin rather than widening it with a
-/// cast no kernel stands behind. The `gate.sigmoid_mul` precedent, and the
-/// `ssm` conv points' before it.
 fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal> {
     if T::CPP == <bf16 as kernels::Elem>::CPP {
         Ok(())
@@ -3044,80 +2548,6 @@ fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal
     }
 }
 
-/// The `Mla` family, claimed. Six of eleven points land.
-///
-/// The two cuts delegate straight through — `kimi_split_kv_a_norm` reads the
-/// latent width back off the `Out` the statement sized, so the stated
-/// `kv_lora_rank` is recorded and unread, the `moe.experts` reading.
-///
-/// THE TWO ABSORBS ARE WHY THE POINTS STATE A WIDTH THEY NEVER USE.
-/// `mla_absorb_q_to_latent_bf16` is a strided batched gemm over the whole
-/// `[heads, nope_dim + v_head_dim, kv_lora_rank]` bank, and the stride it
-/// walks between heads is `(nope_dim + v_head_dim) * kv_lora_rank` — BOTH
-/// halves, whichever half the gemm multiplies by. A `Const` weight carries
-/// an address and no rectangle, so neither half is in the operands; the
-/// declaration states both on both points and each body uses the one it
-/// needs and passes the other through. `tokens` is NOT stated: it is
-/// `q_nope.rows`, which is what the legacy lowering spliced there.
-///
-/// `mla.kv_append` IS THE LAUNCHER-SHAPED ONE, and it lands because the
-/// pool row grew the fire it was always built out of. `write_mla` resolves
-/// a destination from the query CSR, the page CSR, the last-page lengths
-/// and the fire's row validity; four of those five were already fields of
-/// `PagedKvView` and the two that were not (`qo_indptr`, `row_valid`) are
-/// now, beside the `write_page`/`write_offset` pair that was always per-row
-/// of this fire. So the whole input IS the statement's: two rectangles and
-/// ONE CACHE ROW. The body delegates to `write_mla_to_pages` rather than
-/// firing itself, because that launcher already exists and `norm.scale`'s
-/// rule cuts the other way here — a second public name for one kernel is
-/// what the delegation avoids.
-///
-/// `mla.latents_rope` LANDS AS TWO FIRES AND NOT A FUSION. cuda's
-/// `mla_prepare_bf16` does this and three more things in one launch, which
-/// is why the point was measured as a gap; but the declared statement is
-/// only the cut plus a rotation of its rope half, and this plane has a
-/// routine for each. `kimi_split_kv_a_norm` writes the unrotated pair and
-/// `rope_partial_q_bf16` rotates `k_pe` in place, and the angles are
-/// BIT-IDENTICAL to the fused kernel's: `rotate_partial` computes
-/// `powf(theta, -2*dp/head_dim)` then `__sincosf`, which is `rope_cos_sin`
-/// (`prelude/rope.cuh:60-68`) spelled out, and pairs `(dp, dp + half)`,
-/// which is `rotate_pair_to`'s pairing. Two launches where the fusion has
-/// one, and the fusion stays where it is for whoever wants it back.
-///
-/// `mla.absorb_q_pe` IS GONE, and that is `G2`'s answer to it rather than a
-/// claim of it. The point declared an absorb whose result was
-/// `[tokens, heads, kv_lora_rank + rope_dim]` — the latent with the rotated
-/// half carried in its tail — and it was measured at THREE seams: the
-/// absorb is a strided batched gemm with ONE activation operand, so its
-/// `ldc`/`stride_c` could address the wider pitch but nothing writes the
-/// tail (no per-head scatter exists); NOTHING READS ONE either, because
-/// every latent attention kernel indexes `q_nope[(t * H + h) * CKV]` and
-/// `q_pe[(t * H + h) * PE]` with no stride parameter between them
-/// (`attention_mla_naive.cuh`, `mla_fa2::pack`'s `q_nope_stride_h` /
-/// `q_pe_stride_h` off `Shape`); and the legacy glm text folded nothing —
-/// it called `mla_absorbed_attention(q_nope, q_pe, ..)`, the same separate
-/// pair kimi uses (`model-dsl-legacy/src/ops.rs:305-329`). A gap with no
-/// producer, no consumer and no ground truth is not a gap; it is a
-/// statement nobody meant. glm's text now states `mla.absorb_q` and carries
-/// `q_pe` beside it, the two `_selected` readings take the pair, and the
-/// declaration is deleted.
-///
-/// EVERY POINT THIS PLANE HAS A KERNEL FOR NOW LANDS, and the last two —
-/// `mla.attention_{decode,prefill}` — landed the way the fa2 core did: the
-/// schedule was never an operand, and R4b gave the body a door to ask for it
-/// by key. `attn::plan::mla` measures it on the HOST out of `qo_indptr`,
-/// `kv_indptr` and `kv_len_arr` slices and uploads it into an int arena the
-/// launch reads without bounds-checking, exactly as `Fa2Decode` is; a body
-/// that built one would have to copy the device CSR back mid-fire, which is a
-/// sync a capture cannot record. So `Ctx::raised::<MlaPlanned>()` asks for
-/// `"mla.plan"` and the executor answers or refuses WITH THE KEY IN IT.
-///
-/// `driver-cuda` STAGES NO `"mla.plan"` TODAY — it is on that driver's
-/// `UNSTAGED` list beside the moe banks and the dsv4 slabs — so these two
-/// still refuse there. What changed is the sentence the refusal makes: it
-/// used to be "no staging shim for `attn::attention_mla_decode_bf16`", which
-/// is a fact about a shim, and it is now "this fire staged no `mla.plan`",
-/// which is a fact about the fire and names the thing to build.
 #[kernels_macros::claims]
 impl kernels::points::Mla for Ctx<'_> {
     fn latents<T: kernels::points::Scalar>(
@@ -3129,16 +2559,10 @@ impl kernels::points::Mla for Ctx<'_> {
         kv_c: Out<Tensor<T>>,
         k_pe: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        // The cut's own width is `kv_c`'s, which the statement allocated
-        // from this very number; the routine reads it back off the result.
         let _ = kv_lora_rank;
         kimi_split_kv_a_norm(self, kv_a, weight, kv_c, k_pe, Const::new(eps))
     }
 
-    /// [`kernels::points::Mla::latents`] with the rope half rotated on the
-    /// way out — the cut, then the rotation, in that order and in two
-    /// launches. See this impl's header for why the fused
-    /// `mla_prepare_bf16` is not what answers it and why the angles agree.
     fn latents_rope<T: kernels::points::Scalar>(
         &self,
         kv_a: In<Tensor<T>>,
@@ -3152,34 +2576,20 @@ impl kernels::points::Mla for Ctx<'_> {
         k_pe: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
         at_bf16::<T>("mla.latents_rope at an element other than bf16")?;
-        // `mla.latents`' reading of the same number, for the same reason.
+
         let _ = kv_lora_rank;
         let rope = width("the rope width this cut states", rope_dim)?;
-        // READ BEFORE THE CUT CONSUMES IT: the rotation is IN PLACE over
-        // the rectangle `kimi_split_kv_a_norm` is about to write, so the
-        // second launch addresses the same bytes the first one left.
+
         let rotated = InOut {
             ptr: k_pe.ptr.cast::<bf16>(),
             rows: k_pe.rows,
             width: k_pe.width,
         };
         kimi_split_kv_a_norm(self, kv_a, weight, kv_c, k_pe, Const::new(eps))?;
-        // ONE HEAD, WHOLLY ROTATED: `k_pe` is `[tokens, rope_dim]` and the
-        // rope covers all of it, so the pitch and the rotated slice are the
-        // same number. `rope_partial_q_bf16` passes a zero `k_width`, which
-        // is what makes the kv half of `rotate_partial` empty.
+
         crate::rope::rope_partial_q_bf16(self, rotated, rope, rope, theta, positions.ptr)
     }
 
-    /// Leave this fire's latent pair in the pool row the statement names.
-    ///
-    /// THE LAUNCHER FORM'S INPUTS, ALL OF THEM THE STATEMENT'S: two
-    /// rectangles and one cache row. The two page planes are the pool's
-    /// `keys`/`values` (see [`mla_layer`]), the two pitches are the
-    /// operands' own widths, and the destination arithmetic reads the
-    /// fire's CSR, the page CSR, the last-page lengths and the row validity
-    /// off the same pool row — see `PagedKvView::qo_indptr` for why those
-    /// last two live there.
     fn kv_append<T: kernels::points::Scalar>(
         &self,
         kv_c: In<Tensor<T>>,
@@ -3215,10 +2625,6 @@ impl kernels::points::Mla for Ctx<'_> {
                 width: 1,
             },
             pages.raised(),
-            // ONE BYTE PER ROW BEHIND AN `In<Tensor<i32>>`, which is the
-            // fiction every appender in this file carries: the routine
-            // casts the pointer to `*const u8` and the buffer must be
-            // bytes. Null is legal and means every row is valid.
             In {
                 ptr: view.row_valid.cast::<i32>(),
                 rows: kv_c.rows,
@@ -3228,14 +2634,6 @@ impl kernels::points::Mla for Ctx<'_> {
         )
     }
 
-    /// Attend in the latent basis, one token per request, through the
-    /// schedule this fire was raised on.
-    ///
-    /// The fire's CSR comes off the POOL ROW and not off an operand, because
-    /// the declaration states none: a decode reading is one row per request
-    /// and the statement carries no window. `PagedKvView::qo_indptr` is the
-    /// same buffer [`kernels::points::Mla::attention_prefill`] takes as its
-    /// second operand — one per fire, handed to both.
     fn attention_decode<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -3255,13 +2653,14 @@ impl kernels::points::Mla for Ctx<'_> {
             as_out(&o),
             pages.raised(),
             Const::new(width("the head count this attention states", heads)?),
-            Const::new(width("the latent rank this attention states", kv_lora_rank)?),
+            Const::new(width(
+                "the latent rank this attention states",
+                kv_lora_rank,
+            )?),
             Const::new(sm_scale),
         )
     }
 
-    /// [`kernels::points::Mla::attention_decode`] over a query WINDOW, with
-    /// the statement's own CSR and the causal order it implies.
     fn attention_prefill<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -3284,8 +2683,7 @@ impl kernels::points::Mla for Ctx<'_> {
         let view = kv_view_of(&kvc)?;
         let rope = rope_per_head(&q_pe, heads)?;
         let layer = mla_layer(view, kv_lora_rank, rope);
-        // The request count is the CSR operand's own row count, which is what
-        // every other prefill routine in this file reads.
+
         let num_requests = indptr.rows;
         dispatch_attention_mla_bf16(
             self,
@@ -3374,8 +2772,6 @@ impl kernels::points::Mla for Ctx<'_> {
             Const::new(width("the nope width this absorb states", nope_dim)?),
             Const::new(width("the value width this absorb states", v_head_dim)?),
             Const::new(width("the latent rank this absorb states", kv_lora_rank)?),
-            // The token count is the operand's own rows, which is what the
-            // legacy lowering spliced into this run.
             Const::new(q_nope.rows),
         )
     }
@@ -3412,21 +2808,6 @@ impl kernels::points::Mla for Ctx<'_> {
         )
     }
 
-    /// Attend over the keys `index.topk` chose, one query row per request.
-    ///
-    /// A BODY AND NOT A CLAIM-ONLY ROW, and the difference is the PLAN. The
-    /// two unselected readings resolve through routines because their FA2
-    /// arm wants a schedule measured on the host out of three CSR slices;
-    /// this one has no FA2 arm to want it. Only `mla_naive_paged_kernel`
-    /// honours a selection (see [`selected_attention_mla_bf16`]) and that
-    /// kernel takes no plan at all — it walks the page table itself. So the
-    /// whole input IS the statement's: two query planes, a selection, one
-    /// cache row and three numbers.
-    ///
-    /// NOT CAUSAL, for [`attention_mla_decode_bf16`]'s reason: one query row
-    /// per request sees the whole cached prefix. The SELECTION is causal —
-    /// `index_topk_paged` ranks only `j <= abs_q` — so the order this
-    /// reading needs is already in the list it was handed.
     fn attention_decode_selected<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -3481,8 +2862,6 @@ impl kernels::points::Mla for Ctx<'_> {
         )
     }
 
-    /// [`kernels::points::Mla::attention_decode_selected`] over a query
-    /// WINDOW, with the statement's own CSR and the causal order it implies.
     fn attention_prefill_selected<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -3526,8 +2905,6 @@ impl kernels::points::Mla for Ctx<'_> {
             },
             view,
             indptr.ptr,
-            // The request count is the CSR operand's own row count, which is
-            // what every other prefill reading in this file reads.
             indptr.rows,
             heads,
             sm_scale,
@@ -3536,28 +2913,6 @@ impl kernels::points::Mla for Ctx<'_> {
     }
 }
 
-/// The `Index` family, claimed — ALL FOUR of it, which is `G2`.
-///
-/// Both rotations land and both are IN PLACE, which is what the points'
-/// `InOut` says and what the routines' own `out(.. = like(..))` rules
-/// already said. The two that were on the floor's default body are the DSA
-/// selection path, and neither was a rename away from a claim:
-///
-/// * `index.kv_append` — NO ROUTINE ANYWHERE ANSWERED IT, because the legacy
-///   indexer never paged its keys: it scored the token plane it had just
-///   written and kept nothing across fires. What answers it is `write_mla`
-///   with its SECOND PLANE EMPTY — a single-plane append is the latent pair
-///   minus one pitch, and the kernel's `for (i = tid; i < qk_rope_head_dim;
-///   ...)` loop is already the empty loop at zero. `mla.latents_rope` uses
-///   the same zero-width idiom on `rotate_partial`'s kv half.
-/// * `index.topk` — a NEW KERNEL, because the old one answers a different
-///   question. `dsa_index_topk_mask` scores a TOKEN-PLANE `idx_k` (the rows
-///   this fire just projected), is causal only within the batch, and writes
-///   a byte mask that glm's legacy text assigned to `let _index_mask` and
-///   threw away. The statement names the POOL, so `index_topk_paged` scores
-///   the whole cached prefix through the page table, and it answers the
-///   SELECTION rather than a mask — see [`kernels::points::Index::topk`] for
-///   why the list is the sizable value and the mask is not.
 #[kernels_macros::claims]
 impl kernels::points::Index for Ctx<'_> {
     fn layernorm_rope<T: kernels::points::Scalar>(
@@ -3648,27 +3003,6 @@ impl kernels::points::Index for Ctx<'_> {
         )
     }
 
-    /// Leave this fire's index keys in the pool row the statement names.
-    ///
-    /// ONE PLANE, THROUGH THE TWO-PLANE APPEND. `write_mla` writes a latent
-    /// row and a rotated row into the slot the fire's CSR resolves to, and
-    /// its second write is `for (i = tid; i < qk_rope_head_dim; i +=
-    /// blockDim.x)` — the empty loop at zero. So a single-plane append is
-    /// that kernel with `qk_rope_head_dim = 0` and a NULL second page plane:
-    /// nothing is dereferenced, so there is no aliasing question to argue
-    /// (`attention.kv_append_shared` had to argue one because it writes the
-    /// same rows into two live planes). `mla.latents_rope` uses the same
-    /// zero-width idiom on `rotate_partial`'s kv half.
-    ///
-    /// THE PITCH IS READ OFF THE POOL AND CROSS-CHECKED AGAINST THE ROW,
-    /// which is `attention.kv_append_shared`'s rule at a pool that has only
-    /// one pitch to state. `driver-cuda/src/bind/views.rs::kv_view` sets
-    /// `seq_stride` to the elements one TOKEN step crosses in a page —
-    /// `kv_heads * head_dim` for NHD — and a contiguous per-token copy is
-    /// correct exactly when that equals the width being appended. An HND
-    /// pool is refused rather than written sideways: there a token step is
-    /// `head_dim` and the row would have to be scattered per head, which is
-    /// a different kernel.
     fn kv_append<T: kernels::points::Scalar>(
         &self,
         k: In<Tensor<T>>,
@@ -3688,8 +3022,7 @@ impl kernels::points::Index for Ctx<'_> {
             self,
             MlaLayer {
                 ckv_pages: view.keys.cast::<c_void>(),
-                // NULL AND ZERO TOGETHER: the second plane is not this
-                // pool's — the indexer caches a key and no value.
+
                 kpe_pages: core::ptr::null_mut(),
                 page_size: view.page_size,
                 kv_lora_rank: dst.width,
@@ -3711,10 +3044,6 @@ impl kernels::points::Index for Ctx<'_> {
                 width: 1,
             },
             row,
-            // ONE BYTE PER ROW BEHIND AN `In<Tensor<i32>>`, which is the
-            // fiction every appender in this file carries: the routine casts
-            // the pointer to `*const u8` and the buffer must be bytes. Null
-            // is legal and means every row is valid.
             In {
                 ptr: view.row_valid.cast::<i32>(),
                 rows: k.rows,
@@ -3724,25 +3053,6 @@ impl kernels::points::Index for Ctx<'_> {
         )
     }
 
-    /// Rank the whole CACHED prefix and answer the `top_k` keys that win.
-    ///
-    /// THE LOGITS ARE PLANE STAGING, and that is the one thing this body
-    /// pulls from `self`. `index_topk_mask` keeps its scores in dynamic
-    /// shared memory sized on the row count, which is affordable only
-    /// because its keys are the batch; a cached prefix is not, so the scores
-    /// ride a named scratch slab — `ssm::kda_qkv`'s idiom, and one fire wide,
-    /// which is what the stream's serialization buys and what the tests'
-    /// `FIRE` lock stands in for.
-    ///
-    /// THE SCRATCH'S WIDTH IS THE POOL'S OWN ANSWER TO "HOW LONG IS THE KV",
-    /// which is the question the plan could not answer. `max_pages_per_request`
-    /// is a per-FIRE host number on the view (`driver-cuda/src/bind/views.rs`
-    /// takes it off `AttnCtx`), so `max_pages_per_request * page_size` bounds
-    /// every request's `kv_len` in this fire — a host-visible bound where the
-    /// per-request length is a device one. That asymmetry is exactly why the
-    /// SELECTION and not a `[tokens, kv]` mask is the plan-visible value: the
-    /// bound is good enough to size a scratch and not good enough to size a
-    /// rectangle a text can name.
     fn topk<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,
@@ -3764,9 +3074,7 @@ impl kernels::points::Index for Ctx<'_> {
         let heads = width("the head count this ranking states", heads)?;
         let head_dim = width("the key width this ranking states", head_dim)?;
         let top_k = width("the selection budget this ranking states", top_k)?;
-        // THE KEY WIDTH IS THE POOL'S TOO. The query is
-        // `[tokens, heads * head_dim]` and the pool row is one key per token;
-        // the same pitch reading `index.kv_append` wrote them at.
+
         index_pool_pitch(view, head_dim)?;
         let q = q.all("the index query this ranking scores")?;
         if q.width != heads.saturating_mul(head_dim) {
@@ -3789,9 +3097,7 @@ impl kernels::points::Index for Ctx<'_> {
                 at: i64::from(out.width),
             });
         }
-        // The kv bound, on the host, off the pool row. A fire whose view
-        // states no page budget is one this body cannot size a scratch for,
-        // and it is named rather than guessed at.
+
         let max_kv = view
             .max_pages_per_request
             .checked_mul(view.page_size)
@@ -3813,7 +3119,10 @@ impl kernels::points::Index for Ctx<'_> {
                 "attn/dsa_indexer.cuh",
                 "::pie::attn::index_topk_paged<::pie::bf16>",
             )
-            .apply(Launch::per_row(out.rows.unsigned_abs(), dsa_indexer::K_BLOCK)),
+            .apply(Launch::per_row(
+                out.rows.unsigned_abs(),
+                dsa_indexer::K_BLOCK,
+            )),
             &[
                 q.ptr.cast::<bf16>().arg(),
                 w.ptr.cast::<bf16>().arg(),
@@ -3835,10 +3144,6 @@ impl kernels::points::Index for Ctx<'_> {
     }
 }
 
-/// One index pool row's token pitch, checked against the row being written.
-///
-/// See [`kernels::points::Index::kv_append`]'s body for why an HND pool is
-/// refused and why the pool decides rather than the text.
 fn index_pool_pitch(view: &crate::views::PagedKvView, row: i32) -> Result<(), Refusal> {
     const WHAT: &str = "the token pitch this index pool's strides spell";
     if view.layout != 0 {
@@ -3859,34 +3164,10 @@ fn index_pool_pitch(view: &crate::views::PagedKvView, row: i32) -> Result<(), Re
     Ok(())
 }
 
-/// The compressor's window multiplier for a pooling ratio.
-///
-/// A ratio-4 layer pools over `2 * 4` tokens, not `4`; every other ratio
-/// pools over its own span. DERIVED AND NOT STATED, which is what
-/// [`kernels::points::Pool::gather`]'s declaration decided: it is a pure
-/// function of the ratio the statement already states, and a slot for it
-/// would put a second spelling of one number on the floor.
-///
-/// The DRIVER holds the other half of this rule
-/// (`driver-cuda/src/layout/compressed_plane_geometry.rs::compressor_coff`),
-/// where it SIZES the state slab; this one READS the window. They are the
-/// same number for the same reason and they must move together: a slab sized
-/// at one multiplier and read at another reads past its own row.
 const fn compressor_coff(ratio: i32) -> i32 {
     if ratio == 4 { 2 } else { 1 }
 }
 
-/// The boundary meta's THIRD result, which no statement states.
-///
-/// `dsv4_boundary_meta_{decode,paged}` write `out_rope[t]` unconditionally —
-/// the rope base of the window a boundary closes — and NOTHING IN THIS TREE
-/// READS IT. The declaration records the statement as it stands rather than
-/// inventing a consumer, so the plane sinks the write into scratch of its
-/// own: a result nobody reads is not a result, and a slot for it would be a
-/// rectangle no text could name.
-///
-/// PLANE-STAGED AND ONE FIRE WIDE, the `index.topk`/`ssm.kda_*` idiom: one
-/// slab per name, grown to the widest fire and reused, never read back.
 fn boundary_rope(ctx: &Ctx<'_>, rows: i32) -> Result<Out<Tensor<i32>>, Refusal> {
     let bytes = usize::try_from(rows.max(0)).unwrap_or(0) * core::mem::size_of::<i32>();
     let ptr = ctx.scratch("attn::dsv4_boundary_rope", bytes)?;
@@ -3897,15 +3178,6 @@ fn boundary_rope(ctx: &Ctx<'_>, rows: i32) -> Result<Out<Tensor<i32>>, Refusal> 
     })
 }
 
-/// The fire's row-validity plane, as the `In<Tensor<i32>>` fiction the
-/// boundary kernels carry: the routine casts the pointer to `*const u8` and
-/// the buffer must be BYTES.
-///
-/// THROUGH THE OPTIONAL DOOR, because null is the ordinary answer and the
-/// kernels test for it (`row_valid == nullptr || row_valid[t] != 0`). These
-/// two points name no cache row, so unlike every appender in this file they
-/// cannot read the plane off a pool view — `"row_valid"` is what they have,
-/// and `Ctx::staged` is the door for a raise whose absence a kernel reads.
 fn row_valid_staged(ctx: &Ctx<'_>, rows: i32) -> In<Tensor<i32>> {
     In {
         ptr: ctx.staged::<crate::views::RowValid>().ptr.cast::<i32>(),
@@ -3914,41 +3186,8 @@ fn row_valid_staged(ctx: &Ctx<'_>, rows: i32) -> In<Tensor<i32>> {
     }
 }
 
-/// The `Pool` family, claimed — ALL FIVE, and the absences that stood here
-/// were staging rather than kernels.
-///
-/// DeepSeek-V4's compressed plane is three resident objects beside the page
-/// table — the state halves, the running scores, the absolute-position
-/// table — plus the compressed pool itself and two runtime planes the fire
-/// stages. A statement names ONE cache row and its operands, so none of that
-/// could be an operand and this family was claim-only five times over. Every
-/// one of those objects is a `Raise` with a KEY, though, and R4b gave a body
-/// the door to ask by key (`Ctx::raised`), so what was "no honest delegation
-/// exists" is now "this executor stages that object, or refuses and names
-/// it".
-///
-/// THE REFUSALS ARE REAL AND THEY ARE THE POINT. `driver-cuda` allocates
-/// nothing for `"dsv4.state_kv"`, `"dsv4.state_score"`, `"dsv4.ape"` or
-/// `"dsv4.comp_kv_pages"` — its own `UNSTAGED` list says so — so dsv4 still
-/// does not serve through it. What moved is where the sentence is written: a
-/// fire used to stop at "a staging shim for `attn::dsv4_compress_gather_paged_bf16`;
-/// this driver states none", which is a fact about a shim, and now stops at
-/// `"dsv4.state_kv"`, which is a fact about the fire and names the thing to
-/// build. The bodies are exercised by `tests/dsv4_pool.rs`, which stages all
-/// four out of a hand-built answerer.
-///
-/// ONE SEAM STAYS NAMED. `pool.kv_append` and `pool.attention_lse` read the
-/// PAGE TABLE off the cache row the statement names and the COMPRESSED PLANE
-/// off `"dsv4.comp_kv_pages"`, which is two objects where the text states
-/// one — the text names its `entries` row for both. They collapse into the
-/// cache slot the day an executor builds a pool view per named ROW instead of
-/// per model LAYER (`baker::fire::Fire::layer` is the parse that stands in the
-/// way, and its own header calls it the seam). Until then the page CSR is
-/// fire-wide and identical on every row of a fire, so reading it off the
-/// statement's row is right for the fields these kernels take from it.
 #[kernels_macros::claims]
 impl kernels::points::Pool for Ctx<'_> {
-    /// Which tokens close a pooling window, one per request.
     fn boundary_decode(
         &self,
         positions: In<Tensor<i32>>,
@@ -3988,10 +3227,6 @@ impl kernels::points::Pool for Ctx<'_> {
         )
     }
 
-    /// [`kernels::points::Pool::boundary_decode`] over a prefill window,
-    /// `indptr` the fire's query CSR — which is the one thing the prefill
-    /// form needs and the decode form can shortcut (`out_req[t] = t` holds
-    /// only when each request contributes exactly one row).
     fn boundary_prefill(
         &self,
         positions: In<Tensor<i32>>,
@@ -4008,7 +3243,7 @@ impl kernels::points::Pool for Ctx<'_> {
         let row_valid = row_valid_staged(self, rows);
         let qo_indptr = indptr;
         let row_valid = row_valid.ptr as *const u8;
-        // The request count is the CSR operand's own row count.
+
         let num_requests = qo_indptr.rows;
         let qo_indptr = qo_indptr.ptr as *const u32;
         if ratio <= 0 {
@@ -4038,12 +3273,6 @@ impl kernels::points::Pool for Ctx<'_> {
         )
     }
 
-    /// Build one pooled entry per boundary, out of the `ratio` tokens ending
-    /// there.
-    ///
-    /// The stated head width is CHECKED rather than passed: the routine reads
-    /// it back off the result the statement sized, so the two are two accounts
-    /// of one number and a disagreement is a gather striding the wrong row.
     fn gather<T: kernels::points::Scalar>(
         &self,
         boundary_pos: In<Tensor<i32>>,
@@ -4106,7 +3335,6 @@ impl kernels::points::Pool for Ctx<'_> {
         )
     }
 
-    /// Append the pooled entries to the entries pool.
     fn kv_append<T: kernels::points::Scalar>(
         &self,
         entries: In<Tensor<T>>,
@@ -4151,13 +3379,6 @@ impl kernels::points::Pool for Ctx<'_> {
         )
     }
 
-    /// Attend over the pooled entries, stating the log-sum-exp beside the
-    /// output so the merge with the full-resolution attention is exact.
-    ///
-    /// `request_of_token` IS THE THIRD THING NO STATEMENT CARRIES, and it is
-    /// derivable from the query CSR — the executor derives it there — but a
-    /// kernel handed one row cannot do the search, so the plane is staged and
-    /// this asks for it by key.
     fn attention_lse<T: kernels::points::Scalar>(
         &self,
         q: In<Tensor<T>>,

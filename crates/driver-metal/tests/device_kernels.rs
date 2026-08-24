@@ -187,24 +187,40 @@ fn every_declared_entrypoint_builds_a_pipeline_on_this_device() {
                 // tiling, whose shader declares
                 // `max_total_threads_per_threadgroup(128)`, and 1024 for
                 // every scalar single-pass and tiled form.
-                let Some(routine) = driver_metal::lowering::routine::crossed(entry) else {
+                // BY STEM, off the entry point's own spelling.
+                // `lowering::routine::crossed` STOOD HERE and answered with
+                // the `#[routine]` ROW that declared this entry point, whose
+                // `name` was the stem; there are no rows, so the stem is read
+                // where it has always been written — at the front of the
+                // entry point, which `kernels_metal::shaders()` hands over.
+                //
+                // The sink forms come FIRST because `sdpa_paged_mma` is a
+                // prefix of `sdpa_paged_mma_sink` and a first match on the
+                // shorter would answer for both. Here the two want the same
+                // width, so the ordering is a guard against the next pair
+                // rather than a live fix.
+                let Some(stem) = [
+                    "sdpa_paged_mma_sink",
+                    "sdpa_paged_mma",
+                    "sdpa_paged_decode_sink",
+                    "sdpa_paged_decode",
+                    "sdpa_paged_tiled_sink",
+                    "sdpa_paged_tiled",
+                    "sdpa_vector_decode_swa",
+                    "sdpa_vector_decode",
+                ]
+                .into_iter()
+                .find(|stem| entry.starts_with(stem)) else {
                     continue;
                 };
-                let wants: u32 = match routine.name {
+                let wants: u32 = match stem {
                     "sdpa_paged_mma" | "sdpa_paged_mma_sink" => 128,
-                    "sdpa_paged_decode"
-                    | "sdpa_paged_decode_sink"
-                    | "sdpa_paged_tiled"
-                    | "sdpa_paged_tiled_sink"
-                    | "sdpa_vector_decode"
-                    | "sdpa_vector_decode_swa" => 1024,
-                    _ => continue,
+                    _ => 1024,
                 };
                 let admits = pso.maxTotalThreadsPerThreadgroup() as u32;
                 if admits < wants {
                     narrow.push(format!(
-                        "  {entry} [{file}]: admits {admits}, `{}` dispatches {wants}",
-                        routine.name
+                        "  {entry} [{file}]: admits {admits}, `{stem}` dispatches {wants}"
                     ));
                 }
             }

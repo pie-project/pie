@@ -34,15 +34,21 @@ pub struct Shell {
     /// Fires already recorded, by what they are valid for. Replaying one
     /// costs 39.8 us where encoding the same fire costs 14.87 ms.
     pub(crate) recordings: crate::fire::Recordings,
-    /// Graphs already lowered, by the fire shape that produced them. A
-    /// decode's is a constant of the deployment and this driver was deriving
-    /// it once per token -- 0.81 ms of a 4.9 ms step.
-    pub(crate) lowerings: crate::lowering::cached::Lowerings,
+    /// THE LANE, built once at load: the traced plan, every `Program` its
+    /// fact words bind to, and the deployment read off that same plan.
+    ///
+    /// `lowerings: Lowerings` STOOD HERE and was a CACHE — `model_compiler::
+    /// lower` run per fire shape and memoised, because deriving a decode's
+    /// graph once per token cost 0.81 ms of a 4.9 ms step. There is nothing to
+    /// cache: `program::bound` runs ONCE at load and answers every lane the
+    /// text states, so a fire picks one by fact word rather than lowering
+    /// anything. The cache and its invalidation went together.
+    pub(crate) baked: Option<crate::baker::Baked>,
     pub(crate) registry: crate::channel::Registry,
     pub(crate) device_facts: driver_api::DeviceFacts,
-    /// The checkpoint, once one is loaded. Held because every address in its
-    /// tensor map points into the region it owns.
-    pub(crate) model: Option<crate::weights::load::Loaded>,
+    /// The checkpoint on the device, once one is loaded. Held because every
+    /// [`crate::baker::Bank`] is a region INSIDE the allocation it owns.
+    pub(crate) weights: Option<crate::serve::weights::Weights>,
     /// WHICH ROW this checkpoint matched, by id. `&'static str` because a row
     /// is a `const` and its id is the row's own spelling; it is an identity,
     /// not a dispatch key.
@@ -65,13 +71,14 @@ pub struct Shell {
     /// Held on the driver rather than made per-load: a fresh arena per load
     /// would let two pools each believe they had the whole budget.
     pub(crate) arena: crate::device::Arena,
-    /// `[model] config` from the boot TOML, parsed by the caller: a boot TOML
-    /// is the engine's format, and a driver that read it would be the second
-    /// thing entitled to an opinion about the file's shape. It points at the
-    /// checkpoint's own `config.json`, is the FALLBACK for when the artifact
-    /// carries none embedded, and ONE FIELD is read out of it — the declared
-    /// quantization.
-    pub(crate) boot_config: Option<PathBuf>,
+    // `boot_config: Option<PathBuf>` STOOD HERE and was `[model] config`: a
+    // path to the checkpoint's own `config.json`, held because ONE FIELD was
+    // read out of it — the declared quantization, through `model::encoding`.
+    // Neither end survives. There is no `model::encoding`, and what a bank is
+    // stored as rides on the plan's own `repr` column, read at the slot that
+    // binds it (`baker::bound::Bound::form`). A driver holding a path to a
+    // JSON document nothing parses is the shape of the thing this crate keeps
+    // deleting, so it goes with its reader rather than waiting for one.
     /// `[model] id` from the boot TOML: an OVERRIDE, not a selector.
     /// `catalog::identify` matches a checkpoint by its tensors; this exists
     /// for the one case tensors cannot settle, where two rows are
@@ -82,35 +89,25 @@ pub struct Shell {
     /// A control-op capability rather than a shape: the recurrent state only
     /// exists if it does, so `copy_state` and `copy_kv` ask it before planning.
     pub(crate) has_linear_attn: bool,
-    /// The rotary ladder, derived ONCE at load: a deployment that rescales
-    /// its frequencies (llama-3, YaRN) states the rescaling in its config,
-    /// and the config does not change between fires. Held as f32 bits.
-    pub(crate) inv_freq: Vec<u32>,
     /// The row's DEPLOYMENT, projected ONCE at load. A launch that re-derived
     /// its geometry would read the checkpoint through a DIFFERENT reading
     /// than the one its trace was built from, so a fire's head count and a
     /// trace's head count would disagree with nobody holding them together.
     pub(crate) deployment: Option<model::deployment::Deployment>,
-    /// The identified ROW, and what this load observed that no row can state.
-    ///
-    /// `catalog::Deployed::backend` names which driver is asking, so the
-    /// facts are stated once in `crates/model` for both backends.
-    ///
-    /// The [`MetalBinding`] half holds the six things a row cannot know: the
-    /// affine group and bit width the bytes arrived in (`mlx-community`
-    /// publishes one model at g64/b4 and at g128/b8, and the two pack to
-    /// identical extents), whether the expert bank reached the device still
-    /// in MXFP4, and the three kernel capabilities of `crates/kernels-metal`
-    /// as compiled into this binary. [`crate::model::binding`] is the only
-    /// thing that may build it. Held rather than re-derived per fire: a
-    /// launch that re-identified would ask the tensors again, and staging has
-    /// consumed them.
-    ///
-    /// [`MetalBinding`]: model::catalog::MetalBinding
-    pub(crate) text_row: Option<(
-        &'static dyn model::catalog::Variant,
-        model::catalog::MetalBinding,
-    )>,
+    // `text_row: (&dyn Variant, MetalBinding)` STOOD HERE and was the legacy
+    // load contract's carrier: the identified row, plus the six things a load
+    // OBSERVED that no row could state — the affine group and bit width the
+    // bytes arrived in, whether the expert bank reached the device still in
+    // MXFP4, and three kernel capabilities of this binary. The text a fire ran
+    // was then `row.trace(class, Deployed::metal(&binding))`, which is a
+    // driver handing its own measurements back to the catalog and being given
+    // a different model in return.
+    //
+    // There is no such door. A plane is NAMED — `Backend::Metal`, one argument
+    // to `model::trace_of` — and what a bank is stored as rides on the plan's
+    // own `repr` column, read at the slot that binds it
+    // (`baker::bound::Bound::form`). `Shell::id` is what is left of the pair,
+    // and it is an identity rather than a dispatch key.
     /// The runtime shader compiler, and the pipelines a fire's symbols have
     /// compiled to. Held across fires: a model's symbol set is bounded by its
     /// text, so a driver that recompiled per fire would spend more time in the
@@ -127,13 +124,15 @@ unsafe impl Send for Shell {}
 unsafe impl Sync for Shell {}
 
 impl Shell {
-    /// Open the default Metal 4 device. `boot_config` is `[model] config` and
-    /// `boot_model_id` is `[model] id`, both already parsed by the caller.
+    /// Open the default Metal 4 device. `boot_model_id` is `[model] id`,
+    /// already parsed by the caller — a boot TOML is the engine's format, and
+    /// a driver that read one would be the second thing entitled to an
+    /// opinion about its shape.
     ///
     /// # Errors
     ///
     /// No Metal 4 device, or a device whose queue could not be created.
-    pub fn open(boot_config: Option<PathBuf>, boot_model_id: Option<String>) -> Result<Self> {
+    pub fn open(boot_model_id: Option<String>) -> Result<Self> {
         // `Arc` over a type that is neither `Send` nor `Sync`, deliberately: a
         // stepper that BORROWS the context beside it is a self-reference, and
         // the timeline has to outlive a call for run-ahead to be run-ahead.
@@ -151,19 +150,16 @@ impl Shell {
             scratch: crate::fire::Scratch::new(),
             regions: crate::device::Regions::new(),
             recordings: crate::fire::Recordings::new(),
-            lowerings: crate::lowering::cached::Lowerings::new(),
+            baked: None,
             registry: crate::channel::Registry::new(),
             device_facts: device_facts(),
-            model: None,
+            weights: None,
             // No checkpoint is loaded, so no row has been matched. Empty
             // rather than a placeholder the capability report could publish.
             id: "",
             pool: None,
-            boot_config,
             boot_model_id,
-            inv_freq: Vec::new(),
             deployment: None,
-            text_row: None,
             recurrent: None,
             has_linear_attn: false,
             compiler,
@@ -195,10 +191,10 @@ impl Shell {
         &self.registry
     }
 
-    /// The loaded checkpoint, if `load_model` has run.
+    /// The loaded checkpoint's weights, if `load_model` has run.
     #[must_use]
-    pub fn model(&self) -> Option<&crate::weights::load::Loaded> {
-        self.model.as_ref()
+    pub fn weights(&self) -> Option<&crate::serve::weights::Weights> {
+        self.weights.as_ref()
     }
 
     /// The KV pool the checkpoint's geometry was allocated at.

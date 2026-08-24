@@ -86,11 +86,11 @@
 
 use std::path::PathBuf;
 
+use driver_metal::baker::dispatch::{Dispatch, ParamSlot, Touches};
+use driver_metal::baker::{BoundRegion as BoundArg, Slice};
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
-use driver_metal::lowering::executor::{BoundArg, Slice};
 
 /// How much of its own tolerance the worst element used, and the band that
 /// has to hold.
@@ -318,14 +318,13 @@ fn fire(
             slot: *slot as usize,
             at: (at * 4) as u32,
             bytes: 4,
-            packed: false,
             // WHICH of the statement's scalars, not a placeholder.
             // `Params::stage` reads `value` as an index into `params` and
             // `at` as where it lands; `Some(0)` on every slot stages
             // `gqa_factor` seven times, which reads as `scale = 0` and
             // `window = 2` and answers a softmax over the wrong keys with
             // every score equal.
-            value: Some(u8::try_from(at).expect("seven scalars")),
+            value: u8::try_from(at).expect("seven scalars"),
         })
         .collect();
     if arm.tiled {
@@ -334,8 +333,7 @@ fn fire(
             slot: 17,
             at: 24,
             bytes: 4,
-            packed: false,
-            value: Some(6),
+            value: 6,
         });
     }
 
@@ -348,8 +346,7 @@ fn fire(
                 slot: *slot,
                 at: (28 + i * 4) as u32,
                 bytes: 4,
-                packed: false,
-                value: Some(u8::try_from(7 + i).expect("nine scalars")),
+                value: u8::try_from(7 + i).expect("nine scalars"),
             });
         }
     }
@@ -360,7 +357,12 @@ fn fire(
         ROWS as u32
     };
     let dispatch = Dispatch {
-        symbol: &arm.entrypoint,
+        // LEAKED, because `Dispatch::symbol` is `&'static str`: a claim body
+        // names an entry point as a literal, so the walk never composes one at
+        // run time and the field does not carry a lifetime. A test that builds
+        // its arm table at run time does, and one leak per arm is the honest
+        // price of writing the launch out by hand.
+        symbol: String::leak(arm.entrypoint.clone()),
         file: arm.file,
         stamp: "",
         grid: [Q_HEADS as u32 * arm.threads, rows_or_tiles, 1],

@@ -36,11 +36,11 @@
 
 #![cfg(target_vendor = "apple")]
 
+use driver_metal::baker::dispatch::{Dispatch, ParamSlot, Touches};
+use driver_metal::baker::{BoundRegion as BoundArg, Slice};
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
-use driver_metal::lowering::executor::{BoundArg, Slice};
 
 /// The overflow boundary an `exp(2x)` tanh has, and the arguments around it.
 ///
@@ -209,7 +209,7 @@ fn tolerance_holds(worst: f32, what: &str) {
     );
 }
 
-/// One elementwise dispatch: buffers at 0.., a packed params struct, 1D grid.
+/// One elementwise dispatch: buffers at 0.., a scalar struct, 1D grid.
 #[allow(clippy::too_many_arguments)]
 fn fire(
     context: &Context,
@@ -252,12 +252,17 @@ fn fire(
         touches: Touches::everything(&args),
         args,
         params: params.to_vec(),
+        // ONE SLOT AS WIDE AS THE RUN, which is how today's `ParamSlot`
+        // spells what `packed: true` used to. The shader takes its scalars as
+        // a `constant Params&` — the address of the run's first word — so the
+        // slot binds at offset zero and reads every word of it. A slot fixed
+        // at four bytes would stage `params[0]` and leave the rest of the
+        // struct reading whatever the region held.
         param_slots: vec![ParamSlot {
             slot: params_slot,
             at: 0,
-            bytes: 4,
-            packed: true,
-            value: Some(0),
+            bytes: u32::try_from(size_of_val(params)).expect("a small run"),
+            value: 0,
         }],
         layers: 0..1,
         op: 0,

@@ -92,12 +92,6 @@ impl DType {
         }
     }
 
-    /// The dtype a C++ `uint8_t` tag names, or `None` if it names none.
-    #[must_use]
-    pub fn from_tag(tag: u8) -> Option<DType> {
-        DType::ALL.get(usize::from(tag)).copied()
-    }
-
     /// The tag the C++ side sees.
     #[must_use]
     pub const fn tag(self) -> u8 {
@@ -126,14 +120,19 @@ mod tests {
         assert_eq!(DType::E8M0.tag(), 11);
     }
 
+    /// `ALL` IS INDEXED BY TAG, which is what `tag()`'s `self as u8` means.
+    ///
+    /// This used to say "which is what makes `from_tag` a lookup", and
+    /// `from_tag` — `ALL.get(tag)` — was deleted for having no reader outside
+    /// this test. The invariant is not the lookup's, it is the discriminant's:
+    /// a row out of position makes `tag()` lie about which dtype it names,
+    /// and every C++-facing tag in the tree reads that.
     #[test]
-    fn all_is_indexed_by_tag_which_is_what_makes_from_tag_a_lookup() {
+    fn all_is_indexed_by_tag_which_is_what_the_discriminant_means() {
         for (i, &d) in DType::ALL.iter().enumerate() {
             assert_eq!(usize::from(d.tag()), i, "{d:?} is out of position in ALL");
-            assert_eq!(DType::from_tag(d.tag()), Some(d));
         }
-        assert_eq!(DType::from_tag(12), None);
-        assert_eq!(DType::from_tag(u8::MAX), None);
+        assert_eq!(DType::ALL.len(), 12, "a new dtype needs a tag and a row");
     }
 
     #[test]

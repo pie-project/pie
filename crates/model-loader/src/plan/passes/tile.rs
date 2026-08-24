@@ -725,7 +725,7 @@ fn in_arena(plan: &LoadPlan, id: BufferId) -> bool {
 }
 
 /// How deep a chain of views may go before the walk gives up; the same guard
-/// [`crate::plan::spans`] uses, for the same reason.
+/// `passes::arena` and `passes::validate` use, for the same reason.
 const MAX_VIEW_HOPS: usize = 16;
 
 /// The dtype behind a buffer, when it is unquantized.

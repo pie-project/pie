@@ -42,8 +42,8 @@
 
 use core::ffi::c_void;
 
+use kernels::plane::{Const, In, InOut, Out};
 use kernels::points::Scalar;
-use kernels::routine::{Const, In, InOut, Out};
 use kernels_cuda::jit::abi::Tensor;
 use model_compiler::program::Dt;
 
@@ -70,7 +70,6 @@ impl Rect {
     pub(crate) fn bytes(&self) -> usize {
         self.rows as usize * self.width as usize * self.dt.size() as usize
     }
-
 }
 
 pub(crate) fn rin<T: Scalar>(r: Rect) -> In<Tensor<T>> {

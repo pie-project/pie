@@ -71,9 +71,6 @@ pub enum Slot {
 /// Must match `kernels::sample::kArgmaxAccumSlots`; the parity oracle checks it.
 pub const ARGMAX_ACCUM_SLOTS: i64 = 32;
 
-/// Most a single program may reserve.
-pub const MTP_DRAFT_ROWS_PER_PROGRAM: i32 = 32;
-
 /// The shape parameters `allocate_full` takes, named so adjacent same-typed
 /// args can't be swapped silently at a call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,19 +263,32 @@ impl WorkspaceLayout {
     /// What the workspace actually costs.
     ///
     /// Summed from [`Self::slots`], so it is the same layout the allocator
-    /// walks by construction.
+    /// walks by construction — and that "by construction" is why two other
+    /// methods are gone.
+    ///
+    /// # The check that could only pass
+    ///
+    /// `cpp_budget_bytes` stood beside this claiming to be "derived
+    /// independently the way the C++ does so the parity oracle compares two
+    /// walks, not a value against itself", and `budget_shortfall` was
+    /// `bytes() - cpp_budget_bytes()` — with `workspace_parity` asserting the
+    /// difference is zero on every shape in the grid.
+    ///
+    /// The two bodies were BYTE-IDENTICAL. Both walked `slots()` and summed
+    /// `slot_bytes`, so the subtraction was `x - x` and the assertion could
+    /// not fail for any input, including the inputs it was written to catch.
+    /// The parity test's own doc records when that happened: "They used to be
+    /// two hand-written lists and differed by `declared_values +
+    /// mtp_row0_save`; both now walk C++'s `workspace_slots`." The merge was
+    /// the fix; what survived it was a subtraction that had stopped meaning
+    /// anything and a doc comment still describing the two lists.
+    ///
+    /// What DOES cross-check this is
+    /// `workspace_parity::bytes_equals_the_sum_of_what_specs_would_allocate`,
+    /// which sums the `TensorSpec`s an allocator would be handed. That is a
+    /// second walk, over a different structure, and it can fail.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.slots()
-            .into_iter()
-            .map(|(_, dtype, shape)| Self::slot_bytes(dtype, shape[0], shape[1]))
-            .sum()
-    }
-
-    /// Equal to [`Self::bytes`], derived independently the way the C++ does
-    /// so the parity oracle compares two walks, not a value against itself.
-    #[must_use]
-    pub fn cpp_budget_bytes(&self) -> u64 {
         self.slots()
             .into_iter()
             .map(|(_, dtype, shape)| Self::slot_bytes(dtype, shape[0], shape[1]))
@@ -291,14 +301,6 @@ impl WorkspaceLayout {
         (rows.max(0) as u64)
             .saturating_mul(cols.max(0) as u64)
             .saturating_mul(dtype.size_bytes() as u64)
-    }
-
-    /// Bytes the planner is not told about: [`Self::bytes`] less
-    /// [`Self::cpp_budget_bytes`]. Zero, and the parity test requires it to
-    /// stay zero on every shape in the grid.
-    #[must_use]
-    pub fn budget_shortfall(&self) -> u64 {
-        self.bytes().saturating_sub(self.cpp_budget_bytes())
     }
 }
 
@@ -320,13 +322,6 @@ mod tests {
             max_output_rows: 64,
             max_mtp_draft_rows: 0,
         })
-    }
-
-    #[test]
-    fn the_budget_and_the_allocation_are_the_same_number() {
-        let l = qwen3_0_6b();
-        assert_eq!(l.budget_shortfall(), 0);
-        assert_eq!(l.bytes(), l.cpp_budget_bytes());
     }
 
     #[test]

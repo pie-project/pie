@@ -129,21 +129,72 @@ pub struct Shell {
     pub(crate) ptir_plans: std::collections::BTreeMap<u64, driver::ExecPlan>,
 }
 
+/// One raised attention schedule and the workspace it was carved in.
+///
+/// ONE WORKSPACE PER SCHEDULE, and that is a FlashInfer fact rather than a
+/// budget: a plan writes its work list into the workspace it was raised
+/// against, so two live schedules sharing one would each read the other's.
+///
+/// GENERIC OVER THE PLAN, because the two readings differ in NOTHING ELSE. A
+/// decode work list and a prefill one are carved by different planners into
+/// different caches, and everything around them — the class they are filed
+/// under, the workspace that holds them, the fence that publishes them — is
+/// one sentence said twice. [`DecodeSchedule`] and [`PrefillSchedule`] are
+/// that sentence's two readings.
+pub(crate) struct Schedule<P> {
+    /// The class this was planned at — `(head_dim, window)` as the lane's
+    /// statements state them, plus the kv heads the pool row carries.
+    pub class: crate::baker::DecodeClass,
+    pub ws: crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
+    pub plan: P,
+}
+
+/// What `attention.decode` reads, one per class its lane states.
+pub(crate) type DecodeSchedule = Schedule<crate::bind::DecodePlan>;
+
+/// What `attention.masked` reads, one per class its lane states — and, for a
+/// lane that states no masked arm, the cache the planless prefill leg carves
+/// into per statement and asks for classless.
+pub(crate) type PrefillSchedule = Schedule<crate::bind::PrefillPlan>;
+
 /// Driver-lifetime fire scratch.
 pub(crate) struct FireScratch {
-    pub ws: crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
-    /// The prefill plan's own workspace: a FlashInfer plan writes its schedule
-    /// into the workspace it was raised against, so sharing would clobber.
-    pub prefill_ws:
-        crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
-    pub decode_plan: crate::bind::DecodePlan,
-    pub prefill_plan: crate::bind::PrefillPlan,
-    // `decode_plan_full`, `tail_plan` and `tail_ws` STOOD HERE. The second
-    // decode schedule served a stack whose layer kinds disagree about head
-    // dim, picked by the window on a `LaunchSpec`; the tail pair served a
-    // peel. Both are legacy-lowering shapes: a `Program` is one lane with
-    // one geometry, and `Baked::attn_ask` REFUSES a lane that states two
-    // widths rather than raising a second plan nothing can bind.
+    /// One entry per decode CLASS any lane of this model has fired, grown on
+    /// demand and never shrunk. `decode_plan_full` and a fixed pair STOOD
+    /// HERE: the legacy walk kept a second decode schedule for a stack whose
+    /// layer kinds disagree about head dim and picked between them off a
+    /// `LaunchSpec`'s window. A `Program` is one lane, its statements name
+    /// their own class (`kernels::raises::Class`), and this is the same two
+    /// schedules addressed by what the statement says rather than by what the
+    /// lowering remembered.
+    pub decode: Vec<DecodeSchedule>,
+    /// The same table for the PREFILL cache, and a fixed pair — one plan, one
+    /// workspace — stood here for the mirror of the same reason:
+    /// `attention.masked` refused a stated window, so a lane could state one
+    /// masked geometry or already be refused. It serves the window now, so
+    /// gemma's masked lane states two, and this holds one entry per masked
+    /// class under the same growth rule.
+    ///
+    /// A LANE THAT STATES NO MASKED ARM ASKS FOR EXACTLY ONE, the deployment's
+    /// own widest unwindowed geometry, and gets it STAMPED rather than planned:
+    /// the planless prefill leg replans that cache per statement out of the
+    /// host CSR mirrors, so what it needs is the cache and a stamped
+    /// workspace. One ask, one allocation — which is what a fire of every
+    /// other SKU has always made, measured.
+    ///
+    /// BOTH TABLES ARE KEYED BY GEOMETRY, not by the class a body asks with,
+    /// and gemma is where the two spellings visibly differ: its fallback
+    /// geometry — a 512-wide head, unwindowed, 2 kv heads — IS its second
+    /// masked class, so ONE entry serves both roles and the tower stages three
+    /// prefill workspaces rather than four. That is sound because a `Program`
+    /// is one lane and a lane states one arm: a masked fire plans this entry
+    /// before reading it, an unmasked fire stamps it before reading it, and
+    /// neither ever sees the other's leftovers. Which schedule a BODY reaches
+    /// is a separate question, answered by class in `bind::views`. See
+    /// `Baked::attn_ask`.
+    pub prefill: Vec<PrefillSchedule>,
+    // `tail_plan` and `tail_ws` STOOD HERE TOO, and served a peel. Nothing
+    // peels.
 }
 
 /// The pinned swap pool: `layers × [pages × page_bytes]` per plane.
@@ -692,12 +743,30 @@ pub(crate) struct LoadedModel {
     /// lane's program is built from. Carries no family name by design, so
     /// the fire path cannot special-case on one.
     pub deployment: model::deployment::Deployment,
-    /// The caps JSON `load_model` answered with; owned like `Shell::caps`.
-    pub load_caps: Vec<u8>,
-    /// The group this rank's weights were sharded for, carried from the shell so
-    /// a family's facts and its load plan cannot disagree on rank width.
-    pub(crate) tp_size: u32,
+    /// What `load_model` answered with, TYPED.
+    ///
+    /// It was the JSON, and `load_model` returns a `DriverCapabilities`, so
+    /// the document was built, serialised, stored, and then parsed back —
+    /// once to answer the caller and three more times inside the driver
+    /// (`warm_lane`'s rectangle, `calibrate_planner`'s ceiling, the P2P
+    /// plane's token bound). Four `serde_json::from_slice` calls against
+    /// bytes this process had just written.
+    ///
+    /// Each one also manufactured a failure that cannot happen — "the caps
+    /// did not parse" — and two of those printed a refusal sentence and
+    /// returned early. A branch on a parse that cannot fail is a branch no
+    /// test can enter and no reader can price.
+    pub caps: driver_api::DriverCapabilities,
 }
+
+// `LoadedModel::tp_size` STOOD HERE — "the group this rank's weights were
+// sharded for, carried from the shell so a family's facts and its load plan
+// cannot disagree on rank width". It had one reader, `capabilities_json`,
+// which copied it out because the planner needed it after the borrow of
+// `state` had ended. The caps are built BEFORE the model is stored now, so
+// the planner reads `Shell::tp_size` directly and the copy that existed to
+// survive a borrow has no borrow to survive. Two fields that must agree are
+// one field again.
 
 // `LoadedModel::{weights, owned, aliases, layer_scalars}` and the `weight()`
 // resolver STOOD HERE — the LEGACY LOAD CONTRACT's arena and its name map.

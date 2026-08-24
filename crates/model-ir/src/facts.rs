@@ -1,133 +1,91 @@
-use serde::{Deserialize, Serialize};
+//! THE FACT VOCABULARY: the closed set of names a text may state, and the one
+//! derivation that answers them for a fire.
+//!
+//! # Why the word is derived HERE and not by the text that declared it
+//!
+//! A text says what its facts mean in Rust — `qo_one: r.query_len() == 1` —
+//! and that sentence cannot reach an executor, because what crosses is a
+//! [`crate::plan::Plan`] and a plan carries fact NAMES and not a type. So
+//! the declaration was never the live derivation: four executors each kept a
+//! hand match on the name string, and they disagreed with the declaration
+//! about what the fact even ranges over (the text's is per REQUEST, an
+//! executor's is per FIRE — "this is a decode", one answer for the whole
+//! batch).
+//!
+//! One vocabulary and one [`word_of`] is what that measurement leaves. A name
+//! not on this list is a REFUSAL and not a clear bit: a text stating a fact
+//! nothing can answer would have its lanes picked by a guess, and the lane is
+//! the whole program.
+//!
+//! # The census
+//!
+//! Two names, and both are on the list because a shipping text states them:
+//! [`QO_ONE`] on all sixteen catalog rows, [`MASKED`] on gemma-4's three.
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NormPlacement {
-    #[default]
-    Pre,
-    Post,
-    Sandwich,
-}
+use crate::plan::{FireClass, Plan};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QkNorm {
-    #[default]
-    Off,
-    PerHead,
-    Global,
-}
+/// EVERY REQUEST'S QUERY IS ONE TOKEN — which is what a decode fire is.
+///
+/// The fact ranges over the FIRE and not over a request: a driver picks one
+/// lane for the batch, so the bit is the class the batch was assembled as,
+/// and the class is what named it.
+pub const QO_ONE: &str = "qo_one";
 
-pub fn window_left_at(list: &[i32], l: u32) -> i32 {
-    match list.len() {
-        0 => -1,
-        n => list[(l as usize).min(n - 1)],
-    }
-}
+/// THE FIRE CARRIES A CUSTOM ATTENTION MASK the caller staged.
+///
+/// Nothing derives this one — the frame states it — and a text that does not
+/// declare it has ONE attention arm and it is causal, so a masked frame
+/// reaching such a text is refused rather than answered.
+pub const MASKED: &str = "masked";
 
-pub fn rope_theta_at(list: &[f32], l: u32) -> f32 {
-    match list.len() {
-        0 => 0.0,
-        n => list[(l as usize).min(n - 1)],
-    }
-}
+/// The closed vocabulary, in no particular order: a plan's `facts` column is
+/// its own bit ordering and this is only the set of spellings.
+pub const NAMES: &[&str] = &[QO_ONE, MASKED];
 
-#[must_use]
-pub fn full_attn_at(interval: u32, l: u32) -> bool {
-    interval > 0 && (l + 1).is_multiple_of(interval)
-}
-
-#[must_use]
-pub fn after_dense_prefix(dense_layers: u32, l: u32) -> bool {
-    l >= dense_layers
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MlaFacts {
-    pub hidden: u32,
-    pub heads: u32,
-    pub q_lora_rank: u32,
-    pub kv_lora_rank: u32,
-    pub qk_nope_head_dim: u32,
-    pub qk_rope_head_dim: u32,
-    pub v_head_dim: u32,
-
-    #[serde(default)]
-    pub output_gate: bool,
-}
-
-impl MlaFacts {
-    #[must_use]
-    pub const fn qk_head_dim(&self) -> u32 {
-        self.qk_nope_head_dim + self.qk_rope_head_dim
-    }
-
-    #[must_use]
-    pub const fn q_b_width(&self) -> u32 {
-        self.heads * self.qk_head_dim()
-    }
-
-    #[must_use]
-    pub const fn kv_a_width(&self) -> u32 {
-        self.kv_lora_rank + self.qk_rope_head_dim
-    }
-
-    #[must_use]
-    pub const fn v_width(&self) -> u32 {
-        self.heads * self.v_head_dim
-    }
-
-    #[must_use]
-    pub const fn q_kv_a_width(&self) -> u32 {
-        self.q_lora_rank + self.kv_a_width()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MoeFacts {
-    pub num_experts: u32,
-    pub top_k: u32,
-
-    pub norm_topk_prob: bool,
-
-    pub routed_scaling: f32,
-    pub moe_intermediate: u32,
-    pub shared_intermediate: u32,
-}
-
-impl MoeFacts {
-    #[must_use]
-    pub const fn has_shared_expert(&self) -> bool {
-        self.shared_intermediate > 0
-    }
-
-    #[must_use]
-    pub const fn routes(&self, tokens: u32) -> u32 {
-        tokens * self.top_k
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GqaFacts {
-    pub heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-}
-
-impl GqaFacts {
-    #[must_use]
-    pub const fn q_width(&self) -> u32 {
-        self.heads * self.head_dim
-    }
-
-    #[must_use]
-    pub const fn kv_width(&self) -> u32 {
-        self.kv_heads * self.head_dim
-    }
-
-    #[must_use]
-    pub const fn group_size(&self) -> u32 {
-        match self.heads.checked_div(self.kv_heads) {
-            Some(group) => group,
-            None => 0,
+/// The fact word a fire of `class` sets on `plan`, computed off `plan.facts`
+/// rather than assumed: bit `i` is `plan.facts[i]`.
+///
+/// # Errors
+///
+/// A plan over more than 64 facts, a fact outside [`NAMES`], or a masked
+/// frame against a text that states no [`MASKED`] fact. All three are the
+/// same refusal in different clothes — the lane a word picks IS the program,
+/// so a bit this cannot answer is never a bit it clears.
+pub fn word_of(plan: &Plan, class: FireClass, masked: bool) -> Result<u64, String> {
+    let mut word = 0u64;
+    for (bit, fact) in plan.facts.iter().enumerate() {
+        if bit >= 64 {
+            return Err(format!(
+                "`{}` declares {} facts; a fact word is 64 bits",
+                plan.name,
+                plan.facts.len()
+            ));
+        }
+        let holds = match fact.as_str() {
+            QO_ONE => class == FireClass::Decode,
+            MASKED => masked,
+            other => {
+                return Err(format!(
+                    "`{}` states `{other}`, which is not a fact this floor can \
+                     answer for a {} fire; name it in `model_ir::facts` or the \
+                     lane is a guess",
+                    plan.name,
+                    class.suffix()
+                ));
+            }
+        };
+        if holds {
+            word |= 1 << bit;
         }
     }
+    if masked && !plan.facts.iter().any(|f| f == MASKED) {
+        return Err(format!(
+            "this frame carries a user attention mask and `{}` states no \
+             `masked` fact, so every lane it has attends causally: the mask \
+             would be staged and IGNORED, and the request answered as though \
+             it had asked nothing",
+            plan.name
+        ));
+    }
+    Ok(word)
 }

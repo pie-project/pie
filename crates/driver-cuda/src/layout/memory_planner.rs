@@ -8,8 +8,16 @@ use super::planner_policy as policy;
 use super::profile_cache::Lookup;
 use super::profile_key::{ProfileKey, ProfileShape};
 
-/// Relative budget change past which a measured profile stops describing this machine.
-pub const BUDGET_TOLERANCE: f64 = 0.05;
+/// Relative budget change past which a measured profile stops describing this
+/// machine.
+///
+/// RE-EXPORTED, NOT REDECLARED. This was a second `0.05` beside
+/// `profile_cache`'s, and the two guard the same decision from the two ends of
+/// one file format: the cache decides whether an entry is worth returning and
+/// this decides whether a returned entry describes this boot. Two literals
+/// that must agree, in two modules that already import each other, is the
+/// shape that drifts.
+pub use super::profile_cache::BUDGET_TOLERANCE;
 
 /// The operator's prefill pin -- hard-wired to zero, exactly as the C++ is.
 pub const FORCED_PREFILL: i32 = 0;

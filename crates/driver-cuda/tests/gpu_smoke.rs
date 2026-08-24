@@ -20,9 +20,8 @@ fn a_device_can_be_bound_and_described() {
     let (major, minor) = dev.compute_capability().expect("compute capability");
     let sms = dev.sm_count().expect("sm count");
     let (free, total) = dev.memory_info().expect("memory info");
-    let vmm = dev.supports_vmm().expect("vmm support");
     eprintln!(
-        "device {}: sm_{major}{minor}, {sms} SMs, {} MiB free / {} MiB total, vmm={vmm}",
+        "device {}: sm_{major}{minor}, {sms} SMs, {} MiB free / {} MiB total",
         dev.ordinal(),
         free / (1 << 20),
         total / (1 << 20)

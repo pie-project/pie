@@ -61,9 +61,10 @@
 // declared in `deinterleave.hpp`, defined in `deinterleave.cu`, and called
 // from NOWHERE -- no model text, no driver-internal table row, no sibling
 // `.cu` -- so a row for it would be a contract naming a caller that does not
-// exist, which is the refusal `layout/geometry.cuh`'s two kernels already
-// carry. The template is worth having anyway: the day a caller appears the
-// row costs a line and no C++.
+// exist. `layout/geometry.cuh`'s two kernels carried the same refusal and
+// have since been deleted for it, along with the Rust that named the file;
+// this template is still here, and the entry-point allowlist in
+// `tests/every_source_is_reached.rs` is where it is now counted.
 //
 //===----------------------------------------------------------------------===//
 #pragma once

@@ -15,10 +15,10 @@
 //! thing that reads its config. The refusal named exactly one missing thing
 //! and [`Rescale::Yarn`] is it.
 //!
-//! Derived at LOAD from the checkpoint's config, which makes it the driver's
-//! answer and not the text's -- the same argument
-//! [`kernels::Source::Named(<kernels::keys::KvHeadStride as kernels::keys::Fact>::KEY)`] makes for the pool's strides. A model
-//! states an architecture; a config states a deployment.
+//! Derived at LOAD from the deployment, which makes it the driver's answer
+//! and not the text's -- the same argument `baker::KvGeometry` makes for the
+//! pool's strides. A model states an architecture; a deployment states how it
+//! is being served.
 
 /// The rescaling a config asks for, or none.
 ///
@@ -27,15 +27,14 @@
 /// WAVELENGTH and YaRN is a ramp in ROTATIONS-per-token, and the channels
 /// each leaves alone are found by different arithmetic. This was one struct
 /// with llama-3's four fields, which is why a YaRN row had nowhere to land
-/// and [`super::super::batch::geometry`] declined it.
+/// and the deleted `batch::geometry` declined it.
 ///
 /// YaRN's fifth number, `attention_factor`, is deliberately NOT here. It
 /// scales the attention LOGITS, not the ladder -- HF multiplies `cos` and
 /// `sin` by it, which is the same as multiplying the rotated `q` and `k`, so
 /// what reaches the softmax is the dot product times its SQUARE. A frequency
-/// table cannot carry an amplitude, so it travels as
-/// [`model::shared::llama_like::forward::LlamaLikeMetalFacts::attn_scale`]
-/// instead and this module would silently drop it if it took it.
+/// table cannot carry an amplitude, so it travels as the attention scale a
+/// statement states, and this module would silently drop it if it took it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Rescale {
     /// llama-3's piecewise-by-wavelength rescaling (`rope_type: "llama3"`).
@@ -73,23 +72,14 @@ pub enum Rescale {
     },
 }
 
-/// The ladder a GEOMETRY asks for.
-///
-/// One call, so the derivation has one site. What stood here was five lines
-/// spelled out at the load and hand-copied into ten places in
-/// `device_real_weights.rs` -- and a hand-copy of the driver's derivation is
-/// the one thing a numeric gate must not hold, because the copies go stale
-/// silently and the test then compares the model against the ladder the
-/// driver USED TO build. That is a gate which cannot fail for the reason it
-/// exists.
-#[must_use]
-pub fn table(geometry: &crate::batch::DecodeGeometry) -> Vec<f32> {
-    frequencies(
-        geometry.head_dim,
-        geometry.rope_theta,
-        geometry.rope_rescale,
-    )
-}
+// `table(&DecodeGeometry)` STOOD HERE and went with the geometry. It was a
+// three-argument forward to `frequencies` whose whole value was having ONE
+// site for the derivation, because five lines of ladder arithmetic had been
+// hand-copied into ten places in `device_real_weights.rs` and a hand-copy of
+// the driver's derivation is the one thing a numeric gate must not hold.
+// `frequencies` below is still that one site; what changed is that a caller
+// names the three numbers rather than passing a struct projected from a
+// catalog row, because there is no such struct any more.
 
 /// `[rotary_dims/2]` inverse frequencies for `head_dim` at `theta`.
 ///

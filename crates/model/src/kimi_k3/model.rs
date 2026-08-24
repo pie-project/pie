@@ -7,15 +7,13 @@ pub struct Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize = 1> {
     pub hidden: u32,
     pub vocab: u32,
     pub embed: Tensor<W1>,
-    pub head: Head<W1>,
+    /// The lm head's own bank. This text does NOT tie: the tied reading was
+    /// an enum arm no geometry constructed, and `tie_word_embeddings` is
+    /// false in the config these dims are read from.
+    pub head: Tensor<W1>,
     pub layers: Vec<Layer<W1, W2>>,
     pub final_norm: Norm<W1>,
     _kv: PhantomData<K>,
-}
-
-pub enum Head<W1: Dtype> {
-    Tied,
-    Bank(Tensor<W1>),
 }
 
 pub struct Layer<W1: Dtype, W2: Dtype> {
@@ -83,6 +81,7 @@ pub struct Kda<W1: Dtype> {
     pub delta_state: CacheRef,
 }
 
+#[allow(clippy::large_enum_variant)] // a per-layer weight-bank record, built once at trace; boxing buys nothing and costs every reader a deref
 pub enum Mlp<W1: Dtype, W2: Dtype> {
     Dense {
         gate_up: Tensor<W1>,
@@ -149,7 +148,6 @@ struct Dims {
     situ_beta: f32,
     situ_cap: Option<f32>,
     vocab: u32,
-    tied: bool,
     norm_eps: f32,
 }
 
@@ -186,22 +184,53 @@ fn per_rank<const TP: usize>(d: Dims) -> Dims {
 }
 
 impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
+    /// UNVERIFIED — an 8-LAYER STAND-IN, and no Kimi K3 checkpoint is cached
+    /// to make it anything else.
+    ///
+    /// `serve::ROWS` advertises `kimik3-bf16-mxfp4-kv-bf16` as arch
+    /// `kimi_k3`, which is the real architecture's name; `layers: 8` with
+    /// `dense_layers: 1` is not the real architecture's depth. The depth
+    /// that IS load-bearing here is the ratio: at `full_attn_every: 4` and
+    /// `res_block: 4` an 8-layer tower traces 2 MLA layers, 6 KDA layers
+    /// and 1 residual-ledger blend, which is what makes it exercise
+    /// `norm.res_blend` (kimi's variadic point, whose only caller this is)
+    /// and both KDA arms beside MLA. Every number is a plausible shape
+    /// rather than a config key, and the join that would settle them has
+    /// never run.
     pub fn k3() -> Self {
         assemble(Dims {
-            hidden: 2048, layers: 8, dense_layers: 1, full_attn_every: 4, res_block: 4,
+            hidden: 2048,
+            layers: 8,
+            dense_layers: 1,
+            full_attn_every: 4,
+            res_block: 4,
             mla: MlaDims {
-                heads: 16, q_lora_rank: 768, kv_lora_rank: 256,
-                qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128,
+                heads: 16,
+                q_lora_rank: 768,
+                kv_lora_rank: 256,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
                 output_gate: true,
             },
-            kda: KdaDims { heads: 16, head_dim: 128, conv_kernel: 4, norm_eps: 1e-5 },
+            kda: KdaDims {
+                heads: 16,
+                head_dim: 128,
+                conv_kernel: 4,
+                norm_eps: 1e-5,
+            },
             moe: MoeDims {
-                experts: 64, top_k: 6, routed_scaling: 2.0,
-                inter: 1024, shared_inter: 1024,
+                experts: 64,
+                top_k: 6,
+                routed_scaling: 2.0,
+                inter: 1024,
+                shared_inter: 1024,
             },
             dense_inter: 5632,
-            situ_beta: 1.0, situ_cap: None,
-            vocab: 163_840, tied: false, norm_eps: 1e-5,
+            situ_beta: 1.0,
+            situ_cap: None,
+            vocab: 163_840,
+            norm_eps: 1e-5,
         })
     }
 }
@@ -209,9 +238,9 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
 fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, W2, K, TP> {
     let d = per_rank::<TP>(d);
     let hidden = d.hidden as u64;
-    let full_at = |l: u32| d.full_attn_every > 0 && (l + 1) % d.full_attn_every == 0;
+    let full_at = |l: u32| d.full_attn_every > 0 && (l + 1).is_multiple_of(d.full_attn_every);
     let moe_at = |l: u32| l >= d.dense_layers;
-    let blend_at = |l: u32| d.res_block > 0 && l > 0 && l % d.res_block == 0;
+    let blend_at = |l: u32| d.res_block > 0 && l > 0 && l.is_multiple_of(d.res_block);
 
     let a = &d.mla;
     let k = &d.kda;
@@ -222,100 +251,122 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
     let v_width = a.heads as u64 * a.v_head_dim as u64;
     let kda_width = k.heads as u64 * k.head_dim as u64;
 
-    let layers = (0..d.layers).map(|l| {
-        let n = |s: &str| format!("layer.{l}.{s}");
-        let norm = |s: &str, w: u64| Norm { weight: Tensor::sym(n(s), [w]), eps: d.norm_eps };
-        let mixer = if full_at(l) {
-            Mixer::Mla(Mla {
-                heads: a.heads,
-                kv_lora_rank: a.kv_lora_rank,
-                qk_nope_head_dim: a.qk_nope_head_dim,
-                qk_rope_head_dim: a.qk_rope_head_dim,
-                v_head_dim: a.v_head_dim,
-                sm_scale: (qk_head_dim as f32).sqrt().recip(),
-                q_a_proj: Tensor::sym(n("q_a_proj"), [a.q_lora_rank as u64, hidden]),
-                q_a_norm: norm("q_a_norm", a.q_lora_rank as u64),
-                q_b_proj: Tensor::sym(n("q_b_proj"), [q_b_width, a.q_lora_rank as u64]).columns(),
-                kv_a_proj: Tensor::sym(n("kv_a_proj"), [kv_a_width, hidden]),
-                kv_a_norm: norm("kv_a_norm", a.kv_lora_rank as u64),
-                kv_b_proj: Tensor::sym(n("kv_b_proj"), [kv_b_width, a.kv_lora_rank as u64]).columns(),
-                gate: a.output_gate.then(|| Tensor::sym(n("o_gate"), [v_width, hidden]).columns()),
-                o_proj: Tensor::sym(n("o_proj"), [hidden, v_width]).rows(),
-                kv: CacheRef::to(format!("kv.{l}")),
-            })
-        } else {
-            Mixer::Kda(Kda {
-                heads: k.heads,
-                head_dim: k.head_dim,
-                conv_kernel: k.conv_kernel,
-                norm_eps: k.norm_eps,
-                qkv: Tensor::sym(n("kda_qkv"), [3 * kda_width, hidden]).packed([kda_width, kda_width, kda_width]),
-                conv: Tensor::sym(n("kda_conv"), [3 * kda_width, k.conv_kernel as u64]).packed([kda_width, kda_width, kda_width]),
-                f_a: Tensor::sym(n("kda_f_a"), [k.head_dim as u64, hidden]),
-                f_b: Tensor::sym(n("kda_f_b"), [kda_width, k.head_dim as u64]).columns(),
-                b: Tensor::sym(n("kda_b"), [k.heads as u64, hidden]).columns(),
-                dt_bias: Tensor::<F32>::sym(n("kda_dt_bias"), [k.heads as u64, k.head_dim as u64]).columns(),
-                a_log: Tensor::<F32>::sym(n("kda_a_log"), [k.heads as u64]).columns(),
-                gate: Tensor::sym(n("kda_gate"), [kda_width, hidden]).columns(),
-                o_norm: Norm { weight: Tensor::sym(n("kda_o_norm"), [k.head_dim as u64]), eps: k.norm_eps },
-                o_proj: Tensor::sym(n("kda_o_proj"), [hidden, kda_width]).rows(),
-                conv_state: CacheRef::to(format!("conv.{l}")),
-                delta_state: CacheRef::to(format!("delta.{l}")),
-            })
-        };
-        let mlp = if moe_at(l) {
-            let m = &d.moe;
-            let inter = m.inter as u64;
-            let shared_inter = m.shared_inter as u64;
-            Mlp::Routed {
-                router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
-                gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * inter, hidden]).bank([inter, inter]),
-                down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, inter]).rows(),
-                shared: (m.shared_inter > 0).then(|| Shared {
-                    gate_up: Tensor::sym(n("shared_gate_up"), [2 * shared_inter, hidden]).packed([shared_inter, shared_inter]),
-                    down: Tensor::sym(n("shared_down"), [hidden, shared_inter]).rows(),
-                    inter: m.shared_inter,
+    let layers = (0..d.layers)
+        .map(|l| {
+            let n = |s: &str| format!("layer.{l}.{s}");
+            let norm = |s: &str, w: u64| Norm {
+                weight: Tensor::sym(n(s), [w]),
+                eps: d.norm_eps,
+            };
+            let mixer = if full_at(l) {
+                Mixer::Mla(Mla {
+                    heads: a.heads,
+                    kv_lora_rank: a.kv_lora_rank,
+                    qk_nope_head_dim: a.qk_nope_head_dim,
+                    qk_rope_head_dim: a.qk_rope_head_dim,
+                    v_head_dim: a.v_head_dim,
+                    sm_scale: (qk_head_dim as f32).sqrt().recip(),
+                    q_a_proj: Tensor::sym(n("q_a_proj"), [a.q_lora_rank as u64, hidden]),
+                    q_a_norm: norm("q_a_norm", a.q_lora_rank as u64),
+                    q_b_proj: Tensor::sym(n("q_b_proj"), [q_b_width, a.q_lora_rank as u64])
+                        .columns(),
+                    kv_a_proj: Tensor::sym(n("kv_a_proj"), [kv_a_width, hidden]),
+                    kv_a_norm: norm("kv_a_norm", a.kv_lora_rank as u64),
+                    kv_b_proj: Tensor::sym(n("kv_b_proj"), [kv_b_width, a.kv_lora_rank as u64])
+                        .columns(),
+                    gate: a
+                        .output_gate
+                        .then(|| Tensor::sym(n("o_gate"), [v_width, hidden]).columns()),
+                    o_proj: Tensor::sym(n("o_proj"), [hidden, v_width]).rows(),
+                    kv: CacheRef::to(format!("kv.{l}")),
+                })
+            } else {
+                Mixer::Kda(Kda {
+                    heads: k.heads,
+                    head_dim: k.head_dim,
+                    conv_kernel: k.conv_kernel,
+                    norm_eps: k.norm_eps,
+                    qkv: Tensor::sym(n("kda_qkv"), [3 * kda_width, hidden])
+                        .packed([kda_width, kda_width, kda_width]),
+                    conv: Tensor::sym(n("kda_conv"), [3 * kda_width, k.conv_kernel as u64])
+                        .packed([kda_width, kda_width, kda_width]),
+                    f_a: Tensor::sym(n("kda_f_a"), [k.head_dim as u64, hidden]),
+                    f_b: Tensor::sym(n("kda_f_b"), [kda_width, k.head_dim as u64]).columns(),
+                    b: Tensor::sym(n("kda_b"), [k.heads as u64, hidden]).columns(),
+                    dt_bias: Tensor::<F32>::sym(
+                        n("kda_dt_bias"),
+                        [k.heads as u64, k.head_dim as u64],
+                    )
+                    .columns(),
+                    a_log: Tensor::<F32>::sym(n("kda_a_log"), [k.heads as u64]).columns(),
+                    gate: Tensor::sym(n("kda_gate"), [kda_width, hidden]).columns(),
+                    o_norm: Norm {
+                        weight: Tensor::sym(n("kda_o_norm"), [k.head_dim as u64]),
+                        eps: k.norm_eps,
+                    },
+                    o_proj: Tensor::sym(n("kda_o_proj"), [hidden, kda_width]).rows(),
+                    conv_state: CacheRef::to(format!("conv.{l}")),
+                    delta_state: CacheRef::to(format!("delta.{l}")),
+                })
+            };
+            let mlp = if moe_at(l) {
+                let m = &d.moe;
+                let inter = m.inter as u64;
+                let shared_inter = m.shared_inter as u64;
+                Mlp::Routed {
+                    router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
+                    gate_up: Tensor::sym(
+                        n("experts_gate_up"),
+                        [m.experts as u64, 2 * inter, hidden],
+                    )
+                    .bank([inter, inter]),
+                    down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, inter]).rows(),
+                    shared: (m.shared_inter > 0).then(|| Shared {
+                        gate_up: Tensor::sym(n("shared_gate_up"), [2 * shared_inter, hidden])
+                            .packed([shared_inter, shared_inter]),
+                        down: Tensor::sym(n("shared_down"), [hidden, shared_inter]).rows(),
+                        inter: m.shared_inter,
+                    }),
+                    experts: m.experts,
+                    top_k: m.top_k,
+                    routed_scaling: m.routed_scaling,
+                    inter: m.inter,
+                    beta: d.situ_beta,
+                    up_cap: d.situ_cap,
+                }
+            } else {
+                let inter = d.dense_inter as u64;
+                Mlp::Dense {
+                    gate_up: Tensor::sym(n("gate_up"), [2 * inter, hidden]).packed([inter, inter]),
+                    down: Tensor::sym(n("down"), [hidden, inter]).rows(),
+                    inter: d.dense_inter,
+                    beta: d.situ_beta,
+                    up_cap: d.situ_cap,
+                }
+            };
+            Layer {
+                res_blend: blend_at(l).then(|| ResBlend {
+                    norm: norm("res_norm", hidden),
+                    proj: Tensor::sym(n("res_proj"), [1, hidden]),
                 }),
-                experts: m.experts,
-                top_k: m.top_k,
-                routed_scaling: m.routed_scaling,
-                inter: m.inter,
-                beta: d.situ_beta,
-                up_cap: d.situ_cap,
+                mixer,
+                mixer_norm: norm("mixer_norm", hidden),
+                mlp_norm: norm("mlp_norm", hidden),
+                mlp,
             }
-        } else {
-            let inter = d.dense_inter as u64;
-            Mlp::Dense {
-                gate_up: Tensor::sym(n("gate_up"), [2 * inter, hidden]).packed([inter, inter]),
-                down: Tensor::sym(n("down"), [hidden, inter]).rows(),
-                inter: d.dense_inter,
-                beta: d.situ_beta,
-                up_cap: d.situ_cap,
-            }
-        };
-        Layer {
-            res_blend: blend_at(l).then(|| ResBlend {
-                norm: norm("res_norm", hidden),
-                proj: Tensor::sym(n("res_proj"), [1, hidden]),
-            }),
-            mixer,
-            mixer_norm: norm("mixer_norm", hidden),
-            mlp_norm: norm("mlp_norm", hidden),
-            mlp,
-        }
-    }).collect();
+        })
+        .collect();
 
     Model {
         hidden: d.hidden,
         vocab: d.vocab,
         embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
-        head: if d.tied {
-            Head::Tied
-        } else {
-            Head::Bank(Tensor::sym("lm_head", [d.vocab as u64, hidden]))
-        },
+        head: Tensor::sym("lm_head", [d.vocab as u64, hidden]),
         layers,
-        final_norm: Norm { weight: Tensor::sym("final_norm", [hidden]), eps: d.norm_eps },
+        final_norm: Norm {
+            weight: Tensor::sym("final_norm", [hidden]),
+            eps: d.norm_eps,
+        },
         _kv: PhantomData,
     }
 }

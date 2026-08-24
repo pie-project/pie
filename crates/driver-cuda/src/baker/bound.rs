@@ -25,11 +25,11 @@
 //! every slot of every point rather than at the two the shim remembered.
 
 use kernels::bound::{Axis, BoundOp, Rides, Site};
+use kernels::plane::{Cache, Const, In, InOut, Out, Refusal};
 use kernels::points::{Form, Repr};
 use kernels::raises::Struct;
-use kernels::routine::{Cache, Const, In, InOut, Out, Refusal};
-use kernels_cuda::jit::abi::{Bank as CudaBank, Planes, Tensor};
 use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::{Bank as CudaBank, Planes, Tensor};
 use kernels_cuda::views::{KvCache, RecurrentState};
 use model::produce::Dtype;
 use model_compiler::program::Dt;
@@ -129,9 +129,10 @@ impl<'a> BoundOp for Bound<'_, 'a> {
         // rectangle for every result, so the operand's bytes have to be in
         // the result's rectangle before the kernel writes through it. See
         // `Fire::inout`.
-        let r = self
-            .fire
-            .inout(self.fire.input(self.op, from)?, self.fire.output(self.op, to)?)?;
+        let r = self.fire.inout(
+            self.fire.input(self.op, from)?,
+            self.fire.output(self.op, to)?,
+        )?;
         rides::<T>(
             "an in-place operand at an element the point does not state",
             axis(r.dt),
@@ -149,12 +150,9 @@ impl<'a> BoundOp for Bound<'_, 'a> {
     }
 
     fn form(&self, at: usize) -> Result<Form, Refusal> {
-        match self.fire.weight(self.op, at)?.repr.as_str() {
-            "mxfp4" => Ok(Form::Mxfp4),
-            _ => Err(Refusal::Absent {
-                what: "a bank at a repr no point is instantiated at",
-            }),
-        }
+        Form::from_name(&self.fire.weight(self.op, at)?.repr).ok_or(Refusal::Absent {
+            what: "a bank at a repr no point is instantiated at",
+        })
     }
 
     fn bank<R: Repr>(&self, at: usize) -> Result<Const<CudaBank<R>>, Refusal> {

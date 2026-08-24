@@ -3,7 +3,7 @@ use core::ffi::c_void;
 
 #[cfg(feature = "_cuda")]
 use cudarc::runtime::sys as rt;
-use kernels::routine::Refusal;
+use kernels::plane::Refusal;
 
 pub struct PinnedBytes {
     ptr: *mut u8,

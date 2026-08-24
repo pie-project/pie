@@ -1,5 +1,5 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::load::{copy, deinterleave, Import, SfBase};
+use model_dsl::load::{Import, SfBase, copy, deinterleave};
 
 use super::model::Model;
 
@@ -21,25 +21,66 @@ const FUSED: u32 = 2;
 
 const ROW_AXIS: u32 = 1;
 
-pub fn import_hf<B: SfBase, W1: Dtype, W2: Dtype, K: KvDtype>(m: &Model<W1, W2, K>) -> Import {
+pub fn import_hf<B: SfBase, W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(
+    m: &Model<W1, W2, K, TP>,
+) -> Import {
     let mut i = Import::new::<B>();
     i.write("embed", copy("embed_tokens"));
     i.write("final_norm", copy("norm"));
     i.write("lm_head", copy("lm_head"));
     for l in 0..m.layers.len() {
-        i.write(format!("layer.{l}.attn_norm"), copy(format!("layer.{l}.input_layernorm")));
-        i.write(format!("layer.{l}.mlp_norm"), copy(format!("layer.{l}.post_attention_layernorm")));
-        i.write(format!("layer.{l}.q_proj"), copy(format!("layer.{l}.self_attn.q_proj")));
-        i.write(format!("layer.{l}.q_bias"), copy(format!("layer.{l}.self_attn.q_proj.bias")));
-        i.write(format!("layer.{l}.k_proj"), copy(format!("layer.{l}.self_attn.k_proj")));
-        i.write(format!("layer.{l}.k_bias"), copy(format!("layer.{l}.self_attn.k_proj.bias")));
-        i.write(format!("layer.{l}.v_proj"), copy(format!("layer.{l}.self_attn.v_proj")));
-        i.write(format!("layer.{l}.v_bias"), copy(format!("layer.{l}.self_attn.v_proj.bias")));
-        i.write(format!("layer.{l}.o_proj"), copy(format!("layer.{l}.self_attn.o_proj")));
-        i.write(format!("layer.{l}.o_bias"), copy(format!("layer.{l}.self_attn.o_proj.bias")));
-        i.write(format!("layer.{l}.attn_sinks"), copy(format!("layer.{l}.self_attn.sinks")));
-        i.write(format!("layer.{l}.router"), copy(format!("layer.{l}.mlp.router")));
-        i.write(format!("layer.{l}.router_bias"), copy(format!("layer.{l}.mlp.router.bias")));
+        i.write(
+            format!("layer.{l}.attn_norm"),
+            copy(format!("layer.{l}.input_layernorm")),
+        );
+        i.write(
+            format!("layer.{l}.mlp_norm"),
+            copy(format!("layer.{l}.post_attention_layernorm")),
+        );
+        i.write(
+            format!("layer.{l}.q_proj"),
+            copy(format!("layer.{l}.self_attn.q_proj")),
+        );
+        i.write(
+            format!("layer.{l}.q_bias"),
+            copy(format!("layer.{l}.self_attn.q_proj.bias")),
+        );
+        i.write(
+            format!("layer.{l}.k_proj"),
+            copy(format!("layer.{l}.self_attn.k_proj")),
+        );
+        i.write(
+            format!("layer.{l}.k_bias"),
+            copy(format!("layer.{l}.self_attn.k_proj.bias")),
+        );
+        i.write(
+            format!("layer.{l}.v_proj"),
+            copy(format!("layer.{l}.self_attn.v_proj")),
+        );
+        i.write(
+            format!("layer.{l}.v_bias"),
+            copy(format!("layer.{l}.self_attn.v_proj.bias")),
+        );
+        i.write(
+            format!("layer.{l}.o_proj"),
+            copy(format!("layer.{l}.self_attn.o_proj")),
+        );
+        i.write(
+            format!("layer.{l}.o_bias"),
+            copy(format!("layer.{l}.self_attn.o_proj.bias")),
+        );
+        i.write(
+            format!("layer.{l}.attn_sinks"),
+            copy(format!("layer.{l}.self_attn.sinks")),
+        );
+        i.write(
+            format!("layer.{l}.router"),
+            copy(format!("layer.{l}.mlp.router")),
+        );
+        i.write(
+            format!("layer.{l}.router_bias"),
+            copy(format!("layer.{l}.mlp.router.bias")),
+        );
         // THE BANK IS TWO PLANES AND THE CHECKPOINT SHIPS THEM AS TWO, so
         // every row here is a byte move. gpt-oss's release holds
         // `gate_up_proj_blocks` `[E, 2I, H/32, 16]` and `gate_up_proj_scales`

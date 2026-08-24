@@ -1,35 +1,38 @@
 use crate::Ty;
-use crate::routine::Elem;
+use crate::plane::Elem;
 
 pub trait Raise: 'static {
     const KEY: &'static str;
 
     type Value: 'static;
-
-    const RESIDENT: bool = false;
 }
 
-/// What answers a raise BY ITS KEY — the executor's staging, reached from a
-/// `#[claims]` body through the plane's own context.
-///
-/// THE DOOR A GENERATED DISPATCH CANNOT OPEN. A `BoundOp` answers by COLUMN:
-/// every accessor it has reads a slot the statement carries, and the whole
-/// point of a raise is that no statement carries it. A routine took its
-/// staging as an extra operand and the driver bound it positionally; a body
-/// takes the same thing off `self`, and the only name it has for it is the
-/// one the [`Raise`] declares. So the executor answers a `&'static str` and
-/// nothing else: `driver-cuda/src/bind/views.rs::FireViews::raised` was
-/// written to this shape before it had a caller, and this is the caller.
-///
-/// `None` IS A REFUSAL AND NEVER A NULL, with one exception the caller names
-/// rather than the answerer: an object whose ABSENCE a kernel reads — the
-/// row-validity plane, a mask nothing customised — is asked for through the
-/// plane's optional door, and everything else refuses with the key in it.
-/// An answerer that returns `Some(null)` has lied about staging something.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Class {
+    pub head_dim: u32,
+
+    pub window: u32,
+}
+
+impl Class {
+    pub const ANY: Self = Self {
+        head_dim: 0,
+        window: 0,
+    };
+
+    #[must_use]
+    pub const fn attention(head_dim: u32, window: u32) -> Self {
+        Self { head_dim, window }
+    }
+
+    #[must_use]
+    pub const fn is_any(&self) -> bool {
+        self.head_dim == 0 && self.window == 0
+    }
+}
+
 pub trait Answered {
-    /// The staged object registered under `key`, or `None` when this fire
-    /// staged none.
-    fn raised(&self, key: &'static str) -> Option<*const core::ffi::c_void>;
+    fn raised(&self, key: &'static str, class: Class) -> Option<*const core::ffi::c_void>;
 }
 
 pub struct Struct<T: Raise>(core::marker::PhantomData<T>);
@@ -53,8 +56,6 @@ impl<T: Raise> Elem for Struct<T> {
     }
 
     const CPP: &'static str = "";
-    const CPP_CONST: &'static str = "";
-    const CPP_MUT: &'static str = "";
 
     const TY_CONST: Ty = Ty::Raised;
     const TY_MUT: Ty = Ty::Raised;
@@ -70,21 +71,6 @@ macro_rules! raise {
         impl $crate::raises::Raise for $name {
             const KEY: &'static str = $key;
             type Value = $value;
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! resident {
-    ($(#[$m:meta])* $name:ident = $key:literal => $value:ty) => {
-        $(#[$m])*
-        #[derive(Clone, Copy, Debug)]
-        pub struct $name;
-
-        impl $crate::raises::Raise for $name {
-            const KEY: &'static str = $key;
-            type Value = $value;
-            const RESIDENT: bool = true;
         }
     };
 }

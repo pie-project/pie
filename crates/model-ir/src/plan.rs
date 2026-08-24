@@ -16,6 +16,31 @@ pub struct Plan {
     pub seams: Vec<Seam>,
 }
 
+/// WHICH SHAPE OF FIRE a driver is about to run — the one thing about a fire
+/// that a plan's own vocabulary needs a name for.
+///
+/// It stood in `crate::trace`, beside the legacy traced form, and outlived
+/// it: nothing has built a `ForwardPlan` since R3, and this was the one item
+/// of that module four executors still read. So it lives beside [`Plan`],
+/// which is what they read it against — [`crate::facts::word_of`] answers
+/// the `qo_one` fact from it, and [`FireClass::suffix`] is the name a bake
+/// gives each of the two programs it stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FireClass {
+    Decode,
+    Prefill,
+}
+
+impl FireClass {
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Prefill => "prefill",
+        }
+    }
+}
+
 /// One weight a text stated, as the plan holds it.
 ///
 /// `shape` IS WHAT THIS RANK HOLDS. A tensor-parallel row states its own cut
@@ -119,6 +144,7 @@ impl Cond {
     }
 
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // the boolean algebra's own word, beside `and`; `ops::Not` wants `self`, this is a builder
     pub fn not(a: Cond) -> Cond {
         Cond::Not(Box::new(a))
     }

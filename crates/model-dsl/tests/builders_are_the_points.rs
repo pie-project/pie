@@ -44,13 +44,15 @@
 //!   `Dtype` on this surface is the CHECKPOINT's repr axis (bf16 / mxfp4 /
 //!   wna16) and the declaration's is the kernel's ELEMENT (`f32`, or the
 //!   method's `T`). There is no `Dtype` for `f32`, so a `Const` pinned to
-//!   `Self::Tensor<f32>` — `moe.topk_sqrt_softplus`, `hc.gates`,
-//!   `hc.collapse`, `norm.rmsnorm_gated{,_by}` — still takes a
-//!   `&Tensor<W>` here. That is a SURFACE GAP, not drift. The slots that
-//!   have crossed already — the recurrent decay pair, `a_log` and
-//!   `dt_bias` — take `&Tensor<F32>`, because the models declare them that
-//!   way; `ssm.kda_step` and `ssm.kda_chunked` spell BOTH that way and are
-//!   therefore the two points with a `Const` and no `<W: Dtype>` at all.
+//!   `Self::Tensor<f32>` — `moe.topk_sqrt_softplus`,
+//!   `norm.rmsnorm_gated{,_by}` — still takes a `&Tensor<W>` here. That is
+//!   a SURFACE GAP, not drift, and [`crossed_to_f32`] is the list of slots
+//!   for which it has closed: the recurrent decay pair (`a_log` and
+//!   `dt_bias`) and both of deepseek-v4's head-mix pairs (`hc.gates`,
+//!   `hc.collapse`). They take `&Tensor<F32>` because the models declare
+//!   them that way. `ssm.kda_step`, `ssm.kda_chunked`, `hc.gates` and
+//!   `hc.collapse` spell EVERY `Const` that way and are therefore the four
+//!   points with a `Const` and no `<W: Dtype>` at all.
 //!   `attention.sink` LEFT THAT LIST BY BEING FIXED rather than by being
 //!   spelled: its sink slot rides the point's own element now, because
 //!   that is what the checkpoints ship it at, so the `&Tensor<W>` the hand
@@ -69,31 +71,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use kernels::points::{
-    ATTENTION_POINTS, DIST_POINTS, Dtype, GATE_POINTS, GEMM_POINTS, HC_POINTS, INDEX_POINTS,
-    LAYOUT_POINTS, MLA_POINTS, MLP_POINTS, MOE_POINTS, Mark, NORM_POINTS, POOL_POINTS, Point,
-    Prim, ROPE_POINTS, SSM_POINTS,
-};
+use kernels::points::{Dtype, Element, Fan, Mark, Point, Prim, Shape, Width, declared};
 use quote::ToTokens;
 
 /// Every family's table, in the order `kernels/src/points.rs` declares them.
 fn points() -> Vec<&'static Point> {
-    NORM_POINTS
-        .iter()
-        .chain(MLP_POINTS)
-        .chain(GEMM_POINTS)
-        .chain(DIST_POINTS)
-        .chain(ROPE_POINTS)
-        .chain(MOE_POINTS)
-        .chain(GATE_POINTS)
-        .chain(LAYOUT_POINTS)
-        .chain(SSM_POINTS)
-        .chain(ATTENTION_POINTS)
-        .chain(MLA_POINTS)
-        .chain(INDEX_POINTS)
-        .chain(POOL_POINTS)
-        .chain(HC_POINTS)
-        .collect()
+    declared().collect()
 }
 
 // ── The exceptions ──────────────────────────────────────────────────────
@@ -170,7 +153,10 @@ const EXCEPTIONS: &[(&str, &[Except])] = &[
     ("attention.prefill", &[Except::Windows, Except::WindowOpt]),
     ("attention.masked", &[Except::Windows, Except::WindowOpt]),
     ("attention.decode_lse", &[Except::WindowOpt]),
-    ("attention.prefill_lse", &[Except::Windows, Except::WindowOpt]),
+    (
+        "attention.prefill_lse",
+        &[Except::Windows, Except::WindowOpt],
+    ),
     ("ssm.causal_conv1d_chunked", &[Except::Windows]),
     ("ssm.gated_delta_chunked", &[Except::Windows]),
     ("ssm.kda_chunked", &[Except::Windows]),
@@ -189,16 +175,30 @@ fn excepted(point: &str) -> &'static [Except] {
         .map_or(&[][..], |(_, e)| *e)
 }
 
+/// Whether a fixed-f32 `Const` slot has CROSSED — whether the model struct
+/// behind it declares `axes::F32`, so the builder spells `&Tensor<F32>`
+/// rather than standing the slot on the repr axis `W`.
+///
+/// THE LIST IS THE MODELS', not the floor's. Every slot named here is
+/// `Const<Self::Tensor<f32>>` at the declaration and every slot NOT named
+/// here is too — what separates them is whether the text's struct rides
+/// `W1` still, and while it does, `W` is the honest stand-in and `F32`
+/// would be the lie. `moe.topk_sqrt_softplus`'s bias and
+/// `norm.rmsnorm_gated{,_by}`'s weight are what is left.
+fn crossed_to_f32(point: &str, slot: &str) -> bool {
+    matches!(slot, "a_log" | "dt_bias") || matches!(point, "hc.gates" | "hc.collapse")
+}
+
 /// Whether the point's FIRST `Const` slot is a bank, which is what decides
 /// whether `W` names the repr axis or the element one.
 ///
-/// The `a_log`/`dt_bias` pair below is excluded for the reason it is excluded
-/// there: those two spell `axes::F32` outright and claim neither name.
+/// The crossed slots are excluded for the reason they are excluded below:
+/// they spell `axes::F32` outright and claim neither name.
 fn first_kind_is_bank(p: &Point) -> bool {
     p.slots
         .iter()
         .filter(|s| s.mark == Mark::Const)
-        .filter(|s| !matches!((s.dtype, s.name), (Dtype::Fixed(Prim::F32), "a_log" | "dt_bias")))
+        .filter(|s| !matches!(s.dtype, Dtype::Fixed(Prim::F32)) || !crossed_to_f32(p.name, s.name))
         .map(|s| matches!(s.dtype, Dtype::Bank(_)))
         .next()
         .unwrap_or(false)
@@ -221,7 +221,10 @@ fn pool_type(family: &str) -> &'static str {
 
 /// The builder `p` implies, as source.
 fn expected(p: &Point) -> String {
-    let (family, method) = p.name.split_once('.').expect("a point's name is `family.method`");
+    let (family, method) = p
+        .name
+        .split_once('.')
+        .expect("a point's name is `family.method`");
     let ex = excepted(p.name);
     let has = |e: Except| ex.contains(&e);
 
@@ -282,12 +285,14 @@ fn expected(p: &Point) -> String {
                 // documented stand-in for the fixed-f32 slots whose model
                 // structs still ride the W1 axis (the repr-vs-element gap).
                 //
-                // TWO NAMES, and the second is `ssm.kda_*`'s half of the
-                // same pair. `ssm/kda.cuh`'s `kda_gate_beta` takes `A_log`
-                // AND `dt_bias` as `const float*`, both points declare both
+                // WHICH SLOTS HAVE CROSSED is [`crossed_to_f32`]'s list.
+                // `ssm/kda.cuh`'s `kda_gate_beta` takes `A_log` AND
+                // `dt_bias` as `const float*`, both points declare both
                 // slots `Const<Self::Tensor<f32>>`, and `Kda` in
                 // `model/src/kimi_k3/model.rs` declares both `Tensor<F32>`
                 // — so `W` here would be the lie rather than the stand-in.
+                // `hc.gates`/`hc.collapse` are the same sentence for
+                // deepseek-v4's two mix pairs.
                 // `ssm.gdn_prep`'s `dt_bias` never reaches this arm: qwen's
                 // kernel reads it at the model's element, so that slot is
                 // `Generic(0)` and falls through to `W` on its own.
@@ -304,7 +309,7 @@ fn expected(p: &Point) -> String {
                 // throughout.
                 let banked = matches!(s.dtype, Dtype::Bank(_));
                 let repr = match s.dtype {
-                    Dtype::Fixed(Prim::F32) if matches!(name, "a_log" | "dt_bias") => "F32",
+                    Dtype::Fixed(Prim::F32) if crossed_to_f32(p.name, name) => "F32",
                     _ if banked == first_kind_is_bank(p) => {
                         spelled_w = true;
                         "W"
@@ -379,11 +384,17 @@ fn expected(p: &Point) -> String {
         1 => (" -> Value".into(), ".done()"),
         2 => (" -> (Value, Value)".into(), ".pair()"),
         3 => (" -> (Value, Value, Value)".into(), ".triple()"),
-        n => panic!("`{}` states {n} results and the recorder tops out at three", p.name),
+        n => panic!(
+            "`{}` states {n} results and the recorder tops out at three",
+            p.name
+        ),
     };
 
     let recv = receiver.unwrap_or_else(|| {
-        panic!("`{}` rides no operand column: nothing to record the statement on", p.name)
+        panic!(
+            "`{}` rides no operand column: nothing to record the statement on",
+            p.name
+        )
     });
     let generic = match (spelled_w, spelled_b) {
         (true, true) => "<W: Dtype, B: Dtype>",
@@ -414,10 +425,10 @@ fn expected(p: &Point) -> String {
 /// the empty module.
 fn surface() -> BTreeMap<(String, String), syn::ItemFn> {
     let at = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/kernels.rs");
-    let text = std::fs::read_to_string(&at)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", at.display()));
-    let file: syn::File = syn::parse_str(&text)
-        .unwrap_or_else(|e| panic!("parsing {}: {e}", at.display()));
+    let text =
+        std::fs::read_to_string(&at).unwrap_or_else(|e| panic!("reading {}: {e}", at.display()));
+    let file: syn::File =
+        syn::parse_str(&text).unwrap_or_else(|e| panic!("parsing {}: {e}", at.display()));
     let mut out = BTreeMap::new();
     for item in &file.items {
         match item {
@@ -494,8 +505,11 @@ fn builders_are_the_points() {
 
     // A builder no table names. `cuda::*` is tier-2 by construction (an
     // inherent method on the plane's `Ctx`, which no trait and therefore no
-    // `#[points]` table can see) and `query_windows` is the ragged pairing's
-    // constructor, not a statement.
+    // `#[points]` table can see); `query_windows` is the ragged pairing's
+    // constructor, not a statement; and `dist::reduce` is the `TP` FOLD over
+    // `dist.all_reduce` — at `TP > 1` it records that point and nothing
+    // else, at `TP == 1` it records nothing at all, so there is no statement
+    // for a table to state.
     for (family, method) in have.keys() {
         if claimed.contains(&(family.clone(), method.clone())) || family == "cuda" {
             continue;
@@ -503,12 +517,17 @@ fn builders_are_the_points() {
         if family.is_empty() && method == "query_windows" {
             continue;
         }
+        if family == "dist" && method == "reduce" {
+            continue;
+        }
         let path = if family.is_empty() {
             format!("model_dsl::kernels::{method}")
         } else {
             format!("model_dsl::kernels::{family}::{method}")
         };
-        drift.push(format!("UNDECLARED  {path} records a statement no `*_POINTS` row states"));
+        drift.push(format!(
+            "UNDECLARED  {path} records a statement no `*_POINTS` row states"
+        ));
     }
 
     assert!(
@@ -549,5 +568,131 @@ fn tier_two_is_unchecked_and_small() {
         vec!["qkv_fused_qknorm_rope_vnorm_write"],
         "the tier-2 builders are hand-written against no table; a new one is a \
          decision, not a mapping"
+    );
+}
+
+// ── The columns a shape rule counts on ──────────────────────────────────
+
+/// Every operand and param column a point's [`Shape`] rules read.
+///
+/// A rule names SLOTS and `#[points]` turns them into COLUMNS — the index of
+/// the operand in the statement's `inputs`, of the scalar in its `params`.
+/// That translation is only true while a builder records exactly the slots the
+/// declaration lists, in order, one column each. Most of [`EXCEPTIONS`] keeps
+/// that (`.window(w)` IS `.int(..)`, a `&Windows` IS the two values); three
+/// rows do not, and this is what reads them back.
+fn columns(p: &Point) -> (Vec<usize>, Vec<usize>) {
+    fn width(w: &Width, operands: &mut Vec<usize>, params: &mut Vec<usize>) {
+        match *w {
+            Width::Of(at) => operands.push(at),
+            Width::Stated(at) => params.push(at),
+            Width::Axis(..) | Width::Count(_) => {}
+            Width::Times(a, b) | Width::Over(a, b) | Width::Less(a, b) => {
+                width(a, operands, params);
+                width(b, operands, params);
+            }
+        }
+    }
+    let (mut operands, mut params) = (Vec::new(), Vec::new());
+    for Shape {
+        rows,
+        width: w,
+        elem,
+    } in p.outs
+    {
+        match rows {
+            Fan::Fire => {}
+            Fan::Ride(at) | Fan::Per(at) => operands.push(*at),
+        }
+        if let Element::Ride(at) = elem {
+            operands.push(*at);
+        }
+        width(w, &mut operands, &mut params);
+    }
+    (operands, params)
+}
+
+/// How many slots of its own run stand before the one named `name`.
+fn column_of(p: &Point, name: &str, of: impl Fn(Mark) -> bool) -> Option<usize> {
+    let mut at = 0;
+    for s in p.slots {
+        if s.name == name {
+            return Some(at);
+        }
+        if of(s.mark) {
+            at += 1;
+        }
+    }
+    None
+}
+
+/// A `#[shape]` rule never reads a column the hand surface MOVED.
+///
+/// THIS IS THE SEAM THE MIGRATION OPENED, and it is checkable exactly here,
+/// because this is the one file holding both halves: the declaration's slot
+/// list, and the list of places the recorded statement deliberately says
+/// something else. Three exceptions change what a column MEANS, and a sizing
+/// rule reading past any of them would compute a width off the wrong number
+/// and refuse nothing — the silent failure the whole column exists to make
+/// impossible.
+#[test]
+fn no_shape_rule_reads_past_a_column_the_builder_moved() {
+    let mut wrong: Vec<String> = Vec::new();
+    for p in points() {
+        let (operands, params) = columns(p);
+        let ex = excepted(p.name);
+
+        // `layer` is the statement's TAG and the builder records no param for
+        // it, so every scalar declared at or after it stands one column
+        // earlier in `op.params` than the slot list says.
+        if ex.contains(&Except::LayerTag) {
+            let dropped = column_of(p, "layer", |m| m == Mark::Scalar)
+                .expect("the exception names a `layer` slot");
+            if let Some(at) = params.iter().copied().find(|at| *at >= dropped) {
+                wrong.push(format!(
+                    "{}: a shape rule reads param {at}, and `layer` (param {dropped}) is never \
+                     recorded — every column from there on is off by one",
+                    p.name
+                ));
+            }
+        }
+
+        // `blocks` is `&[Value]`: it records one operand per earlier block and
+        // the count grows with the layer, so nothing standing after it has an
+        // operand column at all.
+        if ex.contains(&Except::Blend) {
+            let variadic = column_of(p, "blocks", |m| matches!(m, Mark::In | Mark::InOut))
+                .expect("the exception names a `blocks` slot");
+            if let Some(at) = operands.iter().copied().find(|at| *at > variadic) {
+                wrong.push(format!(
+                    "{}: a shape rule reads operand {at}, which stands after the variadic \
+                     `blocks` (operand {variadic}) — that column is a function of the layer",
+                    p.name
+                ));
+            }
+        }
+
+        // `.norm(n)` is `.weight(&n.weight).float(n.eps)`, so a bundle records
+        // its epsilon AT THE WEIGHT'S PLACE in the chain. That is the identity
+        // on the params run only while `eps` is already the point's first
+        // scalar — which it is on all four bundled points, and which is the
+        // fact this pins rather than the four names.
+        if ex.contains(&Except::NormBundle) {
+            let eps = column_of(p, "eps", |m| m == Mark::Scalar)
+                .expect("the exception names an `eps` slot");
+            assert_eq!(
+                eps, 0,
+                "`{}` bundles `(weight, eps)` into a `&Norm<W>`, which records the epsilon \
+                 first; a point declaring another scalar ahead of it would record its params \
+                 in an order the slot list does not state",
+                p.name
+            );
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} sizing rule(s) count a column the recorded statement does not have.\n\n{}",
+        wrong.len(),
+        wrong.join("\n")
     );
 }

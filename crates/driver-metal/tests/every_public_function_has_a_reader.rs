@@ -60,13 +60,6 @@ const NO_READER: &[(&str, &str)] = &[
          reports or clears it.",
     ),
     (
-        "experts_per_layer",
-        "One of the four numbers describing a mixture slab. Its three \
-         siblings -- `layers`, `slots`, and the per-expert tensor count -- \
-         are read when the slab is sized; this one is derivable from them \
-         and so nothing has needed to ask.",
-    ),
-    (
         "outstanding_bytes",
         "The byte half of `outstanding_buffers`, which IS read. Both are \
          differences of two stats the allocator already publishes, so this \
@@ -98,6 +91,16 @@ const NO_READER: &[(&str, &str)] = &[
          M2 path from the C++. The forward that decides a member's row \
          late is the M3 group builder, and the group builder does not yet \
          rebind -- it composes each member against a row it already knows.",
+    ),
+    (
+        "wait_for_timing",
+        "The TIMED wait: `Stepper::wait_for` with an encode duration folded \
+         in, so a caller can report where a step's milliseconds went. The \
+         serving path takes the untimed `wait_for` -- `serve::launch::retire` \
+         waits on every committed fire and has no encode duration to hand it, \
+         because the baker walk and the encode are two calls apart. Its reader \
+         was `fire::run::run`, the per-call-state path the device tests drove \
+         a fire through, and that went with the legacy walk it wrapped.",
     ),
     (
         "tickets",
@@ -226,8 +229,13 @@ fn every_public_function_has_a_reader_or_a_stated_reason() {
     // surface does, which is the point: this is the denominator every
     // conclusion below is drawn against, and a conclusion drawn against a
     // denominator nobody looked at is not a measurement.
+    // The floor was 300 and is 200: P5 deleted `lowering/`, `batch/`,
+    // `loader/` and `weights/` -- the legacy walk, its grid planner, its
+    // geometry projection and its load contract -- which is where a third of
+    // this crate's public surface lived. What is left is the executor, the
+    // layout arithmetic and the device half, and it scans at 255.
     assert!(
-        declared.len() > 300,
+        declared.len() > 200,
         "scanned only {} `pub fn` declarations under {}, and this crate has \
          several hundred. Either the scan is looking at the wrong tree -- a \
          `git worktree` sharing CARGO_TARGET_DIR bakes the WRONG \

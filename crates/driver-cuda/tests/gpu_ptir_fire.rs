@@ -126,7 +126,8 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
             error: k.error.clone(),
         })
         .collect();
-    let plan = adopt_launch_package_with(package, Boundaries::CUDA).expect("the driver adopts the package");
+    let plan = adopt_launch_package_with(package, Boundaries::CUDA)
+        .expect("the driver adopts the package");
     assert!(
         plan.executable,
         "the plan must be executable: {}",

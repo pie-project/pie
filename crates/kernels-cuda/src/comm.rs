@@ -112,21 +112,6 @@ pub enum Stage {
     TwoStage,
 }
 
-pub const LEAVES: usize = 3;
-
-pub const FP32_ACC_VALUES: usize = 2;
-
-pub const UPSTREAM_POINTS: usize = 240;
-
-pub const AOT_TU_SECONDS: usize = 111;
-
-pub const AOT_CICC_SECONDS: usize = 40;
-
-pub const AOT_PTXAS_SECONDS: usize = 44;
-
-pub const AOT_POINTS_AFTER_PRUNING: usize =
-    NRANKS.len() * INSTANTIATED.len() * FP32_ACC_VALUES * LEAVES;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instantiation {
     pub nranks: i32,
@@ -921,9 +906,3 @@ pub fn all_reduce_residual_rmsnorm_bf16(
         Err(why) => AllReduce::Declined(Decline::Launch(why)),
     }
 }
-
-// TWO `untraced!` ROWS STOOD HERE — `comm::all_reduce_bf16` and
-// `comm::all_reduce_residual_rmsnorm_bf16`, submitted into the linkme
-// registry so a driver could reach them by string. `driver-cuda` calls both
-// BY PATH (`fire/all_reduce.rs`), which is the only caller either ever had,
-// and the registry is deleted with the rest of the routine layer.

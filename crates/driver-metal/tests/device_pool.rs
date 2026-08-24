@@ -1,8 +1,14 @@
-//! The transient pool, against a real device.
+//! The pools, against a real device.
 //!
 //! Two claims worth proving on hardware rather than in a map: a pooled buffer
 //! is one the GPU can actually write through, and a REUSED buffer is still
 //! one the GPU can write through -- residency survives the round trip.
+//!
+//! The transient pool is most of the file; the recurrent seats and the PAGED
+//! KV pool are here too, because all three answer the same question about the
+//! same device. The last two arrived from `device_text_fire.rs`, which was
+//! deleted with the by-name walk that its other seven tests fired -- these two
+//! never named it.
 
 #![allow(clippy::print_stdout)]
 
@@ -503,4 +509,132 @@ fn a_seat_the_pool_does_not_have_is_refused() {
         format!("{err}").contains('2'),
         "the refusal does not name the seat: {err}"
     );
+}
+
+/// The paged KV pool, allocated at the fire's geometry.
+///
+/// `metal::stage_decode_storage` has allocated `KvSlots` since the port, but
+/// sized from `batch::DecodeGeometry` — a model definition inside the driver.
+/// This is the same allocation with its arguments taken from the frame.
+#[test]
+fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
+    use driver_metal::layout::kv::Shape;
+    use driver_metal::pools::kv::{Pool, translate};
+
+    let Some(context) = context() else {
+        return;
+    };
+    let shape = Shape {
+        layers: 24,
+        // The two numbers `lowering::dispatch::Geometry` used to carry here.
+        // Written out because there is no such struct: what a fire is planned
+        // over is a `Program`, and what a pool is laid out from is
+        // `model::deployment::Deployment::attention` (see
+        // `layout::kv::Shape::periodic`).
+        kv_heads: 8,
+        head_dim: 128,
+        page_size: 16,
+        pages: 64,
+        element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
+    };
+    let pool = Pool::allocate(&context, shape).expect("the pool allocates");
+
+    assert_eq!(pool.pages(), 64);
+    assert_eq!(
+        pool.bytes(),
+        shape.layer_bytes_at(0) * 2 * 24,
+        "a K and a V region for every layer"
+    );
+    let layer = pool.layer(0).expect("layer 0 has pages");
+    assert_ne!(
+        layer.k.gpu_address(),
+        layer.v.gpu_address(),
+        "K and V must be distinct regions; one address would make the append \
+         to K overwrite V"
+    );
+    assert!(
+        pool.layer(24).is_none(),
+        "past the last layer there is none"
+    );
+
+    // And the frame's translation reads against it.
+    let table = [0u32, 1, 63];
+    assert_eq!(
+        translate(&pool, &table, &[0, 3], 0).expect("a lane's pages"),
+        &[0, 1, 63]
+    );
+    assert!(
+        translate(&pool, &[64], &[0, 1], 0).is_err(),
+        "a page past the pool addresses another layer's memory"
+    );
+}
+
+/// A KV move, run on the pool, checked byte for byte.
+///
+/// The pages are `StorageModeShared`, so a move is a `memmove` and needs no
+/// encoder — and the memmove semantics are not incidental: a compaction slides
+/// rows toward the front, so source and destination overlap.
+#[test]
+fn a_move_plan_slides_rows_without_smearing_them() {
+    use driver_metal::layout::kv::Shape;
+    use driver_metal::layout::{CellCopy, CellMovePlan};
+    use driver_metal::pools::kv::Pool;
+
+    let Some(context) = context() else {
+        return;
+    };
+    // One layer, one head, tiny pages: the arithmetic is the subject, not the
+    // size.
+    let shape = Shape {
+        layers: 1,
+        kv_heads: 1,
+        head_dim: 4,
+        page_size: 2,
+        pages: 4,
+        element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
+    };
+    let pool = Pool::allocate(&context, shape).expect("the pool allocates");
+    let layer = pool.layer(0).expect("layer 0");
+    let row = shape.row_bytes().expect("a uniform pool") as usize;
+
+    // Each row is its own byte, so a misplaced one names itself.
+    let total = shape.layer_bytes_at(0) as usize;
+    let src: Vec<u8> = (0..total).map(|i| (i / row) as u8).collect();
+    layer.k.write(0, &src).expect("the pattern fits");
+    layer.v.write(0, &src).expect("and into v");
+
+    // Slide page 1 onto page 0 — the overlapping case a compaction makes.
+    let page = shape.page_bytes().expect("a uniform pool");
+    pool.apply(&CellMovePlan {
+        copies: vec![CellCopy {
+            src_off: page,
+            dst_off: 0,
+            bytes: page,
+        }],
+        pages_touched: 2,
+    })
+    .expect("the move runs");
+
+    let read = |p: &driver_metal::pools::kv::Pages| -> Vec<u8> {
+        let at = p
+            .host_span(0, total as u64)
+            .expect("the pages are addressable");
+        unsafe { std::slice::from_raw_parts(at.as_ptr().cast_const(), total) }.to_vec()
+    };
+    for (name, got) in [("k", read(&layer.k)), ("v", read(&layer.v))] {
+        // Page 0 now holds what page 1 held: rows 2 and 3.
+        assert_eq!(got[0], 2, "{name}: page 0 row 0 came from page 1 row 0");
+        assert_eq!(got[row], 3, "{name}: page 0 row 1 came from page 1 row 1");
+        // And page 1 is untouched — a smear would have overwritten it.
+        assert_eq!(got[2 * row], 2, "{name}: page 1 row 0 still its own");
+        assert_eq!(got[3 * row], 3, "{name}: page 1 row 1 still its own");
+        // Pages 2 and 3 were never named.
+        assert_eq!(got[4 * row], 4, "{name}: page 2 untouched");
+    }
 }

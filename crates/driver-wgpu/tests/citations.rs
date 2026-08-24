@@ -486,13 +486,13 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
     );
 }
 
-/// Which refusals a test names, and which twenty-three it does not.
+/// Which refusals a test names, and which eight it does not.
 ///
 /// `device.rs` gives the principle, about `Failed` and its by-value
 /// comparison: "a test that asserts WHICH refusal came back is the only way
 /// an alignment failure stays distinguishable from a length one."
 ///
-/// It is a principle this crate mostly keeps — **seventy-seven of one hundred**
+/// It is a principle this crate mostly keeps — **forty-nine of fifty-six**
 /// refusal variants are named in a test — and nothing measured the rest. A
 /// refusal nothing names is one whose condition could be inverted, or whose
 /// message could describe a different fault, with every suite still green: it
@@ -504,45 +504,43 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
 /// records the progress. Adding a refusal without a test that names it fails
 /// it the other way.
 ///
-/// # The twenty-five are four different things, and only one is a real gap
+/// # The seven are three different things, and only one is a real gap
 ///
-/// * **wrappers, about half of them** — `Unstepped::{Failed, Unfired, Unread,
-///   Unhoused, Unstageable, Uncovered}`, `Unlaunched::{Unserved, Unstepped}`,
-///   `Unopened::{Absent, Device, Unservable}`, `Unforked::*`, `Unresized::*`.
-///   Each carries an inner refusal, and the tests assert the INNER one, which
-///   is the part that says what went wrong. They are on the list because the
-///   census cannot see through a wrapper, and leaving them off would have
-///   meant a hand-maintained exception rule doing the same job less visibly.
-/// * **reachable and untested** — down to the `Undispatchable` planning
-///   refusals: `Layout`, `Unresolved` and `Contiguous`, since `Scalars` has
-///   left. Each needs a driver NUMBER the resolver cannot work out, and every
-///   row naming one is a paged attention with eleven buffers to satisfy first
-///   — a fixture, not a test. The `Unfired` family is down to `Impossible`,
-///   which this crate calls unreachable on purpose, and the `Unread` family is
-///   closed. Twelve have left this group. The `Unfired` family is now down
-///   to `Impossible`, which is the one this crate calls unreachable on
-///   purpose. What made the other three cheap was a single fixture --
-///   `one_launch`, a plan of one rectangle over a 256-byte arena -- pointed at
-///   three different things: a symbol the tree has not got (`NoModule`), a
-///   module store handing back text `naga` will not parse (`Unreadable`), and
-///   a real entrypoint whose row does not state the operand the plan supplies
-///   (`Unplannable`). None needs weights, a pool or a shell.
+/// The census went from a hundred to fifty-six and the unnamed list from
+/// twenty-three to eight, in one cut: `dispatch`, `lowering`, `shell` and
+/// `encode` were deleted whole and `serve`, `turns`, `frames` and `binding`
+/// lost their legacy halves, so `Undispatchable`, `Unplanned`, `Unbindable`,
+/// `Unread`, `Unstepped`, `Unopened`'s three device arms, `Unforked`,
+/// `Unresized` and `Unfired`'s four plan-side arms are all gone. THE WHOLE
+/// "wrappers" CATEGORY WENT WITH THEM: every entry that was on this list only
+/// because the census cannot see through a wrapper carried an inner refusal
+/// from a layer that no longer exists.
 ///
-///   The estimate that kept them here was "each needs a fire built to fail in
-///   one specific way, which is a test apiece". The fire was the expensive
-///   part in that estimate and it was the cheap part: `Unplannable` was first
-///   met BY ACCIDENT, while checking whether a different test's guard could
-///   fire at all. The four `Unread` refusals needed no fire whatever --
-///   `serve::logits` decides all four from the `Readout` the plan states, and
-///   nothing has to have run.
 /// * **reachable only on other hardware** — `Ceiling::{StorageBinding,
-///   UniformBinding, Invocations}`, `Failed::Unreachable` and
-///   `Unopened::Unreachable` name limits this adapter is nowhere near.
-///   `Ceiling::BufferSize` is the one of the four a test does reach, which is
-///   why the enum is here rather than excused wholesale.
+///   UniformBinding, Invocations}` and `Failed::Unreachable` name limits this
+///   adapter is nowhere near. `Ceiling::BufferSize` is the one of the four a
+///   test does reach, which is why the enum is here rather than excused
+///   wholesale.
 /// * **not reachable at all** — `Unstageable::MaskTooWide` fires on a mask row
 ///   longer than a `u32` can address, so provoking it means allocating four
 ///   gibibytes of mask to exercise one comparison.
+/// * **reachable and untested, and this is the real gap** —
+///   `Unaddressable::Unaligned` and `Unreadable::NoSource`. Both ARRIVED on
+///   this list in that same cut,
+///   and neither arrived because the code changed: each was named by a test
+///   that walked a lowered plan, and the tests went with the walk.
+///   `Unaddressable::Unaligned` was named by `binding.rs`'s
+///   `an_operand_the_device_cannot_address_from_is_refused_as_such`, which
+///   resolved a `model_compiler::lower::Arg` at an offset the device cannot
+///   address; `Unreadable::NoSource` by a suite that fired a text. Both are
+///   CHEAP to name again -- neither needs a plan, a pool or a fire -- so this
+///   is the group that should shrink first.
+///
+///   IT WAS THREE AND IS NOW TWO. `Unbridgeable::NoRows` left this crate with
+///   `baker::frame`, and it did not leave untested: `driver_wgpu::walk::frame`'s
+///   `a_step_with_no_rows_refuses_by_name` closes it there. A refusal that
+///   moves house takes its gap with it, and this list is the record of who
+///   owes the test.
 ///
 /// # The selector is a naming convention, and it was too narrow
 ///
@@ -560,7 +558,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
 /// WHICH limit inside `Failed::PastLimit` and is never an error type itself,
 /// so a rule built only on error position would have dropped it.
 ///
-/// The point of the census is not that thirty-three is too many. It is that
+/// The point of the census is not that eight is too many. It is that
 /// thirty-seven was not a number anybody had — and the first probe written for
 /// it said twenty-two, by swallowing non-test code from `src` that happened to
 /// sit after a `#[cfg(test)]`. The number in a sweep is the sweep's until the
@@ -573,30 +571,14 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
         "Ceiling::StorageBinding",
         "Ceiling::UniformBinding",
         "Failed::Unreachable",
-        // Unreachable today, and deliberately built anyway: no crossed body
-        // states more than one dispatch, so `plan_one`'s narrow shape costs
-        // nothing. A two-pass reduction is two entrypoints over one
-        // statement, and the day one arrives this is a named refusal rather
-        // than a silently dropped pass. Give it a test when a body does it.
-        "Undispatchable::Multiple",
-        "Unfired::Impossible",
-        "Unforked::Device",
-        "Unforked::Unhoused",
-        "Unlaunched::Unserved",
-        "Unlaunched::Unstepped",
-        "Unopened::Absent",
-        "Unopened::Device",
-        "Unopened::Unreachable",
-        "Unopened::Unservable",
-        "Unresized::Device",
-        "Unresized::Stranded",
+        // THE TWO THAT ARRIVED WITH THE CUT, and neither because the code
+        // changed: each was named by a test that walked a lowered plan, and
+        // the tests went with the walk. Both are cheap to name again.
+        // `Unbridgeable::NoRows` was a third and is gone from this list --
+        // `driver_wgpu::walk::frame` holds it now, and names it.
+        "Unaddressable::Unaligned",
+        "Unreadable::NoSource",
         "Unstageable::MaskTooWide",
-        "Unstepped::Failed",
-        "Unstepped::Uncovered",
-        "Unstepped::Unfired",
-        "Unstepped::Unhoused",
-        "Unstepped::Unread",
-        "Unstepped::Unstageable",
     ];
 
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -614,7 +596,7 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // refusals are only ever named in one.
     let mut named = String::new();
     for file in suites.iter().chain(&sources) {
-        // NOT this file. `UNNAMED` below is twenty-three string literals, so
+        // NOT this file. `UNNAMED` below is eight string literals, so
         // counting it would have every refusal "named in a test" by the very
         // census that says they are not -- which is exactly what happened the
         // first time this ran, and the empty result is what gave it away.
@@ -649,9 +631,30 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // this file exists to catch, and ten of them could go without a word.
     // A floor only guards the collapse of the PARSER; the census guards the
     // census. Both readings are wanted, so the number is the count.
+    //
+    // IT MOVED DOWN, from a hundred to fifty-six, and P5b's deletion of the
+    // legacy walk is the whole of why. `dispatch`, `lowering`, `shell` and
+    // `encode` went as modules and `serve`, `turns`, `frames` and `binding`
+    // lost their legacy halves, so forty-four refusal variants left with the
+    // functions that raised them -- `Undispatchable`, `Unplanned`,
+    // `Unbindable`, `Unread`, `Unstepped`, `Unopened`, `Unforked`,
+    // `Unresized` and most of `Unfired`. Downward is the direction a cut
+    // makes, and the direction this gate is least worried about; what it
+    // guards is a refusal ADDED without a test, which raises the number
+    // silently. The doc above says which enums went.
+    //
+    // IT MOVED DOWN to fifty-three when the executor's plane-agnostic half
+    // became `baker-walk`, and BACK UP TO FIFTY-SIX when that crate was
+    // dissolved. The same three variants both times, and neither move added
+    // or deleted one: `Unresolved` (the load-time report), `Refused` (the
+    // step that could not fire) and `Unbridgeable` (a frame whose tables do
+    // not describe its rows). This census counts DECLARATIONS in `src/`, and
+    // `src/walk/` is in `src/`, so what this crate can return by name is
+    // what it owes a test for -- which is the reading to keep, and the
+    // reason the number is allowed to move in both directions.
     assert_eq!(
         refusals.len(),
-        100,
+        56,
         "the refusal census moved. If variants were added, name them in a \
          test and raise this; if they were removed, say which in the commit \
          and lower it. If it collapsed to a handful, the parser has stopped \
@@ -739,8 +742,8 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (100, 77),
-        "this test's own doc says seventy-seven of one hundred refusal variants \
+        (56, 49),
+        "this test's own doc says forty-nine of fifty-six refusal variants \
          are named by a test. Update the sentence with the number."
     );
 }

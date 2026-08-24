@@ -10,13 +10,8 @@ pub mod cublas;
 mod device;
 mod graph;
 mod stream;
-mod vmm;
 
-pub use alloc::{
-    Allocator, CaptureScope, DeviceBuffer, copy_raw_span, fill_raw_span, read_raw_span,
-    write_raw_span,
-};
+pub use alloc::{Allocator, CaptureScope, DeviceBuffer};
 pub use device::{COMPILED_MAJOR, Device};
-pub use graph::{ConditionalIf, ConditionalSwitch, Graph, GraphExec};
+pub use graph::{ConditionalIf, Graph, GraphExec};
 pub use stream::{Event, OwnedStream, PinnedBuf, StreamRef};
-pub use vmm::{Arena, LOGICAL_PAGE_BYTES, PhysicalPool, PoolBudget, pages_for_bytes};

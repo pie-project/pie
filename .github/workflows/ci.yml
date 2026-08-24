@@ -214,6 +214,18 @@ jobs:
       # question is P5's now; the quarantine note further down is where it
       # went.
       #
+      # `driver-metal` REJOINS at P5, and only half of it can. This step is
+      # an ubuntu runner, so what it lints is the crate WITHOUT `metal-4` --
+      # `baker/`, `layout/`, `model/`, `envelope/` -- and it lints clean there
+      # at zero warnings under these exact flags. The Apple half is linted by
+      # `scripts/check-metal-4.sh` in `workspace-verify`, which cross-compiles
+      # it for `aarch64-apple-darwin` and runs this same `-D warnings`; two
+      # steps, because they are two compilations of two different module sets.
+      #
+      # The paragraph below used to say this crate could not join for "a
+      # `type_complexity` error and a macOS-only half". The first is gone with
+      # `lowering/`; the second is now covered rather than excused.
+      #
       # `baker-smoke` and `model-dsl-macros` JOINED, and the first is the
       # interesting one. It reads as a GPU crate -- it links a CUDA shell,
       # `cuda-12`/`cuda-13` are its only features and it declares no default --
@@ -236,7 +248,8 @@ jobs:
             -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
             -p kernels-wgpu \
             -p kernels-metal -p kernels-vulkan -p kernels-cuda \
-            -p kernels-macros -p baker-smoke \
+            -p kernels-macros -p points-dispatch \
+            -p driver-metal -p driver-wgpu \
             -p model-dsl -p model-ir -p model-dsl-macros \
             -- -D warnings
 
@@ -295,14 +308,17 @@ jobs:
       # under this exact command, and it had never been in this list -- one of
       # the two members the gate-coverage audit found describing nothing.
       #
-      # `baker-smoke` is the other, and it is EXCLUDED rather than gated:
-      # `cargo fmt --check -p baker-smoke` reports 22 drifted hunks against 12
-      # commits in the last seven days, which is the R4 baker work landing in
-      # it rather than a crate that drifted once. The reason and the command
-      # to re-measure it with live in `scripts/ci-gate-audit.py`'s
-      # `EXCLUSIONS`, beside `driver-cuda`'s and `kernels-cuda`'s, which are
-      # the same shape. Its CLIPPY is in the list above -- the crate lints
-      # clean, it just does not format clean.
+      # `baker-smoke` was the other, and it was EXCLUDED rather than gated for
+      # churn. The crate is deleted: it was a second executor over the same
+      # kernels, and its one unique gate -- three banked argmaxes, gpt-oss's
+      # among them -- now fires through the shell in
+      # `driver-cuda/tests/banked_argmaxes.rs`.
+      # `driver-metal` REJOINS here too, and unlike clippy it is the WHOLE
+      # crate: rustfmt parses and never type-checks, so it gives the same
+      # answer for the gated modules on this runner as on a Mac. That was
+      # already the argument for having it here before R3 took it out of the
+      # workspace; what is new is that the crate is a member again and that
+      # the drift P5 left in it (twenty files) is cleaned.
       - name: cargo fmt (compiler crates)
         run: |
           cargo fmt --check \
@@ -316,7 +332,7 @@ jobs:
             -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
             -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer \
             -p kernels-wgpu \
-            -p kernels-macros \
+            -p kernels-macros -p points-dispatch -p driver-metal -p driver-wgpu \
             -p model-dsl -p model-ir -p model-dsl-macros
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
@@ -348,10 +364,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build ccache python3-yaml
 
+      # `aarch64-apple-darwin` is here for `driver-metal`'s Apple half and
+      # needs no Apple machine: `cargo check` type-checks and does not link,
+      # so the target's prebuilt `rust-std` is the whole requirement. See the
+      # step at the bottom of this job.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip2
+          targets: wasm32-wasip2, aarch64-apple-darwin
 
       - name: Cache cargo + cmake build
         uses: actions/cache@v5
@@ -511,6 +531,33 @@ jobs:
       # exactly the crates that have optional backends to `cfg` on.
       - name: cfg feature audit
         run: python3 scripts/cfg-feature-audit.py
+
+      # THE HALF OF `driver-metal` NO LINUX JOB COMPILES.
+      #
+      # Everything above builds that crate WITHOUT `metal-4`, which is its
+      # portable half; `src/lib.rs` turns the feature into a `compile_error!`
+      # off an Apple target, so the six gated modules are invisible to every
+      # step in this file. They were invisible for the whole of Q6..Q11 and
+      # drifted thirty errors deep, one of them a four-argument
+      # `model::produce` called with two.
+      #
+      # CHECK-ONLY, AND ON THIS RUNNER. Clippy does not link, so
+      # `--target aarch64-apple-darwin` needs that target's `rust-std` and
+      # nothing else -- no Xcode, no SDK, no Mac. `--all-targets` is in the
+      # script and is the point of it: nine of the thirty-three `metal-4`
+      # test targets had stopped compiling while the library still built.
+      #
+      # It is also THE ONLY CLIPPY THIS CRATE GETS. `cargo clippy (deny
+      # warnings)` above does not list `driver-metal` -- see the gate-coverage
+      # audit, which says so out loud -- and would only reach the portable
+      # half if it did.
+      #
+      # It does NOT run anything, and the crate's `device_*` targets are
+      # compiled here and executed nowhere. Turning them from compiled into
+      # measured wants a runner with a Metal 4 GPU, which this file does not
+      # have; the script's own header lists the rest of what it cannot catch.
+      - name: driver-metal, Apple half (type-check only, no device)
+        run: bash scripts/check-metal-4.sh
 
       # `coverage audit (no file where nothing runs)` STOOD HERE, running
       # `scripts/coverage-audit.py`, and both the step and the script are

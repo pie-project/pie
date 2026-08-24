@@ -6,7 +6,7 @@ use crate::jit::abi::bf16;
 use kernels::Refusal;
 use kernels::Region;
 
-use kernels::routine::{Const, In, Out};
+use kernels::plane::{Const, In, Out};
 
 const BLOCK: u32 = 256;
 
@@ -42,8 +42,6 @@ const fn this_family(refusal: Refusal) -> Refusal {
     }
 }
 
-/// A stated width as the launches here spell one. A declaration states `u32`
-/// because a width is not negative; the device text takes `i32`.
 fn stated_width(width: u32, what: &'static str) -> Result<i32, Refusal> {
     i32::try_from(width).map_err(|_| Refusal::Wide {
         what,
@@ -52,14 +50,6 @@ fn stated_width(width: u32, what: &'static str) -> Result<i32, Refusal> {
     })
 }
 
-/// Whether the element a statement rides is the one this family's rows take.
-///
-/// Which axes a plane serves is a runtime truth, never a declared list, and
-/// cuda's cuts are ROWS rather than open templates: `split_rows`,
-/// `split_qkv` and `split_q_gate` are each instantiated at `::pie::bf16` by
-/// a literal symbol, so there is no f16 row to fire and no host arithmetic
-/// that would make one. The compare is what makes the casts below sound —
-/// past it, `T` IS `bf16`.
 fn cuts_bf16<T: kernels::points::Scalar>() -> bool {
     <T as kernels::Elem>::TY_MUT == <bf16 as kernels::Elem>::TY_MUT
 }
@@ -80,37 +70,6 @@ fn as_bf16_out<T: kernels::points::Scalar>(y: Out<Tensor<T>>) -> Out<Tensor<bf16
     }
 }
 
-/// The `Layout` family, claimed. Every point in it, and every body is the
-/// launch itself.
-///
-/// THREE OF THE FOUR CUTS DROP THE STATED WIDTH, and the asymmetry is the
-/// declaration's rather than an oversight: `split_qkv` and `split_rows`
-/// divide at a boundary BOTH halves carry, so the launch reads the same
-/// number back off the rectangles the statement sized from it, while
-/// `split_q_gate` passes its width through because a per-head interleave is
-/// a pitch no half's rectangle holds.
-///
-/// `layout.select` reads its stated width too, and for a third reason.
-/// Gemma's relay was
-/// TRANSPOSED to `[layers, rows, ple_dim]` in the legacy prologue
-/// (`transpose_bf16_nld_to_lnd`) so that a layer's slice was a whole
-/// contiguous plane and `dsl::select` was a rebase with no kernel behind it.
-/// The baker text keeps the relay in its `[rows, layers * ple_dim]` gather
-/// order, which makes the same slice a strided per-row copy — so this is the
-/// kernel that transpose used to stand in for, and there is no routine for it
-/// to delegate to.
-///
-/// `layout.embed` IS THE OTHER LAUNCHER, and the blocker it stood on is
-/// GONE rather than worked around. The body needs `vocab`, the table's ROW
-/// count, to clamp every id against — a runaway wire payload must read row
-/// zero, not past the largest tensor in the model — and a `Const` table is
-/// an address with no rectangle, so that number was in no slot to read.
-/// Inventing `i32::MAX` would have retired the clamp; the declaration
-/// STATES the bound instead, and the seven texts that say this point say it
-/// from the vocab their own dims carry. The launch is `embed_bf16`'s,
-/// inlined: the vectorised instantiation is a HOST choice off two
-/// alignments and a divisibility the device cannot test for itself, which
-/// is why `layout/embed.cuh` keeps it as a `bool` template parameter.
 #[kernels_macros::claims]
 impl kernels::points::Layout for Ctx<'_> {
     fn embed<T: kernels::points::Scalar>(
@@ -122,10 +81,6 @@ impl kernels::points::Layout for Ctx<'_> {
     ) -> Result<(), Refusal> {
         const EMBED_BLOCK: u32 = 256;
 
-        // The gather is `bf16`'s, not a template: `::pie::layout::embed` is
-        // spelled at `bf16` and its `VEC` arm moves a `float4` as eight of
-        // them. `embed_vocab_shard` beside it IS templated; nothing states
-        // that point yet.
         if !cuts_bf16::<T>() {
             return Err(Refusal::Absent {
                 what: "layout.embed at an element other than bf16",
@@ -138,9 +93,7 @@ impl kernels::points::Layout for Ctx<'_> {
             });
         }
         let dst = stated(y.all("the embedded row's width"))?;
-        // The result is one row per id, and the two rectangles say so
-        // independently — a disagreement means the walk sized this gather
-        // from something that is not the fire's token count.
+
         if ids.rows != dst.rows {
             return Err(Refusal::Narrow {
                 what: "the gathered rows against the token ids handed over",
@@ -182,9 +135,6 @@ impl kernels::points::Layout for Ctx<'_> {
         k: Out<Tensor<T>>,
         v: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        // Stated and unread: the launch takes the two halves' widths off `q`
-        // and `k`'s own rectangles, which the statement sized from these
-        // very numbers.
         let _ = (q_width, kv_width);
         if !cuts_bf16::<T>() {
             return Err(Refusal::Absent {
@@ -280,8 +230,6 @@ impl kernels::points::Layout for Ctx<'_> {
         left: Out<Tensor<T>>,
         right: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        // Stated and unread, as above: the launch divides where the two
-        // halves' own rectangles say it divides.
         let _ = width;
         if !cuts_bf16::<T>() {
             return Err(Refusal::Absent {
@@ -308,27 +256,6 @@ impl kernels::points::Layout for Ctx<'_> {
         )
     }
 
-    /// `y = table[.., layer * width .. (layer + 1) * width]`, per row.
-    ///
-    /// STATED AND READ, where this family's other widths are stated and
-    /// dropped. `split_qkv` lets its routine take the halves' widths off the
-    /// halves' own rectangles, because the cut is at a boundary both sides
-    /// carry; here the stated width is where the slice STARTS, and an offset
-    /// is not something either rectangle holds. So the statement's number is
-    /// the one that lands in the launch, and `y`'s own rectangle is what it
-    /// gets checked against.
-    ///
-    /// The relay's row is read off `table` rather than stated. It is
-    /// `layers * width` and the walk never needed it — the result is sized
-    /// from the stated width alone — so asking the statement for it would be
-    /// a slot whose only reader is an assertion.
-    ///
-    /// A TEMPLATE, not a bf16 row: this is a pure copy, so `T` is the
-    /// element and nothing here converts to float. `split_qkv` and its
-    /// siblings are pinned at bf16 because their kernels are instantiated by
-    /// literal symbols in routines the legacy driver calls; nothing calls
-    /// this one, so it is spelled the way `deinterleave.cuh`'s header says a
-    /// row-copy should be.
     fn select<T: kernels::points::Scalar>(
         &self,
         table: In<Tensor<T>>,
@@ -460,12 +387,3 @@ const VEC_WIDTH: i32 = 8;
 pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(weight.cast()) && aligned16(y.cast())
 }
-
-// `derived_name_is` STOOD HERE: a `const fn` byte-comparison of two `&str`,
-// written because `str::eq` is not const and the only callers were
-// `const _: () = { assert!(derived_name_is(..)) }` blocks pinning a derived
-// symbol to its spelling. Those blocks went in the CUDA comment sweep -- a
-// block that binds and asserts nothing proves only that the routine exists
-// -- and this went unused with them. `str::eq` is const on this toolchain
-// now, so the next reader who wants the claim should write it directly
-// rather than restore this.

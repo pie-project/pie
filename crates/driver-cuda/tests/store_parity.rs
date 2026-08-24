@@ -587,11 +587,7 @@ fn every_layer_produces_varying_output() {
         v.dedup();
         v.len()
     };
-    for (kind, min) in [
-        ("RECSTRIDE", 100),
-        ("RECADDR", 100),
-        ("SWAPHASH", 20),
-    ] {
+    for (kind, min) in [("RECSTRIDE", 100), ("RECADDR", 100), ("SWAPHASH", 20)] {
         assert!(
             distinct(kind) >= min,
             "{kind} has only {} distinct rows",

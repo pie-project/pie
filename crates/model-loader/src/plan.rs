@@ -18,7 +18,6 @@ pub mod group;
 pub mod index;
 pub mod pass;
 pub mod passes;
-pub mod spans;
 
 pub use crate::extent::{Dim, Extent};
 pub use passes::tile::{
@@ -248,10 +247,9 @@ pub struct BufferDecl {
     /// staging.
     ///
     /// Separate from [`persistent_offset`](Self::persistent_offset) because
-    /// the two answer different questions, and three passes depend on the
+    /// the two answer different questions, and two passes depend on the
     /// difference. `persistent_offset` means "this is a resident tensor, laid
-    /// out" — [`spans::publish_spans`] publishes exactly those, and
-    /// `rewrite::extent_write_as_bulk` turns exactly those writes into
+    /// out" — `rewrite::extent_write_as_bulk` turns exactly those writes into
     /// arena-absolute `BulkExtentWrite`s that `hoist_bulk_extent_writes` then
     /// moves to the front of the schedule. A staging buffer must be neither:
     /// it is not a tensor anyone names, and its write must stay where the

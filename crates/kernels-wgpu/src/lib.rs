@@ -1,5 +1,3 @@
-pub use kernels::Cap;
-
 mod capability;
 pub use crate::capability::Capability;
 
@@ -10,7 +8,9 @@ pub mod source;
 pub use crate::source::{Missing, SOURCES, entrypoint_source, source};
 
 pub mod points;
-pub mod routine;
+
+pub mod plane;
+pub mod points_dispatch;
 pub mod views;
 
 pub mod attn;

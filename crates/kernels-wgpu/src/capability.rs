@@ -3,21 +3,7 @@ pub enum Capability {
     Baseline,
     Fp16,
     Subgroup,
-    /// F16xF16->F32 cooperative matrix, which on Metal is
-    /// `simdgroup_matrix<T, 8, 8>` and in wgpu is
-    /// `EXPERIMENTAL_COOPERATIVE_MATRIX` behind an `unsafe` token.
-    ///
-    /// ABOVE `Subgroup` DELIBERATELY, and it is the only tier whose feature
-    /// carries a "there may be UB-containing bugs in these apis" contract. It
-    /// is still a tier and not a switch, which is what makes that acceptable:
-    /// a tier is a promise about a BODY with a baseline fallback beneath it,
-    /// so a symbol with no `@matrix` instantiation is unaffected and a core
-    /// WebGPU adapter never reaches this arm at all. `tests/cooperative.rs`
-    /// measured it at 2.4x on an M4 Pro's projections shape with every
-    /// spot-checked output bit-exact against an f32 CPU dot.
-    ///
-    /// It requires `SHADER_F16` as well, because the operand type is f16 and
-    /// a module that declares a cooperative matrix must `enable f16`.
+
     Matrix,
 }
 

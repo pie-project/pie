@@ -7,12 +7,12 @@
 //! `driver-cuda`'s `SupergraphCache`. `.wiki/driver/real-metal-north-star.md`
 //! §5 names them one concept under two names and asks for this one.
 
+use crate::baker::dispatch::Dispatch;
 use crate::bind::encode::{Params, Pipelines, commands};
 use crate::device::context::Context;
 use crate::device::recording::{Recording, record};
 use crate::device::regions::Regions;
 use crate::error::{Error, Result};
-use crate::lowering::dispatch::Dispatch;
 
 /// Recordings, kept by what they are valid for.
 ///
@@ -52,7 +52,7 @@ impl Recordings {
         pipelines: &Pipelines,
         params: &Params,
         regions: &Regions,
-        dispatches: &[Dispatch<'_>],
+        dispatches: &[Dispatch],
     ) -> Result<&Recording> {
         let key = fingerprint(dispatches, params);
         // REFUSED ONCE, not once a step. A fire that cannot be recorded --
@@ -142,7 +142,7 @@ impl std::fmt::Debug for Recordings {
 /// without the `Command` vectors, which is why it keys off the dispatches a
 /// caller already holds rather than off what a recording is finally made of.
 #[must_use]
-pub fn fingerprint(dispatches: &[Dispatch<'_>], params: &Params) -> u64 {
+pub fn fingerprint(dispatches: &[Dispatch], params: &Params) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     dispatches.len().hash(&mut hasher);

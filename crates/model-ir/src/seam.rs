@@ -1,128 +1,57 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cap {
-    Transform,
+//! THE SEAMS A TEXT MAY STAND AT, and the one column of each that anything
+//! reads: its name.
+//!
+//! # What a `Def` used to carry, and why four fifths of it went
+//!
+//! `sees`, `caps`, `position` and `sink` stood beside `name`, plus the `Cap`
+//! enum, a `Position` struct, an `ALL` table and a `by_name` lookup. Not one
+//! of them was ever read: `model_dsl::seam::at` records `def.name`, and the
+//! four executors find the logits by comparing a recorded seam against
+//! [`OUT`]`.name`. R5 measured it and the columns went.
+//!
+//! ONE OF THEM STATED A REAL LAW and could not keep stating it, which is why
+//! it is written out here rather than dropped. `ATTN_QV`'s `position` said
+//! the transform seam sits AFTER the packed row is cut (`gemm.matmul`,
+//! `layout.split_qkv`) and BEFORE anything consumes the cut (`norm.rmsnorm`,
+//! `rope`, `attention.kv_append`), and `seam::check_plan` walked a
+//! `ForwardPlan` checking it. That walk went with `ForwardPlan` at R4e, and
+//! the form that replaced it cannot express the check: a legacy
+//! `SeamStatement` carried the op index it stood after, and
+//! [`crate::plan::Seam`] carries the values it sees and the layer it stands
+//! at — no op index — so "after this statement, before that one" has nothing
+//! to compare. The law still holds of every text that stands at `attn.qv`;
+//! it is a rule an author keeps, not one a walk can check, until a plan
+//! carries the order again.
+//!
+//! # The names are still six and are still closed
+//!
+//! A seam is a place a HOST may stand — observe the row, transform it, sink
+//! the page mask, sample, emit — and a text that invented one would be
+//! offering a door no host knows to knock on. So the set is spelled here
+//! rather than left to the string a text passes.
 
-    Observe,
-
-    Scores,
-
-    PageMaskSink,
-
-    Put,
-
-    Sample,
-
-    Emit,
-}
-
+/// One seam: a place a text stands and a host may reach.
 pub struct Def {
     pub name: &'static str,
-
-    pub sees: &'static [&'static str],
-    pub caps: &'static [Cap],
-
-    pub position: Option<Position>,
-
-    pub sink: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Position {
-    pub after: &'static [&'static str],
-    pub before: &'static [&'static str],
-}
+/// After the q projection, before attention: where a mask sink and an
+/// observer of the query rows stand.
+pub const ATTN_Q: Def = Def { name: "attn.q" };
 
-pub const ATTN_Q: Def = Def {
-    name: "attn.q",
-    sees: &["q"],
-    caps: &[Cap::Observe, Cap::PageMaskSink],
-    position: None,
+/// After attention, before the output projection: the attended rows, and
+/// where a scores reader stands.
+pub const ATTN_OUT: Def = Def { name: "attn.out" };
 
-    sink: Some("attention.pages"),
-};
+/// After the packed qkv row is cut and before anything consumes the cut —
+/// the ordering law this module's header states.
+pub const ATTN_QV: Def = Def { name: "attn.qv" };
 
-pub const ATTN_OUT: Def = Def {
-    name: "attn.out",
-    sees: &["a"],
-    caps: &[Cap::Observe, Cap::Scores],
-    position: None,
-    sink: None,
-};
+/// The mixed row of a recurrent layer.
+pub const RECURRENT: Def = Def { name: "recurrent" };
 
-pub const ATTN_QV: Def = Def {
-    name: "attn.qv",
-    sees: &["q", "v"],
-    caps: &[Cap::Transform],
+/// The whole fire's entry: where a host puts rows in and emits.
+pub const IN: Def = Def { name: "in" };
 
-    position: Some(Position {
-        after: &["gemm.matmul", "gemm.matmul_acc", "matmul", "layout.split_qkv"],
-        before: &[
-            "norm.add_bias",
-            "norm.rmsnorm",
-            "norm.rmsnorm_no_scale",
-            "rmsnorm",
-            "rope",
-            "rope.full",
-            // THE SAME ADMITTED SET UNDER TWO SPELLINGS. `admits` matches a
-            // routine's claim either whole or by its first dotted segment,
-            // so the bare entry used to cover the core append and the
-            // `kv_append.mla` / `.index` / `.pool` sub-families at once. The
-            // core's claim is `attention.kv_append` now — under `attention`,
-            // where the bare entry no longer reaches it — so it is spelled
-            // whole, and the bare one stays for the three sub-families that
-            // still read their role there. `attention` itself is NOT the
-            // entry: it would admit the attention statement the seam is
-            // required to sit before.
-            "attention.kv_append",
-            "kv_append",
-        ],
-    }),
-    sink: None,
-};
-
-pub const RECURRENT: Def = Def {
-    name: "recurrent",
-    sees: &["mixed"],
-    caps: &[Cap::Observe],
-    position: None,
-    sink: None,
-};
-
-pub const IN: Def = Def {
-    name: "in",
-    sees: &[],
-    caps: &[Cap::Put, Cap::Emit],
-    position: None,
-    sink: None,
-};
-
-pub const OUT: Def = Def {
-    name: "out",
-    sees: &["logits"],
-    caps: &[Cap::Observe, Cap::Sample, Cap::Put, Cap::Emit],
-    position: None,
-    sink: None,
-};
-
-// `check_plan` AND ITS THREE HELPERS STOOD HERE — the seam-ordering walk
-// over `crate::trace::ForwardPlan`: does each seam sit after the op whose
-// value it observes and before the next op that consumes it. It read a
-// statement's role through `kernels::claim_of`, which read
-// `KernelSig::canon`.
-//
-// It went with its subject. `ForwardPlan` is the LEGACY traced form and
-// `TraceBuilder::finish` was the only thing that ever called this; R3 deleted
-// `model-dsl-legacy`'s `Trace`, which was the only thing that ever built a
-// `TraceBuilder`. A check with no plan to check is not a check.
-//
-// THE DEFS BELOW ARE NOT LEGACY and stay: `model_dsl::forward` records `IN`
-// and `OUT` by name on every traced plan, and `driver-cuda`/`baker-smoke`
-// both find the logits by asking for `OUT.name`.
-
-pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &RECURRENT, &OUT];
-
-pub fn by_name(name: &str) -> Option<&'static Def> {
-    ALL.iter().copied().find(|d| d.name == name)
-}
-
-
+/// The whole fire's exit: the logits, and where sampling stands.
+pub const OUT: Def = Def { name: "out" };

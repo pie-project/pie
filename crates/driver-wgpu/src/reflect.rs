@@ -242,8 +242,10 @@ impl Declared {
     ///
     /// There a hole is a binding number with NO declaration at all, because
     /// `glslc` deletes the declaration of a buffer a variant never reads. The
-    /// driver has nothing to put at that number, and a body asks for
-    /// [`crate::lowering::hold::Asked::Unbound`] at exactly those positions.
+    /// driver has nothing to put at that number, and a body asks for an
+    /// UNBOUND slot at exactly those positions. `lowering::hold::Asked::Unbound`
+    /// was this crate's name for that ask and STOOD in a module the
+    /// legacy-walk cut took whole.
     ///
     /// `naga` deletes nothing, so a hole here is a binding that EXISTS and that
     /// this entry point happens not to read -- a body still asks for a real
@@ -259,16 +261,17 @@ impl Declared {
     /// `driver-vulkan` closes its plan with `buffers + block == bindings -
     /// holes()`, and that equality is a Vulkan COINCIDENCE -- there a hole and
     /// an unbound ask are the same position, so the two counts move together.
-    /// Here they do not. The retirement in [`crate::dispatch`] keeps that
-    /// reasoning at length.
+    /// Here they do not. The retirement that kept that reasoning at length
+    /// STOOD in `dispatch`, which the legacy-walk cut deleted whole; the
+    /// paragraph above is what is left of it.
     ///
     /// It IS an accounting term, which is a different use and not a
     /// contradiction: a hole is a slot the driver fills with
     /// [`crate::binding::Slot::Nothing`], so `filled + holes == bindings` for
-    /// every rectangle, and `tests/arena.rs`'s
-    /// `what_the_plan_states_and_what_the_module_binds_account_for_each_other`
-    /// asserts exactly that. Balancing the books is allowed; lowering the bar
-    /// is not.
+    /// every rectangle. A fleet walk STOOD HERE asserting exactly that, in
+    /// `tests/arena.rs`, over every rectangle of every text; it is deleted
+    /// with the lowering that produced those rectangles. Balancing the books
+    /// is allowed; lowering the bar is not.
     #[must_use]
     pub fn holes(&self) -> usize {
         self.used.iter().filter(|u| !**u).count()

@@ -64,25 +64,6 @@ impl KvSpec {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StateSpec {
-    pub rows: Vec<StateRow>,
-}
-
-impl StateSpec {
-    #[must_use]
-    pub fn new() -> StateSpec {
-        StateSpec::default()
-    }
-
-    pub fn state(&mut self, name: impl Into<String>, slab: impl IntoIterator<Item = u64>) {
-        self.rows.push(StateRow {
-            name: name.into(),
-            slab: slab.into_iter().collect(),
-        });
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HybridSpec {
     pub kv: Vec<KvRow>,
     pub state: Vec<StateRow>,

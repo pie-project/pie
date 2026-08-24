@@ -9,7 +9,7 @@ use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreateWithFlags, cudaEventDestroy, cudaEventDisableTiming,
     cudaEventElapsedTime, cudaEventQuery, cudaEventRecord, cudaEventSynchronize,
     cudaLaunchHostFunc, cudaStream_t, cudaStreamCreateWithPriority, cudaStreamDestroy,
-    cudaStreamNonBlocking, cudaStreamQuery, cudaStreamSynchronize, cudaStreamWaitEvent,
+    cudaStreamNonBlocking, cudaStreamSynchronize, cudaStreamWaitEvent,
 };
 
 use crate::error::{Result, check_rt, ignore_in_drop};
@@ -28,26 +28,6 @@ unsafe impl Send for StreamRef<'_> {}
 unsafe impl Sync for StreamRef<'_> {}
 
 impl<'a> StreamRef<'a> {
-    /// Borrow a stream created elsewhere — by [`OwnedStream`] or the C++ shell.
-    ///
-    /// # Safety
-    /// `raw` must be a live `cudaStream_t` that stays live for `'a`.
-    pub const unsafe fn from_raw(raw: cudaStream_t) -> Self {
-        Self {
-            raw,
-            _owner: PhantomData,
-        }
-    }
-
-    /// The default (`NULL`) stream; `'static` since it is never destroyed and outlives
-    /// anything that could hold it.
-    pub const fn null() -> StreamRef<'static> {
-        StreamRef {
-            raw: std::ptr::null_mut(),
-            _owner: PhantomData,
-        }
-    }
-
     /// The raw handle, for a launcher's last argument.
     pub const fn as_raw(self) -> cudaStream_t {
         self.raw
@@ -60,18 +40,6 @@ impl<'a> StreamRef<'a> {
             unsafe { cudaStreamSynchronize(self.raw) },
             "cudaStreamSynchronize",
         )
-    }
-
-    /// Has everything submitted so far finished? Does not block.
-    pub fn is_idle(self) -> Result<bool> {
-        match unsafe { cudaStreamQuery(self.raw) } {
-            cudaError::cudaSuccess => Ok(true),
-            cudaError::cudaErrorNotReady => Ok(false),
-            code => Err(crate::Error::Runtime {
-                call: "cudaStreamQuery",
-                code,
-            }),
-        }
     }
 
     /// Make this stream wait on `event` without blocking the host.
@@ -136,12 +104,6 @@ impl OwnedStream {
             _owner: PhantomData,
         }
     }
-
-    /// Give up ownership, returning the raw handle; the caller must `cudaStreamDestroy`
-    /// it (e.g. the C++ shell).
-    pub fn into_raw(self) -> cudaStream_t {
-        std::mem::ManuallyDrop::new(self).raw
-    }
 }
 
 impl Drop for OwnedStream {
@@ -179,11 +141,6 @@ impl Event {
             "cudaEventCreateWithFlags",
         )?;
         Ok(Self { raw, timing })
-    }
-
-    /// The raw handle.
-    pub const fn as_raw(&self) -> cudaEvent_t {
-        self.raw
     }
 
     /// Block until this event has been reached.
@@ -235,12 +192,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_null_stream_is_static_and_null() {
-        let s = StreamRef::null();
-        assert!(s.as_raw().is_null());
-    }
-
-    #[test]
     fn a_stream_ref_is_a_word() {
         // No drop glue, one word — every launcher signature pays if this grows.
         assert_eq!(
@@ -248,14 +199,6 @@ mod tests {
             std::mem::size_of::<cudaStream_t>()
         );
         assert!(!std::mem::needs_drop::<StreamRef<'_>>());
-    }
-
-    #[test]
-    fn borrowing_a_raw_handle_round_trips() {
-        // `from_raw` must hand back exactly what it was given.
-        let fake = 0xdead_beefusize as cudaStream_t;
-        let borrowed = unsafe { StreamRef::from_raw(fake) };
-        assert_eq!(borrowed.as_raw(), fake);
     }
 
     #[test]
@@ -306,6 +249,12 @@ impl PinnedBuf {
     }
 
     /// Was this a zero-length request?
+    ///
+    /// No caller, and it stays for the reason `ConditionalIf::is_empty`
+    /// states in its own doc: clippy asks for the pair, and a public `len`
+    /// without one is an API shape the lint exists to prevent. Deleting it
+    /// with the rest of this file's zero-reader surface turned
+    /// `len_without_is_empty` on, which is the lint doing its job.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0

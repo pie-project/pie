@@ -223,10 +223,11 @@ __global__ void rotate(
 // **This is a trade, not a bug, and it is stated rather than taken.** Below
 // 64K context the error does not survive bf16 storage and `__sincosf` is
 // free accuracy; above it the error is real and grows. Whoever owns the
-// numerics decides, and `rope/rope_tile.cuh` is a CuTile twin that already
-// uses the accurate form -- 1.2-1.4x FASTER than this kernel while being
-// three orders of magnitude closer to fp64 -- and is declined for exactly
-// this reason.
+// numerics decides. `rope/rope_tile.cuh` WAS a CuTile twin that used the
+// accurate form -- 1.2-1.4x FASTER than this kernel while being three orders
+// of magnitude closer to fp64 -- and was declined for exactly this reason;
+// it is deleted now, with the other eleven tile headers, because nothing
+// read the `Root` that named it and its NVRTC floor is above this crate's.
 //
 // The rotation angle depends only on (pos, dim_pair): every head of this
     // token shares it. Computing it inside the element loop ran a full-precision

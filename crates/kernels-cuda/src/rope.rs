@@ -5,14 +5,12 @@ use crate::jit::abi::Tensor;
 use crate::jit::abi::{MaybeConst, bf16};
 use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
-use kernels::routine::{In, InOut};
+use kernels::plane::{In, InOut};
 use kernels::{Bind, Fire};
 
 use core::ptr::NonNull;
 
 pub const ROTATE_BLOCK: i32 = 256;
-
-pub const FUSED_BLOCK: u32 = 128;
 
 pub const MAX_CACHED_PAIRS: i32 = 4096;
 
@@ -109,9 +107,6 @@ fn k_heads<T>(q: *mut T, k: *mut T, width: i32, head_dim: i32) -> Result<i32, Re
     heads(width, head_dim)
 }
 
-/// A stated width as the launches below spell one. A declaration states
-/// `u32` because a width is not negative; a routine takes `i32` because the
-/// device text does.
 fn stated(width: u32, what: &'static str) -> Result<i32, Refusal> {
     i32::try_from(width).map_err(|_| Refusal::Wide {
         what,
@@ -120,18 +115,6 @@ fn stated(width: u32, what: &'static str) -> Result<i32, Refusal> {
     })
 }
 
-/// The element a statement rides, re-marked as the one this plane's rotate
-/// rows take, or a refusal naming the point that has no row for it.
-///
-/// Which axes a plane serves is a runtime truth, never a declared list, and
-/// cuda's rotations are rows rather than open templates: `rope.cuh` states
-/// that only `standard_table` and `rotate_partial` are templates and that
-/// "the other eight stay bf16", because they rotate through
-/// `rope_device.cuh`'s `rotate_pair`, which takes `bf16*`. `rotate_partial`
-/// IS a template and `rope_partial_f16` is the row that would open the f16
-/// axis — no text has ever stated one, so it stays a row nothing fires and
-/// this claim stays at the element the family is measured on. The compare
-/// is what makes the cast sound: past it, `T` IS `bf16`.
 fn rotates_bf16<T: kernels::points::Scalar>(
     r: InOut<Tensor<T>>,
     what: &'static str,
@@ -146,16 +129,6 @@ fn rotates_bf16<T: kernels::points::Scalar>(
     })
 }
 
-/// The `Rope` family, claimed. Every body is the launch itself, deriving
-/// what `rope/rope.cuh` asks for and the declaration does not state:
-/// `num_q_heads` and `num_kv_heads` are each operand's row over the STATED
-/// head width, which is the whole reason `head_dim` is stated.
-///
-/// `rope.partial_last` passes [`Yarn::NONE`]'s numbers, and that is the
-/// point's definition rather than a guess: the trailing rotation states no
-/// YaRN block, `rotate_partial_last` guards its ramp with
-/// `if (yarn_factor > 1.f)`, and the interpolated rotation is `rope.yarn` —
-/// a different point, not a parameterisation of this one.
 #[kernels_macros::claims]
 impl kernels::points::Rope for Ctx<'_> {
     fn full<T: kernels::points::Scalar>(
@@ -267,20 +240,14 @@ impl kernels::points::Rope for Ctx<'_> {
         let rotary_dim = stated(rotary_dim, "the rotated width this statement states")?;
         let head_dim = stated(head_dim, "the head width this rotation states")?;
         let q = rotates_bf16(q, "rope.partial_last")?;
-        // ONE PLANE, TWO SLOTS. `rotate_partial_last` takes q and k; this
-        // point states q alone, so k is q's address with a ZERO width — the
-        // head count `heads` derives from it is zero and the kernel's k leg
-        // runs over nothing.
+
         let num_q_heads = q_heads(q.width, head_dim)?;
-        // `rope.partial_last` states no YaRN block, and that is the point's
-        // definition rather than a guess: `rotate_partial_last` guards its
-        // ramp with `if (yarn_factor > 1.f)`, and the interpolated rotation
-        // is `rope.yarn` — a different point, not a parameterisation of
-        // this one.
+
         self.fire(
-            Fire::at("rope/rope.cuh", "::pie::rope::rotate_partial_last").apply(
-                Launch::per_row(q.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs()),
-            ),
+            Fire::at("rope/rope.cuh", "::pie::rope::rotate_partial_last").apply(Launch::per_row(
+                q.rows.unsigned_abs(),
+                ROTATE_BLOCK.unsigned_abs(),
+            )),
             &[
                 q.arg(),
                 q.ptr.arg(),
@@ -335,14 +302,12 @@ impl kernels::points::Rope for Ctx<'_> {
         let pairs = cache_pairs(half);
         let per_block = heads_per_block(half);
         self.fire(
-            Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn_original").apply(
-                rotate_launch(
-                    q.rows,
-                    num_q_heads + num_kv_heads,
-                    per_block,
-                    pairs.unsigned_abs() * 8,
-                ),
-            ),
+            Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn_original").apply(rotate_launch(
+                q.rows,
+                num_q_heads + num_kv_heads,
+                per_block,
+                pairs.unsigned_abs() * 8,
+            )),
             &[
                 q.arg(),
                 k.arg(),
@@ -405,12 +370,6 @@ where
     )
 }
 
-/// The query-only partial rotation.
-///
-/// TWO CALLERS, WHICH IS WHY IT IS A FUNCTION: `Rope::partial_q` above, and
-/// kimi's MLA prologue, which rotates the `k_pe` lane it just cut. The k
-/// slot is q's address at a ZERO width, so the kernel's k leg runs over no
-/// heads.
 pub(crate) fn rope_partial_q_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,

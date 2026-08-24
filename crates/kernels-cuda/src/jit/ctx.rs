@@ -1,8 +1,8 @@
 use core::ffi::c_void;
-use kernels::routine::Fire;
+use kernels::plane::Fire;
 
+use kernels::plane::{Backend, Extent, In, Refusal};
 use kernels::raises::Struct;
-use kernels::routine::{Backend, Extent, In, Refusal};
 
 use crate::comm::Plane;
 use crate::jit::{ArgValue, Root};
@@ -24,10 +24,6 @@ impl Backend for Cuda {
     }
 }
 
-/// What this plane is to a `points` declaration: a family method's operand
-/// marks carry a JIT region, one per element type the point quantifies over,
-/// and a `Cache` mark carries the raise this plane's ssm routines already
-/// take — `In<Struct<RecurrentState>>`, whose payload is named here once.
 impl kernels::points::Plane for Ctx<'_> {
     type Tensor<T: kernels::points::Scalar> = crate::jit::abi::Tensor<T>;
 
@@ -38,7 +34,7 @@ impl kernels::points::Plane for Ctx<'_> {
     type Pages = kernels::raises::Struct<crate::views::KvCache>;
 }
 
-impl kernels::routine::Answers<Cuda> for Ctx<'_> {
+impl kernels::plane::Answers<Cuda> for Ctx<'_> {
     fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         self.env
             .ok_or(Refusal::Unstated {
@@ -57,7 +53,7 @@ pub struct Launch {
     pub cooperative: bool,
 }
 
-impl kernels::routine::Geometry for Launch {
+impl kernels::plane::Geometry for Launch {
     fn apply_to(self, fire: Fire) -> Fire {
         self.apply_to_impl(fire)
     }
@@ -154,28 +150,13 @@ pub struct Ctx<'a> {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: Option<Plane>,
-    env: Option<&'a (dyn kernels::routine::Answers<Cuda> + 'a)>,
-    /// THE EXECUTOR'S STAGING, BY KEY — what a `#[claims]` body pulls off
-    /// `self` when the statement carries no slot for it: the fa2 schedules,
-    /// the host CSR mirrors the planless prefill walks, the custom mask, the
-    /// dsv4 residents. `.wiki/baker.md`: *"Plane staging (fa2 plan residents,
-    /// host mirrors) never appears in a declaration — the body pulls it from
-    /// `self`."* This field is that `self`.
-    ///
-    /// `None` on a context built for a hand-written call, which is what every
-    /// device test does: such a context stages nothing and every raise on it
-    /// refuses with its own key in the message.
+    env: Option<&'a (dyn kernels::plane::Answers<Cuda> + 'a)>,
+
     raised: Option<&'a (dyn kernels::raises::Answered + 'a)>,
     held: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> Ctx<'a> {
-    /// A context on a stream, answering nothing else.
-    ///
-    /// # Safety
-    ///
-    /// `stream` must be a live CUDA stream in the current context, and must
-    /// stay live for as long as the returned `Ctx` is used to fire.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
@@ -188,26 +169,12 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// The same context, carrying a cuBLAS handle for the routines that want one.
-    ///
-    /// # Safety
-    ///
-    /// `handle` must be a live `cublasHandle_t` in the current context, and
-    /// its stream must be this context's -- a handle set to another stream
-    /// orders its work against the wrong queue.
     #[must_use]
     pub const unsafe fn with_cublas(mut self, handle: *mut c_void) -> Self {
         self.cublas = handle;
         self
     }
 
-    /// The same context, carrying the communicator a collective fires on.
-    ///
-    /// # Safety
-    ///
-    /// `plane` must name a communicator that is live and whose every rank is
-    /// making the same call in the same order; a collective that one rank
-    /// skips hangs the rest.
     #[must_use]
     pub const unsafe fn with_comm(mut self, plane: Plane) -> Self {
         self.comm = Some(plane);
@@ -215,32 +182,28 @@ impl<'a> Ctx<'a> {
     }
 
     #[must_use]
-    pub const fn with_env(mut self, env: &'a (dyn kernels::routine::Answers<Cuda> + 'a)) -> Self {
+    pub const fn with_env(mut self, env: &'a (dyn kernels::plane::Answers<Cuda> + 'a)) -> Self {
         self.env = Some(env);
         self
     }
 
-    /// The same context, carrying this fire's staging — see [`Ctx::raised`].
     #[must_use]
     pub const fn with_raised(mut self, staged: &'a (dyn kernels::raises::Answered + 'a)) -> Self {
         self.raised = Some(staged);
         self
     }
 
-    /// One staged object a claim body MUST have, by the key its [`Raise`]
-    /// declares.
-    ///
-    /// The mark is the one every routine already takes for a raise —
-    /// `In<Struct<R>>`, an address with no rectangle — so a body hands the
-    /// answer straight on. An unstaged key refuses with the KEY as the
-    /// reason, which is what makes "this driver stages no `mla.plan`" a
-    /// sentence a load can print rather than a null a launch dereferences.
-    ///
-    /// [`Raise`]: kernels::raises::Raise
     pub fn raised<R: kernels::raises::Raise>(&self) -> Result<In<Struct<R>>, Refusal> {
+        self.raised_at::<R>(kernels::raises::Class::ANY)
+    }
+
+    pub fn raised_at<R: kernels::raises::Raise>(
+        &self,
+        class: kernels::raises::Class,
+    ) -> Result<In<Struct<R>>, Refusal> {
         let ptr = self
             .raised
-            .and_then(|staged| staged.raised(R::KEY))
+            .and_then(|staged| staged.raised(R::KEY, class))
             .ok_or(Refusal::Absent { what: R::KEY })?;
         Ok(In {
             ptr: ptr.cast::<R::Value>(),
@@ -249,20 +212,12 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// One staged object whose ABSENCE a kernel reads, as a null.
-    ///
-    /// The narrow door beside [`Ctx::raised`], and the caller is what makes
-    /// it narrow: `row_valid` null means every row of this fire is valid and
-    /// every appending kernel in this crate tests for exactly that, so a
-    /// refusal there would refuse the ordinary fire. Nothing else may use
-    /// this — an object a kernel dereferences unconditionally is a
-    /// [`Ctx::raised`], and the difference is the kernel's own null test.
     #[must_use]
     pub fn staged<R: kernels::raises::Raise>(&self) -> In<Struct<R>> {
         In {
             ptr: self
                 .raised
-                .and_then(|staged| staged.raised(R::KEY))
+                .and_then(|staged| staged.raised(R::KEY, kernels::raises::Class::ANY))
                 .map_or(core::ptr::null(), |p| p.cast::<R::Value>()),
             rows: 0,
             width: 0,
@@ -343,6 +298,11 @@ impl<'a> Ctx<'a> {
         } else {
             Root::variant(fire.unit, fire.file)
         };
+
+        if crate::jit::warm::warming() {
+            crate::jit::warm::resolve_only(&root, fire.entrypoint);
+            return Ok(());
+        }
         let launch = Launch {
             grid: fire.grid(),
             block: fire.group,

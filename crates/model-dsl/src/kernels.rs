@@ -34,12 +34,34 @@ pub mod gemm {
     }
 }
 
-/// The `Dist` family, one fn per method of `kernels::points::Dist`.
+/// The `Dist` family, one fn per method of `kernels::points::Dist`, plus
+/// [`dist::reduce`] — the `TP` fold over the one method, which is not a
+/// statement and is exempted in `builders_are_the_points` as such.
 pub mod dist {
     use super::*;
 
     pub fn all_reduce(buf: &Value) -> Value {
         buf.stmt("dist.all_reduce").done()
+    }
+
+    /// A rank's partial, as the world's answer: `all_reduce` at `TP > 1`,
+    /// and the value ITSELF at `TP == 1`.
+    ///
+    /// WORLD 1 IS THE IDENTITY. That is Q6's ratified law and it already
+    /// holds where the cut is made — `model::produce` derives a degree per
+    /// row and writes tp1's bytes whole, with no `if tp` in it — but the
+    /// texts broke it twelve times over, once per rank-cut result in each
+    /// of six families, each spelling the same four lines. A verb states
+    /// the law once and the arithmetic disappears from the texts: a reader
+    /// of `qwen_3_5/forward.rs` no longer has to check that the `else` arm
+    /// really is the identity, because there is no `else` arm to check.
+    ///
+    /// BY VALUE, so the fold is free: the hand form moved `buf` out of the
+    /// `else` arm and this moves it out of the `if`. The recorded plan is
+    /// byte-identical at both worlds.
+    #[must_use]
+    pub fn reduce<const TP: usize>(buf: Value) -> Value {
+        if TP > 1 { all_reduce(&buf) } else { buf }
     }
 }
 
@@ -52,31 +74,77 @@ pub mod norm {
         x.stmt("norm.rmsnorm").weight(weight).float(eps).done()
     }
 
-    pub fn rmsnorm_per_head<W: Dtype>(x: &Value, weight: &Tensor<W>, head_dim: u32, eps: f32) -> Value {
-        x.stmt("norm.rmsnorm_per_head").weight(weight).int(head_dim).float(eps).done()
+    pub fn rmsnorm_per_head<W: Dtype>(
+        x: &Value,
+        weight: &Tensor<W>,
+        head_dim: u32,
+        eps: f32,
+    ) -> Value {
+        x.stmt("norm.rmsnorm_per_head")
+            .weight(weight)
+            .int(head_dim)
+            .float(eps)
+            .done()
     }
 
     /// [`rmsnorm`] against a bank stored as an OFFSET (`1 + weight`). A
     /// separate fn because it is a separate point: the convention is the
     /// checkpoint's and a text states one for its whole life.
     pub fn rmsnorm_plus_one<W: Dtype>(x: &Value, weight: &Tensor<W>, eps: f32) -> Value {
-        x.stmt("norm.rmsnorm_plus_one").weight(weight).float(eps).done()
+        x.stmt("norm.rmsnorm_plus_one")
+            .weight(weight)
+            .float(eps)
+            .done()
     }
 
-    pub fn rmsnorm_per_head_plus_one<W: Dtype>(x: &Value, weight: &Tensor<W>, head_dim: u32, eps: f32) -> Value {
-        x.stmt("norm.rmsnorm_per_head_plus_one").weight(weight).int(head_dim).float(eps).done()
+    pub fn rmsnorm_per_head_plus_one<W: Dtype>(
+        x: &Value,
+        weight: &Tensor<W>,
+        head_dim: u32,
+        eps: f32,
+    ) -> Value {
+        x.stmt("norm.rmsnorm_per_head_plus_one")
+            .weight(weight)
+            .int(head_dim)
+            .float(eps)
+            .done()
     }
 
     pub fn rmsnorm_no_scale(x: &Value, head_dim: u32, eps: f32) -> Value {
-        x.stmt("norm.rmsnorm_no_scale").int(head_dim).float(eps).done()
+        x.stmt("norm.rmsnorm_no_scale")
+            .int(head_dim)
+            .float(eps)
+            .done()
     }
 
-    pub fn rmsnorm_gated<W: Dtype>(x: &Value, gate: &Value, weight: &Tensor<W>, head_dim: u32, eps: f32) -> Value {
-        x.stmt("norm.rmsnorm_gated").value(gate).weight(weight).int(head_dim).float(eps).done()
+    pub fn rmsnorm_gated<W: Dtype>(
+        x: &Value,
+        gate: &Value,
+        weight: &Tensor<W>,
+        head_dim: u32,
+        eps: f32,
+    ) -> Value {
+        x.stmt("norm.rmsnorm_gated")
+            .value(gate)
+            .weight(weight)
+            .int(head_dim)
+            .float(eps)
+            .done()
     }
 
-    pub fn rmsnorm_gated_by<W: Dtype>(x: &Value, gate: &Value, weight: &Tensor<W>, heads: u32, eps: f32) -> Value {
-        x.stmt("norm.rmsnorm_gated_by").value(gate).weight(weight).int(heads).float(eps).done()
+    pub fn rmsnorm_gated_by<W: Dtype>(
+        x: &Value,
+        gate: &Value,
+        weight: &Tensor<W>,
+        heads: u32,
+        eps: f32,
+    ) -> Value {
+        x.stmt("norm.rmsnorm_gated_by")
+            .value(gate)
+            .weight(weight)
+            .int(heads)
+            .float(eps)
+            .done()
     }
 
     pub fn residual_add(x: &Value, y: &Value) -> Value {
@@ -101,7 +169,12 @@ pub mod norm {
     /// single concatenated rectangle its routine takes. The recorded op is
     /// what it always was — receiver, then the blocks, then the norm's
     /// weight and eps, then the projection.
-    pub fn res_blend<W: Dtype>(prefix: &Value, blocks: &[Value], norm: &Norm<W>, proj: &Tensor<W>) -> Value {
+    pub fn res_blend<W: Dtype>(
+        prefix: &Value,
+        blocks: &[Value],
+        norm: &Norm<W>,
+        proj: &Tensor<W>,
+    ) -> Value {
         let mut s = prefix.stmt("norm.res_blend");
         for block in blocks {
             s = s.value(block);
@@ -118,11 +191,20 @@ pub mod mlp {
     }
 
     pub fn swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value {
-        packed.stmt("mlp.swiglu_clamp").int(intermediate).float(limit).done()
+        packed
+            .stmt("mlp.swiglu_clamp")
+            .int(intermediate)
+            .float(limit)
+            .done()
     }
 
     pub fn swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alpha: f32) -> Value {
-        packed.stmt("mlp.swiglu_clamp_alpha").int(intermediate).float(limit).float(alpha).done()
+        packed
+            .stmt("mlp.swiglu_clamp_alpha")
+            .int(intermediate)
+            .float(limit)
+            .float(alpha)
+            .done()
     }
 
     pub fn geglu_tanh(gate: &Value, up: &Value) -> Value {
@@ -130,13 +212,21 @@ pub mod mlp {
     }
 
     pub fn geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
-        packed.stmt("mlp.geglu_tanh_packed").int(intermediate).done()
+        packed
+            .stmt("mlp.geglu_tanh_packed")
+            .int(intermediate)
+            .done()
     }
 
     /// `up_cap` is optional in the text and rides a `0.0` sentinel in the
     /// statement — the encoding the point declares, kept verbatim.
     pub fn situ(packed: &Value, intermediate: u32, beta: f32, up_cap: Option<f32>) -> Value {
-        packed.stmt("mlp.situ").int(intermediate).float(beta).float(up_cap.unwrap_or(0.0)).done()
+        packed
+            .stmt("mlp.situ")
+            .int(intermediate)
+            .float(beta)
+            .float(up_cap.unwrap_or(0.0))
+            .done()
     }
 }
 
@@ -148,20 +238,70 @@ pub mod mlp {
 pub mod rope {
     use super::*;
 
-    pub fn full(q: &Value, k: &Value, positions: &Value, head_dim: u32, theta: f32, interleaved: bool) -> (Value, Value) {
-        q.stmt("rope.full").value(k).value(positions).int(head_dim).float(theta).int(u32::from(interleaved)).pair()
+    pub fn full(
+        q: &Value,
+        k: &Value,
+        positions: &Value,
+        head_dim: u32,
+        theta: f32,
+        interleaved: bool,
+    ) -> (Value, Value) {
+        q.stmt("rope.full")
+            .value(k)
+            .value(positions)
+            .int(head_dim)
+            .float(theta)
+            .int(u32::from(interleaved))
+            .pair()
     }
 
-    pub fn partial(q: &Value, k: &Value, positions: &Value, rotary_dim: u32, head_dim: u32, theta: f32) -> (Value, Value) {
-        q.stmt("rope.partial").value(k).value(positions).int(rotary_dim).int(head_dim).float(theta).pair()
+    pub fn partial(
+        q: &Value,
+        k: &Value,
+        positions: &Value,
+        rotary_dim: u32,
+        head_dim: u32,
+        theta: f32,
+    ) -> (Value, Value) {
+        q.stmt("rope.partial")
+            .value(k)
+            .value(positions)
+            .int(rotary_dim)
+            .int(head_dim)
+            .float(theta)
+            .pair()
     }
 
-    pub fn partial_q(q: &Value, positions: &Value, rotary_dim: u32, head_dim: u32, theta: f32) -> Value {
-        q.stmt("rope.partial_q").value(positions).int(rotary_dim).int(head_dim).float(theta).done()
+    pub fn partial_q(
+        q: &Value,
+        positions: &Value,
+        rotary_dim: u32,
+        head_dim: u32,
+        theta: f32,
+    ) -> Value {
+        q.stmt("rope.partial_q")
+            .value(positions)
+            .int(rotary_dim)
+            .int(head_dim)
+            .float(theta)
+            .done()
     }
 
-    pub fn partial_last(q: &Value, positions: &Value, rotary_dim: u32, head_dim: u32, theta: f32, interleaved: bool) -> Value {
-        q.stmt("rope.partial_last").value(positions).int(rotary_dim).int(head_dim).float(theta).int(u32::from(interleaved)).done()
+    pub fn partial_last(
+        q: &Value,
+        positions: &Value,
+        rotary_dim: u32,
+        head_dim: u32,
+        theta: f32,
+        interleaved: bool,
+    ) -> Value {
+        q.stmt("rope.partial_last")
+            .value(positions)
+            .int(rotary_dim)
+            .int(head_dim)
+            .float(theta)
+            .int(u32::from(interleaved))
+            .done()
     }
 
     pub fn yarn(
@@ -215,8 +355,19 @@ pub fn query_windows(x: &Value) -> Windows {
 pub mod attention {
     use super::*;
 
-    pub fn decode(q: &Value, pages: &Pages, window: Option<u32>, head_dim: u32, sm_scale: f32) -> Value {
-        q.stmt("attention.decode").cache(&pages.name).window(window).int(head_dim).float(sm_scale).done()
+    pub fn decode(
+        q: &Value,
+        pages: &Pages,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+    ) -> Value {
+        q.stmt("attention.decode")
+            .cache(&pages.name)
+            .window(window)
+            .int(head_dim)
+            .float(sm_scale)
+            .done()
     }
 
     pub fn prefill(
@@ -238,7 +389,13 @@ pub mod attention {
             .done()
     }
 
-    pub fn masked(w: &Windows, pages: &Pages, window: Option<u32>, head_dim: u32, sm_scale: f32) -> Value {
+    pub fn masked(
+        w: &Windows,
+        pages: &Pages,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+    ) -> Value {
         w.data
             .stmt("attention.masked")
             .value(&w.indptr)
@@ -284,7 +441,11 @@ pub mod attention {
     }
 
     pub fn sink<W: Dtype>(o: &Value, lse: &Value, sink: &Tensor<W>, head_dim: u32) -> Value {
-        o.stmt("attention.sink").value(lse).weight(sink).int(head_dim).done()
+        o.stmt("attention.sink")
+            .value(lse)
+            .weight(sink)
+            .int(head_dim)
+            .done()
     }
 
     pub fn merge_lse(
@@ -309,11 +470,17 @@ pub mod attention {
     }
 
     pub fn kv_append(k: &Value, v: &Value, pages: &Pages) {
-        k.stmt("attention.kv_append").value(v).cache(&pages.name).effect();
+        k.stmt("attention.kv_append")
+            .value(v)
+            .cache(&pages.name)
+            .effect();
     }
 
     pub fn kv_append_shared(plane: &Value, pages: &Pages) {
-        plane.stmt("attention.kv_append_shared").cache(&pages.name).effect();
+        plane
+            .stmt("attention.kv_append_shared")
+            .cache(&pages.name)
+            .effect();
     }
 }
 
@@ -325,7 +492,11 @@ pub mod moe {
     use super::*;
 
     pub fn topk_softmax(logits: &Value, experts: u32, top_k: u32) -> (Value, Value) {
-        logits.stmt("moe.topk_softmax").int(experts).int(top_k).pair()
+        logits
+            .stmt("moe.topk_softmax")
+            .int(experts)
+            .int(top_k)
+            .pair()
     }
 
     pub fn topk_sigmoid(
@@ -363,7 +534,10 @@ pub mod moe {
     }
 
     pub fn matmul_select<W: Dtype>(x: &Value, bank: &Tensor<W>, routes: &Value) -> Value {
-        x.stmt("moe.matmul_select").weight(bank).value(routes).done()
+        x.stmt("moe.matmul_select")
+            .weight(bank)
+            .value(routes)
+            .done()
     }
 
     /// TWO REPR PARAMETERS AND NOW THEY MEAN DIFFERENT THINGS. `W` is the
@@ -382,7 +556,11 @@ pub mod moe {
         bias: &Tensor<B>,
         routes: &Value,
     ) -> Value {
-        x.stmt("moe.matmul_select_bias").bank(bank).weight(bias).value(routes).done()
+        x.stmt("moe.matmul_select_bias")
+            .bank(bank)
+            .weight(bias)
+            .value(routes)
+            .done()
     }
 
     pub fn weighted_sum(routed: &Value, weights: &Value) -> Value {
@@ -390,7 +568,11 @@ pub mod moe {
     }
 
     pub fn sigmoid_gate_add(routed: &Value, shared: &Value, gate: &Value) -> Value {
-        routed.stmt("moe.sigmoid_gate_add").value(shared).value(gate).done()
+        routed
+            .stmt("moe.sigmoid_gate_add")
+            .value(shared)
+            .value(gate)
+            .done()
     }
 }
 
@@ -423,7 +605,11 @@ pub mod layout {
     }
 
     pub fn split_qkv(packed: &Value, q_width: u32, kv_width: u32) -> (Value, Value, Value) {
-        packed.stmt("layout.split_qkv").int(q_width).int(kv_width).triple()
+        packed
+            .stmt("layout.split_qkv")
+            .int(q_width)
+            .int(kv_width)
+            .triple()
     }
 
     pub fn split_q_gate(packed: &Value, head_dim: u32) -> (Value, Value) {
@@ -458,11 +644,25 @@ pub mod layout {
 pub mod ssm {
     use super::*;
 
-    pub fn causal_conv1d<W: Dtype>(x: &Value, weight: &Tensor<W>, state: &State, conv_width: u32) -> Value {
-        x.stmt("ssm.causal_conv1d").weight(weight).cache(&state.name).int(conv_width).done()
+    pub fn causal_conv1d<W: Dtype>(
+        x: &Value,
+        weight: &Tensor<W>,
+        state: &State,
+        conv_width: u32,
+    ) -> Value {
+        x.stmt("ssm.causal_conv1d")
+            .weight(weight)
+            .cache(&state.name)
+            .int(conv_width)
+            .done()
     }
 
-    pub fn causal_conv1d_chunked<W: Dtype>(w: &Windows, weight: &Tensor<W>, state: &State, conv_width: u32) -> Value {
+    pub fn causal_conv1d_chunked<W: Dtype>(
+        w: &Windows,
+        weight: &Tensor<W>,
+        state: &State,
+        conv_width: u32,
+    ) -> Value {
         w.data
             .stmt("ssm.causal_conv1d_chunked")
             .value(&w.indptr)
@@ -646,7 +846,11 @@ pub mod mla {
     }
 
     pub fn split_q_b(q_b: &Value, heads: u32, nope_dim: u32, rope_dim: u32) -> (Value, Value) {
-        q_b.stmt("mla.split_q_b").int(heads).int(nope_dim).int(rope_dim).pair()
+        q_b.stmt("mla.split_q_b")
+            .int(heads)
+            .int(nope_dim)
+            .int(rope_dim)
+            .pair()
     }
 
     pub fn absorb_q<W: Dtype>(
@@ -686,7 +890,10 @@ pub mod mla {
     }
 
     pub fn kv_append(kv_c: &Value, k_pe: &Value, pages: &Pages) {
-        kv_c.stmt("mla.kv_append").value(k_pe).cache(&pages.name).effect();
+        kv_c.stmt("mla.kv_append")
+            .value(k_pe)
+            .cache(&pages.name)
+            .effect();
     }
 
     pub fn attention_decode(
@@ -801,8 +1008,21 @@ pub mod index {
             .done()
     }
 
-    pub fn rope(q: &Value, positions: &Value, heads: u32, head_dim: u32, rope_dim: u32, theta: f32) -> Value {
-        q.stmt("index.rope").value(positions).int(heads).int(head_dim).int(rope_dim).float(theta).done()
+    pub fn rope(
+        q: &Value,
+        positions: &Value,
+        heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+    ) -> Value {
+        q.stmt("index.rope")
+            .value(positions)
+            .int(heads)
+            .int(head_dim)
+            .int(rope_dim)
+            .float(theta)
+            .done()
     }
 
     pub fn topk(
@@ -843,15 +1063,36 @@ pub mod pool {
     }
 
     pub fn boundary_prefill(w: &Windows, ratio: u32) -> (Value, Value) {
-        w.data.stmt("pool.boundary_prefill").value(&w.indptr).int(ratio).pair()
+        w.data
+            .stmt("pool.boundary_prefill")
+            .value(&w.indptr)
+            .int(ratio)
+            .pair()
     }
 
-    pub fn gather(boundary_pos: &Value, boundary_req: &Value, pages: &Pages, head_dim: u32, ratio: u32) -> Value {
-        boundary_pos.stmt("pool.gather").value(boundary_req).cache(&pages.name).int(head_dim).int(ratio).done()
+    pub fn gather(
+        boundary_pos: &Value,
+        boundary_req: &Value,
+        pages: &Pages,
+        head_dim: u32,
+        ratio: u32,
+    ) -> Value {
+        boundary_pos
+            .stmt("pool.gather")
+            .value(boundary_req)
+            .cache(&pages.name)
+            .int(head_dim)
+            .int(ratio)
+            .done()
     }
 
     pub fn kv_append(entries: &Value, boundary_pos: &Value, boundary_req: &Value, pool: &Pages) {
-        entries.stmt("pool.kv_append").value(boundary_pos).value(boundary_req).cache(&pool.name).effect();
+        entries
+            .stmt("pool.kv_append")
+            .value(boundary_pos)
+            .value(boundary_req)
+            .cache(&pool.name)
+            .effect();
     }
 
     pub fn attention_lse(
@@ -893,11 +1134,16 @@ pub mod hc {
         streams.stmt("hc.rmsnorm_f32").float(eps).done()
     }
 
-    pub fn gates<W: Dtype>(
+    /// `scale` and `base` are `Tensor<F32>` and not a repr axis, for the
+    /// reason [`ssm::kda_step`]'s pair is: `hc.gates` declares both slots
+    /// `Const<Self::Tensor<f32>>` and the dispatch binds them as `float*`,
+    /// so a bf16 bank here is an over-read the address carries no check
+    /// against. `deepseek_v4::model::Mix` declares them that way.
+    pub fn gates(
         normed: &Value,
         streams: &Value,
-        scale: &Tensor<W>,
-        base: &Tensor<W>,
+        scale: &Tensor<F32>,
+        base: &Tensor<F32>,
         stream_count: u32,
         gate_eps: f32,
         alpha: f32,
@@ -916,13 +1162,19 @@ pub mod hc {
     }
 
     pub fn fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -> Value {
-        x.stmt("hc.fold").value(streams).value(post_mix).value(comb_mix).done()
+        x.stmt("hc.fold")
+            .value(streams)
+            .value(post_mix)
+            .value(comb_mix)
+            .done()
     }
 
-    pub fn collapse<W: Dtype>(
+    /// `head_scale` and `head_base` are `Tensor<F32>` for [`gates`]'
+    /// reason, one point over.
+    pub fn collapse(
         streams: &Value,
-        head_scale: &Tensor<W>,
-        head_base: &Tensor<W>,
+        head_scale: &Tensor<F32>,
+        head_base: &Tensor<F32>,
         stream_count: u32,
         gate_eps: f32,
     ) -> Value {

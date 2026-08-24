@@ -3,7 +3,7 @@ use core::ffi::c_void;
 use crate::jit::Ctx;
 use crate::jit::abi::Tensor;
 use kernels::Refusal;
-use kernels::routine::{Const, In, Out};
+use kernels::plane::{Const, In, Out};
 
 #[cfg(feature = "_cuda")]
 use cudarc::cublas::sys::{
@@ -85,10 +85,7 @@ pub fn mla_absorb_q_to_latent_bf16(
     q_nope: In<Tensor<c_void>>,
     kv_b_proj: Const<Tensor<c_void>>,
     q_latent: Out<Tensor<c_void>>,
-    // THE STATEMENT CARRIES THESE FOUR, which is what `Const` says: the driver
-    // arm reads them off `spec.params` and each absorb takes the WHOLE
-    // `kv_b_proj` bank and slices it itself, so no operand's rectangle spells
-    // the head pitch.
+
     heads: Const<i32>,
     qk_nope_dim: Const<i32>,
     v_head_dim: Const<i32>,
@@ -149,7 +146,7 @@ pub fn mla_absorb_latent_to_v_bf16(
     attn_latent: In<Tensor<c_void>>,
     kv_b_proj: Const<Tensor<c_void>>,
     attn_v: Out<Tensor<c_void>>,
-    // [`mla_absorb_q_to_latent_bf16`]'s four, for its reason.
+
     heads: Const<i32>,
     qk_nope_dim: Const<i32>,
     v_head_dim: Const<i32>,

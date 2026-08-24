@@ -16,3 +16,9 @@ serde = { version = "1.0", features = ["derive"] }
 kernels = { path = "../kernels" }
 kernels-cuda = { path = "../kernels-cuda", default-features = false }
 kernels-metal = { path = "../kernels-metal", default-features = false }
+# The wgpu claim tables, on the terms the two above are taken: this crate is
+# the ONE join over every plane's `*_CLAIMS`, so a plane whose tables are not
+# reachable from here is a plane `sweep::resolve` cannot bind a lane against.
+# `kernels-wgpu` has no features to drop -- WGSL is not a build product, so
+# there is no `native` and no toolchain behind one.
+kernels-wgpu = { path = "../kernels-wgpu" }

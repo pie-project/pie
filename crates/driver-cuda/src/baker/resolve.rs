@@ -25,21 +25,26 @@
 //!   plane's inherent surface, which the same generator writes beside it.
 //!
 //! The third — **is the CUDA source for this instantiation compilable** —
-//! is NOT answered, and the reason is worth stating rather than leaving as
-//! a silent gap. A claim body builds its own JIT symbol from the operands
-//! it was handed (`kernels-cuda`'s `Norm::rmsnorm_residual_add` spells
+//! is not answered HERE, and the reason it cannot be is worth keeping. A
+//! claim body builds its own JIT symbol from the operands it was handed
+//! (`kernels-cuda`'s `Norm::rmsnorm_residual_add` spells
 //! `::pie::norm::rmsnorm_residual_add<{T::CPP}, 256>` and chooses the block
 //! width from the row it is about to write), and `jit::nvrtc::compile_text`
-//! takes a fully-built `Job`. So warming would mean either replicating each
-//! body's symbol construction out here — a second spelling of the thing
-//! most likely to drift — or firing the kernels for real at load. Neither
-//! is "where cheap".
+//! takes a fully-built `Job`. So a warm out here would mean replicating
+//! each body's symbol construction — a second spelling of the thing most
+//! likely to drift — and the census in `kernels_cuda::jit::warm` says the
+//! copy could not even be exact: seven of qwen decode's nineteen
+//! instantiations are picked from facts no table out here holds, and they
+//! carry 79 % of the compile time.
 //!
-//! **The seam:** when `#[claims]` generates the dispatch (W5), it can also
-//! emit a `warm(point, axes)` beside each arm, built from the same symbol
-//! expression the body uses. That is the honest place for it, and it is one
-//! generator away. Until then the JIT's own first-fire compile is what
-//! reports an uncompilable instantiation, and it reports it by name.
+//! **The seam is closed, from the other side.** `serve::load::warm_lane`
+//! walks the lane with `kernels_cuda::jit::warm::pass` open, so every
+//! `Ctx::fire` resolves its instantiation and launches nothing: the warm
+//! arm IS the fire arm, there is no second spelling, and an instantiation
+//! that will not compile refuses `load_model` by name instead of arriving
+//! at token 1. What this pass still answers, and answers first, is the
+//! POINT: a lane naming a point the plane does not claim has no body to run
+//! and would warm nothing.
 
 use std::collections::BTreeSet;
 
@@ -89,11 +94,12 @@ pub(crate) fn check(plan: &Plan, program: &Program) -> Vec<Unresolved> {
             // registry answered the symbol and CONTINUED when one did — which
             // was true of both symbols that still reach this arm, and told
             // the caller the model was loaded. Then the fire reached
-            // `staging::symbol`, which is a bare refusal and has been since
-            // R4b retired the last of its five arms. A pass whose whole
-            // reason is that "a driver that discovers at token 300 that it
-            // cannot answer `mlp.swiglu` has already told a caller the model
-            // was loaded" cannot be the thing that does it.
+            // `baker::staging::symbol`, which had been a bare refusal since
+            // R4b retired the last of its five arms — and is now deleted, its
+            // sentence inlined into `Fire::step`'s own `Call::Symbol` arm. A
+            // pass whose whole reason is that "a driver that discovers at
+            // token 300 that it cannot answer `mlp.swiglu` has already told a
+            // caller the model was loaded" cannot be the thing that does it.
             //
             // The registry row is not the question. Whether a row exists says
             // the plane HAS a launcher; what a fire needs is the STAGING
@@ -134,9 +140,10 @@ pub(crate) fn check(plan: &Plan, program: &Program) -> Vec<Unresolved> {
                         point.clone(),
                         format!(
                             "this plane answers it, but not at {}",
-                            dt.map_or_else(|| "an unstated element".to_string(), |d| format!(
-                                "{d:?}"
-                            )),
+                            dt.map_or_else(
+                                || "an unstated element".to_string(),
+                                |d| format!("{d:?}")
+                            ),
                         ),
                     ),
                 }
@@ -266,10 +273,8 @@ mod tests {
     fn every_tier2_point_is_a_statement_the_compiler_gates_to_this_plane() {
         for (point, _, _) in TIER2 {
             let statement = format!("cuda::{point}");
-            let call = model_compiler::program::call_of(
-                model_ir::kernels::Backend::Cuda,
-                &statement,
-            );
+            let call =
+                model_compiler::program::call_of(model_ir::kernels::Backend::Cuda, &statement);
             assert_eq!(
                 call,
                 Some(Call::Tier2((*point).to_string())),
@@ -280,10 +285,7 @@ mod tests {
             // same statement on another plane is a lowering violation, not a
             // backlog row.
             assert_eq!(
-                model_compiler::program::call_of(
-                    model_ir::kernels::Backend::Metal,
-                    &statement,
-                ),
+                model_compiler::program::call_of(model_ir::kernels::Backend::Metal, &statement,),
                 None,
                 "`{statement}` resolves on a plane that does not declare it",
             );
@@ -323,8 +325,14 @@ mod tests {
     /// The three answers, on a census row that exists.
     #[test]
     fn a_claim_is_checked_at_the_dtype_and_not_only_by_name() {
-        assert!(matches!(claimed(CLAIMED, "norm.rmsnorm", Some(Dt::Bf16)), Claim::Yes));
-        assert!(matches!(claimed(CLAIMED, "norm.rmsnorm", Some(Dt::F32)), Claim::Yes));
+        assert!(matches!(
+            claimed(CLAIMED, "norm.rmsnorm", Some(Dt::Bf16)),
+            Claim::Yes
+        ));
+        assert!(matches!(
+            claimed(CLAIMED, "norm.rmsnorm", Some(Dt::F32)),
+            Claim::Yes
+        ));
         assert!(matches!(
             claimed(CLAIMED, "norm.rmsnorm", Some(Dt::I32)),
             Claim::NoDtype

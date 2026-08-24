@@ -155,17 +155,6 @@ impl Allocator {
             .live
     }
 
-    /// Bytes freed during an open capture and not yet reclaimed; nonzero with
-    /// no capture open means a drain never ran.
-    #[must_use]
-    pub fn deferred_bytes(&self) -> usize {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .deferred
-    }
-
     /// Begin capturing `stream` into a graph.
     ///
     /// The returned scope holds `&mut self`, so no allocation while it lives.
@@ -303,114 +292,6 @@ pub struct DeviceBuffer {
     owner: Arc<AllocatorInner>,
 }
 
-/// A device-to-host read from a raw base; prefer [`DeviceBuffer::read_at`]
-/// when the caller owns the buffer (this is for a published weight's base).
-///
-/// # Safety
-///
-/// `src` must name at least `dst.len()` readable device bytes for the copy's
-/// duration, and `stream` must outlive it.
-pub unsafe fn read_raw_span(
-    src: *const c_void,
-    dst: &mut [u8],
-    stream: StreamRef<'_>,
-) -> Result<()> {
-    if dst.is_empty() {
-        return Ok(());
-    }
-    check_rt(
-        unsafe {
-            cudaMemcpyAsync(
-                dst.as_mut_ptr().cast(),
-                src,
-                dst.len(),
-                cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                stream.as_raw(),
-            )
-        },
-        "cudaMemcpyAsync (read_raw_span)",
-    )
-}
-
-/// A host-to-device write into a raw base; prefer [`DeviceBuffer::write_at`]
-/// when the caller owns the buffer (this is for a fire destination by byte count).
-///
-/// # Safety
-///
-/// `dst` must name at least `src.len()` writable device bytes for the copy's
-/// duration; pageable `src` is staged asynchronously, so keep it alive until
-/// the stream is synchronised.
-pub unsafe fn write_raw_span(dst: *mut c_void, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
-    if src.is_empty() {
-        return Ok(());
-    }
-    check_rt(
-        unsafe {
-            cudaMemcpyAsync(
-                dst,
-                src.as_ptr().cast(),
-                src.len(),
-                cudaMemcpyKind::cudaMemcpyHostToDevice,
-                stream.as_raw(),
-            )
-        },
-        "cudaMemcpyAsync (write_raw_span)",
-    )
-}
-
-/// A device-to-device copy between two raw bases, which
-/// [`DeviceBuffer::write_at`] cannot express.
-///
-/// # Safety
-///
-/// `src`/`dst` must each name `bytes` valid device memory (read/write
-/// respectively) for the copy's duration, and `stream` must outlive it. The
-/// spans must not overlap — `cudaMemcpyAsync` is not a `memmove`.
-pub unsafe fn copy_raw_span(
-    dst: *mut c_void,
-    src: *const c_void,
-    bytes: usize,
-    stream: StreamRef<'_>,
-) -> Result<()> {
-    if bytes == 0 {
-        return Ok(());
-    }
-    check_rt(
-        unsafe {
-            cudaMemcpyAsync(
-                dst,
-                src,
-                bytes,
-                cudaMemcpyKind::cudaMemcpyDeviceToDevice,
-                stream.as_raw(),
-            )
-        },
-        "cudaMemcpyAsync (copy_raw_span)",
-    )
-}
-
-/// A byte fill over a raw base that is the fire's, not one of ours; prefer
-/// [`DeviceBuffer::memset`]/[`DeviceBuffer::memset_at`] when owned.
-///
-/// # Safety
-///
-/// `dst` must name at least `bytes` writable device bytes for the fill's
-/// duration, and `stream` must outlive it.
-pub unsafe fn fill_raw_span(
-    dst: *mut c_void,
-    value: u8,
-    bytes: usize,
-    stream: StreamRef<'_>,
-) -> Result<()> {
-    if bytes == 0 {
-        return Ok(());
-    }
-    check_rt(
-        unsafe { cudaMemsetAsync(dst, i32::from(value), bytes, stream.as_raw()) },
-        "cudaMemsetAsync (fill_raw_span)",
-    )
-}
-
 impl DeviceBuffer {
     /// The device address, for a launcher argument.
     pub const fn as_ptr(&self) -> *mut c_void {
@@ -420,11 +301,6 @@ impl DeviceBuffer {
     /// Size in bytes.
     pub const fn len(&self) -> usize {
         self.bytes
-    }
-
-    /// Was this a zero-byte allocation?
-    pub const fn is_empty(&self) -> bool {
-        self.bytes == 0
     }
 
     /// The address `offset` bytes in, or `None` if `offset + len` leaves the
@@ -500,31 +376,6 @@ impl DeviceBuffer {
                     self.ptr.as_raw(),
                     i32::from(value),
                     self.bytes,
-                    stream.as_raw(),
-                )
-            },
-            "cudaMemsetAsync",
-        )
-    }
-
-    /// Fill a span of this buffer with a byte value, ordered on `stream`.
-    pub fn memset_at(
-        &mut self,
-        offset: usize,
-        len: usize,
-        value: u8,
-        stream: StreamRef<'_>,
-    ) -> Result<()> {
-        self.check_span("cudaMemsetAsync (memset_at)", offset, len)?;
-        if len == 0 {
-            return Ok(());
-        }
-        check_rt(
-            unsafe {
-                cudaMemsetAsync(
-                    self.ptr.as_raw().byte_add(offset),
-                    i32::from(value),
-                    len,
                     stream.as_raw(),
                 )
             },

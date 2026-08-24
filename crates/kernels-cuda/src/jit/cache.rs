@@ -40,10 +40,21 @@ pub fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Er
     bind_context()?;
     let arch = arch().ok_or(Error::NoDevice)?;
     let key = root.key(instantiation, arch);
-    slot(&key)
+
+    let started = crate::jit::warm::warming().then(std::time::Instant::now);
+    let out = slot(&key)
         .get_or_init(|| load(root, instantiation, &key, arch))
         .as_ref()
-        .map_err(Clone::clone)
+        .map_err(Clone::clone);
+    if let Some(started) = started {
+        crate::jit::warm::note(
+            root.name,
+            instantiation,
+            out.as_ref().err().map(ToString::to_string),
+            started.elapsed(),
+        );
+    }
+    out
 }
 
 fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Error> {

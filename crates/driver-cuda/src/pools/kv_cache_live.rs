@@ -144,10 +144,18 @@ pub trait ElasticPool {
     fn committed_bytes(&self) -> usize;
 }
 
-/// A cache whose pages are all resident. The only [`ElasticPool`] so far:
-/// [`Arena`](crate::device::vmm::Arena) speaks `ensure_committed(bytes)`, not
-/// `ensure_fraction`, so nothing bridges them and `materialize` leaves `elastic`
-/// `None` regardless.
+/// A cache whose pages are all resident, and the ONLY [`ElasticPool`] there
+/// has ever been.
+///
+/// `materialize` leaves `elastic` `None` unconditionally and `serve::state`
+/// instantiates `KvCache<AllResident>`, so every method of the trait is a
+/// no-op reached through a `None`. The thing it was waiting for is gone:
+/// `device::vmm`'s `Arena` — a 803-line VMM allocator with 41 public items
+/// and no non-test reader in any `src/` — spoke `ensure_committed(bytes)`
+/// where this speaks `ensure_fraction`, nothing ever bridged them, and the
+/// caps have always advertised `elastic_page_bytes: 0`. The arena is
+/// deleted; this seam is what is left of the plan, and it stays only because
+/// `KvCache` is generic over it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AllResident;
 

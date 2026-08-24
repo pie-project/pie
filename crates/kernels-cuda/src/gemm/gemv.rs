@@ -2,7 +2,7 @@ use crate::jit::abi::Tensor;
 use crate::jit::{ArgValue, Ctx, Launch, aligned16};
 use kernels::Fire;
 use kernels::Refusal;
-use kernels::routine::{Const, In, Out};
+use kernels::plane::{Const, In, Out};
 
 const WARPS: u32 = 4;
 
@@ -29,12 +29,7 @@ pub(crate) fn gemv_bf16(
     weight: Const<Tensor<std::ffi::c_void>>,
     act: In<Tensor<std::ffi::c_void>>,
     out: Out<Tensor<std::ffi::c_void>>,
-    // THE CALLER'S NUMBER, AND `Const` IS HOW THIS ROUTINE'S CALLERS ALREADY
-    // HAND ONE OVER: `dense.rs` builds `Const { v: w }`, `In { .. }` and
-    // `Out { .. }` by hand at both call sites, because a path-fired launch has
-    // no statement to place them. One site passes its own `beta` and the other
-    // a literal `0.0` under a `beta == 0.0` guard, so the value is decided
-    // per call and no fact could answer it.
+
     beta: Const<f32>,
 ) -> Result<(), Refusal> {
     const SPLIT_K_MAX_ROWS: i32 = 4096;

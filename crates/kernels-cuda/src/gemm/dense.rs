@@ -5,17 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::cublas::sys::{
-    cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx, cublasGemmEx,
-    cublasGemmGroupedBatchedEx, cublasGetStream_v2, cublasGetVersion_v2, cublasHandle_t,
-    cublasOperation_t, cublasSetStream_v2, cublasStatus_t, cudaDataType,
+    cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGemmGroupedBatchedEx,
+    cublasGetStream_v2, cublasGetVersion_v2, cublasHandle_t, cublasOperation_t, cublasSetStream_v2,
+    cublasStatus_t, cudaDataType,
 };
 use cudarc::cublaslt::sys as lt;
 use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
-    cudaEventRecord, cudaEventSynchronize, cudaFree, cudaGetDevice, cudaGetErrorName,
-    cudaGetLastError, cudaMalloc, cudaMemGetInfo, cudaMemsetAsync, cudaPeekAtLastError,
-    cudaStreamCaptureStatus, cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamIsCapturing,
-    cudaStreamNonBlocking, cudaStreamSynchronize,
+    cudaEventRecord, cudaEventSynchronize, cudaFree, cudaGetDevice, cudaGetLastError, cudaMalloc,
+    cudaMemsetAsync, cudaStreamCaptureStatus, cudaStreamCreateWithFlags, cudaStreamDestroy,
+    cudaStreamIsCapturing, cudaStreamNonBlocking, cudaStreamSynchronize,
 };
 
 use super::gemv::gemv_bf16;
@@ -1016,13 +1015,7 @@ fn dense_tactic_for(
         if tuner.chosen.len() >= MAX_TUNED_SHAPES {
             return None;
         }
-        // A TACTIC ALREADY DECIDED IS ADOPTED BEFORE ANY THROTTLE.
-        //
-        // The disk cache outlives the process, so in steady state every shape
-        // this model fires is already answered here. Reading it FIRST is what
-        // makes the first fire of a process compute the same numbers as the
-        // second, and that is not a performance property but a correctness
-        // one -- see `# What the throttle cost`.
+
         if let Some(tactic) = tuner.disk.lookup(key).and_then(|(kind, algo)| {
             GemmKind::from_i32(kind).map(|kind| DenseTactic { kind, algo })
         }) {
@@ -1030,56 +1023,10 @@ fn dense_tactic_for(
             return Some(tactic);
         }
 
-        // A SHAPE FIRST SEEN INSIDE A CAPTURE IS NOT TUNED HERE.
-        //
-        // Timing a candidate means `cudaStreamSynchronize` on the tuning
-        // arena's own stream, and under the default global capture mode an
-        // unsafe API called ANYWHERE in the process while a capture is in
-        // flight invalidates that capture -- the arena having its own stream,
-        // its own handle and its own buffers does not save it. So the tuner
-        // does not tune during one; the timing run waits for an eager fire,
-        // which every shape gets, because the fire ahead of a capture is eager
-        // by construction.
-        //
-        // # What that cost
-        //
-        // The adapter correction's GEMM shapes are reached for the first time
-        // INSIDE the fire that captures, because nothing else in the model has
-        // them. Tuning them invalidated that capture; the next launch onto it
-        // failed with `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`, and cuBLAS
-        // after it with `CUBLAS_STATUS_INTERNAL_ERROR`, which is where the
-        // panic came from when it panicked at all.
-        //
-        // The `capturing` argument used to be read to SKIP the second-sighting
-        // counter below, which made the tuner more eager inside a capture
-        // rather than less. It is the same argument and the opposite rule.
         if capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone {
             return None;
         }
 
-        // # What the throttle cost
-        //
-        // This counter exists so a shape fired once is never paid for, and it
-        // used to sit AHEAD of the disk lookup. That made the first sighting
-        // of a shape in a process take the untuned fallback and the second
-        // take the tuned tactic -- two different kernels, two different
-        // summation orders, two different bf16 roundings, for the same
-        // arguments.
-        //
-        // The difference is small and it is not nothing. `lora-probe` on
-        // qwen3-0.6b answered " Senate" to the FIRST request of a process and
-        // " Paris" to every request after it, same process, same seed, from
-        // logits that differed in the third significant figure (5.1562 against
-        // 5.1875 at token 0). It read as a LoRA defect for a long time because
-        // LoRA is what the fixture is for; it reproduced with the adapter
-        // staged, with the adapter zeroed on the device, and with the adapter
-        // path disabled outright, which is what finally named it.
-        //
-        // A process with a COLD cache still tunes on the second sighting and
-        // still moves under itself once per shape. Ending that means deciding
-        // every tactic before the first answer is served, which is a warm-up
-        // this driver does not have; this ends it for every process after the
-        // first, which is every process in a deployment.
         let seen = tuner.seen.entry(key).or_insert(0);
         *seen += 1;
         if *seen < 2 {
@@ -1099,17 +1046,6 @@ fn dense_tactic_for(
         Some(tactic)
     });
     (plan, tactic)
-}
-
-#[must_use]
-pub fn dense_tactic_is_gemv(m: i32, n: i32, k: i32, beta: f32) -> bool {
-    let key = dense_key(m, n, k, beta);
-    with_tuner(|tuner| {
-        tuner
-            .chosen
-            .get(&key)
-            .is_some_and(|t| t.kind == GemmKind::Gemv)
-    })
 }
 
 fn path_trace_take() -> bool {
@@ -1285,148 +1221,6 @@ pub unsafe fn act_x_wt_bf16(
         );
     }
     check(status, &format!("cublasGemmEx[bf16] M={m} N={n} K={k}"));
-}
-
-fn grouped_support(key: u64) -> Option<bool> {
-    static KNOWN: OnceLock<Mutex<HashMap<(i32, u64), bool>>> = OnceLock::new();
-    let map = KNOWN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("grouped-batched support map poisoned");
-    map.get(&(current_device(), key)).copied()
-}
-
-fn store_grouped_support(key: u64, supported: bool) {
-    static KNOWN: OnceLock<Mutex<HashMap<(i32, u64), bool>>> = OnceLock::new();
-    let mut map = KNOWN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("grouped-batched support map poisoned");
-    map.entry((current_device(), key)).or_insert(supported);
-}
-
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn batched_act_x_wt_bf16(
-    handle: *mut c_void,
-    act_ptrs_dev: *const *const c_void,
-    w_ptrs_dev: *const *const c_void,
-    y_ptrs_dev: *const *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    batch_count: i32,
-    beta: f32,
-) {
-    if batch_count <= 0 {
-        return;
-    }
-
-    if m <= 0 || n <= 0 || k <= 0 {
-        return;
-    }
-    let handle: cublasHandle_t = handle.cast::<cublasContext>();
-    let alpha = 1.0f32;
-    let grouped_key =
-        dense_key(m, n, k, beta) ^ (batch_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let known = grouped_support(grouped_key);
-    let capturing = cublas_stream(handle).map_or(true, |s| {
-        capture_status(s).is_none_or(|c| c != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
-    });
-    let try_grouped = known == Some(true) || (known.is_none() && !capturing);
-    if try_grouped {
-        let transa = [cublasOperation_t::CUBLAS_OP_T];
-        let transb = [cublasOperation_t::CUBLAS_OP_N];
-        let m_array = [n];
-        let n_array = [m];
-        let k_array = [k];
-        let lda = [k];
-        let ldb = [k];
-        let ldc = [n];
-        let group_size = [batch_count];
-
-        let status = unsafe {
-            cublasGemmGroupedBatchedEx(
-                handle,
-                transa.as_ptr(),
-                transb.as_ptr(),
-                m_array.as_ptr(),
-                n_array.as_ptr(),
-                k_array.as_ptr(),
-                std::ptr::from_ref(&alpha).cast(),
-                w_ptrs_dev,
-                cudaDataType::CUDA_R_16BF,
-                lda.as_ptr(),
-                act_ptrs_dev,
-                cudaDataType::CUDA_R_16BF,
-                ldb.as_ptr(),
-                std::ptr::from_ref(&beta).cast(),
-                y_ptrs_dev,
-                cudaDataType::CUDA_R_16BF,
-                ldc.as_ptr(),
-                1,
-                group_size.as_ptr(),
-                COMPUTE,
-            )
-        };
-        if known.is_none() {
-            store_grouped_support(grouped_key, status == cublasStatus_t::CUBLAS_STATUS_SUCCESS);
-        }
-        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return;
-        }
-    }
-
-    let status = unsafe {
-        cublasGemmBatchedEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            n,
-            m,
-            k,
-            std::ptr::from_ref(&alpha).cast(),
-            w_ptrs_dev,
-            cudaDataType::CUDA_R_16BF,
-            k,
-            act_ptrs_dev,
-            cudaDataType::CUDA_R_16BF,
-            k,
-            std::ptr::from_ref(&beta).cast(),
-            y_ptrs_dev,
-            cudaDataType::CUDA_R_16BF,
-            n,
-            batch_count,
-            COMPUTE,
-            ALGO_TENSOR_OP,
-        )
-    };
-    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        let device = current_device();
-        let pending = unsafe { cudaPeekAtLastError() };
-        let pending_name = unsafe { CStr::from_ptr(cudaGetErrorName(pending)) }
-            .to_string_lossy()
-            .into_owned();
-        let capture = cublas_stream(handle).map_or_else(
-            || "unknown".to_owned(),
-            |s| match capture_status(s) {
-                Some(cudaStreamCaptureStatus::cudaStreamCaptureStatusActive) => "active".to_owned(),
-                Some(cudaStreamCaptureStatus::cudaStreamCaptureStatusInvalidated) => {
-                    "INVALIDATED".to_owned()
-                }
-                Some(cudaStreamCaptureStatus::cudaStreamCaptureStatusNone) => "none".to_owned(),
-                _ => "unknown".to_owned(),
-            },
-        );
-        let mut free_bytes: usize = 0;
-        let mut total_bytes: usize = 0;
-        let _ = unsafe { cudaMemGetInfo(&raw mut free_bytes, &raw mut total_bytes) };
-        panic!(
-            "cuBLAS error ({status:?}): cublasGemmBatchedEx[bf16] M={m} N={n} K={k} \
-             batch={batch_count} device={device} capture={capture} \
-             pending_cuda={pending_name} free_mib={}",
-            free_bytes >> 20
-        );
-    }
 }
 
 pub unsafe fn act_x_wt_bf16_out_fp32(

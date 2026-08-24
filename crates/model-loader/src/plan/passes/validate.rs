@@ -359,7 +359,7 @@ fn in_arena(program: &LoadPlan, id: BufferId) -> Result<bool> {
 }
 
 /// How deep a chain of views may go before the walk gives up; the same guard
-/// [`crate::plan::spans`] uses, for the same reason.
+/// `passes::arena` and `passes::tile` use, for the same reason.
 const MAX_VIEW_HOPS: usize = 16;
 
 /// Operand-unit invariants the optimizer/ABI must preserve and the C++ executor

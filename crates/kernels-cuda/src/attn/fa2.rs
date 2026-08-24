@@ -13,17 +13,17 @@ use kernels::Bind;
 
 use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
 use crate::attn::fa2::params::{
-    Buffers, DecodeParams, DecodePlan, DecodeScoreParams, DevicePtr, Partials, PrefillPagedParams,
-    PrefillPlan, PrefillScoreParams, make_decode_params, make_prefill_params,
+    Buffers, DecodeParams, DecodePlan, DevicePtr, Partials, PrefillPagedParams, PrefillPlan,
+    make_decode_params, make_prefill_params,
 };
 use crate::jit::abi::Tensor;
 use crate::jit::abi::{bf16, unpack_aggregate};
 use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
 use crate::raises::{Fa2Decode, Fa2Prefill};
-use crate::routine::Fire;
 use crate::views::{AttnMask, KvCache, KvPageIndptrHost, QoIndptrHost};
+use kernels::plane::Fire;
+use kernels::plane::{Arg, Const, In, Out};
 use kernels::raises::Struct;
-use kernels::routine::{Arg, Const, In, Out};
 use kernels::{Refusal, Ty};
 
 fn dequant_prelude(
@@ -53,10 +53,6 @@ fn upload_plan(ctx: &Ctx<'_>, src: *const u8, len: usize, dst: *mut u8) -> Resul
 
     unsafe { plan::upload_int_plan(bytes, dst as u64, 0, ctx.stream()) }
 }
-
-pub const HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
-
-pub const DECODE_GQA: &[u32] = &[1, 2, 3, 4, 8];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeArm {
@@ -947,25 +943,6 @@ pub fn prefill_root(
     })
 }
 
-#[must_use]
-pub fn decode_instantiation(
-    head_dim: u32,
-    group_size: u32,
-    arm: DecodeArm,
-) -> Option<&'static str> {
-    decode_root(head_dim, group_size).map(|p| p.arms[arm as usize])
-}
-
-#[must_use]
-pub fn prefill_instantiation(
-    head_dim: u32,
-    cta_tile_q: u32,
-    num_mma_kv: u32,
-    arm: PrefillArm,
-) -> Option<&'static str> {
-    prefill_root(head_dim, cta_tile_q, num_mma_kv).map(|p| p.arms[arm as usize])
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePoint {
     pub head_dim: u32,
@@ -986,14 +963,6 @@ pub struct PrefillPoint {
     pub device: Device,
 }
 
-pub trait DecodeBlock: Copy {}
-impl DecodeBlock for DecodeParams {}
-impl DecodeBlock for DecodeScoreParams {}
-
-pub trait PrefillBlock: Copy {}
-impl PrefillBlock for PrefillPagedParams {}
-impl PrefillBlock for PrefillScoreParams {}
-
 fn block<P>(params: &P) -> ArgValue {
     ArgValue::Bytes {
         ptr: core::ptr::from_ref(params).cast::<u8>(),
@@ -1006,7 +975,7 @@ fn no_point(what: &'static str, why: &dyn core::fmt::Display) -> Refusal {
     Refusal::Unstated { what }
 }
 
-pub fn decode<P: DecodeBlock>(ctx: &Ctx<'_>, at: DecodePoint, params: &P) -> Result<(), Refusal> {
+pub fn decode(ctx: &Ctx<'_>, at: DecodePoint, params: &DecodeParams) -> Result<(), Refusal> {
     let Some(point) = decode_root(at.head_dim, at.group_size) else {
         return Err(no_point(
             "an FA2 decode lattice point",
@@ -1033,10 +1002,10 @@ pub fn decode<P: DecodeBlock>(ctx: &Ctx<'_>, at: DecodePoint, params: &P) -> Res
     )
 }
 
-pub fn prefill<P: PrefillBlock>(
+pub fn prefill(
     ctx: &Ctx<'_>,
     at: PrefillPoint,
-    params: &P,
+    params: &PrefillPagedParams,
 ) -> Result<(), Refusal> {
     let geometry =
         PrefillGeometry::derive(at.head_dim, at.cta_tile_q, KvWidth::BF16, false, at.device)
@@ -1081,22 +1050,6 @@ pub fn decode_arm(
 }
 
 #[must_use]
-pub fn decode_capture_arm(
-    full_attention_variant: bool,
-    window_left: i32,
-    logits_soft_cap: f32,
-) -> Option<DecodeArm> {
-    if logits_soft_cap > 0.0 || window_left >= 0 {
-        return None;
-    }
-    Some(if full_attention_variant {
-        DecodeArm::CaptureFull
-    } else {
-        DecodeArm::CaptureWindow
-    })
-}
-
-#[must_use]
 pub fn prefill_arm(full_attention_variant: bool, causal: bool, logits_soft_cap: f32) -> PrefillArm {
     if full_attention_variant {
         return match (causal, logits_soft_cap > 0.0) {
@@ -1111,22 +1064,6 @@ pub fn prefill_arm(full_attention_variant: bool, causal: bool, logits_soft_cap: 
     } else {
         PrefillArm::CausalWindow
     }
-}
-
-#[must_use]
-pub fn prefill_capture_arm(
-    causal: bool,
-    window_left: i32,
-    logits_soft_cap: f32,
-) -> Option<PrefillArm> {
-    if logits_soft_cap > 0.0 || window_left >= 0 {
-        return None;
-    }
-    Some(if causal {
-        PrefillArm::CausalCapture
-    } else {
-        PrefillArm::NoneCapture
-    })
 }
 
 #[must_use]
@@ -1158,8 +1095,6 @@ fn addr<T>(p: *const T) -> DevicePtr {
     p as usize as u64
 }
 
-// The split-KV merge, moved home from the deleted `cascade` module: fa2
-// is its only caller and `cascade/merge_states.cuh` is what it fires.
 const NUM_THREADS: u32 = 128;
 const NUM_SMEM_STAGES: u32 = 4;
 const NO_ROW: Refusal = Refusal::Unstated {
@@ -1343,13 +1278,6 @@ fn buffers(
     }
 }
 
-/// The fa2 DECODE launch, and the schedule this file owns rather than the
-/// claim that names it.
-///
-/// TWO POINTS AND A TEST reach it: `attention.decode` and
-/// `attention.decode_lse` through `attn::fa2_decode`, which differ only in
-/// whether `lse` is `Some`, and `tests/attention_paged.rs`, which measures
-/// the planned leg against the ragged one.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_attention_flashinfer_decode(
     ctx: &Ctx<'_>,
@@ -1460,13 +1388,13 @@ fn prefill_paged(
     }
 }
 
-/// The fa2 CUSTOM-MASK prefill launch, which `attention.masked` names.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_attention_flashinfer_prefill_custom(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
     plan: In<Struct<Fa2Prefill>>,
     o: Out<Tensor<bf16>>,
+    window_left: Const<i32>,
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>,
     maskv: In<Struct<AttnMask>>,
@@ -1539,7 +1467,7 @@ pub(crate) fn dispatch_attention_flashinfer_prefill_custom(
 
     params.maybe_custom_mask = addr(mask);
     params.maybe_mask_indptr = addr(mask_indptr);
-    params.window_left = -1;
+    params.window_left = *window_left;
     prefill(
         ctx,
         prefill_at(&planned, arm, params.padded_batch_size),
@@ -1552,13 +1480,6 @@ pub(crate) fn dispatch_attention_flashinfer_prefill_custom(
     }
 }
 
-// ELEVEN ARGUMENTS, and no `expect` had been needed before: `window_left`
-// and the two host row arrays arrived with the no-ask series, which took them
-// out of a fact bag and put them in signatures. This is a private planner and
-// not a `#[routine]`, so D1's *"a routine takes fields, never a struct"* is
-// not what justifies it -- what does is that every one of the eleven is read
-// by a different branch of the plan below, and a struct built to carry them
-// would have exactly eleven fields and one caller.
 #[expect(
     clippy::too_many_arguments,
     reason = "eleven independent plan inputs, one caller; a struct would only rename them"
@@ -1646,11 +1567,6 @@ fn plan_own_prefill(
     Ok(dispatch::prefill_plan_of(cache, plan::fa_device()))
 }
 
-/// The fa2 PREFILL launch — the planless leg, which carves its own schedule
-/// out of the two host CSR mirrors the executor stages.
-///
-/// TWO POINTS reach it through `attn::fa2_prefill`: `attention.prefill` and
-/// `attention.prefill_lse`, which differ only in whether `lse` is `Some`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_flashinfer_prefill(
     ctx: &Ctx<'_>,
@@ -1680,15 +1596,13 @@ pub(crate) fn attention_flashinfer_prefill(
             what: "the prefill plan cache this statement names",
         });
     }
-    // The planless routine PLANS: it owns the cache for this fire, which is
-    // what the `*mut u8` the retired key answered had always meant.
+
     let cache = unsafe { &mut *plan_cache.ptr.cast_mut() };
 
     dequant_prelude(ctx, kvc_ptr, *kv_num_heads, *head_dim);
     let plan = plan_own_prefill(
         ctx,
         q.width,
-        // The request count is the CSR operand's own row count.
         qo_indptr.rows,
         *head_dim,
         q.rows,

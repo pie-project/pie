@@ -20,11 +20,6 @@ impl Encoding {
         self.method.is_empty()
     }
 
-    #[must_use]
-    pub fn is_mxfp4(&self) -> bool {
-        self.method.eq_ignore_ascii_case("mxfp4")
-    }
-
     pub fn from_config_json(text: &str) -> Result<Self, serde_json::Error> {
         let root: serde_json::Value = serde_json::from_str(text)?;
         Ok(Self::from_config_value(&root))

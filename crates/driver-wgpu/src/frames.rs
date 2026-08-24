@@ -11,8 +11,10 @@
 //!
 //! Two allocators handing out page 7 is not an error anyone sees: attention
 //! reads another conversation's keys and the model answers fluently. So this
-//! path does not touch the book, and [`crate::turns::Serving::over`] exists
-//! so that it does not have to.
+//! path does not touch the book, and `turns::Serving::over` existed so that
+//! it did not have to. `Serving` STOOD in `turns` and went with the legacy
+//! walk; every mention of it below is in that past tense, and is kept because
+//! the reason a frame is shaped this way did not go with it.
 //!
 //! # What a frame is
 //!
@@ -25,27 +27,26 @@
 use driver_api::{FrameSubmission, LaunchPlan};
 
 use crate::resources::Request;
-use crate::turns::{Step, Unstepped};
+use crate::turns::Step;
 
-/// What a frame did.
-///
-/// The engine's three answers, and they are three because the caller's next
-/// move differs completely: [`Self::Exhausted`] means try again after
-/// evicting, [`Self::Impossible`] means never, and no amount of waiting
-/// changes it.
-#[derive(Debug)]
-pub enum Launched {
-    /// It ran. One [`Step`] per step of the frame, in execution order.
-    Ran(Vec<Step>),
-    /// The pool cannot hold this frame TODAY. Evict and re-post.
-    Exhausted,
-    /// The pool cannot hold this frame at any occupancy.
-    ///
-    /// Distinct from [`Self::Exhausted`] because a scheduler that waited on
-    /// this would wait forever, and one that dropped an `Exhausted` frame
-    /// would drop work it had correctly admitted.
-    Impossible,
-}
+// `pub enum Launched` STOOD HERE -- what a frame DID, in the engine's three
+// answers: `Ran(Vec<Step>)`, one step per step of the frame in execution
+// order; `Exhausted`, the pool cannot hold this frame TODAY, so evict and
+// re-post; and `Impossible`, the pool cannot hold it at any occupancy.
+//
+// The last two were three answers and not two for a measured reason, and it is
+// the reason this file carries an audit test at all. `Exhausted` was declared
+// here, documented as "evict and re-post", MATCHED ON at the engine seam in
+// `crates/engine/src/driver/backend/wgpu.rs` -- and constructed nowhere. Every
+// device that would not give the memory took the fault path instead, so a
+// request died for a condition that clears the moment something else finishes.
+// A scheduler that waited on `Impossible` would wait forever and one that
+// dropped an `Exhausted` frame would drop work it had correctly admitted; the
+// distinction is the whole value of the enum, and half of it was unreachable.
+//
+// `Shell::launch` was what produced all three, and it went with `Shell`.
+// `every_answer_this_crate_declares_is_one_it_constructs`, below, is what
+// caught the original defect and what refused to let the rest stand.
 
 /// Why a frame could not be served at all.
 #[derive(Debug)]
@@ -55,18 +56,19 @@ pub enum Unlaunched {
     /// Checked BEFORE anything is staged, which is the rule this crate keeps
     /// everywhere: decide, then move.
     Malformed(String),
-    /// A step ran into the layer below.
-    Unstepped(Unstepped),
-    /// The frame names a verb this driver does not serve.
-    Unserved(&'static str),
+    // `Unstepped(turns::Unstepped)` and `Unserved(&'static str)` STOOD HERE:
+    // a step that ran into the layer below, and a frame naming a verb this
+    // driver does not serve. `Shell::launch` raised both -- it was the thing
+    // that ran a step and the thing that dispatched a frame's verb -- and both
+    // went with it. `Malformed` is what is left, and it is the one this file's
+    // own readers raise: a step's CSRs are checked BEFORE anything is staged,
+    // which is the rule this crate keeps everywhere -- decide, then move.
 }
 
 impl std::fmt::Display for Unlaunched {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Malformed(why) => write!(f, "this frame is not servable: {why}"),
-            Self::Unstepped(e) => write!(f, "a step of this frame did not run: {e:?}"),
-            Self::Unserved(what) => write!(f, "this driver does not serve {what}"),
         }
     }
 }
@@ -126,9 +128,9 @@ pub fn pages_named(frame: &FrameSubmission) -> u32 {
 ///
 /// [`pages_named`]'s sibling, and here beside it because they answer the same
 /// question about the same elastic pool through two different doors: a frame
-/// arrives at [`crate::shell::Shell::admit`] and a copy plan at
-/// [`crate::shell::Shell::copy_kv`], and a pool that grows for one and not
-/// the other refuses work it could serve.
+/// arrived at `shell::Shell::admit` and a copy plan at `shell::Shell::copy_kv`
+/// -- both STOOD in `shell`, which the legacy-walk cut deleted whole -- and a
+/// pool that grows for one and not the other refuses work it could serve.
 ///
 /// # Destinations only
 ///
@@ -260,8 +262,8 @@ pub fn writes_stay_in_the_declared_span(
 /// `engine` or `worker` ever populates it, and it was empty on every plan of
 /// the sweep.
 ///
-/// `sampling_indices` is deliberately absent: [`crate::turns::Serving::over`]
-/// forces every row to sample and says why there, so a sampling table is
+/// `sampling_indices` is deliberately absent: `turns::Serving::over` forced
+/// every row to sample and said why there, so a sampling table is
 /// OVERWRITTEN rather than ignored, and the rows the caller wanted are
 /// recoverable from `Step::readout_of`.
 ///
@@ -563,7 +565,7 @@ pub type Fault = (u64, String);
 /// went nowhere. `crate::programs`' module doc used to end by saying exactly
 /// that. This is the verb that closes it.
 ///
-/// # Why it is here and not in [`crate::shell::Shell`]
+/// # Why it is here and not in `shell::Shell`
 ///
 /// The registry is not the shell's. It is alive from the driver's `create`
 /// rather than from its `load_model`, because nothing in the channel plane is
@@ -573,8 +575,8 @@ pub type Fault = (u64, String);
 ///
 /// # Rows, and the mistake this avoids
 ///
-/// [`crate::turns::Serving::over`] forces every ROW to sample, so
-/// `step.logits` holds one distribution per token in FIRE order, and
+/// `turns::Serving::over` forced every ROW to sample, so `step.logits` holds
+/// one distribution per token in FIRE order, and
 /// `step.readout_of[r]` says which of those rows is request `r`'s answer.
 /// The interpreter reads its inputs from `base_row = 0` and cannot be told
 /// otherwise, so a member's rows are GATHERED into a fresh buffer rather than
@@ -857,8 +859,8 @@ pub fn member_requests(
 ///
 /// # Why `sampling_indices` is dropped
 ///
-/// [`crate::turns::Serving::over`] forces every row to sample, for the arena
-/// reason recorded there, and rewrites the sampling table to the identity to
+/// `turns::Serving::over` forced every row to sample, for the arena reason
+/// recorded there, and rewrote the sampling table to the identity to
 /// match. A `samples` here would be overwritten one line later, so stating it
 /// would be a lie in the record rather than a value anyone reads.
 ///

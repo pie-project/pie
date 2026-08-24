@@ -14,16 +14,24 @@
 // once per layer per step, so at decode shapes the standalone chain was
 // almost entirely launch latency.
 //
-//  * `qkv_decode_qk_norm_rope_write_kv<BLOCK, USE_ROPE_TABLE>` -- one block
-//    per (request, head). The general form: any head dim, `BLOCK` threads
-//    striding it.
-//  * `qkv_decode_qk_norm_rope_write_kv_warp<HEAD_DIM, USE_ROPE_TABLE>` -- one
+//  * `qkv_decode_qk_norm_rope_vnorm_write_kv<BLOCK, USE_ROPE_TABLE>` -- one
+//    block per (request, head). The general form: any head dim, `BLOCK`
+//    threads striding it.
+//  * `qkv_decode_qk_norm_rope_vnorm_write_kv_warp<HEAD_DIM, USE_ROPE_TABLE>` -- one
 //    WARP per (request, head), `HEAD_DIM` known at compile time so
 //    `ELEMS_PER_THREAD` is a constant and the norm reduction is
 //    `__shfl_xor_sync` with no shared memory and no `__syncthreads`. Chosen
 //    for head_dim 64/128/256; the block form is the fallback.
 //  * `qkv_packed_qk_norm_rope_vnorm_write_kv<BLOCK>` -- the prefill/packed
-//    form, one block per (row, head), and it additionally RMSNorms v.
+//    form, one block per (row, head).
+//
+// ALL THREE RMSNORM V. The two decode forms did not until it was measured
+// against a transformers forward on gemma-4-E4B: they copied v through
+// while their own point is named `..._vnorm_write` and the unfused text
+// states `norm.rmsnorm_no_scale` in the same place. A single-token fire
+// cannot see the difference -- one v is one direction, and the
+// post-attention norm downstream removes its scale -- so five layers of
+// smoke had fired this arm without the error being reachable.
 //
 // # `USE_ROPE_TABLE` is a real arm, not a decoration
 //
@@ -108,7 +116,7 @@
 namespace pie::attn {
 
 template <int BLOCK, bool USE_ROPE_TABLE>
-__global__ void qkv_decode_qk_norm_rope_write_kv(
+__global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
     bf16* __restrict__ k_pages,
@@ -153,17 +161,38 @@ __global__ void qkv_decode_qk_norm_rope_write_kv(
         : src_row + q_dim + local_head * head_dim;
     const bf16* weight = is_q ? q_weight : k_weight;
 
+    // V IS NORMED TOO, and its sum of squares rides the same reduction:
+    // `qkv_packed_qk_norm_rope_vnorm_write_kv` below has always done this and
+    // this kernel COPIED v through, which is a different model. Gemma-4's
+    // `v_norm` is `Gemma4RMSNorm(head_dim, with_scale=False)` — the
+    // `norm.rmsnorm_no_scale` an unfused text states between the split and the
+    // append — and it is invisible at one token (the reading is a single v,
+    // and the post-attention norm downstream divides the scale straight back
+    // out) and wrong at every prefix longer than that, because a mixture of
+    // un-normed v's points somewhere a mixture of normed ones does not.
+    const bf16* v_src =
+        is_q ? nullptr : src_row + q_dim + kv_dim + local_head * head_dim;
     float local = 0.f;
+    float local_v = 0.f;
     for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
         const float v = bf16_to_f32(src[i]);
         local += v * v;
+        if (!is_q) {
+            const float vv = bf16_to_f32(v_src[i]);
+            local_v += vv * vv;
+        }
     }
 
     __shared__ float buf[BLOCK];
+    __shared__ float buf_v[BLOCK];
     buf[threadIdx.x] = local;
+    buf_v[threadIdx.x] = local_v;
     __syncthreads();
     for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
+        if (threadIdx.x < off) {
+            buf[threadIdx.x] += buf[threadIdx.x + off];
+            buf_v[threadIdx.x] += buf_v[threadIdx.x + off];
+        }
         __syncthreads();
     }
 
@@ -206,10 +235,10 @@ __global__ void qkv_decode_qk_norm_rope_write_kv(
     }
 
     if (!is_q) {
-        const bf16* v_src =
-            src_row + q_dim + kv_dim + local_head * head_dim;
+        const float inv_v =
+            rsqrtf(buf_v[0] / static_cast<float>(head_dim) + eps);
         for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
-            v_dst[i] = v_src[i];
+            v_dst[i] = f32_to_bf16(bf16_to_f32(v_src[i]) * inv_v);
         }
     }
 
@@ -245,7 +274,7 @@ __global__ void qkv_decode_qk_norm_rope_write_kv(
 }
 
 template <int HEAD_DIM, bool USE_ROPE_TABLE>
-__global__ void qkv_decode_qk_norm_rope_write_kv_warp(
+__global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
     bf16* __restrict__ k_pages,
@@ -299,18 +328,29 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp(
         : src_row + q_dim + local_head * HEAD_DIM;
     const bf16* weight = is_q ? q_weight : k_weight;
 
+    // V IS NORMED TOO — see the block form above for why a copy is a
+    // different model. The v sum of squares rides the same warp reduction,
+    // and the early-outs before this point are all warp-uniform, so the
+    // FULL_MASK shuffle sees a whole warp for both.
+    const bf16* v_src =
+        is_q ? nullptr : src_row + q_dim + kv_dim + local_head * HEAD_DIM;
     float vals[ELEMS_PER_THREAD];
+    float v_vals[ELEMS_PER_THREAD];
     float sum = 0.f;
+    float v_sum = 0.f;
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
         const int dim = lane * ELEMS_PER_THREAD + i;
         const float v = bf16_to_f32(src[dim]);
         vals[i] = v;
         sum += v * v;
+        v_vals[i] = is_q ? 0.f : bf16_to_f32(v_src[dim]);
+        v_sum += v_vals[i] * v_vals[i];
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_xor_sync(FULL_MASK, sum, offset, 32);
+        v_sum += __shfl_xor_sync(FULL_MASK, v_sum, offset, 32);
     }
 
     const float inv_rms =
@@ -394,12 +434,12 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp(
         dst[dim] = f32_to_bf16(vals[i]);
     }
     if (!is_q) {
-        const bf16* v_src =
-            src_row + q_dim + kv_dim + local_head * HEAD_DIM;
+        const float inv_v =
+            rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps);
 #pragma unroll
         for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
             const int dim = lane * ELEMS_PER_THREAD + i;
-            v_dst[dim] = v_src[dim];
+            v_dst[dim] = f32_to_bf16(v_vals[i] * inv_v);
         }
     }
 }

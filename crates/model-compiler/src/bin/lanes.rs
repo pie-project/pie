@@ -1,13 +1,13 @@
 use std::io::Read;
 
-use model_compiler::program::{Program, Rows, Slot};
+use model_compiler::program::{Call, Program, Rows, Slot, Why};
 use model_ir::plan::Plan;
 
 fn main() {
     let mut json = String::new();
     std::io::stdin().read_to_string(&mut json).unwrap();
     let plan: Plan = serde_json::from_str(&json).expect("stdin is not a plan");
-    let lowered = model_compiler::sweep::lower(&plan);
+    let lanes = model_compiler::sweep::lanes(&plan);
     let bound = model_compiler::program::bound(&plan);
 
     println!("plan `{}` on {:?}", plan.name, plan.plane);
@@ -21,7 +21,7 @@ fn main() {
         plan.seams.len()
     );
     let (mut built, mut refused) = (0, 0);
-    for (i, lane) in lowered.lanes.iter().enumerate() {
+    for (i, lane) in lanes.iter().enumerate() {
         println!("  lane {i}: words {:?}, {} ops", lane.words, lane.ops.len());
         match &bound[i] {
             Ok(program) => {
@@ -38,21 +38,54 @@ fn main() {
     }
     println!("  programs: {built} built, {refused} refused");
 
-    let r = &lowered.resolution;
+    resolution(&plan);
+}
+
+/// EVERY DISTINCT KERNEL THE PLAN STATES, joined against the plane, in the
+/// order the plan first states each.
+///
+/// This is what `sweep::resolve` handed back as a `Resolution` — the second
+/// derivation of `program::call_for`'s three-way answer, and the only reader
+/// either of them had. The join is one call now; the three lists are this
+/// binary's own formatting, which is where a report's shape belongs.
+fn resolution(plan: &Plan) {
+    let (mut resolved, mut unclaimed, mut wrong_plane) = (Vec::new(), Vec::new(), Vec::new());
+    let mut seen: Vec<&str> = Vec::new();
+    for op in &plan.ops {
+        let kernel = op.kernel.as_str();
+        if seen.contains(&kernel) {
+            continue;
+        }
+        seen.push(kernel);
+        match model_compiler::program::call_for(plan.plane, kernel) {
+            // A tier-2 call is answered `tier2::` and a claimed point
+            // `points::`, because the two reach a driver by different doors:
+            // one through the generated dispatch, the other through a
+            // staging shim. A `canon` row already spells its own symbol.
+            Ok(Call::Tier2(point)) => resolved.push((kernel, format!("tier2::{point}"))),
+            Ok(Call::Point(point)) => resolved.push((kernel, format!("points::{point}"))),
+            Ok(Call::Symbol(symbol)) => resolved.push((kernel, symbol.to_string())),
+            Err(Why::Unclaimed) => unclaimed.push(kernel),
+            Err(Why::WrongPlane) => wrong_plane.push(kernel),
+            // Never answered by a join over a NAME: it takes a bound
+            // statement, and the lane reports above are where it shows up.
+            Err(Why::Unsized) => unreachable!("`call_for` answers no width"),
+        }
+    }
     println!(
         "  resolution: {} resolved, {} unresolved, {} violations",
-        r.resolved.len(),
-        r.unresolved.len(),
-        r.violations.len()
+        resolved.len(),
+        unclaimed.len(),
+        wrong_plane.len()
     );
-    for (role, symbol) in &r.resolved {
+    for (role, symbol) in &resolved {
         println!("    {role} -> {symbol}");
     }
-    for role in &r.unresolved {
+    for role in &unclaimed {
         println!("    {role} -> UNCLAIMED");
     }
-    for v in &r.violations {
-        println!("    {v} -> WRONG PLANE");
+    for role in &wrong_plane {
+        println!("    {role} -> WRONG PLANE");
     }
 }
 

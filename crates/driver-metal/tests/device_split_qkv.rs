@@ -7,10 +7,10 @@
 
 use std::path::PathBuf;
 
+use driver_metal::baker::dispatch::{Dispatch, Touches};
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::{Dispatch, Touches};
 use driver_metal::program::Compiler;
 
 use driver_metal::skip::skipped;
@@ -88,19 +88,17 @@ fn the_split_puts_every_channel_where_its_width_says() {
         // read back. A hand-built dispatch is a transcription of the shader's
         // signature, and this is the drift that costs.
         param_slots: vec![
-            driver_metal::lowering::dispatch::ParamSlot {
+            driver_metal::baker::dispatch::ParamSlot {
                 slot: 4,
                 at: 0,
                 bytes: 4,
-                packed: false,
-                value: Some(0),
+                value: 0,
             },
-            driver_metal::lowering::dispatch::ParamSlot {
+            driver_metal::baker::dispatch::ParamSlot {
                 slot: 5,
                 at: 4,
                 bytes: 4,
-                packed: false,
-                value: Some(1),
+                value: 1,
             },
         ],
         layers: 0..1,
@@ -163,9 +161,9 @@ fn the_split_puts_every_channel_where_its_width_says() {
     }
 }
 
-fn bound(address: u64) -> driver_metal::lowering::executor::BoundArg {
-    driver_metal::lowering::executor::BoundArg {
-        slice: driver_metal::lowering::executor::Slice {
+fn bound(address: u64) -> driver_metal::baker::BoundRegion {
+    driver_metal::baker::BoundRegion {
+        slice: driver_metal::baker::Slice {
             address,
             bytes: 1 << 20,
         },

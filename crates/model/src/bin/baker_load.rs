@@ -2,8 +2,8 @@
 //! family's production table, joined against the plan that will consume it.
 //!
 //! ```text
-//! baker_load <sku> [hf-cache-dir] [--base <flavor>] [--verbose]
-//!                   [--digest <param>]...
+//! baker_load <sku> [hf-cache-dir] [--base <flavor>] [--rank <n>]
+//!                   [--verbose] [--digest <param>]...
 //! ```
 //!
 //! Two tables meet here and nothing else does. The DEMAND is `plan.params`
@@ -13,6 +13,17 @@
 //! `model::produce`. A row of one that finds no row of the other is a bug
 //! in whichever was written blind, and this binary is what stops that
 //! being discovered on a GPU.
+//!
+//! `--rank` IS THE THIRD THING, and it is an argument to the supply side
+//! rather than a column of either table. A `-tp2` row's demand is stated
+//! per rank -- `Param::shape` is what THIS rank holds -- so the join only
+//! closes when production has taken this rank's slice, which is what
+//! `model::produce` does with the demand column it is handed. The degree is
+//! nowhere in the arguments because nothing states it: it is the checkpoint's
+//! extent over the plan's, derived per weight and checked for agreement. So
+//! `JOIN 100%` on a `-tp2` row is not a naming coincidence -- it is the
+//! statement that every sharded weight was cut at the one degree the
+//! checkpoint and the plan agree on, and `--digest` is what says WHICH half.
 //!
 //! THE DEVICE HALF IS DELIBERATELY NOT HERE. Uploading would mean `cudarc`
 //! in `crates/model`'s graph -- the crate whose whole job is to hold model
@@ -37,6 +48,12 @@ use model_dsl::Plane;
 const CACHED: &[(&str, &str)] = &[
     ("qwen35-d0.8b-bf16-kv-bf16", "models--Qwen--Qwen3.5-0.8B"),
     ("qwen35-a3b-bf16-kv-bf16", "models--Qwen--Qwen3.5-35B-A3B"),
+    // The same directory: a rank cut is a way of reading a checkpoint, not a
+    // second checkpoint.
+    (
+        "qwen35-a3b-bf16-kv-bf16-tp2",
+        "models--Qwen--Qwen3.5-35B-A3B",
+    ),
     ("gemma4-e4b-bf16-kv-bf16", "models--google--gemma-4-E4B-it"),
     (
         "gptoss-20b-bf16-mxfp4-kv-bf16",
@@ -47,16 +64,27 @@ const CACHED: &[(&str, &str)] = &[
 fn main() {
     let mut args = std::env::args().skip(1);
     let sku = args.next().unwrap_or_else(|| {
-        eprintln!("usage: baker_load <sku> [hf-cache-dir] [--base <flavor>] [--verbose]");
+        eprintln!(
+            "usage: baker_load <sku> [hf-cache-dir] [--base <flavor>] \
+             [--rank <n>] [--verbose] [--digest <param>]..."
+        );
         std::process::exit(2);
     });
     let mut cache_dir = None;
     let mut base = "safetensors-bf16".to_string();
+    let mut rank = 0u32;
     let mut verbose = false;
     let mut digests: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--base" => base = args.next().expect("--base wants a flavor"),
+            "--rank" => {
+                rank = args
+                    .next()
+                    .expect("--rank wants a number")
+                    .parse()
+                    .expect("--rank wants a number");
+            }
             "--digest" => digests.push(args.next().expect("--digest wants a param name")),
             "--verbose" | "-v" => verbose = true,
             other => cache_dir = Some(other.to_string()),
@@ -90,7 +118,7 @@ fn main() {
         std::process::exit(2);
     });
 
-    println!("sku `{sku}`, base `{base}`");
+    println!("sku `{sku}`, base `{base}`, rank {rank}");
     println!(
         "  checkpoint {}\n    {} shard(s), {} tensors",
         snap.dir.display(),
@@ -109,7 +137,7 @@ fn main() {
     println!("  import: {} rows", import.rows.len());
 
     let t0 = std::time::Instant::now();
-    let produced = match produce(&import, &|n| snap.read(n)) {
+    let produced = match produce(&import, &plan.params, rank, &|n| snap.read(n)) {
         Ok(p) => p,
         Err(e) => {
             println!("\nPRODUCTION REFUSED: {e}");
@@ -213,7 +241,7 @@ fn main() {
     }
 
     if !digests.is_empty() {
-        println!("\nprobes (FNV-1a/64 over the produced bytes)");
+        println!("\nprobes (FNV-1a/64 over the produced bytes — rank {rank}'s slice)");
         for name in &digests {
             match supply.get(name.as_str()) {
                 None => println!("  {name}: no import row produces it"),

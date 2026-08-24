@@ -4,7 +4,7 @@ use crate::jit::{Ctx, Launch, aligned16};
 use kernels::Refusal;
 use kernels::Region;
 use kernels::Stride;
-use kernels::routine::{Const, In, InOut, Out};
+use kernels::plane::{Const, In, InOut, Out};
 use kernels::{Bind, Fire};
 
 use core::ffi::c_void;
@@ -15,10 +15,6 @@ const BLOCK: u32 = 256;
 const VBLOCK: u32 = 512;
 
 const WARP: u32 = 32;
-
-pub const ALTUP_EPS: f32 = 1e-5;
-
-pub const RASR_VEC512_ABOVE: i32 = 2560;
 
 pub const MAX_HC_MULT: i32 = 8;
 
@@ -113,18 +109,12 @@ pub(crate) fn heads<P>(row: &Region<P>, head_dim: i32) -> Result<i32, Refusal> {
     Ok(width / head_dim)
 }
 
-/// `per_head_dim = 0`: the reduction runs over the whole row. Every other
-/// value is the head width the statement pins it to.
 const WHOLE_ROW: i32 = 0;
 
-/// `WEIGHT_PLUS_ONE = false`: the scale IS the weight.
 fn absolute_bank<T: kernels::Elem>() -> String {
     format!("::pie::norm::rmsnorm<{}, 256>", T::CPP)
 }
 
-/// `WEIGHT_PLUS_ONE = true`: the scale is `1 + weight`, folded in float.
-/// See `Norm::rmsnorm_plus_one` for why the other convention is a separate
-/// point and not a flag.
 fn offset_bank<T: kernels::Elem>() -> String {
     format!("::pie::norm::rmsnorm_gemma<{}, 256>", T::CPP)
 }
@@ -147,24 +137,6 @@ fn streams<P>(row: &Region<P>, hidden_size: i32) -> Result<i32, Refusal> {
     Ok(hc_mult)
 }
 
-/// The `Norm` family, claimed. Every body is the launch itself, deriving
-/// from the operands what the declaration does not state: a whole-row norm
-/// passes [`WHOLE_ROW`] where a per-head one passes the stated head width,
-/// and the row count is the result rectangle's.
-///
-/// FOUR POINTS FIRE ONE LAUNCH, which is why [`rms_row`] is a function and
-/// the four bodies are two numbers each: `rmsnorm`, `rmsnorm_per_head`,
-/// `rmsnorm_plus_one` and `rmsnorm_per_head_plus_one` differ in the AXIS and
-/// in the bank convention, and the convention arrives as the entrypoint's
-/// name because `WEIGHT_PLUS_ONE` is a template parameter.
-///
-/// One point stays on the floor's default body, and the absence is a
-/// measured row rather than an oversight:
-///
-/// * `norm.res_blend` — kimi's variadic ledger item. The text states one
-///   value per earlier block and the count grows with the layer, so the
-///   statement's arity is a function of where it stands. It resolves
-///   through [`crate::CANON`] until the floor carries a `Vararg` mark.
 #[kernels_macros::claims]
 impl kernels::points::Norm for Ctx<'_> {
     fn rmsnorm_per_head<T: kernels::points::Scalar>(
@@ -199,8 +171,7 @@ impl kernels::points::Norm for Ctx<'_> {
             max: i64::from(i32::MAX),
         })?;
         let d = rect.width / heads.max(1);
-        // `ssm/kda.cuh`'s own grid: one block per (row, head), and the head
-        // width as the block width clamped into a launchable range.
+
         const KDA_BLOCK_MIN: u32 = WARP;
         const KDA_BLOCK_MAX: u32 = 128;
         self.fire(
@@ -234,10 +205,6 @@ impl kernels::points::Norm for Ctx<'_> {
         rms_row(self, &absolute_bank::<T>(), x, weight, y, WHOLE_ROW, eps)
     }
 
-    /// The offset-bank pair, both delegating to `rmsnorm_gemma` -- the same
-    /// `rmsnorm_row` body as `rmsnorm`, instantiated at
-    /// `WEIGHT_PLUS_ONE = true` (`kernels/norm/rmsnorm.cuh:226-237`). One
-    /// kernel, two conventions, and the declaration is what picks.
     fn rmsnorm_plus_one<T: kernels::points::Scalar>(
         &self,
         x: In<Tensor<T>>,
@@ -301,11 +268,6 @@ impl kernels::points::Norm for Ctx<'_> {
         eps: f32,
         y: Out<Tensor<T>>,
     ) -> Result<(), Refusal> {
-        // `per_head_dim`, and passing `0` here was the bug the declaration's
-        // new `head_dim` exists to close: zero means "the whole row" to
-        // `rmsnorm_gated_fp32_in`, so a `[value_heads * value_head_dim]`
-        // mixer output was reduced as one vector and `weight[i]` walked off
-        // the end of a one-head bank.
         let head_dim = i32::try_from(head_dim).map_err(|_| Refusal::Wide {
             what: "the head width this gated norm states",
             at: i64::from(head_dim),
@@ -374,22 +336,6 @@ impl kernels::points::Norm for Ctx<'_> {
         )
     }
 
-    /// `x *= s[0]`, the factor a `[1]` bank on the device.
-    ///
-    /// The launcher, not a delegation — see this impl's header. Everything
-    /// about the geometry is `norm.mul_scalar`'s: one thread per element,
-    /// 256 to a block, the count rounded up and the tail threads told to
-    /// stop. What differs is one operand's MARK, and a mark is who binds
-    /// the slot: `mul_scalar`'s factor comes off the fire's params run,
-    /// this one's off the load-time parameter table.
-    ///
-    /// The `[1]` shape is not checked here and could not be. A
-    /// `Const<Tensor<T>>` carries the weight's ADDRESS and no rectangle
-    /// (`bind/table.rs`: "a weight's shape is the MODEL's, not the
-    /// statement's"), so the one element this reads is the model text's
-    /// claim about its own checkpoint, verified where that claim is made —
-    /// `baker_load`'s join, which reads gemma's `layer.{l}.ple_scalar` as
-    /// `[1]` or refuses.
     fn scale<T: kernels::points::Scalar>(
         &self,
         s: Const<Tensor<T>>,
@@ -464,16 +410,6 @@ pub fn rmsnorm_strided_bf16_at(
     )
 }
 
-/// `norm/rmsnorm.cuh`'s row norm, and the only place its two entrypoints
-/// are named.
-///
-/// FOUR POINTS FIRE THIS ONE LAUNCH, which is why it is a function rather
-/// than four copies of itself in the impl above: `rmsnorm`,
-/// `rmsnorm_per_head`, `rmsnorm_plus_one` and `rmsnorm_per_head_plus_one`
-/// differ in the AXIS the reduction runs over and in the bank convention,
-/// and in nothing else. The axis is a number the caller has; the convention
-/// is a separate `__global__` because `WEIGHT_PLUS_ONE` is a template
-/// parameter, so it arrives as the entrypoint's name.
 fn rms_row<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     entrypoint: &str,
@@ -550,11 +486,6 @@ pub(crate) fn add_bias<T: crate::RoutineElem>(
     )
 }
 
-/// The canon point `norm.residual_add`: add a residual into an accumulator.
-///
-/// The claim was on `norm::residual_add_rmsnorm` -- the FUSED form -- for as
-/// long as the gate that would have said so could not compile. See the note
-/// there for what that cost.
 pub(crate) fn residual_add<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     y: InOut<Tensor<T>>,
@@ -577,32 +508,6 @@ pub(crate) fn residual_add<T: crate::RoutineElem>(
     )
 }
 
-/// The `Hc` family, claimed. Four of five points land, and every body is the
-/// launch itself: one `__global__` out of `norm/dsv4_hc.cuh`.
-///
-/// EVERY BODY DROPS THE STATED `stream_count`. The declaration states it
-/// because the collapsed row is an `Out` the statement allocates and a
-/// divisor has to exist before the row does; a body has both rectangles in
-/// hand and reads the count back off them (`streams`
-/// above, the stack's width over the collapsed one). The `moe.experts`
-/// reading exactly.
-///
-/// `hc.rmsnorm_f32` crosses a bf16 PIN BY NAME rather than with a cast no
-/// kernel stands behind: `::pie::norm::hc_rmsnorm_to_f32` is instantiated at
-/// bf16 by a literal symbol and nowhere else, so a second element wants a
-/// second instantiation in the `.cuh`. The `gate.sigmoid_mul` precedent.
-///
-/// One point stays on the floor's default body:
-///
-/// * `hc.collapse` — `hc_head_postprocess` reads TWO planes where the
-///   statement names one: an `[N, streams]` f32 `mixes` (the head gate
-///   logits, "after GEMM" in the kernel's own comment) beside the
-///   `[N, streams, hidden]` residual stack. The legacy call site passed the
-///   bf16 stack for the f32 `mixes` slot — which reads a stack's leading
-///   bytes as gates — and that is a caller's bug, not a shape to reproduce.
-///   [`hc_head_postprocess`] keeps the launch and [`crate::CANON`] keeps the
-///   resolution; the day a text states the projection the kernel asks for,
-///   the body is four lines.
 #[kernels_macros::claims]
 impl kernels::points::Hc for Ctx<'_> {
     fn expand<T: kernels::points::Scalar>(
@@ -621,13 +526,7 @@ impl kernels::points::Hc for Ctx<'_> {
                 crate::jit::symbol(&format!("::pie::norm::hc_expand<{}>", T::CPP)),
             )
             .apply(elementwise_wide(total)),
-            &[
-                x.arg(),
-                y.arg(),
-                x.rows.arg(),
-                hc_mult.arg(),
-                x.width.arg(),
-            ],
+            &[x.arg(), y.arg(), x.rows.arg(), hc_mult.arg(), x.width.arg()],
         )
     }
 
@@ -678,16 +577,7 @@ impl kernels::points::Hc for Ctx<'_> {
             at: i64::from(sinkhorn),
             max: i64::from(i32::MAX),
         })?;
-        // THE STATEMENT'S RESULT ORDER IS NOT THE LAUNCH'S. A text reads
-        // `(x, post_mix, comb_mix)` — the row it runs on first, because that
-        // is the one it consumes — and the kernel writes `post_mix`,
-        // `comb_mix`, `layer_input`. The mapping is here, named, once.
-        //
-        // THE RECTANGLE ANSWERS THREE OF THE SIX. `n` is the row count and
-        // `hidden_size` the collapsed row's width, both on `x`; the stream
-        // count is what the residual stack is wider by, which is what
-        // `streams` computes and what `Hc::fold` reads the same way. Only
-        // the three CONSTANTS are asked for.
+
         let dst = x.all("the hyper-connection row's width")?;
         let (n, hidden_size) = (dst.rows, dst.width);
         let hc_mult = self::streams(&streams.all("the residual row's width")?, hidden_size)?;
@@ -755,7 +645,6 @@ pub fn hc_head_postprocess<T: crate::RoutineElem>(
     out: Out<Tensor<T>>,
     hc_eps: Const<f32>,
 ) -> Result<(), Refusal> {
-    // [`hc_pre_postprocess`]'s reading, off the one result this form declares.
     let dst = out.all("the collapsed row's width")?;
     let (n, hidden_size) = (dst.rows, dst.width);
     let hc_mult = streams(&residual.all("the residual row's width")?, hidden_size)?;
@@ -782,12 +671,6 @@ pub fn hc_head_postprocess<T: crate::RoutineElem>(
     )
 }
 
-/// NO CANON AND NO POINT ANSWERS THROUGH THIS ONE. It reads the sink at
-/// f32 and does not rebase the lse, which is neither half of what
-/// `attention.sink` states: the checkpoints ship the sink at the model's
-/// element and the lse arrives in base two. `attn::attn_sink_rescale` is
-/// the kernel that answers the point; this launcher stays only because the
-/// legacy dsv4 text still fires it, and dies with `model-dsl-legacy`.
 pub fn attn_sink_correction<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<T>>,

@@ -74,12 +74,16 @@
 //! in `StepSubmission::region_sig` and this crate reads that field only in
 //! test fixtures, so a region marked LoRA gets no refusal here.
 //!
-//! It is safe because a LoRA program cannot be LOWERED for this backend. The
-//! kernel table states no LoRA symbol, so the model text cannot name one, and
-//! a plan that named one anyway dies at `dispatch::row` with
-//! `Undispatchable::Unknown` -- by symbol, with `a_symbol_no_row_states_is_
-//! refused_by_name` as its control. The enforcement is the TABLE, one layer
-//! down, and not a capability test in this file.
+//! It is safe because a LoRA program cannot be PLANNED for this backend.
+//! Nothing on this plane claims a LoRA point, so the model text cannot name
+//! one, and a plan that named one anyway dies where a symbol is resolved, by
+//! symbol. The enforcement is one layer down and not a capability test in
+//! this file.
+//!
+//! `a_symbol_no_row_states_is_refused_by_name` was cited here as the control
+//! and STOOD HERE in `dispatch.rs`'s own `mod tests` -- it drove a symbol no
+//! row claimed through `plan_one` and required `Undispatchable::Unknown` back,
+//! naming the symbol. It went with `plan_one` and the row table both.
 //!
 //! That is worth knowing before adding one: a capability check here would be a
 //! second gate on the same fact, and the two could disagree.

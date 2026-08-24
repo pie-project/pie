@@ -120,7 +120,7 @@ impl Shell {
                 i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
                 i32::try_from(model.deployment.shape.head_dim_kernel).unwrap_or(0),
             );
-            let page_size: i32 = 16;
+            let page_size: i32 = crate::boot::KV_PAGE_SIZE;
             let _layers_n = model.deployment.layers as usize;
 
             if host_src || host_dst {
@@ -506,7 +506,7 @@ impl Shell {
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
             let kv_heads = i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0);
-            let page_size: usize = 16;
+            let page_size = crate::boot::KV_PAGE_SIZE.unsigned_abs() as usize;
 
             let stream = match crate::device::OwnedStream::new(0) {
                 Ok(s) => s,
@@ -542,7 +542,11 @@ impl Shell {
                         // gemma-4's tail attends through the last earlier layer
                         // of its own kind; every other family owns its pages.
                         kv_source_layer: dep.attention.iter().map(|a| a.kv_source as i32).collect(),
-                        num_kv_heads: vec![kv_heads; n_layers],
+                        // The layer's own count, as `fire::launch` builds it:
+                        // a two-kind tower may disagree here too, and a table
+                        // the two paths filled differently is a shared layer's
+                        // pages read at two pitches.
+                        num_kv_heads: dep.attention.iter().map(|a| a.kv_heads as i32).collect(),
                     };
                     if per.check_sharing().is_err() {
                         return Err(PIE_STATUS_INVALID_ARGUMENT);

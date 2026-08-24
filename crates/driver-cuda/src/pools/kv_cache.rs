@@ -12,7 +12,7 @@
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::{KvCacheFormat, KvCacheScaleLayout};
-use crate::tensor::{DeviceTensor, TensorSpec};
+use crate::tensor::TensorSpec;
 
 /// Everything one layer slot owns. A `None` field is the C++'s default
 /// `DeviceTensor` placeholder — keeps slot index == layer index, never read.
@@ -479,53 +479,15 @@ impl KvCacheLayout {
         }
         out
     }
-
-    /// Allocate every tensor in the manifest, in slot order — a suballocator's
-    /// addresses depend on it.
-    #[cfg(feature = "_cuda")]
-    pub fn allocate(&self, alloc: &crate::device::Allocator) -> Result<Vec<AllocatedSlot>> {
-        let mut out = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
-            let one = |s: &Option<TensorSpec>| -> Result<Option<DeviceTensor>> {
-                s.clone()
-                    .map(|spec| DeviceTensor::allocate(alloc, spec))
-                    .transpose()
-            };
-            out.push(AllocatedSlot {
-                k: one(&slot.k)?,
-                v: one(&slot.v)?,
-                k_scale: one(&slot.k_scale)?,
-                v_scale: one(&slot.v_scale)?,
-                k_bf16: one(&slot.k_bf16)?,
-                v_bf16: one(&slot.v_bf16)?,
-                k_env_min: one(&slot.k_env_min)?,
-                k_env_max: one(&slot.k_env_max)?,
-            });
-        }
-        Ok(out)
-    }
 }
 
-/// One layer slot's realised device memory.
-#[derive(Debug)]
-pub struct AllocatedSlot {
-    /// Key pages.
-    pub k: Option<DeviceTensor>,
-    /// Value pages.
-    pub v: Option<DeviceTensor>,
-    /// Key side scales.
-    pub k_scale: Option<DeviceTensor>,
-    /// Value side scales.
-    pub v_scale: Option<DeviceTensor>,
-    /// Dequantisation mirror for the keys.
-    pub k_bf16: Option<DeviceTensor>,
-    /// Dequantisation mirror for the values.
-    pub v_bf16: Option<DeviceTensor>,
-    /// Per-page key minima.
-    pub k_env_min: Option<DeviceTensor>,
-    /// Per-page key maxima.
-    pub k_env_max: Option<DeviceTensor>,
-}
+// `KvCacheLayout::allocate` AND `AllocatedSlot` STOOD HERE, and nothing has
+// ever called either — not `src/`, not a test, not a parity transcript. They
+// were the manifest's "now realise it" half; the shell realises its KV
+// through `pools::kv_cache_live::KvCache::materialize`, which is the pool
+// `serve::state` holds and the one a fire's views are cut from. What stays
+// is the LAYOUT — the slot table and the per-layer page arithmetic — which
+// `tests/kv_cache_parity.rs` pins against the C++ golden.
 
 #[cfg(test)]
 mod tests {

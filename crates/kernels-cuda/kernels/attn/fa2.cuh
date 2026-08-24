@@ -184,10 +184,20 @@ using VariantWindowSoftcap = ::flashinfer::DefaultAttention<false, true, true, f
 using VariantFull = ::flashinfer::DefaultAttention<false, false, false, false>;
 /// `VariantFull` plus soft cap.
 using VariantFullSoftcap = ::flashinfer::DefaultAttention<false, false, true, false>;
-/// Caller-supplied mask bitmap. Sliding window does not compose with it.
-using VariantCustom = ::flashinfer::DefaultAttention<true, false, false, false>;
+/// Caller-supplied mask bitmap AND the sliding window, which is one
+/// predicate each and both of them ANDed in `LogitsMask`
+/// (`flashinfer/attention/variants.cuh`). `attention.masked` states a window
+/// beside its mask -- gemma's 35 sliding layers state 512 on it -- and the two
+/// are not one fact spelled twice: a mask says which pairs the CALLER admits
+/// and a window says how far back the TEXT reads, so a reading that dropped
+/// either would be plausible and wrong. `VariantWindow`'s note above is what
+/// makes one instantiation enough for both readings: `window_left = -1` turns
+/// the window predicate into `kv_idx + qo_len >= qo_idx`, which every pair
+/// satisfies, so the 7 global layers that state window 0 run this arm and
+/// attend exactly what the mask admits.
+using VariantCustom = ::flashinfer::DefaultAttention<true, true, false, false>;
 /// `VariantCustom` plus soft cap.
-using VariantCustomSoftcap = ::flashinfer::DefaultAttention<true, false, true, false>;
+using VariantCustomSoftcap = ::flashinfer::DefaultAttention<true, true, true, false>;
 
 // ── The params structs ──────────────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::{kernels, Facts, merge, seam, Classify, Forward, Input, KvSpec, Request, Value};
+use model_dsl::{Classify, Facts, Forward, Input, KvSpec, Request, Value, kernels, merge, seam};
 
-use super::model::{Attn, Head, Mlp, Model};
+use super::model::{Attn, Mlp, Model};
 
 #[derive(Facts)]
 pub struct Facts {
@@ -40,12 +40,16 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
         for (_, w) in inputs.layers(&m.layers) {
             let x = kernels::norm::rmsnorm(&y, &w.attn_norm.weight, w.attn_norm.eps);
             let o = latent_attention(&x, &inputs, &w.attn);
-            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
+            let o = kernels::dist::reduce::<TP>(o);
             y = kernels::norm::residual_add(&o, &y);
 
             let x = kernels::norm::rmsnorm(&y, &w.mlp_norm.weight, w.mlp_norm.eps);
             let f = match &w.mlp {
-                Mlp::Dense { gate_up, down, inter } => kernels::gemm::matmul(
+                Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                } => kernels::gemm::matmul(
                     &kernels::mlp::swiglu(&kernels::gemm::matmul(&x, gate_up), *inter),
                     down,
                 ),
@@ -84,18 +88,13 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
                     }
                 }
             };
-            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            let f = kernels::dist::reduce::<TP>(f);
             y = kernels::norm::residual_add(&f, &y);
         }
 
         let fin = &m.final_norm;
         let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
-        let logits = match &m.head {
-            Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
-        };
-
-        logits
+        kernels::gemm::lm_head(&x, &m.head)
     }
 }
 
@@ -121,8 +120,15 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>) -
     );
     kernels::mla::kv_append(&kv_c, &k_pe, &pages);
 
-    let (q_nope, q_pe) = kernels::mla::split_q_b(&q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
-    let q_pe = kernels::rope::partial_q(&q_pe, &positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta);
+    let (q_nope, q_pe) =
+        kernels::mla::split_q_b(&q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
+    let q_pe = kernels::rope::partial_q(
+        &q_pe,
+        &positions,
+        a.qk_rope_head_dim,
+        a.qk_rope_head_dim,
+        a.theta,
+    );
     // THE ABSORB IS KIMI'S, AND SO IS THE QUERY PAIR. This text used to
     // state `mla.absorb_q_pe` — the absorb with the rotated half folded into
     // the result's tail — and hand the fused row to a selected attention

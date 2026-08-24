@@ -201,20 +201,20 @@ fn transcript() -> String {
         )
         .unwrap();
         writeln!(out, "{}{SEP}allocated_bytes{SEP}{allocated}", case.label).unwrap();
+        // BOTH ROWS ARE UNCHANGED IN VALUE and one of them is now a literal.
+        // `budgeted_bytes` read `WorkspaceLayout::cpp_budget_bytes`, whose
+        // body was byte-identical to `bytes()`'s, and `shortfall_bytes` read
+        // their difference. The pair is deleted (see `bytes`' doc); the C++
+        // transcript these rows reproduce still carries them, so they are
+        // still emitted and the golden is untouched.
         writeln!(
             out,
             "{}{SEP}budgeted_bytes{SEP}{}",
             case.label,
-            layout.cpp_budget_bytes()
+            layout.bytes()
         )
         .unwrap();
-        writeln!(
-            out,
-            "{}{SEP}shortfall_bytes{SEP}{}",
-            case.label,
-            layout.budget_shortfall()
-        )
-        .unwrap();
+        writeln!(out, "{}{SEP}shortfall_bytes{SEP}0", case.label).unwrap();
     }
     out
 }
@@ -245,31 +245,25 @@ fn the_rust_layout_reproduces_the_cpp_allocation_transcript() {
     );
 }
 
-/// The whole reason the transcript carries both totals.
+/// `the_planner_is_charged_for_every_buffer_that_gets_allocated` STOOD HERE
+/// and could not fail.
 ///
-/// `allocate_full` creates the tensors and `workspace_bytes` — the figure
-/// `memory_planner.cpp:599` sums into `arena` and tests against the device
-/// budget — prices them. They used to be two hand-written lists and differed
-/// by `declared_values + mtp_row0_save`; both now walk C++'s `workspace_slots`.
-/// This asserts the gap is zero on every shape in the grid, which is the
-/// invariant the old code asserted only in a comment.
-#[test]
-fn the_planner_is_charged_for_every_buffer_that_gets_allocated() {
-    for case in CASES {
-        let layout = case.layout();
-        assert_eq!(
-            layout.budget_shortfall(),
-            0,
-            "{}: the planner's arena figure is short by {} bytes; a buffer is \
-             allocated and not budgeted",
-            case.label,
-            layout.budget_shortfall(),
-        );
-    }
-}
+/// It asserted `WorkspaceLayout::budget_shortfall() == 0` on every shape in
+/// the grid — and `budget_shortfall` was `bytes() - cpp_budget_bytes()` over
+/// two methods with byte-identical bodies, both walking `slots()` and summing
+/// `slot_bytes`. So it asserted `x - x == 0`, for every input, forever.
+///
+/// The doc it carried explains how it got that way and is worth keeping:
+/// "They used to be two hand-written lists and differed by `declared_values +
+/// mtp_row0_save`; both now walk C++'s `workspace_slots`." The merge was the
+/// FIX. What outlived it was a subtraction with nothing on either side of it
+/// and a sentence still describing two lists.
+///
+/// [`bytes_equals_the_sum_of_what_specs_would_allocate`] below is the check
+/// that survives, and it is the one that can bite: it sums the `TensorSpec`s
+/// an allocator would actually be handed, which is a second walk over a
+/// different structure.
 
-/// What the fix is worth, per shape, so a regression reports a size and not
-/// just a failure.
 #[test]
 fn the_two_formerly_unbudgeted_buffers_are_a_real_share_of_the_arena() {
     for case in CASES {

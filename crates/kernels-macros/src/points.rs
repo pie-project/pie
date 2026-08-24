@@ -1,16 +1,13 @@
-//! `#[points]` — a family's point table, read off the trait that declares it.
-//!
-//! The macro only READS: the trait is re-emitted byte for byte, default
-//! bodies and all, and the table lands beside it.
-
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use syn::punctuated::Punctuated;
 use syn::{
-    Error, FnArg, GenericParam, Ident, ItemTrait, Pat, PathSegment, ReceiverKind, ReturnType,
-    Signature, TraitItem, Type, TypeParamBound, WherePredicate, spanned::Spanned,
+    Attribute, BinOp, Block, Error, Expr, ExprAssign, FnArg, GenericParam, Ident, ItemTrait, Lit,
+    Member, Pat, PathSegment, ReceiverKind, ReturnType, Signature, Token, TraitItem, Type,
+    TypeParamBound, WherePredicate, parse_quote, spanned::Spanned,
 };
 
-pub fn expand(item: ItemTrait) -> Result<TokenStream, Error> {
+pub fn expand(mut item: ItemTrait) -> Result<TokenStream, Error> {
     let family = snake(&item.ident);
     let table = Ident::new(
         &format!("{}_POINTS", family.to_uppercase()),
@@ -23,8 +20,17 @@ pub fn expand(item: ItemTrait) -> Result<TokenStream, Error> {
             TraitItem::Fn(f) => Some(f),
             _ => None,
         })
-        .map(|f| point(format!("{family}.{}", f.sig.ident), &f.sig))
+        .map(|f| point(format!("{family}.{}", f.sig.ident), &f.attrs, &f.sig))
         .collect::<Result<Vec<_>, _>>()?;
+    for i in &mut item.items {
+        if let TraitItem::Fn(f) = i {
+            strip_shape(&mut f.attrs);
+            if f.default.is_none() {
+                f.default = Some(unclaimed(&format!("{family}.{}", f.sig.ident), &f.sig));
+                f.semi_token = None;
+            }
+        }
+    }
     Ok(quote! {
         #item
 
@@ -32,8 +38,24 @@ pub fn expand(item: ItemTrait) -> Result<TokenStream, Error> {
     })
 }
 
-/// The trait's CamelCase as a point name's first half: `MoeRouter` →
-/// `moe_router`, `MLP` → `mlp`.
+fn unclaimed(name: &str, sig: &Signature) -> Block {
+    let slots = sig.inputs.iter().filter_map(|a| match a {
+        FnArg::Typed(pt) => match &*pt.pat {
+            Pat::Ident(id) => Some(id.ident.clone()),
+            _ => None,
+        },
+        FnArg::Receiver(_) => None,
+    });
+    parse_quote!({
+        let _ = (#(#slots,)*);
+        Err(Refusal::unclaimed(#name))
+    })
+}
+
+pub(crate) fn strip_shape(attrs: &mut Vec<Attribute>) {
+    attrs.retain(|a| !a.path().is_ident("shape"));
+}
+
 pub(crate) fn snake(ident: &Ident) -> String {
     let spelled: Vec<char> = ident.to_string().chars().collect();
     let mut out = String::with_capacity(spelled.len() + 4);
@@ -50,16 +72,11 @@ pub(crate) fn snake(ident: &Ident) -> String {
     out
 }
 
-/// One row of a point table, read off the signature that declares it.
-///
-/// THE NAME IS THE CALLER'S, and that is the only thing the two callers
-/// differ in. A tier-1 point's name is `family.method`, composed from the
-/// trait that declares it; a tier-2 point's is the method alone, because an
-/// inherent impl has no family to prefix with — see [`crate::claims`]. Every
-/// other question this asks is asked of a `Signature`, which both kinds of
-/// item carry, so ONE READER writes both tables and a tier-2 declaration is
-/// written in exactly the vocabulary a floor declaration is.
-pub(crate) fn point(name: String, sig: &Signature) -> Result<TokenStream, Error> {
+pub(crate) fn point(
+    name: String,
+    attrs: &[Attribute],
+    sig: &Signature,
+) -> Result<TokenStream, Error> {
     let Axes { scalars, reprs } = axes(&name, sig)?;
     answers(&name, sig)?;
     let mut args = sig.inputs.iter();
@@ -72,30 +89,522 @@ pub(crate) fn point(name: String, sig: &Signature) -> Result<TokenStream, Error>
             ));
         }
     }
-    let slots = args
-        .map(|a| slot(&name, a, &scalars, &reprs))
-        .collect::<Result<Vec<_>, _>>()?;
+    let decls = read(&name, args, &scalars, &reprs)?;
+    let slots = decls.iter().map(Decl::row);
+    let outs = outs(&name, attrs, &decls)?;
     let n = scalars.len();
     let r = reprs.len();
-    Ok(quote!(Point { name: #name, axes: #n, reprs: #r, slots: &[#(#slots),*] }))
+    Ok(
+        quote!(Point { name: #name, axes: #n, reprs: #r, slots: &[#(#slots),*], outs: &[#(#outs),*] }),
+    )
 }
 
-/// A point's two runs of generics, each in declaration order.
+struct Decl {
+    name: Ident,
+    kind: Kind,
+
+    dtype: TokenStream,
+
+    axis: Option<usize>,
+
+    prim: Option<Ident>,
+
+    bank: bool,
+
+    column: usize,
+
+    countable: bool,
+    span: Span,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    In,
+    InOut,
+    Out,
+    Const,
+    Cache,
+    Scalar,
+}
+
+impl Decl {
+    fn row(&self) -> TokenStream {
+        let name = self.name.to_string();
+        let mark = Ident::new(
+            match self.kind {
+                Kind::In => "In",
+                Kind::InOut => "InOut",
+                Kind::Out => "Out",
+                Kind::Const => "Const",
+                Kind::Cache => "Cache",
+                Kind::Scalar => "Scalar",
+            },
+            self.span,
+        );
+        let dtype = &self.dtype;
+        quote!(Slot { name: #name, mark: Mark::#mark, dtype: #dtype })
+    }
+
+    fn operand(&self) -> bool {
+        matches!(self.kind, Kind::In | Kind::InOut)
+    }
+}
+
+fn read<'a>(
+    point: &str,
+    args: impl Iterator<Item = &'a FnArg>,
+    axes: &[Ident],
+    reprs: &[Ident],
+) -> Result<Vec<Decl>, Error> {
+    let (mut operands, mut weights, mut params) = (0, 0, 0);
+
+    let mut banked = false;
+
+    let mut minted: Option<String> = None;
+    let mut pooled: Option<String> = None;
+    let mut out = Vec::new();
+    for arg in args {
+        let mut d = slot(point, arg, axes, reprs)?;
+        d.countable = true;
+        if let Some(result) = &minted
+            && d.kind != Kind::Out
+        {
+            return Err(Error::new(
+                d.span,
+                format!(
+                    "`{point}`: slot `{}` stands after the result `{result}` — a point's \
+                     `Out` slots come last. A statement's operands are this list with the \
+                     results taken off the end, so a result in the middle renumbers every \
+                     slot behind it in the generated builder and refuses nowhere",
+                    d.name
+                ),
+            ));
+        }
+        if d.kind == Kind::Out {
+            minted.get_or_insert_with(|| d.name.to_string());
+        }
+        if d.kind == Kind::Cache {
+            if let Some(first) = &pooled {
+                return Err(Error::new(
+                    d.span,
+                    format!(
+                        "`{point}`: slot `{}` is a second `Cache` beside `{first}` — a \
+                         statement names ONE pool row, which is why `BoundOp::recurrent` \
+                         and `BoundOp::pages` take no index. Both slots would bind that \
+                         one row",
+                        d.name
+                    ),
+                ));
+            }
+            pooled = Some(d.name.to_string());
+        }
+        match d.kind {
+            Kind::In | Kind::InOut => {
+                d.column = operands;
+                operands += 1;
+            }
+            Kind::Const => {
+                d.column = weights;
+                d.countable = !banked;
+                banked |= d.bank;
+                weights += 1;
+            }
+            Kind::Scalar => {
+                d.column = params;
+                params += 1;
+            }
+
+            Kind::Out | Kind::Cache => {}
+        }
+        out.push(d);
+    }
+    Ok(out)
+}
+
+fn outs(point: &str, attrs: &[Attribute], decls: &[Decl]) -> Result<Vec<TokenStream>, Error> {
+    let results: Vec<&Decl> = decls
+        .iter()
+        .filter(|d| matches!(d.kind, Kind::Out | Kind::InOut))
+        .collect();
+    let stated = attrs.iter().find(|a| a.path().is_ident("shape"));
+    if let Some(extra) = attrs.iter().filter(|a| a.path().is_ident("shape")).nth(1) {
+        return Err(Error::new(
+            extra.span(),
+            format!("`{point}` states its results' sizes once, in one `#[shape]`"),
+        ));
+    }
+
+    let mints = results.iter().any(|d| d.kind == Kind::Out);
+    let rides = results.iter().any(|d| d.kind == Kind::InOut);
+    if mints && rides {
+        return Err(Error::new(
+            results[0].span,
+            format!(
+                "`{point}` mints an `Out` and writes through an `InOut`: a statement's results \
+                 are one or the other, because a rule can size what it mints and can only \
+                 restate what it was handed"
+            ),
+        ));
+    }
+    if !mints {
+        if let Some(a) = stated {
+            return Err(Error::new(
+                a.span(),
+                format!(
+                    "`{point}` mints nothing: an `InOut` result is the rectangle its operand \
+                     already is, and an effect states no rectangle at all"
+                ),
+            ));
+        }
+        return Ok(results
+            .iter()
+            .map(|d| {
+                let at = d.column;
+                quote!(Shape {
+                    rows: Fan::Ride(#at),
+                    width: Width::Of(#at),
+                    elem: Element::Ride(#at)
+                })
+            })
+            .collect());
+    }
+
+    let Some(attr) = stated else {
+        let named: Vec<String> = results.iter().map(|d| d.name.to_string()).collect();
+        return Err(Error::new(
+            results[0].span,
+            format!(
+                "`{point}` mints {} and states no `#[shape]`: how wide a result is is a fact \
+                 of this declaration, so write it here — `#[shape({} = ..)]`",
+                named.join(", "),
+                named.join(" = .., ")
+            ),
+        ));
+    };
+    let clauses = attr.parse_args_with(Punctuated::<ExprAssign, Token![,]>::parse_terminated)?;
+
+    let mut rows = Vec::new();
+    for d in &results {
+        let mut found = None;
+        for c in &clauses {
+            let Expr::Path(p) = &*c.left else {
+                return Err(Error::new(
+                    c.left.span(),
+                    format!("`{point}`: a `#[shape]` clause names a result — `y = ..`"),
+                ));
+            };
+            if p.path.is_ident(&d.name) {
+                if found.is_some() {
+                    return Err(Error::new(
+                        c.span(),
+                        format!("`{point}`: result `{}` is sized twice", d.name),
+                    ));
+                }
+                found = Some(&*c.right);
+            }
+        }
+        let Some(expr) = found else {
+            return Err(Error::new(
+                attr.span(),
+                format!(
+                    "`{point}`: result `{}` has no size — every `Out` slot states one",
+                    d.name
+                ),
+            ));
+        };
+        rows.push(shape(point, decls, d, expr)?);
+    }
+
+    for c in &clauses {
+        let Expr::Path(p) = &*c.left else { continue };
+        if !results.iter().any(|d| p.path.is_ident(&d.name)) {
+            return Err(Error::new(
+                c.left.span(),
+                format!(
+                    "`{point}`: `{}` is not a result of this point",
+                    quoted(&c.left)
+                ),
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+fn shape(point: &str, decls: &[Decl], out: &Decl, expr: &Expr) -> Result<TokenStream, Error> {
+    let elem = element(point, decls, out)?;
+
+    if let Expr::Path(_) = expr {
+        let at = operand_of(point, decls, expr)?.column;
+        return Ok(quote!(Shape { rows: Fan::Ride(#at), width: Width::Of(#at), elem: #elem }));
+    }
+    let Expr::Array(a) = expr else {
+        return Err(Error::new(
+            expr.span(),
+            format!(
+                "`{point}`: a result is an operand's own rectangle (`y = x`) or a rows-and-width \
+                 pair (`y = [x.rows, intermediate]`)"
+            ),
+        ));
+    };
+    let [r, w] = a.elems.iter().collect::<Vec<_>>()[..] else {
+        return Err(Error::new(
+            a.span(),
+            format!("`{point}`: a stated rectangle is `[rows, width]` and nothing longer"),
+        ));
+    };
+    let rows = fan(point, decls, r)?;
+    let width = width(point, decls, w)?;
+    Ok(quote!(Shape { rows: #rows, width: #width, elem: #elem }))
+}
+
+fn fan(point: &str, decls: &[Decl], expr: &Expr) -> Result<TokenStream, Error> {
+    match expr {
+        Expr::Path(p) if p.path.is_ident("fire") => Ok(quote!(Fan::Fire)),
+
+        Expr::Field(f) if member_is(&f.member, "rows") => {
+            let d = operand_of(point, decls, &f.base)?;
+            let at = d.column;
+            Ok(quote!(Fan::Ride(#at)))
+        }
+
+        Expr::Call(c) if matches!(&*c.func, Expr::Path(p) if p.path.is_ident("per")) => {
+            let [arg] = c.args.iter().collect::<Vec<_>>()[..] else {
+                return Err(Error::new(
+                    c.span(),
+                    format!("`{point}`: `per(..)` names one operand — the fan it counts"),
+                ));
+            };
+            let d = operand_of(point, decls, arg)?;
+            let at = d.column;
+            Ok(quote!(Fan::Per(#at)))
+        }
+        _ => Err(Error::new(
+            expr.span(),
+            format!(
+                "`{point}`: a row count is `fire`, an operand's `x.rows`, or `per(x)` — one row \
+                 per element of that operand's width"
+            ),
+        )),
+    }
+}
+
+fn width(point: &str, decls: &[Decl], expr: &Expr) -> Result<TokenStream, Error> {
+    match expr {
+        Expr::Paren(p) => width(point, decls, &p.expr),
+        Expr::Group(g) => width(point, decls, &g.expr),
+
+        Expr::Lit(l) => match &l.lit {
+            Lit::Int(n) => {
+                let n: u64 = n.base10_parse()?;
+                Ok(quote!(Width::Count(#n)))
+            }
+            other => Err(Error::new(
+                other.span(),
+                format!("`{point}`: a width is a whole number of elements"),
+            )),
+        },
+        Expr::Binary(b) => {
+            let left = width(point, decls, &b.left)?;
+            let right = width(point, decls, &b.right)?;
+            let op = match b.op {
+                BinOp::Mul(_) => quote!(Times),
+                BinOp::Div(_) => quote!(Over),
+                BinOp::Sub(_) => quote!(Less),
+                _ => {
+                    return Err(Error::new(
+                        b.op.span(),
+                        format!(
+                            "`{point}`: a width multiplies, divides exactly, or subtracts — \
+                             every rule this floor states is one of the three"
+                        ),
+                    ));
+                }
+            };
+            Ok(quote!(Width::#op(&#left, &#right)))
+        }
+
+        Expr::Field(f) if member_is(&f.member, "width") => {
+            let d = operand_of(point, decls, &f.base)?;
+            let at = d.column;
+            Ok(quote!(Width::Of(#at)))
+        }
+
+        Expr::MethodCall(m) if m.method == "axis" => {
+            let d = slot_named(point, decls, &m.receiver)?;
+            if d.kind != Kind::Const {
+                return Err(Error::new(
+                    m.receiver.span(),
+                    format!(
+                        "`{point}`: `{}` is not a `Const` — an axis is a dimension of a WEIGHT, \
+                         read off the parameter the Load contract registered",
+                        d.name
+                    ),
+                ));
+            }
+            if !d.countable {
+                return Err(Error::new(
+                    m.receiver.span(),
+                    format!(
+                        "`{point}`: `{}` stands after a quantised bank, so its weight column is \
+                         `R::PLANES` wide and no number this macro can count",
+                        d.name
+                    ),
+                ));
+            }
+            let [arg] = m.args.iter().collect::<Vec<_>>()[..] else {
+                return Err(Error::new(
+                    m.span(),
+                    format!("`{point}`: `.axis(n)` names one dimension"),
+                ));
+            };
+            let Expr::Lit(l) = arg else {
+                return Err(Error::new(
+                    arg.span(),
+                    format!("`{point}`: `.axis(n)` takes a literal dimension"),
+                ));
+            };
+            let Lit::Int(n) = &l.lit else {
+                return Err(Error::new(
+                    l.span(),
+                    format!("`{point}`: `.axis(n)` takes a literal dimension"),
+                ));
+            };
+            let dim: usize = n.base10_parse()?;
+            let at = d.column;
+            Ok(quote!(Width::Axis(#at, #dim)))
+        }
+
+        Expr::Path(_) => {
+            let d = slot_named(point, decls, expr)?;
+            if d.kind != Kind::Scalar {
+                return Err(Error::new(
+                    expr.span(),
+                    format!(
+                        "`{point}`: `{}` is a rectangle and not a number — write `{}.width` for \
+                         how wide it is",
+                        d.name, d.name
+                    ),
+                ));
+            }
+
+            match d.prim.as_ref().map(Ident::to_string).as_deref() {
+                Some("I32" | "U32") => {}
+                other => {
+                    return Err(Error::new(
+                        expr.span(),
+                        format!(
+                            "`{point}`: `{}` is a `{}` and a width is a COUNT — the statement's \
+                             params column carries an `f32` as its bit pattern, so a width read \
+                             off one is a rectangle of a billion elements and no refusal \
+                             anywhere",
+                            d.name,
+                            other.unwrap_or("?").to_lowercase(),
+                        ),
+                    ));
+                }
+            }
+            let at = d.column;
+            Ok(quote!(Width::Stated(#at)))
+        }
+        _ => Err(Error::new(
+            expr.span(),
+            format!(
+                "`{point}`: a width is an operand's `x.width`, a stated scalar, a weight's \
+                 `w.axis(n)`, a number, or those multiplied, divided and subtracted"
+            ),
+        )),
+    }
+}
+
+fn element(point: &str, decls: &[Decl], out: &Decl) -> Result<TokenStream, Error> {
+    if let Some(p) = &out.prim {
+        if p == "Bool" {
+            return Err(Error::new(
+                out.span,
+                format!(
+                    "`{point}`: result `{}` is a rectangle of `bool`, and `bool` is a host \
+                     scalar's run on this floor — no arena mints one and no walk can size it",
+                    out.name
+                ),
+            ));
+        }
+        return Ok(quote!(Element::Fixed(Prim::#p)));
+    }
+    let Some(axis) = out.axis else {
+        return Err(Error::new(
+            out.span,
+            format!(
+                "`{point}`: result `{}` carries no element — a result is a rectangle of \
+                 elements, so it is `Out<Self::Tensor<..>>` and not a bank or a pool view",
+                out.name
+            ),
+        ));
+    };
+    let on_axis = |want: fn(&Decl) -> bool| decls.iter().find(|d| want(d) && d.axis == Some(axis));
+    if let Some(d) = on_axis(Decl::operand) {
+        let at = d.column;
+        return Ok(quote!(Element::Ride(#at)));
+    }
+    if let Some(d) = on_axis(|d| d.kind == Kind::Const && d.countable) {
+        let at = d.column;
+        return Ok(quote!(Element::Weight(#at)));
+    }
+    Ok(quote!(Element::Activation))
+}
+
+fn member_is(m: &Member, named: &str) -> bool {
+    matches!(m, Member::Named(id) if id == named)
+}
+
+fn slot_named<'d>(point: &str, decls: &'d [Decl], expr: &Expr) -> Result<&'d Decl, Error> {
+    let Expr::Path(p) = expr else {
+        return Err(Error::new(
+            expr.span(),
+            format!("`{point}`: a `#[shape]` names slots of this method, one word each"),
+        ));
+    };
+    decls
+        .iter()
+        .find(|d| p.path.is_ident(&d.name))
+        .ok_or_else(|| {
+            Error::new(
+                expr.span(),
+                format!("`{point}`: `{}` is not a slot of this method", quoted(expr)),
+            )
+        })
+}
+
+fn operand_of<'d>(point: &str, decls: &'d [Decl], expr: &Expr) -> Result<&'d Decl, Error> {
+    let d = slot_named(point, decls, expr)?;
+    if !d.operand() {
+        return Err(Error::new(
+            expr.span(),
+            format!(
+                "`{point}`: `{}` is not an operand — only an `In` or `InOut` slot carries a \
+                 rectangle a rule can read rows and a width off",
+                d.name
+            ),
+        ));
+    }
+    Ok(d)
+}
+
+fn quoted(expr: &Expr) -> String {
+    match expr {
+        Expr::Path(p) => p
+            .path
+            .get_ident()
+            .map_or_else(|| "that".to_string(), std::string::ToString::to_string),
+        _ => "that".to_string(),
+    }
+}
+
 struct Axes {
-    /// `T: Scalar` — what a `Self::Tensor<T>` payload indexes into.
     scalars: Vec<Ident>,
-    /// `R: Repr` — what a `Self::Bank<R>` payload indexes into.
+
     reprs: Vec<Ident>,
 }
 
-/// The method's axes, split by the bound each one states.
-///
-/// TWO RUNS AND NOT ONE, because they are two different crossings: an
-/// element is what an arena minted, a repr is what a checkpoint stores, and a
-/// dispatch reads them off different columns of the bound statement. The
-/// SCALAR RUN COMES FIRST — `<T: Scalar, R: Repr>` — so that the turbofish a
-/// generator writes is `axes` then `reprs` and nothing has to remember an
-/// interleaving.
 fn axes(point: &str, sig: &Signature) -> Result<Axes, Error> {
     let mut out = Axes {
         scalars: Vec::new(),
@@ -158,8 +667,6 @@ fn bound_is(b: &TypeParamBound, what: &str) -> bool {
     matches!(b, TypeParamBound::Trait(t) if t.path.segments.last().is_some_and(|s| s.ident == what))
 }
 
-/// Every point answers `Result<(), Refusal>`: an unclaimed one is a backlog
-/// row, so there is no other answer to give.
 fn answers(point: &str, sig: &Signature) -> Result<(), Error> {
     let stated = match &sig.output {
         ReturnType::Type(_, ty) => match &**ty {
@@ -186,7 +693,7 @@ fn answers(point: &str, sig: &Signature) -> Result<(), Error> {
     ))
 }
 
-fn slot(point: &str, arg: &FnArg, axes: &[Ident], reprs: &[Ident]) -> Result<TokenStream, Error> {
+fn slot(point: &str, arg: &FnArg, axes: &[Ident], reprs: &[Ident]) -> Result<Decl, Error> {
     let FnArg::Typed(pt) = arg else {
         return Err(Error::new(
             arg.span(),
@@ -199,25 +706,57 @@ fn slot(point: &str, arg: &FnArg, axes: &[Ident], reprs: &[Ident]) -> Result<Tok
             format!("`{point}`: a slot is named, and this one is a pattern"),
         ));
     };
-    let name = id.ident.to_string();
-    let (mark, dtype) = marked(point, &name, &pt.ty, axes, reprs)?;
-    Ok(quote!(Slot { name: #name, mark: Mark::#mark, dtype: #dtype }))
+    let name = id.ident.clone();
+    let (kind, rides) = marked(point, &name.to_string(), &pt.ty, axes, reprs)?;
+    Ok(Decl {
+        name,
+        kind,
+        dtype: rides.dtype,
+        axis: rides.axis,
+        prim: rides.prim,
+        bank: rides.bank,
+        column: 0,
+        countable: true,
+        span: pt.span(),
+    })
 }
 
-/// The slot's mark and its payload dtype. A host scalar wears no mark, which
-/// is what makes it one.
+struct Rides {
+    dtype: TokenStream,
+    axis: Option<usize>,
+    prim: Option<Ident>,
+    bank: bool,
+}
+
+impl Rides {
+    fn generic(at: usize) -> Rides {
+        Rides {
+            dtype: quote!(Dtype::Generic(#at)),
+            axis: Some(at),
+            prim: None,
+            bank: false,
+        }
+    }
+
+    fn fixed(p: Ident) -> Rides {
+        Rides {
+            dtype: quote!(Dtype::Fixed(Prim::#p)),
+            axis: None,
+            prim: Some(p),
+            bank: false,
+        }
+    }
+}
+
 fn marked(
     point: &str,
     slot: &str,
     ty: &Type,
     axes: &[Ident],
     reprs: &[Ident],
-) -> Result<(Ident, TokenStream), Error> {
+) -> Result<(Kind, Rides), Error> {
     if let Some(p) = prim(ty) {
-        return Ok((
-            Ident::new("Scalar", ty.span()),
-            quote!(Dtype::Fixed(Prim::#p)),
-        ));
+        return Ok((Kind::Scalar, Rides::fixed(p)));
     }
     let marked = match ty {
         Type::Path(p) => p.path.segments.last().filter(|s| {
@@ -248,31 +787,24 @@ fn marked(
             ),
         ));
     };
-    // `Cache` carries a POOL'S VIEW and `Const<Self::Bank<..>>` a BANK's,
-    // and neither is a rectangle of elements: the three payload readers are
-    // different for that reason, and neither slot's dtype column is an
-    // element axis.
-    let dtype = if seg.ident == "Cache" {
+
+    let rides = if seg.ident == "Cache" {
         pool(point, slot, payload)?
     } else if let Some(bank) = bank(point, slot, payload, reprs) {
         bank?
     } else {
         tensor(point, slot, payload, axes)?
     };
-    Ok((seg.ident.clone(), dtype))
+    let kind = match seg.ident.to_string().as_str() {
+        "In" => Kind::In,
+        "InOut" => Kind::InOut,
+        "Out" => Kind::Out,
+        "Const" => Kind::Const,
+        _ => Kind::Cache,
+    };
+    Ok((kind, rides))
 }
 
-/// The PLANE PAYLOAD a slot carries, as the associated item's own segment.
-///
-/// TWO SPELLINGS, ONE MEANING, and the second exists because rustc has no
-/// shorthand at the tier-2 site. A family declaration writes
-/// `Self::Tensor<T>`: inside a trait, `Self` is bounded by that trait, so the
-/// associated item resolves. An inherent `impl Ctx<'_>` states no such bound
-/// and `Self::Tensor` there is E0223 — ambiguous associated type — so a
-/// tier-2 declaration writes the same thing fully qualified,
-/// `<Self as Plane>::Tensor<T>`. Both name THE PLANE'S payload for the
-/// method's own `Self`, which is the one thing this needs to read, so both
-/// are accepted and neither is preferred.
 fn payload<'t>(ty: &'t Type, named: &str) -> Option<&'t PathSegment> {
     let Type::Path(p) = ty else { return None };
     let seg = p.path.segments.last().filter(|s| s.ident == named)?;
@@ -280,24 +812,11 @@ fn payload<'t>(ty: &'t Type, named: &str) -> Option<&'t PathSegment> {
         Some(q) => matches!(&*q.ty, Type::Path(s)
             if s.qself.is_none() && s.path.is_ident("Self"))
         .then_some(seg),
-        None => (p.path.segments.len() == 2 && p.path.segments[0].ident == "Self")
-            .then_some(seg),
+        None => (p.path.segments.len() == 2 && p.path.segments[0].ident == "Self").then_some(seg),
     }
 }
 
-/// `Self::Bank<R>` → `Dtype::Bank(i)` for the method's i-th repr axis.
-///
-/// `None` — not an error — when the payload is not a `Self::Bank<..>` at
-/// all, so that `tensor` gets to give its own message for everything else. A
-/// `Self::Bank` whose argument is not one of the method's repr axes IS an
-/// error: a bank pinned to a concrete repr would be a point that only one
-/// checkpoint could ever state, which is the thing this axis exists to stop.
-fn bank(
-    point: &str,
-    slot: &str,
-    ty: &Type,
-    reprs: &[Ident],
-) -> Option<Result<TokenStream, Error>> {
+fn bank(point: &str, slot: &str, ty: &Type, reprs: &[Ident]) -> Option<Result<Rides, Error>> {
     let seg = payload(ty, "Bank")?;
     let carried = args(seg);
     let [repr] = carried.as_slice() else {
@@ -312,7 +831,12 @@ fn bank(
             .get_ident()
             .and_then(|id| reprs.iter().position(|a| a == id))
     {
-        return Some(Ok(quote!(Dtype::Bank(#i))));
+        return Some(Ok(Rides {
+            dtype: quote!(Dtype::Bank(#i)),
+            axis: None,
+            prim: None,
+            bank: true,
+        }));
     }
     Some(Err(Error::new(
         repr.span(),
@@ -323,17 +847,17 @@ fn bank(
     )))
 }
 
-/// `Self::Recurrent` or `Self::Pages` — the plane's view of a pool row, and
-/// the two payloads a `Cache` mark carries. ONE ASSOCIATED TYPE PER POOL,
-/// not one per family: the recurrent slabs the mixers keep and the paged KV
-/// the latent, index and pooled families address are two pools, and every
-/// family reading either names the pool's own view here.
-fn pool(point: &str, slot: &str, ty: &Type) -> Result<TokenStream, Error> {
+fn pool(point: &str, slot: &str, ty: &Type) -> Result<Rides, Error> {
     let named = payload(ty, "Recurrent")
         .or_else(|| payload(ty, "Pages"))
         .filter(|s| s.arguments.is_none());
     if named.is_some() {
-        return Ok(quote!(Dtype::Opaque));
+        return Ok(Rides {
+            dtype: quote!(Dtype::Opaque),
+            axis: None,
+            prim: None,
+            bank: false,
+        });
     }
     Err(Error::new(
         ty.span(),
@@ -344,9 +868,7 @@ fn pool(point: &str, slot: &str, ty: &Type) -> Result<TokenStream, Error> {
     ))
 }
 
-/// `Self::Tensor<T>` → `Dtype::Generic(i)` for the method's i-th axis;
-/// `Self::Tensor<f32>` → `Dtype::Fixed(Prim::F32)`.
-fn tensor(point: &str, slot: &str, ty: &Type, axes: &[Ident]) -> Result<TokenStream, Error> {
+fn tensor(point: &str, slot: &str, ty: &Type, axes: &[Ident]) -> Result<Rides, Error> {
     let Some(seg) = payload(ty, "Tensor") else {
         return Err(Error::new(
             ty.span(),
@@ -370,10 +892,10 @@ fn tensor(point: &str, slot: &str, ty: &Type, axes: &[Ident]) -> Result<TokenStr
             .get_ident()
             .and_then(|id| axes.iter().position(|a| a == id))
     {
-        return Ok(quote!(Dtype::Generic(#i)));
+        return Ok(Rides::generic(i));
     }
     if let Some(p) = tensor_prim(dtype) {
-        return Ok(quote!(Dtype::Fixed(Prim::#p)));
+        return Ok(Rides::fixed(p));
     }
     Err(Error::new(
         dtype.span(),
@@ -384,7 +906,6 @@ fn tensor(point: &str, slot: &str, ty: &Type, axes: &[Ident]) -> Result<TokenStr
     ))
 }
 
-/// A host scalar's spelling, as the `Prim` variant that names it.
 fn prim(ty: &Type) -> Option<Ident> {
     let Type::Path(p) = ty else { return None };
     let id = p.path.get_ident()?;
@@ -398,10 +919,6 @@ fn prim(ty: &Type) -> Option<Ident> {
     Some(Ident::new(variant, id.span()))
 }
 
-/// A fixed TENSOR element's spelling. A rectangle carries elements a host
-/// scalar run never does — `Self::Tensor<u8>` is the byte mask a selection
-/// writes — so the two readers are different, and a bare `u8` parameter
-/// stays what it always was: not a scalar this floor knows how to run.
 fn tensor_prim(ty: &Type) -> Option<Ident> {
     if let Some(p) = prim(ty) {
         return Some(p);
@@ -411,7 +928,6 @@ fn tensor_prim(ty: &Type) -> Option<Ident> {
     (id == "u8").then(|| Ident::new("U8", id.span()))
 }
 
-/// The type arguments of `Foo<A, B>`, dropping lifetimes and consts.
 fn args(seg: &PathSegment) -> Vec<&Type> {
     match &seg.arguments {
         syn::PathArguments::AngleBracketed(a) => a

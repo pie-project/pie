@@ -1,12 +1,7 @@
-use crate::routine::{Bind, Const, Ctx, Fire, In, Out};
-use kernels::routine::Refusal;
+use crate::plane::{Bind, Const, Ctx, Fire, In, Out};
+use kernels::plane::Refusal;
 use kernels::shader::elementwise_rows;
 
-/// The affine bank's arm, as an index into a six-name list.
-///
-/// The six are the product of `(32, 64, 128)` and `(4, 8)` in that nesting,
-/// which is the order `layout/embed_gather.slang` stamps them in and the
-/// order every such list in this crate is written in.
 pub fn affine_point(group: i32, bits: i32) -> Result<usize, Refusal> {
     let g = match group {
         32 => 0,
@@ -32,11 +27,6 @@ pub fn affine_point(group: i32, bits: i32) -> Result<usize, Refusal> {
     Ok(g * 2 + b)
 }
 
-/// One workgroup grid per `(head_dim, heads, rows)`, which is what every
-/// per-head cut on this plane addresses: `x` walks the head's channels,
-/// `y` the heads, `z` the token rows. The same shape `attn.rs` grids its
-/// `q_gate_split` and `kv_append` by, transcribed here beside the claim
-/// that uses it.
 fn head_grid(head_dim: i32, heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if head_dim <= 0 {
         return Err(Refusal::Empty {
@@ -56,38 +46,6 @@ fn head_grid(head_dim: i32, heads: i32, rows: i32) -> Result<[u32; 3], Refusal> 
     ])
 }
 
-/// The `Layout` family, claimed. Three of five points land; two are
-/// measured backlog rows and both absences are one missing kernel each.
-///
-/// # `embed` is the whole `Bank<R: Repr>` seam in one point
-///
-/// `layout.embed` declares `table: Const<Self::Tensor<T>>` — ONE address.
-/// `embed_gather.slang` binds THREE — `StructuredBuffer<uint> w`, then
-/// `scales` and `biases` at the activation element — and picks among six
-/// modules on the `(group, bits)` pair. That is not a shape a body can
-/// derive from a handle: it is what the LOAD contract bound to the
-/// weight's name, and `.wiki/baker-todo.md` has it on the ledger as the
-/// `Bank<R: Repr>` floor type. The body below is written against
-/// [`crate::points::Staged::bank`], which is that type's stub.
-///
-/// There is no dense embedding gather on this plane at all — every
-/// instantiation in `layout/embed_gather.slang` is `_4bit` — so this seam
-/// is not "the quantised path also exists", it is the only path.
-///
-/// # Two points stay on the floor's default body
-///
-/// * `layout.split_rows` — the plain two-way divide at `width`.
-///   `split_qkv.slang` writes THREE bindings from stated `q_width` and
-///   `kv_width`; there is no two-way form, and firing the three-way one
-///   with a zero-width third result is a launch this plane refuses at its
-///   grid. A `PIE_SPLIT2` instantiation closes it.
-/// * `layout.select` — one layer's `[rows, width]` slice of a
-///   `[rows, layers * width]` relay, at column `layer * width`. That is a
-///   STRIDED per-row copy and `row_gather.slang` is not one: it gathers
-///   whole rows by index (`out[r] = input[rows[r]]`), which is the
-///   sampling cut and a different arithmetic. Gemma's PLE relay is what
-///   wants this, and gemma does not serve on this plane for other reasons
-///   as well (`ple_combine` has no point at all).
 #[kernels_macros::claims]
 impl kernels::points::Layout for Ctx<'_> {
     fn embed<T: kernels::points::Scalar>(
@@ -99,17 +57,11 @@ impl kernels::points::Layout for Ctx<'_> {
     ) -> Result<(), Refusal> {
         use crate::points::Staged;
 
-        // STATED AND UNREAD: `embed_gather_mb_4bit_bfloat16_*` takes no
-        // vocab bound and does not clamp. The out-of-range id it would read is a seam of this
-        // plane's shader, not of the statement, which says the number.
         let _ = vocab;
         crate::points::at_bf16::<T>("layout.embed, at an element this plane does not instantiate")?;
-        // THE WIDTH IS READ OFF THE RESULT, and the declaration says so:
-        // "a `Const` table carries an address and no rectangle, so the
-        // width is not in the operands to read at all. The statement
-        // allocates the result and the plane reads the width back off it."
+
         let out = y.all("the embedded row's width")?;
-        // SEAM: the three planes and two numbers behind the one `Const`.
+
         let bank = self.bank(table)?;
         let at = affine_point(bank.group, bank.bits)?;
         let entrypoint = [
@@ -122,7 +74,7 @@ impl kernels::points::Layout for Ctx<'_> {
         ][at];
         self.fire(
             Fire::at(
-                crate::routine::module_path(entrypoint, self.best()),
+                crate::plane::module_path(entrypoint, self.best()),
                 entrypoint,
             )
             .apply(elementwise_rows(out.width, out.rows)?),
@@ -137,15 +89,6 @@ impl kernels::points::Layout for Ctx<'_> {
         )
     }
 
-    /// Cut one packed `[q | k | v]` projection into three.
-    ///
-    /// THE ONLY CUT ON THIS PLANE THAT NEEDS NO WINDOW, and it is worth
-    /// saying why while the sibling seams are open: `split_qkv.slang`
-    /// binds the packed row once and the three results separately, and
-    /// does its own column arithmetic from `q_width` and `kv_width`. A cut
-    /// whose halves are RESULTS is expressible here; a cut whose halves
-    /// are OPERANDS — every `Mlp` packed point — is not, because a
-    /// descriptor has no base. See [`crate::points::Staged::window`].
     fn split_qkv<T: kernels::points::Scalar>(
         &self,
         packed: In<crate::points::Handle<T>>,
@@ -161,10 +104,7 @@ impl kernels::points::Layout for Ctx<'_> {
         let row = packed.all("the packed projection's row")?;
         let qw = crate::points::stated("the query width this cut states", q_width)?;
         let kw = crate::points::stated("the key/value width this cut states", kv_width)?;
-        // The statement's three widths must be the row it divides. The
-        // shader reads past the end otherwise, and the numbers are the
-        // text's rather than the rectangle's, so this is the one place the
-        // two meet.
+
         if qw.saturating_add(kw.saturating_mul(2)) != row.width {
             return Err(Refusal::Narrow {
                 what: "the packed `[q | k | v]` row, against the widths this cut states",
@@ -173,7 +113,7 @@ impl kernels::points::Layout for Ctx<'_> {
         }
         self.fire(
             Fire::at(
-                crate::routine::module_path("split_qkv_bf16", self.best()),
+                crate::plane::module_path("split_qkv_bf16", self.best()),
                 "split_qkv_bf16",
             )
             .apply(elementwise_rows(row.width, row.rows)?),
@@ -188,13 +128,6 @@ impl kernels::points::Layout for Ctx<'_> {
         )
     }
 
-    /// Cut an INTERLEAVED per-head `[query | gate]` row into its halves.
-    ///
-    /// `head_dim` is the PITCH the cut walks and not a width either half
-    /// carries — the declaration says so — so the head count comes off the
-    /// RESULT's width, which is `heads * head_dim`. The packed row is
-    /// twice that; the two row strides the shader takes are the two
-    /// rectangles' own widths.
     fn split_q_gate<T: kernels::points::Scalar>(
         &self,
         packed: In<crate::points::Handle<T>>,
@@ -211,7 +144,7 @@ impl kernels::points::Layout for Ctx<'_> {
         let heads = crate::points::heads("the heads this cut divides by", dst.width, hd)?;
         self.fire(
             Fire::at(
-                crate::routine::module_path("q_gate_split_bfloat16", self.best()),
+                crate::plane::module_path("q_gate_split_bfloat16", self.best()),
                 "q_gate_split_bfloat16",
             )
             .apply(head_grid(hd, heads, src.rows)?),

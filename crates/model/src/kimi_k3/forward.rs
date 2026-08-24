@@ -1,7 +1,9 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::{kernels, Facts, merge, seam, Classify, ForwardHybrid, HybridInput, HybridSpec, Request, Value};
+use model_dsl::{
+    Classify, Facts, ForwardHybrid, HybridInput, HybridSpec, Request, Value, kernels, merge, seam,
+};
 
-use super::model::{Head, Kda, Mixer, Mla, Mlp, Model};
+use super::model::{Kda, Mixer, Mla, Mlp, Model};
 
 #[derive(Facts)]
 pub struct Facts {
@@ -29,9 +31,14 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
                         [1, (a.kv_lora_rank + a.qk_rope_head_dim) as u64],
                     );
                 }
+                // `[K, C]` for the reason qwen's text spells out: the KDA
+                // conv is the same `ssm.causal_conv1d` point over a packed
+                // `[q | k | v]` bank, so its slot is the same `K` rows of
+                // channels the kernel indexes and not the `K - 1` window that
+                // is live between fires.
                 Mixer::Kda(k) => {
                     let width = (k.heads * k.head_dim) as u64;
-                    c.state(format!("conv.{l}"), [3 * width, (k.conv_kernel - 1) as u64]);
+                    c.state(format!("conv.{l}"), [k.conv_kernel as u64, 3 * width]);
                     c.state(
                         format!("delta.{l}"),
                         [k.heads as u64, k.head_dim as u64, k.head_dim as u64],
@@ -59,13 +66,24 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
                 Mixer::Mla(a) => mla_mixer(&x, &inputs, a),
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
-            let o = if TP > 1 { kernels::dist::all_reduce(&o) } else { o };
+            let o = kernels::dist::reduce::<TP>(o);
             y = kernels::norm::residual_add(&o, &y);
 
             let x = kernels::norm::rmsnorm(&y, &w.mlp_norm.weight, w.mlp_norm.eps);
             let f = match &w.mlp {
-                Mlp::Dense { gate_up, down, inter, beta, up_cap } => kernels::gemm::matmul(
-                    &kernels::mlp::situ(&kernels::gemm::matmul(&x, gate_up), *inter, *beta, *up_cap),
+                Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                    beta,
+                    up_cap,
+                } => kernels::gemm::matmul(
+                    &kernels::mlp::situ(
+                        &kernels::gemm::matmul(&x, gate_up),
+                        *inter,
+                        *beta,
+                        *up_cap,
+                    ),
                     down,
                 ),
                 Mlp::Routed {
@@ -102,23 +120,21 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
                                 *beta,
                                 *up_cap,
                             );
-                            kernels::norm::residual_add(&kernels::gemm::matmul(&act, &s.down), &routed)
+                            kernels::norm::residual_add(
+                                &kernels::gemm::matmul(&act, &s.down),
+                                &routed,
+                            )
                         }
                     }
                 }
             };
-            let f = if TP > 1 { kernels::dist::all_reduce(&f) } else { f };
+            let f = kernels::dist::reduce::<TP>(f);
             y = kernels::norm::residual_add(&f, &y);
         }
 
         let fin = &m.final_norm;
         let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
-        let logits = match &m.head {
-            Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
-        };
-
-        logits
+        kernels::gemm::lm_head(&x, &m.head)
     }
 }
 
@@ -193,13 +209,22 @@ fn kda_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, k: &Kda<W1>) -> 
     let core = merge![
         {
             let mixed = kernels::ssm::causal_conv1d(&qkv_d, &k.conv, &conv, k.conv_kernel);
-            kernels::ssm::kda_step(&mixed, &f_d, &b_d, &k.dt_bias, &k.a_log, &delta, k.heads, k.head_dim, k.norm_eps)
+            kernels::ssm::kda_step(
+                &mixed, &f_d, &b_d, &k.dt_bias, &k.a_log, &delta, k.heads, k.head_dim, k.norm_eps,
+            )
         },
         {
             let mixed = kernels::ssm::causal_conv1d(&qkv_p, &k.conv, &conv, k.conv_kernel);
             kernels::ssm::kda_chunked(
-                &kernels::query_windows(&mixed), &f_p, &b_p, &k.dt_bias, &k.a_log, &delta,
-                k.heads, k.head_dim, k.norm_eps,
+                &kernels::query_windows(&mixed),
+                &f_p,
+                &b_p,
+                &k.dt_bias,
+                &k.a_log,
+                &delta,
+                k.heads,
+                k.head_dim,
+                k.norm_eps,
             )
         },
     ];

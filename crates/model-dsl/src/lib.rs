@@ -185,12 +185,6 @@ pub mod axes {
         }
     }
 
-    /// WNA16 int4 (glm's routed experts).
-    pub enum Wna16 {}
-    impl Dtype for Wna16 {
-        const NAME: &'static str = "wna16";
-    }
-
     /// Native bf16 KV pages.
     pub enum NativeKv {}
     impl KvDtype for NativeKv {
@@ -202,6 +196,15 @@ pub mod axes {
 /// Enumerate one shipping SKU: a name, the trace fn, and the monomorphized
 /// model it instantiates. The row is a `(name, fn(Plane) -> Plan)` pair in
 /// a plain table the family's cover file exposes.
+/// One catalog row's TEXT: the fn a SKU id is traced through.
+///
+/// ONE SPELLING, and it lives here because [`catalog!`] is what produces the
+/// values that wear it. Every family module wrote this line for itself —
+/// six identical `pub type TraceFn`s and a seventh in `model::lib` under
+/// another name — which is six chances for the six to drift apart on a
+/// signature the macro fixes anyway.
+pub type TraceFn = fn(Plane) -> Plan;
+
 #[macro_export]
 macro_rules! catalog {
     ($( ($name:literal, $trace:path, $m:expr $(,)?) ),+ $(,)?) => {

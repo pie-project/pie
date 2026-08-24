@@ -216,10 +216,9 @@ fn view_bases(program: &LoadPlan) -> HashMap<BufferId, BufferId> {
 /// The buffer whose bytes `id` actually is: itself, or the base of the view
 /// chain it sits on.
 ///
-/// The same walk `executor::host::resolve` and [`crate::plan::spans`] do, and
-/// bounded the same way — a chain that does not terminate is a malformed plan,
-/// and the honest answer is then the buffer the walk gave up on rather than a
-/// hang.
+/// The same walk `executor::host::resolve` does, and bounded the same way — a
+/// chain that does not terminate is a malformed plan, and the honest answer is
+/// then the buffer the walk gave up on rather than a hang.
 fn backing_of(
     program: &LoadPlan,
     views: &HashMap<BufferId, BufferId>,

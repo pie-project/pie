@@ -10,12 +10,22 @@
 //!
 //! One builder, and the resolver's index map beside it. What a caller supplies
 //! is the FRAME's data; what this owns is the order.
+//!
+//! # THE ROTARY LADDER IS NOT ONE OF THEM
+//!
+//! `rope_frequencies` was the eighth table here and `FireTable` has no row
+//! for it. A rotation is a statement of the trace and its base rides on that
+//! statement, so a plain ladder is raised by the shader and a rescaled one is
+//! a `Const` bank the text names -- neither is a plane a fire stages.
+//! `baker::stage` carries the same note, and the three KV STRIDES that left
+//! with it went to `baker::KvGeometry`, where a number the allocator settled
+//! belongs.
 
+use crate::baker::{FireTable, Slice};
 use crate::device::{Context, Handle};
 use crate::error::Result;
 use crate::fire::scratch::{Lease, Scratch};
 use crate::layout::region::Region as _;
-use crate::lowering::executor::{FireTable, Slice};
 
 /// The tables a fire states, in the order [`Staged::at`] indexes them.
 ///
@@ -39,8 +49,6 @@ pub struct Frame<'a> {
     pub kv_write_page: &'a [u32],
     /// See [`Self::kv_write_page`].
     pub kv_write_offset: &'a [u32],
-    /// The rotary inverse frequencies, as f32 bits.
-    pub rope_frequencies: &'a [u32],
     /// Which rows of the FIRE the readout samples, in fire order.
     ///
     /// ABSOLUTE, and not what the wire carries. `Step::sampling_indices` is
@@ -48,7 +56,7 @@ pub struct Frame<'a> {
     /// the fire's stream with whatever is here -- so the two are different
     /// numbers wherever a fire has more than one request, and the wrong one
     /// reads a different token's hidden state without failing.
-    /// [`crate::lowering::frame::sampled_rows`] is the translation, and the
+    /// [`crate::baker::frame::sampled_rows`] is the translation, and the
     /// only one; nothing else may fill this.
     pub sampling_indices: &'a [u32],
     /// How many KV rows one page holds.
@@ -125,18 +133,20 @@ impl Staged {
             FireTable::KvPageIndptr => 4,
             FireTable::KvWritePage => 5,
             FireTable::KvWriteOffset => 6,
-            FireTable::RopeFrequencies => 7,
-            FireTable::SamplingIndices => 8,
-            FireTable::RecurrentSlots => 10,
+            FireTable::SamplingIndices => 7,
             // The enable flag is staged (zeros: causal), and the mask itself
             // is not -- a row whose enable is zero never indexes it. The
             // pool's numbers are answered by `Resolver::pool` rather than by
             // an address.
-            FireTable::AttentionMaskEnabled => 9,
-            FireTable::AttentionMask
-            | FireTable::KvHeadStride
-            | FireTable::KvSeqStride
-            | FireTable::KvPageSize => return None,
+            FireTable::AttentionMaskEnabled => 8,
+            FireTable::RecurrentSlots => 9,
+            FireTable::AttentionMask => return None,
+            // `QoIndptr` and `RowValid` are rows of `kernels::runtime::TIER1`
+            // that this path does not stage: `serve::launch` builds a fire's
+            // frame from the wire's own plan and neither plane is on it. A
+            // slot naming one gets `None` — a refusal at the walk — rather
+            // than an address into somebody else's table.
+            FireTable::QoIndptr | FireTable::RowValid => return None,
         };
         let (at, len) = *self.spans.get(i)?;
         (len > 0).then(|| Slice {
@@ -268,7 +278,6 @@ pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<S
         frame.kv_page_indptr,
         frame.kv_write_page,
         frame.kv_write_offset,
-        frame.rope_frequencies,
         frame.sampling_indices,
     ] {
         spans.push((blob.len(), table.len()));
@@ -294,8 +303,8 @@ pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<S
     let enable_words = frame.token_ids.len().max(1);
     spans.push((blob.len(), enable_words));
     blob.extend(std::iter::repeat_n(0u32, enable_words));
-    // Index TEN: the recurrent slot per token, after the enable flag because
-    // the flag took nine and the order here is the contract `Staged::at`
+    // Index NINE: the recurrent slot per token, after the enable flag because
+    // the flag took eight and the order here is the contract `Staged::at`
     // reads. Empty for a stack with no linear layers.
     spans.push((blob.len(), frame.recurrent_slots.len()));
     blob.extend_from_slice(frame.recurrent_slots);

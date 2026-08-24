@@ -32,11 +32,10 @@ fn catalogue() -> Vec<(&'static str, Plan, Vec<Program>)> {
         .into_iter()
         .map(|(sku, _)| {
             let plan = traced(sku);
-            let lanes = model_compiler::program::programs(&plan)
-                .unwrap_or_else(|refused| {
-                    let told: Vec<String> = refused.iter().map(ToString::to_string).collect();
-                    panic!("`{sku}` refused: {}", told.join(" | "))
-                });
+            let lanes = model_compiler::program::programs(&plan).unwrap_or_else(|refused| {
+                let told: Vec<String> = refused.iter().map(ToString::to_string).collect();
+                panic!("`{sku}` refused: {}", told.join(" | "))
+            });
             (sku, plan, lanes)
         })
         .collect()
@@ -146,7 +145,8 @@ fn the_pitch_is_the_busiest_instant() {
         for (at, lane) in lanes.iter().enumerate() {
             let bound = model_compiler::program::live_bound(&plan, lane);
             assert_eq!(
-                lane.row_pitch, bound,
+                lane.row_pitch,
+                bound,
                 "`{sku}` lane {at}: the carve left {} bytes of hole over the busiest \
                  instant -- a fragmentation report, not a wrong answer",
                 lane.row_pitch.saturating_sub(bound)

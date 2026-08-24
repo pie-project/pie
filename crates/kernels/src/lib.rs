@@ -1,29 +1,23 @@
+#![allow(clippy::missing_safety_doc)]
+
 pub mod bind;
 pub mod bound;
-pub mod routine;
+pub mod plane;
 
 pub mod jit;
 
 pub mod points;
 pub mod raises;
-pub mod runtime;
 
 pub mod shader;
 
-pub use routine::{Answers, Arg, Asks, Backend, Refusal};
+pub use plane::{Answers, Arg, Asks, Backend, Refusal};
 
-pub use routine::{Elem, Layout, Region, Stride};
+pub use plane::{Elem, Region, Stride};
 
-pub use routine::{Addressed, Bind, BindMut, Fire, Geometry, Grid};
+pub use plane::{Addressed, Bind, BindMut, Fire, Geometry, Grid};
 
-pub use routine::{Cache, Const, ConstRun, In, InOut, Out};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cap {
-    Scores,
-
-    PageMaskSink,
-}
+pub use plane::{Cache, Const, ConstRun, In, InOut, Out};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LaunchRule {
@@ -216,14 +210,6 @@ pub enum Ty {
 
     I32Array,
 
-    MoeActivation,
-
-    Mxfp4RowSelect,
-
-    CustomAllReduce,
-
-    Dtype,
-
     KvScheme,
 
     KvDType,
@@ -242,23 +228,13 @@ pub enum Ty {
 
     Stream,
 
-    CublasHandle,
-
-    AttentionWorkspaceView,
-
     KvCacheLayerView,
-
-    MlaCacheLayerView,
 
     DecodePlanCache,
 
     PrefillPlanCache,
 
     MlaPlanCache,
-
-    HopperPrefillPlan,
-
-    YarnOriginalParams,
 
     Raised,
 }
@@ -273,120 +249,6 @@ pub enum Binds {
 }
 
 impl Ty {
-    pub const fn cpp(self) -> &'static str {
-        match self {
-            Ty::InPacked => "::std::uint32_t",
-            Ty::BufMut => "void*",
-            Ty::Buf => "const void*",
-            Ty::I32s => "const ::std::int32_t*",
-            Ty::I64s => "const ::std::int64_t*",
-            Ty::BufArray => "const void* const*",
-            Ty::BufArrayMut => "void* const*",
-            Ty::BufArrayOut => "const void**",
-            Ty::BufArrayOutMut => "void**",
-            Ty::U8Array => "const ::std::uint8_t* const*",
-            Ty::CustomAllReduce => "::pie::comm::CustomAllReduce*",
-            Ty::I8s => "const ::std::int8_t*",
-            Ty::I8sMut => "::std::int8_t*",
-            Ty::Bf16s => "const ::pie::bf16*",
-            Ty::F16s => "const ::pie::f16*",
-            Ty::Bf16sMut => "::pie::bf16*",
-            Ty::F16sMut => "::pie::f16*",
-            Ty::I32Array => "const ::std::int32_t* const*",
-            Ty::MoeActivation => "::pie::moe::MoeActivation",
-            Ty::Mxfp4RowSelect => "::pie::quant::Mxfp4RowSelect",
-            Ty::U16s => "const ::std::uint16_t*",
-            Ty::U16sMut => "::std::uint16_t*",
-            Ty::Dtype => "::pie_cuda_driver::DType",
-            Ty::KvScheme => "::pie::attn::KvScheme",
-            Ty::KvDType => "::pie::attn::KvDType",
-
-            Ty::Fp8Kind => "::__nv_fp8_interpretation_t",
-            Ty::I64 => "long long",
-            Ty::U32s => "const ::std::uint32_t*",
-            Ty::U8s => "const ::std::uint8_t*",
-            Ty::F32sMut => "float*",
-            Ty::F32s => "const float*",
-            Ty::I32sMut => "::std::int32_t*",
-            Ty::U32sMut => "::std::uint32_t*",
-            Ty::U8sMut => "::std::uint8_t*",
-            Ty::I32 => "int",
-            Ty::U32 => "::std::uint32_t",
-            Ty::Usize => "::std::size_t",
-            Ty::F32 => "float",
-            Ty::Bool => "bool",
-            Ty::Stream => "cudaStream_t",
-            Ty::CublasHandle => "cublasHandle_t",
-            Ty::AttentionWorkspaceView => "::pie_cuda_driver::AttentionWorkspaceView",
-            Ty::KvCacheLayerView => "::pie_cuda_driver::KvCacheLayerView",
-            Ty::MlaCacheLayerView => "::pie_cuda_driver::MlaCacheLayerView",
-            Ty::DecodePlanCache => "const ::pie::attn::DecodePlanCache&",
-            Ty::PrefillPlanCache => "const ::pie::attn::PrefillPlanCache&",
-            Ty::MlaPlanCache => "const ::pie::attn::MlaPlanCache&",
-            Ty::HopperPrefillPlan => "const ::pie::attn::HopperPrefillPlan&",
-            Ty::YarnOriginalParams => "const ::pie::attn::YarnOriginalParams*",
-
-            Ty::Raised => "",
-        }
-    }
-
-    pub const fn rust(self) -> &'static str {
-        match self {
-            Ty::InPacked => "u32",
-            Ty::BufMut => "*mut ::core::ffi::c_void",
-            Ty::Buf => "*const ::core::ffi::c_void",
-            Ty::I32s => "*const i32",
-            Ty::I64s => "*const i64",
-            Ty::BufArray => "*const *const ::core::ffi::c_void",
-            Ty::BufArrayMut => "*const *mut ::core::ffi::c_void",
-            Ty::BufArrayOut => "*mut *const ::core::ffi::c_void",
-            Ty::BufArrayOutMut => "*mut *mut ::core::ffi::c_void",
-            Ty::U8Array => "*const *const u8",
-            Ty::CustomAllReduce => "*mut ::core::ffi::c_void",
-            Ty::I8s => "*const i8",
-            Ty::I8sMut => "*mut i8",
-
-            Ty::Bf16s | Ty::F16s => "*const u16",
-            Ty::Bf16sMut | Ty::F16sMut => "*mut u16",
-            Ty::I32Array => "*const *const i32",
-            Ty::MoeActivation => "u32",
-            Ty::Mxfp4RowSelect => "i32",
-            Ty::U16s => "*const u16",
-            Ty::U16sMut => "*mut u16",
-            Ty::Dtype => "u8",
-
-            Ty::KvScheme | Ty::KvDType => "u8",
-
-            Ty::Fp8Kind => "u32",
-            Ty::I64 => "::core::ffi::c_longlong",
-            Ty::U32s => "*const u32",
-            Ty::U8s => "*const u8",
-            Ty::F32sMut => "*mut f32",
-            Ty::F32s => "*const f32",
-            Ty::I32sMut => "*mut i32",
-            Ty::U32sMut => "*mut u32",
-            Ty::U8sMut => "*mut u8",
-            Ty::I32 => "::core::ffi::c_int",
-            Ty::U32 => "u32",
-            Ty::Usize => "usize",
-            Ty::F32 => "f32",
-            Ty::Bool => "bool",
-            Ty::Stream | Ty::CublasHandle => "*mut ::core::ffi::c_void",
-
-            Ty::AttentionWorkspaceView => "AttentionWorkspaceView",
-            Ty::KvCacheLayerView => "KvCacheLayerView",
-            Ty::MlaCacheLayerView => "MlaCacheLayerView",
-
-            Ty::DecodePlanCache | Ty::PrefillPlanCache | Ty::MlaPlanCache => {
-                "*const ::core::ffi::c_void"
-            }
-            Ty::HopperPrefillPlan => "*const HopperPrefillPlan",
-            Ty::YarnOriginalParams => "*const YarnOriginalParams",
-
-            Ty::Raised => "*const ::core::ffi::c_void",
-        }
-    }
-
     #[must_use]
     pub const fn binds(self) -> Binds {
         match self {
@@ -424,23 +286,14 @@ impl Ty {
             | Ty::F32
             | Ty::Bool
             | Ty::InPacked
-            | Ty::MoeActivation
-            | Ty::Mxfp4RowSelect
-            | Ty::Dtype
             | Ty::KvScheme
             | Ty::KvDType
             | Ty::Fp8Kind
             | Ty::Stream
-            | Ty::CublasHandle
-            | Ty::CustomAllReduce
-            | Ty::AttentionWorkspaceView
             | Ty::KvCacheLayerView
-            | Ty::MlaCacheLayerView
             | Ty::DecodePlanCache
             | Ty::PrefillPlanCache
-            | Ty::MlaPlanCache
-            | Ty::HopperPrefillPlan
-            | Ty::YarnOriginalParams => Binds::Nothing,
+            | Ty::MlaPlanCache => Binds::Nothing,
 
             Ty::Raised => Binds::Reads,
         }
@@ -448,23 +301,9 @@ impl Ty {
 
     #[must_use]
     pub const fn needs_mirror(self) -> bool {
-        matches!(
-            self,
-            Ty::AttentionWorkspaceView
-                | Ty::KvCacheLayerView
-                | Ty::MlaCacheLayerView
-                | Ty::HopperPrefillPlan
-                | Ty::YarnOriginalParams
-        )
+        matches!(self, Ty::KvCacheLayerView)
     }
 }
-
-// `pub trait Signature` STOOD HERE — `NAMESPACE`, `NAME`, and a `Sig` tuple
-// of a routine's parameter types, implemented by `#[routine]` on every
-// columned row of every plane. Its reader was `model-dsl-legacy`'s
-// `fire::<R>`, which derived a whole statement from the tuple; R3 deleted
-// that crate and R4e's census found the trait read nowhere on any target. A
-// statement's shape comes off the POINT's slot list now.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -512,4 +351,3 @@ pub enum Lit {
 
     I32(i32),
 }
-

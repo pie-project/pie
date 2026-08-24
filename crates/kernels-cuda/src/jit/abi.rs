@@ -71,8 +71,6 @@ impl<T: 'static> kernels::Elem for MaybeConst<T> {
     }
 
     const CPP: &'static str = "void";
-    const CPP_CONST: &'static str = "const void*";
-    const CPP_MUT: &'static str = "void*";
     const TY_CONST: Ty = Ty::Buf;
     const TY_MUT: Ty = Ty::BufMut;
 }
@@ -259,29 +257,15 @@ impl<E: kernels::Elem> kernels::Elem for Tensor<E> {
     }
 
     const CPP: &'static str = E::CPP;
-    const CPP_CONST: &'static str = E::CPP_CONST;
-    const CPP_MUT: &'static str = E::CPP_MUT;
     const TY_CONST: Ty = E::TY_CONST;
     const TY_MUT: Ty = E::TY_MUT;
 }
 
 impl<E: kernels::Elem> kernels::ConstRun for Tensor<E> {
-    const RUN: kernels::routine::Claim = kernels::routine::Claim::Weight;
     const TY: Ty = E::TY_CONST;
     type Held = E::Read;
 }
 
-/// This plane's `Plane::Bank<R>`: a QUANTISED bank's payload, as the tag a
-/// `Const` slot wears.
-///
-/// `Tensor<E>` one line up is the same shape of thing — a zero-sized tag
-/// whose `ConstRun::Held` is what the mark actually carries — and the only
-/// difference is that a bank's `Held` is a PAIR of addresses rather than
-/// one. That is the whole content of `Bank` vs `Tensor` on this plane: there
-/// is no rectangle, no element, no stride, and no rows/width the way `In`
-/// and `Out` have them, because the dimensions a bank has are the ones the
-/// STATEMENT's other operands already state (`y.width` is `N`, `x.width` is
-/// `K`) and the ones the repr defines (32 codes to a scale group).
 #[derive(Debug)]
 pub struct Bank<R>(core::marker::PhantomData<R>);
 
@@ -292,33 +276,14 @@ impl<R> Clone for Bank<R> {
 }
 impl<R> Copy for Bank<R> {}
 
-/// The addresses one bank's byte planes begin at, on this device.
-///
-/// TWO NAMED FIELDS AND NOT AN ARRAY, because the two planes are not
-/// interchangeable and a kernel indexes them differently: `codes` is
-/// `[E, N, K/2]` and `scales` is `[E, N, K/32]`, so an off-by-one between
-/// them is silently a wrong number rather than a fault. A repr storing one
-/// plane leaves `scales` null; a repr storing three wants a third field and
-/// a third `Const` column, which is why `Repr::PLANES` is a constant on the
-/// repr and not a length here.
-///
-/// EXPERT STRIDE IS NOT HERE EITHER. A bank is `[E, ...]` contiguous — one
-/// upload, one allocation — so expert `e`'s slab begins at
-/// `codes + e * N * K/2`, which the kernel computes from numbers it already
-/// has. That retires the per-expert POINTER ARRAYS the legacy MXFP4 leg had
-/// to carve at load (`driver-cuda`'s `build_moe_expert_ptrs`) and the whole
-/// class of fault they existed to prevent.
 #[derive(Debug, Clone, Copy)]
 pub struct Planes {
-    /// The packed codes: 4-bit E2M1 two to a byte for mxfp4.
     pub codes: *const u8,
 
-    /// The block scales: one E8M0 byte per 32 codes for mxfp4.
     pub scales: *const u8,
 }
 
 impl<R: kernels::points::Repr> kernels::ConstRun for Bank<R> {
-    const RUN: kernels::routine::Claim = kernels::routine::Claim::Weight;
     const TY: Ty = Ty::U8s;
     type Held = Planes;
 }
@@ -336,8 +301,6 @@ impl kernels::Elem for bf16 {
     }
 
     const CPP: &'static str = "::pie::bf16";
-    const CPP_CONST: &'static str = "const ::pie::bf16*";
-    const CPP_MUT: &'static str = "::pie::bf16*";
     const TY_CONST: Ty = Ty::Bf16s;
     const TY_MUT: Ty = Ty::Bf16sMut;
 }
@@ -355,19 +318,10 @@ impl kernels::Elem for f16 {
     }
 
     const CPP: &'static str = "::pie::f16";
-    const CPP_CONST: &'static str = "const ::pie::f16*";
-    const CPP_MUT: &'static str = "::pie::f16*";
     const TY_CONST: Ty = Ty::F16s;
     const TY_MUT: Ty = Ty::F16sMut;
 }
 
-/// The two elements this plane instantiates that the floor cannot name.
-///
-/// `kernels::bound::Rides` is what lets a bound statement CHECK that the
-/// element a dispatch asked a slot for is the element the rectangle carries.
-/// The floor implements it for the primitives it owns; the half-precision
-/// pair is declared here, which is also the only place it could be — both
-/// types are this crate's.
 impl kernels::bound::Rides for bf16 {
     const AXIS: kernels::bound::Axis = kernels::bound::Axis::Bf16;
 }
@@ -648,8 +602,6 @@ impl<'a> Bytes<'a> {
     }
 }
 
-pub const TYPECHECK_ENTRY: &str = "::pie::typecheck::probe";
-
 fn push_static_assert(out: &mut String, cond: &str, message: &str) {
     out.push_str("static_assert(");
     out.push_str(cond);
@@ -698,24 +650,20 @@ pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
 
 elem_agrees!(bf16, f16, i32, i64, i8, u32, u8, u16, f32, c_void);
 
-/// THE ELEMENT A ROUTINE CAN INSTANTIATE AND BIND: its device text spells it
-/// (`Elem::CPP`) and its addresses bind (`Addressed`, one impl for every
-/// pointee). Both hold for every `points::Scalar`, which is what lets a
-/// family implementation delegate here at the floor's own bound.
 pub trait Pointee:
-    kernels::routine::Elem<
-        Read: kernels::routine::Bind<crate::jit::ArgValue>,
-        Write: kernels::routine::Bind<crate::jit::ArgValue>
-                   + kernels::routine::BindMut<crate::jit::ArgValue>,
+    kernels::plane::Elem<
+        Read: kernels::plane::Bind<crate::jit::ArgValue>,
+        Write: kernels::plane::Bind<crate::jit::ArgValue>
+                   + kernels::plane::BindMut<crate::jit::ArgValue>,
     >
 {
 }
 
 impl<T> Pointee for T where
-    T: kernels::routine::Elem<
-            Read: kernels::routine::Bind<crate::jit::ArgValue>,
-            Write: kernels::routine::Bind<crate::jit::ArgValue>
-                       + kernels::routine::BindMut<crate::jit::ArgValue>,
+    T: kernels::plane::Elem<
+            Read: kernels::plane::Bind<crate::jit::ArgValue>,
+            Write: kernels::plane::Bind<crate::jit::ArgValue>
+                       + kernels::plane::BindMut<crate::jit::ArgValue>,
         >
 {
 }

@@ -2,7 +2,7 @@ use std::ffi::c_void;
 
 use crate::jit::abi::bf16;
 use crate::{norm, vision};
-use kernels::routine::{Const, In, InOut, Out};
+use kernels::plane::{Const, In, InOut, Out};
 
 use super::{Refused, Result, Scratch, Stream, call, read_raw_span};
 

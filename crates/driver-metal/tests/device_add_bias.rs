@@ -15,10 +15,10 @@
 
 use std::path::PathBuf;
 
+use driver_metal::baker::dispatch::{Dispatch, ParamSlot, Touches};
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
 
 use driver_metal::skip::skipped;
 
@@ -89,8 +89,7 @@ fn the_bias_lands_on_every_row_and_on_the_right_column() {
             slot: 2,
             at: 0,
             bytes: 4,
-            packed: false,
-            value: Some(0),
+            value: 0,
         }],
         layers: 0..1,
         op: 0,
@@ -134,9 +133,9 @@ fn the_bias_lands_on_every_row_and_on_the_right_column() {
     }
 }
 
-fn bound(address: u64) -> driver_metal::lowering::executor::BoundArg {
-    driver_metal::lowering::executor::BoundArg {
-        slice: driver_metal::lowering::executor::Slice {
+fn bound(address: u64) -> driver_metal::baker::BoundRegion {
+    driver_metal::baker::BoundRegion {
+        slice: driver_metal::baker::Slice {
             address,
             bytes: 1 << 20,
         },

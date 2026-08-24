@@ -131,23 +131,6 @@ pub struct PrefillPagedParams {
     pub maybe_max_item_len_ptr: DevicePtr,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct DecodeScoreParams {
-    pub base: DecodeParams,
-    pub score_out: DevicePtr,
-    pub score_indptr: DevicePtr,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct PrefillScoreParams {
-    pub base: PrefillPagedParams,
-    pub score_out: DevicePtr,
-    pub score_indptr: DevicePtr,
-    pub score_window: u32,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Buffers {
     pub q: DevicePtr,

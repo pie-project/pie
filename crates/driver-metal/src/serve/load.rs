@@ -1,24 +1,46 @@
 //! Create, and the once-per-model work.
 //!
-//! One model per driver, the same shape `driver-cuda`'s `serve/state.rs` has
+//! One model per driver, the same shape `driver-cuda`'s `serve/load.rs` has
 //! and the reason a frame's instance roster is one family's.
+//!
+//! # The order is the cuda sibling's, and every step of it moved
+//!
+//! `driver-cuda/src/serve/load.rs::load_impl` is the spec: WHICH SKU first,
+//! asked of the checkpoint's own tensors; then the lane, traced for this
+//! plane and bound; then the deployment, read off the SAME plan; then the
+//! weights, produced from the SAME import table identification matched
+//! against; then the pools, sized from the deployment.
+//!
+//! What that replaced here was five separate readings of one checkpoint: a
+//! `config.json` parsed for its quantization, `catalog::identify_artifact`
+//! matching tensor names against a hand-written manifest, an `Encoding`
+//! projected from the config, a `MetalBinding` measured off the staged bytes
+//! and handed back to the catalog to choose a text with, and a `LoadPlan`
+//! authored from the row and the encoding together. Every one of them could
+//! disagree with the others and two of them did.
+//!
+//! # A REFUSED LOAD AND NOT A WARNING
+//!
+//! Serving a checkpoint whose lane refuses would mean accepting `load_model`
+//! and then failing every fire — the engine would have a model registered,
+//! capabilities published and a scheduler admitting requests against a driver
+//! that cannot answer one. So the eager resolve pass runs here
+//! (`baker::Baked::unresolved`) and its whole report is the refusal's message.
 
+use crate::baker::{Baked, Metal};
 use crate::error::{Error, Result};
 use crate::serve::state::{Shell, elastic_budget_bytes};
+use crate::serve::weights::Weights;
 
 impl Shell {
-    /// Identify the checkpoint, author its load plan, run it, and stage every
-    /// tensor.
-    ///
-    /// The order is `driver-cuda`'s `load_impl` order: WHICH MODEL first, from
-    /// the tensors, and everything after it a projection of the row that
-    /// answered.
+    /// Identify the checkpoint, trace its lane for this plane, produce its
+    /// weights, and allocate the pools its deployment states.
     ///
     /// # Errors
     ///
-    /// More than one descriptor; a checkpoint no catalog row matches; a row
-    /// whose architecture no Metal text states; a shape this build's kernels
-    /// cannot be launched at; or a plan that will not stage.
+    /// More than one descriptor; a snapshot no catalog row matches; a row
+    /// whose lanes this plane cannot bind; a checkpoint this reader cannot
+    /// produce from; or a pool the device declines.
     pub fn load_model(
         &mut self,
         descs: &[driver_api::ModelLoadDesc],
@@ -32,249 +54,180 @@ impl Shell {
                 ),
             });
         };
-        // THE CHECKPOINT'S OWN `config.json`: embedded in the artifact, else
-        // the boot TOML's path. ONE FIELD is read out of it — the declared
-        // QUANTIZATION — because it is the one thing a catalog row genuinely
-        // cannot state: the same model is published at four bits and at eight,
-        // and a group size is not an extent of any tensor (g64/b8 and g128/b4
-        // pack to identical shapes). Every other number is a row's.
-        let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(&desc.snapshot_dir)
-            .map_err(|e| Error::Unserved {
-                what: "load_model",
-                message: format!(
-                    "{} did not read as a checkpoint: {e:?}",
-                    desc.snapshot_dir.display()
-                ),
-            })?;
-        let config_json = match model_loader::checkpoint::read::read_meta(
-            &meta,
-            model::encoding::CONFIG_OBJECT,
-        ) {
-            Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| Error::Unserved {
-                what: "load_model",
-                message: format!(
-                    "the embedded {} is not utf8: {e}",
-                    model::encoding::CONFIG_OBJECT
-                ),
+        let unserved = |message: String| Error::Unserved {
+            what: "load_model",
+            message,
+        };
+
+        // ── 1. WHICH SKU THIS IS, asked of the checkpoint's own tensors. ──
+        //
+        // The same list `produce` is about to read, so identification and
+        // loadability are one question — which is what replaced a
+        // `config.json` deciding an architecture. `[model] id` outranks it,
+        // which is how a row is proven before its checkpoint is one the
+        // reader can tell apart.
+        //
+        // `Snapshot::at` AND NOT `Snapshot::open`: `open` resolves a cache-dir
+        // NAME under `$HOME/.cache/huggingface/hub`, and a driver is handed
+        // the snapshot directory itself.
+        let sku = match self.boot_model_id.as_deref() {
+            Some(id) => model::serve::row(id).map(|r| r.id).ok_or_else(|| {
+                unserved(format!(
+                    "`{id}` is not a row of `model::catalog()`; did you mean {}?",
+                    model::serve::nearest_ids(id, 3).join(", "),
+                ))
             })?,
-            Ok(None) => {
-                let path = self.boot_config.as_ref().ok_or_else(|| Error::Unserved {
-                    what: "load_model",
-                    message: "no embedded model/config and no `[model] config` in the \
-                              boot config. One field is read out of it — the declared \
-                              quantization — and no metal kernel can be named without it"
-                        .to_string(),
-                })?;
-                std::fs::read_to_string(path).map_err(|e| Error::Unserved {
-                    what: "load_model",
-                    message: format!("{}: {e}", path.display()),
-                })?
-            }
-            Err(e) => {
-                return Err(Error::Unserved {
-                    what: "load_model",
-                    message: format!("the artifact's metadata did not read: {e:?}"),
-                });
+            None => {
+                let snap =
+                    model::snapshot::Snapshot::at(desc.snapshot_dir.clone()).ok_or_else(|| {
+                        unserved(format!(
+                            "no safetensors snapshot at {}",
+                            desc.snapshot_dir.display()
+                        ))
+                    })?;
+                model::identify(&|name| snap.shape_of(name))
+                    .map_err(|why| unserved(why.to_string()))?
             }
         };
 
-        // WHICH MODEL THIS IS, asked of the TENSORS — unless pie wrote them.
+        // ── 2. THE LANE, and the deployment read off the same plan. ───────
         //
-        // The config above no longer DECIDES anything. What this driver did
-        // instead was read `architectures[0]` out of a descriptor, lowercase
-        // it, strip its `ForCausalLM` tail, and use the result as a dispatch
-        // key against a list — which is how `Qwen3MoeForCausalLM` and
-        // `qwen3_moe` came to be two spellings of one architecture that two
-        // gates answered differently, and how the load gate could report five
-        // checkpoints healthy while the seam refused two of them.
-        //
-        // Identification and validation are the same operation here, and that
-        // is the point: a config that lies about its geometry used to be
-        // believed by the derivation and contradicted by an assertion several
-        // frames later, if at all. A checkpoint is a known model or it is not.
-        //
-        // The exception is an artifact `pie model build` produced, whose
-        // tensors are post-transform and match no manifest by construction; it
-        // carries the row this same identification settled at build time. See
-        // `catalog::identify_artifact`.
-        let chosen = self
-            .boot_model_id
-            .as_ref()
-            .map_or(model::catalog::Override::None, |id| {
-                model::catalog::Override::Id(id.clone())
-            });
-        let attributes =
-            model_loader::checkpoint::read::parse_checkpoint_attributes(&desc.snapshot_dir)
-                .unwrap_or_default();
-        let row = model::catalog::identify_artifact(&attributes, &meta, &chosen).map_err(|e| {
-            Error::Unserved {
-                what: "load_model",
-                message: e.to_string(),
-            }
-        })?;
-        let encoding = model::encoding::Encoding::from_config_json(&config_json).map_err(|e| {
-            Error::Unserved {
-                what: "load_model",
-                message: format!("the checkpoint's config does not state its encoding: {e}"),
-            }
-        })?;
-
-        // ONCE, at load, and never again. See `Shell::deployment`. A PROJECTION
-        // of the matched row rather than a derivation from a parsed config.
-        //
-        // `Deployed::single()` because this driver serves one device: there is
-        // no tensor-parallel split to state and no host scalars to hand over —
-        // gemma-4's `layer_scalar` is the only row that takes any, and its two
-        // attention shapes are refused by the geometry below.
-        let deployment = row
-            .deployment(model::catalog::Deployed::single())
-            .map_err(Error::from)?;
-        // Read off the projection BEFORE it is stored: both are `Copy` facts
-        // the capability report publishes, and the shell keeps the projection.
-        let arch = deployment.advertised.arch;
-        let max_model_len = deployment.advertised.max_model_len;
-        // Whether this build has a Metal text for the row, asked BEFORE a byte
-        // is staged — and asked of the ROW.
-        //
-        // THE PLACEMENT IS DELIBERATE. On the 31B gemma, staging first means
-        // 17 GB spent to reach a refusal identification had already settled.
-        // Same rule as `weights::stage::fits_on_this_gpu`: asked before a byte
-        // is read is the only moment it can be asked usefully.
-        //
-        // **The refusal must not depend on the binding facts**, and it does
-        // not: `binding::serves` asks with `binding::ANY_ENCODING`, because a
-        // row that refuses Metal refuses it for EVERY encoding. Whether a text
-        // was written is a fact about this build's source, which is what lets
-        // the question be asked here, where `moe_mxfp4` is not yet knowable.
-        // `binding::a_row_is_served_the_same_way_at_every_encoding` holds the
-        // whole catalog to that, so this placement stops being sound loudly.
-        if let Err(refusal) = crate::model::binding::serves(row) {
-            return Err(Error::Unserved {
-                what: "load_model",
-                message: format!(
-                    "no Metal text for row `{}` (`{arch}`): {refusal}. The row exists \
-                     and its author is written — what is missing is the forward pass, \
-                     which `tests/catalog_coverage.rs` enumerates. Refused before \
-                     staging: the answer is the row's, so reading the checkpoint could \
-                     not have changed it.",
-                    row.id()
-                ),
-            });
+        // Not beside anything — this IS the fire path. `Deployment::of` reads
+        // the KV row, the recurrent slabs and every advertised width off the
+        // trace the programs are built from, so a pool and the program that
+        // indexes it cannot describe different models. That is what R3 bought,
+        // and it is why cuda's `baker::Geometry::agrees_with` is gone.
+        let baked = Baked::of::<Metal>(sku).map_err(unserved)?;
+        let unresolved = baked.unresolved::<Metal>();
+        if !unresolved.is_empty() {
+            return Err(unserved(format!(
+                "`{sku}` states {} point(s) this plane does not answer, so no fire \
+                 could be served: {}",
+                unresolved.len(),
+                unresolved
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )));
         }
+        // `|l| l.is_ok()` AND NOT `Result::is_ok`: `Result` in this module is
+        // `crate::error::Result`, whose error is fixed to `Error`, so the path
+        // form names a function over a different type than the one `lanes`
+        // holds (`model_compiler::program::Refusal`).
+        if !baked.lanes.iter().any(|l| l.is_ok()) {
+            return Err(unserved(format!(
+                "`{sku}` binds no lane on this plane: {}",
+                baked
+                    .lanes
+                    .iter()
+                    .filter_map(|l| l.as_ref().err())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )));
+        }
+        let arch = baked.deployment.advertised.arch;
+        let max_model_len = baked.deployment.advertised.max_model_len;
+        let vocab = baked.deployment.shape.vocab;
+        let hidden = baked.deployment.shape.hidden;
 
-        let loaded = crate::weights::load::load(&self.context, &desc.snapshot_dir, row, &encoding)?;
-        self.id = row.id();
-        self.has_linear_attn = deployment.recurrent.is_some();
+        // ── 3. THE WEIGHTS, through `produce` and not a load plan. ────────
+        //
+        // WHICH RANK, and this plane has exactly one honest answer.
+        // `driver-cuda` reads `[driver] tp_rank` out of the boot TOML in its
+        // `create_impl` and threads it to `baker::load`; there is no such key
+        // on this path — `Shell::open` is handed `[model] config` and
+        // `[model] id` and nothing else — and `kernels_metal::dist` states the
+        // other half: this plane claims no `dist.all_reduce`, so there is no
+        // collective for a world of more than one to sum through.
+        //
+        // So the rank is ZERO because the world is ONE, and a row that says
+        // otherwise is REFUSED BY NAME rather than loaded at a rank nobody
+        // chose. A `-tp2` row's `Param::shape` is a rank's share; loading it
+        // whole would leave every sharded row of the join below reading
+        // MISMATCH, which is the failure `model::produce`'s own note says a
+        // driver-side cut was invented to avoid.
+        //
+        // The refusal reads the PLAN and not the SKU's spelling, which is the
+        // rule `model::is_one_rank_of_a_world` states: `-tp2` is a name and
+        // `dist.all_reduce` is the statement. `Baked::unresolved` above would
+        // refuse the same row a step earlier, with the unanswered point named;
+        // this says the same thing in the load's own vocabulary, so a rank
+        // source arriving here has one place to change.
+        const RANK: u32 = 0;
+        if let Some(op) = baked
+            .plan
+            .ops
+            .iter()
+            .position(|op| op.kernel == "dist.all_reduce")
+        {
+            return Err(unserved(format!(
+                "`{sku}` is ONE RANK of a tensor-parallel world — op {} states \
+                 `dist.all_reduce`, so it holds a share of a weight some peer \
+                 holds the rest of. This driver has no rank source (`[driver] \
+                 tp_rank` is a cuda boot key and `Shell::open` reads none) and \
+                 this plane claims no collective, so serving it would mean \
+                 picking a rank on its behalf. Load the whole-model row \
+                 instead.",
+                op,
+            )));
+        }
+        let weights = Weights::produce(&self.context, sku, &desc.snapshot_dir, &baked.plan, RANK)?;
 
-        // The pool, at the geometry the checkpoint states. `PIE_METAL_KV_PAGES`
-        // is the CEILING rather than the size: the pages are elastic, so this
-        // is the count address space is reserved at and the most `resize_pool`
-        // may grow back to. The pool starts committed to all of it.
+        self.id = sku;
+        self.has_linear_attn = baked.deployment.recurrent.is_some();
+        // THE ROTARY LADDER IS NOT DERIVED HERE ANY MORE. A `Deployment` states
+        // no `rope_theta`: a rotation is a statement of the trace
+        // (`kernels::rope::{full,partial,partial_q,partial_last}`), its base
+        // rides on that statement, and a rescaled ladder is a `Const` bank the
+        // text names — which `baker::stage`'s own note gives as the reason
+        // `FireTable::RopeFrequencies` left the table. `crate::model::rope`
+        // is what a driver-side derivation would go through and nothing calls
+        // it; see `tests/every_public_function_has_a_reader.rs`.
+
+        // A model reload moves every address, so the old recordings are
+        // invalid — stated rather than left to the fingerprint.
+        self.recordings.clear();
+        self.regions = crate::device::Regions::new();
+        self.regions.add(weights.arena());
+
+        // ── 4. THE POOLS, sized from the deployment. ──────────────────────
+        //
+        // `PIE_METAL_KV_PAGES` is the CEILING rather than the size: the pages
+        // are elastic, so this is the count address space is reserved at and
+        // the most `resize_pool` may grow back to.
         let pages: u32 = std::env::var("PIE_METAL_KV_PAGES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024);
-        // The Metal-side numbers, projected from the row's deployment.
+        // THE PER-LAYER WIDTHS ARE THE DEPLOYMENT'S, and G4 is why they have
+        // to be: gemma-4's sliding layers attend 16 kv heads at 256 and its
+        // global ones 4 at 512, in one tower. `Deployment::attention` is one
+        // row per layer, read off the cache rows the statements NAME, so the
+        // pool is laid out from the same reading the text fires against.
         //
-        // The affine point is passed separately because it is the CHECKPOINT's
-        // and not the row's — and it is asked of the BYTES, not of
-        // `config.json`, whose stated default per-tensor overrides may
-        // supersede for every tensor in the file. `Loaded::affine_point` owns
-        // the refusal when a checkpoint arrives at more than one, and
-        // `geometry_from_deployment` refuses rather than defaulting.
-        let quant = loaded.affine_point(row.id())?;
-        let geometry = crate::batch::geometry_from_deployment(&deployment, row.load_shape(), quant)
-            .map_err(Error::from)?;
-
-        // The sandwich-norm/GELU pair is checked in
-        // `model/tests/sandwich_norm_implies_gelu.rs`, where both halves are
-        // stated and no checkpoint is needed, so every row is checked when it
-        // is written rather than the ones a Metal load happens to reach. This
-        // driver must not hold a second answer: `no_probe_decides_a_fact`
-        // forbids the tensor question that guard asked.
-
-        // THE ROW, and what this load OBSERVED that the row cannot state.
-        //
-        // No facts struct is rebuilt here from `has_tensor` probes. Deriving
-        // qk-norm, fused QKV, attention bias, the router, the shared expert,
-        // the sandwich norm, the attention sink, the per-layer scalar and the
-        // norm variant from whether a name is in a safetensors index is how
-        // the norm variant came to read `(1 + w)` for gemma-4 — a stack whose
-        // gains are a plain multiplier — because it shipped the norm the probe
-        // asked about. Every one of those is the row's answer.
-        //
-        // What is left is six values, none of them about the model: the affine
-        // point the BYTES arrived in, whether the expert bank reached the
-        // device still in MXFP4, and three capabilities of the kernels this
-        // binary was BUILT with. `binding::observed`'s narrow signature is the
-        // guarantee rather than a convenience — it cannot see the geometry, so
-        // it cannot smuggle a model fact back in.
-        //
-        // `Loaded::mxfp4` decides an ENCODING, not a fact: a checkpoint need
-        // not quantize uniformly, and reading an expert bank with the dense
-        // format is NaNs rather than a near miss. MXFP4 banks take their own
-        // kernel at their own group and are never read at an affine point, so
-        // the ONE affine point `observed` takes from `geometry.quant` — the
-        // point the kernels are built at and the scales were written at, one
-        // value with one source — does not cover them.
-        self.text_row = Some((
-            row,
-            crate::model::binding::observed(
-                geometry.quant,
-                |name| loaded.affine_point_of(name),
-                |name| loaded.mxfp4.contains(name),
-            ),
-        ));
-        self.inv_freq = crate::model::rope::table(&geometry)
-            .iter()
-            .map(|f| f.to_bits())
-            .collect();
-        // Which buffer each weight address belongs to, so a fire can be
-        // RECORDED. A model reload moves every address, so the old recordings
-        // are invalid — stated rather than left to the fingerprint.
-        self.recordings.clear();
-        // And the graphs, one step earlier: a lowering is the graph of the text
-        // the OLD row named, and serving it over a new checkpoint's weights
-        // would fire the previous architecture at whatever the new one staged.
-        self.lowerings.clear();
-        self.regions = crate::device::Regions::new();
-        self.deployment = Some(deployment);
-        for region in &loaded.regions {
-            self.regions.add(region);
-        }
-        self.model = Some(loaded);
-        let shape = crate::layout::kv::Shape {
-            layers: geometry.n_layers,
-            kv_heads: geometry.n_kv_heads,
-            head_dim: geometry.head_dim,
-            page_size: self.device_facts.page_size,
+        // `Shape::periodic` is the narrowing, and it REFUSES what it cannot
+        // narrow. This read `Geometry::{global_head_dim, global_kv_heads,
+        // full_attn_every}` — three fields G4 deleted, because what a driver
+        // got from them was one number repeated `layers` times.
+        let shape = crate::layout::kv::Shape::periodic(
+            &baked.deployment.attention,
+            self.device_facts.page_size,
             pages,
-            element_bytes: 2,
-            // The FULL-attention layers' own shape, when the checkpoint states
-            // a second one. Zero everywhere but gemma-4, and the pool reads
-            // the zeros as "one shape for the whole stack". `full_attn_every`
-            // is the rule the row's text derives `window_left` from, so pool
-            // and text agree about which layers are full without a second list.
-            global_head_dim: geometry.global_head_dim,
-            global_kv_heads: geometry.global_kv_heads,
-            full_attn_every: geometry.full_attn_every,
-        };
-        // The previous pool's memory goes back to the arena BEFORE the next one
-        // asks for any. Elastic pages are charged against a budget, and holding
-        // a whole model's KV while allocating a second one is how a reload gets
-        // refused for memory that is about to be free.
+            2,
+        )
+        .map_err(|why| unserved(format!("`{sku}`'s KV pool cannot be laid out: {why}")))?;
+        // The previous pool's memory goes back to the arena BEFORE the next
+        // one asks for any: holding a whole model's KV while allocating a
+        // second is how a reload gets refused for memory about to be free.
         self.pool = None;
-        // Elastic, so that `resize_pool` has something to resize: the pages sit
-        // in placement heaps behind a sparse buffer, and giving memory back
-        // moves no address a fire has already bound. Committed to full size
-        // here, so an unresized pool behaves exactly as a fixed one.
         let pool = crate::pools::kv::Pool::allocate_elastic(
             &self.context,
             &mut self.stepper,
             &self.arena,
             shape,
         )?;
-        // Every layer's K and V, for the same reason as the weights.
         for l in 0..shape.layers {
             if let Some(layer) = pool.layer(l) {
                 layer.k.register(&mut self.regions);
@@ -293,14 +246,10 @@ impl Shell {
         // on the first slot but zero. `layout::recurrent::ELEM_BYTES` is the
         // one place that says so.
         //
-        // Slots are seats, not pages, and one is expensive -- 63 MB a seat on
-        // qwen3.6-35B-A3B, 151 MB on the 27B -- so the count is a knob with a
-        // small default rather than a fraction of memory. `PIE_METAL_RS_SLOTS`
-        // is the ceiling and the allocation both: these are fixed, because
-        // there is nothing to resize toward. A request holds its seat from
-        // its first token to its last.
+        // Slots are seats, not pages, and one is expensive, so the count is a
+        // knob with a small default rather than a fraction of memory.
         self.recurrent = None;
-        if let Some(rs) = self.deployment.as_ref().and_then(|d| d.recurrent.as_ref()) {
+        if let Some(rs) = baked.deployment.recurrent.as_ref() {
             let slots: u32 = std::env::var("PIE_METAL_RS_SLOTS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -318,6 +267,10 @@ impl Shell {
             pool.register(&mut self.regions);
             self.recurrent = Some(pool);
         }
+
+        self.deployment = Some(baked.deployment.clone());
+        self.weights = Some(weights);
+        self.baked = Some(baked);
 
         // What the checkpoint states, and what the pool states.
         //
@@ -424,10 +377,10 @@ impl Shell {
             // which this driver could not give at all while what it had was a
             // `model_type` read off a config rather than an identity.
             model_id: self.id.to_string(),
-            vocab_size: geometry.vocab,
+            vocab_size: vocab,
             max_model_len,
             activation_dtype: "bf16".to_string(),
-            hidden_size: geometry.hidden,
+            hidden_size: hidden,
             // FALSE regardless of what the row ships, because this is a fact
             // about the BACKEND: there is no encode entry point here, so a row
             // with a vision or audio tower is served as its text half or

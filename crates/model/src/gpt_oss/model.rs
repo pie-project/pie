@@ -21,7 +21,17 @@ pub struct Layer<W1: Dtype, W2: Dtype> {
 }
 
 pub struct Attn<W1: Dtype> {
-    pub kind: AttnKind,
+    /// The sliding window this layer attends through, or `None` for the
+    /// global layers.
+    ///
+    /// AN `Option<u32>` AND NOT AN `AttnKind`, unlike gemma-4's, and the
+    /// difference is what the two enums carry. Gemma's arms hold two
+    /// GEOMETRIES — different head widths, different kv head counts,
+    /// different rope — and five accessors read them apart. gpt-oss's held
+    /// nothing but this number: every other field of the layer is the same
+    /// on both kinds, the sole reader called `window()`, and the enum was
+    /// `Option` spelled long.
+    pub window: Option<u32>,
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
@@ -37,20 +47,6 @@ pub struct Attn<W1: Dtype> {
     pub o_bias: Tensor<W1>,
     pub sinks: Tensor<W1>,
     pub kv: CacheRef,
-}
-
-pub enum AttnKind {
-    Full,
-    Sliding { window: u32 },
-}
-
-impl AttnKind {
-    pub fn window(&self) -> Option<u32> {
-        match *self {
-            AttnKind::Full => None,
-            AttnKind::Sliding { window } => Some(window),
-        }
-    }
 }
 
 pub struct Moe<W1: Dtype, W2: Dtype> {
@@ -116,31 +112,62 @@ fn per_rank<const TP: usize>(d: Dims) -> Dims {
 }
 
 impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
+    /// `openai/gpt-oss-20b`, verified from both sides: `baker_load` joins
+    /// 459 of 459 params with every repr truthful against the cached
+    /// checkpoint, and the model fires to ARGMAX 11 at 14.4375. The mxfp4
+    /// expert stacks go in as the checkpoint's own `_blocks` and `_scales`
+    /// — no repack, which is what `axes::Mxfp4` documents.
     pub fn b20() -> Self {
         assemble(Dims {
-            hidden: 2880, layers: 24,
-            q_heads: 64, kv_heads: 8, head_dim: 64,
+            hidden: 2880,
+            layers: 24,
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
             theta: 150_000.0,
-            yarn_factor: 32.0, yarn_beta_fast: 32.0, yarn_beta_slow: 1.0,
-            yarn_attention_factor: 1.346_573_6, yarn_original_max_position: 4096,
+            yarn_factor: 32.0,
+            yarn_beta_fast: 32.0,
+            yarn_beta_slow: 1.0,
+            yarn_attention_factor: 1.346_573_6,
+            yarn_original_max_position: 4096,
             window: 128,
-            experts: 32, top_k: 4, inter: 2880,
-            swiglu_limit: 7.0, swiglu_alpha: 1.702,
-            vocab: 201_088, norm_eps: 1e-5,
+            experts: 32,
+            top_k: 4,
+            inter: 2880,
+            swiglu_limit: 7.0,
+            swiglu_alpha: 1.702,
+            vocab: 201_088,
+            norm_eps: 1e-5,
         })
     }
 
+    /// UNVERIFIED against a checkpoint — no gpt-oss-120b is cached. The
+    /// dims are the published 120B config and every one of them except
+    /// `layers` and `experts` is shared with [`Self::b20`], which HAS been
+    /// read; those two are what a file would settle. Q6 measured the
+    /// related fact that 20b's tensor names are a SUBSET of 120b's, so a
+    /// 120b checkpoint identifies as both rows (membership, not equality).
     pub fn b120() -> Self {
         assemble(Dims {
-            hidden: 2880, layers: 36,
-            q_heads: 64, kv_heads: 8, head_dim: 64,
+            hidden: 2880,
+            layers: 36,
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
             theta: 150_000.0,
-            yarn_factor: 32.0, yarn_beta_fast: 32.0, yarn_beta_slow: 1.0,
-            yarn_attention_factor: 1.346_573_6, yarn_original_max_position: 4096,
+            yarn_factor: 32.0,
+            yarn_beta_fast: 32.0,
+            yarn_beta_slow: 1.0,
+            yarn_attention_factor: 1.346_573_6,
+            yarn_original_max_position: 4096,
             window: 128,
-            experts: 128, top_k: 4, inter: 2880,
-            swiglu_limit: 7.0, swiglu_alpha: 1.702,
-            vocab: 201_088, norm_eps: 1e-5,
+            experts: 128,
+            top_k: 4,
+            inter: 2880,
+            swiglu_limit: 7.0,
+            swiglu_alpha: 1.702,
+            vocab: 201_088,
+            norm_eps: 1e-5,
         })
     }
 }
@@ -155,56 +182,59 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
     let inter = d.inter as u64;
     let sliding_at = |l: u32| l.is_multiple_of(2);
 
-    let layers = (0..d.layers).map(|l| {
-        let n = |s: &str| format!("layer.{l}.{s}");
-        let norm = |s: &str, w: u64| Norm { weight: Tensor::sym(n(s), [w]), eps: d.norm_eps };
-        Layer {
-            attn: Attn {
-                kind: if sliding_at(l) {
-                    AttnKind::Sliding { window: d.window }
-                } else {
-                    AttnKind::Full
+    let layers = (0..d.layers)
+        .map(|l| {
+            let n = |s: &str| format!("layer.{l}.{s}");
+            let norm = |s: &str, w: u64| Norm {
+                weight: Tensor::sym(n(s), [w]),
+                eps: d.norm_eps,
+            };
+            Layer {
+                attn: Attn {
+                    window: sliding_at(l).then_some(d.window),
+                    q_heads: d.q_heads,
+                    kv_heads: d.kv_heads,
+                    head_dim: d.head_dim,
+                    sm_scale: (d.head_dim as f32).sqrt().recip(),
+                    rope: Yarn {
+                        theta: d.theta,
+                        factor: d.yarn_factor,
+                        beta_fast: d.yarn_beta_fast,
+                        beta_slow: d.yarn_beta_slow,
+                        attention_factor: d.yarn_attention_factor,
+                        original_max_position: d.yarn_original_max_position,
+                    },
+                    q_proj: Tensor::sym(n("q_proj"), [q_w, hidden]).columns(),
+                    q_bias: Tensor::sym(n("q_bias"), [q_w]).columns(),
+                    k_proj: Tensor::sym(n("k_proj"), [kv_w, hidden]).columns(),
+                    k_bias: Tensor::sym(n("k_bias"), [kv_w]).columns(),
+                    v_proj: Tensor::sym(n("v_proj"), [kv_w, hidden]).columns(),
+                    v_bias: Tensor::sym(n("v_bias"), [kv_w]).columns(),
+                    o_proj: Tensor::sym(n("o_proj"), [hidden, q_w]).rows(),
+                    o_bias: Tensor::sym(n("o_bias"), [hidden]),
+                    sinks: Tensor::sym(n("attn_sinks"), [d.q_heads as u64]).columns(),
+                    kv: CacheRef::to(format!("kv.{l}")),
                 },
-                q_heads: d.q_heads,
-                kv_heads: d.kv_heads,
-                head_dim: d.head_dim,
-                sm_scale: (d.head_dim as f32).sqrt().recip(),
-                rope: Yarn {
-                    theta: d.theta,
-                    factor: d.yarn_factor,
-                    beta_fast: d.yarn_beta_fast,
-                    beta_slow: d.yarn_beta_slow,
-                    attention_factor: d.yarn_attention_factor,
-                    original_max_position: d.yarn_original_max_position,
+                attn_norm: norm("attn_norm", hidden),
+                mlp_norm: norm("mlp_norm", hidden),
+                mlp: Moe {
+                    experts: d.experts,
+                    top_k: d.top_k,
+                    inter: d.inter,
+                    swiglu_limit: d.swiglu_limit,
+                    swiglu_alpha: d.swiglu_alpha,
+                    router: Tensor::sym(n("router"), [experts, hidden]),
+                    router_bias: Tensor::sym(n("router_bias"), [experts]),
+                    gate_up: Tensor::sym(n("expert_gate_up_bank"), [experts, 2 * inter, hidden])
+                        .bank([inter, inter]),
+                    gate_up_bias: Tensor::sym(n("expert_gate_up_bias"), [experts, 2 * inter])
+                        .bank([inter, inter]),
+                    down: Tensor::sym(n("expert_down_bank"), [experts, hidden, inter]).rows(),
+                    down_bias: Tensor::sym(n("expert_down_bias"), [experts, hidden]),
                 },
-                q_proj: Tensor::sym(n("q_proj"), [q_w, hidden]).columns(),
-                q_bias: Tensor::sym(n("q_bias"), [q_w]).columns(),
-                k_proj: Tensor::sym(n("k_proj"), [kv_w, hidden]).columns(),
-                k_bias: Tensor::sym(n("k_bias"), [kv_w]).columns(),
-                v_proj: Tensor::sym(n("v_proj"), [kv_w, hidden]).columns(),
-                v_bias: Tensor::sym(n("v_bias"), [kv_w]).columns(),
-                o_proj: Tensor::sym(n("o_proj"), [hidden, q_w]).rows(),
-                o_bias: Tensor::sym(n("o_bias"), [hidden]),
-                sinks: Tensor::sym(n("attn_sinks"), [d.q_heads as u64]).columns(),
-                kv: CacheRef::to(format!("kv.{l}")),
-            },
-            attn_norm: norm("attn_norm", hidden),
-            mlp_norm: norm("mlp_norm", hidden),
-            mlp: Moe {
-                experts: d.experts,
-                top_k: d.top_k,
-                inter: d.inter,
-                swiglu_limit: d.swiglu_limit,
-                swiglu_alpha: d.swiglu_alpha,
-                router: Tensor::sym(n("router"), [experts, hidden]),
-                router_bias: Tensor::sym(n("router_bias"), [experts]),
-                gate_up: Tensor::sym(n("expert_gate_up_bank"), [experts, 2 * inter, hidden]).bank([inter, inter]),
-                gate_up_bias: Tensor::sym(n("expert_gate_up_bias"), [experts, 2 * inter]).bank([inter, inter]),
-                down: Tensor::sym(n("expert_down_bank"), [experts, hidden, inter]).rows(),
-                down_bias: Tensor::sym(n("expert_down_bias"), [experts, hidden]),
-            },
-        }
-    }).collect();
+            }
+        })
+        .collect();
 
     Model {
         hidden: d.hidden,
@@ -212,7 +242,10 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
         embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
         head: Tensor::sym("lm_head", [d.vocab as u64, hidden]),
         layers,
-        final_norm: Norm { weight: Tensor::sym("final_norm", [hidden]), eps: d.norm_eps },
+        final_norm: Norm {
+            weight: Tensor::sym("final_norm", [hidden]),
+            eps: d.norm_eps,
+        },
         _kv: PhantomData,
     }
 }

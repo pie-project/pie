@@ -11,6 +11,8 @@ pub mod register;
 pub mod state;
 pub mod transfer;
 
+pub mod weights;
+
 pub use launch::Launched;
 pub use state::Shell;
 pub use transfer::{

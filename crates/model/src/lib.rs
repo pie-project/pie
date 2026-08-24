@@ -1,5 +1,5 @@
-pub mod deployment;
 pub mod deepseek_v4;
+pub mod deployment;
 pub mod gemma_4;
 pub mod glm_5;
 pub mod gpt_oss;
@@ -35,7 +35,10 @@ pub mod qwen_3_5;
 pub mod serve;
 pub mod snapshot;
 
-pub fn catalog() -> Vec<(&'static str, fn(model_dsl::Plane) -> model_dsl::Plan)> {
+/// One catalog row: the SKU id and the text that traces it.
+pub type Row = (&'static str, model_dsl::TraceFn);
+
+pub fn catalog() -> Vec<Row> {
     [
         deepseek_v4::CATALOG,
         gemma_4::CATALOG,
@@ -49,8 +52,18 @@ pub fn catalog() -> Vec<(&'static str, fn(model_dsl::Plane) -> model_dsl::Plan)>
 
 /// Every shipping import point, across all families.
 ///
-/// Shorter than [`catalog`] and always will be: a tensor-parallel row is the
-/// same bytes cut a different way at load, so it names no import of its own.
+/// A TENSOR-PARALLEL ROW IS IN HERE, and it used to be the one thing that
+/// was not. The old line read "a `-tp2` row is the same bytes cut a different
+/// way at load, so it names no import of its own", which was true about the
+/// bytes and wrong about the consequence: with no import row, `import_of`
+/// answered `None` and no load could reach the production table at all — so
+/// nothing ever applied the cut and a `-tp2` SKU was a row you could select
+/// and never obtain. The cut is `produce`'s (it takes the plan's demand
+/// column and this rank's index), which leaves the import table saying
+/// exactly what it always said: where in the checkpoint each canonical
+/// tensor comes from. A `-tp2` row therefore takes its sibling's table
+/// verbatim — the same production fn over the same structure — and the two
+/// differ by nothing a checkpoint can see, which is the point.
 pub fn imports() -> Vec<model_dsl::load::ImportRow> {
     [
         deepseek_v4::IMPORTS,
@@ -65,7 +78,10 @@ pub fn imports() -> Vec<model_dsl::load::ImportRow> {
 
 /// The trace fn for `sku`, or `None` if no row ships under that name.
 pub fn trace_of(sku: &str) -> Option<fn(model_dsl::Plane) -> model_dsl::Plan> {
-    catalog().into_iter().find(|(n, _)| *n == sku).map(|(_, f)| f)
+    catalog()
+        .into_iter()
+        .find(|(n, _)| *n == sku)
+        .map(|(_, f)| f)
 }
 
 /// The import table that builds `sku` from a `base`-flavored checkpoint.
@@ -114,9 +130,14 @@ pub fn bases_for(sku: &str) -> Vec<&'static str> {
 /// hold. Whoever opens the file owns the spelling, which is the same rule
 /// [`crate::snapshot`] states.
 ///
-/// A tensor-parallel row is never an answer: `-tp2` SKUs name no import of
-/// their own (the same bytes, cut at load), so they are not candidates and a
-/// TP deployment states its SKU.
+/// A tensor-parallel row is never an answer, and it is no longer excluded by
+/// having no import — it has one now, its sibling's. It is excluded because
+/// of what it IS: a plan that states `dist.all_reduce` is ONE RANK of a
+/// world, and a checkpoint is not a rank. The same bytes answer for the whole
+/// row and for every rank of every cut of it, so the tensors genuinely cannot
+/// tell them apart and asking them to would be [`Unmatched::Ambiguous`] for
+/// every family that ships a `-tp2` row. Which cut to deploy is what
+/// `[baker] sku` is for, and always was.
 ///
 /// # Errors
 ///
@@ -132,6 +153,9 @@ pub fn identify(shape_of: &dyn Fn(&str) -> Option<Vec<u64>>) -> Result<&'static 
             // so it is not an identification this build can act on.
             continue;
         };
+        if is_one_rank_of_a_world(row.sku) {
+            continue;
+        }
         let import = (row.make)();
         match matches(&import, serving.vocab, shape_of) {
             Ok(()) => {
@@ -151,6 +175,24 @@ pub fn identify(shape_of: &dyn Fn(&str) -> Option<Vec<u64>>) -> Result<&'static 
         }
         _ => Err(Unmatched::Ambiguous { skus: matched }),
     }
+}
+
+/// Whether `sku` is one rank of a tensor-parallel world rather than a whole
+/// model.
+///
+/// READ OFF THE PLAN AND NOT OFF THE NAME. `-tp2` is a spelling and the
+/// statement is `dist.all_reduce`: a text states it exactly when it holds a
+/// share of a weight some peer holds the rest of, which
+/// `model/tests/a_rank_cut_is_the_shard_column.rs::a_row_that_reduces_is_a_
+/// row_that_cuts` is what keeps honest. A row that reduces cannot be what a
+/// checkpoint IS, because a checkpoint has no peer.
+fn is_one_rank_of_a_world(sku: &str) -> bool {
+    trace_of(sku).is_some_and(|trace| {
+        trace(model_dsl::Plane::Cuda)
+            .ops
+            .iter()
+            .any(|op| op.kernel == "dist.all_reduce")
+    })
 }
 
 /// Whether `import` can be produced from a checkpoint whose tensors
@@ -203,11 +245,7 @@ fn matches(
 fn leaves<'a>(source: &'a model_dsl::load::Source, into: &mut Vec<&'a str>) {
     use model_dsl::load::Source;
     match source {
-        Source::Copy(n)
-        | Source::PlusOne(n)
-        | Source::ScalarOf(n)
-        | Source::Deinterleave(n, _, _)
-        | Source::Squeeze(n, _) => into.push(n),
+        Source::Copy(n) | Source::Deinterleave(n, _, _) | Source::Squeeze(n, _) => into.push(n),
         Source::Pack(each) | Source::Stack(each) => {
             for one in each {
                 leaves(one, into);

@@ -18,7 +18,6 @@
 //!   batched GEMMs out of. It outlived its only consumer by one commit.
 pub mod all_reduce;
 pub mod attention_workspace;
-pub mod attn_score;
 /// Re-exported from `kernels_cuda::gemm` so `gemm::*`/`gemv::*` keep resolving.
 pub use kernels_cuda::gemm::dense as gemm;
 pub use kernels_cuda::gemm::gemv;

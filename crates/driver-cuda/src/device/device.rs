@@ -92,52 +92,6 @@ impl Device {
         self.attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount)
     }
 
-    /// `cudaDevAttrMaxSharedMemoryPerMultiprocessor`, in bytes. The FA2 prefill
-    /// geometry snaps `NUM_MMA_KV` down against it.
-    pub fn max_shared_memory_per_sm(&self) -> Result<i32> {
-        self.attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor)
-    }
-
-    /// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, in bytes: the opt-in limit,
-    /// not `cudaDevAttrMaxSharedMemoryPerBlock`. FA2 prefill raises its dynamic
-    /// allocation past the default 48 KB, which the plain limit would refuse.
-    pub fn max_shared_memory_per_block_optin(&self) -> Result<i32> {
-        self.attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin)
-    }
-
-    /// Whether this device supports the virtual-memory management API that
-    /// [`crate::device::Arena`] is built on. Only the driver API exposes it;
-    /// the runtime's `cudaDeviceAttr` has no equivalent enumerator.
-    pub fn supports_vmm(&self) -> Result<bool> {
-        use cudarc::driver::sys as dr;
-        let mut dev: dr::CUdevice = 0;
-        // SAFETY: `dev` is a valid, writable handle slot. The driver is
-        // already initialised, because `bind` forced the primary context.
-        let code = unsafe { dr::cuDeviceGet(&raw mut dev, self.ordinal) };
-        if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Error::Driver {
-                call: "cuDeviceGet",
-                code,
-            });
-        }
-        let mut v = 0;
-        // SAFETY: `v` is valid and writable; `dev` came from `cuDeviceGet`.
-        let code = unsafe {
-            dr::cuDeviceGetAttribute(
-                &raw mut v,
-                dr::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
-                dev,
-            )
-        };
-        if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Error::Driver {
-                call: "cuDeviceGetAttribute(VMM_SUPPORTED)",
-                code,
-            });
-        }
-        Ok(v != 0)
-    }
-
     /// Free and total device memory, in bytes.
     pub fn memory_info(&self) -> Result<(usize, usize)> {
         let mut free = 0usize;

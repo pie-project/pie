@@ -230,7 +230,11 @@ def main() -> int:
         declared = features_declared(manifest)
         used: dict[str, set[Path]] = {}
         for source in sorted(directory.rglob("*.rs")):
-            if "target" in source.relative_to(directory).parts:
+            # The same prune the manifest walk takes, for the same reason: the
+            # root package's directory IS the repo root, so an unpruned rglob
+            # reads every agent worktree under `.claude` and reports another
+            # checkout's crate as this one's dead cfg.
+            if PRUNE.intersection(source.relative_to(directory).parts):
                 continue
             if any(source.is_relative_to(other) for other in nested):
                 continue

@@ -79,6 +79,114 @@ pub struct Shape {
 }
 
 impl Shape {
+    /// The shape a pool holding `attention` must be allocated at, or the
+    /// refusal that names what this pool cannot describe.
+    ///
+    /// # THE DEPLOYMENT STATES A VECTOR AND THIS STRUCT STATES A PERIOD
+    ///
+    /// `model::deployment::Deployment::attention` is one row per layer —
+    /// `head_dim`, `kv_heads`, and the layer whose pages it reads — because a
+    /// tower may disagree with itself and gemma-4 does. The three fields
+    /// below say the same thing in fewer numbers: ONE alternating kind, every
+    /// `full_attn_every`-th layer. That is enough for every row this plane
+    /// serves and it is strictly less than the deployment states, so the
+    /// narrowing is a REFUSAL and not a projection — a tower whose widths do
+    /// not fall on a period is named here instead of being allocated at the
+    /// first layer's shape and attended at its own.
+    ///
+    /// `Deployment::shape` carried these three numbers until G4 read the
+    /// widths off the cache rows, and a driver reading them there was reading
+    /// one number repeated `layers` times. This is the reading that replaced
+    /// it, and the refusals are the half that reading could not have.
+    ///
+    /// # Errors
+    ///
+    /// A tower with more than two attention shapes, two shapes that do not
+    /// alternate on a period, or a layer that reads another's pages — this
+    /// pool allocates every layer its own, so an alias would be a layer
+    /// reading pages nothing ever wrote.
+    pub fn periodic(
+        attention: &[model::deployment::LayerAttention],
+        page_size: u32,
+        pages: u32,
+        element_bytes: u32,
+    ) -> Result<Self, String> {
+        let [first, rest @ ..] = attention else {
+            return Err("the deployment states no attention layer, so there is \
+                        nothing to allocate pages for"
+                .to_string());
+        };
+        if let Some((l, a)) = attention
+            .iter()
+            .enumerate()
+            .find(|(l, a)| a.kv_source as usize != *l)
+        {
+            return Err(format!(
+                "layer {l} reads layer {}'s KV pages, and this pool allocates \
+                 every layer its own — a shared layer would read pages nothing \
+                 ever wrote, at a stride that need not even be its own",
+                a.kv_source
+            ));
+        }
+        let base = (first.kv_heads, first.head_dim);
+        let mut global: Option<(u32, u32)> = None;
+        let mut wide: Vec<u32> = Vec::new();
+        for (l, a) in rest.iter().enumerate() {
+            let here = (a.kv_heads, a.head_dim);
+            if here == base {
+                continue;
+            }
+            if let Some(seen) = global
+                && seen != here
+            {
+                return Err(format!(
+                    "layer {} attends {} head(s) at {}, a third shape beside \
+                     {base:?} and {seen:?}; this pool describes two",
+                    l + 1,
+                    a.kv_heads,
+                    a.head_dim,
+                ));
+            }
+            global = Some(here);
+            wide.push(u32::try_from(l + 1).unwrap_or(u32::MAX));
+        }
+        let layers = u32::try_from(attention.len()).unwrap_or(u32::MAX);
+        let mut shape = Self {
+            layers,
+            kv_heads: base.0,
+            head_dim: base.1,
+            page_size,
+            pages,
+            element_bytes,
+            global_head_dim: 0,
+            global_kv_heads: 0,
+            full_attn_every: 0,
+        };
+        let Some((kv_heads, head_dim)) = global else {
+            return Ok(shape);
+        };
+        // The PERIOD is the first wide layer's own index, and it is then
+        // CHECKED against every layer rather than assumed: `is_full_attention`
+        // is what the pool, the mover and the text all read, so a tower whose
+        // wide layers merely start on a period would be allocated one way and
+        // attended another.
+        shape.global_kv_heads = kv_heads;
+        shape.global_head_dim = head_dim;
+        shape.full_attn_every = wide[0] + 1;
+        let stated: Vec<u32> = (0..layers)
+            .filter(|&l| shape.is_full_attention(l))
+            .collect();
+        if stated != wide {
+            return Err(format!(
+                "the deployment attends {kv_heads} head(s) at {head_dim} on \
+                 layers {wide:?}, which is not one layer every {}; this pool \
+                 describes an alternating tower and nothing else",
+                shape.full_attn_every,
+            ));
+        }
+        Ok(shape)
+    }
+
     /// Whether layer `l` attends the whole context.
     #[must_use]
     pub fn is_full_attention(&self, l: u32) -> bool {
@@ -257,6 +365,95 @@ mod tests {
         assert_eq!(s.row_bytes(), None);
         assert_eq!(s.page_bytes(), None);
         assert!(s.grid().is_none());
+    }
+
+    fn layer(kv_heads: u32, head_dim: u32, at: u32) -> model::deployment::LayerAttention {
+        model::deployment::LayerAttention {
+            head_dim,
+            kv_heads,
+            kv_source: at,
+        }
+    }
+
+    /// A tower that agrees with itself reads as uniform, and no layer is
+    /// full-attention — which is what keeps `heads_at` on one arm.
+    #[test]
+    fn one_shape_everywhere_is_read_as_one_shape_everywhere() {
+        let rows: Vec<_> = (0..12).map(|l| layer(8, 128, l)).collect();
+        let s = Shape::periodic(&rows, 16, 64, 2).expect("a uniform tower");
+        assert!(s.is_uniform());
+        assert_eq!((s.layers, s.kv_heads, s.head_dim), (12, 8, 128));
+        assert_eq!(s.full_attn_every, 0);
+        assert_eq!(s.heads_at(11), (8, 128));
+    }
+
+    /// gemma-4's own reading, off the per-layer rows rather than off three
+    /// scalars a `Geometry` used to carry.
+    ///
+    /// The numbers are `gemma-4-31b-it-4bit`'s: 16 kv heads at 256 sliding,
+    /// 4 at 512 full, one full layer in six. What this pins is that the
+    /// PERIOD is derived rather than assumed — layers 5 and 11 are the wide
+    /// ones and `full_attn_every` comes back 6 because they are, not because
+    /// anything said so.
+    #[test]
+    fn two_shapes_on_a_period_come_back_as_that_period() {
+        let rows: Vec<_> = (0..12u32)
+            .map(|l| {
+                if (l + 1).is_multiple_of(6) {
+                    layer(4, 512, l)
+                } else {
+                    layer(16, 256, l)
+                }
+            })
+            .collect();
+        let s = Shape::periodic(&rows, 16, 64, 2).expect("an alternating tower");
+        assert!(!s.is_uniform());
+        assert_eq!(s.full_attn_every, 6);
+        assert_eq!(s.heads_at(0), (16, 256));
+        assert_eq!(s.heads_at(5), (4, 512));
+        assert_eq!(s.heads_at(11), (4, 512));
+    }
+
+    /// A tower whose wide layers do not fall on a period is REFUSED, and
+    /// that is the whole reason this constructor is fallible.
+    ///
+    /// The alternative is what a `Geometry`-shaped reading had to do: take
+    /// the first wide layer's index as the period and allocate every sixth
+    /// layer at the wide shape whether or not the deployment attends there.
+    /// Layer 3 below is wide and layer 5 is not, so such a pool would
+    /// allocate 3 narrow and 5 wide — each one read at the other's stride,
+    /// with nothing faulting.
+    #[test]
+    fn wide_layers_off_the_period_are_refused_rather_than_rounded() {
+        let mut rows: Vec<_> = (0..12).map(|l| layer(16, 256, l)).collect();
+        rows[3] = layer(4, 512, 3);
+        let why = Shape::periodic(&rows, 16, 64, 2).expect_err("this is not a period");
+        assert!(why.contains("[3]"), "the message names the layer: {why}");
+    }
+
+    /// Three attention shapes are one more than this pool describes.
+    #[test]
+    fn a_third_attention_shape_is_refused_by_name() {
+        let mut rows: Vec<_> = (0..6).map(|l| layer(16, 256, l)).collect();
+        rows[2] = layer(4, 512, 2);
+        rows[4] = layer(2, 1024, 4);
+        let why = Shape::periodic(&rows, 16, 64, 2).expect_err("three shapes");
+        assert!(why.contains("third shape"), "{why}");
+    }
+
+    /// A layer that reads another's pages is refused, because this pool
+    /// allocates every layer its own.
+    ///
+    /// gemma-4's trailing layers project no KV and attend through their
+    /// source's. Sizing them as though they owned pages allocates memory
+    /// nothing writes and then reads it: no fault, and an answer drawn from
+    /// whatever the allocator left there.
+    #[test]
+    fn a_layer_that_reads_anothers_pages_is_refused() {
+        let mut rows: Vec<_> = (0..6).map(|l| layer(8, 128, l)).collect();
+        rows[5] = layer(8, 128, 4);
+        let why = Shape::periodic(&rows, 16, 64, 2).expect_err("this pool has no aliasing");
+        assert!(why.contains("layer 5 reads layer 4"), "{why}");
     }
 
     #[test]

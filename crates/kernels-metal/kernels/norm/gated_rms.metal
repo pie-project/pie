@@ -60,7 +60,7 @@ using namespace metal;
 // the element of the two that ride the statement. `<bfloat, bfloat>` keeps
 // the name and the ABI the legacy driver has always fired; `<float, bfloat>`
 // is the arm `Norm::rmsnorm_gated` claims.
-template <typename X, typename T>
+template <typename X, typename T, bool SILU>
 METAL_FUNC void gated_rms_body(
     const device X* x, const device T* z, const device X* w, device T* out,
     float eps, uint vd, size_t idx, uint lid,
@@ -72,12 +72,12 @@ METAL_FUNC void gated_rms_body(
   const float zr = float(z[idx]);
   const float y = 1.0f / (1.0f + metal::exp(-metal::fabs(zr)));
   const float sig = zr < 0.0f ? 1.0f - y : y;
-  const float siluz = zr * sig;
+  const float gate = SILU ? zr * sig : sig;
   const float outhat = xi * inv;
-  out[idx] = T((outhat * float(w[lid])) * siluz);
+  out[idx] = T((outhat * float(w[lid])) * gate);
 }
 
-template <typename X, typename T>
+template <typename X, typename T, bool SILU>
 [[kernel]] void gated_rms(
     const device X* x        [[buffer(0)]],   // core_out [V_h, V_d]
     const device T* z        [[buffer(1)]],   // gate     [V_h, V_d]
@@ -94,7 +94,7 @@ template <typename X, typename T>
   const uint lid = lid3.x;
   const size_t idx =
       size_t(tgpos.z * tpg.y + tgpos.y) * vd + lid;
-  gated_rms_body(
+  gated_rms_body<X, T, SILU>(
       x, z, w, out, eps, vd, idx, lid,
       inv_rms, partials, simd_lane, simd_group);
 }
@@ -118,7 +118,7 @@ template <typename X, typename T>
   const size_t idx =
       size_t(tgpos.z) * size_t(row_pitch) + size_t(tgpos.y) * vd + lid;
   (void)tpg;
-  gated_rms_body(
+  gated_rms_body<X, T, true>(
       x, z, w, out, eps, vd, idx, lid,
       inv_rms, partials, simd_lane, simd_group);
 }
@@ -134,7 +134,14 @@ instantiate_gated_rms_strided(bfloat16, bfloat, bfloat)
 
 #define instantiate_gated_rms(name, xtype, itype)                 \
   template [[host_name("gated_rms_" #name)]]                      \
-  [[kernel]] void gated_rms<xtype, itype>(                        \
+  [[kernel]] void gated_rms<xtype, itype, true>(                  \
+      const device xtype*, const device itype*, const device xtype*, \
+      device itype*, const constant float&, const constant uint&,    \
+      uint3, uint3, uint3, uint, uint);
+
+#define instantiate_gated_rms_by(name, xtype, itype)              \
+  template [[host_name("gated_rms_by_" #name)]]                   \
+  [[kernel]] void gated_rms<xtype, itype, false>(                 \
       const device xtype*, const device itype*, const device xtype*, \
       device itype*, const constant float&, const constant uint&,    \
       uint3, uint3, uint3, uint, uint);
@@ -144,3 +151,5 @@ instantiate_gated_rms(bfloat16, bfloat, bfloat)
 // The claimed arm: the normed plane and its weight in float, the gate and the
 // result at the statement's element. `Norm::rmsnorm_gated` fires this one.
 instantiate_gated_rms(f32_bfloat16, float, bfloat)
+
+instantiate_gated_rms_by(f32_bfloat16, float, bfloat)

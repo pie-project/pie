@@ -20,8 +20,21 @@ fn positive(v: &str, max: i64) -> Option<i64> {
     (n > 0 && n <= max).then_some(n)
 }
 
-/// The KV page size, in tokens. Not a knob: the paged-attention kernels are
-/// compiled for 16.
+/// The KV page size, in tokens.
+///
+/// NOT A KNOB: the paged-attention kernels are compiled for 16, so this is a
+/// fact about `kernels-cuda` that the shell must agree with rather than a
+/// choice the shell makes. It is why `PlannerConfig::kv_page_size` is pinned
+/// instead of swept — sweeping page sizes would answer a geometry the fire
+/// never builds.
+///
+/// IT HAD ONE READER AND THE NUMBER HAD EIGHT SPELLINGS. `fire::launch`,
+/// `serve::transfer` (twice), the planner config, and three `unwrap_or(16)`
+/// fallbacks each wrote the literal, so the constant documented a coupling it
+/// did not enforce: a build against 32-token pages would have had to be found
+/// eight times, and the `unwrap_or` sites are exactly where a miss is
+/// silent — a wrong page size does not fault, it reads the neighbour's
+/// tokens.
 pub const KV_PAGE_SIZE: i32 = 16;
 
 /// The whole driver's configuration.

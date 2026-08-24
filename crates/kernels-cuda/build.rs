@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 /// The upstream subtrees, which a `norm` compile must not carry: `nvrtcCreateProgram`
 /// copies every byte it is given.
-const UPSTREAM_ROOTS: [&str; 2] = ["flashinfer", "xqa"];
+const UPSTREAM_ROOTS: [&str; 1] = ["flashinfer"];
 
 /// Carried files are device text. A licence is not.
 fn is_header(path: &Path) -> bool {

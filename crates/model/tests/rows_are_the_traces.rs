@@ -114,10 +114,7 @@ fn every_stated_fact_is_named() {
             "arch",
             "the architecture label a control plane files the model under",
         ),
-        (
-            "max_model_len",
-            "the context ceiling a deployment admits",
-        ),
+        ("max_model_len", "the context ceiling a deployment admits"),
         (
             "template",
             "how a turn of conversation is written and read back",
@@ -147,20 +144,88 @@ fn the_pool_refusals_are_the_measured_ones() {
         vec![
             // MLA and the compressed planes: a single-plane latent row, and
             // this build provisions the k/v pair a pager allocates.
+            //
+            // THE THREE GEMMA ROWS LEFT THIS LIST. They were here for "two KV
+            // plane widths across the tower and this build lays out one",
+            // which was a fact about this function rather than about the
+            // pool: `KvCacheLayout` has carried a per-layer head width and kv
+            // head count all along, and `Deployment::of` handed it one number
+            // repeated. It reads the rows now. The layer-by-layer proof is
+            // `the_two_kinds_of_gemmas_tower_are_read_apart` below.
             "dsv4-base-bf16-kv-bf16",
             "dsv4-base-bf16-kv-bf16-tp2",
-            // Two KV plane widths across the tower (gemma-4 alternates a
-            // sliding-window head geometry with a full-attention one), and
-            // this build lays out one.
-            "gemma4-e4b-bf16-kv-bf16",
-            "gemma4-31b-bf16-kv-bf16",
-            "gemma4-31b-bf16-kv-bf16-tp2",
             "glm5-a12b-bf16-bf16-kv-bf16",
             "glm5-a12b-bf16-bf16-kv-bf16-tp2",
             "kimik3-bf16-mxfp4-kv-bf16",
             "kimik3-bf16-mxfp4-kv-bf16-tp2",
         ],
         "the set of SKUs with no pool moved: {refused:?}",
+    );
+}
+
+/// gemma-4's two attention kinds are read APART, layer by layer.
+///
+/// The row this pins is the one the refusal above used to stand on, and it is
+/// the reason a pool that laid out one width would be wrong rather than
+/// merely wasteful: 35 of e4b's 42 layers read a 256-wide head and 7 read a
+/// 512-wide one, so a uniform 256 would have every global layer striding a
+/// quarter of the plane it wrote and a uniform 512 would double the pool and
+/// still stride the sliding layers wrong.
+///
+/// The KV SOURCE is the other half. e4b's trailing 18 layers project no k/v
+/// and attend through an earlier layer's pages — `kv.22` for the sliding
+/// kind, `kv.23` for the global one — and a `kv_source` of `l` would have the
+/// pager allocate 18 layers of pages nothing ever writes and every one of
+/// those layers attend over zeros.
+#[test]
+fn the_two_kinds_of_gemmas_tower_are_read_apart() {
+    let plan = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("a SKU")(Backend::Cuda);
+    let dep = Deployment::of(&plan, Default::default()).expect("gemma-4's pool is layable now");
+    assert_eq!(dep.layers, 42);
+    assert_eq!(dep.attention.len(), 42);
+
+    // The checkpoint's own `layer_types`: `full_attention` every sixth layer,
+    // `sliding_attention` on the rest.
+    for (l, at) in dep.attention.iter().enumerate() {
+        let full = l % 6 == 5;
+        assert_eq!(
+            at.head_dim,
+            if full { 512 } else { 256 },
+            "layer {l} attends at the wrong head width: {at:?}",
+        );
+        assert_eq!(at.kv_heads, 2, "layer {l}: {at:?}");
+    }
+    assert_eq!(
+        dep.attention.iter().filter(|a| a.head_dim == 512).count(),
+        7,
+        "gemma-4-e4b states 7 full-attention layers",
+    );
+
+    // The 24 owning layers read their own pages; the 18 shared ones read the
+    // last owner OF THEIR OWN KIND.
+    for (l, at) in dep.attention.iter().enumerate() {
+        let want = if l < 24 {
+            l as u32
+        } else if l % 6 == 5 {
+            23
+        } else {
+            22
+        };
+        assert_eq!(
+            at.kv_source, want,
+            "layer {l} reads the wrong pages: {at:?}"
+        );
+    }
+
+    // The scalars are the WIDEST, and the GQA check reads every layer.
+    assert_eq!(dep.shape.head_dim, 512);
+    assert_eq!(dep.shape.kv_heads, 2);
+    assert_eq!(dep.shape.q_heads, 8);
+    dep.servable_by(&[4])
+        .expect("8 q over 2 kv is group 4 on every layer");
+    assert!(
+        dep.servable_by(&[8]).is_err(),
+        "a build with no group-4 decode cannot serve this stack",
     );
 }
 

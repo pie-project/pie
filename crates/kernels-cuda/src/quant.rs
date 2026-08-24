@@ -2,9 +2,8 @@ use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
 use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
-use kernels::routine::{Const, In, InOut, Out};
+use kernels::plane::{In, InOut, Out};
 use kernels::{Bind, Fire};
-
 
 pub mod transcode {
 
@@ -161,97 +160,6 @@ pub fn scale_rows<T: crate::RoutineElem>(
     )
 }
 
-pub fn dequant_fp8_e4m3_to<T: crate::RoutineElem>(
-    ctx: &Ctx<'_>,
-    fp8_in: In<Tensor<u8>>,
-    bf16_out: Out<Tensor<T>>,
-    scale: Const<f32>,
-    rows: Const<i32>,
-    cols: Const<i32>,
-) -> Result<(), Refusal> {
-    let n = (*rows as usize).saturating_mul(*cols as usize);
-    let launch = elementwise(extent("quant::dequant_fp8_e4m3_to_bf16", n));
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_fp8.cuh",
-            crate::jit::symbol(&format!("::pie::quant::dequant_fp8_e4m3<{}>", T::CPP)),
-        )
-        .apply(launch),
-        &[fp8_in.arg(), bf16_out.arg(), scale.arg(), n.arg()],
-    )
-}
-
-pub fn dequant_fp8_e4m3_to_bf16_per_channel(
-    ctx: &Ctx<'_>,
-    fp8_in: In<Tensor<u8>>,
-    bf16_out: Out<Tensor<bf16>>,
-    scale_inv: In<Tensor<f32>>,
-    rows: Const<i32>,
-    cols: Const<i32>,
-) -> Result<(), Refusal> {
-    let launch = route_rows(rows.unsigned_abs(), cols.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_fp8.cuh",
-            "::pie::quant::dequant_fp8_e4m3_per_channel<::pie::bf16>",
-        )
-        .apply(launch),
-        &[fp8_in.arg(), bf16_out.arg(), scale_inv.arg(), cols.arg()],
-    )
-}
-
-pub fn dequant_fp8_e4m3_to_bf16_per_group(
-    ctx: &Ctx<'_>,
-    fp8_in: In<Tensor<u8>>,
-    bf16_out: Out<Tensor<bf16>>,
-    scales: In<Tensor<f32>>,
-    group_size: Const<i32>,
-    rows: Const<i32>,
-) -> Result<(), Refusal> {
-    let rows = *rows;
-    let cols = bf16_out.width;
-    let launch = route_rows(rows.unsigned_abs(), cols.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_fp8.cuh",
-            "::pie::quant::dequant_fp8_e4m3_per_group<::pie::bf16>",
-        )
-        .apply(launch),
-        &[
-            fp8_in.arg(),
-            bf16_out.arg(),
-            scales.arg(),
-            cols.arg(),
-            group_size.arg(),
-        ],
-    )
-}
-
-pub fn dequant_mxfp4_to<T: crate::RoutineElem>(
-    ctx: &Ctx<'_>,
-    packed: In<Tensor<u8>>,
-    block_scale: In<Tensor<u8>>,
-    out: Out<Tensor<T>>,
-    out_dim: Const<i32>,
-    in_dim: Const<i32>,
-) -> Result<(), Refusal> {
-    let launch = route_rows(out_dim.unsigned_abs(), in_dim.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/dequant_fp4.cuh",
-            crate::jit::symbol(&format!("::pie::quant::dequant_mxfp4<{}>", T::CPP)),
-        )
-        .apply(launch),
-        &[packed.arg(), block_scale.arg(), out.arg(), in_dim.arg()],
-    )
-}
-
-/// # Safety
-///
-/// `w_bf16` must address device memory of the extent `rows` and `cols`
-/// state, `w_packed` and `w_scale_e8m0` must address the quantised extent this writes, and
-/// `ctx`'s stream must be live. Nothing here reads a length: the shape
-/// arrives as two integers and is believed.
 pub unsafe fn quantize_bf16_to_mxfp4_e2m1_per_block(
     ctx: &Ctx<'_>,
     w_bf16: *const bf16,
@@ -277,12 +185,6 @@ pub unsafe fn quantize_bf16_to_mxfp4_e2m1_per_block(
     )
 }
 
-/// # Safety
-///
-/// `w_bf16` must address device memory of the extent `rows` and `cols`
-/// state, `w_fp8` and `scale_inv` must address the quantised extent this writes, and
-/// `ctx`'s stream must be live. Nothing here reads a length: the shape
-/// arrives as two integers and is believed.
 pub unsafe fn quantize_bf16_to_fp8_e4m3_per_channel(
     ctx: &Ctx<'_>,
     w_bf16: *const bf16,
@@ -299,140 +201,5 @@ pub unsafe fn quantize_bf16_to_fp8_e4m3_per_channel(
         )
         .apply(launch),
         &[w_bf16.arg(), w_fp8.arg(), scale_inv.arg(), cols.arg()],
-    )
-}
-
-/// # Safety
-///
-/// `w_bf16` must address device memory of the extent `rows` and `cols`
-/// state, `out_int8` and `scale_inv` must address the quantised extent this writes, and
-/// `ctx`'s stream must be live. Nothing here reads a length: the shape
-/// arrives as two integers and is believed.
-pub unsafe fn quantize_bf16_to_int8_per_channel(
-    ctx: &Ctx<'_>,
-    w_bf16: *const bf16,
-    out_int8: *mut i8,
-    scale_inv: *mut f32,
-    rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
-    let launch = rms(rows.unsigned_abs());
-    ctx.fire(
-        Fire::at(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::quant_per_channel<::pie::quant::int8_sym>",
-        )
-        .apply(launch),
-        &[w_bf16.arg(), out_int8.arg(), scale_inv.arg(), cols.arg()],
-    )
-}
-
-/// # Safety
-///
-/// `w_int8` and `scale_inv` must address device memory of the extent `rows` and `cols`
-/// state, `out` must address the quantised extent this writes, and
-/// `ctx`'s stream must be live. Nothing here reads a length: the shape
-/// arrives as two integers and is believed.
-pub unsafe fn dequant_int8_to_bf16_per_channel(
-    ctx: &Ctx<'_>,
-    w_int8: *const i8,
-    out: *mut bf16,
-    scale_inv: *const f32,
-    rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
-    let n = rows.unsigned_abs() as usize * cols.unsigned_abs() as usize;
-    let launch = elementwise(extent("quant::dequant_int8_to_bf16_per_channel", n));
-    ctx.fire(
-        Fire::at(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::dequant_int8_per_channel<::pie::bf16>",
-        )
-        .apply(launch),
-        &[
-            w_int8.arg(),
-            out.arg(),
-            scale_inv.arg(),
-            cols.arg(),
-            n.arg(),
-        ],
-    )
-}
-
-/// # Safety
-///
-/// `acc` must address `m` by `n` accumulators, the two scale pointers the
-/// per-row and per-column inverses that go with them, and `out` the same
-/// rectangle in bf16. `ctx`'s stream must be live.
-pub unsafe fn dequant_int32_w8a8_to_bf16(
-    ctx: &Ctx<'_>,
-    acc: *const i32,
-    act_scale_inv: *const f32,
-    w_scale_inv: *const f32,
-    out: *mut bf16,
-    m: i32,
-    n: i32,
-) -> Result<(), Refusal> {
-    const W8A8_BY: u32 = 8;
-
-    const W8A8_BX: u32 = 32;
-
-    let launch = Launch::grid(
-        [
-            n.unsigned_abs().div_ceil(W8A8_BX),
-            m.unsigned_abs().div_ceil(W8A8_BY),
-            1,
-        ],
-        [W8A8_BX, W8A8_BY, 1],
-    );
-    ctx.fire(
-        Fire::at("quant/quant_bf16_to_fp8.cuh", "::pie::quant::w8a8_dequant").apply(launch),
-        &[
-            acc.arg(),
-            act_scale_inv.arg(),
-            w_scale_inv.arg(),
-            out.arg(),
-            m.arg(),
-            n.arg(),
-        ],
-    )
-}
-
-/// # Safety
-///
-/// `act_bf16` must address `m` by `k` activations, `act_fp8` the same
-/// rectangle in fp8, and `act_scale` one float per group of `group_size`
-/// along `k`. `ctx`'s stream must be live.
-pub unsafe fn quantize_bf16_to_fp8_e4m3_per_token_group(
-    ctx: &Ctx<'_>,
-    act_bf16: *const bf16,
-    act_fp8: *mut u8,
-    act_scale: *mut f32,
-    m: i32,
-    k: i32,
-    group_size: i32,
-) -> Result<(), Refusal> {
-    const GROUP_QUANT_BLOCK: u32 = 128;
-
-    let n_groups = (k + group_size - 1) / group_size;
-    let launch = Launch::grid(
-        [n_groups.unsigned_abs(), m.unsigned_abs(), 1],
-        [GROUP_QUANT_BLOCK, 1, 1],
-    );
-    ctx.fire(
-        Fire::at(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::quant_act_fp8_per_group",
-        )
-        .apply(launch),
-        &[
-            act_bf16.arg(),
-            act_fp8.arg(),
-            act_scale.arg(),
-            m.arg(),
-            k.arg(),
-            group_size.arg(),
-            n_groups.arg(),
-        ],
     )
 }

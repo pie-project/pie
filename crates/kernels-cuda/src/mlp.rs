@@ -2,7 +2,7 @@ use crate::jit::abi::Tensor;
 use crate::jit::abi::{bf16, f16};
 use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
-use kernels::routine::{Const, In, InOut, Out};
+use kernels::plane::{Const, In, InOut, Out};
 use kernels::{Bind, Fire};
 
 const BLOCK: u32 = 256;
@@ -22,24 +22,6 @@ const fn elementwise_rows(rows: i32, width: i32) -> Launch {
 
 pub const GPT_OSS_GLU_ALPHA: f32 = 1.702;
 
-/// The `Mlp` family, claimed. Every body is the launch itself: one
-/// `__global__` out of `mlp/swiglu.cuh`, one thread block per `BLOCK`-wide
-/// stripe of the result, and the packed forms read one `[gate | up]` row and
-/// write a row half as wide.
-///
-/// Every body drops the stated `intermediate`. The declaration states it
-/// because the geometry is not derivable from the first `In` (the `Out` is
-/// HALF its width), but the `Out` reaching a body has already been sized by
-/// the sweep's width rule, and the launch reads `y.width` from it. When
-/// `#[shape]` replaces that rule the stated width becomes its input; until
-/// then it is recorded and unread.
-///
-/// EVERY POINT OF THIS FAMILY IS ANSWERED, and the last absence was a
-/// MISSING OPERAND SHAPE rather than a missing activation.
-/// `mlp.swiglu_clamp_alpha` stood on the floor's default body because
-/// [`gpt_oss_glu`] computes exactly its arithmetic but from gate and up as
-/// two separate rows, and no cuda kernel read the packed form the text
-/// states. `::pie::mlp::chunked_gpt_oss_glu` is that kernel.
 #[kernels_macros::claims]
 impl kernels::points::Mlp for Ctx<'_> {
     fn swiglu<T: kernels::points::Scalar>(
@@ -77,15 +59,6 @@ impl kernels::points::Mlp for Ctx<'_> {
         )
     }
 
-    /// The clamped swiglu whose sigmoid carries a stated `alpha`, over the
-    /// packed row the text states.
-    ///
-    /// A ROW WHERE THE ACTIVATION HAD TWO PLANES, and that was the whole
-    /// gap: [`gpt_oss_glu`] computes this arithmetic and has since gpt-oss
-    /// landed, but from `gate` and `up` as two rectangles, and a text that
-    /// projects `[gate | up]` in one matmul has one. The `.cuh` grew
-    /// `chunked_gpt_oss_glu` beside it — the same clamp, the same
-    /// `(u + 1) * glu`, the same `expf` — over the packed indexing.
     fn swiglu_clamp_alpha<T: kernels::points::Scalar>(
         &self,
         packed: In<Tensor<T>>,
@@ -163,11 +136,6 @@ impl kernels::points::Mlp for Ctx<'_> {
     }
 }
 
-/// The two-plane tanh-GELU gate.
-///
-/// TWO CALLERS, WHICH IS WHY IT IS A FUNCTION: `Mlp::geglu_tanh` above, and
-/// the gemma vision tower's MLP, which holds bare pointers rather than a
-/// statement's rectangles.
 pub(crate) fn geglu_tanh<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     gate: In<Tensor<T>>,
@@ -185,14 +153,6 @@ pub(crate) fn geglu_tanh<T: crate::RoutineElem>(
     )
 }
 
-/// gpt-oss's GLU over gate and up as TWO planes, and the second output plane
-/// its fp16 arm writes.
-///
-/// `Mlp::swiglu_clamp_alpha` is the same arithmetic over one packed row and
-/// is the form every text states. This one is the oracle
-/// `tests/swiglu_clamp_alpha.rs` measures that body against — the packed
-/// kernel is the flat kernel's arithmetic with packed indexing around it,
-/// and that is a claim a test checks rather than a comment.
 pub fn gpt_oss_glu<T: crate::RoutineElem>(
     ctx: &Ctx<'_>,
     gate: In<Tensor<T>>,
@@ -223,12 +183,6 @@ pub fn gpt_oss_glu<T: crate::RoutineElem>(
     )
 }
 
-/// The `Gate` family, claimed. One point, and the body crosses a dtype pin
-/// to reach its kernel: `::pie::mlp::sigmoid_gate_inplace` is spelled at
-/// bf16 while a point quantifies over `Scalar`, so the body states the pin
-/// as a refusal by name and casts the two addresses it was handed. That is
-/// the whole of cuda's gating today; a second dtype wants a second
-/// instantiation in the `.cuh`, not a cast here.
 #[kernels_macros::claims]
 impl kernels::points::Gate for Ctx<'_> {
     fn sigmoid_mul<T: kernels::points::Scalar>(

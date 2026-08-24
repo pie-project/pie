@@ -6,10 +6,10 @@ use std::rc::Rc;
 
 use model_ir::plan::{CacheRow, Cond, Op, Param, Plan, Seam, Shard, ValueDef, ValueId};
 
+use crate::Plane;
 use crate::axes::Dtype;
 use crate::declare::{Norm, Tensor};
 use crate::facts::Predicate;
-use crate::Plane;
 
 #[derive(Clone)]
 pub struct Recorder {
@@ -207,8 +207,16 @@ impl<'r> Stmt<'r> {
         let (rec, cond) = (self.rec.clone(), self.cond.clone());
         let ids = self.push(2);
         (
-            Value { rec: rec.clone(), id: ids[0], cond: cond.clone() },
-            Value { rec, id: ids[1], cond },
+            Value {
+                rec: rec.clone(),
+                id: ids[0],
+                cond: cond.clone(),
+            },
+            Value {
+                rec,
+                id: ids[1],
+                cond,
+            },
         )
     }
 
@@ -216,9 +224,21 @@ impl<'r> Stmt<'r> {
         let (rec, cond) = (self.rec.clone(), self.cond.clone());
         let ids = self.push(3);
         (
-            Value { rec: rec.clone(), id: ids[0], cond: cond.clone() },
-            Value { rec: rec.clone(), id: ids[1], cond: cond.clone() },
-            Value { rec, id: ids[2], cond },
+            Value {
+                rec: rec.clone(),
+                id: ids[0],
+                cond: cond.clone(),
+            },
+            Value {
+                rec: rec.clone(),
+                id: ids[1],
+                cond: cond.clone(),
+            },
+            Value {
+                rec,
+                id: ids[2],
+                cond,
+            },
         )
     }
 

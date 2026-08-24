@@ -180,7 +180,12 @@ const GATE: &str = r#"cfg(feature = "metal-4")"#;
 /// [`walk`], and this list is what it must equal -- a disagreement in either
 /// direction is a failure, so the check cannot pass vacuously.
 const ROOMS: &[&str] = &[
-    "bind", "device", "fire", "pools", "program", "serve", "weights",
+    // `weights` STOOD HERE and was the legacy load contract's stager: a
+    // `LoadPlan` run through `model_loader::executor` into chunked device
+    // regions. Weights arrive through `model::produce` now and land in one
+    // allocation, which is `serve::weights` — inside a room that was already
+    // gated rather than a room of its own.
+    "bind", "device", "fire", "pools", "program", "serve",
 ];
 
 /// The modules that answer questions no GPU changes.
@@ -201,7 +206,18 @@ const ROOMS: &[&str] = &[
 /// parsed into a private facts struct, plus an enum of family names -- and it
 /// needed no GPU to be wrong.
 const PORTABLE: &[&str] = &[
-    "batch", "channel", "envelope", "error", "layout", "loader", "lowering",
+    // `baker` IS THE EXECUTOR and it is portable, which is the P5 claim this
+    // list now carries: a fire's walk, its bound statements and its marks all
+    // resolve through `dyn Encode`, so the device sits behind the door rather
+    // than inside the walk. `lowering` stood where `baker` stands and was the
+    // legacy one; `batch` and `loader` went with the geometry projection and
+    // the load-plan author.
+    // `walk` IS THE OTHER HALF OF THE EXECUTOR and portable for the same
+    // reason `baker` is. It was `baker-walk`, a crate shared with
+    // driver-wgpu, and that crate named `kernels`, `model`,
+    // `model-compiler` and `model-ir` and not one device API. Dissolving
+    // it into this crate did not give it a device.
+    "baker", "walk", "channel", "envelope", "error", "layout",
     // `skip` reads one environment variable and prints a line. It is about
     // the device in the sense that it is what a test says when there is not
     // one, which is the opposite of needing it.

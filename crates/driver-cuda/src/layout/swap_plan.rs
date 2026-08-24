@@ -56,8 +56,18 @@ pub struct CopyOp {
 
 /// The per-layer buffer widths a plan is built against.
 ///
-/// `page_bytes[layer][buffer]`, ragged because MLA layers carry two buffers of
-/// different widths.
+/// `page_bytes[layer][buffer]`, RAGGED IN BOTH DIRECTIONS: a layer may carry
+/// a different number of buffers than its neighbour, and buffers of different
+/// widths.
+///
+/// The example that used to justify it was MLA — ckv and kpe pages differing
+/// in width — and no MLA layer can reach this driver: `Deployment::of`
+/// refuses a plan whose KV rows are not the `[2, kv_heads * head_dim]` pair,
+/// at load, before a pool is sized. The shape stays anyway, and not out of
+/// caution: gemma-4 already varies the WIDTH across layers (35 of e4b's 42
+/// read 256-wide heads and 7 read 512-wide ones), so the outer raggedness is
+/// exercised by a SKU that ships. It is the inner two-buffers-per-layer case
+/// that is currently unreachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
     page_bytes: Vec<Vec<u64>>,

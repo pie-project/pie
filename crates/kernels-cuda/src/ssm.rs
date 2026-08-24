@@ -6,8 +6,8 @@ use crate::jit::abi::{MaybeConst, bf16};
 use crate::jit::{Ctx, Launch};
 use crate::views::RecurrentState;
 use kernels::Refusal;
+use kernels::plane::{Cache, Const, In, Out};
 use kernels::raises::Struct;
-use kernels::routine::{Cache, Const, In, Out};
 use kernels::{Bind, Fire};
 
 use core::ffi::c_void;
@@ -57,22 +57,6 @@ const fn kda_shmem(d: u32) -> u32 {
 
 const GDN_BLOCK: u32 = 128;
 
-/// The claimed `Ssm` points are spelled at bf16 and NOWHERE ELSE, and each
-/// one has its own reason.
-///
-/// The two conv launches are spelled at bf16 because their bodies name the
-/// entrypoint by a LITERAL symbol — the optional bias rides
-/// `MaybeConst<bf16>`, whose `Abi` impl `jit::abi` writes one pointee at a
-/// time, so a template over `T` would have nothing to bind. The chunked
-/// recurrence is pinned
-/// because its PROLOGUE is — `qwen_gdn_qk_norm` and `qwen_gdn_v_gates` are
-/// fired at `::pie::bf16` by literal symbols, and the packed row is the only
-/// operand whose element the point quantifies over.
-///
-/// A point quantifies over `Scalar`, so a claim states the pin as a refusal
-/// BY NAME rather than widening it with a cast no kernel stands behind — the
-/// `gate.sigmoid_mul` precedent. A second element wants a second spelling of
-/// the launcher, not a cast here.
 fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal> {
     if T::CPP == <bf16 as kernels::Elem>::CPP {
         Ok(())
@@ -81,13 +65,9 @@ fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal
     }
 }
 
-/// The recurrent view a `Cache` slot raises, or the refusal that names the
-/// statement.
-///
-/// EVERY BODY IN THIS FILE THAT TOUCHES A RECURRENT SLAB STARTS HERE: the
-/// raise answers a pointer and a null one is a statement whose cache row the
-/// driver never staged, which is a refusal by name rather than a fault.
-fn recurrent(rsv: In<Struct<RecurrentState>>) -> Result<&'static crate::views::RecurrentView, Refusal> {
+fn recurrent(
+    rsv: In<Struct<RecurrentState>>,
+) -> Result<&'static crate::views::RecurrentView, Refusal> {
     if rsv.ptr.is_null() {
         return Err(Refusal::Null {
             what: "the recurrent view this statement names",
@@ -96,13 +76,6 @@ fn recurrent(rsv: In<Struct<RecurrentState>>) -> Result<&'static crate::views::R
     Ok(unsafe { &*rsv.ptr })
 }
 
-/// The conv's two numbers, as the launches ask for them.
-///
-/// `c` is the CHANNEL count and it is read, not stated: a depthwise conv
-/// runs one channel per column, so the channel count IS the operand's row.
-/// `k` is the kernel width and it is stated, because it lives in the
-/// `[channels, width]` weight and a `Const` carries an address with no
-/// rectangle behind it.
 fn conv_shape<T: kernels::Elem>(x: In<Tensor<T>>, conv_width: u32) -> Result<(i32, i32), Refusal> {
     let rect = x.all("the conv's channel count")?;
     let k = i32::try_from(conv_width).map_err(|_| Refusal::Wide {
@@ -113,60 +86,6 @@ fn conv_shape<T: kernels::Elem>(x: In<Tensor<T>>, conv_width: u32) -> Result<(i3
     Ok((rect.width, k))
 }
 
-/// The `Ssm` family, claimed. Five of seven points land; the other two are
-/// measured backlog rows, and each absence is a stated one.
-///
-/// # The three GDN points are one seam, and W10 finished cutting it
-///
-/// * `ssm.gdn_prep` — CLAIMED, one launch. It used to resolve through
-///   `qwen_gdn_post_conv_prep_bf16`, which is a different statement wearing
-///   this point's name: that routine takes the post-conv `qkv` this
-///   declaration has no slot for, writes FIVE rectangles where the
-///   statement states one, and asks for five geometry scalars on top. An
-///   executor firing it had to reach backwards through the plan for the
-///   missing operand and carve three scratch columns for the missing
-///   results — and hand over the two halves of `[b | a]` and of
-///   `[g_log | beta]` as pointer offsets into packed rows, which is a row
-///   stride of `v_heads` claimed for bytes whose stride is `2 * v_heads`.
-///   `qwen_gdn_ba_gates` is that arithmetic with the packing kept: the
-///   projection in as the matmul wrote it, the decay row out as the two
-///   recurrences read it. Nothing is staged and nothing is cut.
-/// * `ssm.gated_delta` — CLAIMED, and structurally identical to the
-///   chunked form below: [`GdnShape::stage`] then the step scan. The five
-///   compact f32 planes the scan takes are not five rows carved out of one
-///   at offsets nothing declares — they are the same two prologue kernels
-///   the window fires, over the same two packed rectangles the statement
-///   carries.
-/// * `ssm.gated_delta_chunked` — CLAIMED, and by a body rather than a
-///   `canon` retag, because no single routine in this file spells it. The
-///   window's prologue (the q/k l2-norm, the value widen, the fused decay
-///   row's cut) and the scan are separate launches, and WHICH scan is a
-///   per-fire choice on `k_dim` and `v_dim` — the branch reads
-///   `kernels/ssm/gated_delta_net.cuh`, not a config flag. See
-///   [`Ssm::gated_delta_chunked`]'s own body for the three arms and what
-///   each one is bounded by.
-///
-///   This is where the l2-norm ended up and why: it cannot live on
-///   `ssm.gdn_prep` at all, because that declaration carries no `qkv` slot.
-///   It is the recurrence points that take the packed row, so it is the
-///   recurrence points that own the norm — the chunked body said so first
-///   and the step form now says it too.
-/// * `ssm.kda_step` / `ssm.kda_chunked` — CLAIMED, and by bodies for the
-///   same reason `gated_delta_chunked` is: no routine in this file spells
-///   either. The legacy KDA leg staged NINE launches per mixer, and the new
-///   text keeps the four that are statements (one packed projection, one
-///   packed conv, the `f` and `b` projections) and leaves the other five
-///   here — a packed-plane cut with two l2 norms and a widen in it, the
-///   gate/beta cook, and the recurrence. The two points' own docs say what
-///   each launch is and where it came from.
-///
-///   The chunked one also carries a finding: `kda_prefill_batched` had
-///   never been fired by anything in this tree, and it is bit-identical to
-///   a per-token loop of the decode step — the same fp32 state through the
-///   same slab, the same warp-per-row reductions. So W2's
-///   rounding-trajectory law holds here with no arm to choose, and
-///   `tests/kda_recurrence.rs` is where that is measured rather than
-///   argued.
 #[kernels_macros::claims]
 impl kernels::points::Ssm for Ctx<'_> {
     fn causal_conv1d<T: kernels::points::Scalar>(
@@ -193,11 +112,6 @@ impl kernels::points::Ssm for Ctx<'_> {
             &[
                 x.ptr.cast::<bf16>().arg(),
                 weight.v.cast::<bf16>().arg(),
-                // The statement carries ONE weight, so there is no bias
-                // plane to hand over. Every shipping conv1d in this tree
-                // agrees — the legacy `ConvW` states `bias: None` — and a
-                // checkpoint that grew one would state a second `Const` on
-                // the point.
                 MaybeConst::<bf16>::none().arg(),
                 rsv.conv_slab.arg(),
                 rsv.slot_ids.arg(),
@@ -222,13 +136,9 @@ impl kernels::points::Ssm for Ctx<'_> {
         at_bf16::<T>("ssm.causal_conv1d_chunked at an element other than bf16")?;
         let (c, k) = conv_shape(x, conv_width)?;
         let rsv = recurrent(state.raised())?;
-        // The request count is the CSR operand's own row count -- the
-        // pairing, not a `Const` restating it.
+
         let r = indptr.rows;
 
-        // THE CHANNEL-TILED ARM, and what bounds it: past eight requests a
-        // block per channel leaves the machine short of blocks, so the tiled
-        // form takes 128 channels at a time and grids the requests instead.
         const CONV_CHANNEL_TILE_FROM: i32 = 8;
         const CONV_TILE: u32 = 128;
         const CONV_PER_CHANNEL_BLOCK: u32 = 64;
@@ -257,12 +167,6 @@ impl kernels::points::Ssm for Ctx<'_> {
                 rsv.conv_stride.arg(),
                 c.arg(),
                 k.arg(),
-                // A STATEMENT THAT NAMES A CACHE ROW LEAVES ITS TAIL THERE.
-                // A chunked conv that skipped the write-back would hand the
-                // next fire a stale window, so there is no second reading
-                // for the point to state; the driver has never bound the
-                // flag any other way either (`fire/launch.rs` builds every
-                // `Gdn` view with `write_state: true`).
                 true.arg(),
                 MaybeConst::<u8>::none().arg(),
                 MaybeConst::<i32>::none().arg(),
@@ -270,33 +174,6 @@ impl kernels::points::Ssm for Ctx<'_> {
         )
     }
 
-    /// Qwen's gated-delta prologue: the packed `[b | a]` projection in, the
-    /// packed `[g_log | beta]` decay row out.
-    ///
-    /// ONE LAUNCH, AND EXACTLY THE DECLARATION'S SLOTS. This point used to
-    /// resolve through `qwen_gdn_post_conv_prep_bf16`, which is a different
-    /// statement wearing this one's name: that routine takes the
-    /// post-convolution `qkv` this declaration has no slot for, and writes
-    /// five rectangles where this one states one. An executor firing it had
-    /// to reach backwards through the plan for the missing operand and carve
-    /// three scratch columns for the missing results — and, worse, hand the
-    /// two halves of `ba` and the two halves of `gates` over as pointer
-    /// offsets into packed rows, which is a row stride of `v_heads` claimed
-    /// for bytes whose stride is `2 * v_heads`. True at one token, false at
-    /// two, and silent either way.
-    ///
-    /// `qwen_gdn_ba_gates` is that arithmetic with the packing kept: it
-    /// reads the projection as the matmul wrote it and writes the decay row
-    /// as [`Ssm::gated_delta`] and [`Ssm::gated_delta_chunked`] read it. The
-    /// three planes the old routine also wrote belong to the recurrence
-    /// points, which declare the `qkv` they are cut from; both stage them
-    /// now (see [`GdnShape::stage`]).
-    ///
-    /// # `v_heads` is read, not stated
-    ///
-    /// The declaration states no scalar, and it does not need to: the
-    /// operand IS `[b | a]`, so the value-head count is half its width. A
-    /// `Const` restating it could disagree with the rectangle it divides.
     fn gdn_prep<T: kernels::points::Scalar>(
         &self,
         ba: In<Tensor<T>>,
@@ -314,10 +191,7 @@ impl kernels::points::Ssm for Ctx<'_> {
             });
         }
         let v_h = src.width / 2;
-        // THE RESULT IS THE OPERAND'S SHAPE ON f32 — `program.rs`'s width
-        // rule says so (`sized(rows(0), width(0), Dt::F32)`) and the kernel
-        // strides both by the same `2 * v_heads`, so a rectangle that
-        // disagreed would be written past rather than partially.
+
         if dst.width != src.width || dst.rows != src.rows {
             return Err(Refusal::Narrow {
                 what: "the fused `[g_log | beta]` row, against the projection it is derived from",
@@ -349,20 +223,6 @@ impl kernels::points::Ssm for Ctx<'_> {
         )
     }
 
-    /// The gated-delta rule for one token per request.
-    ///
-    /// THE SAME BODY AS [`Ssm::gated_delta_chunked`] WITH A DIFFERENT SCAN,
-    /// and that is the point of writing it: the prologue is a property of
-    /// the two rectangles a statement carries, not of how many tokens are in
-    /// them. `qkv` is packed by `conv_dim` and `gates` by `2 * v_heads`; the
-    /// scans read five COMPACT f32 planes. [`GdnShape::stage`] is the cut, in a
-    /// kernel, at any token count — where the executor's own pointer
-    /// arithmetic was right only at one.
-    ///
-    /// The l2-norm rides here for the reason
-    /// [`Ssm::gated_delta_chunked`] states: `ssm.gdn_prep` declares no `qkv`
-    /// slot, so the norm cannot be its arithmetic; this point declares the
-    /// packed row and the four numbers that divide it, so it owns it.
     fn gated_delta<T: kernels::points::Scalar>(
         &self,
         qkv: In<Tensor<T>>,
@@ -375,14 +235,11 @@ impl kernels::points::Ssm for Ctx<'_> {
         v_dim: u32,
         y: Out<Tensor<f32>>,
     ) -> Result<(), Refusal> {
-        // `z` IS THE OUT-NORM'S GATE and this point does not spend it — the
-        // chunked form's reading, in the same words.
         let _ = z;
         at_bf16::<T>("ssm.gated_delta at an element other than bf16")?;
 
         let shape = GdnShape::of(qkv, gates, k_heads, v_heads, k_dim, v_dim)?;
-        // The result is `[tokens, v_heads * v_dim]` and the scan writes it
-        // that way, `out[(r * v_heads + h) * v_dim + v]`.
+
         let result = y.all("the recurrence's result")?;
         if i64::from(result.width) != i64::from(shape.v_h) * i64::from(shape.v_d) {
             return Err(Refusal::Narrow {
@@ -399,95 +256,6 @@ impl kernels::points::Ssm for Ctx<'_> {
         shape.step(self, &staged, state.ptr, y)
     }
 
-    /// The gated-delta rule over a prefill window, GQA and all.
-    ///
-    /// # The prologue is this point's, not `gdn_prep`'s
-    ///
-    /// The legacy text ran the q/k l2-norm inside its prep launch, and the
-    /// decode lane's staging shim still reaches BACKWARDS through the plan's
-    /// dataflow to hand `qwen_gdn_post_conv_prep_bf16` a `qkv` its statement
-    /// never carried (`baker-smoke/src/smoke.rs:1156-1166`). That reach is
-    /// the tell. `ssm.gdn_prep` DECLARES three slots — `ba`, `dt_bias`,
-    /// `a_log` — and not one of them is the packed row, so the l2-norm
-    /// cannot be its arithmetic. This point declares `qkv` and the four head
-    /// numbers that divide it, so the norm is HERE, and the body owns it:
-    ///
-    ///   1. `qwen_gdn_qk_norm` — the two key-head planes, l2-normalised and
-    ///      widened, `q` carrying the `1/sqrt(k_dim)` scale the decode
-    ///      prologue applies (`driver_internal.rs:101`). Compact in
-    ///      `k_heads` heads, which is what the GQA scans below read.
-    ///   2. `qwen_gdn_v_gates` — the value slice widened out of the packed
-    ///      row, and `gates` cut into its two COMPACT halves. The cut is a
-    ///      kernel and not a pointer offset: the scans index
-    ///      `g_log[t * v_heads + h]` while `gates` strides by `2 * v_heads`
-    ///      per token, and the two agree only at ONE token. The decode
-    ///      shim used to take that offset by hand and was right for exactly
-    ///      as long as its fires were one row wide.
-    ///   3. one of three scans.
-    ///
-    /// # The scratch
-    ///
-    /// Named device slabs from [`Ctx::scratch`] — the same grow-on-demand
-    /// arena `attn::xqa` takes its two workspaces from and `sample` its
-    /// argmax pairs. A body that staged nothing could not claim this point
-    /// at all; a body that asked the DRIVER to stage it would be putting
-    /// five rectangles nothing declares on the operand column.
-    ///
-    /// A named slab is per PROCESS, not per fire, so the planes are alive
-    /// only between the prologue and the scan that reads them — which is
-    /// exactly the window a fire owns, since the launches are issued in
-    /// order on one stream. Two fires racing the same plane would share
-    /// them, and that is the property every `Ctx::scratch` caller already
-    /// has.
-    ///
-    /// # Which scan, and why the token count is not the question
-    ///
-    /// The legacy text guarded its three arms on TOKENS
-    /// (`GuardPred::TokensLE(64)` for the warp-tiled arm, `TokensLE(4096)`
-    /// for the cached one). Neither bound is in a kernel. Every one of these
-    /// scans walks its request's window with `for (int t = 0; t < T; ++t)`
-    /// and no cap — the guards were a performance dial, and the shipping
-    /// projection turns BOTH off (`warp_tiled: false`, `cached_max: 0`,
-    /// `model-legacy/src/qwen_3_5/project.rs:233-235`), leaving the fla arm
-    /// to serve every window length. What IS in the kernels is shape:
-    ///
-    /// * `chunk_gated_delta_prefill_batched_fla<_, 128, 128>` is GQA-NATIVE
-    ///   (`h_k = h / (V_h / K_h)`, `gated_delta_net.cuh:1440-1451`), so the
-    ///   `repeat_interleave` the legacy staged is not a step this arm needs
-    ///   at all. Its bounds are `BK_MAX = 128 >= k_dim` and a `BV = 128`
-    ///   that must DIVIDE `v_dim` — the block returns early past `v_dim`,
-    ///   and the token loop's `__syncthreads()` would hang on the lanes that
-    ///   left.
-    /// * `chunk_gated_delta_prefill_batched_warp_tiled_gqa` is GQA-native
-    ///   too and takes any `v_dim`; it is bounded by `MAX_K_PER_LANE = 8`
-    ///   over 32 lanes — `k_dim <= 256` (`gated_delta_net.cuh:469`).
-    /// * `chunk_gated_delta_prefill_batched` is the only one that is NOT:
-    ///   it takes `V_h` alone and indexes q/k by it, which is precisely what
-    ///   the legacy composite's `repeat_interleave_heads_fp32` was FOR. Past
-    ///   both bounds above, this body stages that repeat itself.
-    ///
-    /// The order between the first two is not arbitrary. fla holds its state
-    /// in bf16 registers and rounds it TWICE per token, which is what the
-    /// per-token form does through HBM (`gated_delta_net.cuh:1414-1420`
-    /// records the two as bit-identical) and what the decode step is pinned
-    /// to (`recurrent_step_batched_gqa_smem` rounds `state * g` before
-    /// adding delta ON PURPOSE — "Qwen3.5-0.8B diverged from the HF
-    /// reference trajectory at the SECOND decoded token" without it,
-    /// `gated_delta_net.cuh:1370-1381`). The warp-tiled arm carries fp32
-    /// state across the whole window instead: more accurate per step, and
-    /// agreeing with neither. A prefill whose tail is handed to the decode
-    /// step must round the way the step rounds, so fla goes first and
-    /// warp-tiled serves only the shapes fla cannot take.
-    ///
-    /// # The slot the tail lands in
-    ///
-    /// `state_bf16`, `KLast = false`: `slab + slot * slot_stride_elems +
-    /// h * k_dim * v_dim`, then `k * v_dim + v`. That is the decode step's
-    /// addressing verbatim (`gated_delta_net.cuh:1291-1293, 1345`) and the
-    /// `[v_heads, k_dim, v_dim]` bf16 slab `baker-smoke` allocates. The
-    /// element is PINNED rather than read because a `Cache` slot's dtype
-    /// column is `Opaque` — the pool chose it, and on this plane the pool
-    /// chose bf16.
     fn gated_delta_chunked<T: kernels::points::Scalar>(
         &self,
         qkv: In<Tensor<T>>,
@@ -501,20 +269,12 @@ impl kernels::points::Ssm for Ctx<'_> {
         v_dim: u32,
         y: Out<Tensor<f32>>,
     ) -> Result<(), Refusal> {
-        // `z` IS THE OUT-NORM'S GATE and this point does not spend it. The
-        // statement carries it because the recurrence and the gate are one
-        // arm of the text's `merge!`, and `norm.rmsnorm_gated` downstream is
-        // what reads it — the decode lane says the same thing in the same
-        // words (`baker-smoke/src/smoke.rs:1215-1217`).
         let _ = z;
         at_bf16::<T>("ssm.gated_delta_chunked at an element other than bf16")?;
 
         let window = Chunked::of(qkv, indptr, gates, k_heads, v_heads, k_dim, v_dim)?;
         let shape = window.g;
-        // The result is `[tokens, v_heads * v_dim]` and the scans write it
-        // that way, `out[(t * v_heads + h) * v_dim + v]`. A narrower
-        // rectangle would be written PAST rather than partially, so the
-        // width is checked here and not left to the walk that sized it.
+
         let result = y.all("the recurrence's result")?;
         if i64::from(result.width) != i64::from(shape.v_h) * i64::from(shape.v_d) {
             return Err(Refusal::Narrow {
@@ -532,61 +292,6 @@ impl kernels::points::Ssm for Ctx<'_> {
         window.scan(self, &staged, rsv, y.ptr)
     }
 
-    /// Kimi's KDA rule for one token per request.
-    ///
-    /// # What the TEXT carries and what this body stages
-    ///
-    /// The legacy leg fired NINE launches per mixer
-    /// (`model-legacy/src/kimi_k3/forward/mod.rs:199-283`) and the new text
-    /// keeps four of them, because it says the same arithmetic in fewer
-    /// rectangles:
-    ///
-    /// | legacy | the text |
-    /// | --- | --- |
-    /// | `q_proj`, `k_proj`, `v_proj` — three matmuls | ONE `gemm.matmul` on a packed `[3 * heads * head_dim, hidden]` bank |
-    /// | `q_conv1d`, `k_conv1d`, `v_conv1d` — three convs | ONE `ssm.causal_conv1d` on the packed plane, over `3 * heads * head_dim` channels |
-    /// | `f_a`, `f_b`, `b` — three matmuls | the same three; `f` and `b` arrive as VALUES |
-    ///
-    /// So the matmuls are not this body's and neither is the convolution:
-    /// `mixed` arrives post-conv, `f` and `b` arrive projected. The other
-    /// five ARE this body's, and they are exactly the ones with no
-    /// statement of their own to stand in — two casts, an l2 norm, the
-    /// gate/beta cook and the recurrence:
-    ///
-    ///   1. `kda_qkv_prep` — the packed row cut into three COMPACT f32
-    ///      planes, `q` and `k` l2-normalised at the STATED `norm_eps` and
-    ///      `v` widened. ONE launch where the legacy fired three
-    ///      (`l2norm_scale_bf16_to_fp32` twice and `bf16_to_fp32` once)
-    ///      over rectangles its three separate convs had already left
-    ///      compact. `kernels/ssm/kda.cuh` transcribes those three and says
-    ///      what it normalises OVER, which is the whole plane and not the
-    ///      head — the shipped reading, and a debt it names rather than
-    ///      quietly settles.
-    ///   2. `kda_gate_beta` — `g = -exp(a_log[h]) * softplus(f + dt_bias)`
-    ///      per CHANNEL and `beta = sigmoid(b)` per head. Unchanged from
-    ///      the legacy launch, argument for argument.
-    ///   3. `kda_recurrent_step_batched` — the delta rule against the
-    ///      slot's `[heads, head_dim, head_dim]` f32 state.
-    ///
-    /// # The scratch
-    ///
-    /// Named device slabs from [`Ctx::scratch`], the arena
-    /// `Ssm::gated_delta_chunked` takes its five planes from and for the
-    /// same reason: a body that asked the DRIVER to stage them would be
-    /// putting five rectangles nothing declares on the operand column. Two
-    /// slabs and five planes, because the recurrences take the planes as
-    /// separate pointers — `[q | k | v]` in one and `[gate | beta]` in the
-    /// other, cut at the offsets `stage` computes and nowhere else.
-    ///
-    /// # The state's element is F32 here and bf16 next door
-    ///
-    /// `kda_recurrent_step_batched` takes `float* __restrict__ state_base`
-    /// (`kernels/ssm/kda.cuh`), where every gated-delta scan in this file
-    /// is instantiated `<::pie::ssm::state_bf16, ..>`. A `Cache` slot's
-    /// dtype column is `Opaque` — the pool chose it — so this is a pin
-    /// against the kernel rather than a reading of the slot, and the pool
-    /// already spells both (`driver-cuda/src/layout/recurrent_layout.rs`'s
-    /// `recurrent_is_bf16`).
     fn kda_step<T: kernels::points::Scalar>(
         &self,
         mixed: In<Tensor<T>>,
@@ -622,44 +327,6 @@ impl kernels::points::Ssm for Ctx<'_> {
         )
     }
 
-    /// [`Ssm::kda_step`] over a prefill window — the same prologue, and the
-    /// window form of the same recurrence.
-    ///
-    /// # `kda_prefill_batched`, and why it is not "the step in a loop"
-    ///
-    /// It IS the step in a loop, and that is the finding rather than the
-    /// objection. Both kernels live in `kernels/ssm/kda.cuh`, share the
-    /// warp-per-`v`-row mapping, and carry the state as F32 THROUGH THE
-    /// SLAB — `row[ki] = sv` twice per token, read back by the next token
-    /// from the same address. There is no register-resident window and no
-    /// bf16 round trip, so the two rounding trajectories are not merely
-    /// close: the prefill kernel's per-token body is the decode kernel's,
-    /// character for character, with `rh` replaced by `t * H + h` and the
-    /// whole thing wrapped in the window's `for (t = begin; t < end; ++t)`.
-    ///
-    /// That matters because of W2's law: A PREFILL TAIL MUST LEAVE THE
-    /// STATE THE DECODE STEP WOULD HAVE LEFT. The gated-delta family had to
-    /// CHOOSE its arm to satisfy it (fla rounds to bf16 twice per token
-    /// because the step does, and warp-tiled — more accurate — is
-    /// therefore the fallback rather than the default). KDA has no such
-    /// choice to make: one arithmetic, two loop nests.
-    ///
-    /// `kernels-cuda/tests/kda_recurrence.rs` MEASURES it rather than
-    /// asserting it, because the legacy never fired this kernel. It ran the
-    /// step form even on prefill, one launch per token, and
-    /// `.wiki/driver/new-horizon.md:7652` lists `ssm::kda_prefill_batched`
-    /// among the seven symbols with "nothing at all — not a test, not a
-    /// comment, only the row and its wrapper". A kernel nothing has ever
-    /// run is not one to trust on a reading of its source, so the test runs
-    /// a two-window handoff against a per-request step loop and compares
-    /// the slab bit for bit.
-    ///
-    /// # The CSR is the request count and nothing else
-    ///
-    /// `kda_prefill_batched` reads `qo_indptr[r]` and `qo_indptr[r + 1]`
-    /// and takes its `r` off the CSR operand's own row count, which is the
-    /// pairing every other `*_chunked` routine in this file uses rather
-    /// than a `Const` restating it.
     fn kda_chunked<T: kernels::points::Scalar>(
         &self,
         mixed: In<Tensor<T>>,
@@ -695,7 +362,7 @@ impl kernels::points::Ssm for Ctx<'_> {
         };
         let (h, d) = (shape.h, shape.d);
         let rsv = recurrent(rsv)?;
-        // The request count is the CSR operand's own row count.
+
         let r = indptr.rows;
         let qo_indptr = indptr.ptr as *const u32;
         const KDA_PREFILL_MAX_WARPS: i32 = 32;
@@ -725,8 +392,6 @@ impl kernels::points::Ssm for Ctx<'_> {
     }
 }
 
-/// The recurrent view a `Cache` slot names, or the refusal that says it was
-/// not there.
 fn raised(
     state: Cache<kernels::raises::Struct<RecurrentState>>,
 ) -> Result<In<Struct<RecurrentState>>, Refusal> {
@@ -738,8 +403,6 @@ fn raised(
     Ok(state.raised())
 }
 
-/// One staged plane, as the routines want it: a rectangle whose rows are the
-/// fire's and whose width the shape states.
 const fn plane(ptr: *mut f32, rows: i32, width: i32) -> In<Tensor<f32>> {
     In {
         ptr: ptr.cast_const(),
@@ -748,26 +411,16 @@ const fn plane(ptr: *mut f32, rows: i32, width: i32) -> In<Tensor<f32>> {
     }
 }
 
-/// KDA's geometry, read ONCE and checked against the four rectangles that
-/// carry it.
-///
-/// `heads` and `head_dim` are STATED because a packed `[q | k | v]` row
-/// cannot be divided by reading it, and everything else is READ: `n` is the
-/// fire's own row count, and the widths are checked against the two stated
-/// numbers rather than trusted.
 #[derive(Clone, Copy)]
 struct Kda {
     n: i32,
     h: i32,
     d: i32,
-    /// `h * d` — ONE plane of the packed row, and the width of every f32
-    /// plane the recurrence reads.
+
     w: i32,
     eps: f32,
 }
 
-/// The five f32 planes the KDA recurrences take, carved out of the named
-/// scratch.
 #[derive(Clone, Copy)]
 struct KdaStaged {
     q_norm: *mut f32,
@@ -807,10 +460,6 @@ impl Kda {
             max: i64::from(i32::MAX),
         })?;
 
-        // THE ROW THE TWO NUMBERS ADD UP TO, three times over. A width that
-        // disagrees is a statement whose head numbers are not this
-        // rectangle's, and the prologue would cut the value plane at the
-        // wrong column — so it refuses rather than slicing on faith.
         let packed = mixed.all("the post-convolution `[q | k | v]` row")?;
         if i64::from(packed.width) != 3 * i64::from(w) {
             return Err(Refusal::Narrow {
@@ -820,12 +469,6 @@ impl Kda {
         }
         let n = packed.rows;
 
-        // `f` IS PER CHANNEL AND `b` IS PER HEAD, which is KDA's whole
-        // shape: the forget gate is a `[heads, head_dim]` decay where the
-        // gated-delta rule's is one column per head, and beta is the
-        // column. That reading is checkable exactly here, and
-        // `kda_gate_beta` reads the two apart — `raw_g[(t * H + h) * D + d]`
-        // against `raw_beta[t * H + h]`.
         let forget = f.all("the forget projection this statement hands over")?;
         if i64::from(forget.width) != i64::from(w) {
             return Err(Refusal::Narrow {
@@ -847,10 +490,6 @@ impl Kda {
             });
         }
 
-        // The result is `[rows, heads * head_dim]` and the recurrences write
-        // it that way, `out[(t * H + h) * D + v]`. A narrower rectangle
-        // would be written PAST rather than partially, so the width is
-        // checked here and not left to the walk that sized it.
         let result = y.all("the recurrence's result")?;
         if i64::from(result.width) != i64::from(w) {
             return Err(Refusal::Narrow {
@@ -867,7 +506,6 @@ impl Kda {
         })
     }
 
-    /// `n * width` f32 elements, refused rather than wrapped.
     fn plane_elems(self, width: i32, what: &'static str) -> Result<usize, Refusal> {
         let elems = i64::from(self.n) * i64::from(width);
         usize::try_from(elems).map_err(|_| Refusal::Wide {
@@ -877,7 +515,6 @@ impl Kda {
         })
     }
 
-    /// The prologue: two launches, five planes.
     fn stage<T: kernels::points::Scalar>(
         self,
         ctx: &Ctx<'_>,
@@ -889,17 +526,12 @@ impl Kda {
     ) -> Result<KdaStaged, Refusal> {
         const PREP_BLOCK: u32 = 128;
 
-        /// `q`, `k`, `v` — the three the cut writes, one block each per row.
-        /// `kda_qkv_prep` reads which one off `blockIdx.y`.
         const PLANES: u32 = 3;
 
         let Kda { n, h, d, w, eps } = self;
         let wide = self.plane_elems(w, "the `[q | k | v]` plane this fire stages")?;
         let decay = self.plane_elems(h, "the beta column this fire stages")?;
 
-        // Three planes in the first slab and two in the second, because the
-        // recurrences take them as five separate pointers: `q`, `k`, `v`,
-        // then `gate` and `beta`.
         let qkv = ctx
             .scratch("ssm::kda_qkv", 3 * wide * core::mem::size_of::<f32>())?
             .cast::<f32>();
@@ -918,8 +550,9 @@ impl Kda {
         };
 
         ctx.fire(
-            Fire::at("ssm/kda.cuh", "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>")
-                .apply(Launch::grid([n.unsigned_abs(), PLANES, 1], [PREP_BLOCK, 1, 1])),
+            Fire::at("ssm/kda.cuh", "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>").apply(
+                Launch::grid([n.unsigned_abs(), PLANES, 1], [PREP_BLOCK, 1, 1]),
+            ),
             &[
                 mixed.ptr.cast::<bf16>().arg(),
                 staged.q_norm.arg(),
@@ -930,10 +563,6 @@ impl Kda {
             ],
         )?;
 
-        // The gate/beta cook, through the routine the legacy fired — same
-        // launcher, same arguments, and `lower_bound` left at the zero that
-        // launcher pins, which is the softplus branch. The sigmoid branch
-        // past it is a reading no kimi text has ever stated.
         kda_gate_beta::<bf16>(
             ctx,
             In {
@@ -964,19 +593,6 @@ impl Kda {
     }
 }
 
-/// The gated-delta rule's geometry, read ONCE and checked against the two
-/// rectangles that carry it.
-///
-/// SHARED BY THE STEP AND THE WINDOW, because the two points differ in
-/// exactly two things and neither is here: how the request boundary arrives
-/// (a row count vs a CSR) and which scan runs. Everything before that — the
-/// four head numbers, the packed row they must add up to, the fused
-/// `[g_log | beta]` row, and the five compact f32 planes the scans read — is
-/// one description, so it is written once.
-///
-/// The four head numbers are STATED on the point — a packed row cannot be
-/// divided by reading it — and everything else is READ: `n` is the window's
-/// own row count and `conv_dim` its width.
 #[derive(Clone, Copy)]
 struct GdnShape {
     n: i32,
@@ -987,11 +603,6 @@ struct GdnShape {
     conv_dim: i32,
 }
 
-/// [`GdnShape`] over a prefill window: the same geometry, plus the request
-/// boundary the scans walk.
-///
-/// `r` is the CSR's row count, the pairing every other `*_chunked` routine in
-/// this file uses rather than a `Const` restating it.
 #[derive(Clone, Copy)]
 struct Chunked {
     g: GdnShape,
@@ -999,7 +610,6 @@ struct Chunked {
     qo_indptr: *const u32,
 }
 
-/// The five f32 planes the scans take, carved out of the named scratch.
 #[derive(Clone, Copy)]
 struct Staged {
     q_norm: *mut f32,
@@ -1040,10 +650,7 @@ impl GdnShape {
             });
         }
         let packed = qkv.all("the post-convolution qkv")?;
-        // THE ROW THE FOUR NUMBERS ADD UP TO. A width that disagrees is a
-        // statement whose head numbers are not this rectangle's, and the
-        // prologue would read the value slice at the wrong column — so it
-        // refuses rather than slicing on faith.
+
         let want = 2 * i64::from(k_h) * i64::from(k_d) + i64::from(v_h) * i64::from(v_d);
         if i64::from(packed.width) != want {
             return Err(Refusal::Narrow {
@@ -1068,7 +675,6 @@ impl GdnShape {
         })
     }
 
-    /// `n * heads * width` f32 elements, refused rather than wrapped.
     fn plane(self, heads: i32, width: i32, what: &'static str) -> Result<usize, Refusal> {
         let elems = i64::from(self.n) * i64::from(heads) * i64::from(width);
         usize::try_from(elems).map_err(|_| Refusal::Wide {
@@ -1078,16 +684,6 @@ impl GdnShape {
         })
     }
 
-    /// The prologue: two launches, five planes.
-    ///
-    /// BOTH RECURRENCE POINTS COME THROUGH HERE, and that is the whole
-    /// answer to the strideless mark. The scans read five COMPACT planes —
-    /// `q_norm[(t * K_h + h) * K_d]`, `g_log[t * V_h + h]` — while the two
-    /// rectangles a statement carries are PACKED rows: `qkv` strides by
-    /// `conv_dim` and `gates` by `2 * V_h`. Cutting a compact plane out of
-    /// either with a pointer offset claims the cut's width as the row
-    /// stride, which is true at one token and false at two. So the cut is a
-    /// kernel, at every token count, for the step exactly as for the window.
     fn stage(self, ctx: &Ctx<'_>, qkv: *const bf16, gates: *const f32) -> Result<Staged, Refusal> {
         const PREP_BLOCK: u32 = 128;
 
@@ -1103,8 +699,6 @@ impl GdnShape {
         let val = self.plane(v_h, v_d, "the value plane this recurrence stages")?;
         let decay = self.plane(v_h, 1, "the decay plane this recurrence stages")?;
 
-        // Two planes per slab and one slab per shape, because the scans take
-        // the halves as separate pointers: `q` then `k`, `g_log` then `beta`.
         let qk = ctx
             .scratch("ssm::gdn_chunk_qk", 2 * key * core::mem::size_of::<f32>())?
             .cast::<f32>();
@@ -1171,15 +765,6 @@ impl GdnShape {
         Ok(staged)
     }
 
-    /// The step scan, over the five planes [`GdnShape::stage`] just wrote.
-    ///
-    /// THE ROW COUNT IS THE REQUEST COUNT HERE, and it is read rather than
-    /// stated because the point's own name is what makes it true: a step
-    /// form is one token per request, which is the fact (`qo_one`) the lane
-    /// carrying this statement was selected on. `recurrent_step_batched_gqa`
-    /// indexes both `slot_ids[r]` and the token row by the same `blockIdx.y`
-    /// (`gated_delta_net.cuh:1275-1284`), so the two numbers are one number
-    /// and a `Const` restating it could only disagree with the rectangle.
     fn step(
         self,
         ctx: &Ctx<'_>,
@@ -1257,16 +842,11 @@ impl Chunked {
         Ok(Chunked {
             g,
             r: indptr.rows,
-            // The CSR is `[requests + 1]` u32 boundaries; every scan in this
-            // file reads it that way and the declaration spells its slot
-            // `i32` because a boundary buffer is an ordinary device
-            // rectangle, not because the kernel signs it.
+
             qo_indptr: indptr.ptr.cast::<u32>(),
         })
     }
 
-    /// The scan, chosen on the shape. See the point's own doc for what each
-    /// arm is bounded by and why the order is what it is.
     fn scan(
         self,
         ctx: &Ctx<'_>,
@@ -1278,16 +858,11 @@ impl Chunked {
 
         const BV_FLA: u32 = 128;
 
-        /// `MAX_K_PER_LANE * 32` — `kernels/ssm/gated_delta_net.cuh:469`.
         const WARP_TILED_K_MAX: i32 = 256;
 
         let Chunked { g, r, qo_indptr } = self;
         let GdnShape {
-            k_h,
-            v_h,
-            k_d,
-            v_d,
-            ..
+            k_h, v_h, k_d, v_d, ..
         } = g;
         let (rows, heads) = (r.unsigned_abs(), v_h.unsigned_abs());
         let state_base = rsv.slab;
@@ -1298,8 +873,7 @@ impl Chunked {
         }
         let slot_ids = rsv.slot_ids;
         let slot_stride_elems = rsv.slot_stride_elems;
-        // A STATEMENT THAT NAMES A CACHE ROW LEAVES ITS TAIL THERE — the
-        // chunked conv's reading, and the same one here.
+
         let write_state = true;
 
         if k_d <= BK_MAX_FLA && v_d.unsigned_abs() % BV_FLA == 0 {
@@ -1328,9 +902,7 @@ impl Chunked {
                     k_d.arg(),
                     v_d.arg(),
                     write_state.arg(),
-                    // No commit-length clamp and no per-row mask: this point
-                    // states neither, and a null is what "the pass is
-                    // uniform" spells at both kernels.
+
                     MaybeConst::<i32>::none().arg(),
                     MaybeConst::<u8>::none().arg(),
                 ],
@@ -1365,11 +937,6 @@ impl Chunked {
             );
         }
 
-        // PAST BOTH GQA-NATIVE ARMS, and this is where the legacy composite
-        // lives: the per-token form indexes q and k by `V_h`, so the key
-        // heads have to be broadcast up to the value heads first. One more
-        // scratch slab, one more launch, and the scan reads a `k_h == v_h`
-        // rectangle.
         let (q_norm, k_norm) = if v_h == k_h {
             (staged.q_norm.cast_const(), staged.k_norm.cast_const())
         } else {
@@ -1604,8 +1171,7 @@ pub fn kda_recurrent_step_batched(
     let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;
     let slot_stride_elems = rsv.slot_stride_elems;
-    // One row per request: the statement's `[Requests, H, D]` result is the
-    // launch rectangle, so the count is the result's own row count.
+
     let r = out.rows;
     const KDA_STEP_BLOCK: u32 = 256;
     ctx.fire(
@@ -1655,7 +1221,6 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     }
     let rsv = unsafe { &*rsv.ptr };
 
-    // The request count is the CSR operand's own row count.
     let r = qo_indptr.rows;
     let state_base = rsv.slab;
     let slot_ids = rsv.slot_ids;

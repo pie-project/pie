@@ -1,18 +1,18 @@
-# ── THIS MANIFEST DOES NOT RESOLVE, AND THAT IS THE QUARANTINE (R3) ─────
+# ── THE QUARANTINE IS OVER (P5) ─────────────────────────────────────────
 #
-# `driver-metal` is in the root workspace's `exclude` list and no member
-# path-depends on it, because it was one of the last three consumers of
-# `model-legacy` and `model_compiler::lower` — both deleted. The
-# `model-legacy` edge below therefore points at a directory that is not
-# there.
+# R3 left this manifest naming `model-legacy` on a DANGLING path and said
+# why: the crate was not being repaired, it was being REWRITTEN, and editing
+# the line to a crate the source could not use would have been "a manifest
+# that resolves and a build that does not". The rewrite is here. What this
+# crate depends on now is `crates/model` and `model_compiler::program`,
+# exactly as `driver-cuda` does — the same catalog, the same lowering, the
+# same generated dispatch — and the dangling edge is gone because there is
+# source behind it.
 #
-# It is left standing rather than deleted because the crate is not being
-# repaired, it is being REWRITTEN: P5 ("Shader planes — impl the families for
-# metal/vulkan/wgpu Ctx") gives this driver a `#[claims] impl` for its plane
-# and a `Program` walk of its own, and what it will depend on then is
-# `crates/model`, exactly as `driver-cuda` does now. Editing the line to a
-# crate this source cannot use would be a manifest that resolves and a build
-# that does not, which is a worse lie than a dangling path.
+# EVERY DEPENDENCY BELOW WAS MEASURED against the baker executor rather than
+# inherited: `model-loader` went with the legacy load contract (see its
+# stanza), and `kernels-metal` changed from a table lookup to the plane the
+# dispatch is generated for.
 
 [package]
 name = "driver-metal"
@@ -40,7 +40,7 @@ path = "src/lib.rs"
 
 [features]
 # There is deliberately NO default. `cargo test -p driver-metal` with no
-# features builds and tests the PORTABLE half -- `layout/` and `lowering/`,
+# features builds and tests the PORTABLE half -- `layout/` and `baker/`,
 # everything that is a function of the plan's numbers rather than of the
 # device -- and that is the whole reason this is a feature rather than
 # `cfg(target_vendor = "apple")`:
@@ -101,36 +101,70 @@ driver = { path = "../driver" }
 # ride on the emitted kernel beside the entry name and the source.
 tensor-compiler = { path = "../tensor-compiler" }
 
-# The kernel contract vocabulary: `LaunchRule` (which grid shape a row states)
-# and `sig_in` (how an instantiated point resolves to its row). Tables only --
-# no shader is built by reading one.
+# THE HALF OF THE BAKER EXECUTOR THAT IS NOT THIS PLANE: the walk over a
+# `Program`, the bound statement a generated dispatch reads, the frame's
+# numbering and the load-time resolve pass. `src/baker/plane.rs` is this
+# crate's answer to its one trait, and the five modules left in `src/baker/`
+# are the ones that MEASURABLY differ from `driver-wgpu`'s -- the region, the
+# staging, the views, and the two that plan a dispatch.
+#
+# It needs no GPU, no toolkit and no OS, which is `crates/driver`'s rule, so
+# it is a workspace default member and its tests run in an unqualified sweep.
+
+# THE DECLARATION FLOOR. `kernels::bound::BoundOp` is the trait
+# `baker_walk::bound` implements -- the one data->type crossing, whose accessors
+# hand back the marks (`In`, `Out`, `InOut`, `Const`, `Cache`) a claim body
+# takes -- and `kernels::routine::Refusal` is what every one of them answers
+# with. `kernels::raises::{Class, Struct}` beside them for the by-key door.
+#
+# It was here for `LaunchRule` and `sig_in`: which grid shape a ROW states,
+# and how an instantiated point resolved to one. There are no rows. A grid is
+# computed by the claim body that fires it and arrives on `Fire::lanes`, so
+# neither name is read any more and the crate is depended on for the trait
+# instead.
 kernels = { path = "../kernels" }
 
-# The load-plan path calls the loader in-process where the C++ went through
-# the C ABI: `model` owns the author registry (the `contract` feature alone --
-# no chat aspect, so no tokenizer or image decoders ride along), and
-# `model-loader` owns the plan compiler and the checkpoint readers. Both are
-# host-portable.
-# The lowering the executor runs: `model_compiler::lower` states a fire as a
-# flat list of launches naming kernel symbols. Host-portable — reading a
-# lowered trace builds no shader. `model-ir` alongside it for the traced form
-# those launches are stated over, and for `kernels`, the signature table this
-# crate's binding checks itself against.
+# The lowering the executor runs. `model_compiler::program::bound(&plan)`
+# binds each of a plan's lanes into a `Program` -- steps naming POINTS, and
+# slots saying where each value lives in the fire's arena -- and that is the
+# whole of what this crate reads from it. Host-portable: binding a lane
+# builds no shader.
+#
+# IT WAS `model_compiler::lower`, and the difference is the crossing. `lower`
+# stated a fire as a flat list of launches naming kernel SYMBOLS, which this
+# driver then matched against a by-name registry; a `Program`'s steps name
+# points, and the plane's own generated dispatch answers them. `lower` is
+# deleted (R3) and this crate was one of its last three consumers.
 model-compiler = { path = "../model-compiler" }
+# The traced form a `Program` is bound from: `Plan`, its `Op` rows and the
+# `ValueId`s a slot is keyed by, plus `kernels::Backend` -- which is how this
+# crate says `Metal` when it asks a catalog row to trace.
 model-ir = { path = "../model-ir" }
-# The Metal signature table. A real dependency and not a dev one: the executor
-# resolves every symbol the lowering states through `sig_in` AT RUN TIME -- the
-# row is where a kernel's file and launch rule live, so a driver that dispatches
-# by name cannot do it without the table. `default-features = false` keeps it to
-# the table itself, which is host-portable: no shader is built by reading one.
+# THE PLANE. `kernels_metal::points_dispatch::dispatch(ctx, op)` is what one
+# step of a fire becomes, `plane::{Handle, Planes}` are the payloads this
+# crate mints for it, `routine::{Encode, ArgValue, Fire}` is the encode door a
+# claim body talks through, and `views::{PagedKvView, RecurrentView}` are the
+# two pool carriers a `Cache` mark hands over. `default-features = false`
+# keeps it off `native`, which stages shaders and needs a toolchain; every
+# name above is host-portable.
+#
+# It was here for the SIGNATURE TABLE -- `sig_in` resolved a symbol the
+# lowering stated to the row holding its file and launch rule. The rows are
+# gone with `#[routine]` and the launches are `#[claims]` bodies; what this
+# crate reads now is the dispatch generated from those claims.
 kernels-metal = { path = "../kernels-metal", default-features = false }
-# `contract` for the load plan's author; `forward` for the TEXTS. The driver
-# needs the texts because selecting one is the driver's job -- it runs the
-# model it loaded -- and `driver-cuda` takes the same two for the same
-# reason. Selecting is not CHOOSING A KERNEL: the text names every symbol, and
-# what the driver does is look up which text the checkpoint it loaded is.
-model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
-model-loader = { path = "../model-loader" }
+# THE CATALOG, singular since R3. `model::identify` says which SKU a
+# checkpoint's tensors are, `model::trace_of` gives the plan the program is
+# built from, `model::deployment::Deployment::of` reads the pool geometry off
+# THAT SAME plan, `model::produce` turns a checkpoint's bytes into the tensors
+# the plan's params name, and `model::serve::ROWS` carries the two facts no
+# trace states. Default features: `serve` is off, which is what keeps the
+# chat templates and the image decoders out of a driver.
+#
+# `model-legacy` STOOD HERE under the name `model`, with `features =
+# ["contract"]` for a load-contract author that no longer exists. One catalog
+# now, and this is it.
+model = { path = "../model" }
 
 # Apple-only. Everything that names a Metal type lives under `src/metal/` and
 # is gated on this cfg, so the crate still builds -- and its portable half
@@ -237,28 +271,54 @@ features = [
 [dev-dependencies]
 tempfile = "3"
 
-# Tests only. The binder is proved against a REAL lowering, and the texts live
-# behind `model`'s `forward` feature -- which the driver itself does not need,
-# so it is enabled here rather than in the dependency table above.
-model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
+# A SECOND `model` EDGE STOOD HERE, for a `forward` feature the line did not
+# actually request. There is one catalog and the driver depends on it above;
+# the walk test reads the same rows the driver loads, which is the point of
+# the test.
 
 # `required-features` keeps `cargo test -p driver-metal` with no feature to
 # the portable half, rather than failing to build the device targets. It is
 # the mechanism `driver-cuda/Cargo.toml` already uses for `_cuda`, and the
 # reason the same job can run the crate both ways on one runner.
 #
-# The tests NOT listed here are the portable ones -- `portable_half`,
-# `mod_audit`, `model_bind`, `model_dispatch`, `polymorphism`, `layering`,
-# `no_family_names`, `catalog_coverage`, `text_conformance` -- and that list
-# is the claim this file makes about what needs no GPU.
+# The tests NOT listed here are the portable ones -- `the_walk_is_the_program`,
+# `portable_half`, `mod_audit`, `layering`,
+# `every_public_function_has_a_reader`, `real_kernels` -- and that list is the
+# claim this file makes about what needs no GPU.
 #
-# `family_registry` and `geometry_from_descriptor` were on that list and are
-# deleted. Both were gates on the SPLIT: one reconciled the two `model_type`
-# tables that decided which family Metal supported, the other pinned a
-# `pie.model/1` descriptor being cut into four family-prefixed blocks and
-# merged back. There is one `model::catalog` row per model now and no
-# document between it and the driver, so neither property is expressible --
-# `catalog_coverage` replaces the first with the claim that survived it.
+# `the_walk_is_the_program` IS THE EXECUTOR'S GATE and it is portable on
+# purpose: a fire's steps are walked against a mock `Encode` that records what
+# it was asked to fire, so the walk order, the points asked and the handles
+# bound are all checkable with no Metal in the process. That is what
+# `baker::encode` being a plain `Encode` implementor buys -- the device half
+# is the encoder BEHIND the door, not the door.
+#
+# `text_conformance`, `model_bind`, `model_dispatch`, `polymorphism`,
+# `no_family_names`, `catalog_coverage`, `no_probe_decides_a_fact`,
+# `packed_params_cover_the_struct` and `geometry_is_stated` were on that list
+# and are deleted with the legacy walk they measured: every one of them was a
+# property of the by-name crossing (which symbol a text states, which row
+# claims it, which slot a `kernel!` row reorders an operand into) and there is
+# no by-name crossing. `every_claim_has_an_arm` in `kernels-metal` is where
+# the surviving half of that question is asked now.
+#
+# `device_text_fire` and `device_checkpoint_names` JOIN THAT LIST, one commit
+# late, and the lateness is the finding. Both were gated on `metal-4`, so
+# nothing on a Linux runner ever compiled them and the deletion sweep above
+# could not see them; the first lowered `model::shared::llama_like` through
+# `model_compiler::lower` and fired it, and the second joined
+# `lowering::resolve::Names` against a checkpoint. `llama_like`, `lower` and
+# `Names` are all deleted. What each measured is asked elsewhere now:
+# `tests/the_walk_is_the_program.rs` walks a real `Program` for the first, and
+# `baker::join` (run at every load, and reported as JOIN by
+# `model/src/bin/baker_load.rs`) is the second. Their two device-only
+# survivors -- the KV pool's allocation and its move plan -- moved to
+# `device_pool`, which is what a pool test is called.
+#
+# THE GATE THAT LET THAT HAPPEN IS CLOSED. `scripts/check-metal-4.sh` type-
+# checks this feature on a non-Apple host by cross-checking
+# `--target aarch64-apple-darwin`, and CI runs it; see the script's own header
+# for what it can and cannot catch.
 
 [[test]]
 name = "device_archive"
@@ -270,10 +330,6 @@ required-features = ["metal-4"]
 
 [[test]]
 name = "device_attention"
-required-features = ["metal-4"]
-
-[[test]]
-name = "device_checkpoint_names"
 required-features = ["metal-4"]
 
 [[test]]
@@ -357,10 +413,6 @@ name = "device_pso"
 required-features = ["metal-4"]
 
 [[test]]
-name = "device_real_weights"
-required-features = ["metal-4"]
-
-[[test]]
 name = "device_region"
 required-features = ["metal-4"]
 
@@ -370,10 +422,6 @@ required-features = ["metal-4"]
 
 [[test]]
 name = "device_runtime"
-required-features = ["metal-4"]
-
-[[test]]
-name = "device_smoke"
 required-features = ["metal-4"]
 
 [[test]]
@@ -389,10 +437,6 @@ name = "device_tables"
 required-features = ["metal-4"]
 
 [[test]]
-name = "device_text_fire"
-required-features = ["metal-4"]
-
-[[test]]
 name = "device_timestamps"
 required-features = ["metal-4"]
 
@@ -404,6 +448,3 @@ required-features = ["metal-4"]
 name = "real_kernels"
 required-features = ["metal-4"]
 
-[[test]]
-name = "text_conformance"
-required-features = ["metal-4"]

@@ -20,7 +20,6 @@ pub mod dump;
 pub mod error;
 pub mod executor;
 pub mod extent;
-pub mod group_slot;
 pub mod plan;
 #[cfg(feature = "testkit")]
 pub mod testkit;

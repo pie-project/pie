@@ -1,10 +1,18 @@
 //! The Import interpreter: a family's production table run over host
-//! tensors, one canonical tensor per row.
+//! tensors, one THIS RANK'S tensor per row.
 //!
 //! [`produce`] is the executable half of the Load contract's supply side.
 //! The demand side is a plan's `params` column; the two are joined by name
 //! and shape, and `bin/baker_load.rs` is that join run against a real
 //! checkpoint.
+//!
+//! THE DEMAND COLUMN IS AN ARGUMENT HERE, and that is the rank cut. A
+//! `-tp2` catalog row states per-rank shapes (`Param::shape` IS what this
+//! rank holds) and a shard mark saying which axis the knife ran along; the
+//! checkpoint holds the whole tensor. So the last thing a production row
+//! does is take this rank's slice of what it just built, and the interpreter
+//! reads the SAME `params` the join is about to run against — see [`cut`]
+//! for why the slice lives here and not at the driver's upload.
 //!
 //! The interpreter reads the checkpoint through a closure rather than a
 //! reader type on purpose. A production table names checkpoint tensors in
@@ -16,6 +24,7 @@
 //! Option<HostTensor>`.
 
 use model_dsl::load::{Import, Source};
+use model_ir::plan::{Param, Shard};
 
 /// A checkpoint tensor's element type, in the safetensors spelling.
 ///
@@ -179,8 +188,6 @@ pub enum Fault {
     Unpackable { a: Vec<u64>, b: Vec<u64> },
     /// `Stack`: the operands are not the same rectangle.
     Unstackable { a: Vec<u64>, b: Vec<u64> },
-    /// `PlusOne` at a dtype with no float fold.
-    Unfoldable { name: String, dtype: Dtype },
     /// `Squeeze`: no such axis, or its extent is not 1.
     Unsqueezable {
         name: String,
@@ -197,6 +204,21 @@ pub enum Fault {
     },
     /// A verb this interpreter does not perform yet.
     Refused { verb: &'static str, why: String },
+    /// The plan's shard column and the checkpoint's own rectangle do not
+    /// describe one cut of one tensor: a missing axis, a disagreement off
+    /// the cut axis, an extent this rank's does not divide, or segments
+    /// that do not cover the axis they partition.
+    Uncuttable {
+        axis: u32,
+        whole: Vec<u64>,
+        mine: Vec<u64>,
+    },
+    /// A rank outside the world the checkpoint says this weight was cut
+    /// into -- including rank 1 of a plan that cuts nothing, which is a
+    /// whole-model SKU handed to a two-way deployment.
+    Unranked { rank: u32, world: u32 },
+    /// Two weights of one plan, cut two different ways by one checkpoint.
+    Uneven { world: u32, saw: u32 },
 }
 
 impl std::fmt::Display for ProduceError {
@@ -224,11 +246,6 @@ impl std::fmt::Display for ProduceError {
             Fault::Unstackable { a, b } => {
                 write!(f, "stack: {a:?} and {b:?} are not the same rectangle")
             }
-            Fault::Unfoldable { name, dtype } => write!(
-                f,
-                "the (1 + w) fold has no reading at {} (`{name}`)",
-                dtype.name()
-            ),
             Fault::Unsqueezable { name, axis, shape } => write!(
                 f,
                 "`{name}` is {shape:?}, whose axis {axis} is not an extent of 1"
@@ -243,31 +260,201 @@ impl std::fmt::Display for ProduceError {
                 "`{name}` is {shape:?}, whose axis {axis} is not a whole {groups} groups"
             ),
             Fault::Refused { verb, why } => write!(f, "{verb} is refused: {why}"),
+            Fault::Uncuttable { axis, whole, mine } => write!(
+                f,
+                "the checkpoint holds {whole:?} and this rank holds {mine:?}, \
+                 which is not that rectangle cut on axis {axis}"
+            ),
+            Fault::Unranked { rank, world } => write!(
+                f,
+                "the checkpoint cuts this weight {world} way(s) and this load \
+                 was asked for rank {rank}"
+            ),
+            Fault::Uneven { world, saw } => write!(
+                f,
+                "this weight is cut {saw} ways where an earlier one is cut \
+                 {world}; a checkpoint is ONE cut of one plan"
+            ),
         }
     }
 }
 
 impl std::error::Error for ProduceError {}
 
-/// Run every row of `import` against a checkpoint, in table order.
+/// Run every row of `import` against a checkpoint, in table order, and hand
+/// back what `rank` holds.
 ///
 /// `read` answers with the checkpoint's tensor under the family's own
-/// spelling, or `None` when it holds none. The result is the canonical
-/// tensors, named as the plan's `params` column names them -- which is
-/// what makes the join a lookup and not a translation.
+/// spelling, or `None` when it holds none. `params` is the plan's demand
+/// column -- the same one the join is about to run against -- and it is what
+/// makes this a rank's load rather than a checkpoint's: each row's tensor is
+/// [`cut`] by the param of the same name before it is pushed.
+///
+/// A target no param names is passed through WHOLE. There is nothing to cut
+/// it by, the join already reports it as a produced row nobody demands, and
+/// guessing an axis for it would be the one thing worse than moving the
+/// bytes.
+///
+/// # THE WORLD IS DERIVED, ONCE, AND CHECKED
+///
+/// Nothing states the degree. Every cut row says one -- `checkpoint extent /
+/// Param::shape[axis]` -- and they must all say the same one, because a
+/// checkpoint is ONE cut of one plan. A row that disagrees is
+/// [`Fault::Uneven`] and names both numbers; a `rank` no row's world holds
+/// is [`Fault::Unranked`]. At world 1 (every single-GPU row) the cut is the
+/// identity and no byte moves, which is why a `-tp1` load through here is
+/// the same bytes it was before this argument existed.
+///
+/// # Errors
+///
+/// The first row that could not be run or could not be cut, named.
 pub fn produce(
     import: &Import,
+    params: &[Param],
+    rank: u32,
     read: &dyn Fn(&str) -> Option<HostTensor>,
 ) -> Result<Vec<(String, HostTensor)>, ProduceError> {
     let mut out = Vec::with_capacity(import.rows.len());
+    let mut world: Option<u32> = None;
     for row in &import.rows {
-        let t = run(&row.source, read).map_err(|fault| ProduceError {
+        let named = |fault| ProduceError {
             target: row.target.clone(),
             fault,
-        })?;
+        };
+        let t = run(&row.source, read).map_err(named)?;
+        let Some(p) = params.iter().find(|p| p.name == row.target) else {
+            out.push((row.target.clone(), t));
+            continue;
+        };
+        let (t, saw) = cut(t, p, rank).map_err(named)?;
+        if let Some(saw) = saw {
+            match world {
+                Some(seen) if seen != saw => return Err(named(Fault::Uneven { world: seen, saw })),
+                _ => world = Some(saw),
+            }
+        }
         out.push((row.target.clone(), t));
     }
     Ok(out)
+}
+
+/// One rank's share of a canonical tensor, and the world the checkpoint says
+/// it was cut into -- `None` for a weight every rank holds whole.
+///
+/// # WHY THE SLICE IS HERE
+///
+/// Three places could hold it and only one of them can be checked.
+///
+/// * **The import table.** No: `model-dsl`'s `load` module states the rule
+///   in its first line -- import may rewrite bytes, load may only view -- and
+///   a cut verb there would put the degree in the production table, where a
+///   `-tp2` row would then need a table of its own that differed from its
+///   sibling's by nothing a checkpoint can see. A `-tp2` row takes its
+///   sibling's table VERBATIM and this function is the whole difference.
+/// * **The driver, at upload.** No, twice over. The join `bin/baker_load.rs`
+///   runs is `plan.params` against what production produced, and
+///   `Param::shape` is what a rank holds -- so a driver-side cut would leave
+///   every sharded row of a `-tp2` join reading MISMATCH, and the only way
+///   to a green gate would be teaching the join to accept "a multiple of the
+///   demanded extent", which is the join softened into saying nothing. And
+///   the upload loop's whole documented virtue is that it has no decision in
+///   it: one contiguous H2D per bank, no restride, no repack, no cast. A
+///   slice IS a restride.
+/// * **Here**, in the interpreter, fused into the production loop. The
+///   driver and the CLI reach one implementation, so the gate exercises the
+///   arithmetic the driver runs; the join stays the join it already was; and
+///   peak host memory is a rank's model plus one whole tensor rather than
+///   the whole model plus a rank's (a3b: 34 GiB + one bank, not 66 + 34).
+///
+/// # The arithmetic, and what it checks
+///
+/// EACH SEGMENT IS CUT, which is what [`Shard::Cut`]'s segment list is for.
+/// A `[gate | up]` bank at half width is `[gate/2 | up/2]`, so this walks the
+/// segments and takes `rank`'s share out of each one where it sits in the
+/// whole -- never `rank`'s half of the concatenated axis, which would hand
+/// rank 0 the whole gate and rank 1 the whole up.
+///
+/// A QUANTIZED BANK NEEDS NO ARM. `model_dsl`'s `restated` already says a
+/// bank's cut in each stored plane's own extents (mxfp4 codes are
+/// `[.., K/32, 16]` and the segments come divided by the block), so this
+/// slices axis `axis` of the shape the checkpoint actually holds and the
+/// whole-code-block check is the divisibility check below -- a cut that
+/// landed on half a block would show up as an extent this rank's does not
+/// divide.
+///
+/// What is NOT checked here is a `Replicated` row whose rectangle is not the
+/// plan's. There is nothing this could do about it that the join does not do
+/// better, with both shapes in the message; the rule is that the interpreter
+/// refuses what it cannot PERFORM and the join reports everything else.
+fn cut(t: HostTensor, p: &Param, rank: u32) -> Result<(HostTensor, Option<u32>), Fault> {
+    let Shard::Cut { axis, segments } = &p.shard else {
+        return Ok((t, None));
+    };
+    let at = *axis as usize;
+    let (Some(&whole), Some(&mine)) = (t.shape.get(at), p.shape.get(at)) else {
+        return Err(uncuttable(&t, p, *axis));
+    };
+    let off_axis = |(i, (a, b)): (usize, (&u64, &u64))| i != at && a != b;
+    if t.shape.len() != p.shape.len()
+        || t.shape.iter().zip(&p.shape).enumerate().any(off_axis)
+        || mine == 0
+        || !whole.is_multiple_of(mine)
+        || segments.iter().sum::<u64>() != mine
+    {
+        return Err(uncuttable(&t, p, *axis));
+    }
+    let world = u32::try_from(whole / mine).map_err(|_| uncuttable(&t, p, *axis))?;
+    if rank >= world {
+        return Err(Fault::Unranked { rank, world });
+    }
+    if world == 1 {
+        // The identity, taken as one. A single-rank load must not pay a copy
+        // of every weight in the model to slice `[0, whole)` out of
+        // `[0, whole)` -- and this is also what makes a `-tp1` load byte-
+        // identical by construction rather than by inspection.
+        return Ok((t, Some(1)));
+    }
+
+    // Below the cut axis: the bytes one position of it carries, which move as
+    // a unit and are never inspected. Above it: every combination of the
+    // leading extents, each holding one whole copy of the partitioned axis.
+    let inner = t.shape[at + 1..].iter().product::<u64>() as usize * t.dtype.width();
+    let outer = t.shape[..at].iter().product::<u64>() as usize;
+    let stride = whole as usize * inner;
+    let mut bytes = Vec::with_capacity(outer * mine as usize * inner);
+    for o in 0..outer {
+        let base = o * stride;
+        // Where the WHOLE segment starts on the axis; this rank's share of it
+        // begins `rank` shares in.
+        let mut start = 0usize;
+        for seg in segments {
+            let take = *seg as usize;
+            let from = base + (start + rank as usize * take) * inner;
+            bytes.extend_from_slice(&t.bytes[from..from + take * inner]);
+            start += take * world as usize;
+        }
+    }
+    let mut shape = t.shape;
+    shape[at] = mine;
+    Ok((
+        HostTensor {
+            shape,
+            dtype: t.dtype,
+            bytes,
+        },
+        Some(world),
+    ))
+}
+
+/// The one refusal [`cut`] has for a cut it cannot perform, carrying both
+/// rectangles: every way the arithmetic can fail is the same sentence, and
+/// which of the two tables is wrong is the reader's to decide from them.
+fn uncuttable(t: &HostTensor, p: &Param, axis: u32) -> Fault {
+    Fault::Uncuttable {
+        axis,
+        whole: t.shape.clone(),
+        mine: p.shape.clone(),
+    }
 }
 
 fn fetch(name: &str, read: &dyn Fn(&str) -> Option<HostTensor>) -> Result<HostTensor, Fault> {
@@ -288,59 +475,13 @@ fn fetch(name: &str, read: &dyn Fn(&str) -> Option<HostTensor>) -> Result<HostTe
 fn run(s: &Source, read: &dyn Fn(&str) -> Option<HostTensor>) -> Result<HostTensor, Fault> {
     match s {
         Source::Copy(name) => fetch(name, read),
-        Source::PlusOne(name) => plus_one(fetch(name, read)?, name),
         Source::Pack(sources) => pack(sources, read),
         Source::Stack(sources) => stack(sources, read),
-        Source::ScalarOf(name) => Err(Fault::Refused {
-            verb: "scalar_of",
-            why: format!(
-                "no shipping checkpoint has been read that stores a scalar beside \
-                 `{name}` -- gemma's HF release files it as a `[1]` tensor of its \
-                 own (`layer.{{l}}.layer_scalar`), which is a `copy`, and the GGUF \
-                 release's form is unmeasured. Until one is read, a guess here \
-                 would be a silently wrong weight rather than a refusal"
-            ),
-        }),
         Source::Deinterleave(name, axis, groups) => {
             deinterleave(fetch(name, read)?, name, *axis, *groups)
         }
         Source::Squeeze(name, axis) => squeeze(fetch(name, read)?, name, *axis),
     }
-}
-
-/// The `(1 + w)` norm fold. Gemma ships its rmsnorm weights centred on
-/// zero and the canonical weight is plain, so the fold is the import's
-/// and not the kernel's. Computed in f32 and written back at the source
-/// dtype: a bf16 `1 + w` done in bf16 would lose the whole mantissa of a
-/// small `w`.
-fn plus_one(mut t: HostTensor, name: &str) -> Result<HostTensor, Fault> {
-    match t.dtype {
-        Dtype::Bf16 => {
-            for c in t.bytes.chunks_exact_mut(2) {
-                let bits = u16::from_le_bytes([c[0], c[1]]);
-                let folded = f32_to_bf16(bf16_to_f32(bits) + 1.0);
-                c.copy_from_slice(&folded.to_le_bytes());
-            }
-        }
-        Dtype::F32 => {
-            for c in t.bytes.chunks_exact_mut(4) {
-                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) + 1.0;
-                c.copy_from_slice(&v.to_le_bytes());
-            }
-        }
-        // NO f16 ARM, and it is a refusal rather than an omission. Every
-        // norm this fold has been run against ships bf16 (gemma) or f32
-        // (qwen's gdn rows); an f16 codec written for nobody would be
-        // thirty lines of unexercised rounding whose first exercise would
-        // be a wrong weight on a GPU. A refusal names the row instead.
-        dtype => {
-            return Err(Fault::Unfoldable {
-                name: name.to_string(),
-                dtype,
-            });
-        }
-    }
-    Ok(t)
 }
 
 /// Concatenate along the OUT axis -- axis 0, the axis a projection's rows
@@ -494,15 +635,4 @@ fn squeeze(mut t: HostTensor, name: &str, axis: u32) -> Result<HostTensor, Fault
 #[must_use]
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
-}
-
-/// Round-to-nearest-even, the same rule every bf16 cast in this tree uses.
-#[must_use]
-pub fn f32_to_bf16(x: f32) -> u16 {
-    if x.is_nan() {
-        return 0x7FC0;
-    }
-    let bits = x.to_bits();
-    let round = 0x7FFF + ((bits >> 16) & 1);
-    ((bits + round) >> 16) as u16
 }

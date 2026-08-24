@@ -113,11 +113,11 @@
 
 #![cfg(target_vendor = "apple")]
 
+use driver_metal::baker::dispatch::{Dispatch, ParamSlot, Touches};
+use driver_metal::baker::{BoundRegion as BoundArg, Slice};
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
-use driver_metal::lowering::executor::{BoundArg, Slice};
 
 /// One key head's width, and `32 * n_per_t` with `n_per_t = Dk / 32`.
 use driver_metal::skip::skipped;
@@ -313,8 +313,7 @@ fn gdn_scalar_slots(base: usize) -> Vec<ParamSlot> {
             slot: base + i,
             at: (i as u32) * 4,
             bytes: 4,
-            packed: false,
-            value: Some(i as u8),
+            value: i as u8,
         })
         .collect()
 }
@@ -327,23 +326,27 @@ fn gdn_prefill_slots(base: usize) -> Vec<ParamSlot> {
         slot: base + 11,
         at: 44,
         bytes: 4,
-        packed: false,
-        value: Some(11),
+        value: 11,
     });
     slots.push(ParamSlot {
         slot: base + 12,
         at: 48,
         bytes: 4,
-        packed: false,
-        value: Some(12),
+        value: 12,
     });
     slots
 }
 
+// Thirteen: the eight planes a GDN core reads, the three it writes, and the
+// two the fixture varies. Grouping them into a struct would be a second
+// spelling of the argument list the kernel already has.
+#[allow(clippy::too_many_arguments)]
 fn fire(
     context: &Context,
     compiler: &driver_metal::program::Compiler,
-    entrypoint: &str,
+    // `&'static str`, because that is what `Dispatch::symbol` is: a claim
+    // body names an entry point as a literal and the walk never composes one.
+    entrypoint: &'static str,
     mixed: &[f32],
     conv_state: &[f32],
     rstate_in: &[f32],
@@ -630,7 +633,7 @@ fn fire_pair(
 
     let dispatches = vec![
         Dispatch {
-            symbol: &prep_sym,
+            symbol: String::leak(prep_sym.clone()),
             file: "ssm/gdn_prep.metal",
             stamp: "",
             // One simdgroup per `(row, v-head)`: the q/k path computed exactly
@@ -645,7 +648,7 @@ fn fire_pair(
             op: 0,
         },
         Dispatch {
-            symbol: &rec_sym,
+            symbol: String::leak(rec_sym.clone()),
             file: "ssm/gdn_prep.metal",
             stamp: "",
             grid: [32, DV as u32, (ROWS * HV) as u32],
@@ -1387,7 +1390,7 @@ fn fire_prefill(
             op: 0,
         },
         Dispatch {
-            symbol: &scan_sym,
+            symbol: String::leak(scan_sym.clone()),
             file: "ssm/gdn_prep.metal",
             stamp: "",
             grid: [32, grid_y, HV as u32],

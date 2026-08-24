@@ -152,64 +152,6 @@ impl Graph {
         })
     }
 
-    /// A switch node: branches on an integer index rather than a boolean,
-    /// reaching every arm from one node via the index the device writes into
-    /// the handle — the mechanism a merged Decode/Prefill graph uses to share
-    /// one exec across two topologies. `bodies` is the arm count; out-of-range runs none.
-    pub fn add_conditional_switch(
-        &mut self,
-        deps: &[cudaGraphNode_t],
-        bodies: u32,
-    ) -> Result<ConditionalSwitch<'_>> {
-        if bodies == 0 {
-            return Err(Error::invalid(
-                "cudaGraphAddNode",
-                "a switch with no bodies selects nothing",
-            ));
-        }
-        let mut handle: cudaGraphConditionalHandle = 0;
-        check_rt(
-            unsafe { cudaGraphConditionalHandleCreate(&mut handle, self.raw, 0, 0) },
-            "cudaGraphConditionalHandleCreate",
-        )?;
-        let mut params: cudaGraphNodeParams = unsafe { std::mem::zeroed() };
-        params.type_ = cudaGraphNodeType::cudaGraphNodeTypeConditional;
-        params.__bindgen_anon_1.conditional = cudaConditionalNodeParams {
-            handle,
-            type_: cudaGraphConditionalNodeType::cudaGraphCondTypeSwitch,
-            size: bodies,
-            phGraph_out: std::ptr::null_mut(),
-        };
-        let mut node: cudaGraphNode_t = std::ptr::null_mut();
-        check_rt(
-            unsafe {
-                add_node(
-                    &raw mut node,
-                    self.raw,
-                    deps.as_ptr(),
-                    deps.len(),
-                    &raw mut params,
-                )
-            },
-            "cudaGraphAddNode",
-        )?;
-        let out = unsafe { params.__bindgen_anon_1.conditional.phGraph_out };
-        if out.is_null() {
-            return Err(Error::invalid(
-                "cudaGraphAddNode",
-                "the driver returned no body graphs for the switch node",
-            ));
-        }
-        // SAFETY: `phGraph_out` points at exactly `bodies` graphs, owned by the parent.
-        let graphs = unsafe { std::slice::from_raw_parts(out, bodies as usize) }.to_vec();
-        Ok(ConditionalSwitch {
-            node,
-            bodies: graphs,
-            handle,
-            _parent: PhantomData,
-        })
-    }
-
     /// Instantiate into a launchable graph. The trailing `0` is the flags
     /// word; a bad graph reports itself through the return code alone.
     pub fn instantiate(&self) -> Result<GraphExec> {
@@ -254,48 +196,6 @@ impl ConditionalIf<'_> {
 
     /// The conditional handle, for the device-side kernel that sets the
     /// predicate via `cudaGraphSetConditional`.
-    pub const fn handle(&self) -> cudaGraphConditionalHandle {
-        self.handle
-    }
-}
-
-/// A switch node added to a [`Graph`] and the handle that selects which of
-/// its bodies runs. Borrows the parent graph, which owns the body graphs.
-#[derive(Debug, Clone)]
-pub struct ConditionalSwitch<'g> {
-    node: cudaGraphNode_t,
-    bodies: Vec<cudaGraph_t>,
-    handle: cudaGraphConditionalHandle,
-    _parent: PhantomData<&'g Graph>,
-}
-
-impl ConditionalSwitch<'_> {
-    /// The node itself, to name as a dependency of a later node.
-    pub const fn node(&self) -> cudaGraphNode_t {
-        self.node
-    }
-
-    /// One body graph, by index. Owned by the parent graph; do not destroy it.
-    #[must_use]
-    pub fn body(&self, index: usize) -> Option<cudaGraph_t> {
-        self.bodies.get(index).copied()
-    }
-
-    /// How many bodies this switch selects among.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.bodies.len()
-    }
-
-    /// Whether the switch has no bodies. Never true (the constructor refuses a
-    /// zero-body switch) but clippy asks for the pair.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.bodies.is_empty()
-    }
-
-    /// The conditional handle. Its consumer writes an index, not a boolean; see
-    /// [`crate::fire::supergraph::set_switch`].
     pub const fn handle(&self) -> cudaGraphConditionalHandle {
         self.handle
     }
@@ -420,11 +320,18 @@ mod tests {
 // PROGRAM PER LANE, chosen on the host by the fact word before a byte is
 // issued. There is no predicate for a conditional node to read.
 //
-// WHAT STAYS ABOVE: `Graph`, `GraphExec`, `ConditionalIf`,
-// `ConditionalSwitch` — the CUDA graph API port itself, which is a device
-// capability and not a lowering's opinion, and which `Allocator::
-// begin_capture` still builds against. A capture of the eager baker walk
-// starts from those and needs none of what was deleted here.
+// WHAT STAYS ABOVE: `Graph`, `GraphExec` and `ConditionalIf` — the CUDA
+// graph API port itself, which is a device capability and not a lowering's
+// opinion, and which `Allocator::begin_capture` still builds against. A
+// capture of the eager baker walk starts from those and needs none of what
+// was deleted here.
+//
+// `ConditionalSwitch` STOOD IN THAT LIST and is gone too. It branched on an
+// INDEX rather than a boolean — the mechanism a merged Decode/Prefill graph
+// used to share one exec across two topologies — and the thing that wrote
+// the index was `fire::supergraph::set_switch`, which its own doc still
+// pointed at after the module was deleted. `ConditionalIf` has a live reader
+// in `tests/gpu_graph.rs`; the switch had none anywhere.
 //
 // `fire::supergraph`'s two arming launchers and `tests/gpu_supergraph.rs`
 // went with it.

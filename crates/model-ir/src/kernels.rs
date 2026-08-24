@@ -8,14 +8,15 @@
 //! `semantic_in_place`, `ARITY_EXCEPTIONS`, `arity_problem` and `check_plan`.
 //! Together they read every LEGACY COLUMN a `#[routine]` emits — the operand
 //! `sources`, the `derived` names-and-nullability run, `args`, `whole`,
-//! `depth_prefix_plan` and the `out_rule`s — and checked a
-//! `crate::trace::ForwardPlan` against them: does this statement place as
-//! many pointers as the routine reads, does its result geometry follow the
-//! rule the attribute stated.
+//! `depth_prefix_plan` and the `out_rule`s — and checked the legacy traced
+//! form, `ForwardPlan`, against them: does this statement place as many
+//! pointers as the routine reads, does its result geometry follow the rule
+//! the attribute stated.
 //!
 //! Every one of them was reachable from exactly one place,
-//! `TraceBuilder::finish`, and nothing has built a `TraceBuilder` since R3
-//! deleted `model-dsl-legacy`'s `Trace`. The baker path asks none of it: a
+//! `TraceBuilder::finish`, and nothing had built a `TraceBuilder` since R3
+//! deleted `model-dsl-legacy`'s `Trace`. R5 deleted the pair of them and the
+//! whole `trace` module with them. The baker path asks none of it: a
 //! statement's operands are checked against the POINT's slot list by the
 //! generated dispatch, its geometry by `model_compiler::program`'s width
 //! walk, and its claim by `points_dispatch::CLAIMED` before a fire.
@@ -24,24 +25,30 @@
 //! functions.
 
 pub use kernels::Kind;
+pub use kernels::points;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Backend {
     Cuda,
 
     Metal,
+
+    /// The WebGPU plane, added at P5b on the terms `Metal` arrived on at P5a:
+    /// a row here is what makes a plane's claim tables reachable from
+    /// [`point_claims`], and therefore what lets `sweep::resolve` bind — or
+    /// honestly refuse — a lane against it.
+    ///
+    /// `driver-wgpu/src/baker/` names this variant in exactly one place, the
+    /// `trace(..)` call in `Baked::of`, which is the whole of what used to be
+    /// a load-time binding on this plane too.
+    Wgpu,
 }
 
-impl Backend {
-    pub fn of_family(family: &str) -> Option<Backend> {
-        let mut parts = family.split('.').skip(1);
-        match parts.next() {
-            Some("cuda") => Some(Backend::Cuda),
-            Some("metal") => Some(Backend::Metal),
-            _ => None,
-        }
-    }
-}
+// `Backend::of_family` STOOD HERE: the second segment of a dotted family
+// name (`kernels.cuda.norm`) read back as a plane. It was the legacy
+// registry's reverse lookup — a linkme row carried its plane in its own name
+// — and the three claim tables below are indexed by the plane a caller
+// ALREADY HAS. R5 measured zero callers.
 
 /// Every family a cuda `#[claims]` block answers, one line per migrated
 /// family. A family's line is its `*_CLAIMS` slice and nothing else, so
@@ -122,6 +129,51 @@ const METAL_CLAIMS: &[&[&str]] = &[
     kernels_metal::norm::HC_CLAIMS,
 ];
 
+/// Every family a wgpu `#[claims]` block answers — the same line-per-family
+/// shape as [`CUDA_CLAIMS`], on the second shader plane to follow cuda onto
+/// the declaration floor.
+///
+/// ALL FOURTEEN, and as with [`METAL_CLAIMS`] the empty lines are the
+/// measurement. Seven of them are empty, and the two that decide what this
+/// plane can serve are argued at length in their impl headers:
+///
+/// * `GEMM_CLAIMS` (from `quant`) — EMPTY, and this is the plane's headline
+///   gap: every matmul `kernels-wgpu` stamps is QUANTIZED (`qmv.wgsl`,
+///   `qmm_t.wgsl`), so all three `Gemm` points wait on the floor's
+///   `Bank<R: Repr>` payload. There is no dense matmul on this plane at all,
+///   which is why a dense bf16 SKU refuses at `gemm.matmul` before it can
+///   refuse anywhere else.
+/// * `SSM_CLAIMS` — EMPTY: the fused GDN core this plane ships cuts the
+///   family differently from the floor's three points (see the impl header's
+///   three options), so claiming one would be a lie about which arithmetic
+///   ran.
+/// * `DIST_CLAIMS`, `MLA_CLAIMS`, `INDEX_CLAIMS`, `POOL_CLAIMS`,
+///   `HC_CLAIMS` — no `.wgsl` kernel for any point of any of the five; these
+///   are families to write, not crossings to make.
+///
+/// The module each line reads from is where the impl block lives, which on
+/// this plane is the file the shaders are filed under: `GEMM_CLAIMS` from
+/// `quant` because every matmul here is a quantised one, `GATE_CLAIMS` from
+/// `attn` because the gate kernel is filed with the attention it gates, and
+/// the five empty families from `points`, which is where this plane keeps the
+/// blocks it has no shader directory for.
+const WGPU_CLAIMS: &[&[&str]] = &[
+    kernels_wgpu::norm::NORM_CLAIMS,
+    kernels_wgpu::mlp::MLP_CLAIMS,
+    kernels_wgpu::quant::GEMM_CLAIMS,
+    kernels_wgpu::rope::ROPE_CLAIMS,
+    kernels_wgpu::moe::MOE_CLAIMS,
+    kernels_wgpu::layout::LAYOUT_CLAIMS,
+    kernels_wgpu::attn::ATTENTION_CLAIMS,
+    kernels_wgpu::attn::GATE_CLAIMS,
+    kernels_wgpu::ssm::SSM_CLAIMS,
+    kernels_wgpu::points::DIST_CLAIMS,
+    kernels_wgpu::points::MLA_CLAIMS,
+    kernels_wgpu::points::INDEX_CLAIMS,
+    kernels_wgpu::points::POOL_CLAIMS,
+    kernels_wgpu::points::HC_CLAIMS,
+];
+
 /// The points a plane's `#[claims]` impl blocks answer — baker's claim
 /// table, consulted ahead of the routine `canon` attributes. One slice per
 /// migrated family, concatenated; a family lands by adding its line, and the
@@ -130,9 +182,11 @@ const METAL_CLAIMS: &[&[&str]] = &[
 pub fn point_claims(backend: Backend) -> &'static [&'static str] {
     static CUDA: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     static METAL: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    static WGPU: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     match backend {
         Backend::Cuda => CUDA.get_or_init(|| CUDA_CLAIMS.concat()),
         Backend::Metal => METAL.get_or_init(|| METAL_CLAIMS.concat()),
+        Backend::Wgpu => WGPU.get_or_init(|| WGPU_CLAIMS.concat()),
     }
 }
 
@@ -153,9 +207,63 @@ pub fn canon_symbol(plane: Backend, claim: &str) -> Option<&'static str> {
     let table = match plane {
         Backend::Cuda => kernels_cuda::CANON,
         Backend::Metal => kernels_metal::CANON,
+        // EMPTY, AND MEASURED RATHER THAN OMITTED. `kernels-wgpu` states no
+        // `CANON` const at all: the fold that deleted this plane's routine
+        // layer (99/101 rows) left no row carrying a resolution, because the
+        // two it de-macro'd are the sampling and delivery tail — fired
+        // outside the lowered plan, so no claim ever reaches them. A plane
+        // with nothing here answers every unclaimed point as unclaimed, which
+        // is the honest report and is what the backlog is for.
+        Backend::Wgpu => &[],
     };
     table
         .iter()
         .find(|(role, _)| *role == claim)
         .map(|(_, symbol)| *symbol)
+}
+
+/// The DECLARATION `name` states — its slots, its axes, and how big each of
+/// its results is.
+///
+/// TWO TIERS, ONE LOOKUP, and the prefix is what tells them apart. A tier-1
+/// point is `family.method` and is declared on the floor, where every plane
+/// owes it; a tier-2 point is one plane's inherent method, declared and
+/// claimed by the same line, and a text spells it with that plane's name in
+/// front. `model_compiler` is plane-agnostic and reads both through here for
+/// the reason [`point_claims`] is here: the tables belong to the kernel
+/// crates, and this is the one join over them.
+#[must_use]
+pub fn point_of(name: &str) -> Option<&'static points::Point> {
+    if let Some(rest) = name.strip_prefix("cuda::") {
+        return kernels_cuda::attn::TIER2_POINTS
+            .iter()
+            .find(|p| p.name == rest);
+    }
+    points::point_of(name)
+}
+
+/// Which column of a statement's PARAMS RUN the point's scalar slot named
+/// `name` occupies, or `None` where the point states no such scalar.
+///
+/// A statement's params run is the declaration's scalar run in declaration
+/// order — that is the whole rule — and this is the only honest way to read
+/// one number out of it by meaning rather than by position. The failure it
+/// exists to stop is one a spelled index cannot notice: `head_dim` is param
+/// 1 on all five points `model::deployment`'s `ATTENDS` walks today, param 2
+/// on `pool.attention_lse`, and absent from `mla.attention_{decode,prefill}`
+/// — so a reader spelling `params[1]` reads `ratio` or `heads` as a head
+/// width the day the walked set widens, and sizes a plausible wrong pool
+/// with no refusal anywhere.
+#[must_use]
+pub fn param_at(point: &points::Point, name: &str) -> Option<usize> {
+    let mut at = 0;
+    for slot in point.slots {
+        if slot.name == name {
+            return (slot.mark == points::Mark::Scalar).then_some(at);
+        }
+        if slot.mark == points::Mark::Scalar {
+            at += 1;
+        }
+    }
+    None
 }

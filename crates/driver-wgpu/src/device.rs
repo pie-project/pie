@@ -142,8 +142,10 @@
 //! class of "bind an unrelated tensor to a slot on the theory that nothing
 //! looks there".
 //!
-//! What is NOT legal is a binding past the row's count, and
-//! [`crate::dispatch::plan_one`] refuses that with the traced op in hand.
+//! What is NOT legal is a binding past the row's count. `dispatch::plan_one`
+//! refused that with the traced op in hand and STOOD in a module the
+//! legacy-walk cut deleted whole; `baker::dispatch` is the crossing a
+//! statement takes now.
 //!
 //! # Every refusal is named, and nothing panics
 //!
@@ -2881,7 +2883,8 @@ impl Device {
         // them. Fusion still pays. A fold that removes a launch while keeping
         // its work is worth about 0.7 us and is not worth doing. The table of
         // where the 8.3 ms actually goes -- the split attention alone is 32% --
-        // is in `serving.rs::what_a_decode_costs_at_length`.
+        // was in `serving.rs`'s decode bench, which RETIRED with that suite at
+        // P5b; the figures here are the record it left.
         // THE GPU'S OWN CLOCK, when `PIE_WGPU_STAMP` opened the device with it.
         // One pass per launch and one query pair per pass; resolved into a
         // buffer at the end of the same command buffer, so the whole thing is

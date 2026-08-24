@@ -46,7 +46,10 @@ impl Flavor {
                     Err(missing_feature_msg("cuda_native", "driver-cuda"))
                 }
             }
-            DriverKind::Metal => Err(retired_msg("metal")),
+            // METAL IS BACK IN THE WORKSPACE and still hosted by no build,
+            // which are two different facts and this arm now states the
+            // second one only. See `unhosted_msg`.
+            DriverKind::Metal => Err(unhosted_msg()),
             DriverKind::Vulkan => Err(retired_msg("vulkan")),
             DriverKind::Wgpu => Err(retired_msg("wgpu")),
         }
@@ -58,12 +61,40 @@ impl Flavor {
 /// Distinct from [`missing_feature_msg`] on purpose: "rebuild with a feature"
 /// is advice that would not work, because the crate the feature would name is
 /// not in the workspace.
+///
+/// TWO OF THE THREE, since P5. `driver-metal` is a member again and has the
+/// baker executor R3 named as the condition of its return, so the sentence
+/// below stopped being true of it; [`unhosted_msg`] is the half that still
+/// is.
 fn retired_msg(toml_type: &str) -> String {
     format!(
         "driver type {toml_type:?} is not hosted by any build of pie right \
          now. `driver-{toml_type}` left the workspace with the legacy \
          declarations it was the last consumer of, and returns when its \
          baker executor lands (P5). Compiled flavors: {compiled}.",
+        compiled = compiled_summary(),
+    )
+}
+
+/// Metal: IN the workspace, and hosted by nothing.
+///
+/// Worth a second function rather than a reworded first. `driver-metal` came
+/// back at P5 with the executor R3 named as the condition, and its portable
+/// half — the walk, the bound statements, the layout arithmetic — builds and
+/// tests on every host in the tree. What no build hosts is the SERVING half,
+/// which is behind that crate's `metal-4` feature and `compile_error!`s off
+/// an Apple target. So "rebuild with a feature" is advice that would work, on
+/// a Mac, once `worker` grows the feature to name it with — and saying "it
+/// left the workspace" would send a reader looking for a crate that is right
+/// there.
+fn unhosted_msg() -> String {
+    format!(
+        "driver type \"metal\" is not hosted by any build of pie right now. \
+         `driver-metal` IS in the workspace and has its baker executor (P5); \
+         what is missing is the wiring — its serving half is behind that \
+         crate\'s `metal-4` feature, which needs an Apple target, and `worker` \
+         states no `driver-metal` feature to select it with. Compiled \
+         flavors: {compiled}.",
         compiled = compiled_summary(),
     )
 }

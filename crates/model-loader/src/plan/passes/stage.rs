@@ -267,7 +267,7 @@ fn declare_staging_buffer(program: &mut LoadPlan, stage: &Staging) -> Result<Buf
     program.buffers.push(BufferDecl {
         id,
         // NOT a tensor. Nothing binds these bytes, nothing finalizes them, and
-        // `publish_spans` must not report them — a staging buffer is the
+        // nothing may publish them under a name — a staging buffer is the
         // arena's, not the contract's.
         tensor: None,
         ty: crate::contract::TensorType::new(stage.shape.clone(), stage.encoding.clone()),

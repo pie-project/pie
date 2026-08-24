@@ -32,23 +32,58 @@
 //! result through the raise door. What is refused is a text with no `masked`
 //! fact — one attention arm and it is causal — and that refusal is
 //! `baker::word_of`'s, where the lane is picked.
+//!
+//! # THE WINDOW IS NOT FOLDED IN HERE, and this is where that was decided
+//!
+//! `attention.masked` states a sliding `window` beside its mask (gemma's 35
+//! sliding layers state 512), and the two readings had to meet somewhere. The
+//! candidate that would have landed in THIS file is a fold: AND the causal
+//! window predicate into the caller's words on the way through
+//! [`element_mask::from_words`], and leave the kernel windowless. It loses on
+//! three counts, and every one of them is about what each side can KNOW:
+//!
+//! * **The window is a fact of the STATEMENT.** The text states it, per
+//!   layer, on the point's own slot, and every other attention body on this
+//!   plane hands its statement's window straight to the launch
+//!   (`kernels_cuda::attn::window_left`). A window applied here would be the
+//!   one number the declaration states that never reaches a kernel — dead
+//!   weight in the text and a second account of the reading in the driver.
+//! * **A mask is per FIRE and a window is per STATEMENT.** This module stages
+//!   ONE mask plane per fire, because a mask is what the CALLER said and a
+//!   caller says it once. gemma's masked lane states two windows in one lane
+//!   (512 on 35 layers, 0 on 7), so a fold needs one mask plane per window —
+//!   `sum_r qo_len[r] * kv_len[r]` bits, duplicated per class — where the
+//!   kernel needs none.
+//! * **The kernel's AND is free, and its window is not just a predicate.**
+//!   flashinfer composes the two in one `LogitsMask`
+//!   (`DefaultAttention<use_custom_mask, use_sliding_window, ..>`), and the
+//!   paged prefill also uses `window_left` to move `kv_start_idx` forward —
+//!   it never loads the pages the window excludes. A folded mask leaves the
+//!   whole prefix scheduled and merely zeroes bits.
+//!
+//! And a fold would change what [`element_mask::from_words`] MEANS. Its
+//! contract is "the engine's bitset, repacked", with `None` for a table that
+//! describes a different fire — a refusal, because serving causally would look
+//! right. ANDing something the engine did not say into it makes the same
+//! function two things at once.
 
 /// The element mask the custom-mask attention dispatch reads — element-, not
 /// page-granularity like everything above.
 ///
 /// # The layout is BIT-packed, and this file used to think otherwise
 ///
-/// Both CUDA kernels that read a custom mask index it the same way, and both
-/// index it by BIT:
+/// The kernel that reads a custom mask indexes it by BIT, and the WINDOW is
+/// the predicate beside it rather than something folded in here:
 ///
 /// ```text
 ///   // kernels/flashinfer/attention/variants.cuh
 ///   mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
-///   // kernels/attn/attention_naive_paged.cuh
-///   const long long bit  = qo_off * kv_total + kv_idx;
-///   const long long byte = mask_indptr[request_idx] + (bit >> 3);
-///   return ((mask[byte] >> (bit & 7)) & 1) != 0;
+///   mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
 /// ```
+///
+/// The naive paged kernel spelled the first line arithmetically and has left
+/// the tree; what it said is kept in the test below, because the packing is
+/// what it agreed with this one about.
 ///
 /// So `mask_d` holds `(q, kv)` as one BIT, `mask_indptr_d` counts BYTES, and a
 /// request's mask begins on a byte boundary. This module published one byte per
@@ -247,7 +282,8 @@ pub mod element_mask {
         /// checked against the thing that consumes it rather than against a
         /// restatement of the packer.
         ///
-        /// `attention_naive_paged.cuh`:
+        /// `flashinfer/attention/variants.cuh`, with the CSR base the
+        /// retired `attention_naive_paged.cuh` spelled out:
         /// ```text
         ///   bit  = qo_off * kv_total + kv_idx;
         ///   byte = mask_indptr[request_idx] + (bit >> 3);

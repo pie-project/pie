@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cudarc::runtime::sys as rt;
-use kernels::routine::Refusal;
+use kernels::plane::Refusal;
 
 struct Slab {
     ptr: *mut c_void,

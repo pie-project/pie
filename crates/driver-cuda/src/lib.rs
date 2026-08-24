@@ -1,6 +1,15 @@
-//! The CUDA execution shell, in Rust. Subsystems land here one at a time,
-//! each keeping its C++ original in `driver-cuda/csrc` as the differential
-//! oracle until the Rust side is proven byte-identical.
+//! The CUDA execution shell, in Rust.
+//!
+//! Subsystems landed here one at a time, each keeping its C++ original in
+//! `driver-cuda/csrc` as the differential oracle until the Rust side was
+//! proven byte-identical. THAT TREE IS GONE, and the tense matters: eleven of
+//! the thirteen `tests/oracle/*/run.sh` cannot run at all, because the
+//! sources they copy were deleted with it. `tests/oracle_census.rs` is the
+//! standing measurement of which, and its whole point is that a dead oracle
+//! reads as live infrastructure unless something says otherwise. The goldens
+//! those scripts once produced are still ASSERTED — they are read, not
+//! re-derived — and two oracles (`dtoa`, `gemm_service`) can still be run,
+//! neither of them here.
 //!
 //! It builds without CUDA: `cudarc` is pinned with `fallback-dynamic-loading`,
 //! so nothing is linked and every symbol resolves through `dlopen` on first

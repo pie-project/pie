@@ -1,9 +1,9 @@
 use kernels::Grid;
+use kernels::plane::Refusal;
 use kernels::points::Scalar;
-use kernels::routine::Refusal;
 
-use crate::plane::{self, Handle};
-use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise_rows};
+use crate::plane::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise_rows};
+use crate::points::{self, Handle};
 
 fn affine_point(group: i32, bits: i32) -> Result<usize, Refusal> {
     let g = match group {
@@ -30,9 +30,6 @@ fn affine_point(group: i32, bits: i32) -> Result<usize, Refusal> {
     Ok(g * 2 + b)
 }
 
-/// The affine-bank embedding gather, and one of the two launches this plane
-/// answers by SYMBOL rather than by point — see [`crate::CANON`] for the walk
-/// that reads the pair and what dropping it would cost every metal lane.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
@@ -72,32 +69,6 @@ pub fn embed_gather_mb_4bit(
     )
 }
 
-/// The `Layout` family, claimed — and both bodies fire out of `attn/`, which
-/// is where their kernels have always lived. A family is ONE impl block and
-/// its points may fire out of two shader directories; cuda's `Mla` reaches
-/// into `gemm/` the same way.
-///
-/// Three points stay on the floor's default body:
-///
-/// * `layout.embed` — SEAM: THE ONE GATHER THIS PLANE HAS IS QUANTIZED.
-///   Every `embed_gather*` arm above takes a `[vocab, hidden]` bank as three
-///   operands (packed 4-bit words, per-group scales, per-group biases) plus
-///   the group size and the bit width that say how to decode them, where the
-///   declaration states ONE `Const<Tensor<T>>` and no scalars. That is the
-///   `Bank<R: Repr>` payload the floor does not carry yet, so the point
-///   cannot be claimed without either lying about the operand list or writing
-///   a dense gather no text on this plane would call. The
-///   [`crate::CANON`] row pointing at [`embed_gather_mb_4bit`] keeps
-///   answering, which is what claim-only means.
-/// * `layout.split_rows` — SEAM: the plain two-way divide, and no `.metal`
-///   kernel cuts a row at a stated width. The three cuts this plane has are
-///   the qkv one, the interleaved q/gate one and quant's own, and none of the
-///   three takes a single boundary and two dense halves.
-/// * `layout.select` — SEAM: gemma's per-layer PLE slice, which is
-///   `y[m, ..] = table[m, layer * width ..]` — a strided per-row COLUMN copy.
-///   `layout/row_gather.metal` gathers whole ROWS by an index plane, which is
-///   a different arithmetic; cuda wrote `layout/deinterleave.cuh`'s slice for
-///   this point in W3 and this tree has no counterpart.
 #[kernels_macros::claims]
 impl kernels::points::Layout for Ctx<'_> {
     fn split_qkv<T: Scalar>(
@@ -110,7 +81,7 @@ impl kernels::points::Layout for Ctx<'_> {
         v: Out<Handle<T>>,
     ) -> Result<(), Refusal> {
         const WHAT: &str = "`layout.split_qkv`, at an element this plane does not stamp";
-        let packed = plane::input::<T, bf16>(packed, WHAT)?;
+        let packed = points::input::<T, bf16>(packed, WHAT)?;
         self.fire(
             Fire::at("attn/split_qkv.metal", "split_qkv_bf16").apply(Grid::of(
                 elementwise_rows(packed.width, packed.rows)?,
@@ -118,21 +89,15 @@ impl kernels::points::Layout for Ctx<'_> {
             )),
             &[
                 packed.arg(),
-                plane::result::<T, bf16>(q, WHAT)?.arg(),
-                plane::result::<T, bf16>(k, WHAT)?.arg(),
-                plane::result::<T, bf16>(v, WHAT)?.arg(),
+                points::result::<T, bf16>(q, WHAT)?.arg(),
+                points::result::<T, bf16>(k, WHAT)?.arg(),
+                points::result::<T, bf16>(v, WHAT)?.arg(),
                 q_width.arg(),
                 kv_width.arg(),
             ],
         )
     }
 
-    /// The interleaved cut, and the three numbers it derives are all the
-    /// operands' own. `head_dim` is the pitch the declaration states; the
-    /// two row strides are the packed row and the half row, which is what a
-    /// DENSE rectangle's pitch is on either side; and the head count is the
-    /// half row over the stated pitch — the shader reads it back as
-    /// `grid.y`, so the grid is where it has to be right.
     fn split_q_gate<T: Scalar>(
         &self,
         packed: In<Handle<T>>,
@@ -141,14 +106,14 @@ impl kernels::points::Layout for Ctx<'_> {
         gate: Out<Handle<T>>,
     ) -> Result<(), Refusal> {
         const WHAT: &str = "`layout.split_q_gate`, at an element this plane does not stamp";
-        let head_dim = plane::stated(head_dim, "the head width this cut walks")?;
+        let head_dim = points::stated(head_dim, "the head width this cut walks")?;
         if head_dim <= 0 {
             return Err(Refusal::Empty {
                 what: "the head width this cut walks",
             });
         }
-        let packed = plane::input::<T, bf16>(packed, WHAT)?;
-        let q = plane::result::<T, bf16>(q, WHAT)?;
+        let packed = points::input::<T, bf16>(packed, WHAT)?;
+        let q = points::result::<T, bf16>(q, WHAT)?;
         if q.width <= 0 || q.width % head_dim != 0 {
             return Err(Refusal::Narrow {
                 what: "the query half does not divide by the head width this cut states",
@@ -162,33 +127,172 @@ impl kernels::points::Layout for Ctx<'_> {
             &[
                 packed.arg(),
                 q.arg(),
-                plane::result::<T, bf16>(gate, WHAT)?.arg(),
+                points::result::<T, bf16>(gate, WHAT)?.arg(),
                 head_dim.arg(),
                 packed.width.arg(),
                 q.width.arg(),
             ],
         )
     }
+
+    fn embed<T: Scalar>(
+        &self,
+        ids: In<Handle<i32>>,
+        table: Const<Handle<T>>,
+        vocab: u32,
+        y: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`layout.embed`, at an element this plane does not stamp";
+        let vocab = points::stated(vocab, "the row count this embedding table states")?;
+        if vocab <= 0 {
+            return Err(Refusal::Empty {
+                what: "the row count this embedding table states",
+            });
+        }
+        let ids = points::input::<i32, i32>(ids, "`layout.embed`'s token stream")?;
+        let y = points::result::<T, bf16>(y, WHAT)?;
+        if ids.rows != y.rows {
+            return Err(Refusal::Narrow {
+                what: "the token ids handed over, against the rows this gather lands",
+                at: i64::from(ids.rows),
+            });
+        }
+        self.fire(
+            Fire::at("layout/embed.metal", "embed_bfloat16")
+                .apply(Grid::of(elementwise_rows(y.width, y.rows)?, [256, 1, 1])),
+            &[
+                ids.ptr.arg(),
+                points::weight::<T, bf16>(table, WHAT)?.arg(),
+                y.arg(),
+                y.width.arg(),
+                vocab.arg(),
+            ],
+        )
+    }
+
+    fn split_rows<T: Scalar>(
+        &self,
+        x: In<Handle<T>>,
+        width: u32,
+        left: Out<Handle<T>>,
+        right: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`layout.split_rows`, at an element this plane does not stamp";
+        let width = points::stated(width, "the column this cut falls at")?;
+        let x = points::input::<T, bf16>(x, WHAT)?;
+        let left = points::result::<T, bf16>(left, WHAT)?;
+        let right = points::result::<T, bf16>(right, WHAT)?;
+        if left.width != width {
+            return Err(Refusal::Narrow {
+                what: "the left half is not the width this cut states",
+                at: i64::from(left.width),
+            });
+        }
+        if left.width <= 0 || right.width <= 0 {
+            return Err(Refusal::Empty {
+                what: "a half of this cut",
+            });
+        }
+        if left.width.checked_add(right.width) != Some(x.width) {
+            return Err(Refusal::Narrow {
+                what: "the two halves do not cover the packed row",
+                at: i64::from(x.width),
+            });
+        }
+        self.fire(
+            Fire::at("layout/deinterleave.metal", "split_rows_bfloat16")
+                .apply(Grid::of(elementwise_rows(x.width, x.rows)?, [256, 1, 1])),
+            &[
+                x.arg(),
+                left.arg(),
+                right.arg(),
+                left.width.arg(),
+                right.width.arg(),
+            ],
+        )
+    }
+
+    fn select<T: Scalar>(
+        &self,
+        table: In<Handle<T>>,
+        layer: u32,
+        width: u32,
+        y: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`layout.select`, at an element this plane does not stamp";
+        let width = points::stated(width, "the slice width this select states")?;
+        let table = points::input::<T, bf16>(table, WHAT)?;
+        let y = points::result::<T, bf16>(y, WHAT)?;
+        if y.width != width {
+            return Err(Refusal::Narrow {
+                what: "the selected slice is not the width the statement states",
+                at: i64::from(y.width),
+            });
+        }
+        let offset = points::stated(layer, "the layer this select names")?
+            .checked_mul(width)
+            .ok_or(Refusal::Wide {
+                what: "the column this layer's slice starts at",
+                at: i64::from(layer) * i64::from(width),
+                max: i64::from(i32::MAX),
+            })?;
+        if offset
+            .checked_add(width)
+            .is_none_or(|end| end > table.width)
+        {
+            return Err(Refusal::Narrow {
+                what: "the relayed row does not reach this layer's slice",
+                at: i64::from(table.width),
+            });
+        }
+        self.fire(
+            Fire::at("layout/deinterleave.metal", "select_slice_bfloat16")
+                .apply(Grid::of(elementwise_rows(y.width, y.rows)?, [256, 1, 1])),
+            &[
+                table.arg(),
+                y.arg(),
+                table.width.arg(),
+                offset.arg(),
+                width.arg(),
+            ],
+        )
+    }
 }
 
-/// The `Gemm` family, implemented and claiming nothing.
-///
-/// EVERY MATMUL ON THIS PLANE IS QUANTIZED, and that is the whole of it.
-/// `gemm.matmul`, `gemm.lm_head` and `gemm.attention_landing` each state one
-/// `Const<Self::Tensor<T>>` — one dense bank at the activation's element —
-/// and the `.metal` tree stamps no such kernel: `quant/qmm_t.metal` and
-/// `quant/qmv.metal` are affine (packed words, per-group scales, per-group
-/// biases, a group size and a bit width), `moe/route.metal`'s routed arms are
-/// the same three operands with a permutation, and `third_party/mlx/steel_*`
-/// are the tiles those two are built out of rather than entrypoints of their
-/// own.
-///
-/// SEAM: `Bank<R: Repr>`, the floor payload `.wiki/baker.md` names beside
-/// `Tensor<T>` and the floor does not carry yet. It is the same gap
-/// `layout.embed` above and `moe.matmul_select*` next door are stated
-/// against, and it is one gap and not three — when a point can state a
-/// quantized bank, all six land together and every SKU's `gemm.matmul` row
-/// with them. Writing a dense bf16 GEMM instead would be a kernel no text on
-/// this plane calls.
 #[kernels_macros::claims]
-impl kernels::points::Gemm for Ctx<'_> {}
+impl kernels::points::Gemm for Ctx<'_> {
+    fn matmul<T: Scalar>(
+        &self,
+        act: In<Handle<T>>,
+        w: Const<Handle<T>>,
+        y: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`gemm.matmul`, at an element this plane does not stamp";
+        crate::gemm::act_x_wt(
+            self,
+            points::input::<T, bf16>(act, WHAT)?,
+            points::weight::<T, bf16>(w, WHAT)?,
+            points::result::<T, bf16>(y, WHAT)?,
+        )
+    }
+
+    fn lm_head<T: Scalar>(
+        &self,
+        act: In<Handle<T>>,
+        w: Const<Handle<T>>,
+        y: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        self.matmul(act, w, y)
+    }
+
+    fn attention_landing<T: Scalar>(
+        &self,
+        act: In<Handle<T>>,
+        w: Const<Handle<T>>,
+        layer: u32,
+        y: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = layer;
+        self.matmul(act, w, y)
+    }
+}

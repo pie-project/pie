@@ -17,19 +17,23 @@
 //! The third is why this is a file rather than a unit test beside the trait. A
 //! backing that runs nothing must leave the arena holding exactly what a
 //! backing that was never asked leaves — which is what makes the delegation a
-//! *route* rather than a second implementation that could disagree. The same
-//! sentence is what lets [`Chunked`] be checked here: a segmented arena is
-//! another way to hold the same bytes, so it must hold the same bytes.
+//! *route* rather than a second implementation that could disagree.
+//!
+//! A segmented backing STOOD BESIDE THEM — an arena spread over several
+//! allocations, differentially compared against the flat one — and it went
+//! with the executor::chunked module it was the only reader of. That module
+//! was driver-metal's, moved here so the chunk arithmetic could be checked
+//! with no GPU in the build; driver-metal came back at P5a with a baker
+//! executor whose staging is its own, and took no loader dependency with it.
+//! What was left was a public module read by one test of its own crate.
 
 use std::borrow::Cow;
-use std::ptr::NonNull;
 
 use model_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use model_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
 use model_loader::error::Error;
 use model_loader::executor::Execution;
 use model_loader::executor::arena::{ArenaBacking, TileMapOp};
-use model_loader::executor::chunked::{Chunk, Chunked};
 use model_loader::executor::sink::MemorySink;
 use model_loader::plan::compile as compile_load_plan;
 use model_loader::plan::passes::tile::{CUDA_QUANTIZE_BF16_TO_FP8, CUDA_SCALE_ROWS_BF16};
@@ -561,119 +565,6 @@ fn a_failed_load_does_not_finish_the_arena() {
         refused.finished, 0,
         "a load that stopped part-way has no complete arena to hand over; \
          releasing it is `Drop`'s job, not `finish`'s"
-    );
-}
-
-// ── The same arena, in pieces
-
-/// A chunk backed by a host allocation, standing in for a device buffer.
-///
-/// `driver-metal` passes its `Allocation`s, whose `base` is an `MTLBuffer`'s
-/// `contents()`. A `Box<[u8]>` has the property that matters — a stable,
-/// uniquely-owned, host-addressable span — so the arithmetic under test is
-/// the same arithmetic.
-struct HostChunk(Box<[u8]>);
-
-// SAFETY: each `HostChunk` owns its box, so no two overlap, and the box lives
-// as long as the `HostChunk` that is holding it.
-unsafe impl Chunk for HostChunk {
-    fn base(&self) -> NonNull<u8> {
-        NonNull::new(self.0.as_ptr().cast_mut()).expect("a box is never null")
-    }
-    fn len(&self) -> u64 {
-        self.0.len() as u64
-    }
-}
-
-/// Execute the fixture into an arena cut into `pieces` allocations.
-fn run_chunked(pieces: &[usize]) -> Vec<u8> {
-    let plan = plan();
-    let total = usize::try_from(plan.memory.persistent_bytes).expect("fits");
-    assert_eq!(
-        pieces.iter().sum::<usize>(),
-        total,
-        "the pieces must cover the arena the plan asked for"
-    );
-    let chunks: Vec<HostChunk> = pieces
-        .iter()
-        .map(|&n| HostChunk(vec![0u8; n].into_boxed_slice()))
-        .collect();
-    // One more cut than there are chunks: every chunk's start, then the total.
-    let mut cuts = vec![0u64];
-    for &n in pieces {
-        cuts.push(cuts.last().expect("seeded") + n as u64);
-    }
-
-    let mut arena = Chunked::new(&chunks, &cuts).expect("a covering set of cuts");
-    let mut sink = MemorySink::default();
-    let dir = checkpoint();
-    let outcome = Execution::new(&plan, &dir)
-        .arena(&mut arena)
-        .sink(&mut sink)
-        .run()
-        .map(|_| ());
-    std::fs::remove_dir_all(&dir).ok();
-    outcome.expect("a segmented arena runs the same plan");
-
-    chunks.iter().flat_map(|c| c.0.iter().copied()).collect()
-}
-
-/// A segmented arena holds what a flat one holds.
-///
-/// §11's last row, and the reason [`Chunked`] moved out of `driver-metal`:
-/// once the chunk arithmetic is an [`ArenaBacking`] over a plain trait, it is
-/// checkable against the flat backing with no GPU in the build. The plan does
-/// not change, the bytes do not change, and the only thing that differs is how
-/// many allocations the address space is spread over.
-///
-/// The cuts are deliberately awkward. Metal's real ones fall on tensor
-/// boundaries at 4 GiB, but a cut chosen to land where nothing crosses it is
-/// a cut that proves nothing — the split at `total / 2` is picked to fall in
-/// the middle of the fixture's writes, which is the case the arithmetic
-/// exists for.
-#[test]
-fn a_segmented_arena_lands_the_same_bytes_as_a_flat_one() {
-    let flat = run(false);
-    assert_eq!(flat.outcome, Ok(()));
-    let total = flat.bytes.len();
-
-    for pieces in [
-        vec![total],
-        vec![total / 2, total - total / 2],
-        vec![1, total - 1],
-        vec![total - 1, 1],
-        vec![total / 4, total / 4, total - 2 * (total / 4)],
-    ] {
-        assert_eq!(
-            run_chunked(&pieces),
-            flat.bytes,
-            "an arena in {} piece(s) {pieces:?} disagreed with the flat one",
-            pieces.len()
-        );
-    }
-}
-
-/// A cut in the middle of a write is a write that is split.
-///
-/// The differential above would still pass if every one of the fixture's
-/// accesses happened to sit inside one chunk: the arithmetic would never be
-/// exercised and the test would be measuring nothing, which is the failure
-/// this whole file was rewritten out of. So state the premise separately —
-/// with a cut at `total / 2` at least one access must cross it.
-#[test]
-fn the_fixture_actually_writes_across_a_cut() {
-    let plan = plan();
-    let total = usize::try_from(plan.memory.persistent_bytes).expect("fits");
-    let cut = (total / 2) as u64;
-    let crosses = plan.buffers.iter().any(|buffer| {
-        buffer
-            .persistent_offset
-            .is_some_and(|at| at < cut && at + buffer.bytes > cut)
-    });
-    assert!(
-        crosses,
-        "no buffer in the fixture spans the cut at {cut}, so the chunked \
-         differential is comparing arithmetic that never ran"
     );
 }
 
