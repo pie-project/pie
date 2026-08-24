@@ -35,7 +35,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::layout::embed(&ids, &m.embed);
+        let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
 
         for (l, w) in m.layers.iter().enumerate() {
             let l = l as u32;
@@ -124,9 +124,16 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
 
     let (q_nope, q_pe) = kernels::mla::split_q_b(&q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
     let q_pe = kernels::rope::partial_q(&q_pe, &positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta);
-    let q = kernels::mla::absorb_q_pe(
+    // THE ABSORB IS KIMI'S, AND SO IS THE QUERY PAIR. This text used to
+    // state `mla.absorb_q_pe` — the absorb with the rotated half folded into
+    // the result's tail — and hand the fused row to a selected attention
+    // that stated no `q_pe`. Nothing in the tree ever wrote such a tail and
+    // nothing ever read one: the absorb is a strided batched gemm with a
+    // single activation operand, and both latent attention kernels address
+    // `q_nope` and `q_pe` as two planes with two pitches. The legacy glm
+    // text did not fold either. The point is gone and the pair is here.
+    let q = kernels::mla::absorb_q(
         &q_nope,
-        &q_pe,
         &a.kv_b_proj,
         a.heads,
         a.kv_lora_rank,
@@ -137,11 +144,21 @@ fn latent_attention<W1: Dtype>(x: &Value, inputs: &Input<Facts>, a: &Attn<W1>, l
 
     let one = Facts::qo_one();
     let (dq, pq) = q.split(&one);
+    let (dpe, ppe) = q_pe.split(&one);
     let (d_sel, p_sel) = selection.split(&one);
     let scored = merge![
-        kernels::mla::attention_decode_selected(&dq, &d_sel, &pages, a.heads, a.kv_lora_rank, a.sm_scale),
+        kernels::mla::attention_decode_selected(
+            &dq,
+            &dpe,
+            &d_sel,
+            &pages,
+            a.heads,
+            a.kv_lora_rank,
+            a.sm_scale,
+        ),
         kernels::mla::attention_prefill_selected(
             &kernels::query_windows(&pq),
+            &ppe,
             &p_sel,
             &pages,
             a.heads,

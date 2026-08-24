@@ -13,11 +13,12 @@ pub const ROLES: &[&str] = &[
     "rmsnorm",
     // `attention` carries the whole core family now: `attention.decode`,
     // `.prefill`, `.masked`, the two `_lse` readings, `.sink`,
-    // `.merge_lse`, `.lse_ln`, `.logit_softcap`, `.kv_append` and
-    // `.kv_append_shared` all read their role off this one entry.
-    // `lse_ln`, `logit_softcap` and `res_blend` retired with the migration
-    // — each was a bare role for a single point, and each point now wears
-    // its family's prefix (`res_blend` joined `norm`).
+    // `.merge_lse`, `.logit_softcap`, `.kv_append` and `.kv_append_shared`
+    // all read their role off this one entry. `lse_ln`, `logit_softcap`
+    // and `res_blend` retired as BARE ROLES with the migration — each was
+    // a role for a single point, and each point wears its family's prefix
+    // now (`res_blend` joined `norm`). `attention.lse_ln` then retired as
+    // a point too, when the floor stated the base of an lse.
     "attention",
     // `kv_append` keeps its bare prefix: the shader planes' paged append
     // claims it, and dsv4's shared plane states `kv_append.shared`. The

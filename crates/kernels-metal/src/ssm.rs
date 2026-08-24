@@ -1,8 +1,10 @@
 use kernels::BindMut;
 use kernels::Grid;
+use kernels::points::Scalar;
 use kernels::routine::Refusal;
 use kernels_macros::routine;
 
+use crate::plane::{self, Handle};
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 use crate::views::RecurrentState;
 use kernels::raises::Struct;
@@ -288,6 +290,12 @@ pub fn gdn_prep(
     )
 }
 
+// NOT INLINED, AND NOT THIS POINT ANY MORE. W10 rewrote `ssm.gdn_prep` into
+// one launch over the packed `[b | a]` projection; this routine is the
+// pre-W10 one (conv + norm + widen + gates against a recurrent view, five
+// rectangles out). The `canon` stays because the legacy driver still fires
+// it under that name; `impl Ssm` below claims the point with the launch the
+// declaration actually states.
 #[routine(canon = "ssm.gdn_prep")]
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
@@ -654,4 +662,115 @@ pub fn gdn_core_recurrent_prefill(
             n_scan.arg(),
         ],
     )
+}
+
+/// The threadgroup a per-head prologue runs in.
+///
+/// One lane per value head, capped at the widest threadgroup Metal will take.
+/// The grid is `[v_heads, rows, 1]` and Metal dispatches EXACTLY the threads
+/// asked for, so the cap only splits the row across threadgroups — it never
+/// leaves a head unwritten.
+fn head_lanes(v_heads: i32) -> Result<u32, Refusal> {
+    if v_heads <= 0 {
+        return Err(Refusal::Empty { what: "v_heads" });
+    }
+    Ok(v_heads.unsigned_abs().min(256))
+}
+
+/// The `Ssm` family, claimed — one point of seven, and the one is the one
+/// W10 rewrote.
+///
+/// Six points stay on the floor's default body, and the six absences are two
+/// seams and a family:
+///
+/// * `ssm.causal_conv1d` / `ssm.causal_conv1d_chunked` — SEAM: THE
+///   CONVOLUTION IS NOT A LAUNCH ON THIS PLANE. Both `gdn_prep*` and both
+///   `gdn_core*` run their own depthwise conv inline (over the channels each
+///   one owns) and write their half of `new_conv_state` as they go; no
+///   `.metal` entrypoint takes a `[C, K]` bank, a conv-state ring and a
+///   stated width and does that and nothing else. Cuda's
+///   `causal_conv1d_update_batched` / `_prefill_batched` are the shape these
+///   want.
+/// * `ssm.gated_delta` / `ssm.gated_delta_chunked` — SEAM: the metal
+///   recurrences read the PRE-W10 STAGING. `gdn_core_recurrent_slotted` and
+///   `gdn_core_recurrent_prefill` take `pre_q`, `pre_k` and `pre_gate` — the
+///   three f32 scratch planes `gdn_prep_slotted` wrote — while the points
+///   state the packed post-convolution `qkv`, the gate row and the packed
+///   `[g_log | beta]` decay row, and expect the cut from those to the
+///   recurrence's compact planes to happen INSIDE the launch. That cut is
+///   cuda's `qwen_gdn_v_gates` (`GdnShape::stage`) and this tree has no
+///   counterpart; a body that offset into the packed rows by hand would be
+///   claiming a row stride of `v_heads` for bytes whose stride is
+///   `2 * v_heads` — true at one token, false at two, which is the exact
+///   defect W10 was written to remove.
+/// * `ssm.kda_step` / `ssm.kda_chunked` — SEAM: kimi's delta attention, and
+///   the `.metal` tree carries no KDA kernel in any form.
+#[kernels_macros::claims]
+impl kernels::points::Ssm for Ctx<'_> {
+    /// Qwen's gated-delta prologue: the packed `[b | a]` projection in, the
+    /// packed `[g_log | beta]` decay row out.
+    ///
+    /// ONE LAUNCH, AND EXACTLY THE DECLARATION'S SLOTS — which is what makes
+    /// this a claim rather than a `canon` row. `gdn_prep_slotted` above wears
+    /// the same point's name and is a different statement: it takes the
+    /// post-mixer row this declaration has no slot for, reaches a recurrent
+    /// view this declaration does not name, and writes five rectangles where
+    /// this one states one.
+    ///
+    /// `qwen_gdn_ba_gates` is the arithmetic with the packing kept, ported
+    /// from `kernels-cuda`'s `ssm/gated_delta_net_prep.cuh` slot for slot. It
+    /// reads the projection as the matmul wrote it and writes the decay row
+    /// as the two recurrence points read it.
+    ///
+    /// # `v_heads` is read, not stated
+    ///
+    /// The declaration states no scalar, and it does not need to: the operand
+    /// IS `[b | a]`, so the value-head count is half its width. A `Const`
+    /// restating it could disagree with the rectangle it divides.
+    fn gdn_prep<T: Scalar>(
+        &self,
+        ba: In<Handle<T>>,
+        dt_bias: Const<Handle<T>>,
+        a_log: Const<Handle<f32>>,
+        gates: Out<Handle<f32>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`ssm.gdn_prep`, at an element this plane does not stamp";
+        let ba = plane::input::<T, bf16>(ba, WHAT)?;
+        let gates = plane::result::<f32, f32>(gates, "`ssm.gdn_prep`'s decay row")?;
+        if ba.width % 2 != 0 {
+            return Err(Refusal::Narrow {
+                what: "the `[b | a]` projection's row, which halves into the value heads",
+                at: i64::from(ba.width),
+            });
+        }
+        let v_heads = ba.width / 2;
+        // THE RESULT IS THE OPERAND'S SHAPE ON f32 — the width rule says so
+        // and the kernel strides both by the same `2 * v_heads`, so a
+        // rectangle that disagreed would be written past rather than
+        // partially.
+        if gates.width != ba.width || gates.rows != ba.rows {
+            return Err(Refusal::Narrow {
+                what: "the fused `[g_log | beta]` row, against the projection it is derived from",
+                at: i64::from(gates.width),
+            });
+        }
+        let lanes = head_lanes(v_heads)?;
+        let rows = u32::try_from(ba.rows).map_err(|_| Refusal::Empty { what: "rows" })?;
+        if rows == 0 {
+            return Err(Refusal::Empty { what: "rows" });
+        }
+        self.fire(
+            Fire::at("ssm/gdn_prep.metal", "qwen_gdn_ba_gates_bfloat16").apply(Grid::of(
+                [v_heads.unsigned_abs(), rows, 1],
+                [lanes, 1, 1],
+            )),
+            &[
+                ba.arg(),
+                plane::weight::<f32, f32>(a_log, "`ssm.gdn_prep`'s decay bank")?.arg(),
+                plane::weight::<T, bf16>(dt_bias, WHAT)?.arg(),
+                gates.arg(),
+                v_heads.arg(),
+            ],
+        )
+    }
 }

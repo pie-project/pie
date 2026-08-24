@@ -1,10 +1,11 @@
 use kernels::BindMut;
 use kernels_macros::routine;
 
+use crate::points::{Payload, absent, at_bf16};
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16};
-use crate::views::{AttnMask, AttnSplit, KvCache};
+use crate::views::{AttnFire, AttnFireView, AttnMask, AttnSplit, KvCache};
 use kernels::raises::Struct;
-use kernels::routine::Refusal;
+use kernels::routine::{Cache, Refusal};
 use kernels::shader::{elementwise, elementwise_rows};
 
 fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
@@ -180,7 +181,7 @@ fn tiled_grid(q_heads: i32, head_dim: i32, rows: i32) -> Result<[u32; 3], Refusa
     Ok([x, y, 1])
 }
 
-fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal> {
+pub(crate) fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal> {
     if head_dim <= 0 {
         return Err(Refusal::Empty {
             what: "the head width",
@@ -199,6 +200,7 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
     ])
 }
 
+// INLINED into impl Layout; dies with the routine layer.
 #[routine(canon = "layout.split_qkv", out(q = rows(packed) x const(q_width)), out(k = rows(packed) x const(kv_width)), out(v = rows(packed) x const(kv_width)))]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
@@ -226,6 +228,7 @@ pub fn split_qkv_bf16(
     )
 }
 
+// INLINED into impl Gate; dies with the routine layer.
 #[routine(canon = "gate.sigmoid_mul", out(attn = like(attn)))]
 pub fn gate(
     ctx: &Ctx<'_>,
@@ -242,6 +245,7 @@ pub fn gate(
     )
 }
 
+// INLINED into impl Layout; dies with the routine layer.
 #[routine(canon = "layout.split_q_gate")]
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
@@ -306,6 +310,7 @@ pub fn kv_append(
     )
 }
 
+// INLINED into impl Attention; dies with the routine layer.
 #[routine(canon = "attention.kv_append")]
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
@@ -362,6 +367,7 @@ pub fn kv_append_paged(
     )
 }
 
+// INLINED into impl Attention; dies with the routine layer.
 #[routine(out(out = like(logits)))]
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
@@ -376,6 +382,7 @@ pub fn logit_softcap(
     )
 }
 
+// INLINED into impl Attention; dies with the routine layer.
 #[routine(out(out = like(queries)))]
 pub fn sdpa_paged_decode(
     ctx: &Ctx<'_>,
@@ -823,6 +830,7 @@ pub fn sdpa_paged_decode_sink(
     )
 }
 
+// INLINED into impl Attention; dies with the routine layer.
 #[routine(out(out = like(queries)))]
 pub fn sdpa_paged_tiled(
     ctx: &Ctx<'_>,
@@ -1400,4 +1408,595 @@ pub fn sdpa_vector_decode_sink(
             o_row_stride.arg(),
         ],
     )
+}
+
+/// The fire's attention view, or a refusal naming the pool row.
+///
+/// The one unsafe read in this file's points layer: `Cache<Struct<AttnFire>>`
+/// carries `*const AttnFireView`, the object the driver built for THIS fire.
+/// A raise has no shape, so the mark's `rows` and `width` are zero and the
+/// pointer is the whole of it.
+fn fire_view(pages: &Cache<Struct<AttnFire>>) -> Result<&AttnFireView, Refusal> {
+    if pages.ptr.is_null() {
+        return Err(Refusal::Null {
+            what: "the attention view this statement's pool row names",
+        });
+    }
+    Ok(unsafe { &*pages.ptr })
+}
+
+/// A stated width, as the shader's `i32`.
+fn width_of(v: u32, what: &'static str) -> Result<i32, Refusal> {
+    i32::try_from(v).map_err(|_| Refusal::Wide {
+        what,
+        at: i64::from(v),
+        max: i64::from(i32::MAX),
+    })
+}
+
+/// The query heads a rectangle of `head_dim`-wide heads holds.
+///
+/// READ, NOT STATED. `attention.decode` declares `head_dim` and no head
+/// count, so the count is the operand's own width over it — and a rectangle
+/// whose width is not a whole number of heads is refused here rather than
+/// silently truncated by the division.
+fn heads_of(width: i32, head_dim: i32, what: &'static str) -> Result<i32, Refusal> {
+    if head_dim <= 0 {
+        return Err(Refusal::Empty {
+            what: "the head width",
+        });
+    }
+    if width <= 0 || width % head_dim != 0 {
+        return Err(Refusal::Narrow {
+            what,
+            at: i64::from(width),
+        });
+    }
+    Ok(width / head_dim)
+}
+
+/// `q_heads / kv_heads`, the GQA fan every sdpa entrypoint here takes.
+///
+/// Zero when the pool states no heads, which is the routine layer's reading
+/// verbatim — the shader divides by it and a view built over a store with no
+/// pool comes back all zeros.
+const fn gqa(q_heads: i32, kv_heads: i32) -> i32 {
+    if kv_heads > 0 { q_heads / kv_heads } else { 0 }
+}
+
+/// The paged sdpa arms' shared operand run, up to but not including the
+/// window.
+///
+/// Fifteen values, in the order every `sdpa_paged*` entrypoint declares them.
+/// It is written once because five bodies pass it and a body that reordered
+/// two of them would read a mask stride as a page size with nothing to say
+/// so — the failure `attn/sdpa_paged.wgsl`'s own header warns about, at the
+/// one place a claim can still make it.
+fn paged_run(
+    view: &AttnFireView,
+    queries: crate::routine::ArgValue,
+    out: crate::routine::ArgValue,
+    gqa_factor: i32,
+    kv_heads: i32,
+    sm_scale: f32,
+) -> [crate::routine::ArgValue; 15] {
+    [
+        queries,
+        view.kv.keys.arg_mut(),
+        view.kv.values.arg_mut(),
+        out,
+        gqa_factor.arg(),
+        view.positions.arg(),
+        view.request_of_token.arg(),
+        view.kv.page_indices.arg(),
+        view.kv.page_indptr.arg(),
+        view.kv.page_size.arg(),
+        kv_heads.arg(),
+        sm_scale.arg(),
+        view.mask.mask.arg(),
+        view.mask.stride.arg(),
+        view.mask.enabled.arg(),
+    ]
+}
+
+/// The `Attention` family, claimed. Five of eleven points land.
+///
+/// # What lands, and what a body had to reach for
+///
+/// `decode`, `prefill`, `masked`, `logit_softcap` and `kv_append`. Four of
+/// those five read the fire's staging off [`AttnFireView`] — the positions,
+/// the request-of-token map, the custom-mask triple and the decode split
+/// policy — because a point declares operands and scalars only and this
+/// plane's `Ctx` is a `dyn Encode` with nothing behind it. That view is this
+/// migration's largest single ask of P5 and its doc comment states it.
+///
+/// # The five that do not land
+///
+/// * `decode_lse`, `prefill_lse`, `merge_lse`, `sink` — NO SHADER
+///   ON THIS PLANE WRITES AN LSE. Every `sdpa_paged*` and `sdpa_vector*`
+///   entrypoint here normalises inside the kernel and stores the attention
+///   output alone; there is no second `Out` for the row's log-sum-exp and no
+///   merge that takes two of them. That is why the sliding/full pair is
+///   served by `sdpa_sliding.wgsl` as a WHOLE attention rather than by two
+///   attentions and a merge, and it is why the sink correction is baked into
+///   `sdpa_paged_decode_sink_bfloat16` instead of being applied after the
+///   fact.
+///
+///   The four are ONE seam, not four: an `lse: Out<Tensor<f32>>` on the
+///   paged arms would make `decode_lse`/`prefill_lse` fall out, and
+///   `merge_lse`/`sink` are two small shaders on top of it. Until
+///   then, a text that wants a sink states `attention.decode` and gets no
+///   sink at all, which is why NEITHER is claimed: claiming `decode` with the
+///   sinks buffer bound absent is what this plane already does, and it is
+///   correct for every model without a sink and refuses for the ones with.
+///
+///   **SEAM (P5):** `sdpa_paged.wgsl` gains an `lse` binding under a
+///   `PIE_LSE` define; `attn/sink.wgsl` and `attn/merge_lse.wgsl` are new
+///   files, both reading the lse in the base `attention.decode_lse`
+///   states. `Attention::sink`'s operands are all dense rectangles, so it
+///   is the cheaper of the two to write.
+/// * `kv_append_shared` — dsv4's single-plane append, which cuda claims by
+///   binding one address into both source slots. Bindable here too (one
+///   handle in two read-only bindings is the `residual_add` pattern), but
+///   `attn/kv_write.wgsl`'s paged arm reads `n_kv_heads` and a head width
+///   the SHARED statement does not carry, and this plane's view has no
+///   `layout` flag to read the split off the strides with the way cuda's
+///   `head_split` does. So it waits on the same view work `AttnFireView`
+///   names, and dsv4 does not run here yet regardless (`Mla` is empty).
+///
+/// # Which prefill arm, and why the body cannot choose
+///
+/// This plane has THREE prefill shaders — `sdpa_paged_tiled`,
+/// `sdpa_paged_mma` (cooperative matrix, 2.4x on an M4 Pro) and the strided
+/// tiled form. `.wiki/baker.md` says per-fire kernel choice "branches inside
+/// the body on the operands' dims", and the mma arm's condition is not a
+/// dim: it is `Capability::Matrix`, a property of the ADAPTER. A `dyn Encode`
+/// cannot be asked. So the claims below fire the tiled arm unconditionally
+/// and the fast arm is unreachable through a point.
+///
+/// **SEAM (P5):** `Encode` grows `fn capability(&self) -> Capability`. Then
+/// `prefill` reads it and takes `mma_grid` at `Capability::Matrix` with
+/// `head_dim == 64`, exactly as `driver-wgpu`'s program builder picks today.
+#[kernels_macros::claims]
+impl kernels::points::Attention for Ctx<'_> {
+    /// One query row per request against the pool row's pages.
+    ///
+    /// # The split policy, transcribed with its measurement intact
+    ///
+    /// Below 128 workgroups a decode is LATENCY-bound rather than
+    /// bandwidth-bound — sixteen workgroups each walking 512 keys in series
+    /// with nothing to overlap them — so the fire splits the key history
+    /// eight ways and merges the partials. Measured four times on an M4 Pro
+    /// (`attn::sdpa_paged_decode`'s note carries all four sweeps): taking the
+    /// OTHER branch costs 26%, and the split count itself has been flat-then-
+    /// basined at eight through a `PIE_KR` change, a `PIE_KL` change and a
+    /// doubled key block.
+    ///
+    /// The policy is the DRIVER's to publish and this body's to read:
+    /// `SplitView::splits <= 1` (a saturated device, or a shell that does not
+    /// want the scratch) fires the unsplit form, which is what the optional
+    /// `keys::AttnScratch` ask used to decide by presence.
+    fn decode<T: kernels::points::Scalar>(
+        &self,
+        q: In<Payload<T>>,
+        pages: Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Payload<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.decode at an element other than bf16")?;
+        let view = fire_view(&pages)?;
+        let head_dim = width_of(head_dim, "the head width this attention states")?;
+        let window = width_of(window, "the sliding window this attention states")?;
+        let q_heads = heads_of(q.width, head_dim, "the query rectangle's row")?;
+        let kv_heads = view.kv_heads;
+        let rows = q.rows;
+        let point = head_point(head_dim, &[64, 128, 256, 512])?;
+        let run = paged_run(
+            view,
+            q.arg(),
+            o.arg(),
+            gqa(q_heads, kv_heads),
+            kv_heads,
+            sm_scale,
+        );
+
+        // The unsplit reading, and the test is the WORKGROUP COUNT rather
+        // than the token count: what makes a decode latency-bound is how few
+        // groups its grid has, and `rows * q_heads` is that number.
+        let workgroups = rows.saturating_mul(q_heads);
+        let scratch = if workgroups < 128 && view.split.splits > 1 {
+            Some(view.split.partials)
+        } else {
+            None
+        };
+
+        let Some(scratch) = scratch else {
+            return self.fire(
+                Fire::at(
+                    "attn/sdpa_paged.wgsl",
+                    [
+                        "sdpa_paged_decode_bfloat16_d_64",
+                        "sdpa_paged_decode_bfloat16_d_128",
+                        "sdpa_paged_decode_bfloat16_d_256",
+                        "sdpa_paged_decode_bfloat16_d_512",
+                    ][point],
+                )
+                .apply(paged_decode_grid(head_dim, q_heads, rows)?),
+                &[
+                    run[0],
+                    run[1],
+                    run[2],
+                    run[3],
+                    run[4],
+                    run[5],
+                    run[6],
+                    run[7],
+                    run[8],
+                    run[9],
+                    run[10],
+                    run[11],
+                    run[12],
+                    run[13],
+                    run[14],
+                    window.arg(),
+                    // NO SINK. `attention.sink` is a point of its own and
+                    // this plane does not claim it; a text that wants one
+                    // states it and gets the family's refusal by name rather
+                    // than an attention that quietly dropped it.
+                    absent(self)?,
+                ],
+            );
+        };
+
+        // A PROBE KNOB, and eight is the shipped value — read from the
+        // environment rather than compiled in because `splits` is a runtime
+        // argument AND a grid dimension, so nothing has to be rebuilt to move
+        // it. Four sweeps on tokens from 9.8 ms to 7.4 ms have answered
+        // eight every time; see `attn::sdpa_paged_decode`.
+        let splits = std::env::var("PIE_SPLITS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8);
+
+        self.fire(
+            Fire::at(
+                "attn/sdpa_paged.wgsl",
+                [
+                    "sdpa_paged_decode_split_bfloat16_d_64",
+                    "sdpa_paged_decode_split_bfloat16_d_128",
+                    "sdpa_paged_decode_split_bfloat16_d_256",
+                    "sdpa_paged_decode_split_bfloat16_d_512",
+                ][point],
+            )
+            .apply(paged_split_grid(head_dim, q_heads, rows, splits)?),
+            &[
+                run[0],
+                run[1],
+                run[2],
+                // The split arm writes PARTIALS, not the result: the output
+                // slot is unbound and the scratch plane at the tail is where
+                // the eight walks land.
+                absent(self)?,
+                run[4],
+                run[5],
+                run[6],
+                run[7],
+                run[8],
+                run[9],
+                run[10],
+                run[11],
+                run[12],
+                run[13],
+                run[14],
+                window.arg(),
+                absent(self)?,
+                scratch.arg_mut(),
+                splits.arg(),
+            ],
+        )?;
+
+        // The merge reads the partials and nothing else, so every operand it
+        // does not touch is bound absent. The three it keeps — the gqa fan,
+        // the mask stride and the window — are the row geometry it folds
+        // over, not inputs it reads.
+        self.fire(
+            Fire::at(
+                "attn/sdpa_paged.wgsl",
+                [
+                    "sdpa_paged_decode_merge_bfloat16_d_64",
+                    "sdpa_paged_decode_merge_bfloat16_d_128",
+                    "sdpa_paged_decode_merge_bfloat16_d_256",
+                    "sdpa_paged_decode_merge_bfloat16_d_512",
+                ][point],
+            )
+            .apply(paged_merge_grid(head_dim, q_heads, rows)?),
+            &[
+                absent(self)?,
+                absent(self)?,
+                absent(self)?,
+                o.arg(),
+                gqa(q_heads, kv_heads).arg(),
+                absent(self)?,
+                absent(self)?,
+                absent(self)?,
+                absent(self)?,
+                view.kv.page_size.arg(),
+                kv_heads.arg(),
+                sm_scale.arg(),
+                absent(self)?,
+                view.mask.stride.arg(),
+                absent(self)?,
+                window.arg(),
+                absent(self)?,
+                scratch.arg_mut(),
+                splits.arg(),
+            ],
+        )
+    }
+
+    /// The prefill window: tiles of 32 query rows, heads on x.
+    ///
+    /// # `indptr` is declared and this plane does not read it
+    ///
+    /// The point states the fire's query CSR because cuda's prefill needs it:
+    /// its fa2 schedule is measured on the host from three CSR slices. This
+    /// plane's tiled arm reconstructs the same window from `positions` and
+    /// `request_of_token` — one position per token and the request it belongs
+    /// to — and walks the page CSR per row. The two carry the same
+    /// information and the shader was written against the second pair.
+    ///
+    /// So `indptr` is spent by being unread, and that is stated rather than
+    /// hidden: a body that silently ignored a declared operand would be a
+    /// statement whose dataflow edge means nothing. If the tiled arm ever
+    /// grows a CSR fast path, the operand is already here.
+    ///
+    /// # `kv_heads` is stated AND read, and they must agree
+    ///
+    /// The point declares `kv_heads`; [`AttnFireView`] carries the pool's
+    /// own. A disagreement means the plan and the pool were built from
+    /// different layer facts, which is precisely the class of bug the
+    /// stated-geometry law exists to catch, so it refuses here rather than
+    /// attending over the wrong page stride.
+    fn prefill<T: kernels::points::Scalar>(
+        &self,
+        q: In<Payload<T>>,
+        indptr: In<Payload<i32>>,
+        pages: Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: Out<Payload<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = indptr;
+        at_bf16::<T>("attention.prefill at an element other than bf16")?;
+        let view = fire_view(&pages)?;
+        let stated = width_of(kv_heads, "the kv head count this attention states")?;
+        if stated != view.kv_heads {
+            return Err(Refusal::Narrow {
+                what: "the kv head count this statement states, against the pool row's own",
+                at: i64::from(stated),
+            });
+        }
+        tiled(self, q, o, view, window, head_dim, sm_scale)
+    }
+
+    /// The prefill window under a CUSTOM mask.
+    ///
+    /// THE SAME ENTRYPOINT AS [`kernels::points::Attention::prefill`], and
+    /// the point's own doc says why that is right: "what makes this a point
+    /// of its own is that the text states a different arithmetic, not that it
+    /// hands over a buffer". On this plane the mask triple is bound on EVERY
+    /// sdpa arm — `attention_mask`, its stride and a per-request `enabled`
+    /// byte plane — and the shader reads the mask for a row only where
+    /// `enabled` says so. So the difference between the two points is which
+    /// `enabled` the driver publishes, and the body is the same fire.
+    ///
+    /// `kv_heads` is NOT stated by this point, so it is the pool's alone —
+    /// the one asymmetry between the masked and unmasked prefills, and it
+    /// falls out of the declaration rather than out of anything here.
+    fn masked<T: kernels::points::Scalar>(
+        &self,
+        q: In<Payload<T>>,
+        indptr: In<Payload<i32>>,
+        pages: Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Payload<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = indptr;
+        at_bf16::<T>("attention.masked at an element other than bf16")?;
+        let view = fire_view(&pages)?;
+        tiled(self, q, o, view, window, head_dim, sm_scale)
+    }
+
+    /// `x = cap * tanh(x / cap)`, in place.
+    ///
+    /// Aliased like `norm.residual_add`: `attn/logit_softcap.wgsl` declares
+    /// `logits` and `out_` and reads and writes the same index, so one handle
+    /// fills both bindings.
+    ///
+    /// The grid is `elementwise(rows * width, 1)` and not
+    /// `elementwise(width, rows)`, which is the routine's own reading: this
+    /// shader has no row structure at all — its guard is
+    /// `arrayLength(&out_)` — so the whole rectangle is one flat run.
+    fn logit_softcap<T: kernels::points::Scalar>(
+        &self,
+        x: InOut<Payload<T>>,
+        cap: f32,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.logit_softcap at an element other than bf16")?;
+        let n = x.rows.saturating_mul(x.width);
+        self.fire(
+            Fire::at("attn/logit_softcap.wgsl", "logit_softcap_bfloat16").apply(elementwise(n, 1)?),
+            &[x.ptr.arg(), x.arg(), cap.arg()],
+        )
+    }
+
+    /// Write this fire's keys and values into the pool row's pages.
+    ///
+    /// AN EFFECT AND NOT A RESULT: no `Out` slot, and where the rows land is
+    /// the pool's arithmetic — `write_page` and `write_offset`, one per
+    /// token, published by the driver on the view.
+    ///
+    /// # The head geometry is the POOL's and the width is the operand's
+    ///
+    /// The statement carries neither a head count nor a head width, so the
+    /// count comes off the view (the pool chose it when the slab was
+    /// allocated) and the width is `k.width / kv_heads`. Read rather than
+    /// stated for the reason cuda's `head_split` gives at length: the write
+    /// has to agree with the layout the pages were allocated in, and a head
+    /// count taken from a statement against a pool laid out for another is
+    /// exactly the disagreement nothing else would catch.
+    ///
+    /// # The page size is refused at zero, and that refusal is load-bearing
+    ///
+    /// This grid is heads by tokens and never consults the page size, so a
+    /// view built over a store with no pool — where the pooled numbers come
+    /// back zero — would plan a full write in which every token divides to
+    /// page zero, offset zero, and every layer overwrites the one before it
+    /// on a single row. The metal twin found this by a driver test that had
+    /// been asserting a refusal its routine could not make.
+    fn kv_append<T: kernels::points::Scalar>(
+        &self,
+        k: In<Payload<T>>,
+        v: In<Payload<T>>,
+        pages: Cache<Struct<AttnFire>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.kv_append at an element other than bf16")?;
+        let view = fire_view(&pages)?;
+        if view.kv.page_size <= 0 {
+            return Err(Refusal::Empty {
+                what: "the KV page size",
+            });
+        }
+        let kv_heads = view.kv_heads;
+        if kv_heads <= 0 {
+            return Err(Refusal::Empty {
+                what: "the kv head count this pool row was laid out with",
+            });
+        }
+        if k.width <= 0 || k.width % kv_heads != 0 {
+            return Err(Refusal::Narrow {
+                what: "the appended key row, against the pool row's head count",
+                at: i64::from(k.width),
+            });
+        }
+        let head_dim = k.width / kv_heads;
+        self.fire(
+            Fire::at("attn/kv_write.wgsl", "kv_append_paged_bfloat16")
+                .apply(head_grid(head_dim, kv_heads, k.rows)?),
+            &[
+                k.arg(),
+                v.arg(),
+                view.kv.keys.arg_mut(),
+                view.kv.values.arg_mut(),
+                head_dim.arg(),
+                view.kv.page_size.arg(),
+                kv_heads.arg(),
+                view.kv.write_page.arg(),
+                view.kv.write_offset.arg(),
+            ],
+        )
+    }
+}
+
+/// `sdpa_paged_tiled_bfloat16_d_*`, the arm both prefill points take.
+///
+/// The tile is 32 query rows and it does not move with the lane extents;
+/// `tiled_grid` is the one place the host's copy of `PIE_TX`/`PIE_TY` lives,
+/// and its doc records what happened the last time that copy disagreed with
+/// the shader (32 query heads becoming 8 in every tiled prefill of every
+/// plan, found by a workgroup census and by nothing else).
+fn tiled<T: kernels::points::Scalar>(
+    ctx: &Ctx<'_>,
+    q: In<Payload<T>>,
+    o: Out<Payload<T>>,
+    view: &AttnFireView,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+) -> Result<(), Refusal> {
+    let head_dim = width_of(head_dim, "the head width this attention states")?;
+    let window = width_of(window, "the sliding window this attention states")?;
+    let q_heads = heads_of(q.width, head_dim, "the query rectangle's row")?;
+    let kv_heads = view.kv_heads;
+    let rows = q.rows;
+    let run = paged_run(
+        view,
+        q.arg(),
+        o.arg(),
+        gqa(q_heads, kv_heads),
+        kv_heads,
+        sm_scale,
+    );
+    ctx.fire(
+        Fire::at(
+            "attn/sdpa_paged.wgsl",
+            [
+                "sdpa_paged_tiled_bfloat16_d_64",
+                "sdpa_paged_tiled_bfloat16_d_128",
+                "sdpa_paged_tiled_bfloat16_d_256",
+                "sdpa_paged_tiled_bfloat16_d_512",
+            ][head_point(head_dim, &[64, 128, 256, 512])?],
+        )
+        .apply(tiled_grid(q_heads, head_dim, rows)?),
+        &[
+            run[0],
+            run[1],
+            run[2],
+            run[3],
+            run[4],
+            run[5],
+            run[6],
+            run[7],
+            run[8],
+            run[9],
+            run[10],
+            run[11],
+            run[12],
+            run[13],
+            run[14],
+            window.arg(),
+            absent(ctx)?,
+            // The tiled arm takes the row count as a SCALAR as well as
+            // through the grid: its y extent is rows rounded up to whole
+            // tiles, so the tail tile needs to know where the rows stop.
+            rows.arg(),
+        ],
+    )
+}
+
+/// The `Gate` family: one point, claimed.
+#[kernels_macros::claims]
+impl kernels::points::Gate for Ctx<'_> {
+    /// `x *= sigmoid(gate)`, qwen3.5's gated attention output.
+    ///
+    /// `attn/gate.wgsl`'s note is worth keeping beside the claim: its second
+    /// buffer is the GATE and not the tensor, because the statement is in
+    /// place on operand 0 and the tensor arrives twice — reading the first
+    /// input for both would bind one handle at both slots. `driver-metal` and
+    /// `driver-vulkan` both did until this backend's crossing compared the
+    /// three arms. The ORDER is what has to match, and the declaration's
+    /// order is `(x, gate)`.
+    ///
+    /// The sigmoid is MLX's stable form in f32, narrowed once at the store:
+    /// the naive `1/(1+exp(-x))` overflows `exp` on a large negative argument
+    /// before the quotient underflows.
+    fn sigmoid_mul<T: kernels::points::Scalar>(
+        &self,
+        x: InOut<Payload<T>>,
+        gate: In<Payload<T>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("gate.sigmoid_mul at an element other than bf16")?;
+        let width = x.width;
+        self.fire(
+            Fire::at("attn/gate.wgsl", "gate_bfloat16").apply(elementwise_rows(width, x.rows)?),
+            &[x.arg(), gate.arg(), width.arg()],
+        )
+    }
 }

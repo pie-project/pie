@@ -29,7 +29,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::layout::embed(&ids, &m.embed);
+        let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
 
         for (l, w) in m.layers.iter().enumerate() {
             let l = l as u32;

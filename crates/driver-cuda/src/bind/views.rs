@@ -28,13 +28,10 @@
 //! would still be re-BUILT next fire; the replay never re-reads it.
 
 use core::ffi::c_void;
-use std::collections::{BTreeMap, BTreeSet};
 
-use kernels_cuda::views::{ExpertWeightsView, MaskView, PagedKvView, RecurrentView};
-use model_compiler::lower::{Arg, Lowered};
-use model_ir::trace::{RuntimeBinding, ValueId};
+use kernels_cuda::views::{MaskView, PagedKvView, RecurrentView};
 
-use super::{AttnCtx, DispatchPlan, GdnCtx};
+use super::{AttnCtx, GdnCtx};
 
 /// The staged per-fire STREAMS, by runtime name — the tensors the driver
 /// uploads for the fire being bound. These answer `Resolver::named` for the
@@ -113,10 +110,20 @@ pub struct FireViews {
     /// `"attn.score"` — the observation the driver keeps: the fire's CSR
     /// and the boot-configured window. Nulls/zero when nothing observes.
     pub score: kernels_cuda::views::ScoreView,
-    /// `"moe.expert_weights"` — PER STATEMENT, keyed by the trace value: the bank
-    /// differs per layer AND per projection (gate_up vs down), so the view is
-    /// built from the weight each statement names, not from the fire.
-    pub expert_weights: BTreeMap<ValueId, ExpertWeightsView>,
+    // `expert_weights` STOOD HERE — one `ExpertWeightsView` per trace VALUE,
+    // filled by walking the legacy lowering's launches for the ones that
+    // raised `"moe.expert_weights"` and reading each one's packed bank off
+    // its `LaunchSpec`. There is no launch list to walk, and the values it
+    // was keyed by were the legacy trace's.
+    //
+    // `"moe.expert_weights"` IS THEREFORE A NAMED REFUSAL, not a deletion:
+    // `moe_ptrs` still carves the `_ptrs`/`_scales_ptrs`/`_bias_ptrs` arrays
+    // at load, the kernels still take the view, and the one thing missing is
+    // the join from a STATEMENT to its bank — which a `Program`'s statement
+    // carries in `Op::weights` and nothing has read yet. The MoE SKUs are not
+    // servable through this driver today for other reasons as well (a3b and
+    // dsv4 both refuse lanes), so a refusal by name is the honest answer
+    // until the first of them resolves.
     /// The streams, kept beside the objects so one struct answers both halves.
     pub streams: FireStreams,
 }
@@ -199,79 +206,29 @@ impl FireViews {
             recurrent,
             mask,
             score,
-            expert_weights: BTreeMap::new(),
             streams,
         }
     }
 
-    /// Fill [`Self::expert_weights`] from the statements of one lowering.
-    ///
-    /// Per-STATEMENT, because the bank is: every launch that takes the
-    /// `"moe.expert_weights"` object names its own packed bank as its weight, and
-    /// the `_ptrs`/`_scales_ptrs`/`_bias_ptrs` arrays were carved BESIDE that
-    /// bank at load (`serve::load::build_moe_expert_ptrs`). The map is keyed
-    /// by the trace VALUE the statement places.
-    ///
-    /// Two statements answering ONE value with two different banks is a text
-    /// the driver cannot serve — the mint deduplicated what must stay apart —
-    /// so the colliding value is REMOVED and both statements refuse at bind
-    /// (`RaisedUnbound`), loud rather than smoothly wrong.
-    pub fn fill_expert_weights(
-        &mut self,
-        lowered: &Lowered,
-        dplan: &DispatchPlan,
-        mut weight: impl FnMut(&str) -> Option<*const c_void>,
-    ) {
-        use kernels::raises::Raise;
-        let mut poisoned: BTreeSet<ValueId> = BTreeSet::new();
-        for (i, launch) in lowered.launches.iter().enumerate() {
-            let spec = dplan.spec(i);
-            let run = launch.args.start as usize..launch.args.end as usize;
-            for arg in lowered.args.get(run).unwrap_or(&[]) {
-                let Arg::Raised { value, key } = arg else {
-                    continue;
-                };
-                if key != kernels_cuda::views::ExpertWeights::KEY || poisoned.contains(value) {
-                    continue;
-                }
-                let Some(bank) = spec.weight.as_deref() else {
-                    continue;
-                };
-                let mut suffixed = |s: &str| weight(&format!("{bank}{s}"));
-                // The two pointer arrays the kernels index per expert are
-                // required; the bias array is a checkpoint's to omit.
-                let (Some(ptrs), Some(scale_ptrs)) = (suffixed("_ptrs"), suffixed("_scales_ptrs"))
-                else {
-                    continue;
-                };
-                let view = ExpertWeightsView {
-                    ptrs: ptrs.cast::<u8>(),
-                    scale_ptrs: scale_ptrs.cast::<u8>(),
-                    bias_ptrs: suffixed("_bias_ptrs").map_or(core::ptr::null(), |p| p.cast::<u8>()),
-                };
-                match self.expert_weights.get(value) {
-                    None => {
-                        self.expert_weights.insert(*value, view);
-                    }
-                    Some(held) if held.ptrs == view.ptrs && held.scale_ptrs == view.scale_ptrs => {}
-                    Some(_) => {
-                        // The collision: one value, two banks. Refuse both.
-                        self.expert_weights.remove(value);
-                        poisoned.insert(*value);
-                        eprintln!(
-                            "[driver-cuda] bind: two statements name one \
-                             `expert_weights` value with two different banks; \
-                             refusing both (the trace must mint one value per \
-                             bank)"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// One runtime object's address, by the vocabulary name the trace minted
-    /// it under. `None` is a refusal at the bind ([`RaisedUnbound`]), never a
+    /// it under.
+    ///
+    /// # THE SEAM: nothing calls this yet
+    ///
+    /// `bind::resolve_arg` used to, on every `Arg::Raised` of every lowered
+    /// launch. The walk that replaced it reaches the two objects it needs
+    /// DIRECTLY — `baker::fire::Fire::pages` indexes [`Self::kv`] and
+    /// `Fire::recurrent` indexes [`Self::recurrent`], both by the layer the
+    /// statement names — because `baker::points_shim` is a hand-written
+    /// placeholder for `#[claims]`'s generated dispatch and a hand-written
+    /// arm can index a vector.
+    ///
+    /// The generated dispatch cannot: a raise is declared by KEY
+    /// (`kernels::raises::Struct<KvCache>`), and a generator emitting an arm
+    /// for an arbitrary point has only that key to resolve with. So this
+    /// function is the target, [`ANSWERED`] is the vocabulary it must cover,
+    /// and the mask and score views have no reader today for the same
+    /// reason: no arm of the placeholder shim takes them. `None` is a refusal at the bind ([`RaisedUnbound`]), never a
     /// null: the names this returns `None` for — `"moe.banks"`,
     /// `"gemm.groups"`, the `dsv4.*` state, `"mtp.pending_hidden"` — are
     /// objects this driver does not STAGE yet (nothing allocates their banks
@@ -280,7 +237,7 @@ impl FireViews {
     ///
     /// [`RaisedUnbound`]: super::BindRefusal::RaisedUnbound
     #[must_use]
-    pub fn raised(&self, name: &str, layer: Option<u32>, value: ValueId) -> Option<*const c_void> {
+    pub fn raised(&self, name: &str, layer: Option<u32>) -> Option<*const c_void> {
         let of = |p: *const c_void| (!p.is_null()).then_some(p);
         match name {
             // Per-layer objects: a mint without a layer is a text error and
@@ -296,10 +253,10 @@ impl FireViews {
                 .map(|v| core::ptr::from_ref(v).cast::<c_void>()),
             "attention_mask" => Some(core::ptr::from_ref(&self.mask).cast::<c_void>()),
             "attn.score" => Some(core::ptr::from_ref(&self.score).cast::<c_void>()),
-            "moe.expert_weights" => self
-                .expert_weights
-                .get(&value)
-                .map(|v| core::ptr::from_ref(v).cast::<c_void>()),
+            // See the note where `expert_weights` stood: the object exists,
+            // its banks are carved at load, and the statement->bank join is
+            // not written. `None` is a refusal at the bind, by name.
+            "moe.expert_weights" => None,
             // The planless prefill's three: the plan cache it fills and the
             // two host CSR mirrors it walks. Null means this fire did not
             // stage the planless leg, which is a refusal for a statement
@@ -310,15 +267,6 @@ impl FireViews {
             _ => None,
         }
     }
-}
-
-/// The set of trace values the plan's runtime table binds, for excluding them
-/// from the seam-pin walk: a runtime stream is staged by the driver, so
-/// allocating a seam pin for its `Arg::Named` would be resident memory nothing
-/// reads.
-#[must_use]
-pub fn runtime_values(runtime: &[RuntimeBinding]) -> BTreeSet<ValueId> {
-    runtime.iter().map(|b| b.value).collect()
 }
 
 /// One layer's [`PagedKvView`], from the layer's pool descriptor and the
@@ -372,6 +320,15 @@ fn kv_view(a: &AttnCtx, v: &crate::bind::abi::KvCacheLayerView) -> Option<PagedK
         block_size: v.block_size,
         max_pages_per_request: a.max_pages_per_request,
         pages_in_batch: a.num_pages_in_batch,
+        // The fire's query CSR and row validity, carried on the pool row so
+        // a `#[claims]` body that names ONE cache row can resolve an
+        // append's destination without staging on the operand column's
+        // behalf. Both are the same `AttnCtx` fields the appending routines
+        // take as loose operands; `row_valid_d` is null on a fire with no
+        // rejected rows, which is what the kernels test for.
+        qo_indptr: a.qo_indptr_d.cast::<i32>(),
+        row_valid: a.row_valid_d,
+        requests: a.num_requests,
     })
 }
 
@@ -431,7 +388,6 @@ pub const ANSWERED: &[&str] = &[
     "recurrent_state",
     "attention_mask",
     "attn.score",
-    "moe.expert_weights",
     "fa2.prefill",
     "qo_indptr.host",
     "kv_page_indptr.host",
@@ -458,6 +414,8 @@ pub const ANSWERED: &[&str] = &[
 /// staging owners land (`RaisedUnbound`, by name): the moe/gemm pointer
 /// banks and the dsv4/mtp slabs nothing in driver-cuda allocates today.
 pub const UNSTAGED: &[&str] = &[
+    // See `FireViews::raised`: the banks are carved, the join is not.
+    "moe.expert_weights",
     "moe.banks",
     "gemm.groups",
     "dsv4.state_kv",

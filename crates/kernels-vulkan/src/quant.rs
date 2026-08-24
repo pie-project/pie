@@ -1,3 +1,35 @@
+//! The dense quantised matmuls, and the family this plane claims NOTHING
+//! of.
+//!
+//! `kernels::points::Gemm` declares three points — `matmul`, `lm_head`,
+//! `attention_landing` — and every one of them states its weight as ONE
+//! slot: `w: Const<Self::Tensor<T>>`, an address and no rectangle. There is
+//! no matmul on this plane that can be reached from one address.
+//!
+//! Every entrypoint in `quant/qmm_t.slang` and `quant/qmv.slang` binds
+//! `StructuredBuffer<uint> w` for the packed codes, then `scales` and
+//! `biases` at the activation element, and picks its module on the
+//! `(group, bits)` pair — six affine combinations before the tile shape is
+//! chosen. There is no dense bf16 gemm here at all: a `_bfloat16` in these
+//! names is the ACTIVATION's element, never the weight's.
+//!
+//! That is the `Bank<R: Repr>` gap, and it is on baker's ledger by name
+//! (`.wiki/baker-todo.md`: "`moe.matmul_select_bias` — grouped mxfp4+bias
+//! gemm (real kernel work) + `Bank<R: Repr>` floor type + blocks+scales
+//! import verb"). [`crate::points::Bank`] is this crate's stub for it, and
+//! [`crate::points::Staged::bank`] is where a body says which three planes
+//! it wanted; [`crate::moe`]'s two routed matmuls are already written
+//! against both, so the day the floor carries a bank the `Gemm` family is
+//! three short bodies and not a design question.
+//!
+//! `kernels-cuda` does not claim this family either, for a different
+//! reason — its dense gemm goes through cuBLAS and the migration order in
+//! `.wiki/baker.md` puts `Gemm` after `MLP`. So an unclaimed `Gemm` here is
+//! not this plane falling behind; it is the same row on two ledgers.
+//!
+//! Nothing below carries an `// INLINED` marker: no routine in this file
+//! has been superseded by an impl body, because none could be.
+
 use kernels::routine::Refusal;
 use kernels_macros::routine;
 

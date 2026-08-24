@@ -69,7 +69,6 @@ use cudarc::runtime::sys::{
 // entry points are gone -- their bodies are `gemm::absorb`'s now, called
 // directly below -- and the import outlived them because a test target is not
 // built by `cargo check`.
-use driver_cuda::bind::DispatchCtx;
 use kernels::routine::{Const, In, Out};
 
 /// The two widths the launchers in this file still ask their context for.
@@ -314,52 +313,11 @@ fn sync() {
     }
 }
 
-/// A `DispatchCtx` carrying nothing but the handle.
-///
-/// The four ports read `ctx.cublas` and no other field, which is the point of
-/// injecting `ctx` uniformly: the emitter cannot know which arm wants what,
-/// so it passes the fire's context and the arm takes what it needs. Every
-/// other field here is the value that means "not stated".
-fn ctx_of(cublas: *mut c_void) -> DispatchCtx {
-    DispatchCtx {
-        sampling_indices: std::ptr::null(),
-        sampled_rows: 0,
-        stream: std::ptr::null_mut(),
-        cublas,
-        eps: 0.0,
-        rope_theta: 0.0,
-        rope_theta_by_layer: Vec::new(),
-        rotary_by_layer: Vec::new(),
-        head_dim: 0,
-        num_q_heads: 0,
-        num_kv_heads: 0,
-        vocab: 0,
-        gate_second: false,
-        rope_interleaved: false,
-        token_ids: std::ptr::null_mut(),
-        positions: std::ptr::null_mut(),
-        final_logit_softcap: 0.0,
-        ple_dim: 0,
-        scales: std::collections::BTreeMap::new(),
-        moe_norm_topk: false,
-        moe_routed_scaling: 1.0,
-        experts_per_token: 0,
-        yarn: [0.0; 4],
-        yarn_original_max: 0,
-        glu_limit: 0.0,
-        glu_alpha: 0.0,
-        situ_beta: 0.0,
-        situ_linear_beta: 0.0,
-        wna16_group_size: 0,
-        altup_streams: 0,
-        altup_active: 0,
-        altup_std_mult_by_layer: Vec::new(),
-        lora: None,
-        peel_window: std::ptr::null(),
-        rows_total: 0,
-        moe_ptrs: std::cell::Cell::new(None),
-    }
-}
+// `ctx_of` STOOD HERE — a whole `DispatchCtx` with every field at its
+// "not stated" value, built so the four ports could read the handle and
+// nothing else. `DispatchCtx` is deleted with the legacy dispatch it carried
+// facts for, and what the ports actually wanted was the handle, which is
+// what they are handed now.
 
 // ── the shape table, spelled as the oracle spells it ───────────────────────
 
@@ -405,13 +363,13 @@ fn transcript() -> Vec<String> {
             "cublasCreate failed; is there a device?"
         );
     }
-    let ctx = ctx_of(handle.cast());
+    let cublas: *mut c_void = handle.cast();
     // The absorb pair crossed to `x::gemm::absorb` and take the kernels
     // crate's `Ctx`, which carries the cuBLAS handle rather than a
     // `DispatchCtx`. Same handle and the same null stream, so the oracle
     // below compares the same work it always did.
     // ONE WAS BUILT HERE AND NEVER USED. The loop below mints its own `gctx`
-    // per row off `ctx.cublas`, so this outer `Ctx` -- built off `handle`, the
+    // per row off the handle, so this outer `Ctx` -- built off `handle`, the
     // same cuBLAS handle by a different route -- fed nothing. Two contexts
     // over one handle is not wrong, it is just one more than the test needs,
     // and the unused one carried a `SAFETY` note implying somebody relied on
@@ -435,9 +393,9 @@ fn transcript() -> Vec<String> {
         // states, and nothing frees them before the sync below.
         unsafe {
             // §5 step 5 moved the body to `kernels_cuda::gemm`, where
-            // it takes the handle directly instead of reading `ctx.cublas`.
+            // it takes the handle directly instead of reading the handle.
             // The bytes this test hashes are the same bytes.
-            let gctx = kernels_cuda::jit::Ctx::on(std::ptr::null_mut()).with_cublas(ctx.cublas);
+            let gctx = kernels_cuda::jit::Ctx::on(std::ptr::null_mut()).with_cublas(cublas);
             kernels_cuda::gemm::act_x_wt_bf16_out_fp32(
                 &gctx,
                 // THE THREE EXTENTS ARE NOW TWO RECTANGLES, which is Stage 3

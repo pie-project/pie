@@ -2213,20 +2213,14 @@ device = ["metal:0"]
 [[model]]
 name = "a"
 hf_repo = "x"
-[model.driver]
-type = "metal"
-device = ["cuda:0"]
 
 [[model]]
 name = "b"
 hf_repo = "y"
-[model.driver]
-type = "metal"
-device = ["cuda:1"]
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
         assert!(
-            err.contains("exactly one") && err.contains("[[model]]"),
+            err.contains("no longer an array") && err.contains("[[model]]"),
             "got: {err}"
         );
     }

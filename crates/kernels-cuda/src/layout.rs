@@ -87,27 +87,97 @@ fn as_bf16_out<T: kernels::points::Scalar>(y: Out<Tensor<T>>) -> Out<Tensor<bf16
     }
 }
 
-/// The `Layout` family, claimed. Each body is a delegation to the routine
-/// that already fires the point; the stated widths ride the declaration
-/// because the STATEMENT states them and its results are sized from them,
-/// while the routines read the same numbers back off the rectangles they
-/// were handed. `split_q_gate` is the one that passes a width through — the
-/// per-head interleave is a pitch no half's rectangle carries.
+/// The `Layout` family, claimed. Every point in it. Three bodies are
+/// delegations to the routine that already fires the point — the stated
+/// widths ride the declaration because the STATEMENT states them and its
+/// results are sized from them, while the routines read the same numbers
+/// back off the rectangles they were handed. `split_q_gate` is the one that
+/// passes a width through: the per-head interleave is a pitch no half's
+/// rectangle carries.
 ///
-/// Two points stay on the floor's default body, and each absence is a
-/// measured row rather than an oversight:
+/// `layout.select` IS A LAUNCHER HERE, not a delegation, and for the
+/// reason `norm.scale` is one: no legacy caller reaches it. Gemma's relay was
+/// TRANSPOSED to `[layers, rows, ple_dim]` in the legacy prologue
+/// (`transpose_bf16_nld_to_lnd`) so that a layer's slice was a whole
+/// contiguous plane and `dsl::select` was a rebase with no kernel behind it.
+/// The baker text keeps the relay in its `[rows, layers * ple_dim]` gather
+/// order, which makes the same slice a strided per-row copy — so this is the
+/// kernel that transpose used to stand in for, and there is no routine for it
+/// to delegate to.
 ///
-/// * `layout.embed` — `embed_bf16` takes `vocab`, the table's ROW count,
-///   and clamps every id against it so a runaway wire payload reads row
-///   zero instead of past the largest tensor in the model. The declaration
-///   carries the table as a `Const`, which is an address and no rectangle,
-///   so the row count is nowhere in the slots to read; a delegation could
-///   only invent a bound, and inventing `i32::MAX` would retire the clamp.
-///   The routine keeps its own claim, so the point still resolves.
-/// * `layout.select` — no plane has a kernel for a layer slice, which is
-///   the gap the declaration exists to measure.
+/// `layout.embed` IS THE OTHER LAUNCHER, and the blocker it stood on is
+/// GONE rather than worked around. The body needs `vocab`, the table's ROW
+/// count, to clamp every id against — a runaway wire payload must read row
+/// zero, not past the largest tensor in the model — and a `Const` table is
+/// an address with no rectangle, so that number was in no slot to read.
+/// Inventing `i32::MAX` would have retired the clamp; the declaration
+/// STATES the bound instead, and the seven texts that say this point say it
+/// from the vocab their own dims carry. The launch is `embed_bf16`'s,
+/// inlined: the vectorised instantiation is a HOST choice off two
+/// alignments and a divisibility the device cannot test for itself, which
+/// is why `layout/embed.cuh` keeps it as a `bool` template parameter.
 #[kernels_macros::claims]
 impl kernels::points::Layout for Ctx<'_> {
+    fn embed<T: kernels::points::Scalar>(
+        &self,
+        ids: In<Tensor<i32>>,
+        table: Const<Tensor<T>>,
+        vocab: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        const EMBED_BLOCK: u32 = 256;
+
+        // The gather is `bf16`'s, not a template: `::pie::layout::embed` is
+        // spelled at `bf16` and its `VEC` arm moves a `float4` as eight of
+        // them. `embed_vocab_shard` beside it IS templated; nothing states
+        // that point yet.
+        if !cuts_bf16::<T>() {
+            return Err(Refusal::Absent {
+                what: "layout.embed at an element other than bf16",
+            });
+        }
+        let vocab = stated_width(vocab, "the embedding table's row count")?;
+        if vocab <= 0 {
+            return Err(Refusal::Empty {
+                what: "the embedding table's row count",
+            });
+        }
+        let dst = stated(y.all("the embedded row's width"))?;
+        // The result is one row per id, and the two rectangles say so
+        // independently — a disagreement means the walk sized this gather
+        // from something that is not the fire's token count.
+        if ids.rows != dst.rows {
+            return Err(Refusal::Narrow {
+                what: "the gathered rows against the token ids handed over",
+                at: i64::from(dst.rows),
+            });
+        }
+        let hidden = dst.stride;
+        let vec = vectorisable(hidden.0, table.v.cast(), dst.ptr.cast_const().cast());
+        let per_row = if vec { hidden.0 / VEC_WIDTH } else { hidden.0 };
+        let total = i64::from(dst.rows) * i64::from(per_row);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let blocks = ((total + i64::from(EMBED_BLOCK) - 1) / i64::from(EMBED_BLOCK)) as u32;
+        let instantiation = if vec {
+            "::pie::layout::embed<::pie::true_type::value>"
+        } else {
+            "::pie::layout::embed<::pie::false_type::value>"
+        };
+        self.fire(
+            Fire::at("layout/embed.cuh", instantiation)
+                .apply(Launch::grid([blocks, 1, 1], [EMBED_BLOCK, 1, 1])),
+            &[
+                ids.ptr.arg(),
+                table.arg(),
+                dst.ptr.arg(),
+                hidden.arg(),
+                vocab.arg(),
+                dst.rows.arg(),
+                per_row.arg(),
+            ],
+        )
+    }
+
     fn split_qkv<T: kernels::points::Scalar>(
         &self,
         packed: In<Tensor<T>>,
@@ -173,6 +243,74 @@ impl kernels::points::Layout for Ctx<'_> {
             });
         }
         split_bf16_rows(self, as_bf16_in(x), as_bf16_out(left), as_bf16_out(right))
+    }
+
+    /// `y = table[.., layer * width .. (layer + 1) * width]`, per row.
+    ///
+    /// STATED AND READ, where this family's other widths are stated and
+    /// dropped. `split_qkv` lets its routine take the halves' widths off the
+    /// halves' own rectangles, because the cut is at a boundary both sides
+    /// carry; here the stated width is where the slice STARTS, and an offset
+    /// is not something either rectangle holds. So the statement's number is
+    /// the one that lands in the launch, and `y`'s own rectangle is what it
+    /// gets checked against.
+    ///
+    /// The relay's row is read off `table` rather than stated. It is
+    /// `layers * width` and the walk never needed it — the result is sized
+    /// from the stated width alone — so asking the statement for it would be
+    /// a slot whose only reader is an assertion.
+    ///
+    /// A TEMPLATE, not a bf16 row: this is a pure copy, so `T` is the
+    /// element and nothing here converts to float. `split_qkv` and its
+    /// siblings are pinned at bf16 because their kernels are instantiated by
+    /// literal symbols in routines the legacy driver calls; nothing calls
+    /// this one, so it is spelled the way `deinterleave.cuh`'s header says a
+    /// row-copy should be.
+    fn select<T: kernels::points::Scalar>(
+        &self,
+        table: In<Tensor<T>>,
+        layer: u32,
+        width: u32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let width = stated_width(width, "the slice width this select states")?;
+        let dst = stated(y.all("the selected slice's width"))?;
+        if dst.width != width {
+            return Err(Refusal::Narrow {
+                what: "the selected slice is not the width the statement states",
+                at: i64::from(dst.width),
+            });
+        }
+        let src = stated(table.over(dst.rows, "the relayed table's row"))?;
+        let stride = *src.stride;
+        let offset = i32::try_from(layer)
+            .ok()
+            .and_then(|l| l.checked_mul(width))
+            .ok_or(Refusal::Wide {
+                what: "the column this layer's slice starts at",
+                at: i64::from(layer) * i64::from(width),
+                max: i64::from(i32::MAX),
+            })?;
+        if offset.checked_add(width).is_none_or(|end| end > stride) {
+            return Err(Refusal::Narrow {
+                what: "the relayed row does not reach this layer's slice",
+                at: i64::from(stride),
+            });
+        }
+        self.fire(
+            Fire::at(
+                "layout/deinterleave.cuh",
+                crate::jit::symbol(&format!("::pie::layout::select<{}>", T::CPP)),
+            )
+            .apply(route_rows(dst.rows, width)),
+            &[
+                table.arg(),
+                y.arg(),
+                stride.arg(),
+                offset.arg(),
+                width.arg(),
+            ],
+        )
     }
 }
 
@@ -544,7 +682,9 @@ pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(weight.cast()) && aligned16(y.cast())
 }
 
-#[routine(canon = "layout.embed")]
+// INLINED into impl Layout; dies with the routine layer. Kept only because
+// `model-dsl-legacy`'s generated `cuda::embed_bf16` still names this type.
+#[routine]
 pub fn embed_bf16(
     ctx: &Ctx<'_>,
     weight: Const<Tensor<bf16>>,

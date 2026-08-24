@@ -1,4 +1,5 @@
 pub mod bind;
+pub mod bound;
 pub mod routine;
 
 pub mod jit;

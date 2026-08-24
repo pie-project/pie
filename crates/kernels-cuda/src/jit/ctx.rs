@@ -30,6 +30,8 @@ impl Backend for Cuda {
 impl kernels::points::Plane for Ctx<'_> {
     type Tensor<T: kernels::points::Scalar> = crate::jit::abi::Tensor<T>;
 
+    type Bank<R: kernels::points::Repr> = crate::jit::abi::Bank<R>;
+
     type Recurrent = kernels::raises::Struct<crate::views::RecurrentState>;
 
     type Pages = kernels::raises::Struct<crate::views::KvCache>;

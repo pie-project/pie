@@ -100,7 +100,7 @@ __global__ void mla_naive_paged_kernel(
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,              // [N, H, CKV]
-    const std::uint8_t* __restrict__ index_mask, int index_mask_stride,
+    const std::int32_t* __restrict__ selection, int top_k,
     int R, int H, int CKV, int KPE, int page_size, float sm_scale, bool causal,
     int G)
 {
@@ -114,10 +114,15 @@ __global__ void mla_naive_paged_kernel(
     const int h = blockIdx.y * G + g;  // head
     const int per = CKV / 32;          // latent dims per lane
     const int pper = KPE / 32;
-    // DSA mask row for this query (in-batch keys only).
-    const std::uint8_t* mrow =
-        (index_mask != nullptr) ? index_mask + static_cast<long long>(t) * index_mask_stride
-                                : nullptr;
+    // THE DSA SELECTION IS A LIST AND NOT A MASK. `pie::attn::index_topk_paged`
+    // writes `[N, top_k]` of `i32`, ascending, `-1` past the end, over the
+    // whole CACHED prefix — so this kernel WALKS it instead of testing every
+    // key against a byte, and the sparse reading is actually sparse. Null is
+    // legal and means every key. (What stood here was `index_mask`, a
+    // `[N, in-batch keys]` byte plane that no caller ever bound: the legacy
+    // glm text computed one into `let _index_mask` and threw it away.)
+    const std::int32_t* srow =
+        (selection != nullptr) ? selection + static_cast<long long>(t) * top_k : nullptr;
 
     // Resolve request, kv length, and this query's absolute position.
     int lo = 0, hi = R - 1;
@@ -156,9 +161,17 @@ __global__ void mla_naive_paged_kernel(
     for (int i = 0; i < per; ++i) acc[i] = 0.f;
     float m = -CUDART_INF_F, lsum = 0.f;
 
-    for (int j = s; j < j_end; j += K) {
-        // DSA: skip keys not selected by the lightning indexer (in-batch only).
-        if (mrow != nullptr && j < index_mask_stride && mrow[j] == 0) continue;
+    // THE ONE LOOP, WALKED TWO WAYS. Dense: `n` IS the key. Selected: `n`
+    // indexes the list and the key is what it holds, `-1` (and anything past
+    // the causal bound) skipped. One body either way, so a selected fire and
+    // a dense one cannot drift in the softmax they run.
+    const int steps = (srow != nullptr) ? top_k : j_end;
+    for (int n = s; n < steps; n += K) {
+        int j = n;
+        if (srow != nullptr) {
+            j = srow[n];
+            if (j < 0 || j >= j_end) continue;
+        }
         const int page =
             static_cast<int>(kv_page_indices[pages_first + j / page_size]);
         const int off = j % page_size;
@@ -379,7 +392,6 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
-    const std::uint8_t* __restrict__ index_mask, int index_mask_stride,
     int R, int H, int page_size, float sm_scale, bool causal)
 {
     extern __shared__ __align__(16) char smem_raw[];
@@ -426,10 +438,13 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
     const int abs_q = kv_len - new_tokens + (t - qo_lo);
     const int j_end = causal ? (abs_q + 1) : kv_len;
-    const std::uint8_t* mrow =
-        (index_mask != nullptr)
-            ? index_mask + static_cast<long long>(t) * index_mask_stride
-            : nullptr;
+    // NO SELECTION HERE, AND THAT IS THE ARM'S OWN LIMIT. This kernel tiles
+    // `kBK` CONTIGUOUS keys through one `cp.async` staging of `sK`, so a
+    // selection would have to be gathered into the tile rather than tested
+    // per key — a different kernel, not a predicate. The scalar kernel above
+    // walks the list, and `mla_naive::plan` declines this arm whenever a fire
+    // carries one. What stood here was an `index_mask` byte plane no caller
+    // ever bound.
 
     constexpr int kChunksPerRow = kD / 8;
     for (int c = tid; c < kBM * kChunksPerRow; c += kThreads) {
@@ -558,8 +573,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
                 const int jj = sub * kColsPerSub + i;
                 const int j = j0 + jj;
                 float s = -CUDART_INF_F;
-                if (j < j_end &&
-                    !(mrow != nullptr && j < index_mask_stride && mrow[j] == 0)) {
+                if (j < j_end) {
                     s = sS[row * kBK + jj] * sm_scale;
                 }
                 v[i] = s;

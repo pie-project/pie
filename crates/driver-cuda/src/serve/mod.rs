@@ -142,6 +142,19 @@ impl Shell {
             .map_or(0, crate::device::Allocator::live_bytes)
     }
 
+    /// Whether a fire lane is built — a diagnostic, not one of the verbs.
+    ///
+    /// `true` after any `load_model` that returned `Ok`, because a load that
+    /// could not build a lane REFUSES rather than serving through something
+    /// else. It is published anyway, from outside the crate, so a test can
+    /// assert the tautology without reaching into `Shell`'s `pub(crate)`
+    /// fields — a `Shell` that answered `Ok` with nothing to fire would be
+    /// the one bug this cannot otherwise be seen.
+    #[must_use]
+    pub fn baker_is_armed(&self) -> bool {
+        self.baker.is_some()
+    }
+
     /// Load the model: one parse of the snapshot through the Rust loader and
     /// every bf16 weight resident on the device, with the llama-like fused
     /// trace names built beside the checkpoint names. Quantized encodings are
@@ -445,12 +458,12 @@ impl Shell {
     /// Launch a frame: the executor's fire assembly, promoted from the smokes
     /// into the shell.
     ///
-    /// Today: single-step, single-sub-batch frames over the loaded llama-like
-    /// model; the KV pools are driver-owned and persist across launches, and
-    /// every member's terminal cell is published (release) before the runtime
-    /// is notified. Multi-step frames, device-geometry sub-batches, and
-    /// channel-delivered outputs refuse with `UNSUPPORTED` until their
-    /// machinery lands.
+    /// Today: single-sub-batch frames fired through the loaded checkpoint's
+    /// own `Program`; the KV pools are driver-owned and persist across
+    /// launches, and every member's terminal cell is published (release)
+    /// before the runtime is notified. A fire whose class no built lane
+    /// serves refuses with `UNSUPPORTED`, by name — so does a frame that
+    /// supplies its own attention mask, which no statement reads.
     ///
     /// # Errors
     ///

@@ -427,6 +427,162 @@ __global__ void mxfp4_moe_down_decode(
     }
 }
 
+// `moe.matmul_select_bias`, as one kernel: `y[r] = x[r] @ bank[routes[r]]^T
+// + bias[routes[r]]`, with `bank` an MXFP4 stack and `bias` the expert's own
+// row.
+//
+// THE POINT'S ARITHMETIC AND NOTHING ELSE, which is what makes it a different
+// kernel from the two decode GEMVs above rather than a flag on one. Those two
+// are FUSED legs: `mxfp4_moe_gate_up_decode` emits gate and up as two
+// rectangles and folds the gpt-oss GLU into the epilogue,
+// `mxfp4_moe_down_decode` hard-wires its activation to a per-ROUTE row. A
+// point states one matmul, so this states one -- one `[routes, n]` result,
+// the bias added, and no activation.
+//
+// # The parameter that is NOT in the two above
+//
+// `act_div` is how the activation is indexed. The first `matmul_select_bias`
+// of a text is handed a PER-TOKEN row (`x` is `[tokens, k]`, and route `r`
+// reads token `r / top_k`); the second is handed the ALREADY ROUTED result of
+// the first (`[routes, k]`, and route `r` reads row `r`). Both are the same
+// statement, so the host passes `top_k` or `1` after measuring the operand's
+// own row count against the result's -- it is not a mode, it is the divisor
+// that turns a route index into an activation row, and the two cases differ
+// only in its value.
+//
+// `n` and `k` come off the rectangles the statement carries -- `n` is the
+// result's width, `k` the activation's -- so the bank's dimensions are never
+// restated. The expert stride follows from them: a bank is `[E, ...]`
+// contiguous, so expert `e`'s codes begin at `e * n * (k / 2)` and its scales
+// at `e * n * (k / 32)`. THE PER-EXPERT POINTER ARRAYS ARE GONE. The two
+// GEMVs above take `packed_ptrs[expert]` and `scale_ptrs[expert]`, arrays the
+// LOAD had to carve beside every bank because nothing in a statement names
+// them; here the same address is two multiplies, and the whole carving --
+// with the illegal-address fault it existed to prevent -- has nothing left to
+// do.
+//
+// # fp32 accumulation, where the decode GEMVs accumulate in fp16
+//
+// The two above hold their inner products in `__half2` and fold each 32-code
+// group's fp32 scale in at the group boundary, which keeps the accumulation
+// depth at four and is worth about a third of their bandwidth. This one
+// converts each unpacked code to fp32 and accumulates there.
+//
+// The reason is that this kernel is arithmetic a TEST can pin. An fp16 inner
+// product is exact to about 2^-11 of the sum of MAGNITUDES, so at k = 2880
+// with cancellation it drifts several parts in a hundred from an exact dot --
+// far past bf16's own 2^-8, which means a numeric gate against a host
+// reference could only assert a tolerance loose enough to hide a real fault.
+// In fp32 the kernel and the reference agree to bf16 rounding and the gate is
+// tight. It costs instructions, not bandwidth: the weights are `n * k / 2`
+// bytes per route against `k` activation elements -- 1440:1 at gpt-oss's
+// dimensions -- so this kernel is HBM-bound on the bank either way.
+//
+// One warp per (route, slab of `kRows` output rows), the slab for the reason
+// `mxfp4_moe_down_decode`'s header gives: the activation is re-read by every
+// output row, and amortising each activation load over four weight loads is
+// what takes the GEMV off its instruction-issue bound.
+template <class T, int kRowsT>
+__global__ void mxfp4_matmul_select_bias(
+    const T* __restrict__ act,
+    const i32* __restrict__ routes,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const T* __restrict__ bias,
+    T* __restrict__ out,
+    int act_div,
+    int n,
+    int k)
+{
+    constexpr int kRows = kRowsT;
+    const int route = blockIdx.x;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
+    if (row0 >= n) return;
+    const int expert = routes[route];
+
+    const int groups_per_row = k / 32;          // 32 codes to one E8M0 byte
+    const int words_per_row = k / 8;            // 8 codes to one 32-bit word
+
+    const u8* w = codes + static_cast<long long>(expert) * n * (k / 2);
+    const u8* s = scales + static_cast<long long>(expert) * n * groups_per_row;
+    const T* x = act + static_cast<long long>(route / act_div) * k;
+
+    // A slab can overhang the tail when `n` is not a multiple of kRows. Clamp
+    // the overhanging rows onto the last real one -- their results are
+    // discarded at store time, and the alternative (letting the loads run past
+    // the bank) is an out-of-bounds read. `mxfp4_moe_down_decode` does the
+    // same thing for the same reason.
+    int row_of[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
+
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(w);
+
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+    for (int g = lane_id; g < groups_per_row; g += 32) {
+        // The group's own partial, UNSCALED: the E8M0 byte is constant over
+        // the 32 codes, so it is folded in once at the bottom rather than 32
+        // times here.
+        float part[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) part[r] = 0.f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float xv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                xv[j] = Elem<T>::to_f32(x[g * 32 + q * 8 + j]);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                __half2 qd[4];
+                mxfp4_unpack8(
+                    w32[static_cast<long long>(row_of[r]) * words_per_row + g * 4 + q],
+                    qd);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    // Every MXFP4 codepoint is exact in fp16, so this
+                    // conversion is the code's VALUE and not a rounding of it.
+                    const float2 f = __half22float2(qd[j]);
+                    part[r] = fmaf(f.x, xv[2 * j], part[r]);
+                    part[r] = fmaf(f.y, xv[2 * j + 1], part[r]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            acc[r] = fmaf(
+                part[r],
+                mxfp4_block_scale(
+                    s[static_cast<long long>(row_of[r]) * groups_per_row + g]),
+                acc[r]);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane_id == 0) {
+        const T* b = bias != nullptr
+            ? bias + static_cast<long long>(expert) * n
+            : nullptr;
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row >= n) break;
+            float v = acc[r];
+            if (b != nullptr) v += Elem<T>::to_f32(b[row]);
+            out[static_cast<long long>(route) * n + row] = Elem<T>::from_f32(v);
+        }
+    }
+}
+
 // Expert-grouped variant of `mxfp4_moe_gate_up_decode`.
 //
 // The per-route kernel above gives one block to each (token, expert) route, so

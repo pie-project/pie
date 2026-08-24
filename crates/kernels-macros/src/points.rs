@@ -52,7 +52,7 @@ pub(crate) fn snake(ident: &Ident) -> String {
 
 fn point(family: &str, f: &TraitItemFn) -> Result<TokenStream, Error> {
     let name = format!("{family}.{}", f.sig.ident);
-    let axes = axes(&name, &f.sig)?;
+    let Axes { scalars, reprs } = axes(&name, &f.sig)?;
     answers(&name, &f.sig)?;
     let mut args = f.sig.inputs.iter();
     match args.next() {
@@ -65,27 +65,45 @@ fn point(family: &str, f: &TraitItemFn) -> Result<TokenStream, Error> {
         }
     }
     let slots = args
-        .map(|a| slot(&name, a, &axes))
+        .map(|a| slot(&name, a, &scalars, &reprs))
         .collect::<Result<Vec<_>, _>>()?;
-    let n = axes.len();
-    Ok(quote!(Point { name: #name, axes: #n, slots: &[#(#slots),*] }))
+    let n = scalars.len();
+    let r = reprs.len();
+    Ok(quote!(Point { name: #name, axes: #n, reprs: #r, slots: &[#(#slots),*] }))
 }
 
-/// The method's scalar axes, in declaration order — the cartesian a dispatch
-/// shim writes, and what a `Self::Tensor<T>` payload indexes into.
-fn axes(point: &str, sig: &Signature) -> Result<Vec<Ident>, Error> {
-    let mut out = Vec::new();
+/// A point's two runs of generics, each in declaration order.
+struct Axes {
+    /// `T: Scalar` — what a `Self::Tensor<T>` payload indexes into.
+    scalars: Vec<Ident>,
+    /// `R: Repr` — what a `Self::Bank<R>` payload indexes into.
+    reprs: Vec<Ident>,
+}
+
+/// The method's axes, split by the bound each one states.
+///
+/// TWO RUNS AND NOT ONE, because they are two different crossings: an
+/// element is what an arena minted, a repr is what a checkpoint stores, and a
+/// dispatch reads them off different columns of the bound statement. The
+/// SCALAR RUN COMES FIRST — `<T: Scalar, R: Repr>` — so that the turbofish a
+/// generator writes is `axes` then `reprs` and nothing has to remember an
+/// interleaving.
+fn axes(point: &str, sig: &Signature) -> Result<Axes, Error> {
+    let mut out = Axes {
+        scalars: Vec::new(),
+        reprs: Vec::new(),
+    };
     for p in &sig.generics.params {
         let GenericParam::Type(t) = p else {
             return Err(Error::new(
                 p.span(),
                 format!(
-                    "`{point}`: a point's generics are its scalar axes and nothing else \
-                     — write `<T: Scalar>`"
+                    "`{point}`: a point's generics are its axes and nothing else \
+                     — write `<T: Scalar>` for an element, `<R: Repr>` for a bank"
                 ),
             ));
         };
-        let elsewhere = sig
+        let elsewhere: Vec<&TypeParamBound> = sig
             .generics
             .where_clause
             .iter()
@@ -97,23 +115,39 @@ fn axes(point: &str, sig: &Signature) -> Result<Vec<Ident>, Error> {
                 },
                 _ => None,
             })
-            .flatten();
-        if !t.bounds.iter().chain(elsewhere).any(is_scalar) {
+            .flatten()
+            .collect();
+        let bounds = || t.bounds.iter().chain(elsewhere.iter().copied());
+        if bounds().any(|b| bound_is(b, "Scalar")) {
+            if !out.reprs.is_empty() {
+                return Err(Error::new(
+                    t.span(),
+                    format!(
+                        "`{point}`: axis `{}` is a `Scalar` behind a `Repr` — a point's \
+                         element axes come first, so a turbofish is `axes` then `reprs`",
+                        t.ident
+                    ),
+                ));
+            }
+            out.scalars.push(t.ident.clone());
+        } else if bounds().any(|b| bound_is(b, "Repr")) {
+            out.reprs.push(t.ident.clone());
+        } else {
             return Err(Error::new(
                 t.span(),
                 format!(
-                    "`{point}`: axis `{}` states no bound — a point quantifies over `Scalar`",
+                    "`{point}`: axis `{}` states no bound — a point quantifies over \
+                     `Scalar` (an element) or `Repr` (a bank's storage form)",
                     t.ident
                 ),
             ));
         }
-        out.push(t.ident.clone());
     }
     Ok(out)
 }
 
-fn is_scalar(b: &TypeParamBound) -> bool {
-    matches!(b, TypeParamBound::Trait(t) if t.path.segments.last().is_some_and(|s| s.ident == "Scalar"))
+fn bound_is(b: &TypeParamBound, what: &str) -> bool {
+    matches!(b, TypeParamBound::Trait(t) if t.path.segments.last().is_some_and(|s| s.ident == what))
 }
 
 /// Every point answers `Result<(), Refusal>`: an unclaimed one is a backlog
@@ -144,7 +178,7 @@ fn answers(point: &str, sig: &Signature) -> Result<(), Error> {
     ))
 }
 
-fn slot(point: &str, arg: &FnArg, axes: &[Ident]) -> Result<TokenStream, Error> {
+fn slot(point: &str, arg: &FnArg, axes: &[Ident], reprs: &[Ident]) -> Result<TokenStream, Error> {
     let FnArg::Typed(pt) = arg else {
         return Err(Error::new(
             arg.span(),
@@ -158,7 +192,7 @@ fn slot(point: &str, arg: &FnArg, axes: &[Ident]) -> Result<TokenStream, Error> 
         ));
     };
     let name = id.ident.to_string();
-    let (mark, dtype) = marked(point, &name, &pt.ty, axes)?;
+    let (mark, dtype) = marked(point, &name, &pt.ty, axes, reprs)?;
     Ok(quote!(Slot { name: #name, mark: Mark::#mark, dtype: #dtype }))
 }
 
@@ -169,6 +203,7 @@ fn marked(
     slot: &str,
     ty: &Type,
     axes: &[Ident],
+    reprs: &[Ident],
 ) -> Result<(Ident, TokenStream), Error> {
     if let Some(p) = prim(ty) {
         return Ok((
@@ -205,15 +240,65 @@ fn marked(
             ),
         ));
     };
-    // `Cache` carries a POOL'S VIEW, and a view is not a rectangle of
-    // elements: the two payload readers are different for that reason, and
-    // a cache slot's dtype column is `Opaque` rather than an axis.
+    // `Cache` carries a POOL'S VIEW and `Const<Self::Bank<..>>` a BANK's,
+    // and neither is a rectangle of elements: the three payload readers are
+    // different for that reason, and neither slot's dtype column is an
+    // element axis.
     let dtype = if seg.ident == "Cache" {
         pool(point, slot, payload)?
+    } else if let Some(bank) = bank(point, slot, payload, reprs) {
+        bank?
     } else {
         tensor(point, slot, payload, axes)?
     };
     Ok((seg.ident.clone(), dtype))
+}
+
+/// `Self::Bank<R>` → `Dtype::Bank(i)` for the method's i-th repr axis.
+///
+/// `None` — not an error — when the payload is not a `Self::Bank<..>` at
+/// all, so that `tensor` gets to give its own message for everything else. A
+/// `Self::Bank` whose argument is not one of the method's repr axes IS an
+/// error: a bank pinned to a concrete repr would be a point that only one
+/// checkpoint could ever state, which is the thing this axis exists to stop.
+fn bank(
+    point: &str,
+    slot: &str,
+    ty: &Type,
+    reprs: &[Ident],
+) -> Option<Result<TokenStream, Error>> {
+    let seg = match ty {
+        Type::Path(p)
+            if p.qself.is_none()
+                && p.path.segments.len() == 2
+                && p.path.segments[0].ident == "Self" =>
+        {
+            p.path.segments.last().filter(|s| s.ident == "Bank")?
+        }
+        _ => return None,
+    };
+    let carried = args(seg);
+    let [repr] = carried.as_slice() else {
+        return Some(Err(Error::new(
+            seg.span(),
+            format!("`{point}`: `Self::Bank` on slot `{slot}` carries one repr"),
+        )));
+    };
+    if let Type::Path(p) = repr
+        && let Some(i) = p
+            .path
+            .get_ident()
+            .and_then(|id| reprs.iter().position(|a| a == id))
+    {
+        return Some(Ok(quote!(Dtype::Bank(#i))));
+    }
+    Some(Err(Error::new(
+        repr.span(),
+        format!(
+            "`{point}`: slot `{slot}` carries a bank at a repr that is not an axis of this \
+             method — write `Self::Bank<R>` for `<R: Repr>`"
+        ),
+    )))
 }
 
 /// `Self::Recurrent` or `Self::Pages` — the plane's view of a pool row, and
@@ -264,7 +349,8 @@ fn tensor(point: &str, slot: &str, ty: &Type, axes: &[Ident]) -> Result<TokenStr
             ty.span(),
             format!(
                 "`{point}`: a mark on slot `{slot}` carries the plane's payload, \
-                 `Self::Tensor<..>` — a host scalar is bare and wears no mark"
+                 `Self::Tensor<..>` or `Self::Bank<..>` — a host scalar is bare and \
+                 wears no mark"
             ),
         ));
     };

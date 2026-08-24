@@ -1,8 +1,15 @@
 //===-- elementwise.cuh - the norm family's pointwise kernels ------------===//
 //
-// Two `__global__` templates and nothing else: no host function, no `<<<>>>`,
-// no entry point. Everything else about them is Rust, in `src/norm.rs`'s
-// `elementwise`.
+// Three `__global__` templates and nothing else: no host function, no
+// `<<<>>>`, no entry point. Everything else about them is Rust, in
+// `src/norm.rs`'s `elementwise`.
+//
+// The third arrived last and belongs here rather than in a file of its own:
+// `scale` is `scalar_mul` with the factor read from a device `[1]` bank
+// instead of the params run, and a pointwise norm kernel is what this file
+// collects. Splitting it out would put two spellings of one loop in two
+// places, which is the drift `deinterleave.cuh`'s header records the cost
+// of.
 //
 // # What the launchers were doing, and where it went
 //
@@ -72,6 +79,36 @@ __global__ void scalar_mul(T* __restrict__ x, float s, usize n) {
     if (i >= n) return;
     const float s_rounded = Elem<T>::to_f32(Elem<T>::from_f32(s));
     x[i] = Elem<T>::from_f32(Elem<T>::to_f32(x[i]) * s_rounded);
+}
+
+/// `x *= *s`, elementwise, with the factor read from DEVICE MEMORY.
+///
+/// `scalar_mul`'s sibling, and one indirection is the whole difference. There
+/// the factor rides the fire's params run as an fp32 the HOST chose -- a
+/// `sqrt(hidden)` the text computed. Here it is a learned `[1]` bank the
+/// load-time parameter table bound: gemma's per-layer `layer_scalar`, which
+/// the legacy driver read to the host once at load
+/// (`read_bf16_scalar_once`) precisely because no kernel would take it where
+/// it lives. This is that kernel, and it is why `norm.scale` and
+/// `norm.mul_scalar` are two points at the same shape -- the factor's
+/// PROVENANCE differs, and provenance is what a slot's mark says.
+///
+/// NO ROUNDING TRIP, where `scalar_mul` has one. `scalar_mul` narrows its
+/// fp32 to `T` and widens it back because that is how PyTorch evaluates
+/// `tensor * bf16_scalar`, and a raw fp32 factor drifts a ULP per element.
+/// A `[1]` bank is ALREADY `T`: the checkpoint did that rounding when it
+/// stored the number, and doing it again here would be a second rounding of
+/// a value that has none left to lose.
+///
+/// Every thread loads `s[0]`. One broadcast off L1 per warp against a launch
+/// already bound by the traffic on `x`; staging it through shared memory
+/// would buy a load and cost a `__syncthreads()`.
+template <class T>
+__global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float f = Elem<T>::to_f32(s[0]);
+    x[i] = Elem<T>::from_f32(Elem<T>::to_f32(x[i]) * f);
 }
 
 }  // namespace pie::norm

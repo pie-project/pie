@@ -45,7 +45,7 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<
     fn forward(&self, inputs: HybridInput<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::layout::embed(&ids, &m.embed);
+        let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
         let mut blocks: Vec<Value> = Vec::new();
 
         for (l, w) in m.layers.iter().enumerate() {
@@ -158,7 +158,7 @@ fn mla_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Mla<W1>, l: 
         kernels::mla::attention_decode(&dq, &dpe, &pages, a.heads, a.kv_lora_rank, a.sm_scale),
         kernels::mla::attention_prefill(
             &kernels::query_windows(&p),
-            &kernels::query_windows(&ppe),
+            &ppe,
             &pages,
             a.heads,
             a.kv_lora_rank,

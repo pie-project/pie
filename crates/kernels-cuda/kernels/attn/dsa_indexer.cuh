@@ -240,4 +240,149 @@ __global__ void index_topk_mask(
     for (int j = tid; j < nkeys; j += kBlock) mrow[j] = (logit[j] >= thr) ? 1 : 0;
 }
 
+/// The PAGED reading of the same ranking, answering the SELECTION ITSELF.
+///
+///     logit[t, j] = sum_h relu(q[t, h] . k_pages[j]) * w[t, h]
+///
+/// and `selection[t]` holds the `top_k` largest `j`, ASCENDING, `-1` past
+/// the end.
+///
+/// # Three things differ from `index_topk_mask`, and each is the point
+///
+/// **The keys are the POOL's.** `index_topk_mask` scores a token-plane
+/// `idx_k` — the rows this fire just projected — so its `j` never leaves the
+/// batch and the selection it made was worthless the moment the fire ended
+/// (glm's legacy text assigned it to `_index_mask` and threw it away). Here
+/// `j` runs over the whole CACHED prefix, resolved page by page out of the
+/// same CSR triple `attn::mla_resolve_dst` walks, which is what a sparse
+/// attention over a paged cache actually needs.
+///
+/// **The result is a list.** A `[tokens, kv]` byte mask has a per-request
+/// runtime width; `[tokens, top_k]` of `i32` is dense and stated. The
+/// attention that reads it walks it.
+///
+/// **The logits live in a STAGED PLANE and not in shared memory.**
+/// `index_topk_mask` sizes `extern __shared__ float logit[]` on the row
+/// count, which is only affordable because its `nkeys` is the batch. A
+/// cached prefix is not, so `scores` is a plane-staged `[N, score_stride]`
+/// scratch — `score_stride` the host's `max_pages_per_request * page_size`,
+/// the only kv bound anything on the host holds. Nothing else about the
+/// ranking moved: forty rounds of bisection on the logit range, `>= thr`
+/// admitting every equal logit, no softmax scale (monotonic, so irrelevant
+/// to a ranking) — `index_topk_mask`'s own method, and its own tie
+/// behaviour, with the one difference that a LIST has a length and so a
+/// tie-heavy row is truncated at `top_k` in ascending order rather than
+/// admitting more than `top_k` keys.
+template <class T>
+__global__ void index_topk_paged(
+    const T* __restrict__ idx_q,          // [N, H, D]
+    const T* __restrict__ idx_w,          // [N, H]
+    const T* __restrict__ key_pages,      // [pages, page_size, D]
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    const u32* __restrict__ kv_last_page_lens,
+    float* __restrict__ scores,           // [N, score_stride], staged
+    i32* __restrict__ selection,          // [N, topk]
+    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk)
+{
+    const int t = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    i32* srow = selection + static_cast<long long>(t) * topk;
+
+    // Which request, and how much of the cache this query may see. The walk
+    // is `attn::mla_resolve_dst`'s, minus the page it resolves: `R` is the
+    // batch size and a linear scan over it is what every kernel on this path
+    // does.
+    int r = 0;
+    for (; r < R - 1; ++r) {
+        if (t < static_cast<int>(qo_indptr[r + 1])) break;
+    }
+    const int qo_lo = static_cast<int>(qo_indptr[r]);
+    const int new_tokens = static_cast<int>(qo_indptr[r + 1]) - qo_lo;
+    const int pages_first = static_cast<int>(kv_page_indptr[r]);
+    const int num_pages = static_cast<int>(kv_page_indptr[r + 1]) - pages_first;
+    const int kv_len =
+        (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
+    const int abs_q = kv_len - new_tokens + (t - qo_lo);
+    int nkeys = abs_q + 1;  // causal, in the request's own positions
+    // UNREACHABLE BY THE HOST'S OWN SIZING (`score_stride` is
+    // `max_pages_per_request * page_size` and `kv_len` cannot exceed it), and
+    // here anyway: a staged plane that is short must not be written past.
+    if (nkeys > score_stride) nkeys = score_stride;
+    if (nkeys < 0) nkeys = 0;
+
+    float* frow = scores + static_cast<long long>(t) * score_stride;
+    const T* qi = idx_q + static_cast<long long>(t) * H * D;
+    const T* wi = idx_w + static_cast<long long>(t) * H;
+    for (int j = tid; j < nkeys; j += kBlock) {
+        const int page =
+            static_cast<int>(kv_page_indices[pages_first + j / page_size]);
+        const int off = j % page_size;
+        const T* kj =
+            key_pages + (static_cast<long long>(page) * page_size + off) * D;
+        float acc = 0.f;
+        for (int h = 0; h < H; ++h) {
+            const T* qh = qi + static_cast<long long>(h) * D;
+            float dot = 0.f;
+            for (int d = 0; d < D; ++d) dot += Elem<T>::to_f32(qh[d]) * Elem<T>::to_f32(kj[d]);
+            acc += fmaxf(dot, 0.f) * Elem<T>::to_f32(wi[h]);
+        }
+        frow[j] = acc;
+    }
+    __syncthreads();
+
+    if (nkeys <= topk) {
+        for (int n = tid; n < topk; n += kBlock) srow[n] = (n < nkeys) ? n : -1;
+        return;
+    }
+
+    // The range, reduced across the block. `index_topk_mask` walks it on one
+    // thread because its `nkeys` is a batch; a cached prefix is long enough
+    // that a serial min/max would dominate the bisection it feeds.
+    __shared__ float red[kBlock];
+    float lo_l = pos_inf(), hi_l = -pos_inf();
+    for (int j = tid; j < nkeys; j += kBlock) {
+        lo_l = fminf(lo_l, frow[j]);
+        hi_l = fmaxf(hi_l, frow[j]);
+    }
+    red[tid] = lo_l; __syncthreads();
+    for (int o = kBlock / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fminf(red[tid], red[tid + o]); __syncthreads(); }
+    float lo = red[0];
+    __syncthreads();
+    red[tid] = hi_l; __syncthreads();
+    for (int o = kBlock / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
+    float hi = red[0];
+    __syncthreads();
+
+    __shared__ int cnt_s;
+    float thr = hi;
+    for (int it = 0; it < 40; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        if (tid == 0) cnt_s = 0;
+        __syncthreads();
+        int c = 0;
+        for (int j = tid; j < nkeys; j += kBlock) if (frow[j] >= mid) c++;
+        atomicAdd(&cnt_s, c);
+        __syncthreads();
+        const int cnt = cnt_s;
+        if (cnt > topk) lo = mid; else hi = mid;
+        __syncthreads();
+        thr = hi;
+    }
+
+    // ONE THREAD EMITS, and the order is ascending `j` — which is both what
+    // makes the answer deterministic (a parallel scatter would order ties by
+    // whichever warp got there first) and what makes the attention's walk of
+    // it hit the page table in order. The cost is `nkeys` serial iterations
+    // against `nkeys * H * D` parallel MACs above it.
+    if (tid == 0) {
+        int n = 0;
+        for (int j = 0; j < nkeys && n < topk; ++j) {
+            if (frow[j] >= thr) srow[n++] = j;
+        }
+        for (; n < topk; ++n) srow[n] = -1;
+    }
+}
+
 }  // namespace pie::attn

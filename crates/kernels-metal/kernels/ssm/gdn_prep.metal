@@ -765,3 +765,66 @@ instantiate_gdn_scan(bfloat16, bfloat, 4, 1)
 instantiate_gdn_scan(bfloat16, bfloat, 32, 2)
 instantiate_gdn_scan(bfloat16, bfloat, 32, 4)
 instantiate_gdn_scan(bfloat16, bfloat, 32, 8)
+
+// ── `ssm.gdn_prep`, as W10 rewrote it ────────────────────────────────────────
+//
+// THE POINT ABOVE IS NOT THIS POINT. `gdn_prep`/`gdn_prep_slotted` are the
+// pre-W10 launch: they take the post-mixer row, run the convolution, the
+// l2-norm, the widen AND the gates against a recurrent view, and write three
+// scratch planes. `kernels::points::Ssm::gdn_prep` now states four slots and
+// one result -- the packed `[b | a]` projection in, the packed `[g_log | beta]`
+// decay row out -- because the three planes the old launch also wrote belong
+// to the recurrence points, which declare the `qkv` they are cut from.
+//
+// This is `::pie::ssm::qwen_gdn_ba_gates` (cuda's
+// `ssm/gated_delta_net_prep.cuh`), ported slot for slot so that this plane
+// answers the declaration the cuda plane answers rather than a wider launch
+// wearing its name.
+//
+// `V_h` IS READ, NOT STATED, by the caller: the operand IS `[b | a]`, so the
+// value-head count is half its width, and a `Const` restating it could
+// disagree with the rectangle it divides. It arrives here as a row stride
+// because a shader indexes with numbers and not with rectangles.
+//
+// Both halves stride by `2 * V_h`: `[b | a]` in, `[g_log | beta]` out, in that
+// order, which is what the import packs and what the two recurrence points
+// read. A pointer offset into either would be a row stride of `V_h` claimed
+// for bytes whose stride is twice that -- true at one token, false at two.
+//
+// The two transcendentals mirror the cuda body's: softplus is the numerically
+// stable `z > 20 ? z : log1p(exp(z))` that `g_beta` and `qwen_gdn_v_g_beta`
+// also spell, so the three agree, and the gate is `1 / (1 + exp(-b))`.
+//
+// Launch: dispatchThreads grid=(V_h, N, 1), tg=(min(V_h, 256), 1, 1). Metal
+// dispatches exactly the threads asked for, so there is no bound to check --
+// THE GRID IS THE EXTENT, as everywhere else in this tree.
+template <typename T>
+[[kernel]] void qwen_gdn_ba_gates(
+    const device T* ba          [[buffer(0)]],  // [N, 2 * V_h], `[b | a]`
+    const device float* a_log   [[buffer(1)]],  // [V_h]
+    const device T* dt_bias     [[buffer(2)]],  // [V_h]
+    device float* gates         [[buffer(3)]],  // [N, 2 * V_h], `[g_log | beta]`
+    const constant int& v_heads [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]) {
+  const uint h = pos.x;
+  const uint t = pos.y;
+  const size_t vh = size_t(v_heads);
+  const size_t row = size_t(t) * 2 * vh;
+
+  const float bv = float(ba[row + size_t(h)]);
+  const float av = float(ba[row + vh + size_t(h)]);
+
+  const float z = av + float(dt_bias[h]);
+  const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
+
+  gates[row + size_t(h)] = -metal::fast::exp(a_log[h]) * sp;
+  gates[row + vh + size_t(h)] = 1.0f / (1.0f + metal::fast::exp(-bv));
+}
+
+#define instantiate_qwen_gdn_ba_gates(name, itype)                            \
+  template [[host_name("qwen_gdn_ba_gates_" #name)]]                          \
+  [[kernel]] void qwen_gdn_ba_gates<itype>(                                   \
+      const device itype*, const device float*, const device itype*,          \
+      device float*, const constant int&, uint2);
+
+instantiate_qwen_gdn_ba_gates(bfloat16, bfloat)

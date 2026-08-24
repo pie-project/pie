@@ -42,16 +42,37 @@
 //! * **The traced form** — *model-structural* divergence: what the model
 //!   itself declares, true for every member of every fire against it. An
 //!   MoE trace's per-token expert selection ([`SITE_EXPERT_WEIGHTS`]) is
-//!   this provenance; [`site_table::derive_sites`] walks a
-//!   `model_ir::ForwardPlan` and emits them once per model, not per
-//!   fire.
+//!   this provenance, and it currently has NO PRODUCER — see below.
 //!
-//! [`plan_fire_with_model`] merges both: `build_frame_submission` passes
-//! the model-structural sites the driver's capabilities handshake reported
-//! from its validated plan ([`site_table::summary_sites`]; the [`site_table`]
-//! module doc records why the driver, not the engine, is the honest source).
-
-pub(crate) mod site_table;
+//! [`plan_fire_with_model`] is the merge point for both, and today every
+//! caller passes an empty model-site slice.
+//!
+//! # The model-structural provenance has no producer, and this is measured
+//!
+//! A `site_table` module stood here with two functions: `derive_sites`, which
+//! walked a `model_ir::trace::ForwardPlan` looking for `moe::topk_softmax` and
+//! read `(experts, top_k)` off its operands' widths, and `summary_sites`,
+//! which mapped a driver-reported `driver_api::ModelSiteSummary` into this
+//! vocabulary. Its own doc enumerated three links and measured all three as
+//! open: the producer (`driver-cuda`'s `serve/load.rs`) reported
+//! `ModelSiteSummary::default()`, the carrier ([`DriverSpec`]) had no field to
+//! put a summary in, and the consumer had no caller outside its own tests.
+//! Both functions carried `#[allow(dead_code)]` saying so.
+//!
+//! R1 deleted it, because the fourth fact is the one that settles it: the walk
+//! read the LEGACY traced form. `model_ir::trace::ForwardPlan` is what
+//! `model-dsl-legacy` produces; the baker path produces `model_ir::plan::Plan`,
+//! a different type with a different op vocabulary. A walk over a form the
+//! serving path is being moved off, with no producer, no carrier and no
+//! consumer, is not a reference implementation — it is the only reason this
+//! crate linked the legacy model declarations at all.
+//!
+//! What survives is the VOCABULARY: [`SITE_EXPERT_WEIGHTS`] and
+//! [`expert_weights_site`] still say what such a site is, so the day a driver
+//! reports one there is a shape for it to land in. What does not survive is a
+//! derivation in the past tense.
+//!
+//! [`DriverSpec`]: crate::driver::DriverSpec
 
 /// How a divergence site's variation prices out, independent of device.
 ///
@@ -208,19 +229,22 @@ pub(crate) const SITE_ATTENTION_MASK: &str = "attention_mask";
 ///
 /// NOT derived from [`MemberFacts`], and deliberately so: member facts have
 /// no moe bit and fires do not carry one, because this site is a fact about
-/// the TRACED FORM, not about the members — every member of a fire against
-/// an MoE model diverges here, expert assignment being data. It is emitted
-/// by the plan-derived site table ([`site_table::derive_sites`]: walk the
-/// `ForwardPlan`, one Site per distinct selector parameterization; the
-/// driver runs the C++ mirror of that walk over its validated plan and
-/// reports the result through capabilities — [`site_table::summary_sites`])
-/// and merged into a fire's plan by [`plan_fire_with_model`], which
-/// `build_frame_submission` now calls with the reported sites (the
-/// [`site_table`] module doc records the wiring).
+/// the model's own structure, not about the members — every member of a fire
+/// against an MoE model diverges here, expert assignment being data.
+///
+/// NOTHING EMITS ONE TODAY. The designed source is the driver, which holds the
+/// validated plan and would report its site summary through the capabilities
+/// handshake; the module doc measures why the engine-side walk that used to
+/// stand in for it was deleted rather than ported. This entry says what such a
+/// site *is*, so a reported one has a shape to land in.
+#[allow(
+    dead_code,
+    reason = "the vocabulary outlives its producer on purpose; the module doc measures why"
+)]
 pub(crate) const SITE_EXPERT_WEIGHTS: &str = "expert_weights";
 
-/// The [`SITE_EXPERT_WEIGHTS`] vocabulary entry, as the plan-derived site
-/// table will emit it.
+/// The [`SITE_EXPERT_WEIGHTS`] vocabulary entry, as a driver-reported summary
+/// would land in it.
 ///
 /// The `PerLane` candidate here means "per selected weight, by span" —
 /// dictionary passing, same as lora — and is deliberately NOT the final
@@ -230,6 +254,10 @@ pub(crate) const SITE_EXPERT_WEIGHTS: &str = "expert_weights";
 /// glm5 / mixtral / nemotron_h MoE paths), and per §4.4 choosing among
 /// those strategies is the runtime/driver's device-knowledge call, exactly
 /// as with the lora span-vs-grouped grouping above.
+#[allow(
+    dead_code,
+    reason = "same as `SITE_EXPERT_WEIGHTS`: nothing reports a site, so only tests build one"
+)]
 pub(crate) fn expert_weights_site(experts: u32, top_k: u32) -> Site {
     Site {
         name: SITE_EXPERT_WEIGHTS,
@@ -341,8 +369,9 @@ pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
 
 /// Plan one step group, merging both site provenances (module doc): the
 /// member-fact sites this function derives, then `model_sites` — the
-/// model-structural sites a caller derived once from the traced form
-/// ([`site_table::derive_sites`]) — appended in the caller's order.
+/// model-structural sites a caller obtained once for the model — appended in
+/// the caller's order. Every caller passes an empty slice today; the module
+/// doc measures why.
 ///
 /// Everything here is device-independent (pie-application-plan.md §4.4):
 /// the order and the class assignments are structural facts about the
@@ -772,9 +801,9 @@ mod tests {
     /// The expert-weights vocabulary entry: Weight-class at TOKEN
     /// granularity — `matmul(x, W[i])` with `i` per-token, the grouped-GEMM
     /// half of the SGMV/MoE identity — with the per-lane dictionary-passing
-    /// candidate and a note pointing at the device-side lowering. Pinned
-    /// here as the shape [`site_table::derive_sites`] emits (its own tests
-    /// pin the derivation; this one pins the vocabulary).
+    /// candidate and a note pointing at the device-side lowering. This is now
+    /// the ONLY thing holding the entry's shape: the walk that used to emit it
+    /// is gone with its legacy traced form (module doc).
     #[test]
     fn expert_weights_site_vocabulary() {
         let site = expert_weights_site(256, 8);
@@ -843,35 +872,5 @@ mod tests {
             assert_eq!(a.lowering, b.lowering);
             assert_eq!(a.note, b.note);
         }
-    }
-
-    /// End-to-end across the provenances: sites derived from a real MoE
-    /// traced form merge into a fire plan alongside the member-fact sites.
-    #[test]
-    fn derived_moe_sites_merge_into_a_fire_plan() {
-        // The epsilon is an argument of the text now, not a fact of the
-        // struct. A site derivation walks ops and weights and never reads it.
-        // The CUDA reading: `derive_sites` finds the grouped GEMM by its
-        // symbol, and a semantic text states the role instead. See
-        // `site_table::tests::moe_fragment_derives_the_expert_site`.
-        let traced = model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda(
-            &model::qwen_3_5::forward::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
-            &model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
-            1e-6,
-        );
-        let model_sites = site_table::derive_sites(&traced);
-        let members = vec![
-            member(false, false, false, 0),
-            member(true, false, false, 1),
-        ];
-        let plan = plan_fire_with_model(&members, &model_sites);
-        assert_eq!(plan.sites.len(), 4);
-        let expert = plan
-            .sites
-            .iter()
-            .find(|site| site.name == SITE_EXPERT_WEIGHTS)
-            .expect("expert site merged from the traced form");
-        assert_eq!(expert.class, DivClass::Weight);
-        assert!(expert.note.contains("top-8 of 256 experts"));
     }
 }

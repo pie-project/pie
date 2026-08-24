@@ -35,10 +35,10 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
         let ids = inputs.token_ids();
-        let mut y = kernels::layout::embed(&ids, &m.embed) * (m.hidden as f32).sqrt();
+        let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
 
         let relay = m.ple.as_ref().map(|ple| {
-            let table = kernels::layout::embed(&ids, &ple.table) * (ple.dim as f32).sqrt();
+            let table = kernels::layout::embed(&ids, &ple.table, m.vocab) * (ple.dim as f32).sqrt();
             let proj = kernels::gemm::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
             let n = &ple.model_norm;
             (ple, kernels::norm::residual_add(&table, &kernels::norm::rmsnorm(&proj, &n.weight, n.eps)))
@@ -116,7 +116,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
 
             if let Some((ple, relay)) = &relay {
                 let lp = &ple.per_layer[l as usize];
-                let gated = kernels::mlp::geglu_tanh(&kernels::gemm::matmul(&y, &lp.gate), &kernels::layout::select(relay, l));
+                let gated = kernels::mlp::geglu_tanh(&kernels::gemm::matmul(&y, &lp.gate), &kernels::layout::select(relay, l, ple.dim));
                 let out = kernels::gemm::matmul(&gated, &lp.proj);
                 let out = kernels::norm::rmsnorm(&out, &lp.norm.weight, lp.norm.eps);
                 y = kernels::norm::residual_add(&kernels::norm::scale(&lp.scalar, &out), &y);

@@ -5,7 +5,7 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use ::model::instruct::{ToolDecoder, ToolEvent};
+use ::model::serve::instruct::{ToolDecoder, ToolEvent};
 use anyhow::Result;
 use grammar::matcher::GrammarMatcher;
 use wasmtime::component::Resource;

@@ -101,30 +101,26 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         boot: cfg.clone(),
         kv_format,
         cublas: None,
-        lowerings: std::collections::BTreeMap::new(),
         calibrating,
         device_ordinal,
-        preds: None,
-        peel_win: None,
         logits_staging: None,
         retired_staging: Vec::new(),
         tp_rank,
         tp_size,
         model: None,
+        baker: None,
         load_generation: 0,
         programs: std::collections::BTreeMap::new(),
         instances: std::collections::BTreeMap::new(),
         next_id: 1,
         broker,
         fire_arrays: Scratch::default(),
-        supergraph: crate::fire::recordings::Recordings::new(),
         all_reduce: None,
         tp_group_id,
         kv: None,
         gdn: None,
         channels: std::collections::BTreeMap::new(),
         swap: None,
-        lora_arena: crate::fire::lora::LoraStageArena::default(),
         scratch: None,
         fire_stream: None,
         in_flight: std::collections::VecDeque::new(),
@@ -159,7 +155,23 @@ const FUSED_WORLD_SIZE: u32 = 2;
 ///
 /// Not checked: that a reduction sums correctly. The per-message ceiling (8
 /// MiB, the 16-byte multiple, the NCCL crossover) is `CustomAllReduce::can_handle`'s,
-/// answered per fire, with `bind/arms/comm.rs` falling back rather than failing.
+/// answered per fire.
+///
+/// # THE SEAM R2 LEFT, NAMED
+///
+/// **Nothing reduces through the plane this admits.** The collective was
+/// issued by `bind::dispatch`'s comm arms, which are deleted with the legacy
+/// walk, and no point of `kernels::points` declares an all-reduce — so a
+/// `Program` cannot state one and `baker::points_shim` has no arm to answer
+/// with. `fire::all_reduce` is kept whole (the P2P plane, the rendezvous,
+/// the resident buffers) because it is dist/comm machinery and its shape is
+/// not the lowering's opinion; what it lacks is a statement.
+///
+/// This is not currently reachable, and that is why it is a note rather than
+/// a refusal: the first check below already turns every `tp_size > 1` away,
+/// because `kernels_cuda::comm::CAN_LAUNCH` is false in this build. The day
+/// that constant flips, THIS function is where the missing statement has to
+/// be checked for — before a rank serves a shard as if it were the answer.
 ///
 /// # Errors
 ///
@@ -295,11 +307,11 @@ impl Drop for Shell {
             // `&mut O`), so an unreleased workspace is a pinned-host leak.
             scratch.prefill_ws.release(&mut sops);
             // The peel tail's own workspace, released for the same reason.
-            scratch.tail_ws.release(&mut sops);
+
             drop(scratch.decode_plan);
-            drop(scratch.decode_plan_full);
+
             drop(scratch.prefill_plan);
-            drop(scratch.tail_plan);
+
         }
     }
 }
@@ -432,8 +444,6 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // `state.model` frees the previous weight arena a captured graph baked
     // addresses into, so a same-depth reload would replay into freed memory.
     state.load_generation += 1;
-    state.lowerings.clear();
-    state.supergraph = crate::fire::recordings::Recordings::new();
     // And the P2P plane: the fusion workspace's `hidden` is compared for
     // equality, so a plane built for the previous checkpoint declines (or
     // mis-reduces) the next one's fused fires. Safe to drop — ranks rebuild.
@@ -479,9 +489,138 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         }
     }
 
+    // ── THE LANE. Not beside anything — this IS the fire path. ────────
+    //
+    // LAST, AND AFTER EVERY REFUSAL ABOVE HAS HAD ITS SAY. The order is
+    // the whole safety argument: by the time this runs, `deployment` has
+    // gated the KV style and the GQA ratio, the pools are sized, the caps
+    // are published and the TP plane is up. So the lane is built only for
+    // a checkpoint the driver has already agreed to serve, and it inherits
+    // every refusal the door already knows how to make without restating
+    // one of them.
+    //
+    // `row.id()` is the checkpoint's identification — read off its own
+    // tensors, which is the authoritative answer to "what model is this".
+    // `sku_for` translates it into the new catalog's spelling.
+    //
+    // A REFUSED LOAD AND NOT A WARNING. This block used to print and carry
+    // on, because there was a second path to carry on to. There is not.
+    // Serving a checkpoint whose Program refuses would mean accepting
+    // `load_model` and then failing every fire — the engine would have a
+    // model registered, capabilities published and a scheduler admitting
+    // requests against a driver that cannot answer one. The refusal
+    // belongs here, with the reason in it.
+    state.baker = None;
+    let stated = state.boot.baker_sku.clone();
+    let Some(sku) = crate::baker::sku_for(row.id(), stated.as_deref()) else {
+        return Err(crate::Error::unsupported(
+            "load_model",
+            format!(
+                "`{}` bridges to no `model::catalog()` row, so this driver \
+                 has no program to fire for it. Name one with `[baker] sku` \
+                 / PIE_BAKER_SKU, or add the checkpoint to \
+                 `baker::BRIDGE` once its lane is proven.",
+                row.id()
+            ),
+        )
+        .into());
+    };
+    if let Err(why) = baker_lane(state, &sku, snapshot) {
+        return Err(crate::Error::unsupported(
+            "load_model",
+            format!("`{sku}` did not build: {why}"),
+        )
+        .into());
+    }
+
+    // The calibration sweep fires the ORDINARY path, so it goes after the
+    // lane it fires: a sweep run before the lane was built would measure a
+    // refusal.
     if state.calibrating {
         calibrate_planner(state);
     }
+    Ok(())
+}
+
+/// Build the fire lane and report what it resolved.
+///
+/// Split out of `load_impl` so the happy path there stays four lines and
+/// the reporting lives beside the thing it reports on. Its `Err` is what
+/// `load_impl` turns into a refused load.
+fn baker_lane(state: &mut Shell, sku: &str, snapshot: &std::path::Path) -> Result<(), String> {
+    let alloc = crate::device::Allocator::new();
+    let baked = crate::baker::load(sku, snapshot, &alloc)?;
+
+    // The two catalogues must agree about the model before the lane is
+    // allowed to fire on pools the OTHER catalog sized. See
+    // `Geometry::agrees_with`: a disagreement here is a wrong answer with
+    // no error in it.
+    //
+    // THE SEAM, NAMED: `model::deployment` is still the legacy catalog's
+    // account of this checkpoint, and it is what sizes the KV pages, the
+    // recurrent slabs and the advertised caps. The program is the new
+    // catalog's. R3 is where that stops being two answers.
+    let dep = &state
+        .model
+        .as_ref()
+        .ok_or("the load stored no model")?
+        .deployment;
+    baked.geom.agrees_with(dep)?;
+    eprintln!(
+        "[driver-cuda] baker: `{}` traced — {} facts {:?}, {} params, {} caches, {} ops",
+        baked.plan.name,
+        baked.plan.facts.len(),
+        baked.plan.facts,
+        baked.plan.params.len(),
+        baked.plan.caches.len(),
+        baked.plan.ops.len(),
+    );
+
+    // The eager resolve, per BUILT lane. A refused lane is already a
+    // measurement (`program::Refusal` carries every gap it found), so it is
+    // reported as it stands rather than walked again.
+    let mut armed = 0usize;
+    for (at, lane) in baked.lanes.iter().enumerate() {
+        match lane {
+            Err(r) => eprintln!(
+                "[driver-cuda] baker: lane {at} (words {:?}) refused by the \
+                 walk: {r}",
+                r.words
+            ),
+            Ok(program) => {
+                let gaps = crate::baker::resolve::check(&baked.plan, program);
+                if gaps.is_empty() {
+                    armed += 1;
+                    eprintln!(
+                        "[driver-cuda] baker: lane {at} (words {:?}) RESOLVED — \
+                         {} steps, row_pitch {} B, {} slots",
+                        program.words,
+                        program.steps.len(),
+                        program.row_pitch,
+                        program.slots.len(),
+                    );
+                } else {
+                    // CHECK-THEN-BIND: every gap, with the op named, at
+                    // load. This is the whole point of the pass.
+                    eprintln!(
+                        "[driver-cuda] baker: lane {at} (words {:?}) has {} \
+                         unresolved call(s):",
+                        program.words,
+                        gaps.len(),
+                    );
+                    for gap in &gaps {
+                        eprintln!("[driver-cuda] baker:   {gap}");
+                    }
+                }
+            }
+        }
+    }
+    if armed == 0 {
+        return Err(format!(
+            "no lane of `{sku}` resolved against this plane; see the gaps above"
+        ));
+    }
+    state.baker = Some(baked);
     Ok(())
 }
 

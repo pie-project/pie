@@ -2,7 +2,7 @@
 //! answers them; a plane's own symbols live under its module and appear
 //! only behind that plane's gate.
 
-use crate::axes::Dtype;
+use crate::axes::{Dtype, F32};
 use crate::declare::{Norm, Tensor};
 use crate::forward::{Pages, State};
 use crate::record::{Value, Windows};
@@ -97,12 +97,12 @@ pub mod norm {
     /// single concatenated rectangle its routine takes. The recorded op is
     /// what it always was — receiver, then the blocks, then the norm's
     /// weight and eps, then the projection.
-    pub fn res_blend<W: Dtype>(y: &Value, blocks: &[Value], n: &Norm<W>, proj: &Tensor<W>) -> Value {
-        let mut s = y.stmt("norm.res_blend");
+    pub fn res_blend<W: Dtype>(prefix: &Value, blocks: &[Value], norm: &Norm<W>, proj: &Tensor<W>) -> Value {
+        let mut s = prefix.stmt("norm.res_blend");
         for block in blocks {
             s = s.value(block);
         }
-        s.norm(n).weight(proj).done()
+        s.norm(norm).weight(proj).done()
     }
 }
 
@@ -144,26 +144,26 @@ pub mod mlp {
 pub mod rope {
     use super::*;
 
-    pub fn full(q: &Value, k: &Value, pos: &Value, head_dim: u32, theta: f32, interleaved: bool) -> (Value, Value) {
-        q.stmt("rope.full").value(k).value(pos).int(head_dim).float(theta).int(u32::from(interleaved)).pair()
+    pub fn full(q: &Value, k: &Value, positions: &Value, head_dim: u32, theta: f32, interleaved: bool) -> (Value, Value) {
+        q.stmt("rope.full").value(k).value(positions).int(head_dim).float(theta).int(u32::from(interleaved)).pair()
     }
 
-    pub fn partial(q: &Value, k: &Value, pos: &Value, rotary_dim: u32, head_dim: u32, theta: f32) -> (Value, Value) {
-        q.stmt("rope.partial").value(k).value(pos).int(rotary_dim).int(head_dim).float(theta).pair()
+    pub fn partial(q: &Value, k: &Value, positions: &Value, rotary_dim: u32, head_dim: u32, theta: f32) -> (Value, Value) {
+        q.stmt("rope.partial").value(k).value(positions).int(rotary_dim).int(head_dim).float(theta).pair()
     }
 
-    pub fn partial_q(q: &Value, pos: &Value, rotary_dim: u32, head_dim: u32, theta: f32) -> Value {
-        q.stmt("rope.partial_q").value(pos).int(rotary_dim).int(head_dim).float(theta).done()
+    pub fn partial_q(q: &Value, positions: &Value, rotary_dim: u32, head_dim: u32, theta: f32) -> Value {
+        q.stmt("rope.partial_q").value(positions).int(rotary_dim).int(head_dim).float(theta).done()
     }
 
-    pub fn partial_last(q: &Value, pos: &Value, rotary_dim: u32, head_dim: u32, theta: f32, interleaved: bool) -> Value {
-        q.stmt("rope.partial_last").value(pos).int(rotary_dim).int(head_dim).float(theta).int(u32::from(interleaved)).done()
+    pub fn partial_last(q: &Value, positions: &Value, rotary_dim: u32, head_dim: u32, theta: f32, interleaved: bool) -> Value {
+        q.stmt("rope.partial_last").value(positions).int(rotary_dim).int(head_dim).float(theta).int(u32::from(interleaved)).done()
     }
 
     pub fn yarn(
         q: &Value,
         k: &Value,
-        pos: &Value,
+        positions: &Value,
         head_dim: u32,
         theta: f32,
         factor: f32,
@@ -175,7 +175,7 @@ pub mod rope {
     ) -> (Value, Value) {
         q.stmt("rope.yarn")
             .value(k)
-            .value(pos)
+            .value(positions)
             .int(head_dim)
             .float(theta)
             .float(factor)
@@ -300,12 +300,8 @@ pub mod attention {
             .pair()
     }
 
-    pub fn lse_ln(lse: &Value) -> Value {
-        lse.stmt("attention.lse_ln").done()
-    }
-
-    pub fn logit_softcap(logits: &Value, cap: f32) -> Value {
-        logits.stmt("attention.logit_softcap").float(cap).done()
+    pub fn logit_softcap(x: &Value, cap: f32) -> Value {
+        x.stmt("attention.logit_softcap").float(cap).done()
     }
 
     pub fn kv_append(k: &Value, v: &Value, pages: &Pages) {
@@ -366,13 +362,23 @@ pub mod moe {
         x.stmt("moe.matmul_select").weight(bank).value(routes).done()
     }
 
+    /// TWO REPR PARAMETERS AND NOW THEY MEAN DIFFERENT THINGS. `W` is the
+    /// BANK's storage form and `B` the bias row's element; the declaration
+    /// quantifies over both (`<T: Scalar, R: Repr>`) and gpt-oss instantiates
+    /// them apart — an mxfp4 stack beside a bf16 bias. This used to be a
+    /// documented exception to the builder mapping, because a single `W`
+    /// could not spell it and the declaration had no second axis to hang the
+    /// bank on.
+    ///
+    /// `.bank(..)` and not `.weight(..)` for the same reason: a bank at a
+    /// quantised repr is as many parameters as its repr stores planes.
     pub fn matmul_select_bias<W: Dtype, B: Dtype>(
         x: &Value,
         bank: &Tensor<W>,
         bias: &Tensor<B>,
         routes: &Value,
     ) -> Value {
-        x.stmt("moe.matmul_select_bias").weight(bank).weight(bias).value(routes).done()
+        x.stmt("moe.matmul_select_bias").bank(bank).weight(bias).value(routes).done()
     }
 
     pub fn weighted_sum(routed: &Value, weights: &Value) -> Value {
@@ -404,33 +410,37 @@ pub mod layout {
     /// One row of `table` per token id. The result is `ids`' rows by the
     /// TABLE's width, a shape no `out(..)` convention states: the statement
     /// allocates it and the plane reads the width back off it.
-    pub fn embed<W: Dtype>(ids: &Value, table: &Tensor<W>) -> Value {
-        ids.stmt("layout.embed").weight(table).done()
+    ///
+    /// `vocab` is the table's ROW count and sizes nothing here — it is the
+    /// bound the gather clamps every id against, and the only slot in this
+    /// module whose stated number guards a read.
+    pub fn embed<W: Dtype>(ids: &Value, table: &Tensor<W>, vocab: u32) -> Value {
+        ids.stmt("layout.embed").weight(table).int(vocab).done()
     }
 
-    pub fn split_qkv(x: &Value, q_width: u32, kv_width: u32) -> (Value, Value, Value) {
-        x.stmt("layout.split_qkv").int(q_width).int(kv_width).triple()
+    pub fn split_qkv(packed: &Value, q_width: u32, kv_width: u32) -> (Value, Value, Value) {
+        packed.stmt("layout.split_qkv").int(q_width).int(kv_width).triple()
     }
 
-    pub fn split_q_gate(x: &Value, head_dim: u32) -> (Value, Value) {
-        x.stmt("layout.split_q_gate").int(head_dim).pair()
+    pub fn split_q_gate(packed: &Value, head_dim: u32) -> (Value, Value) {
+        packed.stmt("layout.split_q_gate").int(head_dim).pair()
     }
 
     pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
         x.stmt("layout.split_rows").int(width).pair()
     }
 
-    /// One layer's slice of a relayed table. Unclaimed on every plane: a
-    /// slice of a laid-out stack is a base and an offset, and whichever
-    /// plane answers it may well answer with a view at binding rather than
-    /// a launch. The statement stands so the gap is measured.
-    pub fn select(table: &Value, layer: u32) -> Value {
-        table.stmt("layout.select").int(layer).done()
+    /// One layer's slice of a relayed table: `[rows, layers * width]` in,
+    /// `[rows, width]` out, at column `layer * width`.
+    ///
+    /// `width` is STATED because `layer` says which slice and never how
+    /// many, so the packed row divides by a number no operand carries. The
+    /// text holds it (gemma's `Ple::dim`) and the walk sizes the result from
+    /// it — the `rmsnorm_per_head` law, applied to an operand instead of a
+    /// weight.
+    pub fn select(table: &Value, layer: u32, width: u32) -> Value {
+        table.stmt("layout.select").int(layer).int(width).done()
     }
-}
-
-pub fn causal_conv1d<W: Dtype>(x: &Value, conv: &Tensor<W>, state: &State) -> Value {
-    x.stmt("causal_conv1d").weight(conv).cache(&state.name).done()
 }
 
 /// The `Ssm` family, one fn per method of `kernels::points::Ssm`: same
@@ -444,21 +454,26 @@ pub fn causal_conv1d<W: Dtype>(x: &Value, conv: &Tensor<W>, state: &State) -> Va
 pub mod ssm {
     use super::*;
 
-    pub fn causal_conv1d<W: Dtype>(x: &Value, conv: &Tensor<W>, state: &State, conv_width: u32) -> Value {
-        x.stmt("ssm.causal_conv1d").weight(conv).cache(&state.name).int(conv_width).done()
+    pub fn causal_conv1d<W: Dtype>(x: &Value, weight: &Tensor<W>, state: &State, conv_width: u32) -> Value {
+        x.stmt("ssm.causal_conv1d").weight(weight).cache(&state.name).int(conv_width).done()
     }
 
-    pub fn causal_conv1d_chunked<W: Dtype>(w: &Windows, conv: &Tensor<W>, state: &State, conv_width: u32) -> Value {
+    pub fn causal_conv1d_chunked<W: Dtype>(w: &Windows, weight: &Tensor<W>, state: &State, conv_width: u32) -> Value {
         w.data
             .stmt("ssm.causal_conv1d_chunked")
             .value(&w.indptr)
-            .weight(conv)
+            .weight(weight)
             .cache(&state.name)
             .int(conv_width)
             .done()
     }
 
-    pub fn gdn_prep<W: Dtype>(ba: &Value, dt_bias: &Tensor<W>, a_log: &Tensor<W>) -> Value {
+    /// `a_log` is `Tensor<F32>` and not a second `W`, because
+    /// `ssm.gdn_prep` declares that slot `Const<Self::Tensor<f32>>` while
+    /// `dt_bias` rides `T`. The two are not one axis and a builder that let
+    /// a text pass one dtype for both would be the place the lie could be
+    /// told.
+    pub fn gdn_prep<W: Dtype>(ba: &Value, dt_bias: &Tensor<W>, a_log: &Tensor<F32>) -> Value {
         ba.stmt("ssm.gdn_prep").weight(dt_bias).weight(a_log).done()
     }
 
@@ -506,13 +521,19 @@ pub mod ssm {
             .done()
     }
 
-    pub fn kda_step<W: Dtype>(
+    /// `dt_bias` AND `a_log` are both `Tensor<F32>` and neither is a second
+    /// `W`: `ssm.kda_step` declares both slots `Const<Self::Tensor<f32>>`,
+    /// because `ssm/kda.cuh`'s `kda_gate_beta` takes both as `const
+    /// float*`. The neighbouring [`gdn_prep`] splits them — that kernel
+    /// reads `dt_bias` at the model's element — so the two builders differ
+    /// here exactly where their kernels do.
+    pub fn kda_step(
         mixed: &Value,
         f: &Value,
         b: &Value,
-        dt_bias: &Tensor<W>,
-        a_log: &Tensor<W>,
-        delta_state: &State,
+        dt_bias: &Tensor<F32>,
+        a_log: &Tensor<F32>,
+        state: &State,
         heads: u32,
         head_dim: u32,
         norm_eps: f32,
@@ -523,20 +544,22 @@ pub mod ssm {
             .value(b)
             .weight(dt_bias)
             .weight(a_log)
-            .cache(&delta_state.name)
+            .cache(&state.name)
             .int(heads)
             .int(head_dim)
             .float(norm_eps)
             .done()
     }
 
-    pub fn kda_chunked<W: Dtype>(
+    /// [`kda_step`] over a window; the same F32 decay pair, for the same
+    /// reason.
+    pub fn kda_chunked(
         w: &Windows,
         f: &Value,
         b: &Value,
-        dt_bias: &Tensor<W>,
-        a_log: &Tensor<W>,
-        delta_state: &State,
+        dt_bias: &Tensor<F32>,
+        a_log: &Tensor<F32>,
+        state: &State,
         heads: u32,
         head_dim: u32,
         norm_eps: f32,
@@ -548,7 +571,7 @@ pub mod ssm {
             .value(b)
             .weight(dt_bias)
             .weight(a_log)
-            .cache(&delta_state.name)
+            .cache(&state.name)
             .int(heads)
             .int(head_dim)
             .float(norm_eps)
@@ -603,14 +626,14 @@ pub mod mla {
 
     pub fn latents_rope<W: Dtype>(
         kv_a: &Value,
-        pos: &Value,
+        positions: &Value,
         norm: &Norm<W>,
         kv_lora_rank: u32,
         rope_dim: u32,
         theta: f32,
     ) -> (Value, Value) {
         kv_a.stmt("mla.latents_rope")
-            .value(pos)
+            .value(positions)
             .norm(norm)
             .int(kv_lora_rank)
             .int(rope_dim)
@@ -632,26 +655,6 @@ pub mod mla {
     ) -> Value {
         q_nope
             .stmt("mla.absorb_q")
-            .weight(kv_b)
-            .int(heads)
-            .int(kv_lora_rank)
-            .int(nope_dim)
-            .int(v_head_dim)
-            .done()
-    }
-
-    pub fn absorb_q_pe<W: Dtype>(
-        q_nope: &Value,
-        q_pe: &Value,
-        kv_b: &Tensor<W>,
-        heads: u32,
-        kv_lora_rank: u32,
-        nope_dim: u32,
-        v_head_dim: u32,
-    ) -> Value {
-        q_nope
-            .stmt("mla.absorb_q_pe")
-            .value(q_pe)
             .weight(kv_b)
             .int(heads)
             .int(kv_lora_rank)
@@ -699,9 +702,14 @@ pub mod mla {
             .done()
     }
 
+    /// ONE `&Windows` AND NOT TWO. The declaration states a single ragged
+    /// pair — `q`, then the boundaries — and `q_pe` beside it as a plain
+    /// operand. This fn used to take a second `&Windows` for it and read
+    /// only its `.data`, which asked every text for an `indptr` the
+    /// statement never recorded.
     pub fn attention_prefill(
         w: &Windows,
-        pe: &Windows,
+        q_pe: &Value,
         pages: &Pages,
         heads: u32,
         kv_lora_rank: u32,
@@ -710,7 +718,7 @@ pub mod mla {
         w.data
             .stmt("mla.attention_prefill")
             .value(&w.indptr)
-            .value(&pe.data)
+            .value(q_pe)
             .cache(&pages.name)
             .int(heads)
             .int(kv_lora_rank)
@@ -718,8 +726,13 @@ pub mod mla {
             .done()
     }
 
+    /// [`attention_decode`] over the keys `selection` keeps. The query is
+    /// the SAME separate pair — there is no fused query anywhere in this
+    /// tree, at either end — and the selection is `index::topk`'s `i32`
+    /// index list.
     pub fn attention_decode_selected(
         q: &Value,
+        q_pe: &Value,
         selection: &Value,
         pages: &Pages,
         heads: u32,
@@ -727,6 +740,7 @@ pub mod mla {
         sm_scale: f32,
     ) -> Value {
         q.stmt("mla.attention_decode_selected")
+            .value(q_pe)
             .value(selection)
             .cache(&pages.name)
             .int(heads)
@@ -737,6 +751,7 @@ pub mod mla {
 
     pub fn attention_prefill_selected(
         w: &Windows,
+        q_pe: &Value,
         selection: &Value,
         pages: &Pages,
         heads: u32,
@@ -746,6 +761,7 @@ pub mod mla {
         w.data
             .stmt("mla.attention_prefill_selected")
             .value(&w.indptr)
+            .value(q_pe)
             .value(selection)
             .cache(&pages.name)
             .int(heads)
@@ -766,14 +782,14 @@ pub mod index {
 
     pub fn layernorm_rope<W: Dtype>(
         k: &Value,
-        pos: &Value,
+        positions: &Value,
         norm: &Norm<W>,
         bias: &Tensor<W>,
         rope_dim: u32,
         theta: f32,
     ) -> Value {
         k.stmt("index.layernorm_rope")
-            .value(pos)
+            .value(positions)
             .norm(norm)
             .weight(bias)
             .int(rope_dim)
@@ -781,8 +797,8 @@ pub mod index {
             .done()
     }
 
-    pub fn rope(q: &Value, pos: &Value, heads: u32, head_dim: u32, rope_dim: u32, theta: f32) -> Value {
-        q.stmt("index.rope").value(pos).int(heads).int(head_dim).int(rope_dim).float(theta).done()
+    pub fn rope(q: &Value, positions: &Value, heads: u32, head_dim: u32, rope_dim: u32, theta: f32) -> Value {
+        q.stmt("index.rope").value(positions).int(heads).int(head_dim).int(rope_dim).float(theta).done()
     }
 
     pub fn topk(
@@ -818,25 +834,25 @@ pub mod index {
 pub mod pool {
     use super::*;
 
-    pub fn boundary_decode(pos: &Value, ratio: u32) -> (Value, Value) {
-        pos.stmt("pool.boundary_decode").int(ratio).pair()
+    pub fn boundary_decode(positions: &Value, ratio: u32) -> (Value, Value) {
+        positions.stmt("pool.boundary_decode").int(ratio).pair()
     }
 
     pub fn boundary_prefill(w: &Windows, ratio: u32) -> (Value, Value) {
         w.data.stmt("pool.boundary_prefill").value(&w.indptr).int(ratio).pair()
     }
 
-    pub fn gather(bpos: &Value, breq: &Value, pages: &Pages, head_dim: u32, ratio: u32) -> Value {
-        bpos.stmt("pool.gather").value(breq).cache(&pages.name).int(head_dim).int(ratio).done()
+    pub fn gather(boundary_pos: &Value, boundary_req: &Value, pages: &Pages, head_dim: u32, ratio: u32) -> Value {
+        boundary_pos.stmt("pool.gather").value(boundary_req).cache(&pages.name).int(head_dim).int(ratio).done()
     }
 
-    pub fn kv_append(pooled: &Value, bpos: &Value, breq: &Value, entries: &Pages) {
-        pooled.stmt("pool.kv_append").value(bpos).value(breq).cache(&entries.name).effect();
+    pub fn kv_append(entries: &Value, boundary_pos: &Value, boundary_req: &Value, pool: &Pages) {
+        entries.stmt("pool.kv_append").value(boundary_pos).value(boundary_req).cache(&pool.name).effect();
     }
 
     pub fn attention_lse(
         q: &Value,
-        pos: &Value,
+        positions: &Value,
         entries: &Pages,
         ratio: u32,
         heads: u32,
@@ -844,7 +860,7 @@ pub mod pool {
         sm_scale: f32,
     ) -> (Value, Value) {
         q.stmt("pool.attention_lse")
-            .value(pos)
+            .value(positions)
             .cache(&entries.name)
             .int(ratio)
             .int(heads)

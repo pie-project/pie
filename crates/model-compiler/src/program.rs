@@ -2,8 +2,9 @@
 //!
 //! `sweep` derives WHICH ops a fact word runs; this derives WHAT each op
 //! touches at the fire — where every value lives, how wide it is, and what
-//! call answers the point. Rows stay symbolic (the fire's row count); widths
-//! and dtypes are settled here, per point, from the walk's rules.
+//! call answers the point. The fire's own row count stays symbolic; a
+//! value's FACTOR over it ([`Rows`]), its width and its dtype are settled
+//! here, per point, from the walk's rules.
 
 use model_ir::kernels::Backend;
 use model_ir::plan::{Cond, Op, Param, Plan, ValueDef, ValueId};
@@ -48,8 +49,20 @@ pub enum Slot {
     /// (`token_ids`, `positions`, `qo_indptr`).
     Runtime(String),
     /// A rectangle in the fire's arena: `row * program.row_pitch + offset`,
-    /// `width` elements of `dtype` per row.
-    Arena { offset: u64, width: u64, dtype: Dt },
+    /// `rows.factor() * width` elements of `dtype` per FIRE row.
+    ///
+    /// THE PITCH STAYS PER FIRE ROW. A [`Rows::FireTimes`] slot keeps its
+    /// `k` routed rows CONTIGUOUS inside its own column, so it contributes
+    /// `k * width * dtype.size()` bytes to `row_pitch` and one token's
+    /// routed rows sit `width` elements apart. That is the legacy staging's
+    /// `[tokens, top_k, width]` rectangle to the byte — the same buffer,
+    /// said in the terms the plan can state.
+    Arena {
+        offset: u64,
+        rows: Rows,
+        width: u64,
+        dtype: Dt,
+    },
     /// A merge: on this lane exactly one arm survives, and the value IS it.
     Alias(ValueId),
     /// An effect or an op this lane never runs: nothing to address.
@@ -76,8 +89,56 @@ impl Dt {
     }
 }
 
-/// One value's row: how many elements wide, riding which element.
-type Size = (u64, Dt);
+/// How many rows a value has, in the only terms a plan can state.
+///
+/// A FIRE BRINGS ITS OWN ROW COUNT and the plan does not hold it: `fire_rows`
+/// is one row per token, decided when the driver assembles the batch. What
+/// the plan DOES hold is the FACTOR a value's row count carries over that
+/// number, and this tree has exactly two of them.
+///
+/// The second is the whole reason the enum exists. A router picks `top_k`
+/// experts per token and `moe.matmul_select` runs one matmul per PICK, so
+/// its result is `fire_rows * top_k` rows and not `fire_rows` — and every
+/// point between that fan-out and `moe.weighted_sum`'s fold back rides the
+/// wider count. Calling those values `[fire_rows, width]` would have been
+/// off by `top_k` in the row count and by `top_k` in the arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rows {
+    /// One row per token this fire carries.
+    Fire,
+    /// `fire_rows * k` — one row per ROUTE, `k` the router's `top_k`.
+    ///
+    /// THE FACTOR IS READ, NEVER RESTATED. `moe.matmul_select` states no
+    /// `top_k`; it states `routes`, whose rectangle IS `[fire_rows, top_k]`,
+    /// so the width of that operand is where `k` comes from. A statement
+    /// that restated the number could disagree with the router that made it.
+    FireTimes(u32),
+}
+
+impl Rows {
+    /// How many rows of this value ride ONE fire row.
+    #[must_use]
+    pub fn factor(self) -> u64 {
+        match self {
+            Rows::Fire => 1,
+            Rows::FireTimes(k) => u64::from(k),
+        }
+    }
+}
+
+/// One value's rectangle, as far as the plan can state it: its row factor
+/// over the fire's own count, how many elements wide, riding which element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Size {
+    rows: Rows,
+    width: u64,
+    dtype: Dt,
+}
+
+/// `width` elements of `dtype`, on `rows` rows.
+const fn sized(rows: Rows, width: u64, dtype: Dt) -> Size {
+    Size { rows, width, dtype }
+}
 
 /// What one lane needed and the walk could not answer.
 ///
@@ -267,7 +328,12 @@ fn bind(plan: &Plan, at: usize, lane: &crate::sweep::Lane) -> Result<Program, Re
                         }
                     }
                     match sizes[id] {
-                        Some((width, dtype)) => Slot::Arena { offset: 0, width, dtype },
+                        Some(Size { rows, width, dtype }) => Slot::Arena {
+                            offset: 0,
+                            rows,
+                            width,
+                            dtype,
+                        },
                         None => Slot::Absent,
                     }
                 }
@@ -287,11 +353,21 @@ fn bind(plan: &Plan, at: usize, lane: &crate::sweep::Lane) -> Result<Program, Re
 
     // THE NO-REUSE MVP: every rectangle this lane mints keeps its own column
     // of the row, in value order. Merges alias and allocate nothing.
+    //
+    // A ROUTED SLOT PAYS FOR ALL ITS ROWS HERE, once: `row_pitch` is bytes
+    // per FIRE row, so a `FireTimes(k)` column is `k` sub-rows wide and the
+    // pitch carries the whole fan-out. Nothing downstream multiplies again.
     let mut cursor = 0u64;
     for slot in &mut slots {
-        if let Slot::Arena { offset, width, dtype } = slot {
+        if let Slot::Arena {
+            offset,
+            rows,
+            width,
+            dtype,
+        } = slot
+        {
             *offset = align16(cursor);
-            cursor = *offset + *width * dtype.size();
+            cursor = *offset + rows.factor() * *width * dtype.size();
         }
     }
 
@@ -335,12 +411,14 @@ fn surviving_arm(lane: &crate::sweep::Lane, arms: &[(ValueId, Cond)]) -> Option<
     first
 }
 
-/// The width and element of every result `op` states, or `None` when no rule
-/// covers the point yet.
+/// The rectangle of every result `op` states, or `None` when no rule covers
+/// the point yet.
 ///
-/// ROWS ARE NOT HERE. Every result is `[rows, width]` and `rows` is the
-/// fire's row count — a number the plan does not hold and the walk does not
-/// invent, so the table answers the half that is decided at trace time.
+/// THE FIRE'S OWN ROW COUNT IS NOT HERE. Every result is
+/// `[fire_rows * rows.factor(), width]` and `fire_rows` is a number the plan
+/// does not hold and the walk does not invent. What the table answers is the
+/// FACTOR — one row per token, or one per route — beside the width and the
+/// element.
 ///
 /// The rules are read off three places and nowhere else: the declaration in
 /// `kernels::points` (which slot is `InOut`, which `Out` is spelled `f32`),
@@ -356,7 +434,11 @@ fn out_sizes(point: &str, plan: &Plan, op: &Op, ins: &[Option<Size>]) -> Option<
         return Some(Vec::new());
     }
     let like = |at: usize| -> Option<Size> { *ins.get(at)? };
-    let dtype = |at: usize| -> Option<Dt> { Some(like(at)?.1) };
+    let dtype = |at: usize| -> Option<Dt> { Some(like(at)?.dtype) };
+    let width = |at: usize| -> Option<u64> { Some(like(at)?.width) };
+    let rows = |at: usize| -> Option<Rows> { Some(like(at)?.rows) };
+    // An operand's rows and element, at a width the statement decides.
+    let riding = |at: usize, w: u64| -> Option<Size> { Some(sized(rows(at)?, w, dtype(at)?)) };
     let param = |at: usize| -> Option<u64> { op.params.get(at).copied() };
     let bank = |at: usize| -> Option<&Param> {
         let name = op.weights.get(at)?;
@@ -376,7 +458,6 @@ fn out_sizes(point: &str, plan: &Plan, op: &Op, ins: &[Option<Size>]) -> Option<
         | "dist.all_reduce"
         | "gate.sigmoid_mul"
         | "attention.sink"
-        | "attention.lse_ln"
         | "attention.logit_softcap"
         | "rope.partial_q"
         | "rope.partial_last" => Some(vec![like(0)?]),
@@ -405,61 +486,71 @@ fn out_sizes(point: &str, plan: &Plan, op: &Op, ins: &[Option<Size>]) -> Option<
         // ---- The packed activations: one `[gate | up]` row in, one
         // `intermediate` row out, and `intermediate` is the statement's
         // first param on every one of them.
+        //
+        // THE ROWS RIDE THE OPERAND, and that is what makes the routed leg
+        // work with no MoE special case here: a3b's `swiglu` is handed
+        // `moe.matmul_select`'s result, so its rows are `FireTimes(top_k)`
+        // and its width is still the ONE stated intermediate. Had the fan-out
+        // been carried as a wider row instead, this rule would have had to
+        // ask whether its operand was routed.
         "mlp.swiglu"
         | "mlp.swiglu_clamp"
         | "mlp.swiglu_clamp_alpha"
         | "mlp.geglu_tanh_packed"
-        | "mlp.situ" => Some(vec![(param(0)?, dtype(0)?)]),
+        | "mlp.situ" => Some(vec![riding(0, param(0)?)?]),
 
         // ---- The bank's OUT axis. Every weight in the catalogue is
         // `[out, in]` (`o_proj: [hidden, q_heads * head_dim]`), so a matmul's
         // width is `shape[0]` and the element stays the activation's — a
         // quantized bank dequantizes into the row, it does not retype it.
         "gemm.matmul" | "gemm.lm_head" | "gemm.attention_landing" => {
-            Some(vec![(axis(0, 0)?, dtype(0)?)])
+            Some(vec![riding(0, axis(0, 0)?)?])
         }
 
         // ---- Layout: a table's row, or a cut stated by its own params.
         // `embed` is the walk's ROOT — its operand is `token_ids`, which has
-        // no width, so the table's second axis is the only place the first
-        // activation width can come from.
-        "layout.embed" => Some(vec![(axis(0, 1)?, activation(&bank(0)?.repr))]),
-        "layout.split_qkv" => {
-            let element = dtype(0)?;
-            Some(vec![
-                (param(0)?, element),
-                (param(1)?, element),
-                (param(1)?, element),
-            ])
-        }
+        // no rectangle, so the table's second axis is the only place the
+        // first activation width can come from AND this is the one rule that
+        // states `Rows::Fire` outright rather than inheriting it. Every other
+        // per-token rectangle in a plan is downstream of this one.
+        "layout.embed" => Some(vec![sized(
+            Rows::Fire,
+            axis(0, 1)?,
+            activation(&bank(0)?.repr),
+        )]),
+        "layout.split_qkv" => Some(vec![
+            riding(0, param(0)?)?,
+            riding(0, param(1)?)?,
+            riding(0, param(1)?)?,
+        ]),
         // HALVES, and the param is a pitch and not a width. The packed row
         // is `[rows, heads, 2 * head_dim]` and the kernel writes
         // `[rows, heads, head_dim]` twice (`layout/deinterleave.cuh`), so
         // each half is half the row; `head_dim` only says where the heads
         // are. qwen's bank agrees — `qg_proj: [2 * q_heads * head_dim, hidden]`.
         "layout.split_q_gate" => {
-            let (packed, element) = like(0)?;
+            let packed = width(0)?;
             let head_dim = param(0)?;
             if head_dim == 0 || packed % (2 * head_dim) != 0 {
                 return None;
             }
-            Some(vec![(packed / 2, element), (packed / 2, element)])
+            Some(vec![riding(0, packed / 2)?, riding(0, packed / 2)?])
         }
         "layout.split_rows" => {
-            let (row, element) = like(0)?;
+            let row = width(0)?;
             let cut = param(0)?;
             if cut > row {
                 return None;
             }
-            Some(vec![(cut, element), (row - cut, element)])
+            Some(vec![riding(0, cut)?, riding(0, row - cut)?])
         }
-        // NOT SIZABLE FROM THE PLAN. `select(relay, l)` slices one layer out
-        // of a `[rows, layers * ple_dim]` relay, and `layers` is the one
-        // number the statement does not carry: the param is WHICH layer, not
-        // how many. Sizing it would take either a second param or the
-        // consumer's width, and the walk invents neither. Unclaimed on every
-        // plane besides, so gemma-e4b refuses here twice over.
-        "layout.select" => None,
+        // THE STATED WIDTH, and it is the second param because the first
+        // says WHICH layer. `select(relay, l, ple_dim)` slices one layer out
+        // of a `[rows, layers * ple_dim]` relay; `layers` is the number the
+        // statement never carried, so the width it slices to is stated
+        // rather than divided out — the `rmsnorm_per_head` rule, on an
+        // operand instead of a weight.
+        "layout.select" => Some(vec![riding(0, param(1)?)?]),
 
         // ---- The gated-delta seam. `gdn_prep`'s only operand is the
         // `[a | b]` projection and its result is the decay and beta columns
@@ -469,27 +560,31 @@ fn out_sizes(point: &str, plan: &Plan, op: &Op, ins: &[Option<Size>]) -> Option<
         // states that gap rather than faking a delegation, and the four
         // extra rows are the recurrence's own arithmetic, not this
         // statement's.)
-        "ssm.gdn_prep" => Some(vec![(like(0)?.0, Dt::F32)]),
+        "ssm.gdn_prep" => Some(vec![sized(rows(0)?, width(0)?, Dt::F32)]),
         // `v_heads * v_dim`, off the params the statement states — and f32,
         // which is exactly what `norm.rmsnorm_gated` downstream declares its
         // `x` to be.
-        "ssm.gated_delta" | "ssm.gated_delta_chunked" => {
-            Some(vec![(param(1)?.checked_mul(param(3)?)?, Dt::F32)])
-        }
-        "ssm.kda_step" | "ssm.kda_chunked" => {
-            Some(vec![(param(0)?.checked_mul(param(1)?)?, Dt::F32)])
-        }
+        "ssm.gated_delta" | "ssm.gated_delta_chunked" => Some(vec![sized(
+            rows(0)?,
+            param(1)?.checked_mul(param(3)?)?,
+            Dt::F32,
+        )]),
+        "ssm.kda_step" | "ssm.kda_chunked" => Some(vec![sized(
+            rows(0)?,
+            param(0)?.checked_mul(param(1)?)?,
+            Dt::F32,
+        )]),
 
         // ---- An attention that hands back its log-sum-exp: `o` is `q`, and
         // the lse is one f32 per head, so its width is `q`'s over the stated
         // `head_dim`.
         "attention.decode_lse" | "attention.prefill_lse" => {
-            let (q, element) = like(0)?;
+            let q = width(0)?;
             let head_dim = param(1)?;
             if head_dim == 0 || q % head_dim != 0 {
                 return None;
             }
-            Some(vec![(q, element), (q / head_dim, Dt::F32)])
+            Some(vec![like(0)?, sized(rows(0)?, q / head_dim, Dt::F32)])
         }
         "attention.merge_lse" => Some(vec![like(0)?, like(1)?]),
 
@@ -500,17 +595,248 @@ fn out_sizes(point: &str, plan: &Plan, op: &Op, ins: &[Option<Size>]) -> Option<
         // params — `.norm(q).norm(k)` puts the two epsilons ahead of them,
         // which is why `kv_heads` is param 2 and not param 0.
         "cuda::qkv_fused_qknorm_rope_vnorm_write" => {
-            let (packed, element) = like(0)?;
+            let packed = width(0)?;
             let kv = param(2)?.checked_mul(param(3)?)?;
-            Some(vec![(packed.checked_sub(2 * kv)?, element)])
+            Some(vec![riding(0, packed.checked_sub(2 * kv)?)?])
         }
 
-        // ---- The rows algebra the MVP does not do. `moe.*` is
-        // `tokens * top_k` rows, `pool.*` is one row per boundary, `hc.*` is
-        // one per stream, and `mla.*`/`index.*` mix latent pitches into
-        // both. None of that is a WIDTH rule, and stating a width without
-        // the rows it belongs to would be the fiction this table exists to
-        // avoid.
+        // ---- THE ROUTERS. Two results, never one, and `top_k` sizes both:
+        // `routes` names the chosen experts (`i32`) and `weights` says how
+        // much each counts (`f32`), which is what the declaration's two `Out`
+        // slots spell. `top_k` is param 1 on all three — `experts` comes
+        // first on every builder, and the two that renormalise put their
+        // `renormalize`/`scaling` pair AFTER it.
+        //
+        // These two rectangles are the only place `top_k` is written down in
+        // a bound program, and everything routed downstream reads it here.
+        "moe.topk_softmax" | "moe.topk_sigmoid" | "moe.topk_sqrt_softplus" => {
+            let top_k = param(1)?;
+            Some(vec![
+                sized(Rows::Fire, top_k, Dt::I32),
+                sized(Rows::Fire, top_k, Dt::F32),
+            ])
+        }
+
+        // ---- THE FAN-OUT. `y[r] = x[r] @ bank[routes[r]]`: one matmul per
+        // ROUTE, so the result is one row per route — `fire_rows * top_k` —
+        // and `top_k` is `routes`' own width, read off the router's rectangle
+        // rather than restated on this statement (which carries no `top_k`
+        // param at all).
+        //
+        // ALWAYS `FireTimes`, NEVER A MULTIPLY. The second `matmul_select` of
+        // a text is handed an ALREADY routed operand (a3b's `down` leg reads
+        // `swiglu(matmul_select(x, gate_up, routes))`), and its result is
+        // still one row per route: the fan-out happens once, at the first
+        // statement that consults a route. A rule that multiplied its
+        // operand's factor would have said `top_k * top_k` there.
+        //
+        // The width is the bank's `N`. `bank` is the `[E, N, K]` expert
+        // stack — three axes, not the two an ordinary `[out, in]` weight has
+        // — so the out axis is `shape[1]` and `shape[0]` is the expert fan.
+        //
+        // AND THE ALIGNED STAGING IS NOT HERE, deliberately. cuda's grouped
+        // leg is five launches (`moe_align_decode` → `gather_moe_aligned_
+        // inputs` → `build_moe_ptrs_aligned` → `moe_grouped_gemm` →
+        // `reorder_moe_aligned_output`) and four of them touch a PADDED
+        // rectangle: the routes bucketed by expert, each bucket rounded up to
+        // a block. Three facts put that rectangle on the executor's side of
+        // the line and not the plan's.
+        //
+        // ITS ROW COUNT IS NOT A MULTIPLE OF THE FIRE'S. The legacy plan
+        // carried it as `Dim::MoeAlignedRoutes`, whose rule is
+        // `ceil((n*k + min(E, n*k)*(block-1)) / block) * block` — an upper
+        // bound with an ADDITIVE `E*(block-1)` term, so no `fire_rows * j`
+        // says it for any `j`. The count the fire actually uses is smaller
+        // still and depends on the route histogram, which exists only once
+        // the router has run.
+        //
+        // ITS BLOCK IS A DEVICE TILE, NOT A MODEL NUMBER. cuda's is 16; metal
+        // sets `ROUTE_BLOCK_MATVEC = 1`, at which the aligned count is
+        // EXACTLY the route count and the sort is a pure permutation. A plan
+        // is plane-agnostic, and a number that changes with the tile a plane
+        // picked cannot ride in one.
+        //
+        // NOTHING IN IT IS A STATEMENT'S VALUE. The per-block expert ids, the
+        // gathered activations, the three pointer arrays — no declaration
+        // carries any of them, which is the same sentence
+        // `kernels-cuda/src/moe.rs` writes to explain why `moe.matmul_select`
+        // is claim-only there.
+        //
+        // What the plan holds is the leg's LAST rectangle, the one
+        // `reorder_moe_aligned_output` writes: `route_out`, with
+        // `num_tokens = rows` and `num_routes = rows * width / hidden`, i.e.
+        // the compact `[tokens, top_k, width]`. That is this slot, to the
+        // byte. Everything between the align and the reorder is one fire's
+        // scratch and belongs to whoever runs the fire.
+        "moe.matmul_select" | "moe.matmul_select_bias" => {
+            let top_k = u32::try_from(width(1)?).ok()?;
+            if top_k == 0 {
+                return None;
+            }
+            Some(vec![sized(
+                Rows::FireTimes(top_k),
+                axis(0, 1)?,
+                dtype(0)?,
+            )])
+        }
+
+        // ---- THE FOLD BACK. A token's `top_k` expert rows weighted into
+        // one: the width survives, the fan-out does not, and the result is
+        // per token again. This is the only point in the table that NARROWS
+        // the row factor, which is what makes it the routed leg's closing
+        // bracket.
+        "moe.weighted_sum" => Some(vec![sized(Rows::Fire, width(0)?, dtype(0)?)]),
+        // `y = routed + shared * sigmoid(gate)`: three per-token rows in, one
+        // out. Nothing routed reaches it — `weighted_sum` already folded.
+        "moe.sigmoid_gate_add" => Some(vec![like(0)?]),
+
+        // ---- Hyper-connections (dsv4). The stack is `[tokens, streams,
+        // hidden]` flattened to a row, so `streams` multiplies and divides a
+        // WIDTH here and never a row count: `expand` broadcasts one row into
+        // `streams` of them and `collapse` gates them back down, both inside
+        // the row. The residual stays one row per token throughout.
+        "hc.expand" => Some(vec![riding(0, width(0)?.checked_mul(param(0)?)?)?]),
+        // THE WHOLE STACK, RETYPED. The statement carries no `stream_count`
+        // — the only `Hc` point that does not — so there is no divisor to
+        // narrow with, and the declaration says the result IS the stack
+        // normalised ("the mixer's own input"). `like(0)` at the `f32` the
+        // `Out` slot spells.
+        //
+        // The legacy text sized this `[tokens, hidden]` and fed it to
+        // `hc_pre_postprocess`'s `[N, 2M + M*M]` mix-logit slot, which is the
+        // missing mix PROJECTION already on record at `hc.collapse` — a
+        // model-truth debt, not a width this statement could state.
+        "hc.rmsnorm_f32" => Some(vec![sized(rows(0)?, width(0)?, Dt::F32)]),
+        // Three results and the first is the one the block runs on: the
+        // collapsed row (`streams` wide over `stream_count`), then the two
+        // mixes the fold reads back. A mix matrix is `[M]` and `[M, M]` and
+        // both ride f32, which the declaration spells and the kernels insist
+        // on — rounding a doubly-stochastic mixer to bf16 leaves it
+        // measurably un-stochastic.
+        "hc.gates" => {
+            let streams = param(0)?;
+            if streams == 0 || width(1)? % streams != 0 {
+                return None;
+            }
+            Some(vec![
+                riding(1, width(1)? / streams)?,
+                sized(rows(1)?, streams, Dt::F32),
+                sized(rows(1)?, streams.checked_mul(streams)?, Dt::F32),
+            ])
+        }
+        // The stack the fold writes back is the stack it was handed, and the
+        // stack is operand ONE — `fold(x, streams, post_mix, comb_mix)` puts
+        // the block's answer first because that is what a statement's
+        // receiver is.
+        "hc.fold" => Some(vec![like(1)?]),
+        "hc.collapse" => {
+            let streams = param(0)?;
+            if streams == 0 || width(0)? % streams != 0 {
+                return None;
+            }
+            Some(vec![riding(0, width(0)? / streams)?])
+        }
+
+        // ---- The compressed KV plane (dsv4). ONE ROW PER TOKEN, AND THE
+        // KERNELS ARE WHY. A "pooled row" reading would need the boundary
+        // COUNT, which is a histogram over the fire's positions and known
+        // only at the fire — but no kernel here asks for one:
+        // `dsv4_boundary_meta_decode` writes `out_pos[t]`/`out_req[t]` for
+        // every `t < n` and marks a non-boundary with `-1`, and
+        // `dsv4_compress_gather_paged` reads `boundary_pos[c]` per block and
+        // falls a `bpos < 0` slot through as zeros. That is deliberate: a
+        // compacted list needs a D2H copy and a stream sync, which makes the
+        // layer ineligible for CUDA-graph capture. The list is fixed-length
+        // by design, so the honest row count is the fire's and no runtime
+        // quantity is needed.
+        //
+        // `positions` is a runtime plane with no rectangle, so the two metas
+        // state `Rows::Fire` outright — the `layout.embed` reading, on the
+        // other root a plan has.
+        "pool.boundary_decode" | "pool.boundary_prefill" => Some(vec![
+            sized(Rows::Fire, 1, Dt::I32),
+            sized(Rows::Fire, 1, Dt::I32),
+        ]),
+        // One pooled entry per boundary SLOT, `head_dim` wide — the stated
+        // width, which is what an `Out` the statement allocates is for.
+        //
+        // THE ELEMENT IS THE ACTIVATION'S and there is nowhere else to read
+        // it: both operands are `i32` boundary planes and a `Cache` row
+        // carries no dtype, so the entries ride the plane's activation the
+        // way `layout.embed`'s row does. bf16 on every claim in this tree —
+        // the `activation` helper below says so in one place.
+        "pool.gather" => Some(vec![sized(Rows::Fire, param(0)?, Dt::Bf16)]),
+        // The pooled attention hands back `q`'s rectangle and one f32 per
+        // head beside it, which is `attention.prefill_lse`'s shape with the
+        // head count STATED rather than divided out: `heads` is param 1
+        // (`ratio` leads on every `Pool` builder).
+        "pool.attention_lse" => Some(vec![like(0)?, sized(rows(0)?, param(1)?, Dt::F32)]),
+
+        // ---- Multi-head latent attention. Every width here is a stated
+        // number times a stated number, because a `Const` bank carries an
+        // address and no rectangle: `kv_b` is
+        // `[heads, nope_dim + v_head_dim, kv_lora_rank]` and each absorb
+        // slices it itself, which is why the declarations state the half
+        // they do NOT use.
+        //
+        // The cut, both ways. `kv_lora_rank` is param 1 — `.norm(n)` records
+        // the weight and then its epsilon, so every `Mla` point that takes a
+        // `Norm` has `eps` at param 0 — and the rope half is what is LEFT of
+        // the projection, not a restatement of `rope_dim`. `mla.latents`
+        // states no `rope_dim` at all, so the subtraction is the only rule
+        // both forms can share.
+        "mla.latents" | "mla.latents_rope" => {
+            let rank = param(1)?;
+            Some(vec![
+                riding(0, rank)?,
+                riding(0, width(0)?.checked_sub(rank)?)?,
+            ])
+        }
+        // `[heads, nope_dim]` and `[heads, rope_dim]`, per head.
+        "mla.split_q_b" => Some(vec![
+            riding(0, param(0)?.checked_mul(param(1)?)?)?,
+            riding(0, param(0)?.checked_mul(param(2)?)?)?,
+        ]),
+        // The query in the latent basis: `[heads, kv_lora_rank]`.
+        "mla.absorb_q" => Some(vec![riding(0, param(0)?.checked_mul(param(1)?)?)?]),
+        // Back out to the value basis: `[heads, v_head_dim]`, and
+        // `v_head_dim` is param 2 here because `absorb_out` names the half it
+        // SKIPS (`nope_dim`) last.
+        "mla.absorb_out" => Some(vec![riding(0, param(0)?.checked_mul(param(2)?)?)?]),
+        // All four attentions answer in the latent basis:
+        // `[heads, kv_lora_rank]`, which is what the absorb back out reads.
+        // The ragged forms put `indptr` between `q` and the rest, so the
+        // params line up on all four.
+        "mla.attention_decode"
+        | "mla.attention_prefill"
+        | "mla.attention_decode_selected"
+        | "mla.attention_prefill_selected" => {
+            Some(vec![riding(0, param(0)?.checked_mul(param(1)?)?)?])
+        }
+
+        // ---- The sparse indexer. Both rotations are IN PLACE, which is what
+        // `InOut` says: the result is the row that was rotated.
+        "index.layernorm_rope" | "index.rope" => Some(vec![like(0)?]),
+
+        // ---- THE RESULT THIS TABLE COULD NOT SIZE, SIZED — by changing the
+        // VALUE and not by inventing a number. `index.topk` used to answer a
+        // byte MASK over the cached keys, and the kv extent it would be wide
+        // by is a per-request runtime number that appears in no operand, no
+        // param and no bank of the statement; the legacy
+        // `dsa_index_topk_mask` only escaped that because it scored the
+        // fire's own token plane and its `[tokens, tokens]` is a row count
+        // this walk does not hold either. The point now answers the SELECTION
+        // ITSELF — `[tokens, top_k]` of `i32`, ascending, `-1` past the end —
+        // and `top_k` is param 2 of the statement. Same rule
+        // `moe.topk_sigmoid`'s `routes` rides, for the same reason: a fixed
+        // budget is sizable and the thing it was chosen out of is not.
+        //
+        // THE ROWS RIDE THE QUERY rather than being restated as `Rows::Fire`:
+        // one selection row per query row is what the point means, and a
+        // decode leg whose query is one row per request must not be told it
+        // is one row per token by this table.
+        "index.topk" => Some(vec![sized(rows(0)?, param(2)?, Dt::I32)]),
+
         _ => None,
     }
 }

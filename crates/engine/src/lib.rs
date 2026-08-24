@@ -23,7 +23,7 @@ pub mod inferlet;
 ///
 /// Moved here from `model`, which defines itself as backend-blind family
 /// knowledge — and a process-global `OnceLock` holding whatever this engine
-/// booted is neither a family fact nor knowledge. `::model::ModelMetadata`
+/// booted is neither a family fact nor knowledge. `::model::serve::ModelMetadata`
 /// stayed behind: what an artifact carries is a fact about models.
 pub mod model;
 pub(crate) mod pipeline;

@@ -7,9 +7,6 @@ pub mod spec;
 
 pub mod project;
 
-#[cfg(feature = "chat")]
-use std::sync::Arc;
-
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
 use crate::manifest::Manifest;
@@ -142,11 +139,6 @@ impl Variant for Dsv4 {
 
         self.deployment(load)
             .map(|_| project::trace(&self.shape, class, self.norm_eps, self.rope_theta))
-    }
-
-    #[cfg(feature = "chat")]
-    fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::shared::deepseek::R1Instruct::new(tokenizer))
     }
 }
 

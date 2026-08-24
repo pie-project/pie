@@ -17,3 +17,19 @@ model-dsl-macros = { path = "../model-dsl-macros" }
 # that is the point of the split: an authoring surface reaches the IR and
 # nothing else -- not the lowering, and not a device.
 model-ir = { path = "../model-ir" }
+
+[dev-dependencies]
+# THE DECLARATION FLOOR, AS A DEV-DEPENDENCY AND NOWHERE ELSE. The line
+# above says an authoring surface reaches the IR and nothing else, and that
+# stays true of the artifact: `tests/builders_are_the_points.rs` reads the
+# `*_POINTS` tables to check that every builder in `src/kernels.rs` IS the
+# point its declaration states. A test binary is not the library.
+kernels = { path = "../kernels" }
+# The check GENERATES the builder it expects and diffs token streams, so it
+# parses both sides rather than matching text. `model-dsl-legacy`'s
+# `tests/wrappers_are_current.rs` reached for `syn` as a dev-dep for the
+# same reason, at the same version and features as `kernels-macros`, which
+# parses the same signatures.
+syn = { version = "3.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"

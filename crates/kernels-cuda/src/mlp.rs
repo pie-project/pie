@@ -43,13 +43,14 @@ pub const GPT_OSS_GLU_ALPHA: f32 = 1.702;
 /// launch reads `y.width` from it. When `#[shape]` replaces those rules the
 /// stated width becomes their input; until then it is recorded and unread.
 ///
-/// One point stays on the floor's default body, and the absence is measured
-/// rather than an oversight:
-///
-/// * `mlp.swiglu_clamp_alpha` — `gpt_oss_glu` below computes the same
-///   activation, but from gate and up as two separate rows. No cuda kernel
-///   reads the packed form the text states, so there is nothing to delegate
-///   to and the point reports itself unclaimed.
+/// EVERY POINT OF THIS FAMILY IS ANSWERED NOW, and the last absence was a
+/// MISSING OPERAND SHAPE rather than a missing activation.
+/// `mlp.swiglu_clamp_alpha` stood on the floor's default body because
+/// `gpt_oss_glu` below computes exactly its arithmetic but from gate and up
+/// as two separate rows, and no cuda kernel read the packed form the text
+/// states. `chunked_gpt_oss_glu` is that kernel — `chunked_swiglu_clamp`
+/// beside `swiglu_clamp`, one more time — so the body is a delegation like
+/// the other five.
 #[kernels_macros::claims]
 impl kernels::points::Mlp for Ctx<'_> {
     fn swiglu<T: kernels::points::Scalar>(
@@ -71,6 +72,28 @@ impl kernels::points::Mlp for Ctx<'_> {
     ) -> Result<(), Refusal> {
         let _ = intermediate;
         chunked_swiglu_clamp(self, packed, y, Const::new(limit))
+    }
+
+    /// The clamped swiglu whose sigmoid carries a stated `alpha`, over the
+    /// packed row the text states.
+    ///
+    /// A ROW WHERE THE ACTIVATION HAD TWO PLANES, and that was the whole
+    /// gap: `gpt_oss_glu` computes this arithmetic and has since gpt-oss
+    /// landed, but from `gate` and `up` as two rectangles, and a text that
+    /// projects `[gate | up]` in one matmul has one. The `.cuh` grew
+    /// `chunked_gpt_oss_glu` beside it — the same clamp, the same
+    /// `(u + 1) * glu`, the same `expf` — so this body is the delegation
+    /// every other body in this block already is.
+    fn swiglu_clamp_alpha<T: kernels::points::Scalar>(
+        &self,
+        packed: In<Tensor<T>>,
+        intermediate: u32,
+        limit: f32,
+        alpha: f32,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let _ = intermediate;
+        chunked_gpt_oss_glu(self, packed, y, Const::new(limit), Const::new(alpha))
     }
 
     fn geglu_tanh<T: kernels::points::Scalar>(
@@ -313,6 +336,43 @@ pub fn chunked_situ<T>(
     )
 }
 
+/// gpt-oss's GLU over one packed `[gate | up]` row.
+///
+/// `gpt_oss_glu` BESIDE IT AND NOT INSTEAD OF IT. The flat form takes the
+/// two halves as two planes, which is what the marlin path hands it and what
+/// its `y_fp16` second output exists for; the text states ONE row, and
+/// halving a row on the host would mean minting a second rectangle nothing
+/// declared. So this sits beside it exactly as `chunked_swiglu_clamp` sits
+/// beside `swiglu_clamp` — same `.cuh`, same family, one `__global__` per
+/// operand shape — and `mlp/swiglu.cuh`'s `chunked_gpt_oss_glu` is the flat
+/// kernel's arithmetic transcribed with the packed indexing around it.
+#[routine(bf16, canon = "mlp.swiglu_clamp_alpha", out(y = rows(packed) x half(packed)))]
+pub fn chunked_gpt_oss_glu<T>(
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
+    y: Out<Tensor<T>>,
+    limit: Const<f32>,
+    alpha: Const<f32>,
+) -> Result<(), Refusal> {
+    let limit = *limit;
+    let alpha = *alpha;
+
+    ctx.fire(
+        Fire::at(
+            "mlp/swiglu.cuh",
+            crate::jit::symbol(&format!("::pie::mlp::chunked_gpt_oss_glu<{}>", T::CPP)),
+        )
+        .apply(elementwise_rows(y.rows, y.width)),
+        &[
+            packed.arg(),
+            y.arg(),
+            y.width.arg(),
+            limit.arg(),
+            alpha.arg(),
+        ],
+    )
+}
+
 #[routine(bf16, canon = "mlp.geglu_tanh_packed", out(y = rows(packed) x half(packed)))]
 pub fn chunked_geglu_tanh<T>(
     ctx: &Ctx<'_>,
@@ -368,7 +428,12 @@ impl kernels::points::Gate for Ctx<'_> {
     }
 }
 
-#[routine(bf16, canon = "moe.sigmoid_gate_add", out(out = like(out)))]
+// SUPERSEDED by impl Moe::sigmoid_gate_add, which is not this launch: the
+// point states the gate COLUMN and a separate result, this takes the gate's
+// WEIGHT and folds the dot and the add in place. Kept because
+// `model-dsl-legacy`'s generated `cuda::sigmoid_dot_scalar_gate_add` still
+// names this type; dies with the routine layer.
+#[routine(bf16, out(out = like(out)))]
 pub fn sigmoid_dot_scalar_gate_add<T>(
     ctx: &Ctx<'_>,
     x: In<Tensor<T>>,

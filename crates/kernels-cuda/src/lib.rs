@@ -39,10 +39,21 @@ pub mod layout;
 pub mod mlp;
 pub mod moe;
 pub mod norm;
+/// GENERATED from `kernels::points` × this plane's `*_CLAIMS`; see the
+/// file's own header and `tests/points_dispatch_is_current.rs`.
+pub mod points_dispatch;
 pub mod quant;
 pub mod rope;
 pub mod sample;
 pub mod ssm;
+
+/// The device-side checks for the kernels this crate declares AND launches
+/// itself — the two `#[claims]` bodies that are launchers rather than
+/// delegations. Behind `_cuda` because it fires, and a unit module rather
+/// than a `tests/` file because `cudarc` is optional and an optional
+/// dev-dependency is not a thing Cargo has.
+#[cfg(all(test, feature = "_cuda"))]
+mod devtest;
 
 #[cfg(feature = "_cuda")]
 pub mod tower;

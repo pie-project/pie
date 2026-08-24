@@ -7,6 +7,22 @@ pub mod instruct;
 pub mod kimi_k3;
 pub mod produce;
 pub mod qwen_3_5;
+/// The serving half — chat templates, multimodal decode, the per-id
+/// `(layers, vocab)` a sampler is sized from, and the artifact metadata an
+/// engine is handed. Moved here from `model-legacy`'s `chat` feature by the
+/// R1 cutover; see its module doc.
+///
+/// NOTE, for whoever collapses this: there are TWO `Instruct` traits in this
+/// crate right now. [`serve::instruct`] is the one the guest-facing WIT
+/// contract is written against (`feed(&[u32]) -> ChatEvent`, `reset`, a tool
+/// grammar) and the one `engine` links; [`instruct`] beside it is the thinner
+/// `push(u32) -> Option<String>` sketch that arrived with the family takeover,
+/// together with the six per-family `template.rs` files that implement it. The
+/// sketch has no consumer and cannot answer the WIT surface as written. It is
+/// left standing rather than deleted because collapsing the two is a decision
+/// about the guest contract, not a consequence of cutting a dependency.
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod snapshot;
 
 pub fn catalog() -> Vec<(&'static str, fn(model_dsl::Plane) -> model_dsl::Plan)> {

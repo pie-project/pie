@@ -5,7 +5,7 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use ::model::instruct::{ChatDecoder, ChatEvent};
+use ::model::serve::instruct::{ChatDecoder, ChatEvent};
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

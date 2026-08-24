@@ -9,6 +9,7 @@ pub mod runtime;
 #[allow(unused_imports)]
 use kernels::Axis;
 
+pub mod points;
 pub mod routine;
 pub mod views;
 

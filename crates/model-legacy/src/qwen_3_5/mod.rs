@@ -1,6 +1,3 @@
-#[cfg(feature = "chat")]
-use std::sync::Arc;
-
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
 
@@ -275,14 +272,6 @@ impl Variant for Qwen35 {
             load,
             self.norm_eps,
             self.rope_theta,
-        ))
-    }
-
-    #[cfg(feature = "chat")]
-    fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::shared::chatml::QwenInstruct::new(
-            tokenizer,
-            crate::shared::chatml::QWEN_CHATML,
         ))
     }
 }

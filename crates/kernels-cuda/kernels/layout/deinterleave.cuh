@@ -1,9 +1,13 @@
 //===-- deinterleave.cuh - the packed-bank splits and the row concat --===//
 //
-// Seven `__global__` templates, six of which a row instantiates.
+// Eight `__global__` templates, seven of which a caller instantiates.
 // `deinterleave.cu` includes this file and keeps its seven launchers,
 // so exactly ONE definition of each kernel exists in the tree -- a split and
-// not a copy. `norm/altup_aux` shipped a release with two definitions of six
+// not a copy.
+//
+// The eighth is `select`, and it has no launcher because it never had one:
+// it is claimed straight out of `impl Layout for Ctx`, which is the form
+// baker.md states for a point no legacy caller reaches. `norm/altup_aux` shipped a release with two definitions of six
 // kernels; they agreed on the day they were written, each stayed right for
 // whichever half of the tests exercised it, and the drift was invisible until
 // one half was edited.
@@ -196,6 +200,38 @@ __global__ void split_rows(
         } else {
             r[i - left_dim] = row[i];
         }
+    }
+}
+
+/// One layer's slice of a laid-out relay: `[N, layers * width]` in,
+/// `[N, width]` out, taken at column `offset = layer * width`. One block per
+/// row, exactly `split_rows`' geometry -- this IS a `split_rows` that keeps
+/// one of `layers` parts instead of both of two.
+///
+/// `stride` AND `width` are both parameters and neither is the other. The
+/// packed relay's row is `layers * width` and the result's is `width`; a
+/// kernel that recovered one from the other would have to be told `layers`,
+/// which is the one number gemma's statement does not carry -- its param
+/// says WHICH layer, not how many.
+///
+/// The whole arithmetic is a base and an offset, which is why the
+/// declaration's own doc says a plane may one day answer this at BINDING
+/// with a view and never launch at all. Until the binder can say that, a
+/// copy is what says it: a slice this kernel wrote is a rectangle the arena
+/// owns, with no aliasing rule for a later pass to discover.
+template <class T>
+__global__ void select(
+    const T* __restrict__ table,
+    T* __restrict__ out,
+    int stride,
+    int offset,
+    int width)
+{
+    const int n = blockIdx.x;
+    const T* src = table + (long long)n * stride + offset;
+    T* dst = out + (long long)n * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        dst[i] = src[i];
     }
 }
 

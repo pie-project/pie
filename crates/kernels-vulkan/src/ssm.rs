@@ -1,3 +1,72 @@
+//! The gated-delta mixer, and the family this plane claims NOTHING of.
+//!
+//! Seven points stand in `kernels::points::Ssm` and every one of them is a
+//! measured backlog row here. That is not an oversight and it is not for
+//! want of kernels — `ssm/gdn_core.slang` and `ssm/gdn_prep.slang` between
+//! them stamp nine entrypoints and the whole qwen3.5 mixer runs on them.
+//! It is a DECOMPOSITION disagreement, and it is worth writing down once
+//! rather than discovering three times.
+//!
+//! # What the text states
+//!
+//! `model/src/qwen_3_5/forward.rs` states three statements per mixer:
+//!
+//! ```text
+//! qkv   = ssm.causal_conv1d(qkv, conv_w, conv_state, conv_kernel)
+//! gates = ssm.gdn_prep(ba, dt_bias, a_log)
+//! core  = ssm.gated_delta(qkv, z, gates, delta_state, k_heads, v_heads, k_dim, v_dim)
+//! ```
+//!
+//! So `ssm.gated_delta`'s `qkv` is POST-convolution and its `gates` is the
+//! packed `[g_log | beta]` row `ssm.gdn_prep` already cooked out of the
+//! `[b | a]` projection. `kernels-cuda` claims all three at those exact
+//! boundaries (W10: "`ssm.gdn_prep` is now ONE launch of a new
+//! `qwen_gdn_ba_gates`").
+//!
+//! # What this plane's kernels are
+//!
+//! `gdn_core_slotted` takes `mixed` — the projection BEFORE the
+//! convolution, with q/k/v at `q_off`/`k_off`/`v_off` inside a `conv_dim`
+//! slice — plus `conv_w`, `conv_b`, `a_log`, `dt_bias` and the two gate
+//! halves, and does the convolution, the l2 norms, the decay cook and the
+//! recurrence in ONE launch. `gdn_prep_slotted` is the same thing cut after
+//! the cook, writing three compact f32 planes (`pre_q`, `pre_k`,
+//! `pre_gate`); `gdn_core_recurrent_slotted` reads those three back and
+//! runs the scan — and still does the convolution itself, from `mixed`.
+//!
+//! Only `gdn_core_recurrent_prefill` is a pure scan, and it reads the three
+//! compact planes rather than the packed row and the packed gates the
+//! declaration carries.
+//!
+//! So the cut this plane makes is `[projection → everything]` or
+//! `[projection → cooked planes] + [cooked planes → state]`, and the cut
+//! the floor declares is `[conv] + [ba → gates] + [qkv, gates → state]`.
+//! Not one of the three declared points has an entrypoint whose OPERANDS
+//! are its operands:
+//!
+//! * `ssm.causal_conv1d` / `_chunked` — no standalone convolution exists
+//!   here; every arm fuses it into the mixer.
+//! * `ssm.gdn_prep` — declares `ba`, `dt_bias`, `a_log` and no conv state.
+//!   Every prep arm here reads `conv_state` and writes `new_conv_state`.
+//! * `ssm.gated_delta` / `_chunked` — declares the post-conv packed row and
+//!   the packed decay row. Every scan arm here either does the conv itself
+//!   or reads three COMPACT f32 planes nothing declares.
+//! * `ssm.kda_step` / `_chunked` — kimi's rule. No entrypoint at all.
+//!
+//! # What would close it
+//!
+//! Either a `PIE_POSTCONV` instantiation of `gdn_prep.slang` that skips the
+//! convolution and cuts a packed `[g_log | beta]` row (which makes
+//! `gdn_prep` and a standalone conv both claimable), or the declarations
+//! grow a fused point this plane could claim whole. The first is shader
+//! work of a few lines and keeps the plan plane-agnostic; the second moves
+//! one plane's fusion onto the floor, which `.wiki/baker.md` reserves for
+//! tier-2 — an inherent method on `Ctx`, which is where a fused vulkan GDN
+//! mixer belongs the day a text may name one.
+//!
+//! There is no `#[claims] impl Ssm for Ctx<'_>` below, and the absence is
+//! the statement: seven unclaimed points, seven backlog rows, one reason.
+
 use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 use crate::views::RecurrentState;
 use kernels::BindMut;

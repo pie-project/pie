@@ -1,7 +1,9 @@
 use crate::jit::Abi;
+use crate::jit::abi::Bank;
 use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
 use crate::jit::{Ctx, Launch, Root, aligned16};
+use kernels::points::{Form, Repr};
 use kernels::routine::{Const, In, InOut, Out, Region, Stride};
 use kernels::{Bind, Fire};
 use kernels_macros::routine;
@@ -23,13 +25,6 @@ const DISPATCH_BLOCK: u32 = 256;
 const MOE_VEC_WIDTH: i32 = 8;
 
 const GEMV_WARPS: i32 = 4;
-
-const FRAG: i32 = 16;
-
-const GEMM_WARPS: u32 = 4;
-
-#[allow(clippy::cast_possible_wrap)]
-const N_TILE: i32 = FRAG * GEMM_WARPS as i32;
 
 pub const MOE_ALIGNED_BLOCK_MIN: i32 = 16;
 
@@ -79,31 +74,13 @@ fn routed_rows<P>(out_rows: i32, out_width: i32, aligned: Region<P>) -> Result<i
     Ok(routes)
 }
 
-/// The `Moe` family, claimed. Each body is a delegation to the routine
-/// below that already fires the point; the router's own `experts` and
-/// `top_k` ride the declaration because the statement states them and the
-/// results are sized from them, while the routines read the same two
-/// numbers back off the rectangles they were given.
-///
-/// Three points stay on the floor's default body, and each absence is a
-/// measured row rather than an oversight:
-///
-/// * `moe.matmul_select` — the grouped GEMM is a five-step aligned leg
-///   (`moe_align_decode` → `gather_moe_aligned_inputs` →
-///   `build_moe_ptrs_aligned_bf16` → `moe_grouped_gemm` →
-///   `reorder_moe_aligned_output`), and four of those five steps state
-///   operands no declaration carries: the per-BLOCK expert ids, the gathered
-///   aligned activations, the block ceiling and the aligned row count. The
-///   statement holds the per-TOKEN routes and the raw rows. One call cannot
-///   bridge that, and the routine keeps its own claim so the point still
-///   resolves.
-/// * `moe.matmul_select_bias` — no cuda kernel adds an expert's bias row
-///   inside the grouped GEMM. The gptoss gap.
-/// * `moe.sigmoid_gate_add` — the statement hands over a gate COLUMN it
-///   already projected; cuda's kernel takes the gate's WEIGHT and does the
-///   dot itself, against the pre-norm row the statement no longer names.
-///   Both shader planes take the column, so the declaration follows them
-///   and the cuda routine keeps its claim.
+/// The `Moe` family, claimed. Every point in it. The three routers and
+/// `weighted_sum` are delegations to the routine below that already fires
+/// the point — the router's own `experts` and `top_k` ride the declaration
+/// because the statement states them and the results are sized from them,
+/// while the routines read the same two numbers back off the rectangles
+/// they were given. The two routed GEMMs and the shared-expert combine are
+/// BODIES: no routine in this file is their launcher, and each says why.
 #[kernels_macros::claims]
 impl kernels::points::Moe for Ctx<'_> {
     fn topk_softmax<T: kernels::points::Scalar>(
@@ -174,6 +151,331 @@ impl kernels::points::Moe for Ctx<'_> {
     ) -> Result<(), Refusal> {
         token_batched_weighted_sum(self, y, routed, weights)
     }
+
+    /// The routed GEMM against a DENSE `[E, N, K]` stack: `y[r] = x[r] @
+    /// bank[routes[r]]`, one dot per route.
+    ///
+    /// A BODY, and the routine it replaces was never its launcher — which is
+    /// why `moe_grouped_gemm` is DELETED rather than marked inlined. The
+    /// canon row named it; it is the WMMA arm of the legacy aligned leg, and
+    /// its own `supported` gate refused every `K` above 512 ("above which
+    /// cuBLAS wins", `m` exactly one 16-row fragment, `n` in whole 64-wide
+    /// tiles). Every SKU that states this point contracts far deeper: a3b's
+    /// gate/up leg is `K = 2048` and its down leg `K = 768`, dsv4's and
+    /// kimi's deeper still. So the legacy driver's `fire::moe_grouped` took
+    /// the cuBLAS branch at every shipping shape and this kernel never ran
+    /// for any of them — the row named a launcher that would have refused.
+    /// What ran the same arithmetic per route is `moe_decode_gemv_body`, and
+    /// that is what this fires. Nothing else in the tree reached the routine
+    /// or its gate, measured; the legacy eDSL names it only as a string.
+    ///
+    /// # `act_div`, measured off the rectangles
+    ///
+    /// [`Moe::matmul_select_bias`]'s note applies verbatim and is not
+    /// repeated: a text says this point twice, the gate/up leg hands it a
+    /// PER-TOKEN `x` and the down leg hands it the gate/up leg's own already
+    /// fanned-out result. The ratio `y.rows / x.rows` is the divisor, read
+    /// here rather than stated anywhere, and it picks between the kernel's
+    /// two instantiations — `ActByToken` is a template parameter, so the
+    /// choice is a symbol and not an argument.
+    ///
+    /// # No staging, and the debt that leaves
+    ///
+    /// The aligned leg the legacy prefill built — `moe_align_decode` →
+    /// `gather_moe_aligned_inputs` → `build_moe_ptrs_aligned` → a batched
+    /// cuBLAS call → `reorder_moe_aligned_output` — exists to turn many
+    /// tokens' routes into one GEMM per expert, and it buys back the weight
+    /// re-read this GEMV pays once per route. It is a THROUGHPUT arm, not a
+    /// correctness one, and by W10's rule its five scratch rectangles belong
+    /// inside this fire (`Ctx::scratch`) rather than in a plan. Until it is
+    /// measured back in, a fire wide enough to want it is the one this body
+    /// refuses by name below: `route_count` is the grid's `y` extent and CUDA
+    /// caps that at 65535.
+    fn matmul_select<T: kernels::points::Scalar>(
+        &self,
+        x: In<Tensor<T>>,
+        bank: Const<Tensor<T>>,
+        routes: In<Tensor<i32>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        /// `gridDim.y`'s hardware bound. `blockIdx.y` IS the route here.
+        const MAX_GRID_Y: i32 = 65_535;
+
+        let dst = y.all("N, the bank's output width")?;
+        let act = x.all("K, the activation's width")?;
+        let fan = routes.all("the routed fanout")?;
+        let (n, k) = (dst.width, act.width);
+        let top_k = fan.width;
+
+        if top_k <= 0 {
+            return Err(Refusal::Empty {
+                what: "the routed fanout",
+            });
+        }
+        let route_count = fan.rows.saturating_mul(top_k);
+        if dst.rows != route_count {
+            return Err(Refusal::Narrow {
+                what: "the result's rows against one row per route",
+                at: i64::from(dst.rows),
+            });
+        }
+        if route_count > MAX_GRID_Y {
+            return Err(Refusal::Wide {
+                what: "the route run, which this GEMV puts on the grid's y axis; the \
+                       aligned batched leg is what a wider fire wants",
+                at: i64::from(route_count),
+                max: i64::from(MAX_GRID_Y),
+            });
+        }
+        let by_token = if act.rows == route_count {
+            false
+        } else if act.rows.saturating_mul(top_k) == route_count {
+            true
+        } else {
+            return Err(Refusal::Narrow {
+                what: "the activation's rows, which are the fire's tokens or its routes and \
+                       neither here",
+                at: i64::from(act.rows),
+            });
+        };
+        // Both operand rows are walked as `float4`: eight elements a lane,
+        // no tail. The bank's row is `K` deep and the activation's is the
+        // same `K`, so one divisibility covers both.
+        if k <= 0 || k % MOE_VEC_WIDTH != 0 {
+            return Err(Refusal::Narrow {
+                what: "K, in whole float4 loads of 8",
+                at: i64::from(k),
+            });
+        }
+        if n <= 0 {
+            return Err(Refusal::Empty {
+                what: "N, the bank's output width",
+            });
+        }
+        let form = if by_token { "by_token" } else { "by_route" };
+        self.fire(
+            Fire::at(
+                "moe/moe_dispatch.cuh",
+                crate::jit::symbol(&format!("::pie::moe::moe_decode_gemv_{form}<{}>", T::CPP)),
+            )
+            .apply(Launch::grid(
+                [
+                    n.unsigned_abs().div_ceil(GEMV_WARPS.unsigned_abs()),
+                    route_count.unsigned_abs(),
+                    1,
+                ],
+                [WARP, GEMV_WARPS.unsigned_abs(), 1],
+            )),
+            &[
+                fan.ptr.arg(),
+                act.ptr.arg(),
+                bank.arg(),
+                dst.ptr.arg(),
+                top_k.arg(),
+                k.arg(),
+                n.arg(),
+                (i64::from(n) * i64::from(k)).arg(),
+            ],
+        )
+    }
+
+    /// `y = routed + shared * sigmoid(gate)`: the shared expert joining the
+    /// routed sum through the `[tokens, 1]` gate column the statement
+    /// already projected.
+    ///
+    /// A BODY, and the routine it replaces answers a DIFFERENT question.
+    /// `sigmoid_dot_scalar_gate_add` takes the gate's WEIGHT and computes
+    /// the dot itself against a pre-norm row this statement no longer names,
+    /// then adds in place; the point states the column and a separate
+    /// result, which is what all three shader planes take. The `__global__`
+    /// here is `sigmoid_scalar_gate_add`, whose `stride` is the pitch
+    /// between two rows' gate values — `1` for a dense column, and whatever
+    /// the column's own rectangle says when it is one column of a wider one.
+    fn sigmoid_gate_add<T: kernels::points::Scalar>(
+        &self,
+        routed: In<Tensor<T>>,
+        shared: In<Tensor<T>>,
+        gate: In<Tensor<T>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let dst = y.all("the combined row's width")?;
+        let sum = routed.over(dst.rows, "the routed row's width")?;
+        let side = shared.over(dst.rows, "the shared expert's row width")?;
+        if sum.width != dst.width || side.width != dst.width {
+            return Err(Refusal::Narrow {
+                what: "the two rows this combine adds, which are the result's width",
+                at: i64::from(sum.width.min(side.width)),
+            });
+        }
+        let col = gate.over(dst.rows, "the gate column")?;
+        self.fire(
+            Fire::at(
+                "mlp/swiglu.cuh",
+                crate::jit::symbol(&format!("::pie::mlp::sigmoid_scalar_gate_add<{}>", T::CPP)),
+            )
+            .apply(elementwise_rows(
+                dst.rows.unsigned_abs(),
+                dst.width.unsigned_abs(),
+            )),
+            &[
+                dst.ptr.arg(),
+                sum.ptr.arg(),
+                side.ptr.arg(),
+                col.ptr.arg(),
+                dst.width.arg(),
+                (*col.stride).arg(),
+            ],
+        )
+    }
+
+    /// The routed GEMM with the expert's own bias row — gpt-oss's, and the
+    /// last point that SKU was missing.
+    ///
+    /// A BODY AND NOT A DELEGATION, which makes it the second one in this
+    /// block (`kv_append_shared`'s is the other). Every routine below fires
+    /// something a legacy text already stated; nothing in this tree fires
+    /// THIS statement, because nothing in this tree stated it. The two MXFP4
+    /// GEMVs in `crate::quant` come closest and neither is it: both fuse an
+    /// activation into the epilogue and one hard-wires its operand indexing.
+    /// So the launcher is here and the `__global__` is
+    /// `quant/dequant_fp4.cuh`'s `mxfp4_matmul_select_bias`, beside the two
+    /// it is a de-fused sibling of.
+    ///
+    /// # What the body reads and what it refuses
+    ///
+    /// `n` and `k` come off the rectangles, never off a param: the result's
+    /// width is `N` and the activation's is `K`, and the bank's `[E, N, K]`
+    /// is those two with the expert fan the router already chose. The one
+    /// number that is neither is `act_div` — see below.
+    ///
+    /// # `act_div`: the same statement, two operand shapes
+    ///
+    /// A text says this point twice and hands it two different rows. The
+    /// gate/up leg's `x` is PER TOKEN (`[tokens, K]`); the down leg's is the
+    /// gate/up leg's own result, already fanned out (`[routes, K]`). The
+    /// declaration cannot tell them apart and does not have to: the result is
+    /// `[routes, N]` either way, so the ratio `y.rows / x.rows` IS the
+    /// divisor that turns a route index into an activation row, and it is
+    /// read here rather than stated anywhere. A ratio that is neither `1` nor
+    /// the route width is refused by name — it would mean the two rectangles
+    /// came from different fires.
+    ///
+    /// # No staging, and that is the finding
+    ///
+    /// The MXFP4 leg this replaces needed per-expert POINTER ARRAYS
+    /// (`packed_ptrs[e]`, `scale_ptrs[e]`, `bias_ptrs[e]`), carved at load
+    /// beside every bank because no statement names them, and one bug class
+    /// of its own — a bank's BASE bound where an array of bases belongs reads
+    /// eight bytes of weight data as an address. A canonical bank is
+    /// `[E, ...]` contiguous, so the address is `e * n * (k / 2)` and the
+    /// kernel computes it from numbers it already has. There is no
+    /// `Ctx::scratch` in this body because there is nothing to stage.
+    fn matmul_select_bias<T: kernels::points::Scalar, R: Repr>(
+        &self,
+        x: In<Tensor<T>>,
+        bank: Const<Bank<R>>,
+        bias: Const<Tensor<T>>,
+        routes: In<Tensor<i32>>,
+        y: Out<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        match R::FORM {
+            Form::Mxfp4 => mxfp4_matmul_select_bias(self, x, bank, bias, routes, y),
+        }
+    }
+}
+
+/// `moe.matmul_select_bias` at the MXFP4 repr. See the claim above.
+fn mxfp4_matmul_select_bias<T: kernels::points::Scalar, R: Repr>(
+    ctx: &Ctx<'_>,
+    x: In<Tensor<T>>,
+    bank: Const<Bank<R>>,
+    bias: Const<Tensor<T>>,
+    routes: In<Tensor<i32>>,
+    y: Out<Tensor<T>>,
+) -> Result<(), Refusal> {
+    /// One warp per (route, slab of four output rows), 128 threads a block —
+    /// `crate::quant::routed_qmv_quad`'s geometry, which is the shape the
+    /// two decode GEMVs were measured at.
+    const ROWS_PER_WARP: i32 = 4;
+    const DECODE_BLOCK: u32 = 128;
+
+    let dst = y.all("N, the bank's output width")?;
+    let act = x.all("K, the activation's width")?;
+    let fan = routes.all("the routed fanout")?;
+    let (n, k) = (dst.width, act.width);
+    let top_k = fan.width;
+
+    if top_k <= 0 {
+        return Err(Refusal::Empty {
+            what: "the routed fanout",
+        });
+    }
+    // The route run is the router's whole rectangle, flattened: one matmul
+    // per route, and the result carries exactly that many rows.
+    let route_count = fan.rows.saturating_mul(top_k);
+    if dst.rows != route_count {
+        return Err(Refusal::Narrow {
+            what: "the result's rows against one row per route",
+            at: i64::from(dst.rows),
+        });
+    }
+    // See the claim's `act_div` note: the ratio is measured, never stated.
+    let act_div = if act.rows == route_count {
+        1
+    } else if act.rows.saturating_mul(top_k) == route_count {
+        top_k
+    } else {
+        return Err(Refusal::Narrow {
+            what: "the activation's rows, which are the fire's tokens or its routes and \
+                   neither here",
+            at: i64::from(act.rows),
+        });
+    };
+    // MXFP4's own geometry: 32 codes to one E8M0 byte, two codes to a byte,
+    // eight to the 32-bit word the unpacker reads.
+    if k <= 0 || k % 32 != 0 {
+        return Err(Refusal::Narrow {
+            what: "K, in whole 32-code MXFP4 blocks",
+            at: i64::from(k),
+        });
+    }
+    if n <= 0 {
+        return Err(Refusal::Empty {
+            what: "N, the bank's output width",
+        });
+    }
+    let planes = bank.get();
+    if planes.codes.is_null() || planes.scales.is_null() {
+        return Err(Refusal::Null {
+            what: "an MXFP4 bank plane; a bank slot binds its codes AND its block scales",
+        });
+    }
+
+    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP.unsigned_abs();
+    ctx.fire(
+        Fire::at(
+            "quant/dequant_fp4.cuh",
+            crate::jit::symbol(&format!(
+                "::pie::quant::mxfp4_matmul_select_bias<{}, ::pie::i32({ROWS_PER_WARP})>",
+                T::CPP
+            )),
+        )
+        .apply(Launch::grid(
+            [route_count.unsigned_abs(), n.unsigned_abs().div_ceil(tile), 1],
+            [DECODE_BLOCK, 1, 1],
+        )),
+        &[
+            act.ptr.arg(),
+            fan.ptr.arg(),
+            planes.codes.arg(),
+            planes.scales.arg(),
+            bias.arg(),
+            dst.ptr.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+        ],
+    )
 }
 
 #[routine(bf16, canon = "moe.topk_sigmoid")]
@@ -400,79 +702,6 @@ pub fn apply_per_expert_scale<T>(
             topk_w.arg(),
             per_expert_scale.arg(),
             total.arg(),
-        ],
-    )
-}
-
-pub const fn supported(m: i32, n: i32, k: i32) -> Result<(), Refusal> {
-    const SHORT_K: i32 = 512;
-
-    if m > FRAG {
-        return Err(Refusal::Wide {
-            what: "M, which must be exactly one 16-row fragment",
-            at: m as i64,
-            max: FRAG as i64,
-        });
-    }
-    if m < FRAG {
-        return Err(Refusal::Narrow {
-            what: "M, which must be exactly one 16-row fragment",
-            at: m as i64,
-        });
-    }
-    if k > SHORT_K {
-        return Err(Refusal::Wide {
-            what: "K, above which cuBLAS wins",
-            at: k as i64,
-            max: SHORT_K as i64,
-        });
-    }
-    if n % N_TILE != 0 {
-        return Err(Refusal::Narrow {
-            what: "N, in whole 64-wide tiles",
-            at: n as i64,
-        });
-    }
-    if k % FRAG != 0 {
-        return Err(Refusal::Narrow {
-            what: "K, in whole 16-deep fragments",
-            at: k as i64,
-        });
-    }
-    Ok(())
-}
-
-#[routine(bf16, driver, canon = "moe.matmul_select")]
-pub fn moe_grouped_gemm<T>(
-    ctx: &Ctx<'_>,
-    a: In<Tensor<T>>,
-    weight_base: Const<Tensor<T>>,
-    expert_ids: In<Tensor<i32>>,
-    c: InOut<Tensor<T>>,
-    max_blocks: Const<i32>,
-    m: Const<i32>,
-) -> Result<(), Refusal> {
-    let rows = max_blocks.saturating_mul(*m);
-    let dst = c.over(rows, "N, the destination's width")?;
-    let act = a.over(rows, "K, the activation's width")?;
-    let (n, k) = (dst.width, act.width);
-    supported(*m, n, k)?;
-    ctx.fire(
-        Fire::at(
-            "moe/moe_grouped_gemm.cuh",
-            crate::jit::symbol(&format!("::pie::moe::moe_grouped_gemm<{}>", T::CPP)),
-        )
-        .apply(Launch::grid(
-            [(n / N_TILE).unsigned_abs(), max_blocks.unsigned_abs(), 1],
-            [GEMM_WARPS * 32, 1, 1],
-        )),
-        &[
-            act.ptr.arg(),
-            weight_base.arg(),
-            dst.ptr.arg(),
-            expert_ids.arg(),
-            n.arg(),
-            k.arg(),
         ],
     )
 }

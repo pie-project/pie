@@ -158,7 +158,7 @@ pub struct ModelConfig {
     /// facts come from, for a `.zt` and for a snapshot alike. The runtime used
     /// to probe `config.json` itself when this was absent — two hand-written
     /// key walks that had to agree with the driver's parser by coincidence.
-    pub metadata: ::model::ModelMetadata,
+    pub metadata: ::model::serve::ModelMetadata,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }

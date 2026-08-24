@@ -366,7 +366,7 @@ struct LoadedModelDrivers {
     /// The model's compiled metadata, read once while resolving it. Present
     /// for either input form: an artifact carries the config, a snapshot's
     /// `config.json` is normalized into one.
-    metadata: model::ModelMetadata,
+    metadata: model::serve::ModelMetadata,
 }
 
 struct LoadedPartnerMetadata {

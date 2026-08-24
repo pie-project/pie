@@ -101,118 +101,21 @@ pub struct AttentionWorkspaceView {
     pub page_locked_int: *mut c_void,
 }
 
-/// One layer's paged MLA cache. Its own descriptor, not a null-filled
-/// [`KvCacheLayerView`]: the two caches have different page SHAPES.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct MlaCacheLayerView {
-    /// Which layer this describes.
-    pub layer: c_int,
-    /// Pages in this layer's pool.
-    pub num_pages: c_int,
-    /// Tokens per page.
-    pub page_size: c_int,
-    /// Width of the compressed latent.
-    pub kv_lora_rank: c_int,
-    /// Width of the decoupled rope plane.
-    pub qk_rope_head_dim: c_int,
-    /// The latent pages.
-    pub ckv_pages: *mut c_void,
-    /// The rope-plane pages.
-    pub kpe_pages: *mut c_void,
-}
+// `MlaCacheLayerView`, `HopperPrefillPlan`, `YarnOriginalParams`,
+// `MoeActivation` and `Mxfp4RowSelect` STOOD HERE — five kernel-facing
+// records with no Rust reader. Each mirrored a C++ struct or enum that a
+// LEGACY DISPATCH ARM passed by value: the MLA pool's per-layer view, the
+// Hopper prefill plan's field order, YaRN's four scalars as one record, and
+// the two MoE selectors. Every one of those arms is deleted, and a mirror
+// nothing mirrors INTO is a claim about a foreign layout that no compiler
+// and no test can check.
+//
+// `pools::mla_cache` keeps its own `MlaCacheLayerView` (a different type,
+// same name) and is unaffected; `tests/oracle/caches/oracle.cpp` names the
+// C++ one, which is the oracle's own source and not this file's.
 
-/// FlashInfer's sm90 prefill schedule. Offsets into the workspace's
-/// `int_buffer`, not pointers: the buffer moves and the schedule does not.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct HopperPrefillPlan {
-    /// Offset of the qo tile index array.
-    pub qo_tile_indices_offset: i64,
-    /// Offset of the qo indptr.
-    pub qo_indptr_offset: i64,
-    /// Offset of the kv indptr.
-    pub kv_indptr_offset: i64,
-    /// Offset of the per-tile qo length array.
-    pub qo_len_offset: i64,
-    /// Offset of the per-tile kv length array.
-    pub kv_len_offset: i64,
-    /// Offset of the head index array.
-    pub head_indices_offset: i64,
-    /// Offset of the work indptr.
-    pub work_indptr_offset: i64,
-    /// Offset of the batch index array.
-    pub batch_indices_offset: i64,
-    /// Every head runs the same schedule, so the head arrays are shared.
-    pub same_schedule_for_all_heads: bool,
-    /// Tokens the schedule covers.
-    pub total_tokens: c_int,
-    /// Requests it covers.
-    pub num_requests: c_int,
-    /// Query heads.
-    pub num_q_heads: c_int,
-    /// KV heads.
-    pub num_kv_heads: c_int,
-    /// Head width.
-    pub head_dim: c_int,
-    /// Tokens per page.
-    pub page_size: c_int,
-    /// Sliding-window extent, or `-1` for none.
-    pub window_left: c_int,
-    /// The schedule is causal.
-    pub causal: bool,
-    /// The schedule was built. A default-constructed plan is not.
-    pub valid: bool,
-}
-
-/// Original-YaRN scaling, for the MLA rope. Passed by `const*` rather than
-/// `const&` because it is OPTIONAL.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct YarnOriginalParams {
-    /// Interpolation factor.
-    pub factor: f32,
-    /// Fast-rotating dimension cutoff.
-    pub beta_fast: f32,
-    /// Slow-rotating dimension cutoff.
-    pub beta_slow: f32,
-    /// Post-scaling applied to attention logits.
-    pub attention_factor: f32,
-    /// The context length the checkpoint was trained at.
-    pub original_max_position: c_int,
-}
-
-/// The activation the fused CUTLASS MoE runs between its two grouped GEMMs.
-/// Mirror of `moe::MoeActivation` (`enum class`, default `int`), by value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum MoeActivation {
-    /// nemotron_h.
-    Relu2 = 0,
-    /// qwen3.5 / qwen3.6 MoE, glm5 / kimi / deepseek_v4.
-    Swiglu = 1,
-    /// gemma-4 26B-A4B routed experts (GELU-tanh gate).
-    Geglu = 2,
-}
-
-/// Which rows of a gpt-oss packed MXFP4 scale table the Marlin repack
-/// selects. Mirror of `quant::Mxfp4RowSelect` (`enum class : int`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum Mxfp4RowSelect {
-    /// Every row, in order.
-    Identity = 0,
-    /// Even rows — the gate half of an interleaved bank.
-    Even = 1,
-    /// Odd rows — the up half.
-    Odd = 2,
-}
-
-#[cfg(feature = "_cuda")]
-/// Seed a KV cache's envelope tiers as EMPTY. Safe because the planes are
-/// the cache's own allocation at its own extents, and a null plane is a
-/// cache with no envelopes — which the launcher reads as nothing to do.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Fill an envelope pair with the empty interval, so a page nothing has
+/// written reads as "no values yet" rather than as a range around zero.
 pub fn seed_envelopes_empty(
     env_min: *mut u16,
     env_max: *mut u16,

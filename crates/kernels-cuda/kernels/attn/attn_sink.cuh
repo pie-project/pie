@@ -1,4 +1,4 @@
-//===-- attn_sink.cuh - the sink rescale and the LSE rebase --------------===//
+//===-- attn_sink.cuh - the sink rescale, and the rebase inside it -------===//
 //
 // Two `__global__` templates, no host code. GPT-OSS learns a per-head sink
 // scalar and extends the softmax denominator with `exp(sink)`; flashinfer
@@ -6,6 +6,19 @@
 // attention kernel has already written its output, which is why they are
 // separate launches and not a fused epilogue -- the attention kernel is
 // flashinfer's and cannot be edited.
+//
+// # `attn_sink_rescale` IS `attention.sink`, and `lse_log2_to_ln` is nobody
+//
+// The floor states the base of an lse now -- base two, flashinfer's, the
+// one every attention kernel already has -- and states that the sink is a
+// checkpoint's natural-log logit. So the `kLn2` below is not a conversion
+// somebody remembered to schedule in front of this kernel; it is the point
+// itself, the one place two bases meet, and `Attention::sink`'s claim in
+// `attn/mod.rs` fires this template. `lse_log2_to_ln` answers no point at
+// all any more: the statement that used to call it (`attention.lse_ln`)
+// left the floor with the base disagreement it existed to paper over, and
+// what still fires it is the legacy dsv4 text, which dies with
+// `model-dsl-legacy`.
 //
 // # What moved, and what did not
 //
@@ -73,7 +86,8 @@ __global__ void lse_log2_to_ln(T* __restrict__ lse, usize n) {
     if (isfinite(v)) lse[i] = static_cast<T>(v * kLn2);
 }
 
-/// `o[t, h, :] *= sigmoid(ln_lse[t, h] - sink[h])`, in place.
+/// `o[t, h, :] *= sigmoid(lse[t, h]*ln2 - sink[h])`, in place -- a BASE-TWO
+/// lse against a natural-log sink, which is what `attention.sink` states.
 ///
 /// Equivalent to a virtual KV slot with logit `sink[h]` and value zero: the
 /// denominator grows by `exp(sink)` and the numerator does not, so every
@@ -82,7 +96,8 @@ __global__ void lse_log2_to_ln(T* __restrict__ lse, usize n) {
 /// activations without a copy.
 ///
 /// NO ROW STATES THIS KERNEL -- see the header. `N` is still an argument
-/// because without a rule there is nothing to recover it from.
+/// because without a rule there is nothing to recover it from; the claim
+/// that fires it passes `o.rows`.
 template <class T>
 __global__ void attn_sink_rescale(
     T* __restrict__ o,

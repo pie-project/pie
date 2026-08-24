@@ -13,15 +13,21 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-# tart: the declared-forward toolchain — the fire planner's site table
-# maps driver-reported model sites onto its vocabulary.
+# tart: the declared-forward toolchain, and OPTIONAL now.
 #
-# Two entries since the toolchain split, and they are the two HALVES this
-# crate actually touches: `lower` (the launch list, read by the site table's
-# cost model) and the traced form's vocabulary. The authoring eDSL is not in
-# the graph — the engine schedules forward passes and does not write them.
-model-compiler = { path = "../model-compiler" }
-model-ir = { path = "../model-ir" }
+# These two were unconditional, for the fire planner's site table: `lower` (the
+# launch list its cost model read) and the traced form's vocabulary. R1 deleted
+# that table -- it had no producer, no carrier and no consumer, and it walked
+# `model_ir::trace::ForwardPlan`, the LEGACY traced form the baker path does not
+# produce (`src/scheduler/fire_plan.rs` records the measurement).
+#
+# What is left of either in this crate is `backend/{vulkan,wgpu}.rs`, which
+# lower a legacy declaration to build a shader program: `model_compiler::lower`
+# and `model_ir::trace::FireClass`, nowhere else. So they ride the same two
+# features `model-legacy` does, and a default build of this crate carries no
+# part of the legacy forward toolchain at all.
+model-compiler = { path = "../model-compiler", optional = true }
+model-ir = { path = "../model-ir", optional = true }
 driver-api = { path = "../driver-api" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
@@ -116,9 +122,33 @@ futures = "0.3.33"
 waker = { path = "../waker" }
 tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
-# `forward` for the site table, which traces a real declaration to work out
-# where a fire's hook sites are.
-model = { path = "../model-legacy", package = "model-legacy" }
+# What this engine needs to know about the model it serves that is NOT its
+# forward pass: the chat template a turn is written with, the `(layers, vocab)`
+# a sampler and the PTIR lowering are sized from, host-side multimodal decode,
+# and the shape an artifact's metadata arrives in. All of it is `model::serve`.
+#
+# It used to be `model-legacy`, and the reason was one module: a scheduler site
+# table that traced a real legacy declaration to find a fire's divergence sites.
+# That table had no producer, no carrier and no consumer (see
+# `src/scheduler/fire_plan.rs`), and it walked a traced form the baker path does
+# not produce — so R1 deleted it, and with it this crate's last need for a
+# declaration. Everything left is serving knowledge, and it moved to this crate
+# rather than being ported, file for file.
+model = { path = "../model", features = ["serve"] }
+# THE LEGACY DECLARATIONS, and only for the two shader backends that still read
+# one. `backend/{vulkan,wgpu}.rs` identify a checkpoint against the legacy
+# catalog, author its load plan through `model::boot`, and trace
+# `shared::llama_like` to build the shader program — that is the whole of what
+# is left, it is what P5 replaces with a baker executor per plane, and R2
+# quarantines these two backends until it lands.
+#
+# Optional, and pulled in by those two features ALONE. That is the cut: a
+# default `cargo build -p engine` has no `model-legacy` edge at all, and one
+# appears exactly when a build asks for a backend that still reads a legacy
+# declaration.
+model-legacy = { path = "../model-legacy", package = "model-legacy", default-features = false, features = [
+    "contract",
+], optional = true }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
@@ -191,11 +221,14 @@ driver-vulkan = [
     "dep:driver-vulkan",
     "driver-vulkan/native",
     "dep:model-loader",
+    "dep:model-compiler",
+    "dep:model-ir",
     # `catalog::identify`, `contract::author` and `boot::compile_load_plan_for`
-    # -- the identification and the load plan. This crate already takes
-    # `model` for `forward`; `contract` is the half that reads a publisher's
-    # checkpoint, and only this backend needs it.
-    "model/contract",
+    # -- the identification and the load plan, all of them off the LEGACY
+    # declarations. This is the only kind of consumer that still needs them,
+    # which is why the dependency is optional and named here rather than
+    # carried by every build.
+    "dep:model-legacy",
 ]
 # The Rust WebGPU shell's seam. A library call, like the two above, and gated
 # on the feature ALONE.
@@ -208,7 +241,7 @@ driver-vulkan = [
 # module and `driver_wgpu::shell` absent, and the failure arrives at model load
 # instead of at `cargo build`.
 #
-# `model-loader` and `model/contract` come with it because THIS crate loads the
+# `model-loader` and `model-legacy` come with it because THIS crate loads the
 # checkpoint for that driver, exactly as it does for Vulkan -- see
 # `src/driver/backend/wgpu.rs` for why loading is on this side of the seam.
 #
@@ -236,7 +269,9 @@ driver-wgpu = [
     "dep:driver-wgpu",
     "driver-wgpu/native",
     "dep:model-loader",
-    "model/contract",
+    "dep:model-legacy",
+    "dep:model-compiler",
+    "dep:model-ir",
 ]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
@@ -263,10 +298,6 @@ tempfile = "3"
 # for `cargo build`, which is exactly the line we want here.
 wasmtime = { version = "47", default-features = false, features = ["wat"] }
 tensor-ir = { path = "../tensor-ir" }
-# The same `model`, with the one row that is not a model. The mock harness
-# has to name a row because `model::register` resolves one; see
-# `tests/common/env.rs`'s `MOCK_MODEL_ID` and `model::test_rows`.
-model = { path = "../model-legacy", package = "model-legacy" }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Benchmarks must allocate the way production does. Every engine entry point
 # links `worker`, which sets mimalloc as the global allocator; a bench that

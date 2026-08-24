@@ -1,6 +1,6 @@
-//===-- kda.cuh - Kimi Delta Attention's four kernels, as device text ---===//
+//===-- kda.cuh - Kimi Delta Attention's five kernels, as device text ---===//
 //
-// Four `__global__`s and one `__device__` helper, with no host function and
+// Five `__global__`s and one `__device__` helper, with no host function and
 // no `<<<>>>` anywhere. `kda.cu` includes this file and keeps only its
 // launchers, so each kernel is defined ONCE in the tree — the archive nvcc
 // builds and any cubin NVRTC builds come from the same characters.
@@ -15,6 +15,12 @@
 // `LaunchRule::PerHeadElementwise` — `[rows, q_heads]` at
 // `clamp(head_dim, 32, 128)` — and the head axis the earlier draft of this
 // note said did not exist is exactly the thing that arrived.
+//
+// THE FIFTH ARRIVED WITH THE CLAIM AND HAS NO ROW EITHER, on purpose:
+// `kda_qkv_prep` is fired by `ssm.kda_step`'s BODY
+// (`kernels-cuda/src/ssm.rs`), which states its own launch config, and a
+// row is a thing the retired legacy driver needed. Its own section below
+// says what it is and what it is transcribed from.
 //
 // The other two, `kda_recurrent_step_batched` and `kda_prefill_batched`,
 // state the same `dim3(R, H)` grid and are still refused, on two grounds
@@ -102,6 +108,99 @@ __global__ void kda_gate_beta(
     if (threadIdx.x == 0) {
         beta_out[(long long)t * H + h] =
             sigmoidf(Elem<ElemT>::to_f32(raw_beta[(long long)t * H + h]));
+    }
+}
+
+// ── The packed plane, cut ──────────────────────────────────────────
+
+// The recurrence takes three COMPACT fp32 planes and the text hands the
+// point ONE packed `[q | k | v]` row, so somebody has to cut it. This is
+// that somebody, and it is one launch rather than the six the existing
+// kernels would need (`layout::select` three times to compact the planes,
+// then `l2norm_scale` twice and `widen` once over them) because the cut and
+// the norm read the same bytes.
+//
+// # The arithmetic is transcribed, not invented
+//
+// The two normalised planes are `ssm::l2norm_scale<T, 128>` at `scale =
+// 1.0f` and the widened one is `ssm::widen<T>`, character for character:
+// the same `local` accumulated with a `BLOCK` stride, the same
+// `__shared__ float buf[BLOCK]` folded from `BLOCK / 2` down, the same
+// `rsqrtf(buf[0] + eps)`, the same single `to_f32` per element on the way
+// out. `x * inv * 1.0f` and `x * inv` are the same float, so the fold
+// costs nothing. That equality is what `tests/kda_recurrence.rs` measures
+// against the legacy launches, and it is the only reason a new
+// `__global__` is allowed to stand between a shipped sequence and its
+// replacement.
+//
+// # `eps` is the STATEMENT's
+//
+// `ssm.kda_step` declares `norm_eps` and this kernel spends it, which is
+// the difference between reusing `qwen_gdn_qk_norm` here and writing this.
+// That one is packed-aware too, and at `K_h = 1, K_d = width` it computes
+// exactly these two planes -- but its epsilon is a hard `1e-6f` in the
+// body, so a point that states its own would be stating a number nothing
+// reads.
+//
+// # What it normalises OVER, and the debt that leaves
+//
+// THE WHOLE `heads * head_dim` PLANE, one l2 norm per token, which is what
+// `model-legacy/src/kimi_k3/forward/mod.rs:243-256` fired: an
+// `l2norm_scale` over a `[Tokens, value_heads * value_head_dim]`
+// rectangle, one block per TOKEN. Every published KDA normalises per HEAD
+// instead -- and so does this tree's own gated-delta prologue,
+// `qwen_gdn_qk_norm`, whose grid is `(rows, K_h)`. The two differ, one of
+// them is wrong, and NEITHER CAN BE SETTLED HERE: no kimi checkpoint is
+// cached, and the legacy leg has never been run against one. So this
+// reproduces the shipped sequence exactly, the seam is named, and the
+// checkpoint decides when there is one -- the per-head form is this
+// kernel's grid `(N, 3, heads)` and its `width` becoming `head_dim`,
+// nothing more.
+template <class ElemT, int BLOCK>
+__global__ void kda_qkv_prep(
+    const ElemT* __restrict__ mixed,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    int width, float eps)
+{
+    const int n = blockIdx.x;
+    // 0 = q (normalised), 1 = k (normalised), 2 = v (widened). Uniform per
+    // block, so the early return below takes the whole block with it and no
+    // `__syncthreads()` is reached by a subset of it.
+    const int plane = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const ElemT* src =
+        mixed + (long long)n * 3 * width + (long long)plane * width;
+    float* dst =
+        (plane == 0 ? q_out : (plane == 1 ? k_out : v_out)) +
+        (long long)n * width;
+
+    if (plane == 2) {
+        for (int i = tid; i < width; i += BLOCK) {
+            dst[i] = Elem<ElemT>::to_f32(src[i]);
+        }
+        return;
+    }
+
+    float local = 0.f;
+    for (int i = tid; i < width; i += BLOCK) {
+        const float x = Elem<ElemT>::to_f32(src[i]);
+        local += x * x;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[tid] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(buf[0] + eps);
+
+    for (int i = tid; i < width; i += BLOCK) {
+        dst[i] = Elem<ElemT>::to_f32(src[i]) * inv;
     }
 }
 

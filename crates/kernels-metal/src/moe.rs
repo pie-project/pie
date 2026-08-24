@@ -1,7 +1,9 @@
 use kernels::Grid;
+use kernels::points::Scalar;
 use kernels::routine::Refusal;
 use kernels_macros::routine;
 
+use crate::plane::{self, Handle};
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 
 fn router_lanes(n_experts: u32) -> Result<u32, Refusal> {
@@ -113,6 +115,7 @@ fn tile_point(tile_m: i32, tile_n: i32) -> Result<usize, Refusal> {
         + axis(tile_n, "the routed qmm's column tile")?)
 }
 
+// INLINED into impl Moe; dies with the routine layer.
 #[routine(canon = "moe.topk_softmax", out(expert_weights = rows(logits) x const(experts_per_token)))]
 pub fn router_topk(
     ctx: &Ctx<'_>,
@@ -281,6 +284,7 @@ pub fn combine_sorted(
     )
 }
 
+// INLINED into impl Moe; dies with the routine layer.
 #[routine(canon = "moe.sigmoid_gate_add", out(out = like(routed)))]
 pub fn shared_expert_combine(
     ctx: &Ctx<'_>,
@@ -617,4 +621,146 @@ pub fn mxfp4_qmm_t_routed_bias(
             tile_expert.arg(),
         ],
     )
+}
+
+/// `softmax_over_all = 0`: the softmax denominator is the SELECTED logits, so
+/// the `k` weights sum to one.
+///
+/// THE SAME NUMBERS CUDA'S ROUTER WRITES, and the two spellings meet because
+/// softmax is shift-invariant: `::pie::moe::topk_softmax` normalises over
+/// every expert, selects, and then divides the `k` survivors by their own
+/// sum, which is `exp(x_i - m) / sum_{j in K} exp(x_j - m)` — the expression
+/// this arm computes directly. `1` is the other reading (`norm_topk_prob:
+/// false`), where the weights sum to less than one and scale the routed FFN's
+/// contribution down with them; no point in this family states it.
+const SOFTMAX_OVER_SELECTED: u32 = 0;
+
+/// The `Moe` family, claimed — the router and the combine.
+///
+/// `moe.topk_softmax` LANDED HERE BY A SHADER EDIT, for the reason
+/// `norm.rmsnorm_gated` did next door. The point declares
+/// `weights: Out<Tensor<f32>>` — a router weight is a probability and every
+/// fold that reads one multiplies in float — while `moe/route.metal` wrote
+/// `device T*`, the activation element. `router_topk` is now templated over
+/// the weight element as well as the logit element, with
+/// `<bfloat, bfloat, ..>` keeping the two names and the ABI the legacy driver
+/// fires and `<bfloat, float, false>` stamped beside them as
+/// `router_topk_f32w_bfloat16`, which is the arm this body names. THE SHADER
+/// IS METAL-COMPILE-UNVERIFIED: nothing in this checkout can build a `.metal`
+/// file.
+///
+/// Five points stay on the floor's default body:
+///
+/// * `moe.topk_sigmoid` / `moe.topk_sqrt_softplus` — SEAM: no `.metal` router
+///   scores with a sigmoid or with `sqrt(softplus(x))`, and neither takes the
+///   correction bias, the renormalisation flag or the routed scaling factor
+///   those two declare. `router_topk_scaled` is the softmax one with a
+///   per-expert gain, which is gemma's decision and not either of these.
+/// * `moe.weighted_sum` — SEAM: `combine_sorted` takes an
+///   `inv: In<Tensor<i32>>`, the inverse of the permutation `route_sort`
+///   built, and the declaration states three operands with no permutation
+///   among them. This plane folds a SORTED fan-out where cuda folds a
+///   token-batched one, so the point wants either a sort-free combine or a
+///   slot for the permutation. The weight element was the second half of this
+///   gap and is closed — `combine_sorted` could take the f32 plane the same
+///   way `router_topk` now does — but the permutation is a kernel, not a
+///   crossing.
+/// * `moe.matmul_select` / `moe.matmul_select_bias` — SEAM: the routed GEMMs
+///   above are QUANTIZED (`qmv_routed`, `qmm_t_routed`, the mxfp4 pair): they
+///   take blocks, scales and biases where the declaration states one
+///   `Const<Tensor<T>>`, and they take the sort's permutation and its tile
+///   table beside them. The `Bank<R: Repr>` gap `layout.embed` names, with a
+///   permutation on top.
+#[kernels_macros::claims]
+impl kernels::points::Moe for Ctx<'_> {
+    /// The top-`k` softmax router: one threadgroup per row, one lane per
+    /// expert.
+    ///
+    /// THE PITCH IS THE WIDTH. `router_topk` reads a row at
+    /// `logits_pitch != 0 ? logits_pitch : n_experts`, because a router
+    /// reading a SLICE of a wider activation has a pitch that is not its
+    /// expert count. A mark on this plane is a dense rectangle by the
+    /// strideless-mark law, so the pitch this body states is the rectangle's
+    /// own width — and the stated expert count has to be that width or one of
+    /// the two is wrong about the same row.
+    fn topk_softmax<T: Scalar>(
+        &self,
+        logits: In<Handle<T>>,
+        experts: u32,
+        top_k: u32,
+        routes: Out<Handle<i32>>,
+        weights: Out<Handle<f32>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`moe.topk_softmax`, at an element this plane does not stamp";
+        let logits = plane::input::<T, bf16>(logits, WHAT)?;
+        let routes = plane::result::<i32, i32>(routes, "`moe.topk_softmax`'s route plane")?;
+        let weights = plane::result::<f32, f32>(weights, "`moe.topk_softmax`'s weight plane")?;
+        let width = plane::stated(experts, "the expert count this router states")?;
+        let k = plane::stated(top_k, "the fan-out this router states")?;
+        if logits.width != width {
+            return Err(Refusal::Narrow {
+                what: "the router's row is not the expert count the statement states",
+                at: i64::from(logits.width),
+            });
+        }
+        // BOTH RESULTS STRIDE BY `k`, which the kernel reads off the stated
+        // fan-out and not off either rectangle, so a rectangle that disagreed
+        // would be written past rather than partially.
+        if routes.width != k || weights.width != k {
+            return Err(Refusal::Narrow {
+                what: "a routed result is not the fan-out the statement states",
+                at: i64::from(routes.width),
+            });
+        }
+        let lanes = router_lanes(experts)?;
+        let rows = u32::try_from(logits.rows).map_err(|_| Refusal::Empty { what: "rows" })?;
+        self.fire(
+            Fire::at("moe/route.metal", "router_topk_f32w_bfloat16")
+                .apply(Grid::of([lanes, rows, 1], [lanes, 1, 1])),
+            &[
+                logits.arg(),
+                routes.arg(),
+                weights.arg(),
+                // The per-expert gain is gemma's, and the SCALED
+                // instantiation is the one that dereferences it; this arm
+                // binds the slot because an argument table with a hole in it
+                // is not something an encoder can be asked for.
+                self.absent()?,
+                experts.arg(),
+                top_k.arg(),
+                SOFTMAX_OVER_SELECTED.arg(),
+                // THE SAME WORD THE ROUTINE BINDS, at the same kind: the
+                // shader takes the pitch as a `constant uint&`, and this
+                // rectangle's width is the stated expert count checked above.
+                experts.arg(),
+            ],
+        )
+    }
+
+    /// `y = routed + shared * sigmoid(gate)`. The declaration hands the
+    /// gate over as the `[tokens, 1]` column the statement already
+    /// projected, which is exactly what `shared_expert_combine` reads —
+    /// this is the point the two shader planes' shape decided, and cuda is
+    /// the one that cannot claim it.
+    fn sigmoid_gate_add<T: Scalar>(
+        &self,
+        routed: In<Handle<T>>,
+        shared: In<Handle<T>>,
+        gate: In<Handle<T>>,
+        y: Out<Handle<T>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`moe.sigmoid_gate_add`, at an element this plane does not stamp";
+        let routed = plane::input::<T, bf16>(routed, WHAT)?;
+        let (lanes, group) = route_rows(routed.width, routed.rows)?;
+        self.fire(
+            Fire::at("moe/route.metal", "shared_expert_combine").apply(Grid::of(lanes, group)),
+            &[
+                routed.arg(),
+                plane::input::<T, bf16>(shared, WHAT)?.arg(),
+                plane::input::<T, bf16>(gate, WHAT)?.arg(),
+                plane::result::<T, bf16>(y, WHAT)?.arg(),
+                routed.width.arg(),
+            ],
+        )
+    }
 }

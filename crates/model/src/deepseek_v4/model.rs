@@ -5,6 +5,7 @@ use model_dsl::{CacheRef, Norm, Tensor};
 
 pub struct Model<W1: Dtype, K: KvDtype, const TP: usize = 1> {
     pub hidden: u32,
+    pub vocab: u32,
     pub hyper: Hyper<W1>,
     pub embed: Tensor<W1>,
     pub head: Head<W1>,
@@ -194,6 +195,7 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
 
     Model {
         hidden: d.hidden,
+        vocab: d.vocab,
         hyper: Hyper {
             streams: d.streams,
             norm_eps: d.norm_eps,

@@ -1,7 +1,9 @@
+pub mod plane;
 pub mod routine;
 pub mod views;
 
 pub mod attn;
+pub mod dist;
 pub mod layout;
 pub mod mlp;
 pub mod moe;

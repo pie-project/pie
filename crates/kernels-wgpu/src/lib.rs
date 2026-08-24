@@ -9,6 +9,7 @@ pub use crate::preproc::{Directive, Malformed, Variant, expand, instantiations};
 pub mod source;
 pub use crate::source::{Missing, SOURCES, entrypoint_source, source};
 
+pub mod points;
 pub mod routine;
 pub mod views;
 

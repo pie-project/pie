@@ -30,6 +30,12 @@ pub struct Point {
     /// and every `Dtype::Generic` on a slot indexes into it.
     pub axes: usize,
 
+    /// The method's `R: Repr` generics — the BANK axes, which are not
+    /// elements and are counted apart for that reason. A dispatch's match is
+    /// `Elem^axes × Repr^reprs` and every [`Dtype::Bank`] on a slot indexes
+    /// into this run. Zero on every point but the quantised ones.
+    pub reprs: usize,
+
     /// The operands, in declaration order.
     pub slots: &'static [Slot],
 }
@@ -83,6 +89,15 @@ pub enum Dtype {
     /// Spelled in the declaration: `Self::Tensor<f32>`, or a bare scalar.
     Fixed(Prim),
 
+    /// `Self::Bank<R>` for the method's n-th REPR axis: a quantised bank,
+    /// which is not a rectangle of elements and has no dtype to name. What
+    /// the slot carries is the plane's own view of however many BYTE PLANES
+    /// the repr stores one bank as — mxfp4 stores two, the E2M1 codes and
+    /// the E8M0 block scales — so the slot occupies [`Repr::PLANES`] weight
+    /// columns rather than one, and a dispatch's `Elem^axes` match never
+    /// indexes it.
+    Bank(usize),
+
     /// The slot carries a plane-side VIEW, not a rectangle of elements: the
     /// only dtype the table could name for it is the POOL's, decided when
     /// the slab was allocated and quantified over by no method here. A
@@ -107,6 +122,25 @@ pub enum Prim {
 /// What a plane is, to a declaration: the payloads its marks carry.
 pub trait Plane {
     type Tensor<T: Scalar>: Elem + ConstRun;
+
+    /// What a `Const` slot carries for a QUANTISED BANK: the plane's own
+    /// view of the byte planes the repr stores one bank as.
+    ///
+    /// NOT A SECOND `Elem`, and that is the whole reason this type exists
+    /// beside [`Plane::Tensor`]. A `Tensor<T>` is a rectangle of `T`, so one
+    /// address describes it and `Elem` names the arithmetic. An mxfp4 bank
+    /// is two planes of bytes — 4-bit codes in one, a per-32-element E8M0
+    /// exponent in the other — with no element type at all: the numbers only
+    /// exist once a kernel has multiplied one plane by the other. A payload
+    /// that carried it as `Tensor<u8>` would be describing the first plane
+    /// and silently dropping the second, which is exactly what the `Const`
+    /// slot on `matmul_select_bias` used to do.
+    ///
+    /// ONE ASSOCIATED TYPE PER REPR AXIS, quantified the way `Tensor` is
+    /// quantified over `Scalar`. It is `ConstRun` and not `Elem` because a
+    /// bank is only ever a `Const`: no fire mints one, no arena sizes one,
+    /// and nothing reads a row out of one except the kernel that decodes it.
+    type Bank<R: Repr>: ConstRun;
 
     /// What a `Cache` slot carries for a RECURRENT row: the plane's own
     /// view of the per-request slab pair — the conv window and the
@@ -135,6 +169,61 @@ pub trait Plane {
 pub trait Scalar: Elem<Read = *const Self, Write = *mut Self> + Sized {}
 
 impl<T: Elem<Read = *const T, Write = *mut T>> Scalar for T {}
+
+/// A quantised bank's STORAGE FORM: what a `Const<Self::Bank<R>>` slot's
+/// bytes mean.
+///
+/// A CLOSED MARKER SET AND NOT AN ENUM, on the [`Scalar`] precedent: a repr
+/// has to be a TYPE so a method can quantify over it (`<R: Repr>`), so a
+/// plane can carry one payload per repr (`Bank<R>`), and so a body can
+/// branch on it at compile time. The enum this would otherwise be is
+/// [`Form`], which exists for the one place a repr has to be a VALUE — the
+/// data→type crossing a generated dispatch performs.
+///
+/// [`Scalar`] is open (every pointer-shaped element is one); this is closed,
+/// because a repr is a decoding rule some kernel has to have been written
+/// for. Today the set has one member. That is the point of the axis rather
+/// than an argument against it: `matmul_select_bias`'s bank slot USED to be
+/// `Const<Self::Tensor<T>>`, which pinned the point to one storage form and
+/// to the activation's element at the same time; `<R: Repr>` unpins both, so
+/// a caller whose bank ships at some other form is a member added here and
+/// an arm added to the body, not a second declaration.
+pub trait Repr: 'static {
+    /// This repr, as the value a dispatch matches on.
+    const FORM: Form;
+
+    /// How many BYTE PLANES one bank of this repr is stored as, which is how
+    /// many weight columns its `Const` slot occupies. The planes are bound in
+    /// the order the repr states them, under the bank's own parameter name
+    /// and that name plus the repr's suffix for each plane after the first.
+    const PLANES: usize;
+}
+
+/// A [`Repr`] as a value: what a bound statement answers when a generated
+/// dispatch asks which form the bank at a weight column is stored in.
+///
+/// The [`crate::bound::Axis`] of the repr axis, and the same crossing: an
+/// element is decided by the arena that minted a rectangle, a repr by the
+/// model text that declared the bank, and both have to be read off the fire
+/// before a turbofish can be spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    Mxfp4,
+}
+
+/// OCP MX FP4: 4-bit E2M1 codes packed two to a byte, with one E8M0
+/// exponent byte per 32 consecutive codes.
+///
+/// TWO PLANES, which is the whole reason `Bank` is not `Tensor`. A logical
+/// `[.., N, K]` bank lands as `[.., N, K/32, 16]` bytes of codes and
+/// `[.., N, K/32]` bytes of scale, and gpt-oss ships exactly those two
+/// tensors (`*_blocks` and `*_scales`) rather than one.
+pub enum Mxfp4 {}
+
+impl Repr for Mxfp4 {
+    const FORM: Form = Form::Mxfp4;
+    const PLANES: usize = 2;
+}
 
 #[points]
 pub trait Norm: Plane {
@@ -732,9 +821,23 @@ pub trait Moe: Plane {
     /// expert that route names.
     ///
     /// `bank` is the `[E, N, K]` stack and wears `Const` because that is
-    /// the mark a weight wears. The bank a text hands it is quantized as
-    /// often as not, and the slot wants the `Bank<R: Repr>` payload the
-    /// floor does not carry yet.
+    /// the mark a weight wears.
+    ///
+    /// A DENSE BANK ON PURPOSE, and not the [`Plane::Bank`] payload its
+    /// biased sibling below now carries. A dense expert stack IS a rectangle
+    /// of elements, and `Self::Tensor<T>` says the one thing about it that
+    /// matters and that a `Bank<R>` could not: the bank rides the SAME
+    /// element as the activation. qwen3.5-a3b and dsv4 both state this point
+    /// against bf16 stacks and both mean exactly that tie. A caller whose
+    /// unbiased bank is quantised wants a `Bank<R>` slot — which is a second
+    /// point beside this one, not a widening of it, because it would be
+    /// dropping the tie.
+    ///
+    /// (kimi-k3 declares its stacks at the `mxfp4` repr on the model side
+    /// while its import table copies dense `w1`/`w3` rows into them. That
+    /// disagreement is the checkpoint-unverified debt baker-todo records for
+    /// kimi/glm/dsv4, and it is a MODEL-side lie about a dense declaration,
+    /// not a gap in this one.)
     fn matmul_select<T: Scalar>(
         &self,
         x: In<Self::Tensor<T>>,
@@ -749,12 +852,25 @@ pub trait Moe: Plane {
     }
 
     /// `matmul_select` with the expert's own bias row added to the result —
-    /// gptoss's banks, the only ones that carry one. Unclaimed on every
-    /// plane today: the measured gap.
-    fn matmul_select_bias<T: Scalar>(
+    /// gptoss's banks, the only ones that carry one.
+    ///
+    /// THE ONE POINT WITH TWO KINDS OF AXIS, and the two are different
+    /// questions about the same statement. `T` is what the ACTIVATION and
+    /// the BIAS ride — one element, checked equal at every instantiation,
+    /// which is what makes the bias add a bias add. `R` is what the BANK is
+    /// STORED as, which the activation's element says nothing about: gpt-oss
+    /// hands this point a bf16 row, a bf16 bias and an mxfp4 stack, and no
+    /// single `T` can spell that trio.
+    ///
+    /// The slot used to be `Const<Self::Tensor<T>>` with the debt written in
+    /// prose; `Const<Self::Bank<R>>` is the debt paid. What changed is not
+    /// the arity a text writes — a text still names ONE bank — but what the
+    /// declaration ADMITS about it: a bank is however many byte planes its
+    /// repr stores, and the weight columns follow [`Repr::PLANES`].
+    fn matmul_select_bias<T: Scalar, R: Repr>(
         &self,
         x: In<Self::Tensor<T>>,
-        bank: Const<Self::Tensor<T>>,
+        bank: Const<Self::Bank<R>>,
         bias: Const<Self::Tensor<T>>,
         routes: In<Self::Tensor<i32>>,
         y: Out<Self::Tensor<T>>,
@@ -842,13 +958,24 @@ pub trait Layout: Plane {
     /// at all. The statement allocates the result and the plane reads the
     /// width back off it. This is the family's `#[shape]` row when that
     /// annotation lands, the way [`Mlp`]'s stated intermediate is.
+    ///
+    /// STATED GEOMETRY: `vocab`, the table's ROW count, for the reason the
+    /// width above is READ. The width is on the result, which the statement
+    /// allocated; the row count is on nothing at all — a `Const` table is an
+    /// address, `ids` carries token values and not their range, and no
+    /// result is sized from it. A gather that clamps its index needs that
+    /// bound, and a plane that invented one (`i32::MAX`) would be retiring
+    /// the clamp rather than answering it, so the number comes from the text
+    /// that already knows it. This is `rmsnorm_per_head`'s law reaching the
+    /// one geometry that guards a READ rather than sizing a write.
     fn embed<T: Scalar>(
         &self,
         ids: In<Self::Tensor<i32>>,
         table: Const<Self::Tensor<T>>,
+        vocab: u32,
         y: Out<Self::Tensor<T>>,
     ) -> Result<(), Refusal> {
-        let _ = (ids, table, y);
+        let _ = (ids, table, vocab, y);
         Err(Refusal::Absent {
             what: "layout.embed",
         })
@@ -906,23 +1033,31 @@ pub trait Layout: Plane {
     }
 
     /// One layer's slice of a relayed table — gemma's per-layer PLE plane,
-    /// picked out of the stack the prologue gathered once.
+    /// picked out of the stack the prologue gathered once. The relay is
+    /// `[rows, layers * width]` and the slice is `[rows, width]` at column
+    /// `layer * width`: a strided per-row copy.
     ///
-    /// Unclaimed on every plane, and the absence is why it is declared. The
-    /// arithmetic is nothing: a layer's slice of a laid-out stack is a base
-    /// and an offset, so a plane may well answer this at BINDING with a view
-    /// over the relayed rows and never launch anything at all. No kernel
-    /// claims it because there is nothing for a kernel to do — but until the
-    /// binding stage can say that in its own voice, an unnamed gap is an
-    /// unmeasured one, and this declaration is what puts gemma's slice on
-    /// the backlog under a name.
+    /// STATED GEOMETRY: `width`, for [`Norm::rmsnorm_per_head`]'s reason
+    /// turned inside out. There the width was missing from a `Const`
+    /// weight; here it is missing from the OPERAND — `layer` says WHICH
+    /// slice, never how many there are, so the packed row divides by a
+    /// number no slot carries and the walk cannot size the result. Gemma's
+    /// text holds that number already (`Ple::dim`), and the whole content of
+    /// the stated-geometry law is that the statement says what its results
+    /// are sized from.
+    ///
+    /// The arithmetic is a base and an offset, so a plane may one day answer
+    /// this at BINDING with a view over the relayed rows and never launch at
+    /// all. Cuda answers it with a copy, which is the honest form until a
+    /// binder can state the aliasing.
     fn select<T: Scalar>(
         &self,
         table: In<Self::Tensor<T>>,
         layer: u32,
+        width: u32,
         y: Out<Self::Tensor<T>>,
     ) -> Result<(), Refusal> {
-        let _ = (table, layer, y);
+        let _ = (table, layer, width, y);
         Err(Refusal::Absent {
             what: "layout.select",
         })
@@ -989,11 +1124,27 @@ pub trait Ssm: Plane {
     /// rule's decay and beta columns, through the checkpoint's `dt_bias`
     /// and `a_log`. The result rides f32 — a decay is accumulated, not
     /// activated — and the mixer downstream reads it as one row.
+    ///
+    /// `a_log` IS f32 AND `dt_bias` IS NOT, and the split is the kernel's
+    /// rather than a tidiness point. `ssm/gated_delta_net_prep.cuh` spells
+    /// the two apart in one argument list — `const float* __restrict__
+    /// A_log` beside `const T* __restrict__ dt_bias` — and its own header
+    /// says why: *"HF Qwen3.5 stores `A_log` and the RMSNormGated weight in
+    /// fp32 (matches the FLA fast-path expectation), even when the rest of
+    /// the model is bf16. dt_bias stays bf16."* The routine that claims
+    /// this point, `qwen_gdn_post_conv_prep_bf16`, has taken `a_log:
+    /// Const<Tensor<f32>>` beside `dt_bias: Const<Tensor<bf16>>` the whole
+    /// time. THIS DECLARATION SAID `T` FOR BOTH, which is the one slot
+    /// where the floor disagreed with the plane claiming it, and the
+    /// shipped 35B-A3B checkpoint settles it from the third side: `A_log`
+    /// is F32 [value_heads] and `dt_bias` is BF16 [value_heads] in the same
+    /// BF16 file. Handing that `float*` a bf16 bank is not a cast — it is
+    /// half the decays per head, read as nonsense.
     fn gdn_prep<T: Scalar>(
         &self,
         ba: In<Self::Tensor<T>>,
         dt_bias: Const<Self::Tensor<T>>,
-        a_log: Const<Self::Tensor<T>>,
+        a_log: Const<Self::Tensor<f32>>,
         gates: Out<Self::Tensor<f32>>,
     ) -> Result<(), Refusal> {
         let _ = (ba, dt_bias, a_log, gates);
@@ -1054,13 +1205,35 @@ pub trait Ssm: Plane {
     /// forget and beta projections the text hands over; `norm_eps` is the
     /// rule's own internal normalisation, fused rather than stated as a
     /// separate `norm` point — which is what every KDA kernel does.
+    ///
+    /// `mixed` IS THE PACKED `[q | k | v]` PLANE, three `heads * head_dim`
+    /// slices of one post-convolution row, and `heads`/`head_dim` are what
+    /// divide it. The text convolves the packed row once
+    /// (`model/src/kimi_k3/forward.rs`) where the legacy ran three separate
+    /// projections and three separate convs, so the cut is arithmetic this
+    /// point owns and no upstream statement carries.
+    ///
+    /// BOTH DECAY WEIGHTS ARE F32 AND NEITHER RIDES `T`. `ssm/kda.cuh`
+    /// spells `kda_gate_beta`'s pair `const float* __restrict__ A_log`
+    /// beside `const float* __restrict__ dt_bias` — the same argument list,
+    /// both `float` — and the routine claiming that launch has taken
+    /// `Const<Tensor<f32>>` for both since it was written. That is a
+    /// DIFFERENT answer from [`Ssm::gdn_prep`]'s one line up, where the
+    /// kernel takes `A_log` float beside `dt_bias` at `T`, and the
+    /// asymmetry is each kernel's own rather than a house style.
+    ///
+    /// `dt_bias` is `[heads, head_dim]` and `a_log` is `[heads]`, which the
+    /// kernel also settles: it reads `dt_bias[h * D + d]` per channel and
+    /// `A_log[h]` per head. KDA's forget gate is CHANNEL-wise where the
+    /// gated-delta rule's is head-wise, and the two shapes are that
+    /// difference.
     fn kda_step<T: Scalar>(
         &self,
         mixed: In<Self::Tensor<T>>,
         f: In<Self::Tensor<T>>,
         b: In<Self::Tensor<T>>,
-        dt_bias: Const<Self::Tensor<T>>,
-        a_log: Const<Self::Tensor<T>>,
+        dt_bias: Const<Self::Tensor<f32>>,
+        a_log: Const<Self::Tensor<f32>>,
         state: Cache<Self::Recurrent>,
         heads: u32,
         head_dim: u32,
@@ -1083,8 +1256,8 @@ pub trait Ssm: Plane {
         indptr: In<Self::Tensor<i32>>,
         f: In<Self::Tensor<T>>,
         b: In<Self::Tensor<T>>,
-        dt_bias: Const<Self::Tensor<T>>,
-        a_log: Const<Self::Tensor<T>>,
+        dt_bias: Const<Self::Tensor<f32>>,
+        a_log: Const<Self::Tensor<f32>>,
         state: Cache<Self::Recurrent>,
         heads: u32,
         head_dim: u32,
@@ -1194,6 +1367,17 @@ pub trait Attention: Plane {
     /// [`Attention::decode`], also leaving the per-row log-sum-exp — the
     /// normaliser a second attention's output is merged against, and what
     /// a sink correction rescales by.
+    ///
+    /// THE LSE RIDES BASE TWO, and this is the sentence every other lse
+    /// slot on the floor points at. A softmax kernel does not compute
+    /// `exp`: it folds `log2(e)` into the scale once and runs the whole
+    /// row on `exp2`, because that is the instruction the hardware has. So
+    /// `m + log2(d)` is what an attention reading HAS at the end, and
+    /// every base a floor could name costs somebody a launch to produce
+    /// except that one. A plane whose kernel accumulates in another base
+    /// converts before it writes this slot; a consumer reads log2 and says
+    /// so where it meets a quantity that is not — which is
+    /// [`Attention::sink`], and only there.
     fn decode_lse<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
@@ -1210,7 +1394,8 @@ pub trait Attention: Plane {
         })
     }
 
-    /// [`Attention::prefill`], also leaving the per-row log-sum-exp.
+    /// [`Attention::prefill`], also leaving the per-row log-sum-exp, in
+    /// [`Attention::decode_lse`]'s base.
     fn prefill_lse<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
@@ -1233,13 +1418,31 @@ pub trait Attention: Plane {
 
     /// The attention-sink correction: fold a learned per-head logit into
     /// the softmax after the fact, by rescaling the output against the
-    /// `lse` an `_lse` reading left. The sink rides f32 with the lse —
-    /// both are normaliser arithmetic — while the output rides `T`.
+    /// `lse` an `_lse` reading left — `o *= sigmoid(lse·ln2 − sink)`, which
+    /// is the softmax a virtual zero-valued key at logit `sink[h]` would
+    /// have produced.
+    ///
+    /// THE ONE POINT WHERE TWO BASES MEET, and the whole reason it states
+    /// which. The lse arrives in base two ([`Attention::decode_lse`]); the
+    /// sink is a LOGIT OUT OF A CHECKPOINT and a checkpoint's logits are
+    /// natural — gpt-oss ships `self_attn.sinks` as the `exp(sink)` term
+    /// of an `exp` denominator. Neither fact is anybody's to move, so the
+    /// subtraction rebases, and this declaration is where that is written
+    /// down instead of being a factor of 0.693 somebody's greedy decode
+    /// drifts by (`kernels-cuda/kernels/attn/attn_sink.cuh` records that
+    /// bug being found and fixed once already).
+    ///
+    /// THE SINK RIDES `T` BECAUSE THE CHECKPOINT DOES. It is a per-head
+    /// weight, not accumulator state: gpt-oss ships `[64]` at BF16 and
+    /// dsv4's import copies `attn.sinks` through at the model's element,
+    /// so a slot pinned to f32 would be a declaration no text could state
+    /// without lying about its own bytes. The lse beside it stays f32 —
+    /// that one really is accumulator state, minted by the fire.
     fn sink<T: Scalar>(
         &self,
         o: InOut<Self::Tensor<T>>,
         lse: In<Self::Tensor<f32>>,
-        sink: Const<Self::Tensor<f32>>,
+        sink: Const<Self::Tensor<T>>,
         head_dim: u32,
     ) -> Result<(), Refusal> {
         let _ = (o, lse, sink, head_dim);
@@ -1252,6 +1455,12 @@ pub trait Attention: Plane {
     /// log-sum-exps: `(o1, lse1)` and `(o2, lse2)` become the pair a single
     /// softmax over the union would have produced. The merged lse is a
     /// result and not scratch — a third merge reads it.
+    ///
+    /// BASE-AGNOSTIC ARITHMETIC AT A STATED BASE. The weights this folds by
+    /// are RATIOS — `b^(l1 - m)` against `b^(l2 - m)` — so the merge is the
+    /// same number in any base, and the base is stated all the same because
+    /// the lse it leaves is one an [`Attention::sink`] downstream reads.
+    /// Both operands and the result ride [`Attention::decode_lse`]'s base.
     fn merge_lse<T: Scalar>(
         &self,
         o1: In<Self::Tensor<T>>,
@@ -1266,22 +1475,6 @@ pub trait Attention: Plane {
         let _ = (o1, lse1, o2, lse2, heads, head_dim, o, lse);
         Err(Refusal::Absent {
             what: "attention.merge_lse",
-        })
-    }
-
-    /// Rebase a log-sum-exp from log2 to ln, in place.
-    ///
-    /// NO AXIS: an lse is f32 wherever it came from, so there is nothing
-    /// for this point to quantify over and its dispatch is a single arm.
-    /// It lives in this family and not in `Norm` because the only thing
-    /// that produces one is an `_lse` reading above, and the only things
-    /// that consume one are [`Attention::sink`] and
-    /// [`Attention::merge_lse`] beside it — the base disagreement is
-    /// between two attention kernels and belongs where both are named.
-    fn lse_ln(&self, lse: InOut<Self::Tensor<f32>>) -> Result<(), Refusal> {
-        let _ = lse;
-        Err(Refusal::Absent {
-            what: "attention.lse_ln",
         })
     }
 
@@ -1380,12 +1573,13 @@ pub trait Mla: Plane {
     /// [`Mla::latents`] with the rope half rotated on the way out — glm's
     /// reading, which never sees the unrotated `k_pe`.
     ///
-    /// Unclaimed on every plane, and the absence is a fusion rather than a
-    /// missing kernel: cuda's `mla_prepare_bf16` does this and three more
-    /// things in one launch (it cuts `q_b` as well, and appends the pair to
-    /// the pages), takes the layer's whole `MlaLayer` staging beside a page
-    /// view and the fire's row-validity plane, and is `untraced` for exactly
-    /// that reason. The measured glm gap.
+    /// CLAIMED ON CUDA, AS TWO LAUNCHES. The absence recorded here was a
+    /// FUSION rather than a missing kernel — `mla_prepare_bf16` does this
+    /// and three more things in one launch, and is `untraced` for that
+    /// reason — but the declared statement is only the cut plus a rotation
+    /// of its rope half, and that is [`Mla::latents`]'s own routine followed
+    /// by an ordinary partial rope over a one-head row. The fused kernel
+    /// stays where it is; the point does not need it.
     fn latents_rope<T: Scalar>(
         &self,
         kv_a: In<Self::Tensor<T>>,
@@ -1456,39 +1650,6 @@ pub trait Mla: Plane {
         })
     }
 
-    /// [`Mla::absorb_q`] with the rotated half folded into the same result —
-    /// glm's absorb, which carries `q_pe` through rather than handing it to
-    /// the attention as a second operand.
-    ///
-    /// Unclaimed on every plane: cuda's absorb is a strided batched gemm
-    /// with ONE activation operand and no place to put a second, and the
-    /// fold is not a gemm. The measured glm gap.
-    fn absorb_q_pe<T: Scalar>(
-        &self,
-        q_nope: In<Self::Tensor<T>>,
-        q_pe: In<Self::Tensor<T>>,
-        kv_b: Const<Self::Tensor<T>>,
-        heads: u32,
-        kv_lora_rank: u32,
-        nope_dim: u32,
-        v_head_dim: u32,
-        q_latent: Out<Self::Tensor<T>>,
-    ) -> Result<(), Refusal> {
-        let _ = (
-            q_nope,
-            q_pe,
-            kv_b,
-            heads,
-            kv_lora_rank,
-            nope_dim,
-            v_head_dim,
-            q_latent,
-        );
-        Err(Refusal::Absent {
-            what: "mla.absorb_q_pe",
-        })
-    }
-
     /// `o[h] = kv_b_v[h]ᵀ @ latent[h]`: the attended latent, absorbed back
     /// out to the value basis.
     fn absorb_out<T: Scalar>(
@@ -1509,10 +1670,15 @@ pub trait Mla: Plane {
 
     /// Append the latent pair to the paged pool this family owns.
     ///
-    /// Unclaimed on every plane: cuda's `write_mla_to_pages` is `untraced`
-    /// and takes the layer's `MlaLayer` staging, the fire's query CSR, its
-    /// row-validity plane and the request count beside the page view — none
-    /// of which a statement names. The measured kimi/glm gap.
+    /// CLAIMED ON CUDA, and what closed it was the POOL VIEW rather than a
+    /// new slot here. `write_mla_to_pages` wants the layer's two page
+    /// planes, the fire's query CSR, its row-validity plane and the request
+    /// count beside the page view; the page planes and the page CSR were
+    /// always the pool row's, and cuda's `Pages` view now also carries the
+    /// query CSR, the row validity and the request count it is BUILT PER
+    /// FIRE out of. That is a plane's own answer to "which rows of this
+    /// fire, and where" — not a slot, because no text can place it. The
+    /// declaration is unchanged: two rectangles and one cache row.
     fn kv_append<T: Scalar>(
         &self,
         kv_c: In<Self::Tensor<T>>,
@@ -1529,14 +1695,17 @@ pub trait Mla: Plane {
     /// rotated half the absorb did not fold in, matched against the pool's
     /// own `k_pe` plane.
     ///
-    /// UNCLAIMED, and so are the three below it. One `unsafe`, `untraced`
-    /// `dispatch_attention_mla_bf16` served all four in the legacy tree: it
-    /// takes a host-side `&MlaPlan` measured against the page table, a
-    /// `MlaLayer`, an `AttnMask` raise and the request count, branches on
-    /// the device's compute capability, and answers with a `MlaDispatch`
-    /// rather than a fired point. A routine that returns which kernel it
-    /// picked is not a claim, and none of its staging is a statement's. Four
-    /// measured rows.
+    /// CLAIM-ONLY on cuda, and this one and [`Mla::attention_prefill`] now
+    /// resolve through a routine that has a real operand column.
+    /// `dispatch_attention_mla_bf16` was `unsafe`, `untraced` and answered
+    /// with a `MlaDispatch` saying which kernel it picked; it is none of
+    /// those any more, and `attn::attention_mla_{decode,prefill}_bf16` are
+    /// the columned form — the statement's operands, with the SCHEDULE as a
+    /// raise. What keeps a body off these two is the schedule: it is
+    /// measured on the HOST out of three CSR slices and uploaded into an int
+    /// arena the launch reads, which is [`Attention::decode`]'s plan-cache
+    /// seam exactly. Two rows, and they are plane staging rather than
+    /// missing kernels.
     fn attention_decode<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
@@ -1572,31 +1741,56 @@ pub trait Mla: Plane {
         })
     }
 
-    /// Attend in the latent basis over the keys a `selection` mask keeps —
-    /// deepseek's sparse indexer, read one token per request. The query
-    /// carries its own rotated half, which is why no `q_pe` is stated.
+    /// [`Mla::attention_decode`] over the keys a `selection` KEEPS —
+    /// deepseek's sparse indexer, read one token per request.
+    ///
+    /// THE QUERY IS THE SEPARATE PAIR, and that is a correction rather than
+    /// an addition. This point used to state one fused `q` and no `q_pe`,
+    /// on the reading that glm's absorb carried the rotated half in the
+    /// result's tail; `mla.absorb_q_pe` was the other end of that reading
+    /// and is now DELETED, because nothing writes such a tail (the absorb
+    /// is a strided batched gemm with one activation operand, and no
+    /// per-head scatter exists) and nothing reads one — every latent
+    /// attention kernel in this tree addresses `q_nope` and `q_pe` as two
+    /// planes with two pitches and no stride between them. The legacy glm
+    /// text folded nothing either; it called the same separate-pair absorb
+    /// kimi does. So these two read exactly as [`Mla::attention_decode`]
+    /// and [`Mla::attention_prefill`] do, plus the selection.
+    ///
+    /// `selection` IS AN INDEX LIST AND NOT A MASK: `[tokens, top_k]` of
+    /// `i32`, ascending, padded with `-1`. A mask would be `[tokens, kv]`
+    /// and the kv extent is a per-request runtime number that appears in no
+    /// slot of [`Index::topk`] — the one rectangle `model_compiler`'s width
+    /// table could not size. `top_k` IS a stated scalar, so the list is
+    /// dense and sized, and an attention that consumes it WALKS it instead
+    /// of testing every cached key against a byte, which is what makes the
+    /// sparse reading actually sparse.
     fn attention_decode_selected<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
-        selection: In<Self::Tensor<u8>>,
+        q_pe: In<Self::Tensor<T>>,
+        selection: In<Self::Tensor<i32>>,
         pages: Cache<Self::Pages>,
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Out<Self::Tensor<T>>,
     ) -> Result<(), Refusal> {
-        let _ = (q, selection, pages, heads, kv_lora_rank, sm_scale, o);
+        let _ = (q, q_pe, selection, pages, heads, kv_lora_rank, sm_scale, o);
         Err(Refusal::Absent {
             what: "mla.attention_decode_selected",
         })
     }
 
-    /// [`Mla::attention_decode_selected`] over a prefill window.
+    /// [`Mla::attention_decode_selected`] over a prefill window, `indptr`
+    /// the fire's query CSR — [`Mla::attention_prefill`]'s slot order with
+    /// `selection` after `q_pe`.
     fn attention_prefill_selected<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
         indptr: In<Self::Tensor<i32>>,
-        selection: In<Self::Tensor<u8>>,
+        q_pe: In<Self::Tensor<T>>,
+        selection: In<Self::Tensor<i32>>,
         pages: Cache<Self::Pages>,
         heads: u32,
         kv_lora_rank: u32,
@@ -1606,6 +1800,7 @@ pub trait Mla: Plane {
         let _ = (
             q,
             indptr,
+            q_pe,
             selection,
             pages,
             heads,
@@ -1666,15 +1861,34 @@ pub trait Index: Plane {
         })
     }
 
-    /// Score every cached key against the query, keep the top `top_k`, and
-    /// write the selection out as a byte mask.
+    /// Score every CACHED key against the query and answer WHICH `top_k` of
+    /// them the attention should read:
     ///
-    /// Unclaimed on every plane. `dsa_index_topk_mask` scores a TOKEN-PLANE
-    /// `idx_k` — an ordinary rectangle of the keys this fire just wrote —
-    /// and the statement names the POOL those keys live in. A cache row and
-    /// a staged rectangle are different binders, which is the whole of what
-    /// a mark says, so nothing here is a rename away from claiming it. The
-    /// measured glm gap.
+    /// ```text
+    /// logit[t, j] = Σ_h relu(q[t, h] · k[j]) * weights[t, h]
+    /// ```
+    ///
+    /// causal in the request's own absolute positions, `j` running over the
+    /// whole cached prefix and not merely over this fire's rows.
+    ///
+    /// THE RESULT IS AN INDEX LIST AND NOT A MASK, and that is the shape
+    /// decision this point exists to record. A byte mask is `[tokens, kv]`,
+    /// and the kv extent is a PER-REQUEST RUNTIME NUMBER: it appears in no
+    /// operand, no param and no bank of this statement, so no width rule can
+    /// size it and `model_compiler::program::out_sizes` carried it as its
+    /// one honest `None`. `top_k` is a stated scalar. `[tokens, top_k]` of
+    /// `i32` — ascending, `-1` past the end — is therefore dense, sized
+    /// from the statement itself, and the form `moe.topk_sigmoid`'s `routes`
+    /// already established for "which of many, at a fixed budget". It is
+    /// also the CHEAPER value at every kv longer than `4 * top_k` bytes, and
+    /// the only one an attention can consume by WALKING rather than by
+    /// testing every cached key against a byte.
+    ///
+    /// The legacy `dsa_index_topk_mask` is not this point and never was: it
+    /// scores a TOKEN-PLANE `idx_k`, its causality is `j <= i` inside one
+    /// fire, and the mask it wrote was assigned to `let _index_mask` and
+    /// thrown away. The paged reading is the new one, and `index_topk_paged`
+    /// is the kernel for it.
     fn topk<T: Scalar>(
         &self,
         q: In<Self::Tensor<T>>,
@@ -1683,7 +1897,7 @@ pub trait Index: Plane {
         heads: u32,
         head_dim: u32,
         top_k: u32,
-        selection: Out<Self::Tensor<u8>>,
+        selection: Out<Self::Tensor<i32>>,
     ) -> Result<(), Refusal> {
         let _ = (q, weights, keys, heads, head_dim, top_k, selection);
         Err(Refusal::Absent {
@@ -1693,11 +1907,13 @@ pub trait Index: Plane {
 
     /// Append this fire's key rows to the indexer's own pool.
     ///
-    /// Unclaimed on every plane, and NO ROUTINE ANYWHERE ANSWERS IT: the
-    /// legacy indexer never paged its keys at all — it scored the token
-    /// plane it had just written and kept nothing across fires. The pool the
-    /// statement names is the new reading, and this is the row that measures
-    /// it.
+    /// NO ROUTINE ANYWHERE ANSWERED IT and none had to: the legacy indexer
+    /// never paged its keys at all — it scored the token plane it had just
+    /// written and kept nothing across fires. The pool the statement names
+    /// is the new reading. A SINGLE-PLANE append is what it is: one row per
+    /// token, `k` only, no value half, into the page slot the fire's CSR
+    /// resolves to — which is [`Mla::kv_append`]'s destination arithmetic
+    /// with the second plane empty.
     fn kv_append<T: Scalar>(
         &self,
         k: In<Self::Tensor<T>>,
@@ -1815,6 +2031,9 @@ pub trait Pool: Plane {
 
     /// Attend over the pooled entries, stating the log-sum-exp beside the
     /// output so the merge with the full-resolution attention is exact.
+    ///
+    /// The lse rides [`Attention::decode_lse`]'s base, because the only
+    /// thing that ever reads it is the merge against one.
     ///
     /// Claim-only, for [`Pool::kv_append`]'s two-cache reason and one more:
     /// `attention_compressed_paged` also reads the fire's request-of-token

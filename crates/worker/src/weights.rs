@@ -55,16 +55,16 @@ impl Model {
     /// second path that parses the files beside a snapshot.
     ///
     /// One reader is left, and it wants three fields:
-    /// [`Encoding::from_config_json`](model::encoding::Encoding::from_config_json)
+    /// [`Encoding::from_config_json`](model::serve::encoding::Encoding::from_config_json)
     /// asks what quantization the checkpoint declares. Everything else the
     /// old `pie.model/1` document carried is a catalog row's now.
     ///
     /// The tokenizer half stays optional, and all-or-nothing: half the
     /// tokenizer compiled and half probed from files is the skew the artifact
     /// removes, so a partial one is treated as absent and the files win.
-    pub fn metadata(&self) -> Result<model::ModelMetadata> {
+    pub fn metadata(&self) -> Result<model::serve::ModelMetadata> {
         let Model::Artifact(path) = self else {
-            return Ok(model::ModelMetadata {
+            return Ok(model::serve::ModelMetadata {
                 tokenizer: None,
                 config: lift_snapshot_config(self.path())?,
             });
@@ -74,17 +74,19 @@ impl Model {
         let checkpoint = model_loader::checkpoint::read::parse_checkpoint_metadata(path)
             .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
-        let config =
-            model_loader::checkpoint::read::read_meta(&checkpoint, model::encoding::CONFIG_OBJECT)?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "artifact {} carries no {}; it was written when an artifact \
+        let config = model_loader::checkpoint::read::read_meta(
+            &checkpoint,
+            model::serve::encoding::CONFIG_OBJECT,
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "artifact {} carries no {}; it was written when an artifact \
                  carried a resolved `pie.model/1` document instead of the \
                  checkpoint's own config. Re-import it with `pie model import`",
-                        path.display(),
-                        model::encoding::CONFIG_OBJECT,
-                    )
-                })?;
+                path.display(),
+                model::serve::encoding::CONFIG_OBJECT,
+            )
+        })?;
 
         let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
         for name in tokenizer::canonical::OBJECTS {
@@ -94,7 +96,7 @@ impl Model {
             };
             tokenizer.push((name.to_string(), bytes));
         }
-        Ok(model::ModelMetadata {
+        Ok(model::serve::ModelMetadata {
             tokenizer: (!tokenizer.is_empty()).then_some(tokenizer),
             config,
         })
@@ -118,7 +120,7 @@ impl Model {
 /// The three that remain are the declared quantization — method, bits,
 /// group size — and they are the only ones a row cannot state, because
 /// they are properties of the FILES and Qwen3-8B ships as four
-/// different sets of them. [`model::encoding::Encoding::from_config_json`]
+/// different sets of them. [`model::serve::encoding::Encoding::from_config_json`]
 /// reads exactly those three, so what has to cross is the config
 /// itself.
 ///
@@ -380,20 +382,31 @@ fn runtime_dir_of(archive: &Path) -> Option<PathBuf> {
 ///
 /// # Why identification is checked here and not left to the driver
 ///
-/// Measured, on `openai/gpt-oss-20b`: `pie model build --backend cuda` wrote an
-/// artifact that `model::catalog::identify` refused — *"missing
-/// `layer.{}.mlp.experts.gate_up_proj_bias`"* — because a built artifact's
-/// tensors are post-transform and match no manifest by construction. That is
-/// now fixed at the root (`catalog::identify_artifact`: a build states the row
-/// this same identification settled against the archive), so the question
-/// asked below is the one that can be answered.
+/// The *class* of failure is what a cache must not propagate: an artifact
+/// naming a row this build does not serve, or one the catalog has since
+/// dropped, would otherwise take a boot that worked and stop it from booting at
+/// all. A cache whose hit can be worse than its miss is not a cache. So the
+/// file is asked the question the driver will ask, here, where the answer can
+/// still be "use the archive instead".
 ///
-/// The check stays regardless, because the *class* of failure is what a cache
-/// must not propagate: an artifact naming a row this build does not serve, or
-/// one the catalog has since dropped, would otherwise take a boot that worked
-/// and stop it from booting at all. A cache whose hit can be worse than its
-/// miss is not a cache. So the file is asked the question the driver will ask,
-/// here, where the answer can still be "use the archive instead".
+/// # The question is the row it NAMES, not the tensors it holds
+///
+/// This used to call `model::catalog::identify_artifact`, which had two legs: a
+/// named row was looked up in the catalog, and an artifact that named none was
+/// identified from its tensors against every manifest. The second leg never
+/// once succeeded here, and that was measured rather than assumed — on
+/// `openai/gpt-oss-20b`, `pie model build --backend cuda` wrote an artifact
+/// that manifest identification refused (*"missing
+/// `layer.{}.mlp.experts.gate_up_proj_bias`"*), because a built artifact's
+/// tensors are POST-TRANSFORM and match no manifest by construction. That is
+/// why builds started writing the row down.
+///
+/// So the surviving question is the first leg, and it is asked directly:
+/// `meta::MODEL_ID_KEY` is what the build settled on, and the only thing this
+/// boot needs to know is whether it can still serve it. The statement's safety
+/// condition is already met above — `answers` refuses any artifact that does
+/// not state THIS contract revision, which is the pairing `MODEL_ID_KEY`'s own
+/// doc requires before its word may be taken.
 fn runtime_answers(path: &Path, request: &Request, source_stat: &str) -> bool {
     let Ok(attributes) = model_loader::checkpoint::zt::read_attributes(path) else {
         return false;
@@ -401,29 +414,14 @@ fn runtime_answers(path: &Path, request: &Request, source_stat: &str) -> bool {
     if !answers(&attributes, request, source_stat) {
         return false;
     }
-    let Ok(metadata) = model_loader::checkpoint::read::parse_checkpoint_metadata(path) else {
+    // A parse, for its failure and not its value: a file whose header this build
+    // cannot read is one the driver will not read either, and finding that out
+    // here is what leaves the archive as an option.
+    if model_loader::checkpoint::read::parse_checkpoint_metadata(path).is_err() {
         tracing::warn!(runtime = %path.display(), "a prebuilt runtime cannot be read; ignoring it");
         return false;
-    };
-    // The same map, in the shape the catalog reads. `read_attributes` already
-    // kept only the text-valued entries, which is all provenance ever is, so
-    // this re-wraps rather than re-reads.
-    let stated = model_loader::checkpoint::Attributes::from_pairs(
-        attributes
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    model_loader::checkpoint::Attribute::Text(value.clone()),
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-    // `Override::None` and not the boot's `--as`: the worker does not carry
-    // one, and guessing wrong here can only cost a fallback to the archive.
-    if let Err(why) =
-        model::catalog::identify_artifact(&stated, &metadata, &model::catalog::Override::None)
-    {
+    }
+    if let Err(why) = serves_the_row_it_names(&attributes) {
         tracing::warn!(
             runtime = %path.display(),
             "a prebuilt runtime was built for this boot but is not a model this build \
@@ -432,6 +430,35 @@ fn runtime_answers(path: &Path, request: &Request, source_stat: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Whether the row an artifact NAMES is one this build still ships.
+///
+/// Split from the read for the reason [`answers`] is split from it: the whole
+/// decision is over a map of stated facts, so it can be held to every way an
+/// artifact can name the wrong thing without writing a `.zt` per case.
+///
+/// The caller has already established the safety condition this rests on —
+/// [`answers`] refuses anything not stating THIS contract revision — so the id
+/// found here may be believed. See [`runtime_answers`] for why that is the only
+/// question left to ask.
+fn serves_the_row_it_names(
+    attributes: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Some(stated) = attributes.get(model_loader::checkpoint::meta::MODEL_ID_KEY) else {
+        return Err(
+            "it names no model row, so there is nothing to hold it to; it was built \
+             before builds wrote the row down"
+                .to_string(),
+        );
+    };
+    if model::serve::row(stated).is_none() {
+        return Err(format!(
+            "it names {stated:?}, which this build does not ship; nearest ids: {:?}",
+            model::serve::nearest_ids(stated, 3)
+        ));
+    }
+    Ok(())
 }
 
 /// The match itself, over an artifact's stated facts.
@@ -472,6 +499,45 @@ mod tests {
     use super::*;
     use model_loader::checkpoint::write::CheckpointWriter;
     use model_loader::types::{DType, Encoding, TensorDecl, TensorId};
+
+    /// The attribute map an artifact carries, with whatever row it names.
+    fn names(row: Option<&str>) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        if let Some(row) = row {
+            map.insert(
+                model_loader::checkpoint::meta::MODEL_ID_KEY.to_string(),
+                row.to_string(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn a_runtime_naming_a_row_this_build_ships_is_taken_at_its_word() {
+        let shipped = model::serve::ROWS[0].id;
+        assert!(serves_the_row_it_names(&names(Some(shipped))).is_ok());
+    }
+
+    /// The failure this check exists for: a cache entry naming a row the
+    /// catalog has since dropped must send the boot to the archive, not stop
+    /// it. The reason names the id AND the near misses, because "this build
+    /// does not ship it" is a sentence a reader has to be able to act on.
+    #[test]
+    fn a_runtime_naming_a_row_this_build_dropped_is_refused_with_its_near_misses() {
+        let why = serves_the_row_it_names(&names(Some("gpt-oss-21b")))
+            .expect_err("this build ships no `gpt-oss-21b`");
+        assert!(why.contains("gpt-oss-21b"), "{why}");
+        assert!(why.contains("gpt-oss-20b"), "{why}");
+    }
+
+    /// An artifact from before builds wrote the row down states nothing this
+    /// check can act on. It is refused rather than identified from its tensors:
+    /// that leg existed and never once succeeded, because a built artifact's
+    /// tensors are post-transform and match no manifest by construction.
+    #[test]
+    fn a_runtime_that_names_no_row_is_refused_rather_than_identified() {
+        assert!(serves_the_row_it_names(&names(None)).is_err());
+    }
 
     /// The request `crates/model/src/boot.rs` makes today, and what
     /// `pie model build --backend cuda` states in answer to it.
@@ -706,7 +772,7 @@ mod tests {
         let mut writer = CheckpointWriter::create(&path, &Default::default()).unwrap();
         // Ascending names: `model/…` sorts before `tokenizer/…`.
         writer
-            .add_meta(model::encoding::CONFIG_OBJECT, config)
+            .add_meta(model::serve::encoding::CONFIG_OBJECT, config)
             .unwrap();
         for (name, bytes) in canonical.objects() {
             if !whole_tokenizer && name == tokenizer::canonical::MERGE_TABLE {
@@ -826,7 +892,7 @@ mod tests {
         // defect: most checkpoints declare no quantization, and an absent
         // block is an unquantized checkpoint rather than a missing answer.
         assert!(
-            model::encoding::Encoding::from_config_value(&doc).is_none(),
+            model::serve::encoding::Encoding::from_config_value(&doc).is_none(),
             "an unquantized snapshot declares nothing"
         );
 

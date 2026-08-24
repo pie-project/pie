@@ -284,6 +284,14 @@ fn repr_agrees(repr: &str, dtype: Dtype) -> bool {
         "bf16" => dtype == Dtype::Bf16,
         "f16" => dtype == Dtype::F16,
         "f32" => dtype == Dtype::F32,
+        // A QUANTISED PLANE STILL HAS A STORAGE ANSWER, and leaving it in
+        // the `_` arm was the check declining to run: every repr it did not
+        // know agreed with every dtype, so `mxfp4` would have "matched" a
+        // bank of bf16 and the line would still have read "every satisfied
+        // param's storage matches its plan repr". Both mxfp4 planes are byte
+        // runs — 4-bit codes packed two to a byte, E8M0 exponents one to a
+        // byte — so `U8` is what the checkpoint must say, and now does.
+        "mxfp4" | "e8m0" => dtype == Dtype::U8,
         _ => true,
     }
 }

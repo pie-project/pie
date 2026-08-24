@@ -271,6 +271,58 @@ impl<E: kernels::Elem> kernels::ConstRun for Tensor<E> {
     type Held = E::Read;
 }
 
+/// This plane's `Plane::Bank<R>`: a QUANTISED bank's payload, as the tag a
+/// `Const` slot wears.
+///
+/// `Tensor<E>` one line up is the same shape of thing — a zero-sized tag
+/// whose `ConstRun::Held` is what the mark actually carries — and the only
+/// difference is that a bank's `Held` is a PAIR of addresses rather than
+/// one. That is the whole content of `Bank` vs `Tensor` on this plane: there
+/// is no rectangle, no element, no stride, and no rows/width the way `In`
+/// and `Out` have them, because the dimensions a bank has are the ones the
+/// STATEMENT's other operands already state (`y.width` is `N`, `x.width` is
+/// `K`) and the ones the repr defines (32 codes to a scale group).
+#[derive(Debug)]
+pub struct Bank<R>(core::marker::PhantomData<R>);
+
+impl<R> Clone for Bank<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R> Copy for Bank<R> {}
+
+/// The addresses one bank's byte planes begin at, on this device.
+///
+/// TWO NAMED FIELDS AND NOT AN ARRAY, because the two planes are not
+/// interchangeable and a kernel indexes them differently: `codes` is
+/// `[E, N, K/2]` and `scales` is `[E, N, K/32]`, so an off-by-one between
+/// them is silently a wrong number rather than a fault. A repr storing one
+/// plane leaves `scales` null; a repr storing three wants a third field and
+/// a third `Const` column, which is why `Repr::PLANES` is a constant on the
+/// repr and not a length here.
+///
+/// EXPERT STRIDE IS NOT HERE EITHER. A bank is `[E, ...]` contiguous — one
+/// upload, one allocation — so expert `e`'s slab begins at
+/// `codes + e * N * K/2`, which the kernel computes from numbers it already
+/// has. That retires the per-expert POINTER ARRAYS the legacy MXFP4 leg had
+/// to carve at load (`driver-cuda`'s `build_moe_expert_ptrs`) and the whole
+/// class of fault they existed to prevent.
+#[derive(Debug, Clone, Copy)]
+pub struct Planes {
+    /// The packed codes: 4-bit E2M1 two to a byte for mxfp4.
+    pub codes: *const u8,
+
+    /// The block scales: one E8M0 byte per 32 codes for mxfp4.
+    pub scales: *const u8,
+}
+
+impl<R: kernels::points::Repr> kernels::ConstRun for Bank<R> {
+    const RUN: kernels::routine::Claim = kernels::routine::Claim::Weight;
+    const TY: Ty = Ty::U8s;
+    type Held = Planes;
+}
+
 impl kernels::Elem for bf16 {
     type Read = *const bf16;
     type Write = *mut bf16;
@@ -307,6 +359,21 @@ impl kernels::Elem for f16 {
     const CPP_MUT: &'static str = "::pie::f16*";
     const TY_CONST: Ty = Ty::F16s;
     const TY_MUT: Ty = Ty::F16sMut;
+}
+
+/// The two elements this plane instantiates that the floor cannot name.
+///
+/// `kernels::bound::Rides` is what lets a bound statement CHECK that the
+/// element a dispatch asked a slot for is the element the rectangle carries.
+/// The floor implements it for the primitives it owns; the half-precision
+/// pair is declared here, which is also the only place it could be — both
+/// types are this crate's.
+impl kernels::bound::Rides for bf16 {
+    const AXIS: kernels::bound::Axis = kernels::bound::Axis::Bf16;
+}
+
+impl kernels::bound::Rides for f16 {
+    const AXIS: kernels::bound::Axis = kernels::bound::Axis::F16;
 }
 
 ptr_abi!(bf16, "const ::pie::bf16*", Bf16s, "::pie::bf16*", Bf16sMut);

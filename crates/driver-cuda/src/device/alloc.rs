@@ -170,12 +170,14 @@ impl Allocator {
     ///
     /// The returned scope holds `&mut self`, so no allocation while it lives.
     /// Mode is `Global`, the strictest, to catch a stray sync call.
-    /// [`warm`](crate::fire::supergraph::warm) JIT-compiles the arming
-    /// kernels before capture opens: their first resolve does an illegal
-    /// `cudaFree(null)` inside a capture. A refused warm isn't a refused
-    /// capture — `open_cond` refuses later for an unbuildable kernel.
+    ///
+    /// A `fire::supergraph::warm()` call STOOD HERE: the conditional-node
+    /// arming kernels had to be JIT-compiled BEFORE a capture opened,
+    /// because their first resolve does an illegal `cudaFree(null)` inside
+    /// one. Those kernels are deleted with the union supergraph. Any kernel a
+    /// future capture arms will need the same warming, and this is where it
+    /// goes.
     pub fn begin_capture<'a>(&'a mut self, stream: StreamRef<'a>) -> Result<CaptureScope<'a>> {
-        let _ = crate::fire::supergraph::warm();
         {
             let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             st.begin()?;

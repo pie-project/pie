@@ -1,30 +1,44 @@
 //! The fire's pooled buffers.
 //!
-//! Pooled so a capture can outlive the fire: a recorded graph bakes the
-//! addresses it saw.
+//! Pooled, not per-fire: growth is what a pool avoids, and `cudaFree`
+//! synchronizes the device.
+
+/// Monotonic count of pooled-buffer rewrites.
+///
+/// It lived in `fire::recordings` and outlived it. Its old job was the graph
+/// cache's staleness key — a captured exec bakes the addresses it saw, so a
+/// pool that grew and moved a base had to make every recorded exec a miss.
+/// There is no capture to invalidate, and the counter STAYS because it is the
+/// one honest record of "a pooled base moved", which is what a future capture
+/// of the eager walk will key on and what a leak hunt reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PlanEpoch(u64);
+
+impl PlanEpoch {
+    /// The only way the epoch changes, so nothing else can manufacture one.
+    pub(crate) fn bump(&mut self) {
+        self.0 += 1;
+    }
+}
 
 /// The per-fire device arrays, pooled across fires.
 ///
-/// A captured exec bakes the addresses it recorded, so buffers are grown, not
-/// freed. Growth moves a base address and bumps [`Self::epoch`], the key
-/// `Recordings` files execs under: stale means recapture, not a wrong answer.
+/// Buffers are grown, not freed. Growth moves a base address and bumps
+/// [`Self::epoch`].
 #[derive(Default)]
 pub(crate) struct Scratch {
-    pub(crate) arena: Option<crate::device::DeviceBuffer>,
+    /// The walk's activation arena, `rows * program.row_pitch` — see
+    /// [`Self::baker_arena`].
+    pub(crate) baker: Option<crate::device::DeviceBuffer>,
+    /// Where the walk repitches its `out` seam, and where the delivery reads
+    /// it — see [`Self::logits`].
+    pub(crate) logits: Option<crate::device::DeviceBuffer>,
     /// The unconditional attention-score sink — see [`Self::score`].
     pub(crate) score: Option<crate::device::DeviceBuffer>,
     /// The unconditional custom attention mask — see [`Self::mask`].
     pub(crate) mask: Option<crate::device::DeviceBuffer>,
-    /// The driver-owned attention landing buffer — see [`Self::attn_out`].
-    pub(crate) attn_out: Option<crate::device::DeviceBuffer>,
-    /// The adapter correction's xAᵀ staging — see [`Self::lora_gate`].
-    pub(crate) lora_gate: Option<crate::device::DeviceBuffer>,
-    /// The attention log-sum-exp — see [`Self::lse`].
-    pub(crate) lse: Option<crate::device::DeviceBuffer>,
     /// The per-row live flags — see [`Self::row_valid`].
     pub(crate) row_valid: Option<crate::device::DeviceBuffer>,
-    pub(crate) named:
-        std::collections::BTreeMap<model_ir::trace::ValueId, crate::device::DeviceBuffer>,
     /// The small per-fire u32 descriptor arrays, by slot — see [`slot`].
     pub(crate) slots: Vec<Option<crate::device::DeviceBuffer>>,
     /// Pinned host staging for those uploads, one per slot.
@@ -33,7 +47,7 @@ pub(crate) struct Scratch {
     /// async. One per slot, since a shared buffer would be overwritten while
     /// the previous slot's copy was still queued.
     pub(crate) staging: Vec<Option<crate::device::PinnedBuf>>,
-    pub(crate) epoch: crate::fire::recordings::PlanEpoch,
+    pub(crate) epoch: PlanEpoch,
 }
 
 /// Which slot holds what. The numbers are the interface: two slots claiming one
@@ -48,14 +62,12 @@ pub(crate) mod slot {
     pub(crate) const W_PAGE: usize = 6;
     pub(crate) const W_OFF: usize = 7;
     pub(crate) const SAMPLED: usize = 8;
-    // A peel's tail needs its own: the prefix reads the fire's CSRs after the
-    // tail has uploaded, so the two must not share a slot.
-    pub(crate) const TAIL_INDPTR: usize = 9;
-    pub(crate) const TAIL_LENS: usize = 10;
-    pub(crate) const TAIL_INDICES: usize = 11;
-    pub(crate) const TAIL_QO: usize = 12;
-    /// `"request_of_token"` — the runtime stream a text may name; staged only
-    /// when the fire's plan names it.
+    // 9..=12 STOOD FOR a peel tail's own four CSR slots, so the prefix could
+    // read the fire's after the tail had uploaded. There is no peel. The
+    // numbers are NOT renumbered: they are an interface, and a gap costs
+    // nothing while a shift would silently repoint every slot above it.
+    /// `"request_of_token"` — the runtime stream a lane may name; staged only
+    /// when the lane's slots name it.
     pub(crate) const REQ_OF_TOKEN: usize = 13;
 }
 
@@ -127,7 +139,7 @@ impl Scratch {
     /// trade a latency defect for a correctness one.
     fn grow(
         slot: &mut Option<crate::device::DeviceBuffer>,
-        epoch: &mut crate::fire::recordings::PlanEpoch,
+        epoch: &mut PlanEpoch,
         alloc: &crate::device::Allocator,
         what: &'static str,
         bytes: usize,
@@ -147,14 +159,53 @@ impl Scratch {
         }
         Ok(())
     }
-    /// The activation arena, at least `bytes` wide.
-    pub(crate) fn arena(
+    /// The walk's activation arena, at least `bytes` wide.
+    ///
+    /// Grow-only through the same [`Self::grow`] every pooled buffer uses:
+    /// never freed, and growth bumps the epoch. The walk is eager and
+    /// captures nothing today, so the epoch bump is precaution rather than
+    /// necessity — and it is the cheap kind, since an arena that has stopped
+    /// growing bumps nothing.
+    pub(crate) fn baker_arena(
         &mut self,
         alloc: &crate::device::Allocator,
         bytes: usize,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.arena, &mut self.epoch, alloc, "fire arena", bytes)?;
-        Ok(self.arena.as_ref().expect("just grown").as_ptr())
+        Self::grow(
+            &mut self.baker,
+            &mut self.epoch,
+            alloc,
+            "baker arena",
+            bytes,
+        )?;
+        Ok(self.baker.as_ref().expect("just grown").as_ptr())
+    }
+
+    /// The logits landing, at least `bytes` wide.
+    ///
+    /// DRIVER-OWNED AND NOT A VALUE ANY TEXT STATES, which is the change the
+    /// legacy purge made here. The delivery used to read whichever
+    /// `Arg::Named` buffer the last lowered launch wrote, discovered by
+    /// walking the launch list backwards; the walk's `out` seam is repitched
+    /// into this instead, so one buffer answers `deliver_logits` and
+    /// `run_sampling_programs` and nothing has to agree about which.
+    pub(crate) fn logits(
+        &mut self,
+        alloc: &crate::device::Allocator,
+        bytes: usize,
+    ) -> crate::Result<()> {
+        Self::grow(
+            &mut self.logits,
+            &mut self.epoch,
+            alloc,
+            "logits landing",
+            bytes.max(64),
+        )
+    }
+
+    /// The logits landing, if one has been grown.
+    pub(crate) fn logits_buf(&self) -> Option<&crate::device::DeviceBuffer> {
+        self.logits.as_ref()
     }
 
     /// The score sink, at least `plan.bytes` wide. The CSR goes in its own
@@ -182,80 +233,15 @@ impl Scratch {
         Ok(b.as_ptr())
     }
 
-    /// The attention output slot, for a fire whose op join names none:
-    /// `AttnCtx::o_out` is driver-owned, since a guard region's launches record
-    /// no SSA output of their own.
-    pub(crate) fn attn_out(
-        &mut self,
-        alloc: &crate::device::Allocator,
-        bytes: usize,
-    ) -> crate::Result<*mut std::ffi::c_void> {
-        let bytes = bytes.max(64);
-        Self::grow(
-            &mut self.attn_out,
-            &mut self.epoch,
-            alloc,
-            "attention landing",
-            bytes,
-        )?;
-        Ok(self.attn_out.as_ref().expect("just grown").as_ptr())
-    }
-
-    /// The adapter correction's xAᵀ staging: rank-wide rows the low-rank GEMM
-    /// writes and then reads back through B.
-    ///
-    /// # Why this is not [`Self::attn_out`]
-    ///
-    /// It was. The adapter phase asked `attn_out` for its gate, and on any
-    /// family whose `attn_output` is `DriverPinned` -- qwen3 among them --
-    /// that is the SAME buffer the attention dispatch lands its output in. The
-    /// correction then wrote xAᵀ over the attention output, and whether the
-    /// answer survived depended on which of the two touched the bytes last.
-    ///
-    /// # What that cost
-    ///
-    /// `lora-probe` at `adapter_scale: 0.0` -- a zero-B adapter, whose
-    /// correction is EXACTLY zero and whose answer must therefore be the base
-    /// model's, byte for byte -- answered the base model on some runs and
-    /// something else on others, in the same process, with the same seed. The
-    /// correction's OUTPUT was zero every time and correctly so; it was the
-    /// intermediate, which is not zero because A is not zero, that landed on
-    /// somebody else's rows.
-    ///
-    /// The fixture's whole reason to exist is the §5.1 claim that no adapter
-    /// means no difference, and the aliasing falsified it nondeterministically,
-    /// which is the one failure mode a parity gate cannot be written against.
-    pub(crate) fn lora_gate(
-        &mut self,
-        alloc: &crate::device::Allocator,
-        bytes: usize,
-    ) -> crate::Result<*mut std::ffi::c_void> {
-        let bytes = bytes.max(64);
-        Self::grow(
-            &mut self.lora_gate,
-            &mut self.epoch,
-            alloc,
-            "lora gate",
-            bytes,
-        )?;
-        Ok(self.lora_gate.as_ref().expect("just grown").as_ptr())
-    }
-
-    /// The log-sum-exp the attention dispatches write beside their output.
-    pub(crate) fn lse(
-        &mut self,
-        alloc: &crate::device::Allocator,
-        bytes: usize,
-    ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(
-            &mut self.lse,
-            &mut self.epoch,
-            alloc,
-            "attention lse",
-            bytes.max(64),
-        )?;
-        Ok(self.lse.as_ref().expect("just grown").as_ptr())
-    }
+    // `attn_out`, `lora_gate` and `lse` STOOD HERE. All three were operands
+    // the LEGACY dispatch took loose, off `AttnCtx`/`DispatchCtx`: the
+    // driver-owned attention landing for a fire whose op join named no
+    // output slot, the adapter correction's xAᵀ staging, and the
+    // log-sum-exp the decode dispatch wrote beside its output. A `Program`'s
+    // statements state their own results, so a landing is an arena slot; the
+    // adapter arm is deleted; and `baker::staging` passes `None` for the LSE
+    // because the lane it fires states one attention leg and nothing merges
+    // partials across it.
 
     /// Which rows of the fire are live, for the KV write descriptors.
     pub(crate) fn row_valid(
@@ -347,33 +333,9 @@ impl Scratch {
         Ok(b.as_ptr().cast_const().cast::<u32>())
     }
 
-    /// One named seam buffer, at least `bytes` wide, zeroed every fire — a
-    /// reused buffer still holds the last fire's values.
-    pub(crate) fn named(
-        &mut self,
-        alloc: &crate::device::Allocator,
-        v: model_ir::trace::ValueId,
-        bytes: usize,
-        stream: crate::device::StreamRef<'_>,
-    ) -> crate::Result<()> {
-        // The failure path must put the buffer back: `grow` allocates before it
-        // assigns, so an `Exhausted` here would drop a buffer whose address a
-        // capture baked, with no epoch bump to mark it stale.
-        let mut held = self.named.remove(&v);
-        let grown = Self::grow(
-            &mut held,
-            &mut self.epoch,
-            alloc,
-            "named seam buffer",
-            bytes,
-        );
-        if let Some(back) = held {
-            self.named.insert(v, back);
-        }
-        grown?;
-        let b = self.named.get_mut(&v).expect("just grown");
-        b.memset(0, stream)
-    }
+    // `named` STOOD HERE — one pooled buffer per `Arg::Named` the legacy
+    // lowering placed, zeroed every fire. See `fire::launch`'s
+    // `publish_seam_pins` for what replaced the walk that filled it.
 }
 
 #[cfg(test)]

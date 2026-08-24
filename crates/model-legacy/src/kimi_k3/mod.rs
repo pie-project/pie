@@ -7,9 +7,6 @@ pub mod spec;
 
 pub mod project;
 
-#[cfg(feature = "chat")]
-use std::sync::Arc;
-
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
 use crate::manifest::Manifest;
@@ -148,11 +145,6 @@ impl Variant for KimiK3 {
 
         self.deployment(load)
             .and_then(|_| project::trace(&self.shape, class, self.norm_eps))
-    }
-
-    #[cfg(feature = "chat")]
-    fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::shared::kimi::KimiInstruct::new(tokenizer))
     }
 }
 

@@ -44,9 +44,25 @@ using namespace metal;
 
 #include "rms_reduce.h"
 
-template <typename T>
+// ── TWO ELEMENTS, BECAUSE THE DECLARATION STATES TWO ────────────────────────
+//
+// `kernels::points::Norm::rmsnorm_gated` declares `x: In<Tensor<f32>>` and
+// `weight: Const<Tensor<f32>>` beside a `gate` and a result that ride the
+// statement's `T`: the gated-delta core leaves its output in float, and the
+// norm weight this fold reads is the one the recurrence staged, not the
+// checkpoint's bf16 row. This file used to be one template over ONE `T` for
+// all four buffers, so the point could not be claimed -- a float plane read
+// through a `bfloat*` reads element 2i+1 in place of i and runs off the end
+// of the tensor past V_d/2, which the header above already said in as many
+// words.
+//
+// `X` is the element of the two planes the declaration pins to float; `T` is
+// the element of the two that ride the statement. `<bfloat, bfloat>` keeps
+// the name and the ABI the legacy driver has always fired; `<float, bfloat>`
+// is the arm `Norm::rmsnorm_gated` claims.
+template <typename X, typename T>
 METAL_FUNC void gated_rms_body(
-    const device T* x, const device T* z, const device T* w, device T* out,
+    const device X* x, const device T* z, const device X* w, device T* out,
     float eps, uint vd, size_t idx, uint lid,
     threadgroup float* inv_rms, threadgroup float* partials,
     uint simd_lane, uint simd_group) {
@@ -61,11 +77,11 @@ METAL_FUNC void gated_rms_body(
   out[idx] = T((outhat * float(w[lid])) * siluz);
 }
 
-template <typename T>
+template <typename X, typename T>
 [[kernel]] void gated_rms(
-    const device T* x        [[buffer(0)]],   // core_out [V_h, V_d]
+    const device X* x        [[buffer(0)]],   // core_out [V_h, V_d]
     const device T* z        [[buffer(1)]],   // gate     [V_h, V_d]
-    const device T* w        [[buffer(2)]],   // gate_norm_w [V_d] (raw, act dtype)
+    const device X* w        [[buffer(2)]],   // gate_norm_w [V_d] (raw)
     device T* out            [[buffer(3)]],   // [V_h, V_d]
     const constant float& eps  [[buffer(4)]],
     const constant uint& vd    [[buffer(5)]],
@@ -83,11 +99,11 @@ template <typename T>
       inv_rms, partials, simd_lane, simd_group);
 }
 
-template <typename T>
+template <typename X, typename T>
 [[kernel]] void gated_rms_strided(
-    const device T* x        [[buffer(0)]],
+    const device X* x        [[buffer(0)]],
     const device T* z        [[buffer(1)]],
-    const device T* w        [[buffer(2)]],
+    const device X* w        [[buffer(2)]],
     device T* out            [[buffer(3)]],
     const constant float& eps  [[buffer(4)]],
     const constant uint& vd    [[buffer(5)]],
@@ -107,20 +123,24 @@ template <typename T>
       inv_rms, partials, simd_lane, simd_group);
 }
 
-#define instantiate_gated_rms_strided(name, itype)                \
+#define instantiate_gated_rms_strided(name, xtype, itype)         \
   template [[host_name("gated_rms_strided_" #name)]] [[kernel]] void \
-  gated_rms_strided<itype>(                                       \
-      const device itype*, const device itype*, const device itype*, \
+  gated_rms_strided<xtype, itype>(                                \
+      const device xtype*, const device itype*, const device xtype*, \
       device itype*, const constant float&, const constant uint&,    \
       const constant int&, uint3, uint3, uint3, uint, uint);
 
-instantiate_gated_rms_strided(bfloat16, bfloat)
+instantiate_gated_rms_strided(bfloat16, bfloat, bfloat)
 
-#define instantiate_gated_rms(name, itype)                        \
+#define instantiate_gated_rms(name, xtype, itype)                 \
   template [[host_name("gated_rms_" #name)]]                      \
-  [[kernel]] void gated_rms<itype>(                               \
-      const device itype*, const device itype*, const device itype*, \
+  [[kernel]] void gated_rms<xtype, itype>(                        \
+      const device xtype*, const device itype*, const device xtype*, \
       device itype*, const constant float&, const constant uint&,    \
       uint3, uint3, uint3, uint, uint);
 
-instantiate_gated_rms(bfloat16, bfloat)
+instantiate_gated_rms(bfloat16, bfloat, bfloat)
+
+// The claimed arm: the normed plane and its weight in float, the gate and the
+// result at the statement's element. `Norm::rmsnorm_gated` fires this one.
+instantiate_gated_rms(f32_bfloat16, float, bfloat)

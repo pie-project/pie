@@ -1,8 +1,9 @@
 //===-- gated_delta_net_prep.cuh - GDN's pre-recurrence kernels ---------===//
 //
-// The seven `__global__` templates that run BEFORE Gated Delta Net's
+// The eight `__global__` templates that run BEFORE Gated Delta Net's
 // recurrence: two dtype casts, a GQA head broadcast, an L2 norm, the
-// gate/beta activation, and Qwen3.5's fused post-conv prep pair. No host
+// gate/beta activation, Qwen3.5's fused post-conv prep pair, and the packed
+// `[b | a]` -> `[g_log | beta]` writer `ssm.gdn_prep` claims. No host
 // function, no `<<<>>>`. `gated_delta_net.cu` includes this file and keeps
 // only its launchers, so each kernel is defined ONCE in the tree — the two
 // definitions `norm/altup_aux` shipped for a release are why
@@ -311,6 +312,101 @@ __global__ void qwen_gdn_v_g_beta(
         const float sp = (z > 20.f) ? z : log1pf(__expf(z));
         g_log_out[gh] = -__expf(A_log[h]) * sp;
         beta_out[gh] = 1.f / (1.f + __expf(-bv));
+    }
+}
+
+/// `ssm.gdn_prep`'s whole arithmetic, packed row in and packed row out.
+///
+/// `g_beta` above is this kernel's sibling and the difference is the LAYOUT
+/// of the four columns. That one takes `a` and `b` as two compact `[N, V_h]`
+/// planes and writes `g_log` and `beta` as two more; this one takes the
+/// `[b | a]` projection exactly as the mixer's matmul wrote it -- one row of
+/// `2 * V_h` per token -- and writes the fused `[g_log | beta]` row the
+/// recurrence points read, in the same shape.
+///
+/// THE PACKING IS THE POINT. `ssm.gdn_prep` declares one operand and one
+/// result and both are packed rows, so a driver that split them with pointer
+/// arithmetic would be claiming a row stride of `V_h` for bytes whose stride
+/// is `2 * V_h` -- true at one token and false at two. `qwen_gdn_v_gates`
+/// below already reads `gates` this way; this is the writer that makes the
+/// pair agree at any N.
+///
+/// Pure map, no shared memory, no fold: the block width is a tiling choice
+/// and every lane past `h >= V_h` returns, so the answer does not depend on
+/// it.
+template <class T>
+__global__ void qwen_gdn_ba_gates(
+    const T* __restrict__ ba,
+    const float* __restrict__ A_log,
+    const T* __restrict__ dt_bias,
+    float* __restrict__ gates,
+    int N, int V_h)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= N || h >= V_h) return;
+
+    // `[b | a]`, in that order: the import packs `[in_proj_b, in_proj_a]`.
+    const T* row = ba + (long long)t * 2 * V_h;
+    const float bv = Elem<T>::to_f32(row[h]);
+    const float av = Elem<T>::to_f32(row[V_h + h]);
+
+    // softplus(z) = log1p(exp(z)). Numerically stable variant -- the same
+    // expression `g_beta` and `qwen_gdn_v_g_beta` spell, so the three agree
+    // to the bit.
+    const float z = av + Elem<T>::to_f32(dt_bias[h]);
+    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+
+    float* out = gates + (long long)t * 2 * V_h;
+    out[h] = -__expf(A_log[h]) * sp;
+    out[V_h + h] = 1.f / (1.f + __expf(-bv));
+}
+
+/// The chunked recurrence's half of the prologue: the value slice widened out
+/// of the packed post-convolution row, and the fused decay row cut in two.
+///
+/// `qwen_gdn_v_g_beta` is this kernel's sibling and the difference is WHERE
+/// the two decay columns come from. The step form is handed the raw `[a | b]`
+/// projection and derives them; the chunked point is handed `gates`, which the
+/// `ssm.gdn_prep` upstream of it already stated -- one f32 row of `2 * V_h`,
+/// `[g_log | beta]` in that order. Recomputing them here would need `a_log`
+/// and `dt_bias`, two weights this point declares no slot for.
+///
+/// The cut is not a pointer offset, and that is the whole reason this exists:
+/// the recurrence indexes `g_log[t * V_h + h]`, a COMPACT `[N, V_h]` plane,
+/// while `gates` strides by `2 * V_h` per token. The two agree only at
+/// `N == 1`, so a pointer offset is a row stride that is true for one token
+/// and false for two -- which is what the decode lane used to do by hand,
+/// and why BOTH recurrence points stage through this kernel now.
+///
+/// `v` is a strided widen for the same shape reason: the value columns sit at
+/// `2 * K_h * K_d` inside a row of `conv_dim`, and the recurrence wants them
+/// compact at `V_h * V_d`.
+template <class T, int BLOCK>
+__global__ void qwen_gdn_v_gates(
+    const T* __restrict__ qkv_post,
+    const float* __restrict__ gates,
+    float* __restrict__ v_out,
+    float* __restrict__ g_log_out,
+    float* __restrict__ beta_out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int K_dim = K_h * K_d;
+    const T* v_base =
+        qkv_post + (long long)n * conv_dim + 2 * K_dim + (long long)h * V_d;
+    float* v_dst = v_out + ((long long)n * V_h + h) * V_d;
+    for (int i = tid; i < V_d; i += BLOCK) {
+        v_dst[i] = Elem<T>::to_f32(v_base[i]);
+    }
+
+    if (tid == 0) {
+        const long long gh = (long long)n * V_h + h;
+        const float* row = gates + (long long)n * 2 * V_h;
+        g_log_out[gh] = row[h];
+        beta_out[gh] = row[V_h + h];
     }
 }
 

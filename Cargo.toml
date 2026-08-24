@@ -254,10 +254,26 @@ default-members = [
     "crates/worker-api",
     "crates/driver-api",
     "crates/driver",
-    # See the member comment: no SDK, no vendor driver, no adapter needed to
-    # build it or to run the tests that are not gated on `native`, so a sweep
-    # should carry it where it does not carry `driver-vulkan` or `driver-metal`.
-    "crates/driver-wgpu",
+    # ── THE SHADER PLANES ARE QUARANTINED (R2) ─────────────────────────────
+    #
+    # `driver-metal`, `driver-vulkan` and `driver-wgpu` are MEMBERS (they share
+    # this lockfile) and none of the three is a default member. The first two
+    # never were, for the reasons their member comments give; `driver-wgpu`
+    # was, on the argument that it needs no SDK and no adapter to build, and it
+    # is pulled out here with the other two.
+    #
+    # WHY, AND IT IS NOT ABOUT WGPU'S BUILD: the three shader drivers are the
+    # only consumers left of the legacy lowering surface this round deleted
+    # from `driver-cuda`. Their own executors are the baker migration's P5
+    # ("Shader planes — impl the families for metal/vulkan/wgpu Ctx; the
+    # tier-1 law's other half"), and until P5 lands they are code that cannot
+    # be brought forward and must not gate a host sweep. Their test suites
+    # already carry pre-existing failures.
+    #
+    # THEY COME BACK AT P5, as default members, when each has a `#[claims] impl`
+    # for its plane and a `Program` walk of its own. `cargo check -p
+    # driver-metal` (and the other two) still works today — quarantine is
+    # about what a bare `cargo check` sweeps, not about what exists.
     "crates/model-legacy",
     "crates/model-ir",
     "crates/model-dsl",

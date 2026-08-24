@@ -10,8 +10,23 @@ repository = "https://github.com/pie-project/pie"
 name = "model"
 path = "src/lib.rs"
 
+[features]
+# THE SERVING HALF, off by default — and off for the reason `model-legacy`'s
+# `chat` feature was off for every driver that linked it: a driver fires
+# kernels. It does not write a turn of conversation, and it does not decode a
+# PNG. `image` alone is twenty crates, and `driver-cuda`, `driver-metal`,
+# `model-compiler` and `baker-smoke` all take this crate for its declarations.
+#
+# `engine` and `worker` are the two consumers that ask for it, which is exactly
+# the split the aspect had before it moved here.
+default = []
+serve = ["dep:image"]
+
 [dependencies]
 model-dsl = { path = "../model-dsl" }
 model-ir = { path = "../model-ir" }
 serde_json = "1"
 tokenizer = { path = "../tokenizer" }
+# Host-side media decode for the model-agnostic multimodal API (`serve::multimodal`).
+# Came with that module from `model-legacy`, where it rode the `chat` feature.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }

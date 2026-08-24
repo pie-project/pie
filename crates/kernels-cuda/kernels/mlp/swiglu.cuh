@@ -1,6 +1,6 @@
 //===-- swiglu.cuh - the MLP activations, as `__global__` templates ----===//
 //
-// Twenty-one `__global__` templates and one include. No host function, no
+// Twenty-two `__global__` templates and one include. No host function, no
 // `<<<>>>`, no stream -- everything this file used to know about geometry is
 // a `LaunchRule` on a row in `kernels_cuda::families::mlp`, and
 // everything it used to know about which element type to compile is the `T`
@@ -439,6 +439,48 @@ __global__ void chunked_swiglu_clamp(
     y[row + i] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u);
 }
 
+/// gpt-oss's GLU over a packed `[N, 2I]` activation. Gate half first only,
+/// for `chunked_swiglu_clamp`'s reason: the one caller exports it that way,
+/// and a second name with no caller is vocabulary that reads like a choice.
+///
+/// THE SAME ARITHMETIC AS `gpt_oss_glu`, SPELLED THE SAME WAY. The flat form
+/// above takes gate and up as two planes; this one takes the single row the
+/// text states and cuts it in half, which is the whole difference between
+/// them. Every line is copied rather than tidied -- `expf` and not `__expf`,
+/// `(u + 1.f) * glu` and not `glu * (u + 1.f)` -- because the point of a
+/// second entry into one activation is that the two agree BIT FOR BIT and
+/// `tests/swiglu_clamp_alpha.rs` says so.
+///
+/// The transcription is the discipline and not the test's reach: at bf16 the
+/// intrinsic and the libm call round to the same eight mantissa bits, so
+/// swapping them is invisible and the test would pass. What it does catch is
+/// every difference that survives the narrowing -- a symmetric clamp on the
+/// gate, a dropped `alpha`, a swapped half. Keeping the spelling identical
+/// is what makes those the only ways the two can drift.
+///
+/// NO `y_fp16`. The flat form's second output feeds the MXFP4 down-projection
+/// GEMV; a packed statement declares ONE result, so there is no slot for it
+/// and no caller that wants one.
+template <class T>
+__global__ void chunked_gpt_oss_glu(
+    const T* __restrict__ packed,
+    T* __restrict__ y,
+    i32 I, float limit, float alpha)
+{
+    const i32 n = blockIdx.x;
+    const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= I) return;
+
+    const long long row = static_cast<long long>(n) * I;
+    const long long packed_row = row * 2;
+    float g = Elem<T>::to_f32(packed[packed_row + i]);
+    float u = Elem<T>::to_f32(packed[packed_row + I + i]);
+    g = fminf(g, limit);
+    u = fminf(fmaxf(u, -limit), limit);
+    const float glu = g / (1.f + expf(-alpha * g));
+    y[row + i] = Elem<T>::from_f32((u + 1.f) * glu);
+}
+
 /// SwiGLU over a packed activation whose ROW is wider than `2I` -- the GEMM
 /// wrote it at a padded stride and only the leading `2I` of each row is the
 /// projection. `row_stride` is layout, not geometry, which is why it survived
@@ -555,17 +597,23 @@ __global__ void chunked_swiglu_strided_vec2(
 // The gated residual adds.
 // ---------------------------------------------------------------------------
 
-/// `out += x * sigmoid(scalar_gate[n * stride])` -- one gate value per row,
-/// broadcast across the row.
+/// `out = sum + x * sigmoid(scalar_gate[n * stride])` -- one gate value per
+/// row, broadcast across the row. `moe.sigmoid_gate_add`'s device text.
+///
+/// OUT OF PLACE, because the point is. It read `out` as its own left addend
+/// while it had no caller at all; the declaration states `routed`, `shared`
+/// and a separate `y`, which is what the three shader planes' combine takes,
+/// and the sum a text hands over is generally live somewhere else.
 ///
 /// `stride` is how far apart two rows' gate values are: 1 when the gate is a
-/// dense `[N]` vector, and something else when it is a column of a wider
+/// dense `[N]` column, and something else when it is one column of a wider
 /// tensor. The unfused `sigmoid_scalar_gate_bf16` that used to sit beside
 /// this one is gone -- the add always followed the gate, and a launcher with
 /// no caller is vocabulary that reads like a choice.
 template <class T>
 __global__ void sigmoid_scalar_gate_add(
     T* __restrict__ out,
+    const T* __restrict__ sum,
     const T* __restrict__ x,
     const T* __restrict__ scalar_gate,
     i32 H, i32 stride)
@@ -576,7 +624,7 @@ __global__ void sigmoid_scalar_gate_add(
     const float gv = Elem<T>::to_f32(scalar_gate[static_cast<long long>(n) * stride]);
     const float s = 1.f / (1.f + __expf(-gv));
     const long long i = static_cast<long long>(n) * H + h;
-    const float ov = Elem<T>::to_f32(out[i]);
+    const float ov = Elem<T>::to_f32(sum[i]);
     const float xv = Elem<T>::to_f32(x[i]);
     out[i] = Elem<T>::from_f32(ov + xv * s);
 }

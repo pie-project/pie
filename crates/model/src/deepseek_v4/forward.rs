@@ -35,7 +35,7 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
         let m = self;
         let hy = &m.hyper;
         let ids = inputs.token_ids();
-        let mut streams = kernels::hc::expand(&kernels::layout::embed(&ids, &m.embed), hy.streams);
+        let mut streams = kernels::hc::expand(&kernels::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
 
         for (l, w) in m.layers.iter().enumerate() {
             let l = l as u32;
@@ -69,7 +69,6 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
                 at.heads,
                 at.sm_scale,
             );
-            let lse = kernels::attention::lse_ln(&lse);
 
             let (o, lse) = match &at.pool {
                 Some(p) => {

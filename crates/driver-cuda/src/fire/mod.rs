@@ -1,5 +1,19 @@
-//! One forward pass: scratch, tables, recordings — pooled since a captured
-//! graph bakes buffer addresses.
+//! One forward pass: the walk, its pooled scratch and the planes it stages.
+//!
+//! Six modules STOOD HERE and are deleted with the legacy fire path:
+//!
+//! * `recordings` — the instantiated-graph cache the legacy walk replayed;
+//! * `lora` — the adapter staging whose only firer was `bind::dispatch`'s
+//!   `gemm::lora_qkv_correction` arm;
+//! * `predicate` — the host-side guard-word evaluator a union capture
+//!   uploaded;
+//! * `stage_hooks` — the PTIR hook set (`wants_page_mask`, the sinks) the
+//!   legacy fire read per layer;
+//! * `moe_grouped` — `moe::moe_grouped_gemm_bf16`, which picked the WMMA
+//!   kernel over batched cuBLAS on `x::moe::supported`. That choice belongs
+//!   in a `#[claims]` body beside the point it serves (the baker backlog's
+//!   `moe.matmul_select_bias`), not in the driver; it had no caller left
+//!   once `dispatch` went.
 pub mod all_reduce;
 pub mod attention_workspace;
 pub mod attn_score;
@@ -8,26 +22,15 @@ pub use kernels_cuda::gemm::dense as gemm;
 pub use kernels_cuda::gemm::gemv;
 #[cfg(feature = "abi")]
 pub(crate) mod envelope;
-pub mod hand;
 /// Host side of `attn/kv_paged.cu`: `serve::transfer`'s cell move and the page-view builders.
+pub mod hand;
 pub mod kv_paged;
 #[cfg(feature = "abi")]
 pub mod launch;
-pub mod lora;
 /// `moe::build_moe_ptrs_aligned_bf16`: the aligned MoE leg's pointer build.
 pub mod moe_ptrs;
 
-/// `moe::moe_grouped_gemm_bf16`: the aligned MoE leg's two grouped GEMMs.
-#[cfg(feature = "_cuda")]
-pub mod moe_grouped;
-
 pub mod page_mask;
-pub mod predicate;
-#[cfg(feature = "abi")]
-pub mod recordings;
 #[cfg(feature = "abi")]
 pub mod scratch;
 pub mod sideband_arena;
-pub mod stage_hooks;
-/// The two supergraph launchers, in Rust.
-pub mod supergraph;

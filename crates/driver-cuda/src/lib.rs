@@ -68,6 +68,24 @@ pub mod bind;
 #[cfg(feature = "_cuda")]
 pub mod fire;
 
+// THE FIRE PATH: a `model_compiler::program::Program` per lane, built at
+// load, fired by `fire::launch`. Not "beside" anything and behind no knob —
+// R2 deleted the legacy lowering, dispatch and walk, and a checkpoint whose
+// Program will not build is REFUSED at `load_model` rather than served by a
+// second path.
+//
+// `pub(crate)` and not `pub`, unlike its neighbours: nothing outside this
+// crate reaches it, and the surface it WOULD publish (`Baked`, the point
+// shim, the staging table) is the surface `#[claims]` is going to generate.
+// Publishing it now would be publishing a shape that is about to change.
+//
+// Gated on `_cuda` and not on `abi`, though only the `abi` shell has a
+// `Shell` to hang it off: the load, the resolve and the shim name CUDA
+// symbols and nothing else, so a `--features cuda-13` build compiles and
+// unit-tests them without the ABI door.
+#[cfg(feature = "_cuda")]
+pub(crate) mod baker;
+
 /// User programs: compile, cache, channel, run.
 #[cfg(feature = "_cuda")]
 pub mod program;

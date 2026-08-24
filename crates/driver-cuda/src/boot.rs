@@ -29,16 +29,21 @@ pub const KV_PAGE_SIZE: i32 = 16;
 pub struct Boot {
     /// Return from a launch before the fire retires. `PIE_CUDA_RUNAHEAD`.
     pub runahead: bool,
-    /// Capture fires into a unionized supergraph. `PIE_CUDA_SUPERGRAPH`.
-    ///
-    /// What cannot be replayed stays eager rather than being captured wrong; the
-    /// default-on switch changes which leg runs, not which answers are possible.
-    pub supergraph: bool,
-    /// Trace the supergraph's decisions to stderr. `PIE_CUDA_TRACE_SUPERGRAPH`.
-    ///
-    /// Nothing reads this field yet; `sg_trace` still reads the env var itself,
-    /// deliberately, to avoid threading a `Boot` to every call site.
-    pub trace_supergraph: bool,
+    // `supergraph` and `trace_supergraph` STOOD HERE (`PIE_CUDA_SUPERGRAPH`,
+    // `PIE_CUDA_TRACE_SUPERGRAPH`). They selected between the LEGACY fire
+    // path's two walks -- a unionized capture whose guards were resolved on
+    // the device, and the eager list -- and both walks are gone with the
+    // lowering that produced them.
+    //
+    // THE PERF DEBT IS REAL AND IS NOT HIDDEN HERE: capture bought a
+    // Qwen3-0.6B decode 12 ms of replay against 535 launches issued by hand,
+    // and the baker path is eager, so it pays the issue cost every fire. A
+    // baker capture is a design (`fire::launch`'s note at the walk), not a
+    // knob that was switched off.
+    //
+    // `PIE_CUDA_TRACE_SUPERGRAPH` still WORKS as a variable, because
+    // `fire::launch::sg_trace` reads it directly and always did; what it
+    // traces now is the fire's phase timings.
     /// Apply weight transforms on the device rather than the host.
     pub device_transforms: bool,
     /// Advertise and allocate KV envelopes — read by both the allocating pool
@@ -50,21 +55,40 @@ pub struct Boot {
     pub rs_stash_tokens: Option<i32>,
     /// Sweep the shape ladder at load and store the winner. `PIE_CUDA_CALIBRATE`.
     pub calibrating: bool,
+    // `baker` STOOD HERE (`[driver] baker`, `PIE_BAKER`) and is RETIRED, in
+    // the direction that deletes it rather than flips its default. It was
+    // the A/B switch: off, the legacy lane fired; on, the baker lane was
+    // built BESIDE it and fired instead. There is no legacy lane to sit
+    // beside. The baker lane is built on every load, and a checkpoint whose
+    // lane will not build is REFUSED at load with the reason named --
+    // `serve::load::load_impl`'s last block -- rather than served by
+    // something else.
+    /// Which new-catalog row to trace, when the checkpoint's own identity
+    /// does not name one. `[baker] sku`, else `PIE_BAKER_SKU`.
+    ///
+    /// A STRING KNOB BECAUSE THE TWO CATALOGUES DO NOT SHARE AN ID SPACE.
+    /// `model::catalog::identify` reads the checkpoint's tensors and answers
+    /// a legacy row id (`"qwen3.5-0.8b-base"`); the new catalog files the
+    /// same checkpoint under a SKU that also states its dtypes
+    /// (`"qwen35-d0.8b-bf16-kv-bf16"`). `serve::baker::sku_for` carries the
+    /// bridge table for the rows that are proven; this knob is how a
+    /// deployment names one the table does not hold yet. Both die when the
+    /// id spaces merge.
+    pub baker_sku: Option<String>,
 }
 
 impl Default for Boot {
     /// What this driver does when nothing says otherwise — run-ahead and the
-    /// supergraph on, their knobs there to switch them off while bisecting.
+    /// its knob there to switch it off while bisecting.
     fn default() -> Self {
         Self {
             runahead: true,
-            supergraph: true,
-            trace_supergraph: false,
             device_transforms: true,
             kv_envelopes: false,
             attn_score_window: 32,
             rs_stash_tokens: None,
             calibrating: false,
+            baker_sku: None,
         }
     }
 }
@@ -94,18 +118,6 @@ impl Boot {
         };
         flag(&mut cfg.runahead, "driver", "runahead", "PIE_CUDA_RUNAHEAD");
         flag(
-            &mut cfg.supergraph,
-            "driver",
-            "supergraph",
-            "PIE_CUDA_SUPERGRAPH",
-        );
-        flag(
-            &mut cfg.trace_supergraph,
-            "driver",
-            "trace_supergraph",
-            "PIE_CUDA_TRACE_SUPERGRAPH",
-        );
-        flag(
             &mut cfg.device_transforms,
             "driver",
             "device_transforms",
@@ -123,6 +135,12 @@ impl Boot {
             "calibrate_planner",
             "PIE_CUDA_CALIBRATE",
         );
+        cfg.baker_sku = table("baker", "sku")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| env("PIE_BAKER_SKU"))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
 
         if let Some(n) = table("driver", "attn_score_window")
             .and_then(toml::Value::as_integer)
@@ -159,7 +177,6 @@ mod tests {
     fn the_defaults_are_the_drivers_ordinary_behaviour() {
         let cfg = Boot::parse(None, no_env);
         assert!(cfg.runahead, "run-ahead is the point of the fire path");
-        assert!(cfg.supergraph);
         assert!(cfg.device_transforms);
         assert!(
             !cfg.kv_envelopes,

@@ -398,6 +398,12 @@ __global__ void hc_rmsnorm_to_f32(
 ///
 /// **No row names this kernel**: the launcher's grid is `dim3(N, heads)`, and
 /// no ported rule produces a `gridDim.y`.
+///
+/// **And no POINT names it either.** `attention.sink` states a base-two lse
+/// and a sink at the model's element; this one takes an `ln` lse and a
+/// `const float*`, which is neither. `attn/attn_sink.cuh`'s
+/// `attn_sink_rescale` is what the point fires. What still reaches here is
+/// the legacy dsv4 text, and it dies with `model-dsl-legacy`.
 template <class T>
 __global__ void attn_sink_correction(
     T* __restrict__ out,

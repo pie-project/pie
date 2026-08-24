@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use model_compiler::program::{Program, Slot};
+use model_compiler::program::{Program, Rows, Slot};
 use model_ir::plan::Plan;
 
 fn main() {
@@ -82,5 +82,25 @@ fn report(program: &Program) {
         .max_by_key(|(width, _)| *width);
     if let Some((width, dtype)) = widest {
         println!("    widest slot: {width} x {dtype:?}");
+    }
+    // ONLY WHEN THERE ARE ANY. A plan with no router mints no routed slot,
+    // and a report that printed "0 routed" on every dense lane would move
+    // every dense SKU's output for a number that is always the same.
+    let mut routed: Vec<u32> = program
+        .slots
+        .iter()
+        .filter_map(|s| match s {
+            Slot::Arena {
+                rows: Rows::FireTimes(k),
+                ..
+            } => Some(*k),
+            _ => None,
+        })
+        .collect();
+    if !routed.is_empty() {
+        let slots = routed.len();
+        routed.sort_unstable();
+        routed.dedup();
+        println!("    {slots} routed slots at rows x {routed:?}");
     }
 }

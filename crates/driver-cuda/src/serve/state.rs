@@ -23,18 +23,13 @@ pub struct Shell {
     /// How the KV pages are stored — `[driver] kv_cache_dtype`; the layout plans
     /// scale planes per scheme and the paged-attention kernels switch on it.
     pub(crate) kv_format: crate::layout::KvCacheFormat,
-    /// Cached traced-and-lowered program per fire shape (~3.3 ms/fire), keyed
-    /// including union-asked (a union may be declined).
-    pub(crate) lowerings: std::collections::BTreeMap<LoweringKey, LoweredFire>,
     /// The cuBLAS handle, created once (`cublasDestroy` costs ~3.2 ms); stream
     /// rebound per fire via `cublasSetStream`.
     pub(crate) cublas:
         Option<crate::device::cublas::CublasHandle<cudarc::cublas::sys::cublasHandle_t>>,
-    /// The fire's predicate word, allocated once: `cudaFree` synchronizes the
-    /// device, and a captured graph bakes this address, so it must not move.
-    pub(crate) preds: Option<crate::device::PredicateWord>,
-    /// The fire's peel-window word, allocated once; same reasoning as `preds`.
-    pub(crate) peel_win: Option<crate::device::PeelWindowWord>,
+    // `preds` and `peel_win` STOOD HERE — the device words a captured union
+    // read its guards and its peel split out of. Both are the legacy walk's
+    // and both are gone with it.
     /// The pinned host buffer the logits D2H lands in, grown and reused. The
     /// shell's, not the fire's: a stream callback may not free it.
     pub(crate) logits_staging: Option<crate::device::PinnedBuf>,
@@ -52,6 +47,15 @@ pub struct Shell {
     pub(crate) tp_size: u32,
     /// The loaded model, once `load_model` succeeds.
     pub(crate) model: Option<LoadedModel>,
+    /// THE PROGRAM THIS DRIVER FIRES: one `Program` per lane, its weights,
+    /// and the geometry read off its plan. Built at `load_model` and dropped
+    /// with `model`, because its banks are device addresses in an arena the
+    /// next load would free.
+    ///
+    /// `None` only before a load, or after one that refused. A `Some` here
+    /// is what makes a fire possible at all — `step_impl` refuses by name
+    /// rather than reaching for a second path, because there is not one.
+    pub(crate) baker: Option<crate::baker::Baked>,
     /// Which load this is, from one: the identity model-keyed caches need. Not a
     /// path hash — a reload reallocates, so must not reuse the id.
     pub(crate) load_generation: u64,
@@ -66,10 +70,9 @@ pub struct Shell {
     pub(crate) broker: CompletionBroker,
     /// The hybrid's GDN state slabs, allocated on first hybrid launch.
     pub(crate) gdn: Option<GdnState>,
-    /// The unionized supergraph's instantiated graphs, one per (R, N) bucket;
-    /// empty unless `PIE_CUDA_SUPERGRAPH` armed it. Declared before
-    /// [`Self::fire_arrays`], whose addresses its execs hold, so it drops first.
-    pub(crate) supergraph: crate::fire::recordings::Recordings,
+    // `supergraph` STOOD HERE — `fire::recordings::Recordings`, the
+    // instantiated graphs the legacy walk replayed, one per (R, N) bucket.
+    // The baker walk is eager; the perf debt is named at the walk.
     /// The per-fire device arrays, pooled so a capture can outlive the fire that
     /// recorded it (see [`Scratch`]). Dropped after the execs that address it.
     pub(crate) fire_arrays: Scratch,
@@ -87,9 +90,9 @@ pub struct Shell {
     /// The host-pinned KV swap pool where `copy_kv`'s host domain lands:
     /// page-granular, per layer, both planes. Grown by highest page id touched.
     pub(crate) swap: Option<SwapPool>,
-    /// The adapter staging's bump arena, driver-lifetime: reset each fire, grown
-    /// on demand. Must never retire a block an in-flight fire may still read.
-    pub(crate) lora_arena: crate::fire::lora::LoraStageArena,
+    // `lora_arena` STOOD HERE, with `fire::lora` behind it. The adapter it
+    // staged was fired by exactly one thing, `bind::dispatch`'s
+    // `gemm::lora_qkv_correction` arm, and that arm is deleted.
     /// The fire scratch held per driver: the attention workspace and both
     /// FlashInfer plan caches, created on first launch.
     pub(crate) scratch: Option<FireScratch>,
@@ -130,15 +133,13 @@ pub(crate) struct FireScratch {
     pub prefill_ws:
         crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
     pub decode_plan: crate::bind::DecodePlan,
-    /// gemma-4's second decode plan — the full layers' 512-wide geometry;
-    /// single-kind families never plan it.
-    pub decode_plan_full: crate::bind::DecodePlan,
     pub prefill_plan: crate::bind::PrefillPlan,
-    /// A peel tail's decode plan and its own workspace — like `prefill_ws`, and
-    /// a tail serves `[split, N)`, a different request count, hence its schedule.
-    pub tail_plan: crate::bind::DecodePlan,
-    pub tail_ws:
-        crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
+    // `decode_plan_full`, `tail_plan` and `tail_ws` STOOD HERE. The second
+    // decode schedule served a stack whose layer kinds disagree about head
+    // dim, picked by the window on a `LaunchSpec`; the tail pair served a
+    // peel. Both are legacy-lowering shapes: a `Program` is one lane with
+    // one geometry, and `Baked::attn_ask` REFUSES a lane that states two
+    // widths rather than raising a second plan nothing can bind.
 }
 
 /// The pinned swap pool: `layers × [pages × page_bytes]` per plane.
@@ -237,46 +238,11 @@ pub(crate) fn retire(fire: InFlight) {
 /// by scratch, not by time: the bound is on how much the driver is carrying.
 pub(crate) const RUNAHEAD_DEPTH: usize = 2;
 
-/// What a lowering can depend on: see [`Shell::lowerings`].
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct LoweringKey {
-    pub model_id: u64,
-    pub class: model_ir::trace::FireClass,
-    pub rows: u32,
-    /// A digest of the row axes, not just the count: the lowering resolves
-    /// per-row guards a plain row count cannot distinguish.
-    pub rows_digest: u64,
-    pub union_asked: bool,
-}
-
-/// FNV-1a over the rows' axes. Not a hash of the struct: `Row` is not `Hash`,
-/// so naming the axes means a new one is added to the key deliberately.
-pub(crate) fn digest_rows(rows: &[model_compiler::lower::Row]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut eat = |b: u64| {
-        h ^= b;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    for r in rows {
-        eat(u64::from(r.multi_token));
-        eat(u64::from(r.custom_mask));
-        eat(u64::from(r.hooked));
-        eat(u64::from(r.lora));
-        eat(u64::from(r.write_desc));
-        eat(u64::from(r.wants_scores));
-        eat(u64::from(r.samples));
-        eat(r.depth_k.map_or(u64::MAX, u64::from));
-    }
-    h
-}
-
-/// A traced, lowered and joined program, and whether it kept its union.
-pub(crate) struct LoweredFire {
-    pub plan: model_ir::trace::ForwardPlan,
-    pub lowered: model_compiler::lower::Lowered,
-    pub dplan: crate::bind::DispatchPlan,
-    pub union: bool,
-}
+// `LoweringKey`, `digest_rows` and `LoweredFire` STOOD HERE — the cache key
+// and the cached triple (`ForwardPlan`, `Lowered`, `DispatchPlan`) that made
+// the legacy trace-lower-join chain affordable at ~3.3 ms a fire shape. A
+// `Program` is built once, at load, so there is nothing per-fire left to
+// cache and nothing to key it on.
 
 /// Everything a fire still owes at enqueue, paid from a stream-ordered callback
 /// that cannot borrow — every field owned, no `cudaFreeHost` on live staging.
@@ -582,7 +548,7 @@ impl GdnState {
     pub(crate) fn ensure_slots(
         &mut self,
         need: u32,
-        epoch: &mut crate::fire::recordings::PlanEpoch,
+        epoch: &mut crate::fire::scratch::PlanEpoch,
         alloc: &crate::device::Allocator,
         stream: &crate::device::OwnedStream,
     ) -> Result<bool, i32> {
@@ -680,7 +646,7 @@ impl GdnState {
 /// the bump stops either rebuild path replaying a captured launch against freed pages.
 pub(crate) fn install_kv(
     kv: &mut Option<KvState>,
-    epoch: &mut crate::fire::recordings::PlanEpoch,
+    epoch: &mut crate::fire::scratch::PlanEpoch,
     next: KvState,
 ) {
     *kv = Some(next);

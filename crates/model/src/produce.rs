@@ -187,10 +187,12 @@ pub enum Fault {
         axis: u32,
         shape: Vec<u64>,
     },
-    /// `Deinterleave`: the rows do not divide by the group count.
+    /// `Deinterleave`: no such axis, or its extent does not divide by the
+    /// group count.
     Ungroupable {
         name: String,
-        rows: u64,
+        axis: u32,
+        shape: Vec<u64>,
         groups: u32,
     },
     /// A verb this interpreter does not perform yet.
@@ -231,9 +233,14 @@ impl std::fmt::Display for ProduceError {
                 f,
                 "`{name}` is {shape:?}, whose axis {axis} is not an extent of 1"
             ),
-            Fault::Ungroupable { name, rows, groups } => write!(
+            Fault::Ungroupable {
+                name,
+                axis,
+                shape,
+                groups,
+            } => write!(
                 f,
-                "`{name}` has {rows} rows, which {groups} does not divide"
+                "`{name}` is {shape:?}, whose axis {axis} is not a whole {groups} groups"
             ),
             Fault::Refused { verb, why } => write!(f, "{verb} is refused: {why}"),
         }
@@ -294,7 +301,9 @@ fn run(s: &Source, read: &dyn Fn(&str) -> Option<HostTensor>) -> Result<HostTens
                  would be a silently wrong weight rather than a refusal"
             ),
         }),
-        Source::Deinterleave(name, groups) => deinterleave(fetch(name, read)?, name, *groups),
+        Source::Deinterleave(name, axis, groups) => {
+            deinterleave(fetch(name, read)?, name, *axis, *groups)
+        }
         Source::Squeeze(name, axis) => squeeze(fetch(name, read)?, name, *axis),
     }
 }
@@ -418,27 +427,50 @@ fn stack(
     })
 }
 
-/// Ungroup `groups`-way row interleaving. A checkpoint that stores a fused
-/// bank as `g0 g1 g0 g1 ...` down the rows becomes `g0 g0 ... g1 g1 ...`,
-/// which is what a `Packed` segment list means. The shape does not move --
-/// only the rows do.
-fn deinterleave(t: HostTensor, name: &str, groups: u32) -> Result<HostTensor, Fault> {
-    let rows = t.rows();
-    if groups == 0 || !rows.is_multiple_of(u64::from(groups)) {
-        return Err(Fault::Ungroupable {
-            name: name.to_string(),
-            rows,
-            groups,
-        });
+/// Ungroup `groups`-way interleaving along `axis`. A checkpoint that stores a
+/// fused bank as `g0 g1 g0 g1 ...` down that axis becomes `g0 g0 ... g1 g1
+/// ...`, which is what a `Packed` segment list means. The shape does not move
+/// -- only the rows do.
+///
+/// THE AXIS IS NOT ALWAYS ZERO, and assuming it was is what this fn used to
+/// do. gpt-oss's fused gate/up bank is `[experts, 2 * inter, ..]`: the
+/// interleaving is under the expert fan, and a leading-axis permutation there
+/// shuffles WHICH EXPERT IS WHICH while leaving every shape and byte count
+/// intact -- undetectable by the join, by the shape walk, and by anything
+/// short of a numeric read. So the axis is stated and the axes ABOVE it are
+/// walked: `outer` positions, each holding one `groups * seg` run of `inner`
+/// bytes.
+fn deinterleave(t: HostTensor, name: &str, axis: u32, groups: u32) -> Result<HostTensor, Fault> {
+    let at = axis as usize;
+    let ungroupable = || Fault::Ungroupable {
+        name: name.to_string(),
+        axis,
+        shape: t.shape.clone(),
+        groups,
+    };
+    let Some(&extent) = t.shape.get(at) else {
+        return Err(ungroupable());
+    };
+    if groups == 0 || !extent.is_multiple_of(u64::from(groups)) {
+        return Err(ungroupable());
     }
-    let stride = t.row_bytes();
-    let seg = (rows / u64::from(groups)) as usize;
+    // Above the axis: every combination of the leading extents, each of which
+    // holds one whole interleaved run. Below it: the bytes one position of the
+    // axis carries, which move as a unit and are never inspected.
+    let outer: u64 = t.shape[..at].iter().product();
+    let below: u64 = t.shape[at + 1..].iter().product();
+    let inner = (below * t.dtype.width() as u64) as usize;
+    let run = extent as usize * inner;
+    let seg = (extent / u64::from(groups)) as usize;
     let groups = groups as usize;
     let mut bytes = Vec::with_capacity(t.bytes.len());
-    for g in 0..groups {
-        for j in 0..seg {
-            let src = (j * groups + g) * stride;
-            bytes.extend_from_slice(&t.bytes[src..src + stride]);
+    for o in 0..outer as usize {
+        let base = o * run;
+        for g in 0..groups {
+            for j in 0..seg {
+                let src = base + (j * groups + g) * inner;
+                bytes.extend_from_slice(&t.bytes[src..src + inner]);
+            }
         }
     }
     Ok(HostTensor { bytes, ..t })

@@ -317,7 +317,7 @@ impl Driver for WgpuDriver {
         // identification, and the two disagree in the direction that matters --
         // a checkpoint served as the wrong row is not refused, it is fluent and
         // wrong.
-        let row = model::catalog::identify(&meta, &model::catalog::Override::None)
+        let row = model_legacy::catalog::identify(&meta, &model_legacy::catalog::Override::None)
             .map_err(|e| anyhow!("driver-wgpu: {path:?} matches no catalog row: {e}"))?;
         let (text, deployment) = text_of(row)?;
         // Read from the text BEFORE the shell takes it: what the decode plan
@@ -810,7 +810,7 @@ fn boot_kv_pages(config_bytes: &[u8]) -> u32 {
 /// default rather than a fraction of memory. `driver-metal` reached the same
 /// shape with `PIE_METAL_RS_SLOTS`.
 fn recurrent_of(
-    deployment: &model::deployment::Deployment,
+    deployment: &model_legacy::deployment::Deployment,
 ) -> Option<driver_wgpu::resources::Recurrent> {
     let rs = deployment.recurrent.as_ref()?;
     let slots: u32 = std::env::var("PIE_WGPU_RS_SLOTS")
@@ -829,8 +829,8 @@ fn recurrent_of(
 }
 
 fn theta_of(
-    row: &'static dyn model::catalog::Variant,
-    deployment: &model::deployment::Deployment,
+    row: &'static dyn model_legacy::catalog::Variant,
+    deployment: &model_legacy::deployment::Deployment,
 ) -> Result<f32> {
     if !deployment.theta_by_layer().is_empty() {
         bail!(
@@ -868,12 +868,12 @@ fn theta_of(
 ///
 /// A row asking for YaRN.
 fn rescale_of(
-    row: &'static dyn model::catalog::Variant,
-    deployment: &model::deployment::Deployment,
+    row: &'static dyn model_legacy::catalog::Variant,
+    deployment: &model_legacy::deployment::Deployment,
 ) -> Result<Option<driver_wgpu::rope::Rescale>> {
     match deployment.rope_scaling {
         None => Ok(None),
-        Some(model::deployment::RopeScaling::Piecewise {
+        Some(model_legacy::deployment::RopeScaling::Piecewise {
             factor,
             low_freq_factor,
             high_freq_factor,
@@ -884,7 +884,7 @@ fn rescale_of(
             high: high_freq_factor,
             original_max: original_max_position as f32,
         })),
-        Some(model::deployment::RopeScaling::Yarn { .. }) => bail!(
+        Some(model_legacy::deployment::RopeScaling::Yarn { .. }) => bail!(
             "driver-wgpu: `{}` asks for YaRN and `driver_wgpu::rope` builds only the \
              piecewise ladder. Serving it unrescaled would attend past its trained context \
              with the untouched frequencies, which degrades rather than fails.",
@@ -911,7 +911,7 @@ fn rescale_of(
 fn stage(
     path: &std::path::Path,
     meta: &model_loader::checkpoint::CheckpointMetadata,
-    row: &'static dyn model::catalog::Variant,
+    row: &'static dyn model_legacy::catalog::Variant,
     wanted: &[String],
 ) -> Result<Vec<(String, Vec<u8>)>> {
     // The declared encoding, out of the checkpoint's OWN metadata -- the one
@@ -919,23 +919,25 @@ fn stage(
     // an extent of any tensor. Read as `model/config` rather than off disk:
     // a second reader of that file is a second place for what a model is made
     // of to be decided. All three other seams read it exactly this way.
-    let config =
-        match model_loader::checkpoint::read::read_meta(meta, model::encoding::CONFIG_OBJECT) {
-            Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
-                anyhow!(
-                    "driver-wgpu: the embedded {} is not utf8: {e}",
-                    model::encoding::CONFIG_OBJECT
-                )
-            })?,
-            Ok(None) => bail!(
-                "driver-wgpu: {} is not embedded in the checkpoint at {path:?}. Re-import it \
+    let config = match model_loader::checkpoint::read::read_meta(
+        meta,
+        model_legacy::encoding::CONFIG_OBJECT,
+    ) {
+        Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
+            anyhow!(
+                "driver-wgpu: the embedded {} is not utf8: {e}",
+                model_legacy::encoding::CONFIG_OBJECT
+            )
+        })?,
+        Ok(None) => bail!(
+            "driver-wgpu: {} is not embedded in the checkpoint at {path:?}. Re-import it \
                  with `pie model build`; one field is read out of it -- the declared \
                  quantization -- and no kernel can be named without it.",
-                model::encoding::CONFIG_OBJECT
-            ),
-            Err(e) => bail!("driver-wgpu: cannot read the embedded encoding: {e:?}"),
-        };
-    let encoding = model::encoding::Encoding::from_config_json(&config)
+            model_legacy::encoding::CONFIG_OBJECT
+        ),
+        Err(e) => bail!("driver-wgpu: cannot read the embedded encoding: {e:?}"),
+    };
+    let encoding = model_legacy::encoding::Encoding::from_config_json(&config)
         .map_err(|e| anyhow!("driver-wgpu: unreadable encoding: {e}"))?;
     // `BackendKind::Vulkan`, and this backend is not Vulkan.
     //
@@ -957,13 +959,13 @@ fn stage(
         0,
         1,
     );
-    let (plan, _) = model::boot::compile_load_plan_for(
+    let (plan, _) = model_legacy::boot::compile_load_plan_for(
         path,
         meta,
         &target,
         row,
         &encoding,
-        model::boot::Binding::MLX_IN_PLACE,
+        model_legacy::boot::Binding::MLX_IN_PLACE,
     )
     .map_err(|e| {
         anyhow!(
@@ -1228,15 +1230,18 @@ fn bound_names(text: &driver_wgpu::shell::Text) -> Vec<String> {
 /// The ROW's refusal, carried unchanged: a model this build has no text for
 /// says so in its own words rather than in a sentence this seam made up.
 fn text_of(
-    row: &'static dyn model::catalog::Variant,
-) -> Result<(driver_wgpu::shell::Text, model::deployment::Deployment)> {
-    use model::catalog::Deployed;
+    row: &'static dyn model_legacy::catalog::Variant,
+) -> Result<(
+    driver_wgpu::shell::Text,
+    model_legacy::deployment::Deployment,
+)> {
     use model_ir::trace::FireClass;
+    use model_legacy::catalog::Deployed;
 
     // The build's kernel capabilities, and nothing about the model. g64/b4 is
     // what `mlx-community` publishes and what every measurement in
     // `driver-wgpu` was taken against.
-    let binding = model::catalog::MetalBinding {
+    let binding = model_legacy::catalog::MetalBinding {
         // TRUE, and this is the only backend that says so.
         //
         // `qmm_t.wgsl` carries `m` in `Params` and returns from `write_out`
@@ -1439,7 +1444,7 @@ mod tests {
     /// A row's id and the fixture `driver-wgpu`'s own numbers were taken from.
     type Measured = (
         &'static str,
-        fn() -> model::shared::llama_like::forward::facts::LlamaLikeFacts,
+        fn() -> model_legacy::shared::llama_like::forward::facts::LlamaLikeFacts,
     );
 
     /// The rows `driver-wgpu`'s suites serve for real, by the ids those suites
@@ -1447,11 +1452,11 @@ mod tests {
     const MEASURED: &[Measured] = &[
         (
             "qwen3-0.6b",
-            model::shared::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b,
+            model_legacy::shared::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b,
         ),
         (
             "qwen2.5-1.5b",
-            model::shared::llama_like::forward::facts::LlamaLikeFacts::qwen2_5_1_5b,
+            model_legacy::shared::llama_like::forward::facts::LlamaLikeFacts::qwen2_5_1_5b,
         ),
     ];
 
@@ -1471,24 +1476,25 @@ mod tests {
     #[test]
     fn the_seam_derives_the_text_the_driver_was_measured_against() {
         for (id, facts) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             let (text, _) = text_of(row).unwrap_or_else(|e| panic!("`{id}` has a text: {e}"));
             let fixture = facts();
             // `synthetic()` is `driver-metal`'s answer sheet and this seam is
             // not that driver: it states `add_bias`, which this backend's
             // binder serves. `tests/arena.rs`'s `wgpu_facts()` is this exact
             // struct, which is what makes the comparison worth making.
-            let metal = model::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
+            let metal = model_legacy::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
                 add_bias: true,
-                ..model::shared::llama_like::forward::facts::LlamaLikeMetalFacts::synthetic()
+                ..model_legacy::shared::llama_like::forward::facts::LlamaLikeMetalFacts::synthetic()
             };
             for (class, ours) in [
                 (FireClass::Decode, &text.decode),
                 (FireClass::Prefill, &text.prefill),
             ] {
-                let theirs =
-                    model::shared::llama_like::forward::llama_like_metal(&fixture, &metal, class);
+                let theirs = model_legacy::shared::llama_like::forward::llama_like_metal(
+                    &fixture, &metal, class,
+                );
                 assert_eq!(
                     format!("{ours:?}"),
                     format!("{theirs:?}"),
@@ -1508,8 +1514,8 @@ mod tests {
     #[test]
     fn the_geometry_the_seam_reads_is_the_measured_one() {
         for (id, facts) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             let (text, _) = text_of(row).unwrap_or_else(|e| panic!("`{id}` has a text: {e}"));
             let fixture = facts();
             assert_eq!(text.geometry.q_heads, fixture.q_heads, "`{id}` q_heads");
@@ -1529,7 +1535,8 @@ mod tests {
     /// expert banks.
     #[test]
     fn a_mixture_is_described_as_one() {
-        let row = model::catalog::find("gpt-oss-20b").expect("gpt-oss-20b is in the catalog");
+        let row =
+            model_legacy::catalog::find("gpt-oss-20b").expect("gpt-oss-20b is in the catalog");
         let Ok((text, _)) = text_of(row) else {
             // Its text is `moe_mxfp4`-dependent; if this build has none, there
             // is nothing to check and nothing wrong.
@@ -1560,8 +1567,8 @@ mod tests {
     #[test]
     fn the_rope_base_is_the_rows_own() {
         let mut checked = 0;
-        for id in model::catalog::ids() {
-            let row = model::catalog::find(id).expect("an id the catalog just listed");
+        for id in model_legacy::catalog::ids() {
+            let row = model_legacy::catalog::find(id).expect("an id the catalog just listed");
             let Ok((_, deployment)) = text_of(row) else {
                 continue;
             };
@@ -1589,7 +1596,8 @@ mod tests {
     /// "driver-wgpu cannot load this model" cannot.
     #[test]
     fn a_model_with_no_text_is_refused_in_the_rows_own_words() {
-        let row = model::catalog::find("phi-3-mini-4k").expect("phi-3-mini-4k is in the catalog");
+        let row =
+            model_legacy::catalog::find("phi-3-mini-4k").expect("phi-3-mini-4k is in the catalog");
         assert_eq!(row.load_shape().head_dim, 96, "the checkpoint's own width");
         let Err(said) = text_of(row) else {
             panic!("phi-3-mini-4k has no Metal text")
@@ -1615,8 +1623,8 @@ mod tests {
     #[test]
     fn the_seam_asks_for_the_weights_the_fire_binds() {
         for (id, _) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             let (text, _) = text_of(row).unwrap_or_else(|e| panic!("`{id}` has a text: {e}"));
             let names = bound_names(&text);
             assert!(
@@ -1874,7 +1882,7 @@ kv_pages = 4096
     /// large, which is the bug it was written for -- fails here.
     #[test]
     fn the_widest_fire_is_the_largest_one_that_fits() {
-        let row = model::catalog::find("qwen3-0.6b").expect("this build has qwen3-0.6b");
+        let row = model_legacy::catalog::find("qwen3-0.6b").expect("this build has qwen3-0.6b");
         let (text, _) = text_of(row).expect("the row has a text");
         let most = 4096;
         let n = widest_fire(&text, most);

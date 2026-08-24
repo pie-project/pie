@@ -56,6 +56,13 @@ fn the_table_is_the_norm_trait() {
         [
             "norm.rmsnorm",
             "norm.rmsnorm_per_head",
+            // The `(1 + w)` pair, declared for the qwen3.5 family whose
+            // rmsnorm banks are stored centred on zero. They are POINTS
+            // and not a flag on `rmsnorm` because the fold is the
+            // kernel's arithmetic: a plane claims the folded form or it
+            // does not, and the backlog should be able to say which.
+            "norm.rmsnorm_plus_one",
+            "norm.rmsnorm_per_head_plus_one",
             "norm.rmsnorm_no_scale",
             "norm.rmsnorm_gated",
             "norm.rmsnorm_gated_by",
@@ -64,6 +71,28 @@ fn the_table_is_the_norm_trait() {
             "norm.mul_scalar",
             "norm.scale",
             "norm.res_blend",
+        ]
+    );
+
+    // The offset-bank pair carries the SAME slots as the plain pair it sits
+    // beside: the convention is a fact about the checkpoint's bytes, not
+    // about the statement's shape, which is why it is two points and not a
+    // flag. A text says one or the other for its whole life — qwen3.5 says
+    // these, gemma-4 says the plain ones, and the checkpoint is what decides
+    // (`model/src/gemma_4/import.rs` records that measurement).
+    assert_eq!(slots("norm.rmsnorm_plus_one"), slots("norm.rmsnorm"));
+    assert_eq!(
+        slots("norm.rmsnorm_per_head_plus_one"),
+        slots("norm.rmsnorm_per_head")
+    );
+    assert_eq!(
+        slots("norm.rmsnorm_per_head"),
+        [
+            ("x", In, Generic(0)),
+            ("weight", Const, Generic(0)),
+            ("head_dim", Scalar, Fixed(U32)),
+            ("eps", Scalar, Fixed(F32)),
+            ("y", Out, Generic(0)),
         ]
     );
 
@@ -102,6 +131,11 @@ fn the_table_is_the_norm_trait() {
             ("x", In, Fixed(F32)),
             ("gate", In, Generic(0)),
             ("weight", Const, Fixed(F32)),
+            // STATED, because a gated out-norm's weight is ONE head wide
+            // and a `Const` carries an address with no rectangle: a plane
+            // reading the width off its operands reduces every head into
+            // one mean of squares and walks off the end of the bank.
+            ("head_dim", Scalar, Fixed(U32)),
             ("eps", Scalar, Fixed(F32)),
             ("y", Out, Generic(0)),
         ]
@@ -291,6 +325,46 @@ fn the_table_is_the_moe_trait() {
             ("y", Out, Generic(0)),
         ]
     );
+    assert_eq!(point("moe.matmul_select").axes, 1);
+    assert_eq!(point("moe.matmul_select").reprs, 0);
+
+    // THE ONE POINT WITH TWO KINDS OF AXIS. `Bank(0)` on the bank slot is
+    // the whole of what a quantised weight adds to a declaration: the slot
+    // rides the method's REPR axis and not its element one, so it says
+    // NOTHING about `T` — where its unbiased sibling one assertion up rides
+    // `Generic(0)` and thereby claims the bank and the activation are the
+    // same element. `bias` still rides `Generic(0)`, because an expert's
+    // bias row IS added to the activation's numbers.
+    //
+    // The route selector is `i32` on both, which is what makes the two
+    // points siblings rather than relatives.
+    assert_eq!(
+        slots("moe.matmul_select_bias"),
+        [
+            ("x", In, Generic(0)),
+            ("bank", Const, Bank(0)),
+            ("bias", Const, Generic(0)),
+            ("routes", In, Fixed(I32)),
+            ("y", Out, Generic(0)),
+        ]
+    );
+    assert_eq!(point("moe.matmul_select_bias").axes, 1);
+    assert_eq!(point("moe.matmul_select_bias").reprs, 1);
+
+    // AND IT IS THE ONLY ONE, across every family. A bank axis is what a
+    // point grows when its weight has no element — nothing else in the tree
+    // has one yet, and the count is the measurement rather than a hope.
+    assert_eq!(
+        families().filter(|p| p.reprs > 0).map(|p| p.name).collect::<Vec<_>>(),
+        ["moe.matmul_select_bias"]
+    );
+    assert_eq!(
+        families()
+            .flat_map(|p| p.slots)
+            .filter(|s| matches!(s.dtype, Bank(_)))
+            .count(),
+        1
+    );
     assert_eq!(
         slots("moe.weighted_sum"),
         [
@@ -331,12 +405,18 @@ fn the_table_is_the_layout_trait() {
     // result is the ids' ROWS by the TABLE's width, and neither a `Const`
     // weight nor the first `In` carries that — the shape rule this family
     // is waiting on.
+    //
+    // `vocab` IS THE FAMILY'S ONE STATED READ BOUND. Every other scalar
+    // here sizes a result; this one sizes nothing and is the clamp the
+    // gather compares each id against, because the table's row count is on
+    // no rectangle at the fire.
     assert_eq!(point("layout.embed").axes, 1);
     assert_eq!(
         slots("layout.embed"),
         [
             ("ids", In, Fixed(I32)),
             ("table", Const, Generic(0)),
+            ("vocab", Scalar, Fixed(U32)),
             ("y", Out, Generic(0)),
         ]
     );
@@ -376,18 +456,34 @@ fn the_table_is_the_layout_trait() {
         ]
     );
 
-    // The measured gap: declared so gemma's layer slice has a name, claimed
-    // by nothing, because a slice of a laid-out stack is a base and an
-    // offset and the plane that answers it may answer with a view.
+    // TWO SCALARS, AND THEY ARE NOT THE SAME KIND OF NUMBER. `layer` picks
+    // the slice and `width` sizes it, and the second is stated for the
+    // reason the first makes it necessary: `layer` says WHICH of them and
+    // never how many, so the packed row divides by a count no slot carries
+    // and the walk cannot size the result from the operands. The mirror of
+    // `rmsnorm_per_head`'s missing head width, on an operand instead of a
+    // `Const`.
     assert_eq!(
         slots("layout.select"),
         [
             ("table", In, Generic(0)),
             ("layer", Scalar, Fixed(U32)),
+            ("width", Scalar, Fixed(U32)),
             ("y", Out, Generic(0)),
         ]
     );
 
+    // Every stated width in this family is a `u32` and every one of them is
+    // a SCALAR slot: a width a statement carries is neither an arena
+    // rectangle nor a load-time bank, and the two generators read that off
+    // the mark.
+    for p in LAYOUT_POINTS {
+        for slot in p.slots {
+            if matches!(slot.mark, Scalar) {
+                assert_eq!(slot.dtype, Fixed(U32), "{}.{}", p.name, slot.name);
+            }
+        }
+    }
 }
 
 #[test]
@@ -443,7 +539,13 @@ fn the_table_is_the_ssm_trait() {
         [
             ("ba", In, Generic(0)),
             ("dt_bias", Const, Generic(0)),
-            ("a_log", Const, Generic(0)),
+            // NOT `Generic(0)`, and the asymmetry with `dt_bias` one line
+            // up is the whole point. `gated_delta_net_prep.cuh` takes
+            // `const float* __restrict__ A_log` beside `const T*
+            // __restrict__ dt_bias`, the routine claiming this point has
+            // always spelled `Const<Tensor<f32>>`, and the shipped
+            // 35B-A3B ships `A_log` F32 in an otherwise BF16 file.
+            ("a_log", Const, Fixed(F32)),
             ("gates", Out, Fixed(F32)),
         ]
     );
@@ -466,14 +568,20 @@ fn the_table_is_the_ssm_trait() {
         ]
     );
 
+    // KDA's decay pair is F32 on BOTH slots, where `gdn_prep`'s is split.
+    // `ssm/kda.cuh`'s `kda_gate_beta` takes `const float* A_log` beside
+    // `const float* dt_bias` in one argument list; `gated_delta_net_prep.cuh`
+    // takes `const float* A_log` beside `const T* dt_bias`. Each point
+    // spells its own kernel's answer, and this row is the place the two
+    // disagreeing kernels are visible side by side.
     assert_eq!(
         slots("ssm.kda_step"),
         [
             ("mixed", In, Generic(0)),
             ("f", In, Generic(0)),
             ("b", In, Generic(0)),
-            ("dt_bias", Const, Generic(0)),
-            ("a_log", Const, Generic(0)),
+            ("dt_bias", Const, Fixed(F32)),
+            ("a_log", Const, Fixed(F32)),
             ("state", Cache, Opaque),
             ("heads", Scalar, Fixed(U32)),
             ("head_dim", Scalar, Fixed(U32)),
@@ -522,7 +630,6 @@ fn the_table_is_the_attention_trait() {
             "attention.prefill_lse",
             "attention.sink",
             "attention.merge_lse",
-            "attention.lse_ln",
             "attention.logit_softcap",
             "attention.kv_append",
             "attention.kv_append_shared",
@@ -574,14 +681,16 @@ fn the_table_is_the_attention_trait() {
         assert_eq!(slots(with_lse), expected, "{with_lse}");
     }
 
-    // The mixed one: the output rides `T`, the lse and the learned sink
-    // ride f32 — a normaliser is accumulated, not activated.
+    // The mixed one, and the mix is the whole declaration: the lse is
+    // ACCUMULATOR STATE and rides f32 wherever the output rides, while the
+    // sink is a LEARNED WEIGHT and rides the output's own element because
+    // that is what a checkpoint ships it at (gpt-oss: BF16 `[64]`).
     assert_eq!(
         slots("attention.sink"),
         [
             ("o", InOut, Generic(0)),
             ("lse", In, Fixed(F32)),
-            ("sink", Const, Fixed(F32)),
+            ("sink", Const, Generic(0)),
             ("head_dim", Scalar, Fixed(U32)),
         ]
     );
@@ -599,11 +708,6 @@ fn the_table_is_the_attention_trait() {
             ("lse", Out, Fixed(F32)),
         ]
     );
-
-    // The only point on the floor that quantifies over nothing: an lse is
-    // f32 wherever it came from, so its dispatch is a single arm.
-    assert_eq!(point("attention.lse_ln").axes, 0);
-    assert_eq!(slots("attention.lse_ln"), [("lse", InOut, Fixed(F32))]);
 
     // The two appends are EFFECTS: a statement that names a cache row and
     // leaves the fire's rows in it states no result, and no `Out` slot is
@@ -697,7 +801,6 @@ fn the_table_is_the_mla_trait() {
             "mla.latents_rope",
             "mla.split_q_b",
             "mla.absorb_q",
-            "mla.absorb_q_pe",
             "mla.absorb_out",
             "mla.kv_append",
             "mla.attention_decode",
@@ -753,7 +856,7 @@ fn the_table_is_the_mla_trait() {
             ("q_latent", Out, Generic(0)),
         ]
     );
-    for name in ["mla.absorb_q", "mla.absorb_q_pe", "mla.absorb_out"] {
+    for name in ["mla.absorb_q", "mla.absorb_out"] {
         let stated: Vec<&str> = point(name)
             .slots
             .iter()
@@ -766,9 +869,10 @@ fn the_table_is_the_mla_trait() {
         }
     }
 
-    // The selected pair reads a BYTE MASK where the plain pair reads the
-    // query's rotated half: a selection is not an activation and never
-    // rides the family's axis.
+    // THE SELECTED PAIR IS THE PLAIN PAIR PLUS ONE SLOT. Both readings take
+    // the query as the separate `(q, q_pe)` planes every latent attention
+    // kernel in the tree addresses; the selection is an `i32` INDEX LIST
+    // after them, and never rides the family's activation axis.
     assert_eq!(
         slots("mla.attention_decode"),
         [
@@ -785,7 +889,8 @@ fn the_table_is_the_mla_trait() {
         slots("mla.attention_decode_selected"),
         [
             ("q", In, Generic(0)),
-            ("selection", In, Fixed(U8)),
+            ("q_pe", In, Generic(0)),
+            ("selection", In, Fixed(I32)),
             ("pages", Cache, Opaque),
             ("heads", Scalar, Fixed(U32)),
             ("kv_lora_rank", Scalar, Fixed(U32)),
@@ -793,6 +898,14 @@ fn the_table_is_the_mla_trait() {
             ("o", Out, Generic(0)),
         ]
     );
+    // ONE SLOT AND ONE ONLY: the selected decode is `mla.attention_decode`
+    // with `selection` inserted, which is what makes the two claimed bodies
+    // the same body with a list operand.
+    {
+        let mut expected = slots("mla.attention_decode");
+        expected.insert(2, ("selection", In, Fixed(I32)));
+        assert_eq!(slots("mla.attention_decode_selected"), expected);
+    }
 
     // Every prefill point is its decode sibling plus the query CSR at slot
     // one, and nothing else moves — the `ssm` chunked relation, again.
@@ -858,9 +971,12 @@ fn the_table_is_the_index_trait() {
         ]
     );
 
-    // THE SELECTION IS A BYTE PLANE, and the same one `mla`'s selected
-    // attention reads: one family writes it, the other consumes it, and the
-    // two slots agree at the table rather than by convention.
+    // THE SELECTION IS AN `i32` INDEX LIST, and the same one `mla`'s
+    // selected attention reads: one family writes it, the other consumes
+    // it, and the two slots agree at the table rather than by convention.
+    // `top_k` is a STATED SCALAR of this point, which is the whole reason
+    // the list is the value and a `[tokens, kv]` mask is not — the kv
+    // extent is per-request and appears in no slot here.
     assert_eq!(
         slots("index.topk"),
         [
@@ -870,11 +986,12 @@ fn the_table_is_the_index_trait() {
             ("heads", Scalar, Fixed(U32)),
             ("head_dim", Scalar, Fixed(U32)),
             ("top_k", Scalar, Fixed(U32)),
-            ("selection", Out, Fixed(U8)),
+            ("selection", Out, Fixed(I32)),
         ]
     );
     let written = slots("index.topk").pop().expect("the point states one");
-    let read = slots("mla.attention_decode_selected")[1];
+    let read = slots("mla.attention_decode_selected")[2];
+    assert_eq!(written.0, read.0, "the two families name the same slot");
     assert_eq!(written.2, read.2);
 }
 
@@ -1044,9 +1161,21 @@ fn the_table_is_the_hc_trait() {
     }
 }
 
-/// `Prim::U8` is a TENSOR element and never a host scalar's run: the byte
-/// mask a selection writes is the only slot that carries it, and no
-/// parameter anywhere is a bare `u8`.
+/// NO DECLARATION RIDES `Prim::U8` ANY MORE, and this test is what records
+/// that it once did.
+///
+/// The three slots that carried it were the DSA selection — `index.topk`'s
+/// result and the two `_selected` attentions' operand — declared as a BYTE
+/// MASK over the cached keys. A mask is `[tokens, kv]` and the kv extent is
+/// a per-request runtime number that no slot of `index.topk` holds, so
+/// `model_compiler::program::out_sizes` could not size it; the selection is
+/// now `[tokens, top_k]` of `i32`, which the stated budget sizes. The byte
+/// plane went with the mask.
+///
+/// The invariant the test was written for stands and is checked for the
+/// whole table rather than for those three: `Prim::U8` is a TENSOR element
+/// and never a host scalar's run. A `u8` parameter would be a bare byte in
+/// the params column, which no builder can record and no dispatch can read.
 #[test]
 fn the_byte_plane_is_a_rectangle_and_not_a_run() {
     let mut carried = Vec::new();
@@ -1058,14 +1187,7 @@ fn the_byte_plane_is_a_rectangle_and_not_a_run() {
             }
         }
     }
-    assert_eq!(
-        carried,
-        [
-            "mla.attention_decode_selected.selection",
-            "mla.attention_prefill_selected.selection",
-            "index.topk.selection",
-        ]
-    );
+    assert_eq!(carried, [] as [String; 0]);
 }
 
 trait Toy {

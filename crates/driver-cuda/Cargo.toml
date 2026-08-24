@@ -210,6 +210,24 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 # trap found three times is not going to be remembered the fourth.
 #
 # Not `chat`: the chat templates are not in the load path.
+# WHAT IS LEFT OF THIS EDGE, AND WHY IT IS STILL HERE (R2).
+#
+# The legacy FIRE path is gone: nothing in `src/` calls `Variant::trace`,
+# `model_compiler::lower`, or any of the dispatch that consumed them. What
+# still comes through this edge is the checkpoint's IDENTITY and its SHAPE:
+#
+#   * `catalog::identify` -- reads the checkpoint's own tensors and answers
+#     which model it is, which `baker::sku_for` bridges to a new-catalog SKU;
+#   * `deployment::Deployment` -- the numbers every POOL is sized, strided and
+#     slot-addressed from (`kv_geometry`, `recurrent_layout`, `memory_planner`,
+#     the advertised caps, `servable_by`'s GQA gate);
+#   * `encoding::Encoding` + `contract` -- the load contract `weights::plan`
+#     authors for the checkpoint reader;
+#   * `shared::tower_names` -- the `Encode` verb's vision/audio slot order.
+#
+# THE SEAM, MEASURED: the baker lane fires the NEW catalog's program on pools
+# the OLD catalog sized, and `baker::Geometry::agrees_with` is the check that
+# stands between those two accounts. R3 is where the second account dies.
 model = { path = "../model-legacy", package = "model-legacy", default-features = false, features = ["contract"] }
 
 # NO `libc`. It was here for `flock` and `open` on the profile cache —
@@ -218,14 +236,47 @@ model = { path = "../model-legacy", package = "model-legacy", default-features =
 # the same advisory whole-file lock with the descriptor's lifetime in the
 # type. Dropping it is what lets `layout/` carry `#![forbid(unsafe_code)]`.
 
-# The executor's input: `lower()`'s flat launch list and the trace types
-# its operands name. Pure Rust — the toolkit-free build is unaffected.
+# `program` AND `sweep`, NOT `lower`. This edge used to exist for `lower()`'s
+# flat launch list -- the legacy executor's input -- and R2 deleted every
+# consumer of it. What is used now is `program::{Program, Slot, Call, Rows,
+# bound}`: one `Program` per lane, built at LOAD, whose statements carry their
+# own operands. Pure Rust either way, so the toolkit-free build is unaffected.
 #
-# Two entries since the toolchain split, and the split is why the AUTHORING
-# surface is no longer here: `dsl::cuda` is 4,469 lines this crate's `src/`
-# never called, and the only paths in it that named `dsl` were doc links.
+# `model_compiler::lower` is still COMPILED (the module is not feature-gated,
+# and the three shader drivers still consume it), and nothing in this crate
+# names a path into it. Gating it off is `model-compiler`'s call to make and
+# belongs with R3, when the shader planes are its only consumers left.
 model-compiler = { path = "../model-compiler" }
 model-ir = { path = "../model-ir" }
+
+# THE NEW CATALOG, under a name that says which one it is.
+#
+# `model` in this manifest is `model-legacy` (see its line above), and it has
+# been that since the split. So the baker's front end — `catalog()`, the
+# trace fns, `import_of`, `produce`, `snapshot` — cannot be spelled `model`
+# here: the name is taken, by 63 `model::` paths in `src/` and 186 in
+# `tests/` that all mean the legacy crate. Renaming that edge to free the
+# word would touch every one of them for no behaviour change, on the one
+# path this work is required to leave alone.
+#
+# So the new crate arrives aliased and is spelled `model_baker::` at every
+# call site, which reads as what it is. The alias dies when the legacy
+# crate does and the word comes free.
+#
+# NOT optional and NOT feature-gated: it is pure Rust — a trace is a host
+# walk that allocates a `Plan`, and `produce` reads safetensors with
+# `std::fs` — so it costs the toolkit-free build nothing, exactly as
+# `model-compiler` above costs it nothing.
+model-baker = { path = "../model", package = "model" }
+
+# NO `model-dsl` EDGE, and the reason is worth the four lines because the
+# obvious reading of `trace_of`'s signature says otherwise. It answers a
+# `fn(model_dsl::Plane) -> model_dsl::Plan`, so a caller looks like it needs
+# the authoring crate to name either type. It does not: both are re-exports
+# (`model-dsl/src/lib.rs:20-21`) of `model_ir::kernels::Backend` and
+# `model_ir::plan::Plan`, which arrive on the line above. The baker path
+# spells the `model_ir` names, calls the fn pointer with them, and lets
+# inference carry `import_of`'s `Import` — which it never has to name.
 
 # The PTIR channel plane, shared with the Metal shell: launch-package
 # adoption, the compile-cache identity, the emitted-table index, the bounded
@@ -320,7 +371,10 @@ kernels = { path = "../kernels" }
 # `src/` spells nothing from this crate at all. It used to arrive as part of
 # `model-compiler`, so the 4,469-line `dsl::cuda` surface was in every build
 # of this driver rather than only in its test binaries.
-model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
+# `model-dsl` (= `model-dsl-legacy`) STOOD HERE. Its only consumers were the
+# tests that hand-built a legacy forward -- `real_hybrid`, `real_prefill`,
+# `real_gemma4`, `executor_bind`, `shape_analysis` -- and all five are deleted
+# with the path they exercised. Nothing under `tests/` names `model_dsl::`.
 kernels = { path = "../kernels" }
 # THE ARCHIVE CRATE STOOD HERE TOO, and its line is the one that predicted
 # its own removal: *"This line is kept because removing it is a separate
@@ -465,21 +519,12 @@ required-features = ["_cuda"]
 name = "kv_view_parity"
 required-features = ["_cuda"]
 
-[[test]]
-name = "lora_stage_parity"
-required-features = ["_cuda"]
 
-[[test]]
-name = "page_mask_parity"
-required-features = ["_cuda"]
 
 [[test]]
 name = "sideband_arena_parity"
 required-features = ["_cuda"]
 
-[[test]]
-name = "stage_hooks_parity"
-required-features = ["_cuda"]
 
 [[test]]
 name = "weight_view_parity"
@@ -568,41 +613,26 @@ required-features = ["_cuda"]
 # family's own tests in `kernels-cuda`.
 
 
-[[test]]
-name = "executor_bind"
-required-features = ["_cuda"]
 
-[[test]]
-name = "real_prefill"
-required-features = ["_cuda"]
 
-[[test]]
-name = "real_hybrid"
-required-features = ["_cuda"]
 
-[[test]]
-name = "real_gemma4"
-required-features = ["_cuda"]
 
+
+# The baker lane's gate. `abi` for the reason `serve` above carries it: it
+# opens a `Shell` and speaks `driver_api::local`, and neither exists without
+# the door. The stanza is NOT optional politeness — this manifest sets no
+# `autotests = false`, so a new `tests/*.rs` is auto-discovered and the
+# featureless job (`cargo test -p driver-cuda`, whose entire premise is that
+# this crate has a half that is correct without a GPU) would try to build a
+# target whose first `use` names a module that is `#[cfg]`'d away. See the
+# `[[test]]` block header above: that is exactly how a green job goes red.
 [[test]]
-name = "serve"
+name = "baker_serve"
 required-features = ["_cuda", "abi"]
 
-[[test]]
-name = "union_lower"
-required-features = ["_cuda"]
 
-[[test]]
-name = "gpu_supergraph"
-required-features = ["_cuda"]
 
-[[test]]
-name = "catalog_coverage"
-required-features = ["_cuda", "abi"]
 
-[[test]]
-name = "shape_analysis"
-required-features = ["_cuda"]
 
 
 

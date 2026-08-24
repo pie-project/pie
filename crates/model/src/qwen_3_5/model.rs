@@ -1,10 +1,11 @@
 use std::marker::PhantomData;
 
-use model_dsl::axes::{Dtype, KvDtype};
+use model_dsl::axes::{Dtype, F32, KvDtype};
 use model_dsl::{CacheRef, Norm, Tensor};
 
 pub struct Model<W1: Dtype, K: KvDtype, const TP: usize = 1> {
     pub hidden: u32,
+    pub vocab: u32,
     pub embed: Tensor<W1>,
     pub head: Head<W1>,
     pub layers: Vec<Layer<W1>>,
@@ -45,6 +46,23 @@ pub struct Attn<W1: Dtype> {
     pub kv: CacheRef,
 }
 
+/// TWO OF THIS MIXER'S BANKS ARE f32 AND THE REST ARE `W1`, and that is a
+/// statement about the kernels, not a quirk of one file.
+///
+/// * `a_log` — `ssm.gdn_prep` declares the slot `Const<Self::Tensor<f32>>`
+///   and `ssm/gated_delta_net_prep.cuh` reads it through `const float*
+///   __restrict__ A_log`, in the same argument list where `dt_bias` is
+///   `const T*`.
+/// * `norm` — `norm.rmsnorm_gated` declares `weight:
+///   Const<Self::Tensor<f32>>`, and `kernels-cuda`'s claiming routine
+///   `rmsnorm_gated_fp32_in` takes `Const<Tensor<f32>>`.
+///
+/// The shipped 35B-A3B checkpoint agrees from the other side: in an
+/// otherwise BF16 file, `linear_attn.A_log` is F32 and `linear_attn.norm`
+/// is F32 while `linear_attn.dt_bias` is BF16. Declaring these `W1` made
+/// the plan's repr column say bf16 for sixty rows the checkpoint stores as
+/// f32 — the join reported it, and no cast anyone could write would have
+/// been right, because the kernel wants the f32.
 pub struct Gdn<W1: Dtype> {
     pub k_heads: u32,
     pub v_heads: u32,
@@ -55,8 +73,8 @@ pub struct Gdn<W1: Dtype> {
     pub in_ba: Tensor<W1>,
     pub conv: Tensor<W1>,
     pub dt_bias: Tensor<W1>,
-    pub a_log: Tensor<W1>,
-    pub norm: Norm<W1>,
+    pub a_log: Tensor<F32>,
+    pub norm: Norm<F32>,
     pub out_proj: Tensor<W1>,
     pub conv_state: CacheRef,
     pub delta_state: CacheRef,
@@ -89,6 +107,20 @@ struct MoeDims {
     shared_inter: u32,
 }
 
+/// An SKU's feed-forward is EITHER dense with an intermediate width OR
+/// routed with an expert bank, and it is spelled as a choice because the
+/// two numbers do not coexist in any config this family ships. `a3b`'s
+/// `text_config` states `moe_intermediate_size` and
+/// `shared_expert_intermediate_size` and has NO `intermediate_size` at all
+/// (`mlp_only_layers: []`, so not one layer is dense); the dense SKUs state
+/// `intermediate_size` and no expert count. A struct with both fields made
+/// the routed rows carry a dense width that nothing read and no file
+/// stated. `model-legacy`'s `Qwen35MlpKind` is the same enum.
+enum MlpDims {
+    Dense { inter: u32 },
+    Routed(MoeDims),
+}
+
 struct Dims {
     hidden: u32,
     layers: u32,
@@ -103,22 +135,72 @@ struct Dims {
     k_dim: u32,
     v_dim: u32,
     conv_kernel: u32,
-    mlp_inter: u32,
-    moe: Option<MoeDims>,
+    mlp: MlpDims,
     vocab: u32,
     tied: bool,
     norm_eps: f32,
 }
 
 impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
+    /// EVERY NUMBER HERE IS A `config.json` KEY of the shipped
+    /// `Qwen/Qwen3.5-35B-A3B`, read out of the cached snapshot's
+    /// `text_config` and cross-checked against the safetensors headers:
+    ///
+    /// | field          | config key                          | value |
+    /// |----------------|-------------------------------------|-------|
+    /// | `hidden`       | `hidden_size`                       | 2048 |
+    /// | `layers`       | `num_hidden_layers`                 | 40 |
+    /// | `attn_every`   | `full_attention_interval`           | 4 |
+    /// | `q_heads`      | `num_attention_heads`               | 16 |
+    /// | `kv_heads`     | `num_key_value_heads`               | 2 |
+    /// | `head_dim`     | `head_dim`                          | 256 |
+    /// | `rotary_dim`   | `rope_parameters.partial_rotary_factor` × `head_dim` | 0.25 × 256 = 64 |
+    /// | `theta`        | `rope_parameters.rope_theta`        | 10 000 000 |
+    /// | `k_heads`      | `linear_num_key_heads`              | 16 |
+    /// | `v_heads`      | `linear_num_value_heads`            | 32 |
+    /// | `k_dim`        | `linear_key_head_dim`               | 128 |
+    /// | `v_dim`        | `linear_value_head_dim`             | 128 |
+    /// | `conv_kernel`  | `linear_conv_kernel_dim`            | 4 |
+    /// | `experts`      | `num_experts`                       | 256 |
+    /// | `top_k`        | `num_experts_per_tok`               | 8 |
+    /// | `inter`        | `moe_intermediate_size`             | 512 |
+    /// | `shared_inter` | `shared_expert_intermediate_size`   | 512 |
+    /// | `vocab`        | `vocab_size`                        | 248 320 |
+    /// | `tied`         | `tie_word_embeddings` (top level)   | false |
+    /// | `norm_eps`     | `rms_norm_eps`                      | 1e-6 |
+    ///
+    /// FOUR OF THEM WERE WRONG, each in the direction of an older Qwen:
+    /// `layers` said 48, `vocab` said 151 936 (Qwen2/3's tokenizer, not the
+    /// 248 320 this file's `embed_tokens` and `lm_head` both are),
+    /// `experts` said 512 and `top_k` said 10. A fifth number, a dead
+    /// `mlp_inter: 5120`, stated a dense width for a model with no dense
+    /// layer, and is gone with the field.
+    /// `model-legacy/src/qwen_3_5/spec.rs::qwen3_5_35b_a3b` — the
+    /// deployment that served this checkpoint — already said 256 experts,
+    /// top_k 8, 512/512 intermediates.
+    ///
+    /// The header arithmetic confirms every derived width: `q_proj`
+    /// [8192, 2048] is `2 × q_heads × head_dim` because `attn_output_gate`
+    /// is true and the gate rides the same bank; `k_proj`/`v_proj`
+    /// [512, 2048] are `kv_heads × head_dim`; `conv1d` [8192, 1, 4] is
+    /// `2·k_heads·k_dim + v_heads·v_dim`; `in_proj_z` [4096, 2048] is
+    /// `v_heads × v_dim`; `in_proj_a`/`in_proj_b` [32, 2048] are
+    /// `v_heads`. `layer_types` puts `full_attention` at 3, 7, … 39,
+    /// which is `l % 4 == 3` — what `attn_at` computes.
+    ///
+    /// NOT MODELLED, and named so the gap is a fact rather than a silence:
+    /// `rope_parameters.mrope_interleaved` / `mrope_section [11, 11, 10]`
+    /// (the vision tower's rope; the text lane uses plain partial rope),
+    /// the whole `vision_config` tower, and `mtp_num_hidden_layers: 1`
+    /// (the checkpoint's `mtp.*` rows). All three are checkpoint tensors no
+    /// import row reads, which `baker_load` counts out loud.
     pub fn a3b() -> Self {
         assemble(Dims {
-            hidden: 2048, layers: 48, attn_every: 4,
+            hidden: 2048, layers: 40, attn_every: 4,
             q_heads: 16, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
             k_heads: 16, v_heads: 32, k_dim: 128, v_dim: 128, conv_kernel: 4,
-            mlp_inter: 5120,
-            moe: Some(MoeDims { experts: 512, top_k: 10, inter: 512, shared_inter: 512 }),
-            vocab: 151_936, tied: false, norm_eps: 1e-6,
+            mlp: MlpDims::Routed(MoeDims { experts: 256, top_k: 8, inter: 512, shared_inter: 512 }),
+            vocab: 248_320, tied: false, norm_eps: 1e-6,
         })
     }
 
@@ -127,19 +209,22 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
             hidden: 1024, layers: 24, attn_every: 4,
             q_heads: 8, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
             k_heads: 16, v_heads: 16, k_dim: 128, v_dim: 128, conv_kernel: 4,
-            mlp_inter: 3584,
-            moe: None,
+            mlp: MlpDims::Dense { inter: 3584 },
             vocab: 248_320, tied: true, norm_eps: 1e-6,
         })
     }
 
+    /// UNVERIFIED against a checkpoint — no Qwen3.5-3B is cached, so these
+    /// numbers have had no file held against them the way `a3b` and
+    /// `d0_8b` now have. `vocab: 151_936` is the specific row to distrust:
+    /// it is the number `a3b` was wrong by, and both SKUs that HAVE been
+    /// read ship 248 320.
     pub fn d3b() -> Self {
         assemble(Dims {
             hidden: 2048, layers: 24, attn_every: 4,
             q_heads: 16, kv_heads: 2, head_dim: 256, rotary_dim: 64, theta: 10_000_000.0,
             k_heads: 16, v_heads: 32, k_dim: 128, v_dim: 128, conv_kernel: 4,
-            mlp_inter: 8192,
-            moe: None,
+            mlp: MlpDims::Dense { inter: 8192 },
             vocab: 151_936, tied: true, norm_eps: 1e-6,
         })
     }
@@ -184,21 +269,33 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                 in_ba: Tensor::sym(n("in_ba"), [2 * d.v_heads as u64, hidden]).packed([d.v_heads as u64, d.v_heads as u64]),
                 conv: Tensor::sym(n("conv"), [qkv, d.conv_kernel as u64]).packed([k_w, k_w, v_w]),
                 dt_bias: Tensor::sym(n("dt_bias"), [d.v_heads as u64]).columns(),
-                a_log: Tensor::sym(n("a_log"), [d.v_heads as u64]).columns(),
-                norm: norm("gdn_norm", d.v_dim as u64),
+                a_log: Tensor::<F32>::sym(n("a_log"), [d.v_heads as u64]).columns(),
+                norm: Norm {
+                    weight: Tensor::<F32>::sym(n("gdn_norm"), [d.v_dim as u64]),
+                    eps: d.norm_eps,
+                },
                 out_proj: Tensor::sym(n("out_proj"), [hidden, d.v_heads as u64 * d.v_dim as u64]).rows(),
                 conv_state: CacheRef::to(format!("conv.{l}")),
                 delta_state: CacheRef::to(format!("delta.{l}")),
             })
         };
-        let mlp = match &d.moe {
-            None => Mlp::Dense {
-                gate_up: Tensor::sym(n("gate_up"), [2 * d.mlp_inter as u64, hidden]).packed([d.mlp_inter as u64, d.mlp_inter as u64]),
-                down: Tensor::sym(n("down"), [hidden, d.mlp_inter as u64]).rows(),
-                inter: d.mlp_inter,
+        let mlp = match &d.mlp {
+            MlpDims::Dense { inter } => Mlp::Dense {
+                gate_up: Tensor::sym(n("gate_up"), [2 * *inter as u64, hidden]).packed([*inter as u64, *inter as u64]),
+                down: Tensor::sym(n("down"), [hidden, *inter as u64]).rows(),
+                inter: *inter,
             },
-            Some(m) => Mlp::Routed {
+            MlpDims::Routed(m) => Mlp::Routed {
                 router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
+                // `[E, out, in]`, which is what the KERNEL reads and not a
+                // convention picked here. `moe.matmul_select` declares
+                // "`bank` is the `[E, N, K]` stack", and
+                // `moe/moe_grouped_gemm.cuh` indexes it
+                // `weight_base + e*N*K + n*K` with the b-fragment loaded
+                // `col_major` at `ld = K` — its own words: *"W is [N, K]
+                // row-major, and W^T is [K, N]; a [K, N] column-major view
+                // of W^T is exactly W's own memory with leading dimension
+                // K"*. So N is the output width and K the input width.
                 gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * m.inter as u64, hidden]).experts(),
                 down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, m.inter as u64]).experts(),
                 shared_gate_up: Tensor::sym(n("shared_gate_up"), [2 * m.shared_inter as u64, hidden]).packed([m.shared_inter as u64, m.shared_inter as u64]),
@@ -220,6 +317,7 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
 
     Model {
         hidden: d.hidden,
+        vocab: d.vocab,
         embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
         head: if d.tied {
             Head::Tied

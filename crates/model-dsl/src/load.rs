@@ -49,8 +49,18 @@ pub enum Source {
     Stack(Vec<Source>),
     /// A `[1]` tensor from a scalar the checkpoint stores beside `name`.
     ScalarOf(String),
-    /// Ungroup `groups`-way row interleaving into contiguous segments.
-    Deinterleave(String, u32),
+    /// Ungroup `groups`-way interleaving ALONG ONE AXIS into contiguous
+    /// segments: `g0 g1 g0 g1 ...` becomes `g0 g0 ... g1 g1 ...`, once for
+    /// every position of whatever axes precede it.
+    ///
+    /// THE AXIS IS SPELLED, and it was a silent bug when it was not. This
+    /// verb used to permute the LEADING axis and nothing else; gpt-oss's
+    /// fused gate/up bank is `[experts, 2*inter, ..]` with the interleaving
+    /// on axis 1, so the two rows that stated it were permuting the EXPERTS —
+    /// a shuffle of which expert is which, on a tensor whose leading axis
+    /// happens to divide by two. An axis that must be stated is an axis a
+    /// reader can check.
+    Deinterleave(String, u32, u32),
     /// Drop one extent-1 axis. A depthwise conv ships as
     /// `[channels, 1, width]` and the canonical weight is
     /// `[channels, width]` -- the kernel point states the width in the
@@ -77,6 +87,50 @@ impl Import {
             "`{target}` is produced twice"
         );
         self.rows.push(Row { target, source });
+    }
+
+    /// Every stored plane of one QUANTISED bank, in the repr's own order:
+    /// mxfp4's packed codes under `target`, its block exponents under
+    /// `<target>.scales`.
+    ///
+    /// A WRITE VERB AND NOT A `Source`, and the arithmetic of the import is
+    /// why. A `Source` answers with ONE tensor; a bank at a quantised repr is
+    /// two parameters with two names, two shapes and two allocations — so a
+    /// paired `Source` would have to concatenate the planes into one row,
+    /// which throws away both shapes, defeats the join's shape check and buys
+    /// a split point somebody has to recompute on the device. What the
+    /// pairing actually has to say is that these rows are ONE weight and that
+    /// the suffix is not a convention each family gets to invent, and a write
+    /// verb says exactly that.
+    ///
+    /// THE SUFFIXES COME OFF THE REPR, and this is the third reader of the
+    /// same list rather than a third spelling of it: `Dtype::PLANE_SUFFIXES`
+    /// states them, `Stmt::bank` records a statement's columns from them, and
+    /// this names the production rows. A family's import table spells none.
+    ///
+    /// # Panics
+    ///
+    /// If the sources do not match the repr's plane count — an mxfp4 bank
+    /// built from one tensor is a bank with no scales, which would load as
+    /// silently un-dequantised bytes rather than as a refusal.
+    pub fn bank<W: crate::axes::Dtype>(
+        &mut self,
+        target: impl Into<String>,
+        planes: impl IntoIterator<Item = Source>,
+    ) {
+        let target = target.into();
+        let planes: Vec<Source> = planes.into_iter().collect();
+        let suffixes = W::PLANE_SUFFIXES;
+        assert!(
+            planes.len() == suffixes.len(),
+            "`{target}` is a {} bank of {} plane(s) and this states {}",
+            W::NAME,
+            suffixes.len(),
+            planes.len()
+        );
+        for (suffix, source) in suffixes.iter().zip(planes) {
+            self.write(format!("{target}{suffix}"), source);
+        }
     }
 }
 
@@ -118,8 +172,8 @@ pub fn scalar_of(name: impl Into<String>) -> Source {
     Source::ScalarOf(name.into())
 }
 
-pub fn deinterleave(name: impl Into<String>, groups: u32) -> Source {
-    Source::Deinterleave(name.into(), groups)
+pub fn deinterleave(name: impl Into<String>, axis: u32, groups: u32) -> Source {
+    Source::Deinterleave(name.into(), axis, groups)
 }
 
 pub fn squeeze(name: impl Into<String>, axis: u32) -> Source {

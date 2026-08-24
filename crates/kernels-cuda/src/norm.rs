@@ -121,7 +121,7 @@ fn vec8_ok(
         && aligned16(weight)
 }
 
-fn heads<P>(row: &Region<P>, head_dim: i32) -> Result<i32, Refusal> {
+pub(crate) fn heads<P>(row: &Region<P>, head_dim: i32) -> Result<i32, Refusal> {
     let width = row.width;
     if head_dim <= 0 {
         return Err(Refusal::Empty { what: "head_dim" });
@@ -181,21 +181,29 @@ fn altup_factor<P>(row: &Region<P>, part: i32, part_what: &'static str) -> Resul
     Ok(width / part)
 }
 
-/// The `Norm` family, claimed. Each body is a delegation to the routine
-/// below that already fires the point, deriving the legacy-only parameters
-/// from the operands: a whole-row norm passes `per_head_dim = 0`, which is
-/// what the legacy wrapper passed for the same statement.
+/// The `Norm` family, claimed. Almost every body is a delegation to the
+/// routine below that already fires the point, deriving the legacy-only
+/// parameters from the operands: a whole-row norm passes `per_head_dim = 0`,
+/// which is what the legacy wrapper passed for the same statement.
 ///
-/// Three points stay on the floor's default body, and each absence is a
+/// `norm.scale` IS THE EXCEPTION, and the exception is baker.md's rule.
+/// A `#[routine]` exists so the LEGACY driver can reach a kernel by symbol;
+/// nothing legacy reaches this one, because legacy never fired it — gemma's
+/// `layer_scalar` was read to the HOST once at load
+/// (`read_bf16_scalar_once`, `driver-cuda/tests/real_gemma4.rs`) and rode
+/// the fused sandwich norm's `scale` parameter as an fp32. So there is no
+/// caller for a routine to serve and no canon name for it to answer, and
+/// the impl body is the launcher — the form baker.md states for exactly
+/// this case. Writing it as a routine plus a one-line delegation would add
+/// a second public name for a kernel with one caller.
+///
+/// One point stays on the floor's default body, and the absence is a
 /// measured row rather than an oversight:
 ///
-/// * `norm.scale` — no cuda kernel multiplies by a learned `[1]` scalar.
-/// * `norm.rmsnorm_per_head` and `norm.rmsnorm_gated_by` — both need the
-///   head width, and no operand carries it. `Const<Tensor<T>>` holds the
-///   weight's ADDRESS and nothing else (`bind/table.rs`: "a weight's shape
-///   is the MODEL's, not the statement's"), so the width the declaration
-///   would have to be read for is not there to read. Serving them wants a
-///   stated `head_dim`, as `rmsnorm_no_scale` has.
+/// * `norm.res_blend` — kimi's variadic ledger item. The text states one
+///   value per earlier block and the count grows with the layer, so the
+///   statement's arity is a function of where it stands; the routine keeps
+///   its own `canon` and the point resolves through it.
 #[kernels_macros::claims]
 impl kernels::points::Norm for Ctx<'_> {
     fn rmsnorm_per_head<T: kernels::points::Scalar>(
@@ -341,6 +349,43 @@ impl kernels::points::Norm for Ctx<'_> {
         x: InOut<Tensor<T>>,
     ) -> Result<(), Refusal> {
         scalar_mul(self, x, Const::new(s))
+    }
+
+    /// `x *= s[0]`, the factor a `[1]` bank on the device.
+    ///
+    /// The launcher, not a delegation — see this impl's header. Everything
+    /// about the geometry is `norm.mul_scalar`'s: one thread per element,
+    /// 256 to a block, the count rounded up and the tail threads told to
+    /// stop. What differs is one operand's MARK, and a mark is who binds
+    /// the slot: `mul_scalar`'s factor comes off the fire's params run,
+    /// this one's off the load-time parameter table.
+    ///
+    /// The `[1]` shape is not checked here and could not be. A
+    /// `Const<Tensor<T>>` carries the weight's ADDRESS and no rectangle
+    /// (`bind/table.rs`: "a weight's shape is the MODEL's, not the
+    /// statement's"), so the one element this reads is the model text's
+    /// claim about its own checkpoint, verified where that claim is made —
+    /// `baker_load`'s join, which reads gemma's `layer.{l}.ple_scalar` as
+    /// `[1]` or refuses.
+    fn scale<T: kernels::points::Scalar>(
+        &self,
+        s: Const<Tensor<T>>,
+        x: InOut<Tensor<T>>,
+    ) -> Result<(), Refusal> {
+        let rect = x.all("the scaled rectangle's row width")?;
+        let Ok(n) = usize::try_from(rect.elements()) else {
+            return Err(Refusal::Empty {
+                what: "the scaled rectangle's element count",
+            });
+        };
+        self.fire(
+            Fire::at(
+                "norm/elementwise.cuh",
+                crate::jit::symbol(&format!("::pie::norm::scale<{}>", T::CPP)),
+            )
+            .apply(elementwise(rect.elements())),
+            &[x.arg(), s.arg(), n.arg()],
+        )
     }
 }
 
@@ -1394,7 +1439,13 @@ pub fn hc_rmsnorm_to_f32(
     )
 }
 
-#[routine(bf16, canon = "attention.sink", out(out = like(out)))]
+/// NO CANON AND NO POINT ANSWERS THROUGH THIS ONE. It reads the sink at
+/// f32 and does not rebase the lse, which is neither half of what
+/// `attention.sink` states: the checkpoints ship the sink at the model's
+/// element and the lse arrives in base two. `attn::attn_sink_rescale` is
+/// the kernel that answers the point; this launcher stays only because the
+/// legacy dsv4 text still fires it, and dies with `model-dsl-legacy`.
+#[routine(bf16, out(out = like(out)))]
 pub fn attn_sink_correction<T>(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<T>>,

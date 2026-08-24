@@ -176,7 +176,16 @@ __global__ void gated_softmax_pool(
 
 /// Two attention halves and their log-sum-exps, merged into one — exact
 /// algebra, not an approximation: `o = (w1·o1 + w2·o2) / (w1 + w2)` with the
-/// weights taken relative to `max(lse1, lse2)` so neither `expf` overflows.
+/// weights taken relative to `max(lse1, lse2)` so neither exponential
+/// overflows.
+///
+/// BASE TWO, because `attention.merge_lse` states base two, because an lse
+/// is what an attention kernel HAS at the end and an attention kernel folds
+/// `log2(e)` into its scale and runs on `exp2`. The weights are ratios, so
+/// this fold is the same number in any base; what is NOT base-free is the
+/// `lse_out` it leaves, which a sink correction downstream reads against a
+/// checkpoint's natural-log logit. `exp2f`/`log2f` here and `expf`/`logf`
+/// there would be the same bug in two places at once.
 ///
 /// One block per (token, head). Threads stride along `head_dim`, and every
 /// loop below is `for (d = threadIdx.x; d < head_dim; d += blockDim.x)` —
@@ -242,8 +251,8 @@ __global__ void combine_attn_outputs(
     }
 
     const float lse_max = fmaxf(l1, l2);
-    const float w1 = expf(l1 - lse_max);
-    const float w2 = expf(l2 - lse_max);
+    const float w1 = exp2f(l1 - lse_max);
+    const float w2 = exp2f(l2 - lse_max);
     const float inv_total = 1.0f / (w1 + w2);
 
     const long long off = (static_cast<long long>(n) * num_heads + h) * head_dim;
@@ -254,7 +263,7 @@ __global__ void combine_attn_outputs(
     }
 
     if (lse_out != nullptr && threadIdx.x == 0) {
-        lse_out[n * num_heads + h] = lse_max + logf(w1 + w2);
+        lse_out[n * num_heads + h] = lse_max + log2f(w1 + w2);
     }
 }
 
@@ -388,9 +397,16 @@ __global__ void compressed_attn(
     __syncthreads();
     const float inv_z = z_shared > 0.f ? 1.0f / z_shared : 0.f;
 
+    // `pool.attention_lse` states base two ONE MULTIPLY AWAY: this row
+    // accumulated on `expf` against a natural-log `row_max`, so the lse it
+    // has is `ln`, and the slot it writes is the one a merge against a
+    // flashinfer reading folds. Rebasing here costs a `fmul` on one thread
+    // per (token, head); rebasing the OTHER side would cost a launch over
+    // the whole rectangle.
     if (lse_out != nullptr && tid == 0) {
+        constexpr float kLog2e = 1.44269504088896340736f;
         lse_out[qi * num_q_heads + q_head] =
-            z_shared > 0.f ? (logf(z_shared) + row_max) : neg_inf();
+            z_shared > 0.f ? ((logf(z_shared) + row_max) * kLog2e) : neg_inf();
     }
 
     for (int i = 0; i < dims_per_thread; ++i) {
@@ -747,9 +763,16 @@ __global__ void compressed_attn_paged(
     __syncthreads();
     const float inv_z = z_shared > 0.f ? 1.0f / z_shared : 0.f;
 
+    // `pool.attention_lse` states base two ONE MULTIPLY AWAY: this row
+    // accumulated on `expf` against a natural-log `row_max`, so the lse it
+    // has is `ln`, and the slot it writes is the one a merge against a
+    // flashinfer reading folds. Rebasing here costs a `fmul` on one thread
+    // per (token, head); rebasing the OTHER side would cost a launch over
+    // the whole rectangle.
     if (lse_out != nullptr && tid == 0) {
+        constexpr float kLog2e = 1.44269504088896340736f;
         lse_out[qi * num_q_heads + q_head] =
-            z_shared > 0.f ? (logf(z_shared) + row_max) : neg_inf();
+            z_shared > 0.f ? ((logf(z_shared) + row_max) * kLog2e) : neg_inf();
     }
     for (int i = 0; i < dims_per_thread; ++i) {
         const int d = tid + i * ATTN_BLOCK;

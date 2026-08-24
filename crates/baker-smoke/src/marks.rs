@@ -11,6 +11,14 @@
 //! (`kernels/src/routine.rs:493-517`) and `Const` has `Const::new`
 //! (`kernels/src/routine.rs:617-625`), so an executor outside the driver
 //! can build every mark honestly, with no transmute and no `unsafe`.
+//!
+//! AND NO `column`. A mark carries no stride, so a rectangle taken `elems`
+//! into a packed row and called `width` wide claims a row stride of `width`
+//! for bytes whose stride is the packed one — true at one row, false at
+//! two, and silent either way. This module used to carry that cut for the
+//! gdn seam; the seam's points state their own operands now and do every
+//! packed→compact cut in a kernel that is told the packing (W10). What an
+//! executor hands a kernel is DENSE rectangles, and only those.
 
 use core::ffi::c_void;
 
@@ -22,11 +30,13 @@ use model_compiler::program::Dt;
 /// One value of this fire, addressed: `rows` rows of `width` elements of
 /// `dt` at `ptr`.
 ///
-/// ROWS ARE THE FIRE'S, which is what `program.rs` says the width table
-/// deliberately does not answer. This binary fires one row, so `rows` is 1
-/// on every arena rectangle; it is carried rather than assumed because the
-/// routines read it (`write_kv_to_pages` takes its token count off
-/// `k_curr.rows`, `qo_indptr.rows` IS the request count).
+/// ROWS ARE THE FIRE'S TIMES THE SLOT'S FACTOR. `program.rs` answers the
+/// factor (`Rows::Fire`, or `Rows::FireTimes(top_k)` on a routed value) and
+/// deliberately does not answer the fire's own count. This binary fires one
+/// row of a dense text, so `rows` is 1 on every arena rectangle; both halves
+/// are carried rather than assumed because the routines read them
+/// (`write_kv_to_pages` takes its token count off `k_curr.rows`,
+/// `qo_indptr.rows` IS the request count).
 #[derive(Clone, Copy, Debug)]
 pub struct Rect {
     pub ptr: *mut c_void,
@@ -39,24 +49,6 @@ impl Rect {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.rows as usize * self.width as usize * self.dt.size() as usize
-    }
-
-    /// The same rectangle `elems` elements in, `width` wide -- the cut a
-    /// packed operand's half needs when the routine takes the halves as two
-    /// separate pointers and the statement carries only the packed row.
-    #[must_use]
-    pub fn column(&self, elems: i32, width: i32) -> Rect {
-        Rect {
-            ptr: unsafe {
-                self.ptr
-                    .cast::<u8>()
-                    .add(elems as usize * self.dt.size() as usize)
-                    .cast()
-            },
-            rows: self.rows,
-            width,
-            dt: self.dt,
-        }
     }
 }
 

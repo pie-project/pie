@@ -44,8 +44,19 @@ path = "src/lib.rs"
 # features and `contract` named twelve more, so adding a generation meant
 # editing this line twice and the row that dispatches to it. One crate, and a
 # feature gates modules directly.
-default = ["chat"]
-chat = ["dep:tokenizer", "dep:serde_json", "dep:image"]
+# THE `chat` FEATURE IS GONE, and so is every line it gated: the WIT-shaped
+# `instruct` traits, the six chat templates, the shared decoders and the
+# host-side `multimodal` decode. None of it ever touched the DSL, the catalog
+# facts or the load contract -- it read a `Tokenizer` and returned token ids --
+# and the only consumer that ever enabled the feature was `engine`. R1 moved
+# that half to the new `model` crate (`model::serve`), which is where a serving
+# runtime's model knowledge belongs now, and no remaining consumer of this
+# crate (the four drivers) asks for anything but `contract`.
+#
+# What went with it: `Variant::chat`, the six per-family `chat()` impls, the
+# never-referenced `shared/gemma_chat.rs`, and the `tokenizer` + `image`
+# dependencies -- this crate reads no text and decodes no images now.
+default = []
 # THE `config` FEATURE IS GONE, and so are the 3,595 lines behind it: a
 # `pie.model/1` descriptor normalized out of a 136-field schema by 845
 # lines, a reader that parsed it back, a `ModelFacts` projection of the
@@ -88,7 +99,6 @@ contract = ["dep:model-loader", "dep:serde_json"]
 # Not optional for the reason `model-compiler` is not: a row DERIVES on it
 # (the goldens serialize facts, and `spec.rs` is ungated now).
 serde = { version = "1.0", features = ["derive"] }
-tokenizer = { path = "../tokenizer", optional = true }
 # `default-features = false` drops the loader's testkit half — the authoring
 # side needs the algebra, never the host executor.
 model-loader = { path = "../model-loader", default-features = false, optional = true }
@@ -118,10 +128,14 @@ model-loader = { path = "../model-loader", default-features = false, optional = 
 model-dsl = { path = "../model-dsl-legacy", package = "model-dsl-legacy" }
 model-ir = { path = "../model-ir" }
 serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
-# Host-side media decode for the model-agnostic multimodal API.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }
 
 [dev-dependencies]
+# The NEW model crate, for one test: `tests/serve_rows.rs` holds
+# `model::serve::ROWS` to this catalog row for row, because R1 copied two
+# numbers per row out of here and a number written down twice can disagree.
+# Dev-only and one-directional — nothing in `src/` knows the crate exists —
+# and it dies with this crate.
+model = { path = "../model", features = ["serve"] }
 # The lowering, DEV-ONLY -- the split's sharpest single result. Seven test
 # targets here (`lowering`, `lowering_cost`, `arena_soundness`,
 # `regions_surface`, `seam_names`, `tp_quantized_spec`, `kernels_table`) lower

@@ -131,15 +131,20 @@ model-loader = { path = "../model-loader", default-features = false }
 # anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
 # `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.
 # The artifact's compiled metadata is lifted here and handed to the runtime
-# whole: `model` owns the shape it arrives in, `tokenizer` names the
-# objects that make up a `pie.tokenizer/1`.
+# whole: `model::serve` owns the shape it arrives in, `tokenizer` names the
+# objects that make up a `pie.tokenizer/1`, and `model::serve::encoding` names
+# `model/config` and the `Encoding` read out of it -- so the worker lifts a
+# snapshot's own `config.json` and reads it back out of an artifact under the
+# same name `convert` writes it under.
 #
-# `contract` is what names `model/config` and the `Encoding` read out of
-# it, so the worker lifts a snapshot's own `config.json` and reads it back
-# out of an artifact under the same name `convert` writes it under. It
-# used to ask for `config`, a feature that carried an 845-line normalizer
-# whose whole output the catalog now states as a `const`.
-model = { path = "../model-legacy", package = "model-legacy", features = ["contract"] }
+# THE LEGACY CRATE IS GONE FROM THIS GRAPH. It was here for two things, and
+# neither survived inspection: the `contract` feature, whose whole use was those
+# two names above (now `model::serve::encoding`, which is the same 66 lines and
+# no load contract behind them), and `catalog::identify_artifact`, whose only
+# reachable leg was "is the row this artifact names one this build ships" --
+# `model::serve::row` answers exactly that, and `weights.rs` records the
+# measurement that the other leg never once succeeded.
+model = { path = "../model", features = ["serve"] }
 tokenizer = { path = "../tokenizer" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
@@ -158,14 +163,6 @@ tempfile = "3"
 # another crate; this is that, once.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tensor-ir = { path = "../tensor-ir" }
-# The same `model`, with the one row that is not a model.
-#
-# `dummy_boot_uses_create_compile_load_sequence` writes a four-byte
-# checkpoint because what it checks is the create/compile/load SEQUENCE, not
-# a model. Identity is a manifest match now, so the dummy driver has to name
-# a row it can be held to, and the smallest real one is half a gigabyte of
-# embedding. See `model::test_rows`.
-model = { path = "../model-legacy", package = "model-legacy", features = ["contract"] }
 
 [build-dependencies]
 # `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a

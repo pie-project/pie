@@ -5,6 +5,7 @@ use model_dsl::{CacheRef, Norm, Tensor};
 
 pub struct Model<W1: Dtype, K: KvDtype, const TP: usize = 1> {
     pub hidden: u32,
+    pub vocab: u32,
     pub softcap: Option<f32>,
     pub embed: Tensor<W1>,
     pub head: Head<W1>,
@@ -220,6 +221,7 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
 
     Model {
         hidden: d.hidden,
+        vocab: d.vocab,
         softcap: d.softcap,
         embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
         head: Head::Tied,

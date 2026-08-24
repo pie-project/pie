@@ -1,5 +1,3 @@
-#[cfg(feature = "chat")]
-pub mod chat;
 #[cfg(feature = "contract")]
 pub mod contract;
 
@@ -8,9 +6,6 @@ pub mod project;
 pub mod spec;
 
 pub mod forward;
-
-#[cfg(feature = "chat")]
-use std::sync::Arc;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Advertised, AudioTower, Deployment, Refusal, Towers, VisionTower};
@@ -225,11 +220,6 @@ impl Variant for Gemma4 {
             load.layer_scalars,
             NORM_EPS,
         ))
-    }
-
-    #[cfg(feature = "chat")]
-    fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(self::chat::Gemma4Instruct::new(tokenizer))
     }
 }
 

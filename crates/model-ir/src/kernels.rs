@@ -204,6 +204,51 @@ const CUDA_CLAIMS: &[&[&str]] = &[
     kernels_cuda::norm::HC_CLAIMS,
 ];
 
+/// Every family a metal `#[claims]` block answers — the same line-per-family
+/// shape as [`CUDA_CLAIMS`], on the first plane to follow cuda onto the
+/// declaration floor.
+///
+/// ALL FOURTEEN NOW, and the fourteen are the measurement rather than the
+/// achievement: six of the lines are EMPTY, because a family a plane
+/// implements and claims nothing of is a measured backlog while a family a
+/// plane does not implement at all is a hole in the table where a measurement
+/// should be. Each empty line's reason is written in its impl header, where a
+/// reader arrives with the code in front of them:
+///
+/// * `GEMM_CLAIMS` (from `layout`) — every matmul this plane stamps is
+///   QUANTIZED, so all three points wait on the floor's `Bank<R: Repr>`
+///   payload, with `layout.embed` and `moe.matmul_select*` behind the same
+///   gap.
+/// * `DIST_CLAIMS` — no collective, and no transport under one.
+/// * `MLA_CLAIMS`, `INDEX_CLAIMS`, `POOL_CLAIMS`, `HC_CLAIMS` — no `.metal`
+///   kernel for any point of any of the four; these are families to write,
+///   not crossings to make.
+///
+/// `GATE_CLAIMS` reads from `attn` for `kernels_cuda::mlp::GATE_CLAIMS`'
+/// reason turned around: the impl lives beside the one kernel it fires, and
+/// on this plane that kernel is filed with the attention it gates.
+/// `LAYOUT_CLAIMS` reads from `layout` while both of its claimed points fire
+/// out of `attn/` — a family is one impl block and its points may fire out of
+/// two shader directories. `MLA_CLAIMS`, `INDEX_CLAIMS` and `POOL_CLAIMS`
+/// read from `attn` and `HC_CLAIMS` from `norm`, which is where cuda files
+/// the same four.
+const METAL_CLAIMS: &[&[&str]] = &[
+    kernels_metal::norm::NORM_CLAIMS,
+    kernels_metal::mlp::MLP_CLAIMS,
+    kernels_metal::layout::GEMM_CLAIMS,
+    kernels_metal::dist::DIST_CLAIMS,
+    kernels_metal::rope::ROPE_CLAIMS,
+    kernels_metal::moe::MOE_CLAIMS,
+    kernels_metal::layout::LAYOUT_CLAIMS,
+    kernels_metal::attn::GATE_CLAIMS,
+    kernels_metal::ssm::SSM_CLAIMS,
+    kernels_metal::attn::ATTENTION_CLAIMS,
+    kernels_metal::attn::MLA_CLAIMS,
+    kernels_metal::attn::INDEX_CLAIMS,
+    kernels_metal::attn::POOL_CLAIMS,
+    kernels_metal::norm::HC_CLAIMS,
+];
+
 /// The points a plane's `#[claims]` impl blocks answer — baker's claim
 /// table, consulted ahead of the routine `canon` attributes. One slice per
 /// migrated family, concatenated; a family lands by adding its line, and the
@@ -211,9 +256,10 @@ const CUDA_CLAIMS: &[&[&str]] = &[
 #[must_use]
 pub fn point_claims(backend: Backend) -> &'static [&'static str] {
     static CUDA: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    static METAL: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     match backend {
         Backend::Cuda => CUDA.get_or_init(|| CUDA_CLAIMS.concat()),
-        Backend::Metal => &[],
+        Backend::Metal => METAL.get_or_init(|| METAL_CLAIMS.concat()),
     }
 }
 

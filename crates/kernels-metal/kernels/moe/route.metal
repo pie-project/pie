@@ -77,11 +77,24 @@ constant constexpr uint kRouterMaxSimdgroups = 32;
 
 // SCALED applies Gemma 4's learned per-expert gain after the top-k softmax.
 // Separate instantiations avoid requiring an otherwise-unused scale binding.
-template <typename T, bool SCALED>
+// ── THE WEIGHT PLANE HAS ITS OWN ELEMENT ────────────────────────────────────
+//
+// `kernels::points::Moe::topk_softmax` declares `weights: Out<Tensor<f32>>`:
+// a router weight is a probability, the fold that reads it multiplies in
+// float on every plane, and rounding it to the activation element throws
+// mantissa away for nothing. This kernel was one template over ONE `T` for
+// the logits AND the weights, so the point could not be claimed -- an f32
+// slot written through a `bfloat*` is half a plane.
+//
+// `W` is the weight element. `<bfloat, bfloat, ..>` keeps the two names and
+// the ABI the legacy driver has always fired; `<bfloat, float, false>` is the
+// arm `Moe::topk_softmax` claims. `per_expert_scale` stays at `T`: it is a
+// checkpoint bank, read at the width the loader staged.
+template <typename T, typename W, bool SCALED>
 [[kernel]] void router_topk(
     const device T* logits     [[buffer(0)]],
     device int* expert_ids     [[buffer(1)]],
-    device T* expert_weights   [[buffer(2)]],
+    device W* expert_weights   [[buffer(2)]],
     // MOVED DOWN A SLOT, because `RouterParams` was buffer 3 and this was 4.
     // Still bound by the unscaled instantiation: the slot is positional, so it
     // has to hold an address whether or not `SCALED` dereferences it.
@@ -198,28 +211,34 @@ template <typename T, bool SCALED>
     for (uint r = 0; r < k; ++r) {
       float weight = chosen[r] / sum;
       if (SCALED) weight *= float(per_expert_scale[uint(expert_ids[r])]);
-      expert_weights[r] = static_cast<T>(weight);
+      expert_weights[r] = static_cast<W>(weight);
     }
   }
 }
 
-#define instantiate_router_topk(name, itype)                       \
+#define instantiate_router_topk(name, itype, wtype)                \
   template [[host_name("router_topk_" #name)]]                     \
-  [[kernel]] void router_topk<itype, false>(                       \
-      const device itype*, device int*, device itype*,             \
+  [[kernel]] void router_topk<itype, wtype, false>(                \
+      const device itype*, device int*, device wtype*,             \
       const device itype*,                                         \
       const constant uint&, const constant uint&,                  \
       const constant uint&, const constant uint&,                  \
       uint3, uint, uint, uint3, uint3);                            \
   template [[host_name("router_topk_scaled_" #name)]]              \
-  [[kernel]] void router_topk<itype, true>(                        \
-      const device itype*, device int*, device itype*,             \
+  [[kernel]] void router_topk<itype, wtype, true>(                 \
+      const device itype*, device int*, device wtype*,             \
       const device itype*,                                         \
       const constant uint&, const constant uint&,                  \
       const constant uint&, const constant uint&,                  \
       uint3, uint, uint, uint3, uint3);
 
-instantiate_router_topk(bfloat16, bfloat)
+instantiate_router_topk(bfloat16, bfloat, bfloat)
+
+// The claimed arm: the weights at the element the declaration states. Both
+// `router_topk_f32w_bfloat16` and its scaled twin are stamped, because the
+// macro stamps a pair and the gemma gain is the same decision on the same
+// plane -- `Moe::topk_softmax` fires the unscaled one.
+instantiate_router_topk(f32w_bfloat16, bfloat, float)
 
 // One lane per expert during the prefix scan, so this is the widest expert
 // count this shape serves. `shared_kernels::kRouterMaxExperts` is the same

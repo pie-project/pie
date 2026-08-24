@@ -7,7 +7,7 @@
 //! `OnceLock` holding whatever this engine happens to have booted is a fact
 //! about the process, not about any model.
 //!
-//! What stayed behind is [`::model::ModelMetadata`]: the shape an
+//! What stayed behind is [`::model::serve::ModelMetadata`]: the shape an
 //! artifact's compiled metadata arrives in, which the worker reads without
 //! linking the runtime.
 
@@ -16,9 +16,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 
-use ::model::ModelMetadata;
-use ::model::catalog::{self, Deployed, Variant};
-use ::model::instruct::Instruct;
+use ::model::serve::{self, Instruct, ModelMetadata};
 use tokenizer::Tokenizer;
 
 /// The single model this engine serves. Set once at bootstrap.
@@ -51,16 +49,16 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
 /// descriptor was one document with two readers, and this was the
 /// second one.
 ///
-/// It is the row now, and the row is the same `const` table the driver
-/// linked to answer with this id. Both sides knowing one fact
-/// differently is not a bug that got fixed; it is a sentence that can
-/// no longer be written.
-fn loaded_row(model_id: &str) -> Result<&'static dyn Variant> {
-    catalog::find(model_id).ok_or_else(|| {
+/// It is the row now: `model::serve::ROWS`, whose two numbers are held equal
+/// to the catalog the driver linked by `model-legacy`'s `serve_rows` test.
+/// Both sides knowing one fact differently is not a bug that got fixed; it is
+/// a sentence that can no longer be written.
+fn loaded_row(model_id: &str) -> Result<&'static serve::Row> {
+    serve::row(model_id).ok_or_else(|| {
         anyhow!(
             "the driver loaded {model_id:?}, which this build's model catalog \
              does not contain; nearest ids: {:?}",
-            catalog::nearest_ids(model_id, 3)
+            serve::nearest_ids(model_id, 3)
         )
     })
 }
@@ -97,16 +95,21 @@ pub fn register(
     // removed the second parser and left one document with two readers;
     // this removes the document.
     let row = loaded_row(model_id)?;
-    let num_layers = row.load_shape().layers;
-    // `vocab` is the LOGICAL width and does not shard, so the single-rank
-    // projection answers it at any tensor-parallel width.
-    let vocab_size = row
-        .deployment(Deployed::single())
-        .map_err(|refusal| {
-            anyhow!("the driver loaded {model_id:?} but this build refuses it: {refusal}")
-        })?
-        .shape
-        .vocab;
+    let num_layers = row.layers;
+    // `vocab` is the LOGICAL width and does not shard, so one number answers it
+    // at any tensor-parallel width.
+    //
+    // IT USED TO BE A SECOND REFUSAL: the width came out of
+    // `row.deployment(Deployed::single())`, which could fail, and this line
+    // turned that failure into "the driver loaded X but this build refuses it".
+    // Three of the fourteen rows do fail it — the MLA ones — and the refusal
+    // they raise is about the PAGER ("this build provisions no MLA latent
+    // store"), not about the model. Asking it HERE was asking the wrong party
+    // twice: by the time `register` runs, the driver has already loaded the
+    // model, so a second opinion on whether it can be loaded is either
+    // redundant or wrong. The width is a fact about the row and is stated as
+    // one.
+    let vocab_size = row.vocab;
     // The tokenizer is the half that genuinely differs: compiled objects from
     // an artifact, a file beside a snapshot.
     let tokenizer = match compiled_tokenizer(metadata) {
@@ -125,7 +128,7 @@ pub fn register(
     // contain. The bug was invisible precisely because the output read
     // well.
     //
-    // The id names a catalog row, every row answers `chat()`, and there
+    // The id names a serving row, every row states a template, and there
     // is no arm left to fall through. An unknown id was already an error
     // above, at `loaded_row`, with the nearest known ids named — before
     // the first token rather than after a thousand plausible ones.

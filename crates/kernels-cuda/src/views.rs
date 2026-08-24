@@ -68,6 +68,29 @@ pub struct PagedKvView {
     pub max_pages_per_request: i32,
     /// `keys::KvPagesInBatch`.
     pub pages_in_batch: i32,
+    /// THE FIRE'S QUERY CSR, device-resident `[requests + 1]` — where each
+    /// request's token rows begin in this fire's rectangle.
+    ///
+    /// A POOL VIEW ALREADY CARRIES THE FIRE, which is what makes this a
+    /// field and not an operand: `write_page`/`write_offset` are per-ROW of
+    /// this fire, `pages_in_batch` and `max_pages_per_request` are per-FIRE,
+    /// and `driver-cuda/src/bind/views.rs::kv_view` says in its own header
+    /// that it builds one view "from the layer's pool descriptor and the
+    /// fire-wide CSRs/write descriptors on `AttnCtx`". An append resolves
+    /// its destination out of exactly this CSR plus the page table beside
+    /// it, so a point whose whole statement is "leave these rows in that
+    /// pool" can be claimed by a body that reads the pool row — and nothing
+    /// else. Was answered as `keys::QoIndptr` / the `qo_indptr` runtime
+    /// stream, which is still how a ROUTINE with its own operand column
+    /// takes it.
+    pub qo_indptr: *const i32,
+    /// THE FIRE'S ROW VALIDITY, one BYTE per token row, or null when every
+    /// row is valid. See [`Self::qo_indptr`] for why it lives here; the
+    /// appending kernels all test for the null.
+    pub row_valid: *const u8,
+    /// How many requests [`Self::qo_indptr`] bounds — `indptr.len() - 1`,
+    /// which a device pointer does not spell.
+    pub requests: i32,
 }
 
 /// `In<Struct<RecurrentState>>` — the GDN/mamba state, one view per

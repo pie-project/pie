@@ -73,11 +73,31 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // are budgeted at nothing, which is to say they are not in this
         // table, which is to say a family name appearing in either is
         // exactly this test's quarry.
-        // Zero, kept explicit rather than dropped: its three mentions were
-        // `ffi::pie_k_gemm_act_x_wt_bf16` call sites, now
-        // `use crate::fire::gemm::act_x_wt_bf16;` -- neither spelling
-        // flattens to a family name because `::` survives flattening.
-        ("fire/lora.rs", 0),
+        // `fire/lora.rs` STOOD HERE at zero. Its own note said the ceiling
+        // was kept explicit rather than dropped, because a budgeted file
+        // that falls to zero still has to be recorded. The file is deleted
+        // (R2: the adapter staging's only firer was `bind::dispatch`'s
+        // `gemm::lora_qkv_correction` arm), and a ceiling for a file that
+        // does not exist is exactly the stale permission
+        // `no_budget_line_outlives_what_it_was_for` catches.
+        //
+        // ONE ROW: `baker::BRIDGE`'s `("qwen3.5-0.8b-base",
+        // "qwen35-d0.8b-bf16-kv-bf16")`.
+        //
+        // It is a DATA row, not a dispatch branch, and it is the one place
+        // this driver is allowed to know a checkpoint's name — the two
+        // catalogues do not share an id space, so something has to hold the
+        // pairing, and holding it in one auditable table beats deriving it
+        // from a fuzzy match on a family name (`"qwen3.5-4b"` and
+        // `"qwen35-d3b-bf16-kv-bf16"` are close enough to pair by accident
+        // and are different models). The mention is the KEY of a lookup, and
+        // nothing branches on it: `sku_for` compares for equality and
+        // answers a string.
+        //
+        // It has been over budget since W1 landed the table and this line is
+        // the argument that was owed then. It falls to zero when the id
+        // spaces merge, which is the fix and is not this test's.
+        ("baker/mod.rs", 1),
     ]
     .into_iter()
     .collect()

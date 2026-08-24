@@ -1,8 +1,5 @@
 use crate::manifest::Manifest;
 
-#[cfg(feature = "chat")]
-use std::sync::Arc;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadShape {
     pub layers: u32,
@@ -138,9 +135,6 @@ pub trait Variant: Sync + Send + 'static {
         class: model_ir::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal>;
-
-    #[cfg(feature = "chat")]
-    fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct>;
 }
 
 #[must_use]

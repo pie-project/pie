@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::ops::Mul;
 use std::rc::Rc;
 
-use model_ir::plan::{CacheRow, Cond, Op, Param, Plan, Seam, ValueDef, ValueId};
+use model_ir::plan::{CacheRow, Cond, Op, Param, Plan, Seam, Shard, ValueDef, ValueId};
 
 use crate::axes::Dtype;
 use crate::declare::{Norm, Tensor};
@@ -56,20 +56,31 @@ impl Recorder {
     }
 
     pub(crate) fn param<W: Dtype>(&self, t: &Tensor<W>) {
+        self.plane(&t.name, &t.shape, &t.shard, W::NAME);
+    }
+
+    /// One parameter row, at a name, shape and repr the caller has already
+    /// decided.
+    ///
+    /// [`Recorder::param`] is the dense reading of this and passes the
+    /// tensor's own three columns straight through; a bank's planes differ
+    /// from the tensor in two of the three, which is what this exists for.
+    /// The SHARD is not one of them — every plane of one bank is cut the same
+    /// way, because they are the same weight described twice.
+    pub(crate) fn plane(&self, name: &str, shape: &[u64], shard: &Shard, repr: &str) {
         let mut p = self.inner.borrow_mut();
-        if let Some(seen) = p.params.iter().find(|q| q.name == t.name) {
+        if let Some(seen) = p.params.iter().find(|q| q.name == name) {
             assert!(
-                seen.shape == t.shape && seen.shard == t.shard,
-                "`{}` is declared twice with two shapes",
-                t.name
+                seen.shape == shape && &seen.shard == shard,
+                "`{name}` is declared twice with two shapes"
             );
             return;
         }
         p.params.push(Param {
-            name: t.name.clone(),
-            shape: t.shape.clone(),
-            shard: t.shard.clone(),
-            repr: W::NAME.to_string(),
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            shard: shard.clone(),
+            repr: repr.to_string(),
         });
     }
 
@@ -110,6 +121,29 @@ impl<'r> Stmt<'r> {
     pub(crate) fn weight<W: Dtype>(mut self, t: &Tensor<W>) -> Self {
         self.rec.param(t);
         self.weights.push(t.name.clone());
+        self
+    }
+
+    /// A QUANTISED bank: one thing a text names, however many parameters the
+    /// repr stores it as.
+    ///
+    /// `weight` above is this with the plane count pinned at one, and that
+    /// is not a coincidence — it is the same slot with a repr whose storage
+    /// is its logical shape. What the two differ in is what the DECLARATION
+    /// said: a `Const<Self::Tensor<T>>` slot promises one rectangle of
+    /// elements, a `Const<Self::Bank<R>>` slot promises `R::PLANES` planes
+    /// of bytes, and the columns a statement records have to match the slot
+    /// the point declared or the dispatch reads the wrong one.
+    ///
+    /// THE PLANE ORDER IS THE CONTRACT. `Dtype::planes` states it, this
+    /// records it, `BoundOp::bank` reads it back positionally, and nothing
+    /// in between re-derives it from a name.
+    pub(crate) fn bank<W: Dtype>(mut self, t: &Tensor<W>) -> Self {
+        for plane in W::planes(&t.shape) {
+            let name = format!("{}{}", t.name, plane.suffix);
+            self.rec.plane(&name, &plane.shape, &t.shard, plane.repr);
+            self.weights.push(name);
+        }
         self
     }
 

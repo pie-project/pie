@@ -101,3 +101,69 @@ kernels::resident!(
     /// The decode split policy. Driver-owned, per fire.
     AttnSplit = "attn.split_policy" => SplitView
 );
+
+/// `Cache<Self::Pages>` — the paged KV row AND the per-fire staging every
+/// sdpa arm on this plane reads.
+///
+/// # Why the points layer needs a wider view than the routine layer
+///
+/// A `#[routine]` states its whole input on the operand column, so
+/// `attn::sdpa_paged_decode` takes FIVE raises and tensors the statement does
+/// not carry — `kvc`, `positions`, `request_of_token`, `maskv`, `split` — and
+/// the driver answers each one separately. A POINT states operands and
+/// scalars only (`.wiki/baker.md`: "Plane staging never appears in a
+/// declaration — the body pulls it from `self`"), and `attention.decode`
+/// declares exactly `q`, the pool row, `window`, `head_dim`, `sm_scale`, `o`.
+///
+/// On cuda the body pulls the rest off `self`, because `Ctx` is a struct with
+/// an env behind it. On this plane `Ctx` is `dyn Encode` and has no env, so
+/// the only object a body holds that the driver built for THIS fire is the
+/// pool row. Which is exactly the move W7 made on cuda when `mla.kv_append`
+/// became a claimed body: "the pool view grew the fire's qo_indptr/row_valid/
+/// requests it was always built out of". This is that, for wgpu's five.
+///
+/// # SEAM — what P5 owes
+///
+/// * **A builder.** `driver-wgpu` builds `PagedKvView`, `MaskView` and
+///   `SplitView` today and hands each as its own `In<Struct<..>>`. It must
+///   build ONE of these per (fire, layer) instead. Every field below is a
+///   value it already has at that point; nothing new is measured.
+/// * **`kv_heads`.** `attention.decode` declares no KV head count — cuda
+///   reads it off the pool's strides (`head_split`), which needs a layout
+///   flag this plane's view does not carry. Rather than invent one, the count
+///   is stated here, by the POOL, which is the party that chose it when the
+///   slab was allocated. `attention.prefill` declares its own `kv_heads` and
+///   the two must agree; a body that finds them disagreeing refuses.
+/// * **The capability tier is NOT here.** `sdpa_paged_mma` needs
+///   `Capability::Matrix` and `sdpa_paged_tiled` does not, and that is a
+///   DEVICE fact, not a fire's. It belongs on `Encode` — a
+///   `fn capability(&self) -> Capability` — so a body can branch on it the
+///   way cuda's bodies branch on `Ctx::device()`. Until then every prefill
+///   claim fires the tiled arm and says so.
+#[derive(Debug, Clone, Copy)]
+pub struct AttnFireView {
+    /// The pool row itself, unchanged.
+    pub kv: PagedKvView,
+
+    /// `keys::Positions` — one per token of this fire.
+    pub positions: Tensor<i32>,
+
+    /// `keys::RequestOfToken`.
+    pub request_of_token: Tensor<i32>,
+
+    /// The custom-mask triple, folded in: a point declares no mask slot and
+    /// every sdpa entrypoint binds all three words.
+    pub mask: MaskView,
+
+    /// The decode split policy, folded in for the same reason.
+    pub split: SplitView,
+
+    /// The KV head count the pool was laid out with. See the seam above.
+    pub kv_heads: i32,
+}
+
+kernels::resident!(
+    /// The paged KV row as a POINT's body reads it. Tier-1: the same pool
+    /// `KvCache` names, one view wider.
+    AttnFire = "attn.fire" => AttnFireView
+);

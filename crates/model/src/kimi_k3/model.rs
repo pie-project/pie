@@ -1,10 +1,11 @@
 use std::marker::PhantomData;
 
-use model_dsl::axes::{Dtype, KvDtype};
+use model_dsl::axes::{Dtype, F32, KvDtype};
 use model_dsl::{CacheRef, Norm, Tensor};
 
 pub struct Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize = 1> {
     pub hidden: u32,
+    pub vocab: u32,
     pub embed: Tensor<W1>,
     pub head: Head<W1>,
     pub layers: Vec<Layer<W1, W2>>,
@@ -63,8 +64,18 @@ pub struct Kda<W1: Dtype> {
     pub f_a: Tensor<W1>,
     pub f_b: Tensor<W1>,
     pub b: Tensor<W1>,
-    pub dt_bias: Tensor<W1>,
-    pub a_log: Tensor<W1>,
+    /// THE DECAY PAIR IS F32, and the kernel is what says so:
+    /// `ssm/kda.cuh`'s `kda_gate_beta` takes `const float* __restrict__
+    /// A_log` beside `const float* __restrict__ dt_bias`, both `float`,
+    /// and `ssm.kda_step` declares both slots `Const<Tensor<f32>>`. Qwen's
+    /// gated-delta pair splits the other way — `A_log` f32, `dt_bias` at
+    /// the model's element — because ITS kernel does.
+    ///
+    /// The shapes come from the same place. `dt_bias[h * D + d]` is read
+    /// per CHANNEL (KDA's forget gate is channel-wise) and `A_log[h]` per
+    /// head, so the two are `[heads, head_dim]` and `[heads]`.
+    pub dt_bias: Tensor<F32>,
+    pub a_log: Tensor<F32>,
     pub gate: Tensor<W1>,
     pub o_norm: Norm<W1>,
     pub o_proj: Tensor<W1>,
@@ -210,8 +221,8 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
                 f_a: Tensor::sym(n("kda_f_a"), [k.head_dim as u64, hidden]),
                 f_b: Tensor::sym(n("kda_f_b"), [kda_width, k.head_dim as u64]).columns(),
                 b: Tensor::sym(n("kda_b"), [k.heads as u64, hidden]).columns(),
-                dt_bias: Tensor::sym(n("kda_dt_bias"), [k.heads as u64]).columns(),
-                a_log: Tensor::sym(n("kda_a_log"), [k.heads as u64]).columns(),
+                dt_bias: Tensor::<F32>::sym(n("kda_dt_bias"), [k.heads as u64, k.head_dim as u64]).columns(),
+                a_log: Tensor::<F32>::sym(n("kda_a_log"), [k.heads as u64]).columns(),
                 gate: Tensor::sym(n("kda_gate"), [kda_width, hidden]).columns(),
                 o_norm: Norm { weight: Tensor::sym(n("kda_o_norm"), [k.head_dim as u64]), eps: k.norm_eps },
                 o_proj: Tensor::sym(n("kda_o_proj"), [hidden, kda_width]).rows(),
@@ -263,6 +274,7 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
 
     Model {
         hidden: d.hidden,
+        vocab: d.vocab,
         embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
         head: if d.tied {
             Head::Tied

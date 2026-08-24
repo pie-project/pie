@@ -1,13 +1,8 @@
-#[cfg(feature = "chat")]
-use std::sync::Arc;
-
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
 
 use spec::GptOssFacts;
 
-#[cfg(feature = "chat")]
-pub mod chat;
 #[cfg(feature = "contract")]
 pub mod contract;
 
@@ -161,11 +156,6 @@ impl Variant for GptOss {
             self.rope_theta,
             self.window,
         ))
-    }
-
-    #[cfg(feature = "chat")]
-    fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(chat::GptOssInstruct::new(tokenizer))
     }
 }
 

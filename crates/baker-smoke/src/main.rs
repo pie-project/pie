@@ -27,11 +27,14 @@
 //!   from the slots and calls the trait method. That half is mechanical and
 //!   is what a generated dispatch will do.
 //! * a `Call::Symbol` is a routine that keeps its own `canon` because no
-//!   honest delegation exists (`kernels-cuda/src/ssm.rs:103-121` states
-//!   three of them by name). Those need STAGING: operands the statement does
-//!   not carry, results it does not state, resident objects it only names.
-//!   That half is hand-written here, once, and every decision in it cites
-//!   the driver-side line it mirrors.
+//!   honest delegation exists — the plane's `#[claims]` blocks name each
+//!   one where it is measured. Those need STAGING: operands the statement
+//!   does not carry, results it does not state, resident objects it only
+//!   names. That half is hand-written here, once, and every decision in it
+//!   cites the driver-side line it mirrors. It SHRINKS as the routines are
+//!   decomposed: the gdn seam's two arms — the biggest staging in the file,
+//!   a backwards reach through the plan plus four cuts into packed rows —
+//!   left when `ssm.gdn_prep` and `ssm.gated_delta` became claim bodies.
 
 #[cfg(feature = "_cuda")]
 mod dev;

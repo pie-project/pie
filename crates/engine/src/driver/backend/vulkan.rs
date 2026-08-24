@@ -291,7 +291,7 @@ impl Driver for VulkanDriver {
         // model would be a second identification, and the two disagree in the
         // direction that matters -- a checkpoint served as the wrong row is
         // not refused, it is fluent and wrong.
-        let row = model::catalog::identify(&meta, &model::catalog::Override::None)
+        let row = model_legacy::catalog::identify(&meta, &model_legacy::catalog::Override::None)
             .map_err(|e| anyhow!("driver-vulkan: {path:?} matches no catalog row: {e}"))?;
         let (text, deployment) = text_of(row)?;
         // Read from the text BEFORE the shell takes it: what the decode plan
@@ -800,7 +800,7 @@ fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
 fn stage(
     path: &std::path::Path,
     meta: &model_loader::checkpoint::CheckpointMetadata,
-    row: &'static dyn model::catalog::Variant,
+    row: &'static dyn model_legacy::catalog::Variant,
     wanted: &[String],
 ) -> Result<Vec<(String, Vec<u8>)>> {
     // The declared encoding, out of the checkpoint's OWN metadata — the one
@@ -810,23 +810,25 @@ fn stage(
     // the reason is that a second reader of that file is a second place for
     // what a model is made of to be decided. The other two drivers read it
     // exactly this way.
-    let config =
-        match model_loader::checkpoint::read::read_meta(meta, model::encoding::CONFIG_OBJECT) {
-            Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
-                anyhow!(
-                    "driver-vulkan: the embedded {} is not utf8: {e}",
-                    model::encoding::CONFIG_OBJECT
-                )
-            })?,
-            Ok(None) => bail!(
-                "driver-vulkan: {} is not embedded in the checkpoint at {path:?}. Re-import it \
+    let config = match model_loader::checkpoint::read::read_meta(
+        meta,
+        model_legacy::encoding::CONFIG_OBJECT,
+    ) {
+        Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
+            anyhow!(
+                "driver-vulkan: the embedded {} is not utf8: {e}",
+                model_legacy::encoding::CONFIG_OBJECT
+            )
+        })?,
+        Ok(None) => bail!(
+            "driver-vulkan: {} is not embedded in the checkpoint at {path:?}. Re-import it \
              with `pie model build`; one field is read out of it — the declared quantization \
              — and no kernel can be named without it.",
-                model::encoding::CONFIG_OBJECT
-            ),
-            Err(e) => bail!("driver-vulkan: cannot read the embedded encoding: {e:?}"),
-        };
-    let encoding = model::encoding::Encoding::from_config_json(&config)
+            model_legacy::encoding::CONFIG_OBJECT
+        ),
+        Err(e) => bail!("driver-vulkan: cannot read the embedded encoding: {e:?}"),
+    };
+    let encoding = model_legacy::encoding::Encoding::from_config_json(&config)
         .map_err(|e| anyhow!("driver-vulkan: unreadable encoding: {e}"))?;
     // `BackendKind::Vulkan`, not Metal's target borrowed. The two masks agree
     // today and `driver-vulkan/tests/checkpoint.rs` asserts they still do,
@@ -836,13 +838,13 @@ fn stage(
         0,
         1,
     );
-    let (plan, _) = model::boot::compile_load_plan_for(
+    let (plan, _) = model_legacy::boot::compile_load_plan_for(
         path,
         meta,
         &target,
         row,
         &encoding,
-        model::boot::Binding::MLX_IN_PLACE,
+        model_legacy::boot::Binding::MLX_IN_PLACE,
     )
     .map_err(|e| {
         anyhow!(
@@ -1015,16 +1017,19 @@ fn bound_names(text: &driver_vulkan::shell::Text) -> Vec<String> {
 /// The ROW's refusal, carried unchanged: a model this build has no text for
 /// says so in its own words rather than in a sentence this seam made up.
 fn text_of(
-    row: &'static dyn model::catalog::Variant,
-) -> Result<(driver_vulkan::shell::Text, model::deployment::Deployment)> {
-    use model::catalog::Deployed;
+    row: &'static dyn model_legacy::catalog::Variant,
+) -> Result<(
+    driver_vulkan::shell::Text,
+    model_legacy::deployment::Deployment,
+)> {
     use model_ir::trace::FireClass;
+    use model_legacy::catalog::Deployed;
 
     // The build's kernel capabilities, and nothing about the model. g64/b4 is
     // what `mlx-community` publishes and what every measurement in
     // `driver-vulkan` was taken against; `ANY_ENCODING` on the Metal side is
     // the same constant for the same reason.
-    let binding = model::catalog::MetalBinding {
+    let binding = model_legacy::catalog::MetalBinding {
         qmm_partial_rows: false,
         qmm_fp16_precast: true,
         qmm_tile: None,
@@ -1169,7 +1174,7 @@ mod tests {
     /// A row's id and the fixture the driver's own numbers were taken from.
     type Measured = (
         &'static str,
-        fn() -> model::shared::llama_like::forward::facts::LlamaLikeFacts,
+        fn() -> model_legacy::shared::llama_like::forward::facts::LlamaLikeFacts,
     );
 
     /// The two rows `driver-vulkan`'s device suite serves for real, by the
@@ -1177,11 +1182,11 @@ mod tests {
     const MEASURED: &[Measured] = &[
         (
             "qwen3-0.6b",
-            model::shared::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b,
+            model_legacy::shared::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b,
         ),
         (
             "qwen2.5-1.5b",
-            model::shared::llama_like::forward::facts::LlamaLikeFacts::qwen2_5_1_5b,
+            model_legacy::shared::llama_like::forward::facts::LlamaLikeFacts::qwen2_5_1_5b,
         ),
     ];
 
@@ -1206,8 +1211,8 @@ mod tests {
     #[test]
     fn the_seam_derives_the_text_the_driver_was_measured_against() {
         for (id, facts) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             let (text, _) = text_of(row).unwrap_or_else(|e| panic!("`{id}` has a text: {e}"));
             let fixture = facts();
             // `synthetic()` is documented as `driver-metal`'s answer sheet,
@@ -1216,16 +1221,17 @@ mod tests {
             // So the fixture side is spelled the way `driver-vulkan`'s device
             // suite spells it, which is the whole point of the comparison --
             // the oracles were taken under those facts.
-            let metal = model::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
+            let metal = model_legacy::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
                 add_bias: true,
-                ..model::shared::llama_like::forward::facts::LlamaLikeMetalFacts::synthetic()
+                ..model_legacy::shared::llama_like::forward::facts::LlamaLikeMetalFacts::synthetic()
             };
             for (class, ours) in [
                 (FireClass::Decode, &text.decode),
                 (FireClass::Prefill, &text.prefill),
             ] {
-                let theirs =
-                    model::shared::llama_like::forward::llama_like_metal(&fixture, &metal, class);
+                let theirs = model_legacy::shared::llama_like::forward::llama_like_metal(
+                    &fixture, &metal, class,
+                );
                 assert_eq!(
                     format!("{ours:?}"),
                     format!("{theirs:?}"),
@@ -1245,8 +1251,8 @@ mod tests {
     #[test]
     fn the_geometry_the_seam_reads_is_the_measured_one() {
         for (id, facts) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             let (text, _) = text_of(row).unwrap_or_else(|e| panic!("`{id}` has a text: {e}"));
             let fixture = facts();
             assert_eq!(text.geometry.q_heads, fixture.q_heads, "`{id}` q_heads");
@@ -1346,8 +1352,8 @@ kv_pages = 64
     ///    measuring a specific refusal and not a closed door.
     #[test]
     fn a_model_that_holds_a_recurrent_state_is_refused_before_it_is_staged() {
-        use model::catalog::Deployed;
-        let binding = model::catalog::MetalBinding {
+        use model_legacy::catalog::Deployed;
+        let binding = model_legacy::catalog::MetalBinding {
             qmm_partial_rows: false,
             qmm_fp16_precast: true,
             qmm_tile: None,
@@ -1368,7 +1374,7 @@ kv_pages = 64
         };
 
         let mut hybrids = 0;
-        for row in model::catalog::catalog() {
+        for row in model_legacy::catalog::catalog() {
             let Ok(deployment) = row.deployment(Deployed::metal(&binding)) else {
                 continue;
             };
@@ -1404,8 +1410,8 @@ kv_pages = 64
 
         // The control: a specific refusal, not a closed door.
         for (id, _) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             text_of(row).unwrap_or_else(|e| {
                 panic!("`{id}` holds no recurrent state and must still be served: {e}")
             });
@@ -1426,7 +1432,8 @@ kv_pages = 64
     /// later; the row turns it away before a device is touched.
     #[test]
     fn a_model_with_no_text_is_refused_in_the_rows_own_words() {
-        let row = model::catalog::find("phi-3-mini-4k").expect("phi-3-mini-4k is in the catalog");
+        let row =
+            model_legacy::catalog::find("phi-3-mini-4k").expect("phi-3-mini-4k is in the catalog");
         assert_eq!(row.load_shape().head_dim, 96, "the checkpoint's own width");
         let Err(said) = text_of(row) else {
             panic!("phi-3-mini-4k has no Metal text")
@@ -1452,8 +1459,8 @@ kv_pages = 64
     #[test]
     fn the_seam_asks_for_the_weights_the_fire_binds() {
         for (id, _) in MEASURED {
-            let row =
-                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            let row = model_legacy::catalog::find(id)
+                .unwrap_or_else(|| panic!("`{id}` is in the catalog"));
             let (text, _) = text_of(row).unwrap_or_else(|e| panic!("`{id}` has a text: {e}"));
             let names = bound_names(&text);
             assert!(

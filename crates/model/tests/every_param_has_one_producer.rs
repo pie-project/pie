@@ -27,7 +27,7 @@ fn cites(source: &Source) -> Vec<&str> {
         Source::Copy(n)
         | Source::PlusOne(n)
         | Source::ScalarOf(n)
-        | Source::Deinterleave(n, _)
+        | Source::Deinterleave(n, _, _)
         | Source::Squeeze(n, _) => vec![n.as_str()],
         Source::Pack(parts) | Source::Stack(parts) => parts.iter().flat_map(cites).collect(),
     }

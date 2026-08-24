@@ -5,6 +5,7 @@ use model_dsl::{CacheRef, Norm, Tensor, Yarn};
 
 pub struct Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize = 1> {
     pub hidden: u32,
+    pub vocab: u32,
     pub embed: Tensor<W1>,
     pub head: Tensor<W1>,
     pub layers: Vec<Layer<W1, W2>>,
@@ -180,6 +181,7 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
 
     Model {
         hidden: d.hidden,
+        vocab: d.vocab,
         embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
         head: Tensor::sym("lm_head", [d.vocab as u64, hidden]),
         layers,

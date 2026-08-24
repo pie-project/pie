@@ -34,7 +34,7 @@ pub struct ModelDrivers {
 pub fn build(
     user: &config::Config,
     drivers: ModelDrivers,
-    metadata: model::ModelMetadata,
+    metadata: model::serve::ModelMetadata,
 ) -> Result<::engine::bootstrap::Config> {
     if drivers.groups.is_empty() {
         anyhow::bail!(
@@ -87,7 +87,7 @@ pub fn build(
 fn build_model(
     m: &config::ModelConfig,
     drivers: ModelDrivers,
-    metadata: model::ModelMetadata,
+    metadata: model::serve::ModelMetadata,
 ) -> Result<::engine::bootstrap::ModelConfig> {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps can differ in

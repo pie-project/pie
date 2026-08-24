@@ -361,3 +361,65 @@ macro_rules! scalar_arg {
 scalar_arg!(i32, Ty::I32, as_i32, i32, I32);
 scalar_arg!(u32, Ty::U32, as_u32, u32, U32);
 scalar_arg!(f32, Ty::F32, as_f32, f32, F32);
+
+/// The two shader elements, as the POINTS floor names them.
+///
+/// # Why this is here and not in a plane crate
+///
+/// A `#[points]` family quantifies over [`crate::points::Scalar`], and a
+/// generated dispatch matches over [`crate::bound::Axis`] and names the
+/// element type in each arm — `ctx.rmsnorm::<bf16>(..)`. Both traits are
+/// this crate's and `bf16`/`f16` are this crate's, so no plane crate can
+/// write these four impls without tripping the orphan rule; every shader
+/// plane would otherwise have to mint a SECOND `bf16` beside this one,
+/// three times over, for no reason but coherence.
+///
+/// The floor already spells `Rides` for `f32`, `i32`, `u32` and `u8`, and
+/// [`crate::bound::Axis`] already spells `Bf16` and `F16` as "the two the
+/// device planes instantiate and no arena mints yet". These impls are that
+/// sentence's missing half and nothing more: no declaration moves, no point
+/// changes arity, and a plane that does not instantiate `bf16` is unaffected.
+///
+/// # `Read` is a pointer that no shader plane dereferences
+///
+/// [`crate::points::Scalar`] demands `Elem<Read = *const Self>` because a
+/// cuda region IS an address. A shader plane's payload is a binding handle,
+/// and it says so in its own `Plane::Tensor<T>` — the associated type carries
+/// the handle, and `T`'s own `Read` is never reached by a body or a bind. So
+/// the pointer below is a SHAPE the bound demands, not a claim that a WGSL
+/// buffer has a host address, and `advance_read` refuses to pretend
+/// otherwise: it returns the pointer unmoved, because a zero-sized marker's
+/// `add` is a no-op and a plane that needed to walk elements would be walking
+/// a handle, not this.
+macro_rules! shader_scalar {
+    ($t:ty, $axis:ident, $tc:ident, $tm:ident) => {
+        impl crate::routine::Elem for $t {
+            type Read = *const $t;
+            type Write = *mut $t;
+
+            unsafe fn advance_read(read: Self::Read, _elems: usize) -> Self::Read {
+                read
+            }
+
+            unsafe fn advance_write(write: Self::Write, _elems: usize) -> Self::Write {
+                write
+            }
+
+            /// Empty: this plane has no C++ text for a template argument to
+            /// stand in, which is the spelling `Elem` documents for exactly
+            /// this case.
+            const CPP: &'static str = "";
+            const CPP_CONST: &'static str = "";
+            const CPP_MUT: &'static str = "";
+            const TY_CONST: Ty = Ty::$tc;
+            const TY_MUT: Ty = Ty::$tm;
+        }
+
+        impl crate::bound::Rides for $t {
+            const AXIS: crate::bound::Axis = crate::bound::Axis::$axis;
+        }
+    };
+}
+
+shader_scalar!(bf16, Bf16, Bf16s, Bf16sMut);
+shader_scalar!(f16, F16, F16s, F16sMut);
