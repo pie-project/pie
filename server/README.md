@@ -43,5 +43,4 @@ server/src/config.rs            user-facing TOML schema
 server/src/serve.rs             engine startup/shutdown
 server/src/embedded_driver.rs   embedded driver startup
 server/src/subprocess_driver.rs Python driver supervision
-server/src/rpc_loop.rs          embedded-driver RPC loop
 ```
