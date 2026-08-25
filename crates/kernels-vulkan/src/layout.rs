@@ -55,37 +55,28 @@ impl kernels::points::Layout for Ctx<'_> {
         vocab: u32,
         y: Out<crate::points::Handle<T>>,
     ) -> Result<(), Refusal> {
-        use crate::points::Staged;
-
-        let _ = vocab;
         crate::points::at_bf16::<T>("layout.embed, at an element this plane does not instantiate")?;
 
         let out = y.all("the embedded row's width")?;
-
-        let bank = self.bank(table)?;
-        let at = affine_point(bank.group, bank.bits)?;
-        let entrypoint = [
-            "embed_gather_mb_4bit_bfloat16_gs_32_b_4",
-            "embed_gather_mb_4bit_bfloat16_gs_32_b_8",
-            "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
-            "embed_gather_mb_4bit_bfloat16_gs_64_b_8",
-            "embed_gather_mb_4bit_bfloat16_gs_128_b_4",
-            "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
-        ][at];
+        if ids.rows != y.rows {
+            return Err(Refusal::Narrow {
+                what: "the token ids handed over, against the rows this gather lands",
+                at: i64::from(ids.rows),
+            });
+        }
+        let rows = crate::points::stated("the row count this embedding table states", vocab)?;
+        if rows <= 0 {
+            return Err(Refusal::Empty {
+                what: "the row count this embedding table states",
+            });
+        }
         self.fire(
             Fire::at(
-                crate::plane::module_path(entrypoint, self.best()),
-                entrypoint,
+                crate::plane::module_path("embed_bfloat16", self.best()),
+                "embed_bfloat16",
             )
             .apply(elementwise_rows(out.width, out.rows)?),
-            &[
-                bank.words.arg(),
-                bank.scales.arg(),
-                bank.biases.arg(),
-                ids.arg(),
-                y.arg(),
-                out.width.arg(),
-            ],
+            &[ids.arg(), table.arg(), y.arg(), out.width.arg(), rows.arg()],
         )
     }
 

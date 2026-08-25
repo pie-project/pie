@@ -52,6 +52,9 @@ pub const CLAIMED: &[(&str, Option<Site>, &[ScalarKind])] = &[
     ("attention.decode", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
     ("attention.prefill", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
     ("attention.masked", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
+    ("attention.decode_lse", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
+    ("attention.prefill_lse", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
+    ("attention.sink", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
     ("attention.logit_softcap", Some(Site::Out(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
     ("attention.kv_append", Some(Site::In(0)), &[ScalarKind::Bf16, ScalarKind::F32]),
 ];
@@ -268,6 +271,21 @@ where
             ScalarKind::Bf16 => ctx.masked::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?),
             ScalarKind::F32 => ctx.masked::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?),
             _ => Err(Refusal::Absent { what: "`attention.masked`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.decode_lse" => match op.dtype(Site::Out(0))? {
+            ScalarKind::Bf16 => ctx.decode_lse::<bf16>(op.tin::<bf16>(0)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<bf16>(0)?, op.tout::<f32>(1)?),
+            ScalarKind::F32 => ctx.decode_lse::<f32>(op.tin::<f32>(0)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.f32(2)?, op.tout::<f32>(0)?, op.tout::<f32>(1)?),
+            _ => Err(Refusal::Absent { what: "`attention.decode_lse`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.prefill_lse" => match op.dtype(Site::Out(0))? {
+            ScalarKind::Bf16 => ctx.prefill_lse::<bf16>(op.tin::<bf16>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<bf16>(0)?, op.tout::<f32>(1)?),
+            ScalarKind::F32 => ctx.prefill_lse::<f32>(op.tin::<f32>(0)?, op.tin::<i32>(1)?, op.pages()?, op.u32(0)?, op.u32(1)?, op.u32(2)?, op.f32(3)?, op.tout::<f32>(0)?, op.tout::<f32>(1)?),
+            _ => Err(Refusal::Absent { what: "`attention.prefill_lse`, at an element or repr this plane does not instantiate" }),
+        },
+        "attention.sink" => match op.dtype(Site::Out(0))? {
+            ScalarKind::Bf16 => ctx.sink::<bf16>(op.tinout::<bf16>(0, 0)?, op.tin::<f32>(1)?, op.tconst::<bf16>(0)?, op.u32(0)?),
+            ScalarKind::F32 => ctx.sink::<f32>(op.tinout::<f32>(0, 0)?, op.tin::<f32>(1)?, op.tconst::<f32>(0)?, op.u32(0)?),
+            _ => Err(Refusal::Absent { what: "`attention.sink`, at an element or repr this plane does not instantiate" }),
         },
         "attention.logit_softcap" => match op.dtype(Site::Out(0))? {
             ScalarKind::Bf16 => ctx.logit_softcap::<bf16>(op.tinout::<bf16>(0, 0)?, op.f32(0)?),

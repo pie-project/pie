@@ -8,25 +8,55 @@
 # is merely absent from a run reads exactly like a plane that passed, and
 # `scripts/ci-gate-audit.py` exists because that mistake was made once already.
 #
-#   cuda    SERVES. Three checkpoints go text -> Program -> GPU -> argmax
-#           through the Shell that actually serves, and answer what they were
-#           banked at. `scripts/banked-argmaxes.sh` is that gate; this calls it.
+#   cuda    SERVES ALL THREE. Three checkpoints go text -> Program -> GPU ->
+#           argmax through the Shell that actually serves, and answer what
+#           they were banked at. `scripts/banked-argmaxes.sh` is that gate;
+#           this calls it.
 #
-#   vulkan  COMPUTES THROUGH THE POINTS PATH, and does not serve yet. A
-#           device opens, every module becomes a real pipeline, and a
-#           `norm.rmsnorm` goes Plan -> Program -> walk -> generated dispatch
+#   wgpu    SERVES TWO OF THE THREE. `qwen35-d0.8b-bf16-kv-bf16` walks 381
+#           statements into 387 dispatches on one submission and answers 198 at
+#           12.3125 on the decode lane and the prefill lane both;
+#           `gptoss-20b-bf16-mxfp4-kv-bf16` answers 11 at 14.4375 over 579.
+#           Both are what cuda banked. It is the second plane ever asked, and
+#           walking real towers is what found the two things nothing narrower
+#           could: `attention.{decode,prefill,masked}` could not bind here at
+#           all, and one weight arena cannot hold a model past about 2B
+#           parameters on any shader plane.
+#
+#           gemma-4 is the one left and what stops it is ONE BANK. Its
+#           `ple.table` is [262144, 10752] in bf16 -- 5.25 GiB in a single
+#           tensor -- and `layout.embed` binds it whole. Splitting the arena
+#           cannot help: this is one bank past what one allocation may be
+#           BOUND at, and the largest ceiling any shader plane states is 4 GiB.
+#           Closing it is a change to the POINT, not to a driver.
+#
+#   vulkan  COMPUTES THROUGH THE POINTS PATH, and has not been driven end to
+#           end yet. A device opens, every module becomes a real pipeline, and
+#           a `norm.rmsnorm` goes Plan -> Program -> walk -> generated dispatch
 #           -> claim body -> vkCmdDispatch and lands inside one bf16 ulp of an
-#           f64 reference. What is left is a lane, not a kernel: no catalog
-#           row binds here, because `gemm` is unclaimed on this plane.
+#           f64 reference. `attention.sink` here is BIT-IDENTICAL to the CUDA
+#           twin over all 96 words, checked against a third harness built with
+#           nvcc rather than against carried constants. What it is short of is
+#           a `serve::run` of its own -- not a kernel.
 #
-#   wgpu    FIRES, does not serve. Same shape as vulkan, one plane ahead on
-#           claims and one behind on having been measured against CUDA.
+#   metal   SERVES TWO OF THE THREE, on an Apple box and only there.
+#           `gptoss-20b-bf16-mxfp4-kv-bf16` answers 11 at 14.4375 EXACTLY, and
+#           `qwen35-d0.8b-bf16-kv-bf16` answers token 198 at 12.2500 -- the
+#           banked token, one bf16 step under the banked logit, which is what
+#           an Apple GPU reducing in its own order is worth. Both through
+#           `serve::Shell`, the path a request actually takes.
 #
-#   metal   COMPILES AND BUILDS PIPELINES, on an Apple box and only there.
+#           Getting there took two defects nothing narrower could see: a
+#           `kv_geometry` that stated two layouts in one pair, and every
+#           `InOut` copy staged on the HOST before a single dispatch had run --
+#           so the residual stream was added to zeros from layer 0 onward, in
+#           silence.
+#
+#           It also COMPILES AND BUILDS PIPELINES.
 #           `scripts/check-metal-4.sh` type-checks the Apple half against
 #           `aarch64-apple-darwin` from Linux and that is all it does -- a
 #           green metal column HERE is not a working plane. On a Mac the
-#           suite is real: 366 tests plus 10 device-only, and every one of
+#           suite is real: 366 tests plus 53 device-only, and every one of
 #           the 293 declared entrypoints becomes a pipeline. Metal compiles
 #           MSL at RUN time through the framework, so no `metal`/`metallib`
 #           CLI and no Xcode is needed -- Command Line Tools and a cargo
@@ -35,6 +65,12 @@
 #           `tailscale ssh ingim@ins-mac-studio` reaches one. Plain TCP 22 is
 #           filtered by the tailnet ACL and Tailscale's own SSH is not; that
 #           distinction cost a day of believing the plane was untestable.
+#
+# `scripts/claims-census.py` is the OTHER table -- what each SKU states against
+# what each plane claims -- DERIVED rather than written down, because the hand
+# version was wrong three times in one day and in both directions. As of
+# 2026-08-25 it prints: every point every banked SKU states is claimed on every
+# plane. What separates the four is no longer arithmetic; it is SERVING.
 #
 # VULKAN NEEDS A SLANG COMPILER and this tree does not vendor one. Point
 # `PIE_SLANGC` at a `slangc` binary, or put one on PATH. The releases live at

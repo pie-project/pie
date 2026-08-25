@@ -42,9 +42,9 @@ fn the_module_table_is_empty_only_when_nothing_was_asked_to_fill_it() {
     let n = kernels_vulkan::MODULES.len();
     if cfg!(feature = "device") {
         assert_eq!(
-            n, 691,
+            n, 698,
             "`device` is on, so `kernels-vulkan` was asked for its SPIR-V and \
-             the table holds {n} rather than 686. If a shader was ADDED or a \
+             the table holds {n} rather than 698. If a shader was ADDED or a \
              variant instantiated, raise this number — that edit is the \
              record. If it FELL, the sweeps below are reading less than they \
              read yesterday and every one of them still says `ok`, which is \
@@ -485,9 +485,54 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
     // simply declare four and stop. A family whose optional buffer is
     // appended costs no holes; one whose optional buffer sits in the middle
     // costs a hole in every sibling, which is most of the 418.
-    assert_eq!(modules, 691, "a different number of modules is built");
-    assert_eq!(holed, 173, "a different number of modules has a hole");
-    assert_eq!(holes, 418, "a different number of holes in all");
+    //
+    // 691 BECAME 694 WITH THE LSE PLANE AND THE SINK RESCALE, and this is the
+    // first wave in a while where the holes moved with the modules: 173/418
+    // became 175/420, two of the three new modules carrying one hole each.
+    //
+    // The two are `sdpa_paged_{decode,tiled}_lse_bfloat16_d_64`, and their hole
+    // is the paragraph above's second shape rather than its first. They inherit
+    // the eleven-binding decode header, they read `queries` through
+    // `attention_mask_enabled` at 0..9 and they write the lse at 11 -- but an
+    // `_lse` reading reaches no SINK, so binding 10 is declared, never touched,
+    // and dropped. That is an optional buffer sitting in the MIDDLE, which is
+    // the case that costs a hole; had the lse been given binding 10 and the sink
+    // moved out, the two arms would have cost none and every sinkless sibling in
+    // the family would have gained one. 11 is also `partials`' number under
+    // `PIE_SPLIT`, and the two are never compiled together -- a split holds only
+    // its own slice's denominator.
+    //
+    // The third, `attn_sink_rescale_bfloat16`, is a NEW FILE with a header of
+    // its own: four buffers declared densely from zero and all four read, so no
+    // hole. A family that does not inherit cannot inherit a gap.
+    //
+    // 694 BECAME 697 WHEN THREE POINTS THAT COULD NOT FIRE WERE GIVEN ARMS,
+    // and none of the three moved the holes:
+    //
+    // * `embed_bfloat16` is a NEW FILE (`layout/embed.slang`) and declares
+    //   three buffers densely from zero, all read. `layout.embed` had no dense
+    //   gather at all -- it asked `Staged::bank` for a quantised table's
+    //   sidecars unconditionally, and every catalog row states a `bf16`
+    //   embedding.
+    // * `neox_yarn_mb_bfloat16` is a `PIE_YARN` variant of `rope/neox.slang`,
+    //   whose header is two buffers and a push block. `rope.yarn` had asked
+    //   for a precomputed ladder no driver stages.
+    // * `gptoss_swiglu_strided_bfloat16` is a `PIE_GPTOSS_STRIDED` variant of
+    //   `mlp/gated.slang`, three buffers, all read. The flat arm indexes gate,
+    //   up and out by one id, which a packed `[gate | up]` row cannot use.
+    //
+    // Three modules, zero holes, and the reason is the same each time: a file
+    // whose bindings are declared densely from zero and all read has none, and
+    // a variant that adds only push words changes no binding at all.
+    // 697 BECAME 698 WITH THE UNSORTED COMBINE, and it costs no hole either:
+    // `expert_combine` is a `PIE_EXPERT_COMBINE` arm of `moe/route.slang` with
+    // three buffers declared densely from zero and all three read. It is what
+    // `moe.weighted_sum` was missing — the sorted arm beside it folds through
+    // an inverse permutation `route_sort` writes and no point of this plane
+    // claims, so the point was in the claim table and could fire for nothing.
+    assert_eq!(modules, 698, "a different number of modules is built");
+    assert_eq!(holed, 175, "a different number of modules has a hole");
+    assert_eq!(holes, 420, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header
     // with the matmul family it feeds, reads two of the thirteen bindings that
     // header declares, and `slangc` drops the other eleven. A driver counting

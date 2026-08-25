@@ -332,6 +332,13 @@ required-features = ["metal-4"]
 name = "device_attention"
 required-features = ["metal-4"]
 
+# The whole chain through the Shell that serves: a cached checkpoint to the
+# argmax cuda banked. Apple hardware and 1.4 GiB of weights, so its one test is
+# `#[ignore]`d on top of the feature gate.
+[[test]]
+name = "banked_argmax"
+required-features = ["metal-4"]
+
 [[test]]
 name = "device_compile"
 required-features = ["metal-4"]

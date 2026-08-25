@@ -1774,6 +1774,7 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
                     writes: &[],
                     push: &params,
                     groups,
+                    staged: &[],
                 })
                 .collect();
             device.run_all(&run).expect("the chain records and submits");
@@ -1892,6 +1893,7 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
                 writes: &[],
                 push: &params,
                 groups,
+                staged: &[],
             })
             .collect();
         device.run_all(&run).expect("the fire records and submits");
@@ -4210,7 +4212,10 @@ impl driver_vulkan::baker::stage::Pools for NoStaging {
         None
     }
 
-    fn kv_geometry(&self) -> driver_vulkan::baker::stage::KvGeometry {
+    // ONE SHAPE FOR EVERY LAYER. This fixture stages a single pool, so the
+    // layer changes nothing; the argument exists for a tower that attends at
+    // two widths, which `driver-wgpu/tests/banked_argmax.rs` names.
+    fn kv_geometry(&self, _layer: u32) -> driver_vulkan::baker::stage::KvGeometry {
         driver_vulkan::baker::stage::KvGeometry {
             page_size: 0,
             seq_stride: 0,
@@ -4499,6 +4504,10 @@ fn a_program_walked_onto_this_card_computes_what_the_reference_computes() {
         &Embedded,
         &[&arena_buf, &bank_buf],
         &dispatches,
+        // This plan states no `InOut` point, and the walk agrees: an empty
+        // slice here and `fired.staged == 0` below are the same claim from
+        // the two ends.
+        &fire.blits.borrow(),
         Capability::Baseline,
     );
     let fired = match fired {
@@ -4511,6 +4520,10 @@ fn a_program_walked_onto_this_card_computes_what_the_reference_computes() {
     };
     assert_eq!(fired.dispatches, 1);
     assert_eq!(fired.submissions, 1, "one command buffer for the whole run");
+    assert_eq!(
+        fired.staged, 0,
+        "a `norm.rmsnorm` is not an `InOut` point and stages no copy"
+    );
     assert_eq!(
         fired.blocks, 0,
         "`rms_single_row_bfloat16` declares a push block, so nothing is staged \

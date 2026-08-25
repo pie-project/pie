@@ -563,6 +563,10 @@ mod tests {
                 // also writes. `driver-vulkan`'s `blocks`/`parsed` have no
                 // counterpart here.
                 shadowed: 0,
+                // And its sibling, which is not the same number: a staged copy
+                // is what an `InOut` declaration means on every plane, where a
+                // shadow is this backend's answer to a WebGPU rule.
+                staged: 0,
             },
             rows: 3,
             // Request 0 answers from fire row 0 and request 1 from fire row

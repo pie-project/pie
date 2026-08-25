@@ -14,7 +14,14 @@ PIE_BUFFER_RW(0, x);
 
 struct Push {
     float scale;
-#if defined(PIE_FREQS)
+#if defined(PIE_YARN)
+    float base;
+    int head_dim;
+    float factor;
+    float low_dim;
+    float high_dim;
+    float mscale;
+#elif defined(PIE_FREQS)
     int head_dim;
     float mscale;
 #else
@@ -60,6 +67,31 @@ void main(uint3 group : SV_GroupID) {
     float theta = pc.scale * float(position[row]) * exp2(-d * pc.base);
     uint i1 = row_base + h * uint(pc.head_dim) + i;
     rotate_pair(i1, i1 + half_hd, theta, 1.0);
+#elif defined(PIE_YARN)
+    // THE RAMP, AND THE HOST DECIDED WHERE IT STARTS AND ENDS.
+    // `kernels_vulkan::rope::ramp_bounds` computes `low_dim`/`high_dim` from
+    // beta_fast/beta_slow and the checkpoint's original context, exactly as
+    // `kernels-wgpu`'s does and for the same reason: they are functions of the
+    // MODEL and not of the row, so computing them per invocation would be the
+    // same number derived a few thousand times.
+    //
+    // `base` is `log2(theta)` -- the host takes the log so this can use
+    // `exp2`, which is the same trade `PIE_PROP` and the plain arm already
+    // make on this file.
+    float dn = float(i) / float(pair_half);
+    float base_freq = exp2(-dn * pc.base);
+    // A degenerate ramp is possible -- `high == low` when the correction
+    // bounds collapse -- and dividing by zero there would make every channel
+    // NaN. The epsilon is the one `kernels-cuda` states and it is on the
+    // DENOMINATOR only, so the clamp still saturates the way it should.
+    float denom = (pc.high_dim == pc.low_dim)
+        ? (pc.high_dim + 1e-3 - pc.low_dim)
+        : (pc.high_dim - pc.low_dim);
+    float ramp = clamp((float(i) - pc.low_dim) / denom, 0.0, 1.0);
+    float theta = float(position[row]) * base_freq
+        * ((1.0 - ramp) + ramp / pc.factor);
+    uint i1 = row_base + h * uint(pc.head_dim) + i;
+    rotate_pair(i1, i1 + pair_half, theta, pc.mscale);
 #elif defined(PIE_FREQS)
     float theta = pc.scale * float(position[row]) * inv_freq[i];
     uint i1 = row_base + h * uint(pc.head_dim) + i;
@@ -127,6 +159,7 @@ void main(uint3 group : SV_GroupID) {
 // pie:instantiate neox_freqs_decode_bfloat16 PIE_FREQS=1 PIE_DECODE=1
 // pie:instantiate neox_freqs_mb_bfloat16 PIE_FREQS=1
 // pie:instantiate neox_mb_bfloat16
+// pie:instantiate neox_yarn_mb_bfloat16 PIE_YARN=1
 // pie:instantiate neox_prop_decode_bfloat16 PIE_PROP=1 PIE_DECODE=1
 // pie:instantiate neox_prop_mb_bfloat16 PIE_PROP=1
 // pie:instantiate neox_strided_bfloat16 PIE_STRIDED=1

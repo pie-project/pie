@@ -741,6 +741,7 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
                 // a refusal, so only the even stages carry one.
                 uniform: if k % 2 == 0 { &params } else { &[] },
                 groups: if k % 2 == 0 { norm_grid } else { add_grid },
+                staged: &[],
             })
             .collect();
         if all_at_once {
@@ -866,6 +867,7 @@ fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
         buffers: &[input, output],
         uniform: &[],
         groups: [1, 1, 1],
+        staged: &[],
     };
 
     // The diagnosis, by name and with both offsets.
@@ -2155,6 +2157,7 @@ fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
         ],
         uniform: &[],
         groups: [1, 1, 1],
+        staged: &[],
     };
     assert_eq!(
         device.check(&one),
@@ -2237,6 +2240,7 @@ fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
         ],
         uniform: &[],
         groups: [1, 1, 1],
+        staged: &[],
     };
     assert_eq!(
         device.check(&one),
@@ -2265,6 +2269,7 @@ fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
         ],
         uniform: &[],
         groups: [1, 1, 1],
+        staged: &[],
     };
     assert_eq!(
         device.check(&disjoint),
@@ -2279,6 +2284,7 @@ fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
         ],
         uniform: &[],
         groups: [1, 1, 1],
+        staged: &[],
     };
     assert_eq!(
         device.check(&in_place),

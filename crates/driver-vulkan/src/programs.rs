@@ -520,6 +520,7 @@ mod tests {
             fired: crate::serve::Fired {
                 dispatches: 0,
                 submissions: 0,
+                staged: 0,
                 blocks: 0,
                 parsed: 0,
                 tiered: 0,

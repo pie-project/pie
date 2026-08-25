@@ -1,9 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::plane::{Bind, Ctx, Fire, In, InOut, Out, elementwise, elementwise_rows};
+use crate::plane::{Bind, Const, Ctx, Fire, In, InOut, Out, elementwise, elementwise_rows};
 use crate::views::AttnFire;
 use kernels::BindMut;
 use kernels::plane::Refusal;
+
+const SDPA_LSE_WIDTHS: [i32; 1] = [64];
 
 pub fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
     points
@@ -99,6 +101,21 @@ pub fn tiled_grid(q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
             at: i64::from(rows),
         })?;
     Ok([x, y, 1])
+}
+
+fn lse_plane(
+    lse: &Out<crate::points::Handle<f32>>,
+    rows: i32,
+    q_heads: i32,
+    what: &'static str,
+) -> Result<(), Refusal> {
+    if lse.rows != rows || lse.width != q_heads {
+        return Err(Refusal::Narrow {
+            what,
+            at: i64::from(lse.width),
+        });
+    }
+    Ok(())
 }
 
 pub fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal> {
@@ -235,6 +252,71 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
+    fn decode_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<crate::points::Handle<T>>,
+        pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<crate::points::Handle<T>>,
+        lse: Out<crate::points::Handle<f32>>,
+    ) -> Result<(), Refusal> {
+        crate::points::at_bf16::<T>(
+            "attention.decode_lse, at an element this plane does not instantiate",
+        )?;
+        if pages.ptr.is_null() {
+            return Err(Refusal::Null {
+                what: "the kv pool row this statement names",
+            });
+        }
+        let fired = unsafe { &*pages.ptr };
+        let kv = &fired.kv;
+        let row = q.all("the query row")?;
+        let hd = crate::points::stated("the head width this attention states", head_dim)?;
+        let q_heads = crate::points::heads("the query heads this row divides into", row.width, hd)?;
+        let w = crate::points::stated("the sliding extent this attention states", window)?;
+        let gqa = if fired.kv_heads > 0 {
+            q_heads / fired.kv_heads
+        } else {
+            0
+        };
+        head_point(hd, &SDPA_LSE_WIDTHS)?;
+        lse_plane(
+            &lse,
+            row.rows,
+            q_heads,
+            "`attention.decode_lse`'s log-sum-exp plane",
+        )?;
+        let entrypoint = "sdpa_paged_decode_lse_bfloat16_d_64";
+        self.fire(
+            Fire::at(
+                crate::plane::module_path(entrypoint, self.best()),
+                entrypoint,
+            )
+            .apply(vector_grid(hd, q_heads, row.rows)?),
+            &[
+                q.arg(),
+                kv.keys.arg_mut(),
+                kv.values.arg_mut(),
+                o.arg(),
+                gqa.arg(),
+                fired.positions.arg(),
+                fired.request_of_token.arg(),
+                kv.page_indices.arg(),
+                kv.page_indptr.arg(),
+                kv.page_size.arg(),
+                fired.kv_heads.arg(),
+                sm_scale.arg(),
+                fired.mask.mask.arg(),
+                fired.mask.stride.arg(),
+                fired.mask.enabled.arg(),
+                w.arg(),
+                lse.arg(),
+            ],
+        )
+    }
+
     fn prefill<T: kernels::points::Scalar>(
         &self,
         q: In<crate::points::Handle<T>>,
@@ -257,6 +339,122 @@ impl kernels::points::Attention for Ctx<'_> {
             sm_scale,
             o,
             "attention.prefill",
+        )
+    }
+
+    fn prefill_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<crate::points::Handle<T>>,
+        indptr: In<crate::points::Handle<i32>>,
+        pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: Out<crate::points::Handle<T>>,
+        lse: Out<crate::points::Handle<f32>>,
+    ) -> Result<(), Refusal> {
+        let _ = indptr;
+        crate::points::at_bf16::<T>(
+            "attention.prefill_lse, at an element this plane does not instantiate",
+        )?;
+        if pages.ptr.is_null() {
+            return Err(Refusal::Null {
+                what: "the kv pool row this statement names",
+            });
+        }
+        let fired = unsafe { &*pages.ptr };
+        let kv = &fired.kv;
+        let row = q.all("the query rows this window holds")?;
+        let hd = crate::points::stated("the head width this attention states", head_dim)?;
+        let q_heads = crate::points::heads("the query heads this row divides into", row.width, hd)?;
+        let w = crate::points::stated("the sliding extent this attention states", window)?;
+        let stated = crate::points::stated("the key heads this attention states", kv_heads)?;
+        if stated != fired.kv_heads {
+            return Err(Refusal::Narrow {
+                what: "the key heads this attention states, against the pool it reads",
+                at: i64::from(stated),
+            });
+        }
+        let gqa = if fired.kv_heads > 0 {
+            q_heads / fired.kv_heads
+        } else {
+            0
+        };
+        head_point(hd, &SDPA_LSE_WIDTHS)?;
+        lse_plane(
+            &lse,
+            row.rows,
+            q_heads,
+            "`attention.prefill_lse`'s log-sum-exp plane",
+        )?;
+        let entrypoint = "sdpa_paged_tiled_lse_bfloat16_d_64";
+        self.fire(
+            Fire::at(
+                crate::plane::module_path(entrypoint, self.best()),
+                entrypoint,
+            )
+            .apply(tiled_grid(q_heads, row.rows)?),
+            &[
+                q.arg(),
+                kv.keys.arg_mut(),
+                kv.values.arg_mut(),
+                o.arg(),
+                gqa.arg(),
+                fired.positions.arg(),
+                fired.request_of_token.arg(),
+                kv.page_indices.arg(),
+                kv.page_indptr.arg(),
+                kv.page_size.arg(),
+                fired.kv_heads.arg(),
+                sm_scale.arg(),
+                fired.mask.mask.arg(),
+                fired.mask.stride.arg(),
+                fired.mask.enabled.arg(),
+                w.arg(),
+                row.rows.arg(),
+                lse.arg(),
+            ],
+        )
+    }
+
+    fn sink<T: kernels::points::Scalar>(
+        &self,
+        o: InOut<crate::points::Handle<T>>,
+        lse: In<crate::points::Handle<f32>>,
+        sink: Const<crate::points::Handle<T>>,
+        head_dim: u32,
+    ) -> Result<(), Refusal> {
+        crate::points::at_bf16::<T>(
+            "attention.sink, at an element this plane does not instantiate",
+        )?;
+        let row = o.all("the attention output this sink rescales")?;
+        let hd = crate::points::stated("the head width this sink states", head_dim)?;
+        let heads = crate::points::heads(
+            "the attention output's row, against the head width this sink states",
+            row.width,
+            hd,
+        )?;
+        if lse.rows != row.rows || lse.width != heads {
+            return Err(Refusal::Narrow {
+                what: "the log-sum-exp plane this sink reads is not one f32 per head per row",
+                at: i64::from(lse.width),
+            });
+        }
+        self.fire(
+            Fire::at(
+                crate::plane::module_path("attn_sink_rescale_bfloat16", self.best()),
+                "attn_sink_rescale_bfloat16",
+            )
+            .apply(head_grid(hd, heads, row.rows)?),
+            &[
+                o.ptr.arg(),
+                o.arg(),
+                lse.arg(),
+                sink.v.arg(),
+                hd.arg(),
+                heads.arg(),
+            ],
         )
     }
 

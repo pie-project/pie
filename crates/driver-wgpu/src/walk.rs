@@ -94,7 +94,9 @@ use kernels::plane::{Cache, Const, In, InOut, Out, Refusal};
 use kernels::points::{Repr, Scalar, ScalarKind};
 
 pub use fire::{Blit, Cursor, Extent, Fire, Refused};
-pub use lane::{BANK_ALIGN, Baked, Bank, READABLE_BASE, arena_of, join, readable_base, word_of};
+pub use lane::{
+    Arena, BANK_ALIGN, Baked, Bank, READABLE_BASE, arenas_of, join, readable_base, word_of,
+};
 pub use marks::{Bindings, Bound as BoundRegion, Rect};
 pub use resolve::Unresolved;
 

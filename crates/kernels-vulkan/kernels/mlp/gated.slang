@@ -70,7 +70,18 @@ PIE_BUFFER_RW(2, out_);
 // `GptOssSwiGluParams` opened with a dead per-row element count, held only so
 // `limit` and `alpha` kept their offsets. A push block packed from the marks
 // the BODY passes needs no such filler, so the dead word stops at the host.
-#if defined(PIE_GEGLU_STRIDED) || defined(PIE_SILU_STRIDED)
+#if defined(PIE_GPTOSS_STRIDED)
+// THE PITCHES FIRST AND THE TWO FLOATS AFTER, which is `halves::args` order
+// with `limit` and `alpha` appended. A `[gate | up]` row is ONE tensor whose
+// two halves are `intermediate` apart, so `gate` and `up` are the same buffer
+// at two offsets and the pitch is the packed width -- while `out_` is dense at
+// `intermediate`. Three pitches and not one is what lets that be said.
+struct Push {
+    uint width; uint rows; uint gate_pitch; uint up_pitch; uint out_pitch;
+    float limit; float alpha;
+};
+[[vk::push_constant]] ConstantBuffer<Push> pc;
+#elif defined(PIE_GEGLU_STRIDED) || defined(PIE_SILU_STRIDED)
 struct Push { uint width; uint rows; uint gate_pitch; uint up_pitch; uint out_pitch; };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 #elif defined(PIE_GPTOSS)
@@ -136,6 +147,22 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint gid = tid.x;
     if (past_the_end(gid)) return;
     out_[gid] = PIE_STORE(gelu_tanh(PIE_LOAD(gate[gid])) * PIE_LOAD(up[gid]));
+#elif defined(PIE_GPTOSS_STRIDED)
+    // `PIE_GPTOSS`'s arithmetic over `PIE_GEGLU_STRIDED`'s indexing, and the
+    // reason both exist is that gpt-oss hands this point ONE packed row.
+    // The flat arm reads `gate[gid]` and `up[gid]` at the same index, which is
+    // right for two separate tensors and wrong for two halves of one: the
+    // second half starts `intermediate` elements into the first row and the
+    // pitch is `2 * intermediate`, so `gid` walks off the end of row zero into
+    // row one's gate half.
+    uint n = tid.x;
+    if (n >= pc.rows * pc.width) return;
+    uint m = n / pc.width;
+    uint k = n % pc.width;
+    float g = min(PIE_LOAD(gate[m * pc.gate_pitch + k]), pc.limit);
+    float u = clamp(PIE_LOAD(up[m * pc.up_pitch + k]), -pc.limit, pc.limit);
+    float sig = 1.0 / (1.0 + exp(-pc.alpha * g));
+    out_[m * pc.out_pitch + k] = PIE_STORE((g * sig) * (u + 1.0));
 #elif defined(PIE_GPTOSS)
     uint gid = tid.x;
     if (past_the_end(gid)) return;
@@ -165,5 +192,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
 // pie:instantiate geglu_tanh_bfloat16 PIE_GEGLU=1
 // pie:instantiate geglu_tanh_strided_bfloat16 PIE_GEGLU_STRIDED=1
 // pie:instantiate gptoss_swiglu_bfloat16 PIE_GPTOSS=1
+// pie:instantiate gptoss_swiglu_strided_bfloat16 PIE_GPTOSS_STRIDED=1
 // pie:instantiate silu_mul_bfloat16
 // pie:instantiate silu_mul_strided_bfloat16 PIE_SILU_STRIDED=1

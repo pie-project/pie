@@ -44,7 +44,7 @@ fn plane(b: &mut Bindings, slice: Option<Slice>) -> u32 {
 pub(crate) fn kv(b: &mut Bindings, pools: &dyn Pools, layer: u32) -> Option<PagedKvView> {
     let keys = pools.kv(layer, false)?;
     let values = pools.kv(layer, true)?;
-    let g = pools.kv_geometry();
+    let g = pools.kv_geometry(layer);
     Some(PagedKvView {
         keys: Tensor::new(plane(b, Some(keys))),
         values: Tensor::new(plane(b, Some(values))),

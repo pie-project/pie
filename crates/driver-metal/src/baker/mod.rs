@@ -73,7 +73,9 @@ pub mod stage;
 pub mod views;
 
 pub use crate::walk::frame;
-pub use crate::walk::{BANK_ALIGN, Baked, READABLE_BASE, arena_of, join, readable_base, word_of};
+pub use crate::walk::{
+    Arena, BANK_ALIGN, Baked, READABLE_BASE, arenas_of, join, readable_base, word_of,
+};
 pub use marks::{Bindings, Bound as BoundRegion, NOTHING, Rect, Slice};
 pub use plane::Metal;
 pub use stage::{FireTable, KvGeometry, Pools, Slab};

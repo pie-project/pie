@@ -245,7 +245,10 @@ impl Pools for Staging {
         None
     }
 
-    fn kv_geometry(&self) -> KvGeometry {
+    // ONE SHAPE FOR EVERY LAYER. This fixture stages a single pool, so the
+    // layer changes nothing; the argument exists for a tower that attends at
+    // two widths, which `driver-wgpu/tests/banked_argmax.rs` names.
+    fn kv_geometry(&self, _layer: u32) -> KvGeometry {
         KvGeometry {
             page_size: 16,
             seq_stride: 64,

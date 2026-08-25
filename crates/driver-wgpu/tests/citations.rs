@@ -492,7 +492,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
 /// comparison: "a test that asserts WHICH refusal came back is the only way
 /// an alignment failure stays distinguishable from a length one."
 ///
-/// It is a principle this crate mostly keeps — **forty-one of forty-eight**
+/// It is a principle this crate mostly keeps — **forty-three of fifty**
 /// refusal variants are named in a test — and nothing measured the rest. A
 /// refusal nothing names is one whose condition could be inverted, or whose
 /// message could describe a different fault, with every suite still green: it
@@ -658,9 +658,20 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // by `groups_for`, which no production path called; claim bodies now state
     // lanes directly and the pipeline performs the sole lanes-to-workgroups
     // conversion.
+    //
+    // AND BACK UP TO FIFTY when `serve::run` landed -- the device half of the
+    // baker path, which is what puts a whole walk on the card. Two of the four
+    // plan-side `Unfired` variants P5b deleted came back with it, because it
+    // raises them again: `NoModule` for a symbol no tier of the embedded tree
+    // carries, and `Unbound` for a region naming an allocation the fire was not
+    // given. Both are named by
+    // `the_two_plan_side_refusals_name_the_module_and_not_only_the_launch`.
+    // `Unreadable` did NOT come back and cannot: a module that is not WGSL this
+    // crate can dispatch is `Failed::Module`, already counted here, and a second
+    // spelling would be two names for one condition.
     assert_eq!(
         refusals.len(),
-        48,
+        50,
         "the refusal census moved. If variants were added, name them in a \
          test and raise this; if they were removed, say which in the commit \
          and lower it. If it collapsed to a handful, the parser has stopped \
@@ -748,8 +759,8 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (48, 41),
-        "this test's own doc says forty-one of forty-eight refusal variants \
+        (50, 43),
+        "this test's own doc says forty-three of fifty refusal variants \
          are named by a test. Update the sentence with the number."
     );
 }

@@ -72,14 +72,25 @@ impl kernels::points::Mlp for Ctx<'_> {
         crate::points::at_bf16::<T>(
             "mlp.swiglu_clamp_alpha, at an element this plane does not instantiate",
         )?;
-        let _ = (packed, intermediate, limit, alpha, y);
-        Err(Refusal::Absent {
-            what: "mlp.swiglu_clamp_alpha over a packed `[gate | up]` row: \
-                   `gptoss_swiglu_bfloat16` indexes gate, up and out by one \
-                   flat id and declares no pitch, so the window this plane can \
-                   open on the row's second half is one the entrypoint cannot \
-                   read — `gated.slang` stamps no strided gpt-oss arm",
-        })
+        // THIS WAS A REFUSAL AND THE REFUSAL WAS RIGHT: `gptoss_swiglu_bfloat16`
+        // indexes gate, up and out by one flat id and declares no pitch, so
+        // the window this plane opens on the packed row's second half is one
+        // that entrypoint cannot read. `gated.slang` stamps a strided arm now
+        // — the same arithmetic over `PIE_GEGLU_STRIDED`'s indexing — and this
+        // fires it. gpt-oss is the one row that hands this point a packed row,
+        // and until a whole tower was walked here nothing had.
+        let parts = halves(self, packed, intermediate)?;
+        let mut args = parts.args(y).to_vec();
+        args.push(limit.arg());
+        args.push(alpha.arg());
+        self.fire(
+            Fire::at(
+                crate::plane::module_path("gptoss_swiglu_strided_bfloat16", self.best()),
+                "gptoss_swiglu_strided_bfloat16",
+            )
+            .apply(elementwise(parts.width, parts.rows)?),
+            &args,
+        )
     }
 }
 

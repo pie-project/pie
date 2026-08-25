@@ -89,6 +89,9 @@
 //! the large number was: a cost nobody can see is a cost nobody fixes, and one
 //! `read` declaration brings all 451 of them back.
 
+use std::collections::BTreeMap;
+
+use crate::baker::marks::{BufferId, Slice};
 use crate::device::Failed;
 use kernels_wgpu::Capability;
 
@@ -221,6 +224,16 @@ pub struct Fired {
     /// the tree, whose only other symptom is that decoding got twice as
     /// slow.
     pub shadowed: usize,
+    /// How many device-to-device copies the walk's `InOut` points forced.
+    ///
+    /// [`Self::shadowed`]'s sibling and NOT the same number: a shadow is this
+    /// backend's answer to a WebGPU rule and should be zero, while a staged
+    /// copy is what an `InOut` declaration means on every plane and is a real
+    /// property of the text — one per `norm.residual_add`, per `rope.partial`,
+    /// per `gate.sigmoid_mul`. Reported because it is the price of the walk
+    /// minting a fresh rectangle for every result, and a text that merged its
+    /// residual instead would show the difference here.
+    pub staged: usize,
 }
 
 /// Why a fire did not run.
@@ -253,17 +266,64 @@ pub enum Unfired {
     // binding a fire's scalars over an operand, which is a wrong answer and
     // not a crash).
     //
-    // The two that remain are the two a DEVICE raises, and they are kept
-    // because the distinction between them is the finding below.
+    // TWO OF THEM ARE BACK, because [`run`] is the walk's device half and it
+    // raises them again -- `NoModule` for a symbol no tier of the tree carries,
+    // and `Unbound` for a region naming an allocation the fire was not given.
+    // `Unreadable` did not come back and cannot: a module that is not WGSL this
+    // crate can dispatch is `Failed::Module`, which the pipeline cache raises
+    // and `Refused` carries, so a second spelling of it would be two names for
+    // one condition. `Unplannable` and `Impossible` were the lowering's.
+    /// No module for a symbol the walk fired, at any tier.
+    ///
+    /// A PLAN-SIDE FAILURE AND NOT A DEVICE ONE, which is why it is not
+    /// `Refused`: nothing was submitted and no adapter was asked. A claim body
+    /// named `(file, entrypoint)` and the embedded tree has no such variant, so
+    /// the disagreement is between `kernels-wgpu`'s claim table and
+    /// `kernels-wgpu`'s shader tree and has nothing to do with this machine.
+    NoModule {
+        /// Which launch.
+        at: usize,
+        /// The entrypoint the body named.
+        symbol: String,
+        /// The file it named it in.
+        file: String,
+    },
+    /// A region naming an allocation this fire was not given.
+    ///
+    /// [`run`]'s `buffers` is indexed by
+    /// [`BufferId`](crate::baker::marks::BufferId) — the walk was handed those
+    /// ids when its arena, its banks and its pools were built — so an id past
+    /// the table is a driver that minted a region against a table it did not
+    /// then pass. Refused by name rather than bound to whatever is at index
+    /// zero, which is the weight arena on every fire this driver makes.
+    Unbound {
+        /// Which launch.
+        at: usize,
+        /// The entrypoint the body named.
+        symbol: String,
+        /// The id the region carried.
+        buffer: usize,
+    },
     /// The device refused this launch.
     ///
     /// A launch, and only a launch: everything that reaches here was checked
     /// before anything was submitted. A failure of the submission itself is
     /// [`Self::Undelivered`], which is a different variant precisely so that
     /// it cannot be printed as a launch index.
+    ///
+    /// IT NAMES THE SYMBOL TOO, which this type's own doc claimed of every
+    /// variant while this one carried an index alone. The claim became worth
+    /// keeping when [`run`] started raising it over a real plan: `launch 56` of
+    /// 387 is a number a reader cannot act on, and the refusals that arrive
+    /// here — a bind group whose entry count does not match the module's, a
+    /// uniform block shorter than the struct — are all statements ABOUT a
+    /// module, which has a name.
     Refused {
         /// Which launch.
         at: usize,
+        /// The entrypoint it fired, or what the allocation was for when no
+        /// launch had been reached yet.
+        symbol: String,
         /// What failed.
         why: Failed,
     },
@@ -289,7 +349,14 @@ pub enum Unfired {
 impl std::fmt::Display for Unfired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused { at, why } => write!(f, "launch {at}: {why}"),
+            Self::NoModule { at, symbol, file } => {
+                write!(f, "launch {at}: no module for `{symbol}` in `{file}`")
+            }
+            Self::Unbound { at, symbol, buffer } => write!(
+                f,
+                "launch {at} `{symbol}`: buffer {buffer} is not one this fire was given"
+            ),
+            Self::Refused { at, symbol, why } => write!(f, "launch {at} `{symbol}`: {why}"),
             Self::Undelivered { of, why } => {
                 write!(f, "the submission of {of} launches: {why}")
             }
@@ -359,6 +426,275 @@ impl Logits {
     }
 }
 
+/// Put a walk's dispatches on the card, in the order the walk stated them.
+///
+/// **THE DEVICE HALF OF THE BAKER PATH**, and the one function in this crate
+/// that takes what [`crate::baker::walk::Fire::walk`] produced and turns it into
+/// `dispatch_workgroups`. Everything upstream of it is arithmetic: a `Program`,
+/// an arena, a claim body stating an entrypoint and a grid. `driver-vulkan`'s
+/// `serve::run` is the sibling and arrived first; this is the same three passes
+/// over a plane whose modules are compiled here rather than at build time.
+///
+/// `buffers` is indexed by [`BufferId`], because a
+/// [`Slice`](crate::baker::marks::Slice) names an ALLOCATION and an offset and
+/// only the caller knows which allocation is which — the walk was handed those
+/// ids when its arena, its banks and its pools were built. An id past the table
+/// is [`Unfired::Unbound`].
+///
+/// # The three passes, and why they are three
+///
+/// **Resolve everything, then build every pipeline, then record.** Each
+/// boundary is a borrow a single pass gets wrong, and both were found the hard
+/// way by the fire path this replaces:
+///
+/// * A dispatch's scalars are the fields of one uniform block, and the block has
+///   to be alive when the QUEUE runs the command buffer rather than when it is
+///   recorded. So every block is written in pass one, into a vector that
+///   outlives the submission.
+/// * [`crate::device::Pipelines::get`] takes `&mut self` because it may build,
+///   so a caller cannot hold a reference to one pipeline while asking for the
+///   next — and recording needs one reference per launch, all alive at once. So
+///   pass two builds every distinct module and pass three asks through
+///   [`crate::device::Pipelines::peek`], which borrows immutably.
+///
+/// # The tier walk is per SYMBOL and the lookup is per FILE
+///
+/// A claim body states both halves — `Fire::at(file, entrypoint)` — so the
+/// source is looked up in one file rather than scanned across every embedded
+/// one, and two files declaring the same entrypoint name cannot resolve to
+/// whichever came first. The walk down [`Capability::PREFERENCE`] is [`pick`]'s,
+/// restated here against [`Modules::at`] because `pick` asks by entrypoint
+/// alone.
+///
+/// # The honest null is a real allocation
+///
+/// `kernels_wgpu`'s `points::absent` binds a region that addresses nothing —
+/// six of the sdpa arms declare a slot their point does not carry — and
+/// `Encode::absent` answers it with [`crate::baker::marks::NOTHING`]. WebGPU
+/// refuses a zero-sized binding, so this allocates four zeroed bytes once per
+/// run and binds THOSE. A shader that reads the slot reads zeros loudly instead
+/// of reading a neighbour, which is what the null meant.
+///
+/// # Errors
+///
+/// [`Unfired`], naming the launch index in every case but the submission's. A
+/// failure part way through has still recorded and possibly RUN everything
+/// before it: the queue has no way to undo a submitted command buffer, and this
+/// does not pretend otherwise.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a fire is a plan, a card, a module store and a read-out; naming \
+              them in a struct would be one struct per call site"
+)]
+pub fn run<M: Modules>(
+    device: &crate::device::Device,
+    pipelines: &mut crate::device::Pipelines,
+    modules: &M,
+    buffers: &[&crate::device::Buffer],
+    dispatches: &[crate::baker::dispatch::Dispatch],
+    blits: &[crate::baker::walk::Blit],
+    tier: Capability,
+    read: Option<(BufferId, u64, u64)>,
+) -> Result<(Fired, Vec<u8>), Unfired> {
+    use crate::binding::Bound as Range;
+    use crate::device::{Recorded, Stage, Staged};
+
+    let align = device.min_storage_offset();
+    // Allocated before anything is resolved, because `held` below hands it back
+    // for every region the walk marked as addressing nothing.
+    let nothing = device.zeroed(4).map_err(|why| Unfired::Refused {
+        at: 0,
+        symbol: "the run's null binding".to_owned(),
+        why,
+    })?;
+    let held = |slice: Slice, at: usize, symbol: &str| -> Result<&crate::device::Buffer, Unfired> {
+        if slice.is_nothing() {
+            return Ok(&nothing);
+        }
+        buffers
+            .get(slice.buffer.0 as usize)
+            .copied()
+            .ok_or_else(|| Unfired::Unbound {
+                at,
+                symbol: symbol.to_owned(),
+                buffer: slice.buffer.0 as usize,
+            })
+    };
+
+    // ── pass one: every region resolved and every block written ────────
+    let mut bound: Vec<Vec<Range<'_, crate::device::Buffer>>> =
+        Vec::with_capacity(dispatches.len());
+    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(dispatches.len());
+    for (at, d) in dispatches.iter().enumerate() {
+        let mut args = Vec::with_capacity(d.args.len());
+        for a in &d.args {
+            let buffer = held(a.slice, at, d.symbol)?;
+            // A region that addresses nothing binds the whole four-byte null
+            // rather than a zero-length range of it.
+            let (offset, bytes) = if a.slice.is_nothing() {
+                (0, buffer.size())
+            } else {
+                (a.slice.at, a.slice.bytes)
+            };
+            args.push(Range::within(buffer, offset, bytes, align).map_err(|why| {
+                Unfired::Refused {
+                    at,
+                    symbol: d.symbol.to_owned(),
+                    why: Failed::Wgpu(format!("a region the adapter cannot address: {why}")),
+                }
+            })?);
+        }
+        bound.push(args);
+        blocks.push(d.uniform());
+    }
+
+    // The `InOut` copies, filed against the FIRST dispatch of the statement
+    // that asked. A body may state more than one launch — `rope.full` is two —
+    // and the operand's bytes have to be in place before the first of them
+    // writes through the handle, not before the last.
+    let mut staged: Vec<Vec<Staged<'_>>> = vec![Vec::new(); dispatches.len()];
+    for blit in blits {
+        let at = dispatches
+            .iter()
+            .position(|d| d.op == blit.op)
+            .ok_or_else(|| Unfired::Unbound {
+                at: blit.op as usize,
+                symbol: "an in-place copy for a statement that planned no dispatch".to_owned(),
+                buffer: blit.from.buffer.0 as usize,
+            })?;
+        let symbol = dispatches[at].symbol;
+        staged[at].push(Staged {
+            from: held(blit.from, at, symbol)?,
+            at: blit.from.at,
+            into: held(blit.to, at, symbol)?,
+            to: blit.to.at,
+            bytes: blit.bytes,
+        });
+    }
+
+    // ── pass two: one pipeline per distinct module ─────────────────────
+    let mut landed: BTreeMap<&'static str, Capability> = BTreeMap::new();
+    for (file, symbol, _stamp) in crate::baker::dispatch::pipelines_needed(dispatches) {
+        if landed.contains_key(symbol) {
+            continue;
+        }
+        // The first launch that names it, so a refusal points at a dispatch a
+        // reader can find rather than at launch zero.
+        let at = dispatches
+            .iter()
+            .position(|d| d.symbol == symbol)
+            .unwrap_or_default();
+        let (source, cap) = Capability::PREFERENCE
+            .into_iter()
+            .filter(|candidate| *candidate <= tier)
+            .find_map(|candidate| {
+                modules
+                    .at(file, symbol, candidate)
+                    .map(|source| (source, candidate))
+            })
+            .ok_or_else(|| Unfired::NoModule {
+                at,
+                symbol: symbol.to_owned(),
+                file: file.to_owned(),
+            })?;
+        pipelines
+            .get(device, symbol, cap, &source)
+            .map_err(|why| Unfired::Refused {
+                at,
+                symbol: symbol.to_owned(),
+                why,
+            })?;
+        landed.insert(symbol, cap);
+    }
+
+    // ── the join between a body's run and a module's bind group ────────
+    //
+    // THERE IS NOTHING TO JOIN, AND THAT IS A RULE RATHER THAN AN OBSERVATION.
+    // A claim body's buffer run is exactly the `@group(0)` bindings the module
+    // READS, in binding order, and the bind group this driver builds covers
+    // exactly the same set (`device::Pipelines::build` filters by
+    // `Declared::used`). So the run and the layout are the same list and the
+    // only thing left to do is hand it over — `Device::check_bindable` compares
+    // the two counts and refuses a dispatch where they differ.
+    //
+    // IT WAS NOT TRUE UNTIL THIS MILESTONE, and the defect is worth recording
+    // because nothing in the tree could see it. `attn/sdpa_paged.wgsl` declares
+    // `sinks` at binding 10 for every variant and only the `PIE_WITH_SINK` ones
+    // read it; `kernels_wgpu::attn`'s unsplit `decode`, its split and merge
+    // arms, `tiled` (which is `attention.prefill` and `attention.masked`) and
+    // `mma` all passed `points::absent` at that slot, and the split and merge
+    // arms passed more of them at slots their variants do not reach either.
+    // Every one of those dispatches was refused by `Failed::Bindings` — so
+    // `attention.decode` and `attention.prefill` could not be fired AT ALL on
+    // this plane, on any adapter, for any SKU. `tests/device_sink.rs` did not
+    // see it because the arms it fires are the sink-bearing and `_lse` ones,
+    // which bind their reads exactly; `tests/device_fire.rs` fires one norm.
+    // What found it was walking a whole tower, which is what
+    // `tests/banked_argmax.rs` now does.
+    //
+    // `points::absent` has no caller left in `kernels-wgpu` and is deleted.
+    // `Encode::absent` stays, because the case it names is real — a binding a
+    // module READS that the point states no operand for — and the day one
+    // exists this is where its handle would arrive.
+
+    // ── pass three: record ─────────────────────────────────────────────
+    let mut recorded = Vec::with_capacity(dispatches.len());
+    for (at, d) in dispatches.iter().enumerate() {
+        let cap = landed[d.symbol];
+        let pipeline = pipelines
+            .peek(d.symbol, cap)
+            .ok_or_else(|| Unfired::Refused {
+                at,
+                symbol: d.symbol.to_owned(),
+                why: Failed::Wgpu(format!("built at {} and not held", cap.tag())),
+            })?;
+        recorded.push(Recorded {
+            pipeline,
+            buffers: &bound[at],
+            uniform: &blocks[at],
+            groups: pipeline.workgroups(d.lanes),
+            staged: &staged[at],
+        });
+    }
+
+    let readout = match read {
+        None => None,
+        Some((buffer, at, bytes)) => Some((
+            *buffers
+                .get(buffer.0 as usize)
+                .ok_or_else(|| Unfired::Unbound {
+                    at: dispatches.len().saturating_sub(1),
+                    symbol: "the read-out".to_owned(),
+                    buffer: buffer.0 as usize,
+                })?,
+            at,
+            bytes,
+        )),
+    };
+
+    let (ran, answer) = device
+        .run_all_reading(&recorded, readout)
+        .map_err(|(stage, why)| match stage {
+            Stage::Launch(at) => Unfired::Refused {
+                at,
+                symbol: dispatches
+                    .get(at)
+                    .map_or_else(String::new, |d| d.symbol.to_owned()),
+                why,
+            },
+            Stage::Submission { of } => Unfired::Undelivered { of, why },
+        })?;
+    Ok((
+        Fired {
+            dispatches: dispatches.len(),
+            submissions: ran.buffers,
+            shadowed: ran.shadowed,
+            staged: ran.staged,
+        },
+        answer,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,7 +760,12 @@ mod tests {
             why: why.clone(),
         }
         .to_string();
-        let one = Unfired::Refused { at: 452, why }.to_string();
+        let one = Unfired::Refused {
+            at: 452,
+            symbol: "rms_single_row_bfloat16".to_owned(),
+            why,
+        }
+        .to_string();
 
         assert_ne!(
             whole, one,
@@ -443,6 +784,46 @@ mod tests {
         assert!(
             whole.contains("Wait timed out"),
             "without losing what the device said: {whole}"
+        );
+    }
+
+    /// The two PLAN-SIDE refusals name the module, because a launch index of
+    /// 387 is not a thing a reader can act on.
+    ///
+    /// Both came back with [`run`] and both are about a disagreement between
+    /// `kernels-wgpu`'s claim tables and its shader tree rather than about this
+    /// machine — a body naming an entrypoint no tier of the embedded tree
+    /// carries, and a region naming an allocation the fire was never given. So
+    /// neither is a `Refused`, which means "the device refused this launch",
+    /// and neither may print as one.
+    #[test]
+    fn the_two_plan_side_refusals_name_the_module_and_not_only_the_launch() {
+        let missing = Unfired::NoModule {
+            at: 56,
+            symbol: "sdpa_paged_decode_bfloat16_d_256".to_owned(),
+            file: "attn/sdpa_paged.wgsl".to_owned(),
+        }
+        .to_string();
+        assert!(
+            missing.contains("sdpa_paged_decode_bfloat16_d_256")
+                && missing.contains("attn/sdpa_paged.wgsl"),
+            "a missing module has to say WHICH, in which file: {missing}",
+        );
+
+        let unbound = Unfired::Unbound {
+            at: 56,
+            symbol: "sdpa_paged_decode_bfloat16_d_256".to_owned(),
+            buffer: 91,
+        }
+        .to_string();
+        assert!(
+            unbound.contains("91") && unbound.contains("sdpa_paged_decode_bfloat16_d_256"),
+            "an unbound region has to say which allocation id it named: {unbound}",
+        );
+        assert_ne!(
+            missing, unbound,
+            "the two are different claims about where a fire stopped and a \
+             reader gets only the string",
         );
     }
 

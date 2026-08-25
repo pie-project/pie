@@ -245,30 +245,92 @@ impl Baked {
 /// is the path both drivers' call sites and their tests already ask for.
 pub use model_ir::facts::word_of;
 
-/// Where every produced tensor lands in one arena, and how big the arena is.
+/// One arena: how big it is, and which banks go where inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arena {
+    /// Bytes to allocate.
+    pub bytes: u64,
+    /// `(index into `produced`, offset within this arena)`, in plan order.
+    pub banks: Vec<(usize, u64)>,
+}
+
+/// Where every produced tensor lands, packed into as few arenas as `cap`
+/// allows.
 ///
-/// ONE ARENA AND NOT ONE ALLOCATION PER TENSOR, and every plane has its own
-/// reason. Cuda does it for the address space. Metal does it for the residency
-/// set: an argument table binds a BUFFER and a residency set tracks one, so 260
-/// buffers would be 260 residency entries and 260 chances for the allocator's
-/// live-byte accounting to disagree with the device's. WebGPU does it for
-/// `max_storage_buffers_per_shader_stage` and the binding model -- 260 objects
-/// to keep alive, 260 bind-group entries to build against, and 260 chances for
-/// a `BufferBinding` to name the wrong one. One buffer with 260 offsets into it
-/// is one object and one arithmetic.
+/// AS FEW ARENAS AS POSSIBLE AND NOT ONE PER TENSOR, and every plane has its
+/// own reason. Cuda does it for the address space. Metal does it for the
+/// residency set: an argument table binds a BUFFER and a residency set tracks
+/// one, so 260 buffers would be 260 residency entries and 260 chances for the
+/// allocator's live-byte accounting to disagree with the device's. WebGPU does
+/// it for `max_storage_buffers_per_shader_stage` and the binding model -- 260
+/// objects to keep alive, 260 bind-group entries to build against, and 260
+/// chances for a `BufferBinding` to name the wrong one. One buffer with 260
+/// offsets into it is one object and one arithmetic.
 ///
-/// THE PLACEMENT HAS NO DECISION IN IT, which is what makes this short: every
-/// produced tensor is dense, row-major and canonical, so one contiguous upload
-/// per bank and no restride, no repack, no cast.
-#[must_use]
-pub fn arena_of(produced: &[(String, model::produce::HostTensor)]) -> (Vec<u64>, u64) {
-    let mut at = 0u64;
-    let mut offsets = Vec::with_capacity(produced.len());
-    for (_, t) in produced {
-        offsets.push(at);
-        at += (t.bytes.len() as u64).div_ceil(BANK_ALIGN) * BANK_ALIGN;
+/// # BUT NOT ONE ARENA, AND A 20B CHECKPOINT IS WHY
+///
+/// It was one, and `gptoss-20b-bf16-mxfp4-kv-bf16` is the row that proved it
+/// cannot be: its produced weights are **12.82 GiB** and an L40S states
+/// `max_buffer_size` **4 GiB**, so the single allocation was refused before a
+/// byte was written. That is not this adapter being small. WebGPU's own
+/// default is 256 MiB and its guaranteed floor for a storage BINDING is 128
+/// MiB; Vulkan's `maxStorageBufferRange` is `UINT32_MAX` on most desktop
+/// drivers, which is the same 4 GiB. **Every shader plane has this ceiling**,
+/// and one arena means no plane here can hold a model past about 2B
+/// parameters in bf16 -- which is precisely the wall the first SKU past
+/// qwen3.5-0.8b hit.
+///
+/// So the packing is unchanged and the ARENA COUNT is not: banks fill an arena
+/// until the next one would cross `cap`, then a new arena starts. A caller
+/// that can hold only one — `driver-metal`'s `serve::weights`, which binds by
+/// ADDRESS off a single allocation — checks the length and refuses by name.
+///
+/// THE PLACEMENT STILL HAS NO DECISION IN IT, which is what keeps this short:
+/// every produced tensor is dense, row-major and canonical, so one contiguous
+/// upload per bank and no restride, no repack, no cast. Nothing is reordered
+/// to pack better, because a bank's arena is its `BufferId` and plan order is
+/// what makes that reproducible.
+///
+/// # Errors
+///
+/// A single bank past `cap`, which no arrangement of arenas can hold. It names
+/// the bank and both numbers, because the fix is a smaller shard or a bigger
+/// device and the reader needs to know which.
+pub fn arenas_of(
+    produced: &[(String, model::produce::HostTensor)],
+    cap: u64,
+) -> Result<Vec<Arena>, String> {
+    let mut arenas: Vec<Arena> = Vec::new();
+    let mut open = Arena {
+        bytes: 0,
+        banks: Vec::new(),
+    };
+    for (i, (name, t)) in produced.iter().enumerate() {
+        let bytes = (t.bytes.len() as u64).div_ceil(BANK_ALIGN) * BANK_ALIGN;
+        if bytes > cap {
+            return Err(format!(
+                "`{name}` is {bytes} bytes on its own, past the {cap}-byte \
+                 ceiling one arena can be bound at",
+            ));
+        }
+        if open.bytes + bytes > cap {
+            arenas.push(core::mem::replace(
+                &mut open,
+                Arena {
+                    bytes: 0,
+                    banks: Vec::new(),
+                },
+            ));
+        }
+        open.banks.push((i, open.bytes));
+        open.bytes += bytes;
     }
-    (offsets, at.max(1))
+    // A zero-byte allocation is not one every plane will make, and a load with
+    // no banks is a plan with no params — so the last arena is kept whatever
+    // its size, at a floor of one byte, and the vector is never empty.
+    open.bytes = open.bytes.max(1);
+    arenas.push(open);
+    Ok(arenas)
 }
 
 /// The join `baker_load` proves, restated as a load-time precondition.
@@ -408,8 +470,14 @@ mod tests {
     /// it is never zero long.
     #[test]
     fn the_weight_arena_aligns_every_bank_and_is_never_empty() {
-        let (offsets, bytes) = arena_of(&[]);
-        assert!(offsets.is_empty());
-        assert_eq!(bytes, 1, "a model with no params still needs an allocation");
+        let arenas = arenas_of(&[], u64::from(u32::MAX)).expect("no banks pack");
+        let [arena] = arenas.as_slice() else {
+            panic!("a plan with no params should still want one allocation")
+        };
+        assert!(arena.banks.is_empty());
+        assert_eq!(
+            arena.bytes, 1,
+            "a model with no params still needs an allocation"
+        );
     }
 }

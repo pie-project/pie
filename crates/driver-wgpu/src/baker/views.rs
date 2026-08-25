@@ -63,7 +63,7 @@ fn plane(b: &mut Bindings, slice: Option<Slice>) -> u32 {
 fn kv(b: &mut Bindings, pools: &dyn Pools, layer: u32) -> Option<PagedKvView> {
     let keys = pools.kv(layer, false)?;
     let values = pools.kv(layer, true)?;
-    let g = pools.kv_geometry();
+    let g = pools.kv_geometry(layer);
     Some(PagedKvView {
         keys: Tensor::new(plane(b, Some(keys))),
         values: Tensor::new(plane(b, Some(values))),
@@ -122,7 +122,7 @@ pub(crate) fn attn_fire(b: &mut Bindings, pools: &dyn Pools, layer: u32) -> Opti
         request_of_token: Tensor::new(plane(b, pools.table(FireTable::RequestOfToken))),
         mask: mask(b, pools),
         split: split(b, pools),
-        kv_heads: pools.kv_geometry().kv_heads,
+        kv_heads: pools.kv_geometry(layer).kv_heads,
     })
 }
 

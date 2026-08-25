@@ -388,21 +388,55 @@ fn the_append_arm_checks_its_row_against_a_head_geometry_it_can_now_read() {
 /// A refusal that has been measured is worth as much as an answer and is worth
 /// nothing at all if it drifts, so each of these is held against the sentence
 /// it now gives. What they have in common is that none of them is a door this
-/// plane forgot to open — each names something outside the door: a table the
-/// driver does not stage, a mark the point does not declare, a permutation
-/// nothing writes, an entrypoint the shader tree does not stamp.
+/// plane forgot to open — each names something outside the door.
+///
+/// # ALL FOUR CLOSED, and this test is how each was noticed
+///
+/// It held four refusals. Walking a whole `gptoss-20b` tower on this card
+/// closed every one, a refusal at a time — the walk stops at the first
+/// statement it cannot fire, so each fix moved it to the next:
+///
+/// * **`layout.embed`** asked `Staged::bank` for a quantised table's scale and
+///   bias planes UNCONDITIONALLY, and that helper is an unconditional refusal.
+///   So the point sat in the claim table and could not fire for any row in the
+///   catalog — every one of them states a `bf16` embedding. `layout/embed.slang`
+///   is the dense gather it never had.
+/// * **`rope.yarn`** asked `Staged::stream("rope.yarn_inv_freq")` for a
+///   per-fire plane holding a precomputed ladder, which is a legacy mechanism
+///   this floor has no door for. `neox.slang`'s `PIE_YARN` arm derives the
+///   frequency from the six numbers the point already carries, as
+///   `kernels-wgpu`'s `rope/yarn.wgsl` does.
+/// * **`mlp.swiglu_clamp_alpha`** had nowhere to put a pitch, because
+///   `gptoss_swiglu_bfloat16` indexes gate, up and out by one flat id.
+///   `gated.slang` stamps a strided arm now, the way it already stamped a
+///   strided geglu and a strided silu.
+///
+/// * **`moe.weighted_sum`** folded through an inverse permutation
+///   (`inv[row * top_k + e]`) that `route_sort` writes and no point of this
+///   plane claims. The refusal was right; the ARM beside it was missing.
+///   `routed` arrives in (token, slot) order, so there is nothing to permute,
+///   and `route.slang` stamps `expert_combine` now.
+///
+/// **None of them was reachable by anything narrower than a tower.** Every
+/// other test on this plane fires one family against a reference, and a family
+/// whose body refuses before it fires simply is not measured by one.
+///
+/// The test keeps its name because the name is the JOB: the day a door refuses
+/// again, this is where the sentence it gives is held against what it means.
 #[test]
 fn the_survivors_name_what_is_missing_rather_than_what_was_not_written() {
     modules!();
     let rec = Recorder::new();
     let ctx: &kernels_vulkan::plane::Ctx<'_> = &rec;
 
-    // `rope.frequencies` is a table this driver stages; `rope.yarn_inv_freq` is
-    // not, and it is not a spelling mistake for it — one is llama-3's
-    // piecewise-in-wavelength rescale and the other is YaRN's ramp. The door
-    // works and the table is absent, which is why this refusal comes out of the
-    // driver's own name table rather than out of the plane.
-    let refused = Rope::yarn::<bf16>(
+    // CLOSED. This asked for `rope.yarn_inv_freq`, a per-fire plane holding a
+    // precomputed ladder that nothing stages, and it now derives the frequency
+    // instead — `neox.slang`'s `PIE_YARN` arm, off `base`, `factor`, the two
+    // ramp bounds and `mscale`. The assertion is the other way round now and
+    // it is the stronger one: a body that fired would satisfy `is_ok()` while
+    // stating nothing, so the FIRE is what is counted.
+    let fires_before = rec.fires.borrow().len();
+    let yarn = Rope::yarn::<bf16>(
         ctx,
         InOut {
             ptr: Handle::new(0),
@@ -429,19 +463,24 @@ fn the_survivors_name_what_is_missing_rather_than_what_was_not_written() {
         false,
     );
     assert_eq!(
-        refused,
-        Err(kernels::plane::Refusal::Unstated {
-            what: "a runtime stream this driver stages no table for",
-        }),
-        "rope.yarn refused for a reason other than the missing YaRN ladder"
+        yarn,
+        Ok(()),
+        "rope.yarn no longer has a ladder to be missing"
     );
-    assert!(rec.fires.borrow().is_empty(), "rope.yarn fired anyway");
+    assert_eq!(
+        rec.fires.borrow().len() - fires_before,
+        2,
+        "a YaRN rotation is q and k, one dispatch each; a body that fired once \
+         rotated half the head and would answer fluently",
+    );
 
-    // One address where three planes are read. The point marks this operand
-    // `Const<Tensor<T>>`, and the floor HAS a mark for a weight that crosses in
-    // planes — `Const<Bank<R>>`, which `moe.matmul_select_bias` uses — so this
-    // is a statement about `crates/kernels`, not about this plane.
-    let bank = Layout::embed::<bf16>(
+    // CLOSED. This asked `Staged::bank` for the scale and bias planes of a
+    // quantised table before it did anything else, and `Staged::bank` is an
+    // unconditional refusal — so `layout.embed` was in the claim table and
+    // could fire for nothing. Every catalog row states a `bf16` embedding and
+    // `layout/embed.slang` is the dense gather that answers them.
+    let fires_before = rec.fires.borrow().len();
+    let dense = Layout::embed::<bf16>(
         ctx,
         In {
             ptr: Handle::new(0),
@@ -452,46 +491,60 @@ fn the_survivors_name_what_is_missing_rather_than_what_was_not_written() {
         32000,
         output(2, 4, 512),
     );
-    assert!(
-        matches!(bank, Err(kernels::plane::Refusal::Unstated { what }) if what.contains("Const<Bank<R>>")),
-        "layout.embed refused for a reason other than the single-plane mark: {bank:?}"
+    assert_eq!(dense, Ok(()), "layout.embed no longer reaches for a bank");
+    assert_eq!(
+        rec.fires.borrow().len() - fires_before,
+        1,
+        "a gather is one dispatch",
     );
 
-    // A permutation nothing on this plane writes. `combine_sorted` folds
-    // through `inv[row * top_k + e]` and `route_sort` is what fills one; the
-    // claim census has no point that fires it. A scratch door would hand this
-    // body uninitialised memory and the fold would report success.
-    let inv = Moe::weighted_sum::<bf16>(
+    // CLOSED. This refused for want of the inverse permutation `combine_sorted`
+    // folds through — `inv[row * top_k + e]`, written by `route_sort`, which no
+    // point of this plane claims. The refusal was right and the ARM beside it
+    // was missing: `routed` arrives in (token, slot) order, so slot `e` of
+    // token `n` is at row `n * k + e` and there is nothing to permute.
+    // `route.slang` stamps `expert_combine` now, as `kernels-wgpu` always has.
+    let fires_before = rec.fires.borrow().len();
+    // FOUR TOKENS, TWO ROUTES EACH: `routed` is eight rows and the fold lands
+    // four, so `top_k` is two — and the weight plane is one weight PER ROUTE,
+    // which is `[4, 2]` and not `[8, 1]`. The refusal that says so is the
+    // check this arm carries in place of the permutation the sorted one binds.
+    let unsorted = Moe::weighted_sum::<bf16>(
         ctx,
         input(0, 8, 512),
         In {
             ptr: Handle::new(1),
-            rows: 8,
-            width: 1,
+            rows: 4,
+            width: 2,
         },
         output(2, 4, 512),
     );
-    assert!(
-        matches!(inv, Err(kernels::plane::Refusal::Unstated { what }) if what.contains("route_sort")),
-        "moe.weighted_sum refused for a reason other than the unwritten \
-         permutation: {inv:?}"
+    assert_eq!(
+        unsorted,
+        Ok(()),
+        "moe.weighted_sum has an arm that needs no permutation"
     );
+    assert_eq!(rec.fires.borrow().len() - fires_before, 1, "one fold");
 
-    // The window opens; the entrypoint cannot read it. `gptoss_swiglu_bfloat16`
-    // indexes gate, up and out by one flat id, so the pitch has nowhere to go —
-    // and `gated.slang` stamps no strided gpt-oss arm the way it stamps a
-    // strided geglu and a strided silu.
+    // CLOSED. The window opened and the entrypoint could not read it:
+    // `gptoss_swiglu_bfloat16` indexes gate, up and out by one flat id, so the
+    // pitch had nowhere to go. `gated.slang` stamps a strided arm now.
+    let fires_before = rec.fires.borrow().len();
     let gptoss =
         Mlp::swiglu_clamp_alpha::<bf16>(ctx, input(0, 8, 256), 128, 7.0, 1.702, output(1, 8, 128));
-    assert!(
-        matches!(gptoss, Err(kernels::plane::Refusal::Absent { what }) if what.contains("no strided gpt-oss arm")),
-        "mlp.swiglu_clamp_alpha refused for a reason other than the missing \
-         arm: {gptoss:?}"
-    );
-    // The flat arm is still what a caller with two SEPARATE halves fires, and
-    // the module is still there — the refusal is about the packed row, not
-    // about the entrypoint being absent.
+    assert_eq!(gptoss, Ok(()), "mlp.swiglu_clamp_alpha has its strided arm");
+    assert_eq!(rec.fires.borrow().len() - fires_before, 1);
+    // BOTH ARMS ARE STAMPED, and the flat one is not dead: it is what a caller
+    // with two SEPARATE halves fires. Its push block is the two floats and
+    // nothing else, which is the difference from the strided one and the
+    // reason the two cannot be one entrypoint.
     assert_eq!(declared("gptoss_swiglu_bfloat16").push_offsets, vec![0, 4]);
+    assert_eq!(
+        declared("gptoss_swiglu_strided_bfloat16").push_offsets,
+        vec![0, 4, 8, 12, 16, 20, 24],
+        "the strided arm takes three pitches and the two floats after them, \
+         which is `halves::args` order with `limit` and `alpha` appended",
+    );
 }
 
 /// A pool row and the per-fire planes an sdpa arm reads, at one KV head of 128.

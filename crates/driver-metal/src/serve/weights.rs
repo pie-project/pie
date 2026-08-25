@@ -34,7 +34,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::baker::{Bank, Slice, arena_of, join, readable_base};
+use crate::baker::{Bank, Slice, arenas_of, join, readable_base};
 use crate::device::{Allocation, Context};
 use crate::error::{Error, Result};
 use crate::layout::region::Region as _;
@@ -43,22 +43,42 @@ use model_ir::plan::Plan;
 /// The ceiling a single Metal buffer may be bound at.
 ///
 /// 4 GiB, and it is the INDIRECT COMMAND BUFFER's rather than the device's:
-/// an ICB argument table encodes a buffer's length in 32 bits. A model whose
-/// weights exceed it refuses BY NAME, because the alternative — several
-/// buffers with the arena's offsets spanning them — is a `Slice` that no
-/// single binding can address, and every claim body would be handed an
-/// address it cannot use.
+/// an ICB argument table encodes a buffer's length in 32 bits.
+///
+/// # It bounds ONE ARENA, not the model
+///
+/// It bounded the model until `gptoss-20b` asked for 12.82 GiB, and the
+/// paragraph that stood here said why the alternative was worse: "several
+/// buffers with the arena's offsets spanning them is a `Slice` that no single
+/// binding can address". That objection is about a bank STRADDLING two
+/// buffers, and it is right — a slice half in one allocation and half in the
+/// next has no address a binding can use.
+///
+/// `walk::lane::arenas_of` never straddles. It fills an arena until the next
+/// bank would cross the cap and then opens a new one, so **every bank lies
+/// wholly inside exactly one allocation** and every allocation is under the
+/// ceiling. The 32-bit length holds for each, which is the whole of what the
+/// ICB asks.
+///
+/// What several allocations cost instead is residency: each is a `Regions`
+/// span and a residency entry rather than one. That is a real cost and a
+/// bounded one — four for gpt-oss — and it is the price of the plane holding
+/// a model past two billion parameters at all.
 const BIND_CEILING: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Every weight the plan names, on the device.
 pub struct Weights {
-    /// The arena the banks are spans of, held to keep them alive.
+    /// The arenas the banks are spans of, held to keep them alive.
     ///
-    /// Underscored because nothing reads it, and that is the point: every
-    /// [`Bank`] is a region INSIDE this allocation, so dropping it frees every
-    /// weight the lane is about to fire against. It is the field's existence
-    /// that is load-bearing, not its value.
-    _owned: Allocation,
+    /// One for every model this plane held until `gptoss-20b`, and as many as
+    /// [`BIND_CEILING`] needs since. Every [`Bank`] is a region inside exactly
+    /// one of them, so dropping the vector frees every weight the lane is
+    /// about to fire against.
+    ///
+    /// Read, unlike the single field it replaces: [`Weights::arenas`] hands
+    /// them to `Regions` so a recorded command can name the buffer an address
+    /// is in, and that was one call when there was one arena.
+    owned: Vec<Allocation>,
     /// Every param the plan named, by the name the plan names it.
     pub banks: BTreeMap<String, Bank>,
 }
@@ -111,64 +131,67 @@ impl Weights {
         let produced = model::produce::produce(&import, &plan.params, rank, &|n| snap.read(n))
             .map_err(|e| unserved(format!("production refused: {e}")))?;
 
-        let (offsets, bytes) = arena_of(&produced);
-        if bytes > BIND_CEILING {
-            return Err(unserved(format!(
-                "`{sku}`'s weights are {:.2} GiB, past the {:.0} GiB a single Metal \
-                 buffer can be bound at. Splitting the arena would give every `Const` \
-                 slot an address no one binding can reach.",
-                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                BIND_CEILING as f64 / (1024.0 * 1024.0 * 1024.0),
-            )));
-        }
-        let owned = Allocation::new(context, bytes, "the baker weight arena")?;
-        let base_address = owned.gpu_address();
-
+        // AS MANY ARENAS AS THE ICB'S CEILING NEEDS — see [`BIND_CEILING`] for
+        // why several is sound where a single oversized one is not. One for
+        // every SKU this plane held before `gptoss-20b`, four for that.
+        let arenas = arenas_of(&produced, BIND_CEILING).map_err(unserved)?;
+        let mut owned = Vec::with_capacity(arenas.len());
         let mut banks = BTreeMap::new();
-        for ((name, t), offset) in produced.iter().zip(offsets) {
-            // SHARED STORAGE, SO THE UPLOAD IS THE WRITE. `Region::write`
-            // bounds the span against the allocation's own length before the
-            // first byte, which is what makes `arena_of`'s arithmetic
-            // auditable rather than trusted.
-            //
-            // SAFETY: `t.bytes` is a live host slice that cannot overlap the
-            // device allocation, which was created for this load.
-            unsafe { owned.write(offset, &t.bytes) }?;
-            banks.insert(
-                name.clone(),
-                Bank {
-                    slice: Slice {
-                        address: base_address + offset,
-                        bytes: t.bytes.len() as u64,
+        for arena in &arenas {
+            let held = Allocation::new(context, arena.bytes, "a baker weight arena")?;
+            let base_address = held.gpu_address();
+            owned.push(held);
+            let held = owned.last().expect("just pushed");
+            for &(i, offset) in &arena.banks {
+                let (name, t) = &produced[i];
+                // SHARED STORAGE, SO THE UPLOAD IS THE WRITE. `Region::write`
+                // bounds the span against the allocation's own length before
+                // the first byte, which is what makes `arenas_of`'s arithmetic
+                // auditable rather than trusted.
+                //
+                // SAFETY: `t.bytes` is a live host slice that cannot overlap
+                // the device allocation, which was created for this load.
+                unsafe { held.write(offset, &t.bytes) }?;
+                banks.insert(
+                    name.clone(),
+                    Bank {
+                        // THE ARENA'S OWN BASE, which is the whole of what
+                        // several allocations changes down here: a bank in the
+                        // fourth arena is an address like one in the first and
+                        // no claim body can tell.
+                        slice: Slice {
+                            address: base_address + offset,
+                            bytes: t.bytes.len() as u64,
+                        },
+                        shape: t.shape.clone(),
+                        dtype: t.dtype,
+                        // The demand side's own column, carried across by
+                        // name. A produced row the plan binds no param for
+                        // keeps an empty repr, which is a refusal at a bank
+                        // slot — and no statement can name it anyway.
+                        repr: plan
+                            .params
+                            .iter()
+                            .find(|p| p.name == *name)
+                            .map_or_else(String::new, |p| p.repr.clone()),
                     },
-                    shape: t.shape.clone(),
-                    dtype: t.dtype,
-                    // The demand side's own column, carried across by name. A
-                    // produced row the plan binds no param for keeps an empty
-                    // repr, which is a refusal at a bank slot — and no
-                    // statement can name it anyway.
-                    repr: plan
-                        .params
-                        .iter()
-                        .find(|p| p.name == *name)
-                        .map_or_else(String::new, |p| p.repr.clone()),
-                },
-            );
+                );
+            }
         }
         drop(produced);
         // The join `baker_load` proves, restated as a precondition: a missing
         // bank would be a zero-length binding at a `Const` slot and a shader
         // reading nothing, which is the worst place to find out.
         join(plan, &banks).map_err(unserved)?;
-        Ok(Self {
-            _owned: owned,
-            banks,
-        })
+        Ok(Self { owned, banks })
     }
 
-    /// The arena, so a recorded fire can name the buffer an address is in.
-    #[must_use]
-    pub const fn arena(&self) -> &crate::device::Handle {
-        self._owned.handle()
+    /// The arenas, so a recorded fire can name the buffer an address is in.
+    ///
+    /// One call per allocation at the caller, because `Regions::add` takes one
+    /// handle and the number of them is a fact about the model rather than
+    /// about this driver.
+    pub fn arenas(&self) -> impl Iterator<Item = &crate::device::Handle> {
+        self.owned.iter().map(Allocation::handle)
     }
 }

@@ -1,7 +1,7 @@
 use kernels::BindMut;
 
 use crate::plane::{Bind, Const, Ctx, Fire, In, InOut, Out};
-use crate::points::{Payload, absent, at_bf16};
+use crate::points::{Payload, at_bf16};
 use crate::views::{AttnFire, AttnFireView};
 use kernels::plane::{Cache, Refusal};
 use kernels::raises::Struct;
@@ -327,7 +327,6 @@ impl kernels::points::Attention for Ctx<'_> {
                     run[13],
                     run[14],
                     window.arg(),
-                    absent(self)?,
                 ],
             );
         };
@@ -353,7 +352,6 @@ impl kernels::points::Attention for Ctx<'_> {
                 run[0],
                 run[1],
                 run[2],
-                absent(self)?,
                 run[4],
                 run[5],
                 run[6],
@@ -366,7 +364,6 @@ impl kernels::points::Attention for Ctx<'_> {
                 run[13],
                 run[14],
                 window.arg(),
-                absent(self)?,
                 scratch.arg_mut(),
                 splits.arg(),
             ],
@@ -384,23 +381,13 @@ impl kernels::points::Attention for Ctx<'_> {
             )
             .apply(paged_merge_grid(head_dim, q_heads, rows)?),
             &[
-                absent(self)?,
-                absent(self)?,
-                absent(self)?,
                 o.arg(),
                 gqa(q_heads, kv_heads).arg(),
-                absent(self)?,
-                absent(self)?,
-                absent(self)?,
-                absent(self)?,
                 view.kv.page_size.arg(),
                 kv_heads.arg(),
                 sm_scale.arg(),
-                absent(self)?,
                 view.mask.stride.arg(),
-                absent(self)?,
                 window.arg(),
-                absent(self)?,
                 scratch.arg_mut(),
                 splits.arg(),
             ],
@@ -450,14 +437,6 @@ impl kernels::points::Attention for Ctx<'_> {
             kv_heads,
             sm_scale,
         );
-        // NO `absent` FOR THE SINK SLOT, which every arm beside this one
-        // passes. A `_lse` variant reaches no sink, so `attn/sdpa_paged.wgsl`'s
-        // binding 10 is declared and unread — and on this plane an unread
-        // binding is not in the bind group layout at all (`reflect::of_module`
-        // derives the layout from what the entry point REACHES). The buffer run
-        // is therefore the ten this body reads plus the plane it writes, and
-        // the lse takes the place in the run that the absent buffer holds next
-        // door rather than a place after it.
         self.fire(
             Fire::at(
                 "attn/sdpa_paged.wgsl",
@@ -734,7 +713,6 @@ fn tiled<T: kernels::points::Scalar>(
             run[13],
             run[14],
             window.arg(),
-            absent(ctx)?,
             rows.arg(),
         ],
     )
@@ -783,7 +761,6 @@ pub fn mma<T: kernels::points::Scalar>(
             run[13],
             run[14],
             window.arg(),
-            absent(ctx)?,
             rows.arg(),
         ],
     )

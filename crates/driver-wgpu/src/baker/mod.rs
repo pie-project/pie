@@ -54,19 +54,28 @@
 //! states, and two entry points read it — a staged 32x32x32 tile for
 //! `M >= 32` and a K-split vector arm below it.
 //!
-//! No catalog row's lane binds YET, and the reason has moved: `gemm.matmul`,
-//! `layout.embed`, `layout.select` and `layout.split_rows` no longer appear in
-//! any lane's refusal list, and what does is each SKU's own family —
-//! `mlp.geglu_tanh_packed` and `norm.mul_scalar` for gemma, `moe.*` and
-//! `rope.yarn` for gpt-oss, `ssm.*` for qwen3.5. The catalog walk at the foot
-//! of this file is still the measurement and still reports none binding;
-//! [`crate::walk::resolve::check`] is what turns a gap into a load-time
-//! sentence naming the point and the first statement that asked.
+//! *"No catalog row's lane binds YET"* STOOD HERE, under a list of the
+//! families each SKU was still short of — `mlp.geglu_tanh_packed` and
+//! `norm.mul_scalar` for gemma, `moe.*` and `rope.yarn` for gpt-oss, `ssm.*`
+//! for qwen3.5. All three waves landed. **Seven rows bind**, which is the list
+//! `BOUND` names at the foot of this file and the catalog walk beside it is
+//! still the measurement of; [`crate::walk::resolve::check`] is what turns a
+//! remaining gap into a load-time sentence naming the point and the first
+//! statement that asked.
 //!
 //! What is CHECKED rather than asserted: the walk is mutation-checked with no
 //! adapter (`tests/the_walk_is_the_program.rs`), and `norm.rmsnorm` is driven
 //! through this whole path onto a real adapter and compared against a host
 //! reference (`tests/device_fire.rs`).
+//!
+//! AND THE WHOLE CHAIN IS, WHICH IT WAS NOT. `tests/banked_argmax.rs` takes
+//! `qwen35-d0.8b-bf16-kv-bf16` from its cached checkpoint through
+//! `model::produce`, an upload, real pools, this walk and 387 dispatches onto
+//! an L40S, and the token that comes back is **198 at 12.3125** -- which is
+//! what `driver-cuda/tests/banked_argmaxes.rs` banked off a CUDA card through a
+//! different set of kernels. The only thing the two planes share is the model
+//! TEXT, which is what makes the match a claim about this executor rather than
+//! about a fixture.
 //!
 //! # ONE CATALOG (R3), and this driver joins it at P5b
 //!
@@ -93,7 +102,9 @@ pub mod stage;
 pub mod views;
 
 pub use crate::walk::frame;
-pub use crate::walk::{BANK_ALIGN, Baked, READABLE_BASE, arena_of, join, readable_base, word_of};
+pub use crate::walk::{
+    Arena, BANK_ALIGN, Baked, READABLE_BASE, arenas_of, join, readable_base, word_of,
+};
 pub use marks::{Bindings, Bound as BoundRegion, BufferId, NOTHING, Rect, Slice};
 pub use plane::Wgpu;
 pub use stage::{FireTable, KvGeometry, Pools, Slab, Splits};
@@ -294,8 +305,13 @@ mod tests {
     /// for both: "one that says which lanes bind and fires them". This is the
     /// first half. A lane that binds has an answer for every point it states;
     /// whether the whole tower computes the right tokens is what
-    /// `scripts/banked-argmaxes.sh` asks of cuda, and no shader plane can be
-    /// asked it yet.
+    /// `scripts/banked-argmaxes.sh` asks.
+    ///
+    /// IT ASKS THIS PLANE NOW. `tests/banked_argmax.rs` fires the decode lane of
+    /// `qwen35-d0.8b-bf16-kv-bf16` end to end and gets the token cuda banked, so
+    /// one of the seven rows below has been served as well as bound. The other
+    /// six are still the first half only, and that gap is what this list is
+    /// for.
     #[test]
     fn every_catalog_row_traces_for_this_plane_and_the_bound_ones_are_named() {
         let mut bound_rows = Vec::new();

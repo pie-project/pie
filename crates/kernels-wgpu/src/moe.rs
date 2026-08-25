@@ -1,5 +1,5 @@
 use crate::plane::{Bind, Const, Ctx, Fire, In, Out};
-use crate::points::{Bank, Payload, absent, at_bf16};
+use crate::points::{Bank, Payload, at_bf16};
 use kernels::plane::Refusal;
 use kernels::points::{Form, Repr, Scalar};
 
@@ -315,7 +315,6 @@ impl kernels::points::Moe for Ctx<'_> {
                     &[
                         planes.codes.arg(),
                         planes.scales.arg(),
-                        absent(self)?,
                         x.arg(),
                         y.arg(),
                         bias.get().arg(),

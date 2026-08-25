@@ -29,14 +29,17 @@
 //! Because it is the shortest claimed point that is not trivial: it reduces
 //! across a row, which means the workgroup barrier and the lane split are
 //! exercised, and it reads a `Const` bank, which means the weight arena is too.
-//! And because ONE point is what this plane can honestly demonstrate — no
-//! catalog row's lane binds here (see `baker::mod`'s own tests for the
-//! measurement), so an end-to-end decode is not available to fire and will not
-//! be until a dense matmul exists on this plane.
+//! It was also, when this file landed, the largest true statement available:
+//! no catalog row's lane bound on this plane, so an end-to-end decode was not
+//! available to fire and would not be until a dense matmul existed here.
 //!
-//! A single kernel fired correctly through the whole baker path is the largest
-//! true statement available today, and it is a real one: it is the first time
-//! any shader plane has computed a number through the points path.
+//! **BOTH OF THOSE ARE NOW HISTORY AND THIS FILE IS NOT.** Seven rows bind and
+//! `tests/banked_argmax.rs` fires one of them whole — 387 dispatches from a
+//! cached checkpoint to the token cuda banked. What that test cannot do is what
+//! this one does: hold ONE point against a reference computed on the host in
+//! `f64` from the same bf16 inputs. An argmax says the tower agrees with
+//! another plane's tower; this says a kernel agrees with arithmetic, and when
+//! the first one goes red the second is where a bisection starts.
 
 #![cfg(feature = "native")]
 
@@ -172,7 +175,10 @@ impl Pools for NoPools {
     fn slab(&self, _layer: u32, _which: Slab) -> Option<Slice> {
         None
     }
-    fn kv_geometry(&self) -> KvGeometry {
+    // ONE SHAPE FOR EVERY LAYER. This fixture stages a single pool, so the
+    // layer changes nothing; the argument exists for a tower that attends at
+    // two widths, which `driver-wgpu/tests/banked_argmax.rs` names.
+    fn kv_geometry(&self, _layer: u32) -> KvGeometry {
         KvGeometry::default()
     }
     fn table(&self, _which: FireTable) -> Option<Slice> {
@@ -366,6 +372,7 @@ fn norm_rmsnorm_fires_through_the_baker_path_and_matches_a_host_reference() {
             buffers: &bound,
             uniform: &uniform,
             groups,
+            staged: &[],
         }])
         .unwrap_or_else(|(stage, why)| panic!("the dispatch failed at {stage:?}: {why}"));
 

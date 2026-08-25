@@ -190,7 +190,13 @@ impl Shell {
         // invalid — stated rather than left to the fingerprint.
         self.recordings.clear();
         self.regions = crate::device::Regions::new();
-        self.regions.add(weights.arena());
+        // ONE SPAN PER ARENA. It was one call because there was one
+        // allocation; `Weights` holds as many as the ICB's 4 GiB ceiling
+        // needs now, and a recorded command resolves an address through
+        // whichever span contains it.
+        for arena in weights.arenas() {
+            self.regions.add(arena);
+        }
 
         // ── 4. THE POOLS, sized from the deployment. ──────────────────────
         //

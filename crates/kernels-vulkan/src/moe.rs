@@ -201,15 +201,47 @@ impl kernels::points::Moe for Ctx<'_> {
                 at: i64::from(src.rows),
             });
         }
-        let _ = weights;
-        Err(Refusal::Unstated {
-            what: "the inverse permutation `combine_sorted` folds through: it \
-                   reads `inv[row * top_k + e]` and `route_sort` is what writes \
-                   one, which no point of this plane claims — so the slab is \
-                   not a slab this fire has forgotten to size, it is a table \
-                   nothing on this plane fills, and `route.slang` stamps no \
-                   unsorted combine to fold without it",
-        })
+        // IT STAMPS ONE NOW. This refused for want of the inverse permutation
+        // `combine_sorted` folds through — `inv[row * top_k + e]`, written by
+        // `route_sort`, which no point of this plane claims. That refusal was
+        // right and the arm beside it was missing: `routed` arrives in (token,
+        // slot) order, so slot `e` of token `n` is at row `n * k + e` and
+        // there is nothing to permute. `route.slang`'s `PIE_EXPERT_COMBINE` is
+        // that fold, and `kernels-wgpu` has had its twin all along.
+        let top_k = src.rows / out.rows;
+        if top_k <= 0 {
+            return Err(Refusal::Empty {
+                what: "the routed fanout",
+            });
+        }
+        if src.width != out.width {
+            return Err(Refusal::Narrow {
+                what: "the routed row's width, which the fold does not change",
+                at: i64::from(src.width),
+            });
+        }
+        let w = weights.all("the router's weight plane")?;
+        if w.rows != out.rows || w.width != top_k {
+            return Err(Refusal::Narrow {
+                what: "the weight plane, which is one weight per route",
+                at: i64::from(w.width),
+            });
+        }
+        self.fire(
+            Fire::at(
+                crate::plane::module_path("expert_combine", self.best()),
+                "expert_combine",
+            )
+            .apply(elementwise_rows(out.width, out.rows)?),
+            &[
+                routed.arg(),
+                weights.arg(),
+                y.arg(),
+                out.width.arg(),
+                out.rows.arg(),
+                top_k.arg(),
+            ],
+        )
     }
 
     fn sigmoid_gate_add<T: kernels::points::Scalar>(

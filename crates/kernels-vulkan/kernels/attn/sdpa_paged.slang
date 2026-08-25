@@ -47,6 +47,27 @@ PIE_BUFFER_RW(3, out_);
 [[vk::binding(8)]] StructuredBuffer<uint8_t> attention_mask;
 [[vk::binding(9)]] StructuredBuffer<uint8_t> attention_mask_enabled;
 PIE_BUFFER_RO(10, sinks);
+#if defined(PIE_LSE)
+// THE PUBLISHED DENOMINATOR, and the one buffer in this header that is neither
+// the model's nor the pool's: it is accumulator state that the point promotes
+// to an operand, which is why it is `float` and not `PIE_ACT`. An lse is
+// produced and consumed inside one fire; rounding it to bfloat16 would throw
+// away the precision `attention.sink`'s sigmoid argument is then asked for.
+//
+// AN `_lse` ARM READS TEN OF THE ELEVEN IT INHERITS, and the hole is `sinks` at
+// binding 10 -- an `_lse` reading reaches no sink, so nothing in this variant
+// touches that declaration and `slangc` drops it. The descriptor set carries a
+// hole there, which is the same shape `sdpa_paged_decode_split` has at `out_`
+// and the sinkless `_combine` modules have at `sinks`, and it is what
+// `Declared::holes` is for. Two holes is what `tests/rules.rs` counts for the
+// two stamps below.
+//
+// Binding 11 is `partials`' number under `PIE_SPLIT`. The two are never
+// compiled together and could not be: a split holds only its own slice's
+// denominator, and the one this point states exists after the fold. See the
+// claim body, which takes the unsplit arm on purpose.
+[[vk::binding(11)]] RWStructuredBuffer<float> lse_out;
+#endif
 #if defined(PIE_SPLIT)
 // Where a split leaves its `(sum over its keys of exp(s - max) * v)`, its
 // `max` and its `sum_exp`. `out_` at binding 3 is declared above and never
@@ -236,6 +257,24 @@ void tiled_tile(uint q_head, uint n_q_heads, uint3 group, uint3 local, uint grou
         GroupMemoryBarrierWithGroupSync();
     }
 
+#if defined(PIE_LSE)
+    // ONE writer per `(row, query head)`, and it can be any of the 32 x lanes:
+    // every one of them ran `sdpa_online_update` on the same `score` -- the
+    // tree fold above publishes it at `pie_sdpa_part[slot_y][0]` and all 32
+    // read it -- so they all hold the same `(max_score, sum_exp)`. `lane == 0`
+    // picks one, and `live` is the same guard the writeout below takes: a row
+    // past `pc.n_rows` belongs to the tile's padding and has no lse slot.
+    //
+    // ABOVE the `PIE_WITH_SINK` arm and not below it. The two are never
+    // compiled together, but the ORDER is the statement:
+    // `attention.prefill_lse` publishes the log-sum-exp of the softmax it
+    // normalised by, and `attention.sink` is the separate statement that
+    // extends that denominator afterwards. A sink folded in first would publish
+    // a denominator no downstream `sigmoid(lse - sink)` could undo.
+    if (live && lane == 0u) {
+        lse_out[row * n_q_heads + q_head] = sdpa_lse_base2(max_score, sum_exp);
+    }
+#endif
 #if defined(PIE_WITH_SINK)
     float orescale = sdpa_merge_sink(PIE_LOAD(sinks[q_head]), max_score, sum_exp);
     for (uint i = 0u; i < PIE_D_PER_LANE; i++) out_acc[i] *= orescale;
@@ -401,6 +440,16 @@ void decode_one(uint row, uint q_head, uint d, uint n_q_heads) {
         out_acc += pie_sdpa_acc[s][d] * w;
     }
 
+#if defined(PIE_LSE)
+    // The decode twin of the tiled arm's block, and the redundancy it rests on
+    // is the same one the merge above already rests on: every invocation of
+    // this workgroup walked the whole `subgroups` fold and therefore holds the
+    // same `(merged_max, merged_sum)` -- only `out_acc` is per-`d`. `d == 0`
+    // picks one. See the tiled twin for why this stands above the sink fold.
+    if (d == 0u) {
+        lse_out[row * n_q_heads + q_head] = sdpa_lse_base2(merged_max, merged_sum);
+    }
+#endif
 #if defined(PIE_WITH_SINK)
     float orescale = sdpa_merge_sink(PIE_LOAD(sinks[q_head]), merged_max, merged_sum);
     out_acc *= orescale;
@@ -600,6 +649,19 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint group_i
 // pie:instantiate sdpa_paged_decode_bfloat16_d_128_p32 PIE_HEAD_DIM=128 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1
 // pie:instantiate sdpa_paged_decode_bfloat16_d_64_p32_sg8 PIE_HEAD_DIM=64 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1 PIE_SHORT_GROUP=8
 // pie:instantiate sdpa_paged_decode_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_WITH_SINK=1
+// THE PUBLISHED DENOMINATOR, at gpt-oss's width and no other.
+//
+// `attention.decode_lse` is stated by one family on this plane and its heads
+// are 64 wide, so one stamp is what the tree carries; `head_point` refuses
+// every other width BY NAME at the fire, which is a better answer than three
+// more pipelines nothing states. Add one the day a model states one.
+//
+// A SEPARATE ENTRY POINT AND NOT AN ARGUMENT THE UNSPLIT ARM LEARNS TO IGNORE:
+// a variant's buffer list IS its binding contract here -- `Declared` reads the
+// compiled module's `OpDecorate Binding` set, and `encode::fire` holds a
+// launch's operand run against it -- so a twelfth operand is a new entry point
+// by construction.
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1
 // The flash-decode pair. One split module serves the sink and non-sink forms
 // both, because the sink is merged in the fold and not per split.
 // pie:instantiate sdpa_paged_decode_split_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1
@@ -616,4 +678,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint group_i
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_WITH_SINK=1
+// `attention.prefill_lse`, at the one width that states it. See the decode
+// twin above for why there is one stamp and not four.
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1
 // pie:instantiate sdpa_paged_tiled_strided_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_STRIDED=1

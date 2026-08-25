@@ -258,6 +258,14 @@ pub struct Fired {
     /// is [`Self::dispatches`], and the difference between the two numbers is
     /// the only externally visible sign of which path ran.
     pub submissions: usize,
+    /// How many `InOut` operands were copied into their result rectangle
+    /// before the dispatch that reads them.
+    ///
+    /// Reported because it is the number that was ZERO for the life of this
+    /// driver without anything saying so: the walk recorded these and nothing
+    /// consumed them. A caller that knows how many its plan states can now
+    /// assert the device half moved the same count.
+    pub staged: usize,
     /// How many rectangles put their scalars in a storage block.
     ///
     /// Reported for the same reason as the other two: it is the number this
@@ -554,10 +562,11 @@ pub fn run<M: Modules>(
     modules: &M,
     buffers: &[&crate::device::Buffer],
     dispatches: &[crate::baker::dispatch::Dispatch],
+    blits: &[crate::baker::walk::Blit],
     tier: Capability,
 ) -> Result<Fired, Unfired> {
     use crate::binding::{Params, params_from};
-    use crate::device::Bound;
+    use crate::device::{Bound, Staged};
 
     let align = device.min_storage_offset().max(1);
 
@@ -692,6 +701,47 @@ pub fn run<M: Modules>(
         )
     };
 
+    // ── the `InOut` copies ────────────────────────────────────────────
+    //
+    // Filed against the FIRST dispatch of the statement that asked. A body may
+    // state more than one launch -- `rope.full` is two -- and the operand's
+    // bytes have to be in place before the first of them writes through the
+    // handle, not before the last.
+    //
+    // NOTHING CONSUMED THESE BEFORE. The walk has recorded them since it was
+    // written (`walk::fire::Fire::inout`) and this driver dropped them on the
+    // floor, which is not a refusal anywhere: an `InOut` statement whose
+    // result got its own slot would have read whatever that slot held. A
+    // `gptoss-20b` decode states 240 of them.
+    let mut staged: Vec<Vec<Staged<'_>>> = vec![Vec::new(); dispatches.len()];
+    for blit in blits {
+        let at = dispatches
+            .iter()
+            .position(|d| d.op == blit.op)
+            .ok_or_else(|| Unfired::Unbound {
+                at: blit.op as usize,
+                symbol: "an in-place copy for a statement that planned no dispatch".to_owned(),
+                buffer: blit.from.buffer.0 as usize,
+            })?;
+        let held = |slice: crate::baker::Slice| {
+            buffers
+                .get(slice.buffer.0 as usize)
+                .copied()
+                .ok_or_else(|| Unfired::Unbound {
+                    at,
+                    symbol: dispatches[at].symbol.to_owned(),
+                    buffer: slice.buffer.0 as usize,
+                })
+        };
+        staged[at].push(Staged {
+            from: held(blit.from)?,
+            at: blit.from.at,
+            into: held(blit.to)?,
+            to: blit.to.at,
+            bytes: blit.bytes,
+        });
+    }
+
     let fired = submit(
         device,
         pipelines,
@@ -707,6 +757,7 @@ pub fn run<M: Modules>(
         align,
         tier,
         blocks,
+        &staged,
     );
     if let Some(b) = held {
         // AFTER the submission and not after the recording: `run_all` waits on
@@ -753,6 +804,9 @@ fn submit<'b, M: Modules>(
     align: u64,
     tier: Capability,
     blocks: usize,
+    // The `InOut` copies, already resolved to buffers and filed against the
+    // dispatch that needs them. Parallel to `dispatches`.
+    staged: &[Vec<crate::device::Staged<'b>>],
 ) -> Result<Fired, Unfired> {
     use crate::binding::Params;
     use crate::device::{Bound, Recorded};
@@ -861,6 +915,7 @@ fn submit<'b, M: Modules>(
                 Params::Block { .. } | Params::None => &[],
             },
             groups: grids[at],
+            staged: &staged[at],
         });
     }
     drop(recording);
@@ -884,6 +939,7 @@ fn submit<'b, M: Modules>(
     Ok(Fired {
         dispatches: run.len(),
         submissions: 1,
+        staged: staged.iter().map(Vec::len).sum(),
         blocks,
         parsed: dispatches
             .iter()

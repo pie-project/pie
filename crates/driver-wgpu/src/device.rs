@@ -1380,6 +1380,123 @@ pub struct Recorded<'a, 'b> {
     pub uniform: &'a [u8],
     /// Workgroups in each dimension.
     pub groups: [u32; 3],
+    /// Bytes to move into place BEFORE this dispatch runs.
+    ///
+    /// Ordinarily empty. What fills it is
+    /// [`crate::baker::walk::Blit`](crate::walk::fire::Blit): the walk mints a
+    /// fresh rectangle for every result, including the results of points whose
+    /// declaration marks an operand `InOut` — `norm.residual_add`,
+    /// `rope.partial`, `gate.sigmoid_mul` — so the operand's bytes have to be
+    /// in the result's region before the kernel writes through the handle it
+    /// was handed. Cuda issues a `cudaMemcpyAsync` on the spot and metal stages
+    /// a host `memcpy`; a `wgpu::Buffer` is not host-mapped mid-frame, so the
+    /// copy is encoded here, in walk order, ahead of the dispatch that asked.
+    ///
+    /// It rides on the DISPATCH rather than arriving as a parallel list because
+    /// the ordering is the only thing about it that can be got wrong, and a
+    /// field on the thing it precedes is a shape in which it cannot be.
+    pub staged: &'a [Staged<'b>],
+}
+
+/// One device-to-device copy a [`Recorded`] needs made before it runs.
+///
+/// Both ends are ranges of real allocations and the copy is `wgpu`'s own
+/// `copy_buffer_to_buffer`, so both offsets and the length must be whole
+/// [`wgpu::COPY_BUFFER_ALIGNMENT`] units — refused rather than rounded, for
+/// [`Unaddressable::Unaligned`](crate::binding::Unaddressable)'s reason: a
+/// rounded copy moves the right number of bytes to the wrong element.
+#[derive(Clone, Copy)]
+pub struct Staged<'a> {
+    /// Where the bytes are.
+    pub from: &'a Buffer,
+    /// And where in it.
+    pub at: u64,
+    /// Where they go.
+    pub into: &'a Buffer,
+    /// And where in that.
+    pub to: u64,
+    /// How many.
+    pub bytes: u64,
+}
+
+/// Encode a dispatch's staged copies into the open encoder.
+///
+/// A free function because all three recording paths in
+/// [`Device::run_all_reading`] want the identical lines and the one that got
+/// them subtly different — an encoder per copy — is on record as having cost a
+/// real decode 735 command buffers.
+///
+/// # ONE BUFFER TO ITSELF IS TWO COPIES, and WebGPU leaves no third option
+///
+/// **`copy_buffer_to_buffer` refuses a source and a destination in the same
+/// allocation**, however far apart the ranges are — the same per-allocation
+/// tracking that makes [`Failed::Aliased`] a rule rather than a preference, and
+/// `wgpu` says it in those words: *"Source and destination cannot be the same
+/// buffer"*. Every staged copy a real plan asks for is arena-to-arena, because
+/// an `InOut` operand and its result are two rectangles of ONE activation
+/// arena, so this is the ordinary case and not the corner.
+///
+/// So it goes through `scratch`, which is exactly what [`Device::shuffle`] does
+/// with a page move and for the same reason. The ordering is safe for the
+/// reason that method states: commands in one command buffer execute in order
+/// and `wgpu` puts a barrier between two uses of one buffer, so a second copy's
+/// `src -> scratch` cannot overtake the first's `scratch -> dst`.
+///
+/// The copies are DISJOINT by construction — `walk::fire`'s own note says so:
+/// the walk's spans are inclusive at the step that runs, so an operand read at
+/// step `s` and a result written at step `s` are live together and can never be
+/// given the same bytes. The round trip is therefore a rule of the API rather
+/// than a rule of the data.
+fn stage(work: &mut wgpu::CommandEncoder, staged: &[Staged<'_>], scratch: Option<&wgpu::Buffer>) {
+    for copy in staged {
+        if copy.from == copy.into {
+            let Some(scratch) = scratch else {
+                continue;
+            };
+            work.copy_buffer_to_buffer(&copy.from.inner, copy.at, scratch, 0, Some(copy.bytes));
+            work.copy_buffer_to_buffer(scratch, 0, &copy.into.inner, copy.to, Some(copy.bytes));
+            continue;
+        }
+        work.copy_buffer_to_buffer(
+            &copy.from.inner,
+            copy.at,
+            &copy.into.inner,
+            copy.to,
+            Some(copy.bytes),
+        );
+    }
+}
+
+/// Whether a staged copy is one `copy_buffer_to_buffer` will take.
+///
+/// Checked with the rest of a run's checks, so a refusal has submitted nothing
+/// — which matters more here than for a binding, because a copy that landed
+/// four bytes out would be a plausible number rather than an error.
+fn staged_is_encodable(copy: &Staged<'_>) -> Result<(), Failed> {
+    let align = wgpu::COPY_BUFFER_ALIGNMENT;
+    for at in [copy.at, copy.to, copy.bytes] {
+        if !at.is_multiple_of(align) {
+            return Err(Failed::Wgpu(format!(
+                "a staged copy of {} bytes from {} to {} is not a whole \
+                 {align}-byte unit",
+                copy.bytes, copy.at, copy.to,
+            )));
+        }
+    }
+    if copy.bytes == 0 {
+        return Err(Failed::Wgpu("a staged copy of no bytes".into()));
+    }
+    for (end, size, which) in [
+        (copy.at.saturating_add(copy.bytes), copy.from.size, "source"),
+        (copy.to.saturating_add(copy.bytes), copy.into.size, "target"),
+    ] {
+        if end > size {
+            return Err(Failed::Wgpu(format!(
+                "a staged copy's {which} ends at {end}, past a buffer of {size}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One read-only range copied out of a buffer this dispatch also writes.
@@ -2624,6 +2741,7 @@ impl Device {
             buffers,
             uniform,
             groups,
+            staged: &[],
         }])
         .map(|_| ())
         .map_err(|(_, why)| why)
@@ -2706,6 +2824,9 @@ impl Device {
         for (at, one) in run.iter().enumerate() {
             self.check_bindable(one)
                 .map_err(|e| (Stage::Launch(at), e))?;
+            for copy in one.staged {
+                staged_is_encodable(copy).map_err(|e| (Stage::Launch(at), e))?;
+            }
         }
         // The scratch copies each dispatch needs, and the ranges it will bind in
         // place of its own. Taken before any bind group is made, because a bind
@@ -2720,6 +2841,26 @@ impl Device {
                 .collect()
         });
         let copies: usize = shadows.iter().map(|s| s.len()).sum();
+        let moved: usize = run.iter().map(|one| one.staged.len()).sum();
+        // ONE SCRATCH FOR EVERY SAME-BUFFER COPY IN THE RUN, sized to the
+        // largest of them and allocated only when there is one. See [`stage`]
+        // for why a buffer cannot be copied to itself and why sharing the
+        // scratch across a run is ordered rather than racy.
+        let widest = run
+            .iter()
+            .flat_map(|one| one.staged)
+            .filter(|copy| copy.from == copy.into)
+            .map(|copy| copy.bytes)
+            .max();
+        let scratch = widest.map(|bytes| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fire/staged"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let scratch = scratch.as_ref();
 
         // Then every bind group, so that recording holds only references.
         // `create_bind_group` is where `wgpu` compares the entries against the
@@ -2737,6 +2878,7 @@ impl Device {
         if probe::per_launch() {
             for (at, one) in run.iter().enumerate() {
                 let mut work = encoder("fire/one");
+                stage(&mut work, one.staged, scratch);
                 for copy in &shadows[at] {
                     work.copy_buffer_to_buffer(
                         &copy.from.inner,
@@ -2774,6 +2916,7 @@ impl Device {
             return Ok((
                 Ran {
                     shadowed: copies,
+                    staged: moved,
                     buffers: run.len(),
                 },
                 Vec::new(),
@@ -2929,6 +3072,7 @@ impl Device {
         let mut work = encoder("fire");
         if let Some((set, into, back, bytes)) = &stamps {
             for (index, one) in run.iter().enumerate() {
+                stage(&mut work, one.staged, scratch);
                 for copy in &shadows[index] {
                     work.copy_buffer_to_buffer(
                         &copy.from.inner,
@@ -2979,6 +3123,13 @@ impl Device {
             at = run.len();
         }
         while at < run.len() {
+            // THE STAGED COPIES FIRST, THEN THE SHADOWS, and the order is the
+            // one the two mean: a staged copy puts an `InOut` operand's bytes
+            // into the result rectangle the kernel will write through, and a
+            // shadow takes a snapshot of what the kernel READS. Shadowing
+            // before staging would snapshot the rectangle as it stood before
+            // the operand landed in it.
+            stage(&mut work, run[at].staged, scratch);
             if !shadows[at].is_empty() {
                 for one in &shadows[at] {
                     work.copy_buffer_to_buffer(
@@ -3015,8 +3166,10 @@ impl Device {
                     }
                     at += 1;
                     // The pass runs until the next dispatch that needs a copy,
-                    // which cannot be encoded inside one.
-                    if at >= run.len() || !shadows[at].is_empty() {
+                    // which cannot be encoded inside one. Either kind counts:
+                    // a staged `InOut` operand is as unencodable inside a pass
+                    // as a shadow is.
+                    if at >= run.len() || !shadows[at].is_empty() || !run[at].staged.is_empty() {
                         break;
                     }
                 }
@@ -3135,6 +3288,7 @@ impl Device {
         Ok((
             Ran {
                 shadowed: copies,
+                staged: moved,
                 buffers,
             },
             answer,
@@ -3492,6 +3646,14 @@ pub struct Ran {
     /// How many read-only ranges were copied out of a buffer their own
     /// dispatch also writes. See this module's docs for the rule.
     pub shadowed: usize,
+    /// How many [`Staged`] copies were encoded ahead of a dispatch.
+    ///
+    /// Reported for [`Self::shadowed`]'s reason and not for symmetry: this is
+    /// the price of the walk minting a fresh rectangle for every result, and
+    /// the number a text pays it is a property of how the text is WRITTEN — a
+    /// residual that merges costs nothing and one that does not costs a copy
+    /// of the hidden state per layer.
+    pub staged: usize,
     /// How many COMMAND BUFFERS went into the queue.
     ///
     /// One per `run_all`, whatever the shadowing costs — a shadow point ends

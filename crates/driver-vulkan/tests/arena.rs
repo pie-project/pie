@@ -80,7 +80,7 @@
 
 use std::collections::BTreeSet;
 
-use driver_vulkan::baker::{BANK_ALIGN, arena_of};
+use driver_vulkan::baker::{BANK_ALIGN, arenas_of};
 use model_compiler::program::{Dt, Program, Slot};
 use model_ir::plan::{Cond, Op, Param, Plan, Seam, Shard, ValueDef};
 
@@ -423,7 +423,7 @@ fn the_seed_takes_its_rectangle_from_the_table_and_its_width_from_the_dtype() {
 
 /// The other half of this driver's memory is 256-aligned, and on purpose.
 ///
-/// `arena_of` packs the weight banks, and [`BANK_ALIGN`] is 256 with the Vulkan
+/// `arenas_of` packs the weight banks, and [`BANK_ALIGN`] is 256 with the Vulkan
 /// reason written beside it. This is the check that the two halves did not
 /// drift apart: activations at 16 and banks at 256 is a deliberate asymmetry
 /// only for as long as somebody can point at both numbers.
@@ -450,8 +450,18 @@ fn every_bank_offset_clears_the_strictest_alignment() {
             )
         })
         .collect();
-    let (offsets, total) = arena_of(&produced);
-    for (at, (name, _)) in offsets.iter().zip(&produced) {
+    // A ceiling no arrangement of three tiny banks can reach, so this measures
+    // the PACKING and not the split. `every_bank_lands_in_an_arena_that_can_
+    // hold_it` is where the ceiling itself is the subject.
+    let arenas = arenas_of(&produced, u64::from(u32::MAX)).expect("three small banks pack");
+    let [arena] = arenas.as_slice() else {
+        panic!(
+            "three banks under 6 KiB packed into {} arenas",
+            arenas.len()
+        )
+    };
+    for &(i, at) in &arena.banks {
+        let name = &produced[i].0;
         assert_eq!(
             at % STRICTEST_ALIGNMENT,
             0,
@@ -459,7 +469,7 @@ fn every_bank_offset_clears_the_strictest_alignment() {
         );
     }
     assert_eq!(
-        total % STRICTEST_ALIGNMENT,
+        arena.bytes % STRICTEST_ALIGNMENT,
         0,
         "the packed total should end on a boundary too, so the next arena starts on one",
     );
@@ -503,3 +513,56 @@ fn every_bank_offset_clears_the_strictest_alignment() {
 // * `every_pool_number_reaches_the_shader_through_the_arm_that_names_it` -- a
 //   `FireNumber` traced from `Resolve` to the packed word. `FireNumber` and
 //   `Resolve` both survive; the arm that carried it does not.
+
+/// **The ceiling, and what happens at it.**
+///
+/// `arenas_of` packs into as few arenas as the cap allows, and until
+/// `gptoss-20b-bf16-mxfp4-kv-bf16` was fired on `driver-wgpu` there was only
+/// ever one — its 12.82 GiB of produced weights against an L40S's 4 GiB
+/// `max_buffer_size` is what made the second one exist. Vulkan states the same
+/// ceiling by a different name: `maxStorageBufferRange` is `UINT32_MAX` on
+/// every desktop driver this tree has met, which is the same 4 GiB.
+///
+/// So: banks fill an arena until the next would cross, plan order is never
+/// reordered to pack better (a bank's arena is its buffer id, and a
+/// reproducible one), and one bank past the cap is a refusal that names it.
+#[test]
+fn the_arena_split_fills_before_it_opens_a_new_one() {
+    let produced: Vec<(String, model::produce::HostTensor)> = (0..5)
+        .map(|i| {
+            (
+                format!("bank.{i}"),
+                model::produce::HostTensor::new([400], model::produce::Dtype::U8, vec![0u8; 400]),
+            )
+        })
+        .collect();
+
+    // 400 rounds to 512 at `BANK_ALIGN`, so a 1024-byte cap holds exactly two.
+    let arenas = arenas_of(&produced, 1024).expect("each bank is under the cap");
+    assert_eq!(
+        arenas.iter().map(|a| a.banks.len()).collect::<Vec<_>>(),
+        vec![2, 2, 1],
+        "the packing should fill each arena before opening the next",
+    );
+    assert_eq!(
+        arenas.iter().map(|a| a.bytes).collect::<Vec<_>>(),
+        vec![1024, 1024, 512],
+        "and each arena should be exactly as big as what it holds",
+    );
+
+    // EVERY BANK EXACTLY ONCE, IN PLAN ORDER. A packing that dropped one would
+    // fail `join` later with a missing param, and one that reordered would give
+    // the same load two different buffer ids on two runs.
+    let order: Vec<usize> = arenas
+        .iter()
+        .flat_map(|a| a.banks.iter().map(|&(i, _)| i))
+        .collect();
+    assert_eq!(order, (0..5).collect::<Vec<_>>());
+
+    let why = arenas_of(&produced, 256).expect_err("a 400-byte bank does not fit in 256");
+    assert!(
+        why.contains("bank.0") && why.contains("256"),
+        "the refusal must name the bank and the ceiling, because the fix is a \
+         smaller shard or a bigger device and the reader has to know which: {why}",
+    );
+}

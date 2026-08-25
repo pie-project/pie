@@ -89,7 +89,9 @@ pub mod stage;
 pub mod views;
 
 pub use crate::walk::frame;
-pub use crate::walk::{BANK_ALIGN, Baked, READABLE_BASE, arena_of, join, readable_base, word_of};
+pub use crate::walk::{
+    Arena, BANK_ALIGN, Baked, READABLE_BASE, arenas_of, join, readable_base, word_of,
+};
 pub use marks::{Bindings, Bound as BoundRegion, BufferId, NOTHING, Rect, Slice};
 pub use plane::Vulkan;
 pub use stage::{FireTable, KvGeometry, Pools, Slab, Splits};
@@ -288,14 +290,26 @@ mod tests {
     /// day `kernels/gemm/dense.slang` landed, which is the first time any
     /// catalog row has bound a lane on this plane.
     ///
-    /// WHY GEMMA AND NOT THE OTHER TWELVE, which is the measurement and not a
-    /// coincidence. A lane binds when EVERY point its text states is claimed,
-    /// so the rows that bind are the rows whose whole point set this plane
-    /// answers. Gemma-4's is now closed: the dense matmul was the last of its
-    /// twenty-two. Qwen-3.5 still states the five `ssm.*` and gpt-oss the
-    /// three `attention.*_lse`/`sink`, and neither family has a claim here
-    /// yet — so those rows trace, refuse, and are named by
-    /// [`a_refused_lane_names_a_few_points_and_not_every_point_it_states`].
+    /// WHY THESE SEVEN AND NOT THE OTHER NINE, which is the measurement and
+    /// not a coincidence. A lane binds when EVERY point its text states is
+    /// claimed, so the rows that bind are the rows whose whole point set this
+    /// plane answers. Gemma-4's closed with the dense matmul, Qwen-3.5's with
+    /// the ssm five, and gpt-oss's with the three this ledger last recorded as
+    /// outstanding: `attention.{decode_lse, prefill_lse, sink}`. THE TWO
+    /// GPTOSS ROWS JOINING IS THE RECORD OF THAT LANDING and not a repair —
+    /// they trace to sixteen points each and every one is now answered here,
+    /// which is the same reading `driver-metal` and `driver-wgpu` took when
+    /// the same three closed on those planes.
+    ///
+    /// `attention.merge_lse` was NOT forced by closing them, which is worth a
+    /// line because a plane that publishes an lse looks like it should owe a
+    /// merge. No row of these three families states it; the one row that does
+    /// is dsv4, whose backlog is fifteen points and another slice's business.
+    ///
+    /// What is left refusing is four families with no `#[claims]` block on
+    /// this plane at all — `mla.*`, `index.*`, `hc.*`, `pool.*` — which is
+    /// what [`a_refused_lane_names_a_few_points_and_not_every_point_it_states`]
+    /// now reads.
     ///
     /// The list is asserted as a SET and not a count. A row joining it is news
     /// worth reading in a diff, and a row LEAVING it is a regression that
@@ -329,6 +343,8 @@ mod tests {
             [
                 "gemma4-e4b-bf16-kv-bf16",
                 "gemma4-31b-bf16-kv-bf16",
+                "gptoss-20b-bf16-mxfp4-kv-bf16",
+                "gptoss-120b-bf16-mxfp4-kv-bf16",
                 "qwen35-a3b-bf16-kv-bf16",
                 "qwen35-d3b-bf16-kv-bf16",
                 "qwen35-d0.8b-bf16-kv-bf16",
@@ -358,10 +374,31 @@ mod tests {
     /// at all and the row it was written against now binds. Both halves of the
     /// test had to move: the SKU it reads and the point it names.
     ///
-    /// It reads `qwen35-d0.8b-bf16-kv-bf16` now and names `ssm.gdn_prep`.
-    /// Qwen-3.5 is short of exactly the five `ssm.*` points — a family with no
-    /// `#[claims]` block on this plane at all — which is the same shape the
-    /// gemm five had: a NAMED, SHORT backlog against a lane stating far more.
+    /// It read `qwen35-d0.8b-bf16-kv-bf16` and named `ssm.gdn_prep`, then
+    /// `gptoss-20b-bf16-mxfp4-kv-bf16` and named `attention.sink`. BOTH OF
+    /// THOSE ROWS BIND NOW, so it reads `gemma4-31b-bf16-kv-bf16-tp2` and
+    /// names `dist.all_reduce`. That is the third time this row has been
+    /// re-pointed and the reason has been the same every time, which is the
+    /// paragraph above: a test whose subject is a refused lane stops measuring
+    /// the day its example stops refusing, and it goes on passing.
+    ///
+    /// AND THE THIRD SUBJECT IS A DIFFERENT KIND OF ROW FROM THE FIRST TWO,
+    /// which is worth stating because it is what this plane's ledger now looks
+    /// like. Ten catalog rows survive `Deployment::of` here; seven bind, and
+    /// the three that do not are the two-way variants of rows that DO — each
+    /// short of exactly one point, `dist.all_reduce`, which is a collective and
+    /// not a shader. So the shortest, most named backlog this row has ever
+    /// been pointed at is also the last one available: every single-device row
+    /// this build can provision is now fully claimed, and what is left is a
+    /// family of kernels no shader plane owns.
+    ///
+    /// The rows whose backlogs ARE shader-shaped — kimi-k3's `mla.*`, dsv4's
+    /// `pool.*` and `hc.*`, glm5's `index.*` — cannot be this test's subject,
+    /// because `Deployment::of` refuses all three before a lane is reached:
+    /// they attend through a single-plane latent row and this build provisions
+    /// no store for one. That is a fact about the POOL and not about this
+    /// plane, which is exactly why the sweep above skips them.
+    ///
     /// The SKU is named rather than "the first row that refuses" because which
     /// row that is changes every time a family lands, and a test that silently
     /// re-aims is one that stops measuring what it was written for.
@@ -374,27 +411,28 @@ mod tests {
     /// [`Why::Unclaimed`]: model_compiler::program::Why::Unclaimed
     #[test]
     fn a_refused_lane_names_a_few_points_and_not_every_point_it_states() {
-        // GPT-OSS AND NOT QWEN-3.5, AND THE SWAP IS THE RECORD OF A LANDING.
-        // This read `qwen35-d0.8b` and expected it short of `ssm.gdn_prep`,
-        // because the ssm family was unclaimed here. It is claimed now — five
-        // of its seven points — and that row BINDS. A test whose subject is a
-        // refused lane has to be re-pointed the day its example stops
-        // refusing, or it goes on passing for a reason that is no longer the
-        // one written here.
+        // A TWO-WAY ROW AND NOT GPT-OSS, AND THE SWAP IS THE RECORD OF A
+        // LANDING. This read `gptoss-20b` and expected it short of
+        // `attention.sink`, because the lse plane and the sink rescale were
+        // unclaimed here. All three are claimed now and BOTH gptoss rows bind.
+        // A test whose subject is a refused lane has to be re-pointed the day
+        // its example stops refusing, or it goes on passing for a reason that
+        // is no longer the one written here — which has now happened twice.
         //
-        // gpt-oss is short of `attention.{decode_lse, prefill_lse, sink}`,
-        // which metal and wgpu both closed this week and this plane has not.
-        let baked = Baked::of::<Vulkan>("gptoss-20b-bf16-mxfp4-kv-bf16")
-            .expect("`gptoss-20b-bf16-mxfp4-kv-bf16` traces for this plane");
+        // `gemma4-31b-...-tp2` is short of one point, and it is a collective:
+        // the same twenty-two shader points its single-device twin states, plus
+        // `dist.all_reduce` for the column split. See the header.
+        let baked = Baked::of::<Vulkan>("gemma4-31b-bf16-kv-bf16-tp2")
+            .expect("`gemma4-31b-bf16-kv-bf16-tp2` traces for this plane");
         let refusal = baked
             .lanes
             .iter()
             .find_map(|l| l.as_ref().err())
-            .expect("gpt-oss states the attention sink trio, unclaimed here");
+            .expect("a two-way row states `dist.all_reduce`, unclaimed here");
         let gaps: Vec<&str> = refusal.gaps.iter().map(|g| g.point.as_str()).collect();
         assert!(
-            gaps.contains(&"attention.sink"),
-            "`{}` should be short of the sink rescale: {gaps:?}",
+            gaps.contains(&"dist.all_reduce"),
+            "`{}` should be short of the collective: {gaps:?}",
             baked.sku,
         );
         // A CLAIMED POINT MUST NOT BE IN THE LIST. Every gap is a point this

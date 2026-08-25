@@ -259,6 +259,55 @@ void main(uint3 thread: SV_DispatchThreadID) {
     uint pitch = pc.x_pitch != 0u ? pc.x_pitch : pc.width;
     out_[r * pc.width + c] = sel < 0 ? PIE_STORE(0.0) : x[(uint(sel) / k) * pitch + c];
 }
+#elif defined(PIE_EXPERT_COMBINE)
+// Sum a token's k expert outputs, weighted by the router, reading them WHERE
+// THEY WERE WRITTEN.
+//
+// `routed` is `[rows * k, width]` in (token, slot) order — one row per route,
+// in the order the routes were chosen — so slot `e` of token `n` is at row
+// `n * k + e` and there is no permutation to consult. That is the whole
+// difference from `combine_sorted` below, and it is why the two are two arms
+// rather than one taught an optional index: every sorted family binds an
+// inverse permutation, and a caller whose rows were never moved should not
+// carry a buffer it would only fill with the identity.
+//
+// **THIS PLANE HAD ONLY THE SORTED ONE**, so `moe.weighted_sum` was in the
+// claim table and refused every fire — the permutation `combine_sorted` folds
+// through is written by `route_sort`, which no point of this plane claims. A
+// whole tower is what found it: `driver-vulkan/tests/banked_argmax.rs` walked
+// a gpt-oss decode and stopped here, at op 24.
+//
+// THE WEIGHTS ARE FLOAT. `Moe::weighted_sum` declares them
+// `In<Self::Tensor<f32>>`, because a router weight is a probability and the
+// fold multiplies in float on every plane; `combine_sorted`'s are `PIE_ACT`
+// because that is the element the legacy routed families stage them at.
+PIE_BUFFER_RO(0, routed);
+[[vk::binding(1)]] StructuredBuffer<float> expert_weights;
+PIE_BUFFER_RW(2, out_);
+
+struct Push {
+    uint width;
+    uint rows;
+    uint experts_per_token;
+};
+[[vk::push_constant]] ConstantBuffer<Push> pc;
+
+[numthreads(16, 16, 1)]
+void main(uint3 thread: SV_DispatchThreadID) {
+    uint c = thread.x;
+    uint row = thread.y;
+    // BOTH AXES GUARDED. The grid is `elementwise_rows(width, rows)` and the
+    // driver rounds each axis up to the module's own `[numthreads]`, so a
+    // width of 2880 and 16 lanes fits exactly while a single decode row does
+    // not — fifteen of every sixteen `row` lanes are past the end.
+    if (c >= pc.width || row >= pc.rows) return;
+    float acc = 0.0;
+    for (uint e = 0u; e < pc.experts_per_token; e++) {
+        uint at = row * pc.experts_per_token + e;
+        acc += expert_weights[at] * PIE_LOAD(routed[at * pc.width + c]);
+    }
+    out_[row * pc.width + c] = PIE_STORE(acc);
+}
 #elif defined(PIE_COMBINE_SORTED)
 PIE_BUFFER_RO(0, y);
 PIE_BUFFER_RO(1, expert_weights);
@@ -337,6 +386,7 @@ void main(uint3 thread: SV_DispatchThreadID) {
 #endif
 
 // pie:instantiate combine_sorted PIE_COMBINE_SORTED=1
+// pie:instantiate expert_combine PIE_EXPERT_COMBINE=1
 // pie:instantiate route_gather PIE_ROUTE_GATHER=1
 // pie:instantiate route_sort PIE_ROUTE_SORT=1
 // pie:instantiate router_topk_bfloat16 PIE_ROUTER_TOPK=1

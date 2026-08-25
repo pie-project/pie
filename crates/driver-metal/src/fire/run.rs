@@ -24,7 +24,6 @@ use crate::bind::encode::{Params, Pipelines, encode};
 use crate::device::{ArgumentTable, Context, Stepper};
 use crate::error::{Error, Result};
 use crate::fire::scratch::Lease;
-use crate::layout::region::Region as _;
 use crate::program::Compiler;
 
 /// Everything a driver keeps ACROSS fires.
@@ -92,27 +91,122 @@ pub struct InFlight {
 ///
 /// A span that leaves the arena, which is drift between the walk's offsets
 /// and the arena it was walked against.
-fn stage_blits(arena: &Lease, blits: &[Blit]) -> Result<()> {
-    let base = arena.gpu_address();
-    for b in blits {
-        let (Some(dst), Some(src)) = (
-            b.to.address.checked_sub(base),
-            b.from.address.checked_sub(base),
-        ) else {
-            return Err(Error::Unserved {
-                what: "fire",
-                message: format!(
-                    "op {} stages an in-place operand from outside this fire's arena",
-                    b.op
-                ),
-            });
-        };
-        // SAFETY: both spans are checked against the arena's own length by
-        // `Region::copy` before a byte moves, and nothing is encoded against
-        // the arena yet — see this function's own note on the lease.
-        unsafe { arena.copy(dst, arena.region(), src, b.bytes) }?;
+/// The `InOut` copies, as DISPATCHES, each in front of the statement that
+/// asked for it.
+///
+/// # What stood here, and why it was wrong
+///
+/// `stage_blits`: every operand copied on the HOST before a single dispatch of
+/// the fire had run, under a SAFETY note that said so — "nothing is encoded
+/// against the arena yet". That is correct only if an operand's bytes are
+/// already final when the fire starts, and they are not.
+/// `norm.residual_add` at op14 of a qwen3.5 decode takes value 1, **the
+/// output of `layout.embed`, which is dispatch 0 of this same fire**. The copy
+/// happened first, so the residual stream was added to the zeros the arena was
+/// cleared to, from layer 0 onward.
+///
+/// It was silent: nothing refused, a whole 24-layer tower fired, and the
+/// answer was a real forward of something else — 93126 at 10.9375 where cuda
+/// banked 198 at 12.3125. A bisect against `driver-wgpu` on the identical
+/// program found it at the first `InOut` statement the tower states, with
+/// everything before it matching to within a bf16 ulp.
+///
+/// # Why a dispatch rather than a blit encoder
+///
+/// A `StepEncoder` is a COMPUTE encoder and Metal does not copy from one. The
+/// alternatives were a second pass per copy — sixty-six submissions for a
+/// qwen3.5 decode — or this: a copy that IS a dispatch, ordered by the same
+/// hazard tracker as every other statement and recorded into the same indirect
+/// command buffer. The paragraph in [`submit`] that said "a recording cannot
+/// carry a blit, and it does not have to" is answered by there being no blits
+/// left, only dispatches.
+///
+/// # Errors
+///
+/// A copy filed against a statement that planned no dispatch, or one whose
+/// span is not a whole number of `ushort` — `layout/blit.metal` says why the
+/// element is two bytes.
+fn with_blits(dispatches: &[Dispatch], blits: &[Blit]) -> Result<Vec<Dispatch>> {
+    if blits.is_empty() {
+        return Ok(dispatches.to_vec());
     }
-    Ok(())
+    let unserved = |message: String| Error::Unserved {
+        what: "fire",
+        message,
+    };
+    // Filed against the FIRST dispatch of the statement that asked. A body may
+    // state more than one launch — `rope.full` is two — and the operand's
+    // bytes have to be in place before the first of them writes through the
+    // handle, not before the last.
+    let mut ahead: std::collections::BTreeMap<usize, Vec<Dispatch>> = Default::default();
+    for b in blits {
+        let at = dispatches
+            .iter()
+            .position(|d| d.op == b.op)
+            .ok_or_else(|| {
+                unserved(format!(
+                    "op {} stages an in-place operand and planned no dispatch",
+                    b.op
+                ))
+            })?;
+        if !b.bytes.is_multiple_of(2) {
+            return Err(unserved(format!(
+                "op {} stages {} bytes, which is not a whole number of the \
+                 two-byte element `blit_bfloat16` moves",
+                b.op, b.bytes
+            )));
+        }
+        let elements = u32::try_from(b.bytes / 2).map_err(|_| {
+            unserved(format!(
+                "op {} stages {} bytes, past a u32 of elements",
+                b.op, b.bytes
+            ))
+        })?;
+        ahead.entry(at).or_default().push(Dispatch {
+            symbol: "blit_bfloat16",
+            file: "layout/blit.metal",
+            stamp: "",
+            grid: [elements, 1, 1],
+            threadgroup: [elements.clamp(1, 256), 1, 1],
+            args: vec![
+                crate::baker::BoundRegion {
+                    slice: b.from,
+                    width: 0,
+                },
+                crate::baker::BoundRegion {
+                    slice: b.to,
+                    width: 0,
+                },
+                crate::baker::NOTHING,
+            ],
+            // READ THE OPERAND, WRITE THE RESULT, and stated rather than
+            // conservative: this is the one dispatch in a fire whose direction
+            // is known exactly, and an honest pair is what lets the tracker put
+            // a barrier between the statement that produced the operand and
+            // this copy.
+            touches: crate::baker::dispatch::Touches {
+                reads: vec![b.from],
+                writes: vec![b.to],
+            },
+            param_slots: vec![crate::baker::dispatch::ParamSlot {
+                slot: 2,
+                at: 0,
+                bytes: 4,
+                value: 0,
+            }],
+            params: vec![elements],
+            layers: dispatches[at].layers.clone(),
+            op: b.op,
+        });
+    }
+    let mut out = Vec::with_capacity(dispatches.len() + blits.len());
+    for (i, d) in dispatches.iter().enumerate() {
+        if let Some(copies) = ahead.remove(&i) {
+            out.extend(copies);
+        }
+        out.push(d.clone());
+    }
+    Ok(out)
 }
 
 /// Stage, compile, encode and COMMIT one fire, without waiting for it.
@@ -143,7 +237,12 @@ pub fn submit(
         regions,
         recordings,
     } = machine;
-    stage_blits(&arena, blits)?;
+    // THE COPIES ARE DISPATCHES NOW — see `with_blits`, which is where the
+    // host-side staging this line used to do is written up. Everything below
+    // sees one list, so the argument table, the fingerprint, the recording and
+    // the barriers all take them as the statements they are.
+    let merged = with_blits(dispatches, blits)?;
+    let dispatches = merged.as_slice();
     let params = Params::stage_in(context, scratch, dispatches)?;
     // What this fire leased, so a recording can turn its operand addresses
     // back into buffers. Pooled, so re-registering is the same span and the

@@ -439,6 +439,7 @@ fn run(device: &Device, bufs: &[Buffer], fired: &Fired, patch: Option<(&str, &st
             buffers: &bound,
             uniform: &block,
             groups,
+            staged: &[],
         }])
         .unwrap_or_else(|(stage, why)| panic!("`{}` failed at {stage:?}: {why}", fired.symbol));
 }

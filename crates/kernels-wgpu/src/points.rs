@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use kernels::plane::Refusal;
 use kernels::shader::ShaderValue;
 
-use crate::plane::{ArgValue, Ctx};
+use crate::plane::Ctx;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Handle(pub u32);
@@ -76,10 +76,6 @@ pub fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Ref
     } else {
         Err(Refusal::Absent { what })
     }
-}
-
-pub(crate) fn absent(ctx: &Ctx<'_>) -> Result<ArgValue, Refusal> {
-    ctx.absent()
 }
 
 impl kernels::points::Plane for Ctx<'_> {

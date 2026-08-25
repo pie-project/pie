@@ -155,8 +155,20 @@ pub trait Pools {
     /// scan handed a null carry answers fluently and wrongly.
     fn slab(&self, layer: u32, which: Slab) -> Option<Slice>;
 
-    /// The KV pool's own layout.
-    fn kv_geometry(&self) -> KvGeometry;
+    /// The KV pool's layout AT ONE LAYER.
+    ///
+    /// PER LAYER AND NOT PER FIRE, and gemma-4 is the row that decided it. A
+    /// tower may attend at more than one width: `gemma4-e4b`'s sliding layers
+    /// take `head_dim` 256 and its full-attention layers 512, so a fire-wide
+    /// answer would be right for one half of the tower and wrong for the
+    /// other — and wrong here is attending over the wrong bytes rather than
+    /// refusing. `driver-cuda` has always derived it per layer, in
+    /// `bind::views::kv_view` off the layer's own pool descriptor; this is the
+    /// same fact, stated by the party that chose the layout.
+    ///
+    /// Only asked of a layer [`Self::kv`] answered for, so a driver that holds
+    /// no pool at this layer is never reached here.
+    fn kv_geometry(&self, layer: u32) -> KvGeometry;
 
     /// One of the fire's staged planes.
     fn table(&self, which: FireTable) -> Option<Slice>;

@@ -1826,9 +1826,35 @@ impl Device {
     /// leaves the tail holding the previous fire's numbers and every kernel
     /// here reads its whole operand.
     pub fn write(&self, buffer: &Buffer, bytes: &[u8]) -> Result<(), Failed> {
-        if bytes.len() as u64 > buffer.size {
+        self.write_at(buffer, 0, bytes)
+    }
+
+    /// Overwrite `bytes.len()` bytes of a buffer starting at `at`.
+    ///
+    /// The pair [`Device::read`]/[`Device::read_at`] already are, and this is
+    /// the same pair on the other side. It exists because a WEIGHT ARENA is
+    /// one allocation holding hundreds of banks at hundreds of offsets, and
+    /// the only alternative was assembling the whole arena in host memory
+    /// first — twelve gigabytes of it for `gptoss-20b`, to hand the driver
+    /// bytes it is about to copy anyway.
+    ///
+    /// The mapping is the buffer's WHOLE `mapped` range and the offset is
+    /// applied to the pointer, rather than mapping from `at`: a coherent range
+    /// has an alignment the driver chooses and `at` does not have to divide
+    /// it, and mapping a sub-range that does not is the class of thing that
+    /// works on one vendor.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if the mapping fails, or if the span runs past the
+    /// buffer — which is refused rather than truncated, since a short write
+    /// leaves the tail holding the previous fire's numbers and every kernel
+    /// here reads its whole operand.
+    pub fn write_at(&self, buffer: &Buffer, at: u64, bytes: &[u8]) -> Result<(), Failed> {
+        let end = at.saturating_add(bytes.len() as u64);
+        if end > buffer.size {
             return Err(Failed::Vulkan(format!(
-                "{} bytes into a {}-byte buffer",
+                "{} bytes at {at} into a {}-byte buffer",
                 bytes.len(),
                 buffer.size
             )));
@@ -1839,7 +1865,7 @@ impl Device {
                 .map_memory(buffer.memory, 0, buffer.mapped, vk::MemoryMapFlags::empty())
                 .map_err(|e| Failed::Vulkan(format!("map: {e}")))?
                 .cast::<u8>();
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(at as usize), bytes.len());
             self.device.unmap_memory(buffer.memory);
         }
         self.uploaded
@@ -2344,6 +2370,7 @@ impl Device {
             writes: &[],
             push,
             groups,
+            staged: &[],
         }])
         .map_err(|(_, e)| e)
     }
@@ -2547,6 +2574,40 @@ impl Device {
 
     /// Everything [`Self::run`] refuses a dispatch for, without recording it.
     fn check(&self, one: &Recorded<'_, '_>) -> Result<(), Failed> {
+        // THE `InOut` COPIES FIRST, because a bad one is undefined behaviour
+        // rather than a refusal: Vulkan permits a same-buffer copy only where
+        // the regions do not overlap, and a copy running past either end is
+        // not diagnosed at all outside the validation layers. Both are stated
+        // here so a plan that produced one is refused with the numbers in it.
+        for m in one.staged {
+            let ends = |at: u64, size: u64| at.saturating_add(m.bytes) <= size;
+            if !ends(m.at, m.from.size) || !ends(m.to, m.into.size) {
+                return Err(Failed::Vulkan(format!(
+                    "an in-place copy of {} bytes runs past its buffer: {}..{} of {} \
+                     into {}..{} of {}",
+                    m.bytes,
+                    m.at,
+                    m.at + m.bytes,
+                    m.from.size,
+                    m.to,
+                    m.to + m.bytes,
+                    m.into.size,
+                )));
+            }
+            // Identical addresses are the no-op `record_all` skips. Anything
+            // else that overlaps within one buffer is refused.
+            if std::ptr::eq(m.from, m.into)
+                && m.at != m.to
+                && m.at < m.to + m.bytes
+                && m.to < m.at + m.bytes
+            {
+                return Err(Failed::Vulkan(format!(
+                    "an in-place copy of {} bytes overlaps itself, {} onto {}, which \
+                     Vulkan does not define",
+                    m.bytes, m.at, m.to,
+                )));
+            }
+        }
         let pipeline = one.pipeline;
         // One per slot in the layout, less the module's HOLES.
         //
@@ -2754,7 +2815,70 @@ impl Device {
                     device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, t.pool, 0);
                 }
                 for (at, one) in run.iter().enumerate() {
-                    if at > 0 && hazards(one, &pending_writes, &pending_reads) {
+                    // ── the `InOut` copies this dispatch needs in place ──
+                    //
+                    // Recorded here rather than before the run, because an
+                    // operand may have been written by an earlier dispatch of
+                    // this same command buffer. The two barriers around them
+                    // are FULL rather than per-buffer for the reason the
+                    // barrier below gives at length: the card stalls the same
+                    // either way and the finer form is more bookkeeping in
+                    // front of the same wait. These are rare — one per `InOut`
+                    // statement — so the coarse pair costs nothing measurable
+                    // and is obviously right.
+                    if !one.staged.is_empty() {
+                        pending_writes.clear();
+                        pending_reads.clear();
+                        let to_transfer = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                            )];
+                        device.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &to_transfer,
+                            &[],
+                            &[],
+                        );
+                        for m in one.staged {
+                            // An operand ALREADY at its result's address is
+                            // what "in place" literally means, and copying a
+                            // region onto itself is what Vulkan forbids. This
+                            // is the common case for a point whose operand
+                            // dies at the statement, and it is a no-op.
+                            if std::ptr::eq(m.from, m.into) && m.at == m.to {
+                                continue;
+                            }
+                            device.cmd_copy_buffer(
+                                cmd,
+                                m.from.handle,
+                                m.into.handle,
+                                &[vk::BufferCopy::default()
+                                    .src_offset(m.at)
+                                    .dst_offset(m.to)
+                                    .size(m.bytes)],
+                            );
+                        }
+                        let to_compute = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )];
+                        device.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &to_compute,
+                            &[],
+                            &[],
+                        );
+                        self.barriers
+                            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+                    } else if at > 0 && hazards(one, &pending_writes, &pending_reads) {
                         pending_writes.clear();
                         pending_reads.clear();
                         self.barriers
@@ -3615,6 +3739,37 @@ fn hazards(one: &Recorded<'_, '_>, wrote: &[Span], read: &[Span]) -> bool {
     })
 }
 
+/// One `InOut` operand's bytes, moved into the rectangle a kernel is about to
+/// write through.
+///
+/// A point declared `InOut` reads an operand and writes a result, and the two
+/// are different rectangles: `model_compiler::program::carve` gives the result
+/// its own slot whenever the operand's life does not end there. The walk
+/// records the move (`walk::fire::Fire::inout`) and this is where it happens —
+/// **inside the same command buffer, immediately before the dispatch that
+/// needs it**, because the operand may itself have been written by an earlier
+/// dispatch of the same run.
+///
+/// Almost every one of these is ARENA TO ARENA. Vulkan permits a copy whose
+/// source and destination are one buffer only where the regions do not
+/// overlap, so [`Device::run_all`] refuses an overlapping pair by name rather
+/// than recording undefined behaviour, and treats an operand already sitting
+/// at its result's address as the no-op it is.
+#[derive(Clone, Copy, Debug)]
+pub struct Staged<'b> {
+    /// Where the operand's bytes are.
+    pub from: &'b Buffer,
+    /// Its offset in that buffer.
+    pub at: u64,
+    /// Where the kernel will write.
+    pub into: &'b Buffer,
+    /// The result rectangle's offset.
+    pub to: u64,
+    /// How many bytes: the operand's, which is the smaller of the two by
+    /// construction.
+    pub bytes: u64,
+}
+
 /// One dispatch in a recorded run.
 ///
 /// The same four things [`Device::run`] takes, named rather than positional
@@ -3642,6 +3797,8 @@ pub struct Recorded<'a, 'b> {
     pub push: &'a [u8],
     /// Workgroups in each dimension, none of them zero.
     pub groups: [u32; 3],
+    /// The `InOut` copies this dispatch needs in place first. Usually empty.
+    pub staged: &'a [Staged<'b>],
 }
 
 impl Drop for Device {

@@ -304,6 +304,25 @@ name = "device_ssm"
 name = "device_gemm"
 required-features = ["device"]
 
+# The lse plane and the sink rescale on the same card: both `_lse` arms against
+# an `f64` softmax model, the empty row's `-inf`, `attention.sink` against the
+# bf16 bytes `pie::attn::attn_sink_rescale` writes on this same L40S, and the
+# decomposition that says a published lse rescaled IS the folded arm. Two of its
+# tests are fault injections that rebuild a pipeline from the shipped module with
+# one `OpConstant %float` changed, so the mutations need no `slangc` in this
+# crate's closure. Gated exactly as `device_fire` is, and for the same reason.
+[[test]]
+name = "device_sink"
+required-features = ["device"]
+
+# The whole chain on a real card: a cached 20B checkpoint through `serve::run`
+# to the argmax cuda banked. Needs BOTH gates -- a device and a compiled shader
+# tree -- and the checkpoint besides, which is why its one test is `#[ignore]`d
+# on top of them.
+[[test]]
+name = "banked_argmax"
+required-features = ["device", "native"]
+
 # Neither a GPU nor a shader compiler: it asks the resolver what this crate
 # depends on. Ungated on purpose -- the constraint it checks is about the
 # builds that DO NOT have a toolchain.

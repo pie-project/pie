@@ -241,6 +241,23 @@ required-features = ["native"]
 name = "device_fire"
 required-features = ["native"]
 
+# THE WHOLE CHAIN (P5d): a cached checkpoint through this driver to an argmax,
+# compared against the answer `driver-cuda/tests/banked_argmaxes.rs` banked. Same
+# stanza and the same skip protocol as `device` above, plus a THIRD absence this
+# crate had not had before -- the 1.4 GiB snapshot, which a build box does not
+# have and which the test prints a skip for rather than failing on.
+#
+# It is a separate target from `device_fire` because the question is the whole
+# of what that one asks a corner of. That fires ONE claimed point through the
+# baker path; this fires 459 statements of a real traced plan -- 24 layers, six
+# full-attention and eighteen gated-DeltaNet -- through the same path onto the
+# same card, and compares the token that comes out against a number produced on
+# a CUDA card by a different set of kernels. The only thing the two planes share
+# is the model TEXT, which is what makes a match falsifiable.
+[[test]]
+name = "banked_argmax"
+required-features = ["native"]
+
 # The matrix unit, which this crate does not use and can. Same stanza and the
 # same reasons; what it adds is a THIRD absence -- the adapter may answer and
 # offer no cooperative matrix, which the tests print and skip on.

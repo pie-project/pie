@@ -79,7 +79,7 @@ fn plane(b: &mut Bindings, slice: Option<Slice>) -> u32 {
 pub(crate) fn kv(b: &mut Bindings, pools: &dyn Pools, layer: u32) -> Option<PagedKvView> {
     let keys = pools.kv(layer, false)?;
     let values = pools.kv(layer, true)?;
-    let g = pools.kv_geometry();
+    let g = pools.kv_geometry(layer);
     Some(PagedKvView {
         keys: Tensor::new(plane(b, Some(keys))),
         values: Tensor::new(plane(b, Some(values))),
@@ -124,7 +124,7 @@ fn split(b: &mut Bindings, pools: &dyn Pools) -> SplitView {
 ///
 /// `None` when the layer has no KV pool, for [`kv`]'s reason.
 pub(crate) fn attn_fire(b: &mut Bindings, pools: &dyn Pools, layer: u32) -> Option<AttnFireView> {
-    let g = pools.kv_geometry();
+    let g = pools.kv_geometry(layer);
     Some(AttnFireView {
         kv: kv(b, pools, layer)?,
         positions: Tensor::new(plane(b, pools.table(FireTable::Positions))),

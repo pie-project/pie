@@ -250,6 +250,19 @@ impl Shell {
                     what: "launch",
                     message,
                 })?;
+            #[allow(
+                clippy::print_stderr,
+                reason = "a probe that says which lane a fire chose is the job"
+            )]
+            if std::env::var_os("PIE_METAL_TRACE_LANE").is_some() {
+                eprintln!(
+                    "PIE_LANE {:?} {_word:#b}: {} steps over {} slots, row pitch {}",
+                    class,
+                    program.steps.len(),
+                    program.slots.len(),
+                    program.row_pitch,
+                );
+            }
             // The gather's index list, in the fire's own numbering: the
             // wire's numbers are request-local and the gather's must not be.
             let sampled = crate::baker::frame::sampled_rows(&s).map_err(|why| Error::Program {
@@ -466,6 +479,34 @@ impl Shell {
             fire.walk(&encoder).map_err(Error::from)?;
             let dispatches = encoder.finish();
             let blits = fire.blits.borrow().clone();
+            #[allow(
+                clippy::print_stderr,
+                reason = "a probe that says which statement a dispatch is, is the job"
+            )]
+            if std::env::var_os("PIE_METAL_DUMP_SLOTS").is_some() {
+                // WHICH STATEMENT EACH DISPATCH BELONGS TO. A body may state
+                // more than one launch, so `PIE_METAL_MAX_DISPATCH` counts
+                // dispatches where a reader counts statements — and the two
+                // planes do not agree on the count, which is what makes this
+                // printable mapping the thing that lines a bisect up.
+                for (i, d) in dispatches.iter().enumerate() {
+                    eprintln!("PIE_DISPATCH {i} op{}", d.op);
+                }
+            }
+            // **THE TRUNCATION KNOB IS `PIE_METAL_MAX_DISPATCH`**, in
+            // `bind::encode::encode`, and it was there before this file went
+            // looking for one. It drops the tail at ENCODE time, which is the
+            // only place that can: truncating the list here changes
+            // `table_width` and the recording's fingerprint, and a fire
+            // truncated that way writes nothing at all — measured, at n = 2
+            // and n = 50, every one of the 449 slots zero while the untruncated
+            // fire writes 448 of them.
+            //
+            // `PIE_METAL_MIN_DISPATCH` drops the head, so the pair encodes any
+            // window. With `PIE_METAL_DUMP_SLOTS` below they are what localises
+            // a disagreement to one statement, which is what
+            // `tests/banked_argmax.rs` needs: a whole tower fires either way,
+            // and by the end `carve` has written over every slot but two.
             // The read-out is the `out` seam's own rectangle, which the walk
             // sized like every other value. It travels with the fire because
             // the `Fire` is dropped at the end of this iteration.
@@ -475,6 +516,45 @@ impl Shell {
                 width: r.width,
                 bytes: r.dt.size(),
             });
+            // EVERY SLOT'S RECTANGLE, so a fire can be compared to another
+            // plane's value by value rather than only at the argmax.
+            //
+            // `driver-wgpu` answers this SKU correctly on the identical
+            // program, so the first slot whose bytes differ is the first
+            // statement that disagrees — and nothing narrower can say which,
+            // because a whole tower fires with no refusal either way. Collected
+            // here because `Fire` is dropped at the end of this iteration and
+            // the arena is only readable after the wait.
+            //
+            // A slot is REUSED by `carve`, so what survives to the end is its
+            // last writer's output. That is the same statement on both planes,
+            // which is what keeps the comparison honest.
+            // **THE VALUE ID TRAVELS WITH THE RECTANGLE.** It did not, and the
+            // dump `enumerate()`d the FILTERED vector — so one slot this walk
+            // has no rectangle for shifted every id after it by one, and the
+            // comparison against `driver-wgpu` read value 17's numbers under
+            // value 16's name. It cost a whole bisect: the two planes appeared
+            // to resolve the same value to different rectangles, which is a
+            // frightening thing to believe about a shared walk and was a
+            // counting mistake here.
+            let slots: Vec<(u32, Readout)> = if std::env::var_os("PIE_METAL_DUMP_SLOTS").is_some() {
+                (0..program.slots.len())
+                    .filter_map(|v| {
+                        let r = fire.rect(v as u32).ok()?;
+                        Some((
+                            v as u32,
+                            Readout {
+                                offset: r.slice.address.saturating_sub(arena.gpu_address()),
+                                rows: r.rows,
+                                width: r.width,
+                                bytes: r.dt.size(),
+                            },
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             drop(fire);
 
             let mut machine = crate::fire::run::Machine {
@@ -500,6 +580,7 @@ impl Shell {
                 InFlight {
                     fire,
                     readout,
+                    slots,
                     _tables: staged,
                 },
             ));
@@ -558,6 +639,9 @@ struct InFlight {
     /// that computed it is dropped at the end of the iteration that encoded
     /// it.
     readout: Option<Readout>,
+    /// Every slot's rectangle and the value it belongs to, when
+    /// `PIE_METAL_DUMP_SLOTS` asked for them.
+    slots: Vec<(u32, Readout)>,
     /// The fire's tables, HELD and never read again.
     ///
     /// Not tidiness: a fire's tables are a LEASE from `Shell::scratch`,
@@ -607,6 +691,24 @@ fn retire(
         // thing were the same observation — `pipeline::step` had no
         // production caller at all, and the interpreter was exercised
         // only by tests that built their own inputs.
+        // RAW BYTES AND NOT WIDENED VALUES: the slots are bf16, f32 and i32
+        // alike, and a reader that had to know which would be a second place
+        // this and `driver-wgpu`'s twin could disagree about something other
+        // than the arithmetic.
+        #[allow(
+            clippy::print_stderr,
+            reason = "a probe that prints a fire's rectangles is the job"
+        )]
+        for (v, slot) in &committed.slots {
+            let Some(raw) = read_raw(&committed.fire.arena, *slot) else {
+                continue;
+            };
+            eprintln!(
+                "PIE_SLOT {v} at{} {}",
+                slot.offset,
+                summary(&raw, slot.bytes)
+            );
+        }
         let logits = read_logits(&committed.fire.arena, committed.readout);
         run_programs(registry, instance_ids, step, logits.as_ref(), faults)?;
     }
@@ -703,6 +805,56 @@ fn run_programs(
 ///
 /// The interpreter's `PassInputs` wants `&[f32]` and the metal read-out is
 /// **bf16** (`affine_qmv_fast` writes bf16 whatever the text declares), so the
+/// A rectangle's bytes as three comparable numbers — `driver-wgpu`'s twin.
+///
+/// NOT A CHECKSUM. The first form printed one and said that
+/// `norm.rmsnorm_plus_one` "differs" between two planes whose outputs were
+/// `bf62` and `bf61`: adjacent bf16 values, one ulp apart, which is what two
+/// reduction orders do and not what a wrong kernel does. Every slot downstream
+/// inherits such a difference, so every slot differed and the bisect had
+/// nothing to bisect.
+fn summary(raw: &[u8], width: u64) -> String {
+    let vals: Vec<f64> = if width == 2 {
+        raw.chunks_exact(2)
+            .map(|b| {
+                f64::from(f32::from_bits(
+                    u32::from(u16::from_le_bytes([b[0], b[1]])) << 16,
+                ))
+            })
+            .collect()
+    } else {
+        raw.chunks_exact(4)
+            .map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .collect()
+    };
+    let n = vals.len().max(1) as f64;
+    let mean = vals.iter().sum::<f64>() / n;
+    let rms = (vals.iter().map(|x| x * x).sum::<f64>() / n).sqrt();
+    let max = vals.iter().fold(0.0f64, |a, x| a.max(x.abs()));
+    format!(
+        "n{} mean {mean:.6e} rms {rms:.6e} max {max:.6e}",
+        vals.len()
+    )
+}
+
+/// One rectangle's bytes out of the arena, for the slot dump.
+///
+/// SAFETY, and the same argument [`read_logits`] makes: the arena is
+/// `StorageModeShared` so its contents are host addressable, and the caller
+/// waits on the fire before reading.
+fn read_raw(arena: &crate::fire::scratch::Lease, r: Readout) -> Option<Vec<u8>> {
+    let bytes = usize::try_from(r.bytes).ok()?;
+    let at = usize::try_from(r.offset).ok()?;
+    let span = r.rows as usize * r.width as usize * bytes;
+    if span == 0 || at + span > arena.len() as usize {
+        return None;
+    }
+    Some(
+        unsafe { std::slice::from_raw_parts(arena.contents().cast::<u8>().as_ptr().add(at), span) }
+            .to_vec(),
+    )
+}
+
 /// bytes are reinterpreted anyway and a widening reinterpretation is a copy.
 /// bf16 → f32 is exact: the low sixteen bits are zero.
 fn read_logits(
@@ -812,12 +964,35 @@ impl crate::baker::Pools for FireStaging<'_> {
         })
     }
 
-    fn kv_geometry(&self) -> crate::baker::KvGeometry {
+    // ONE SHAPE FOR EVERY LAYER, WHICH IS THIS POOL'S OWN FACT AND NOT THE
+    // TRAIT'S. `resources::Pool` is opened at a single `Shape`, so every
+    // layer it holds is laid out alike and the argument changes nothing
+    // here. A tower that attends at two widths -- gemma-4 -- wants two
+    // pools, and this is the method that would tell them apart.
+    fn kv_geometry(&self, _layer: u32) -> crate::baker::KvGeometry {
         let shape = self.pool.shape();
         crate::baker::KvGeometry {
             page_size: i32::try_from(shape.page_size).unwrap_or(0),
+            // **BOTH IN ELEMENTS OVER THE PAGE'S OWN AXES, AND `head_stride`
+            // IS THE HEAD WIDTH.** This said `page_size * head_dim` — the HND
+            // stride — beside a `seq_stride` that is the NHD one, which is two
+            // layouts in one pair and could not have been either.
+            //
+            // `kernels_metal::attn` reads them and it reads them the same way
+            // twice: `head_split` derives `head_dim` from `head_stride` and
+            // then requires `seq_stride == heads * head_dim`, and `pool_heads`
+            // checks `head_stride` against the head width the point STATES
+            // and divides `seq_stride` by it for the count. There is no
+            // reading of these two under which the old pair was consistent.
+            //
+            // NOTHING COULD SEE IT. This is the only place the serve path
+            // states a pool row's strides, and no test had ever taken a paged
+            // attention through `Shell::launch` — `tests/device_attention.rs`
+            // builds its own view. `tests/banked_argmax.rs` is what found it,
+            // at op 66 of a qwen3.5 decode, and the refusal named the number:
+            // an appended row of 512 against a head stride of 2048.
             seq_stride: u64::from(shape.kv_heads) * u64::from(shape.head_dim),
-            head_stride: u64::from(shape.page_size) * u64::from(shape.head_dim),
+            head_stride: u64::from(shape.head_dim),
         }
     }
 

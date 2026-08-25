@@ -94,31 +94,49 @@ impl kernels::points::Rope for Ctx<'_> {
         original_max_position: u32,
         interleaved: bool,
     ) -> Result<(), Refusal> {
-        use crate::points::Staged;
-
         crate::points::at_bf16::<T>("rope.yarn, at an element this plane does not instantiate")?;
         if interleaved {
             return Err(NOT_NEOX);
         }
         let hd = crate::points::stated("the head width this rotation states", head_dim)?;
 
-        let _ = (theta, factor, beta_fast, beta_slow, original_max_position);
-
-        let inv_freq = self.stream::<f32>("rope.yarn_inv_freq")?;
+        // THE FREQUENCIES ARE COMPUTED, NOT FETCHED. This asked
+        // `Staged::stream("rope.yarn_inv_freq")` for a per-fire plane holding a
+        // precomputed inverse-frequency table -- a legacy mechanism, and one
+        // this floor has no door for: `Encode::staged` refuses a runtime plane
+        // asked for BY NAME, because the walk hands a body every operand its
+        // point declares and nothing else. So `rope.yarn` was in the claim
+        // table and could not fire for any SKU that states it, which is
+        // gpt-oss, and nothing said so until a whole tower was walked here.
+        //
+        // `neox.slang`'s `PIE_YARN` arm derives the frequency from the same
+        // six numbers `kernels-wgpu`'s `rope/yarn.wgsl` takes. `theta` crosses
+        // as its LOG so the shader can use `exp2`, which is the trade every
+        // other arm of that file already makes.
+        let span = i32::try_from(original_max_position).ok().filter(|n| *n > 0);
+        let Some(span) = span else {
+            return Err(Refusal::Unstated {
+                what: "the checkpoint's YaRN block: its original context length",
+            });
+        };
+        let (low, high) = ramp_bounds(hd, theta, beta_fast, beta_slow, span);
         for x in [q, k] {
             let row = x.all("the rotated row")?;
             self.fire(
                 Fire::at(
-                    crate::plane::module_path("neox_freqs_mb_bfloat16", self.best()),
-                    "neox_freqs_mb_bfloat16",
+                    crate::plane::module_path("neox_yarn_mb_bfloat16", self.best()),
+                    "neox_yarn_mb_bfloat16",
                 )
                 .apply(rope_grid(hd, row.width, hd, row.rows)?),
                 &[
                     x.arg(),
                     positions.arg(),
                     1.0f32.arg(),
-                    inv_freq.arg(),
+                    theta.log2().arg(),
                     hd.arg(),
+                    factor.arg(),
+                    low.arg(),
+                    high.arg(),
                     attention_factor.arg(),
                 ],
             )?;
@@ -159,4 +177,23 @@ fn neox<T: kernels::points::Scalar>(
             head_dim.arg(),
         ],
     )
+}
+
+/// The two dimensions a YaRN ramp runs between, from the checkpoint's block.
+///
+/// A FUNCTION OF THE MODEL AND NOT OF THE ROW, which is why it is here and not
+/// in the shader: `beta_fast`/`beta_slow` and the original context length are
+/// the same for every invocation of every fire, so deriving them per lane
+/// would be one number computed a few thousand times. `kernels-wgpu`'s
+/// `rope::ramp_bounds` is the same arithmetic on the other plane -- stated
+/// twice on purpose, because the two are different crates and a shared one
+/// would be an abstraction serving two callers and nothing else.
+fn ramp_bounds(span: i32, theta: f32, beta_fast: f32, beta_slow: f32, original: i32) -> (f32, f32) {
+    let ln_theta = theta.ln();
+    let corr = |rot: f32| {
+        span as f32 * (original as f32 / (rot * core::f32::consts::TAU)).ln() / (2.0 * ln_theta)
+    };
+    let low = corr(beta_fast).floor().max(0.0);
+    let high = corr(beta_slow).ceil().min((span / 2) as f32 - 1.0).max(low);
+    (low, high)
 }
