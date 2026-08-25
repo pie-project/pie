@@ -197,14 +197,11 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
 /// naming a section they never wrote, from the one module whose stated job is
 /// that the file and the structs are not the same shape.
 fn model_tables(file: &toml::Table) -> impl Iterator<Item = &toml::Table> {
-    file.get("model")
-        .into_iter()
-        .flat_map(|m| match m {
-            toml::Value::Table(t) => vec![t],
-            toml::Value::Array(a) => a.iter().filter_map(toml::Value::as_table).collect(),
-            _ => vec![],
-        })
-        .into_iter()
+    file.get("model").into_iter().flat_map(|m| match m {
+        toml::Value::Table(t) => vec![t],
+        toml::Value::Array(a) => a.iter().filter_map(toml::Value::as_table).collect(),
+        _ => vec![],
+    })
 }
 
 /// The internal path for one full file path, longest file prefix first.

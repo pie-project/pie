@@ -9,7 +9,7 @@
 //! many pages the cache has, how many rows a page holds, which pages a request
 //! happens to own — cannot be in it. A text that stated its page size would be
 //! right for one server and silently wrong for the next, which is why the
-//! kernel rows name these as [`Source`](kernels::Source)s and ask the driver
+//! claim bodies name these inputs and ask the driver
 //! rather than reading them off the statement.
 //!
 //! # Half of this module needs no device, and it is not gated

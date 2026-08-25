@@ -1,10 +1,26 @@
 // Generic MoE routing: choose experts, group the rows by expert, gather them,
 // and combine the sorted results back.
 //
-// Five kernels in one file, the way `moe/route.comp` and `route.metal` have
+// Seven kernels in one file, the way `moe/route.comp` and `route.metal` have
 // them: they share the routing vocabulary, and a split would put
 // `route_sort`'s output layout and `combine_sorted`'s reading of it in two
 // places that can drift.
+//
+//   router_topk                the softmax router, bf16 or f32 weights
+//   router_topk_sigmoid        \  the two RANKED routers, one arm and two
+//   router_topk_sqrt_softplus  /  defines; the arm says why that is one arm
+//   route_sort                 group the (row, slot) pairs by expert
+//   route_gather               move the rows into that order
+//   expert_combine             fold k results per token, UNSORTED
+//   combine_sorted             fold k results per token, through the inverse
+//   shared_expert_combine      the sigmoid-gated dense-plus-routed add
+//
+// This file is a BINDING VOCABULARY and not a binding CONTRACT -- the arms
+// bind three, four and five buffers and they are not the same three. That is
+// what separates it from `mlp/gated.wgsl` and `mlp/packed.wgsl`, which are
+// two files precisely because one contract is one file; a routing kernel is
+// selected by the define it is instantiated with, and no two arms are
+// substitutable for each other by accident.
 //
 // **THE SCALARS ARE MARKS NOW, NOT THREE STORAGE STRUCTS.** Four of the five
 // arms below used to bind a `RouterParams`, a `MoeRouteParams` or an
@@ -77,6 +93,7 @@
 // at its own writer's value.
 
 //#include "common/bf16.inc.wgsl"
+//#include "common/math.inc.wgsl"
 
 // The widest routing the tree compiles for. A `var<workgroup>` is sized by a
 // const-expression in WGSL, so the staging arrays are sized for the ceiling and
@@ -102,7 +119,21 @@ const ROUTER_LANES = 256u;
 // never show it. `atomicAnd` + `atomicOr` costs two instructions per weight --
 // `k` of them per row -- and is correct for every `k` rather than for the even
 // ones.
+//
+// UNDER `PIE_F32W` IT IS PLAIN `array<f32>` AND NONE OF THAT APPLIES: an f32
+// weight is a whole word, so no two lanes share one and there is nothing to
+// tear. The atomic above is a consequence of bf16's half-words, not of the
+// router's shape, and the two spellings are what make that visible.
+//
+// The f32 variant is the one `Moe::topk_softmax` fires, because that is the
+// element the DECLARATION states -- `weights: Out<Self::Tensor<f32>>`. The
+// bf16 pair stays because it is what the legacy routed families stage their
+// weights at and what `combine_sorted` beside it reads.
+//#if defined(PIE_F32W)
+@group(0) @binding(2) var<storage, read_write> expert_weights: array<f32>;
+//#else
 @group(0) @binding(2) var<storage, read_write> expert_weights: array<atomic<u32>>;
+//#endif
 // MOVED DOWN A BINDING, because the block that used to sit between this and the
 // weights is gone. `RouterParams` was binding 3 and the scale was 4; see the
 // header for why a deletion from the middle of the list renumbers what follows
@@ -157,7 +188,12 @@ fn load_scale(i: u32) -> f32 {
 //#endif
 
 // See the declaration of `expert_weights` for why this is two atomics and not
-// `pie_store_bf16`.
+// `pie_store_bf16`, and why the f32 arm needs neither.
+//#if defined(PIE_F32W)
+fn store_weight(i: u32, x: f32) {
+    expert_weights[i] = x;
+}
+//#else
 fn store_weight(i: u32, x: f32) {
     let at = i >> 1u;
     let v = pie_f32_to_bf16(x);
@@ -169,6 +205,7 @@ fn store_weight(i: u32, x: f32) {
         atomicOr(&expert_weights[at], v);
     }
 }
+//#endif
 
 @compute @workgroup_size(ROUTER_LANES)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -255,6 +292,264 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             store_weight(row * k + r, w);
         }
     }
+}
+
+//#elif defined(PIE_ROUTER_RANKED)
+// ── The two RANKED routers ──────────────────────────────────────────────────
+//
+// `router_topk` above ranks the logits and publishes a SOFTMAX over the k it
+// picked. These two rank a TRANSFORM of the logits and publish that transform
+// itself: there is no exponential over the row and no shared denominator, so
+// a row's k weights sum to whatever they sum to, and `renormalize` is what
+// decides whether that sum is divided out.
+//
+//   router_topk_sigmoid        w = sigmoid(x)
+//   router_topk_sqrt_softplus  w = sqrt(log(1 + exp(x))), ranked with a bias
+//
+// ONE ARM AND TWO DEFINES, WHERE `route.metal` WRITES THE KERNEL TWICE. The
+// sibling's reasoning is that folding them would put a `WEIGHT_FORM` enum in
+// front of the one loop whose correctness is a matter of which lane wins. That
+// is a fact about a RUN-TIME selector and this is not one: `//#if` is resolved
+// by the expander before naga ever sees the module, so the two entrypoints are
+// two whole texts here as much as they are two kernels there. What is shared
+// is the SELECTION, which is the part that must not differ, and what varies is
+// `transform` -- one function, whose arms are the two closed forms and nothing
+// else. `mlp/gated.wgsl` states the same arrangement and the same reason for
+// it.
+//
+// THE BIAS SHIFTS THE RANKING AND NOT THE WEIGHT. `sqrt_softplus`'s correction
+// bias is DeepSeek's: it is added to the value the scan COMPARES and not to
+// the value published, which is why the published weight is recomputed from
+// the logit at the chosen expert rather than carried out of the scan. Swapping
+// the two reweights every expert by its own bias, and the model still produces
+// text.
+//
+// A ROW WHOSE FAN-OUT EXCEEDS ITS EXPERT COUNT parks its spare slots on expert
+// 0 with weight zero. Repeating the last winner would double-count it in the
+// fold, and leaving the slot unwritten hands the combine whatever the arena
+// held -- an id that indexes a bank out of bounds.
+@group(0) @binding(0) var<storage, read_write> logits: array<u32>;
+@group(0) @binding(1) var<storage, read_write> expert_ids: array<i32>;
+// PLAIN `array<f32>`, and see the topk arm's declaration for why that is worth
+// saying: an f32 weight is a whole word, so the atomic pair that a bf16 weight
+// plane needs has nothing to protect here.
+@group(0) @binding(2) var<storage, read_write> expert_weights: array<f32>;
+//#if defined(PIE_SQRT_SOFTPLUS)
+// LAST, WHERE `route.metal` PUTS IT SECOND. A Metal kernel's operands are
+// numbered slots in its signature, so an optional one has to sit where the
+// signature says; here the binding numbers are the order the claim body passes
+// its buffers, so putting the correction after the three both arms share is
+// what keeps `expert_ids` at 1 and `expert_weights` at 2 in BOTH modules. That
+// is the same decision `per_expert_scale` records in the topk arm.
+//
+// One float per expert, shared by every row -- it is a property of the expert
+// and not of the token, which is why it is indexed by the lane below and never
+// by the row.
+@group(0) @binding(3) var<storage, read_write> correction: array<f32>;
+//#endif
+
+// The scalars, in the order `kernels_wgpu::moe` fires them.
+//
+// `renormalize` is a `u32` because a uniform block has no `bool`: WGSL forbids
+// `bool` in the uniform address space outright, so the flag crosses as a word
+// and is compared against zero.
+struct Params {
+    n_experts: u32,
+    experts_per_token: u32,
+    renormalize: u32,
+    scaling: f32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
+
+var<workgroup> ranked: array<f32, ROUTER_MAX_EXPERTS>;
+var<workgroup> chosen_i: array<u32, ROUTER_MAX_TOPK>;
+
+// The bf16 half-index split. `pie_load_bf16(&logits, i)` would say this once
+// for every buffer in this file and cannot be called; the topk arm's copy
+// explains why at length.
+fn load_logit(i: u32) -> f32 {
+    let word = logits[i >> 1u];
+    return pie_bf16_to_f32(select(word & 0xffffu, word >> 16u, (i & 1u) == 1u));
+}
+
+// The published weight, and the ranked value minus its bias.
+fn transform(x: f32) -> f32 {
+//#if defined(PIE_SQRT_SOFTPLUS)
+    // `sqrt(log(1 + exp(x)))`, saturated at zero.
+    //
+    // The `x > 20` branch is not an optimisation. `exp(x)` overflows f32 a
+    // little past 88 and `log(1 + inf)` is inf, so one large logit would route
+    // with an infinite weight and renormalize every other expert to zero; past
+    // 20 the two expressions agree to far inside the weight's own precision.
+    //
+    // `pie_log1p` AND NOT `log(1.0 + exp(x))`, which is where this parts from
+    // `route.metal` rather than from `dsv4_routing.cuh`: MSL has no `log1p`
+    // either and metal took the naive spelling and recorded the divergence, so
+    // its weights go to exactly zero below about x = -17 where cuda's are
+    // `sqrt(exp(x))`. `common/math.inc.wgsl` closes that in three lines, so
+    // this arm agrees with cuda at every logit -- including the tail, which is
+    // the one the correction bias can promote.
+    let sp = select(pie_log1p(exp(x)), x, x > 20.0);
+    return sqrt(max(sp, 0.0));
+//#else
+    // Sigmoid is monotone, so ranking the gate and ranking the logit choose
+    // the same experts. It is taken before the scan anyway rather than after:
+    // this is the shape the biased router beside it needs, and one scan over
+    // two different `ranked` is worse than one scan over the same.
+    return 1.0 / (1.0 + exp(-x));
+//#endif
+}
+
+@compute @workgroup_size(ROUTER_LANES)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let lane = lid.x;
+    // One workgroup per ROW, on the grid's y, exactly as the topk arm has it.
+    let row = wid.y;
+    let n = min(params.n_experts, ROUTER_MAX_EXPERTS);
+    let k = min(params.experts_per_token, ROUTER_MAX_TOPK);
+    // A row cannot pick more experts than it has. The rest of `k` is parked
+    // below; see the header.
+    let picks = min(k, n);
+    let neg = -3.0e38;
+    let base = row * n;
+
+    // Four slots per lane at the 1024 ceiling, not one -- this file's header
+    // says why the stride is the workgroup width. Everything past `n` is
+    // stamped with the neutral element rather than left alone, because the
+    // selection scans the whole array.
+    for (var e = lane; e < ROUTER_MAX_EXPERTS; e = e + ROUTER_LANES) {
+        var v = neg;
+        if (e < n) {
+            v = transform(load_logit(base + e));
+//#if defined(PIE_SQRT_SOFTPLUS)
+            v = v + correction[e];
+//#endif
+        }
+        ranked[e] = v;
+    }
+    workgroupBarrier();
+
+    // The selection is one lane's, as it is in the topk arm and in both
+    // siblings: `k` passes over `n` values is a few thousand comparisons for a
+    // router, and a parallel top-k would need a second staging array and three
+    // more barriers to answer the same question. The barrier above is what the
+    // other 255 lanes are for.
+    if (lane == 0u) {
+        for (var r = 0u; r < picks; r = r + 1u) {
+            var best = neg;
+            // Seeded IN RANGE. A strict `>` against `neg` picks the first
+            // maximum, which is the winner cuda's serial scan picks; the seed
+            // only decides what a row of NaNs does, and expert 0 with its own
+            // weight is a routing the fold can carry, where cuda's
+            // `topk_sqrtsoftplus` publishes -1 and indexes a bank with it.
+            var best_i = 0u;
+            for (var e = 0u; e < n; e = e + 1u) {
+                if (ranked[e] > best) {
+                    best = ranked[e];
+                    best_i = e;
+                }
+            }
+            chosen_i[r] = best_i;
+            ranked[best_i] = neg;
+        }
+
+        var sum = 0.0;
+        for (var r = 0u; r < picks; r = r + 1u) {
+            // THE PUBLISHED WEIGHT, WITHOUT THE BIAS. Recomputed from the
+            // logit at the chosen expert, which is the same expression the
+            // scan evaluated minus the term that only ever belonged to the
+            // ranking. The sigmoid arm has no bias and recomputes anyway, so
+            // that the two arms differ in `transform` and nowhere else.
+            let w = transform(load_logit(base + chosen_i[r]));
+            expert_ids[row * k + r] = i32(chosen_i[r]);
+            expert_weights[row * k + r] = w;
+            sum = sum + w;
+        }
+        for (var r = picks; r < k; r = r + 1u) {
+            expert_ids[row * k + r] = 0;
+            expert_weights[row * k + r] = 0.0;
+        }
+
+        var scale = params.scaling;
+        if (params.renormalize != 0u && sum > 0.0) {
+            scale = params.scaling / sum;
+        }
+        for (var r = 0u; r < k; r = r + 1u) {
+            expert_weights[row * k + r] = expert_weights[row * k + r] * scale;
+        }
+    }
+}
+
+//#elif defined(PIE_EXPERT_COMBINE)
+// Sum a token's k expert outputs, weighted by the router, reading them where
+// they were WRITTEN.
+//
+// `routed` is `[rows * k, width]` in (token, slot) order -- one row per route,
+// in the order the routes were chosen -- so slot `e` of token `n` is at row
+// `n * k + e` and there is no permutation to consult. That is the whole
+// difference between this and `combine_sorted` below, and it is why the two
+// are two arms rather than one taught an optional index: every sorted family
+// binds an inverse permutation, and a caller whose rows were never moved
+// should not carry a buffer it would only fill with the identity.
+//
+// THE WEIGHTS ARE FLOAT. `Moe::weighted_sum` declares them
+// `In<Self::Tensor<f32>>`, because a router weight is a probability and the
+// fold multiplies in float on every plane; `combine_sorted`'s are bf16 because
+// that is the element the legacy routed families stage them at.
+@group(0) @binding(0) var<storage, read_write> routed: array<u32>;
+@group(0) @binding(1) var<storage, read_write> expert_weights: array<f32>;
+// Atomic: one bf16 per invocation, so the two halves of a word are the columns
+// `c` and `c + 1` of one row -- two invocations, and two WORKGROUPS whenever
+// `c` is 16-aligned-odd. A read-modify-write would keep one and drop the
+// other.
+@group(0) @binding(2) var<storage, read_write> out_: array<atomic<u32>>;
+
+struct Params {
+    width: u32,
+    experts_per_token: u32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
+
+fn load_routed(i: u32) -> f32 {
+    let word = routed[i >> 1u];
+    return pie_bf16_to_f32(select(word & 0xffffu, word >> 16u, (i & 1u) == 1u));
+}
+
+fn store_out(i: u32, v: f32) {
+    let at = i >> 1u;
+    let b = pie_f32_to_bf16(v);
+    if ((i & 1u) == 1u) {
+        atomicAnd(&out_[at], 0x0000ffffu);
+        atomicOr(&out_[at], b << 16u);
+    } else {
+        atomicAnd(&out_[at], 0xffff0000u);
+        atomicOr(&out_[at], b);
+    }
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let row = gid.y;
+    if (c >= params.width) {
+        return;
+    }
+    let at = row * params.width + c;
+    // The row count is not in the block -- the grid carries it -- so the tail
+    // guard is the buffer's own length, which is the descriptor range the
+    // shell already bound. An overshot row is then a no-op instead of a write
+    // past the tensor.
+    if ((at >> 1u) >= arrayLength(&out_)) {
+        return;
+    }
+    let base = row * params.experts_per_token;
+    var acc = 0.0;
+    for (var e = 0u; e < params.experts_per_token; e = e + 1u) {
+        let slot = base + e;
+        acc = acc + expert_weights[slot] * load_routed(slot * params.width + c);
+    }
+    store_out(at, acc);
 }
 
 //#elif defined(PIE_ROUTE_SORT)
@@ -620,9 +915,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 //#endif
 
 // pie:instantiate combine_sorted PIE_COMBINE_SORTED=1
+// pie:instantiate expert_combine PIE_EXPERT_COMBINE=1
 // pie:instantiate route_gather PIE_ROUTE_GATHER=1
 // pie:instantiate route_sort PIE_ROUTE_SORT=1
 // pie:instantiate router_topk_bfloat16 PIE_ROUTER_TOPK=1
+// pie:instantiate router_topk_f32w_bfloat16 PIE_ROUTER_TOPK=1 PIE_F32W=1
 // pie:instantiate router_topk_scaled_bfloat16 PIE_ROUTER_TOPK=1 PIE_SCALED=1
+// pie:instantiate router_topk_sigmoid PIE_ROUTER_RANKED=1
+// pie:instantiate router_topk_sqrt_softplus PIE_ROUTER_RANKED=1 PIE_SQRT_SOFTPLUS=1
 // pie:instantiate shared_expert_combine
 // pie:instantiate shared_expert_combine_strided PIE_STRIDED=1

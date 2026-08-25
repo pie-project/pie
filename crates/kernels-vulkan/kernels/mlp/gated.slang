@@ -7,7 +7,6 @@
 
 #include "common/bf16.slang"
 
-#if defined(PIE_GEGLU_STRIDED)
 // 256x1 and flat, because that is what this row's rule says.
 //
 // This was a 16x16 workgroup with the dispatch id's `y`
@@ -27,12 +26,15 @@
 // tables and three drivers moved to fix one body. Changing the body to match
 // the rule it already states is local, needs no table edit and needs no
 // agreement from Metal. `kernels-wgpu` took the same change first.
+//
+// EVERY ARM, and the chain that stood here is gone with the last exception:
+// `PIE_SILU_STRIDED` was a 16x16 workgroup reading the row off `tid.y`, which
+// is the very shape the paragraph above condemns. It was never fired -- the
+// tree records the body as unwritten on this backend and on Metal -- so the
+// bug was latent rather than paid for, and the fix is the one the geglu arm
+// already took: one flat index over `rows * width`, recovered into a row and
+// a column.
 #define PIE_NUMTHREADS [numthreads(256, 1, 1)]
-#elif defined(PIE_SILU_STRIDED)
-#define PIE_NUMTHREADS [numthreads(16, 16, 1)]
-#else
-#define PIE_NUMTHREADS [numthreads(256, 1, 1)]
-#endif
 
 PIE_BUFFER_RO(0, gate);
 PIE_BUFFER_RO(1, up);
@@ -68,16 +70,11 @@ PIE_BUFFER_RW(2, out_);
 // `GptOssSwiGluParams` opened with a dead per-row element count, held only so
 // `limit` and `alpha` kept their offsets. A push block packed from the marks
 // the BODY passes needs no such filler, so the dead word stops at the host.
-#if defined(PIE_GEGLU_STRIDED)
+#if defined(PIE_GEGLU_STRIDED) || defined(PIE_SILU_STRIDED)
 struct Push { uint width; uint rows; uint gate_pitch; uint up_pitch; uint out_pitch; };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 #elif defined(PIE_GPTOSS)
 struct Push { float limit; float alpha; };
-[[vk::push_constant]] ConstantBuffer<Push> pc;
-#endif
-
-#if defined(PIE_SILU_STRIDED)
-struct Push { int row_pitch; };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 #endif
 
@@ -146,12 +143,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float u = clamp(PIE_LOAD(up[gid]), -pc.limit, pc.limit);
     float sig = 1.0 / (1.0 + exp(-pc.alpha * g));
     out_[gid] = PIE_STORE((g * sig) * (u + 1.0));
+#elif defined(PIE_SILU_STRIDED)
+    uint n = tid.x;
+    if (n >= pc.rows * pc.width) return;
+    uint m = n / pc.width;
+    uint k = n % pc.width;
+    float g = PIE_LOAD(gate[m * pc.gate_pitch + k]);
+    float sg = bf16_to_f32(f32_to_bf16(sigmoid_mlx(g)));
+    float sil = bf16_to_f32(f32_to_bf16(g * sg));
+    out_[m * pc.out_pitch + k] = PIE_STORE(sil * PIE_LOAD(up[m * pc.up_pitch + k]));
 #else
-    #if defined(PIE_SILU_STRIDED)
-    uint gid = tid.y * uint(pc.row_pitch) + tid.x;
-    #else
     uint gid = tid.x;
-    #endif
     if (past_the_end(gid)) return;
     float g = PIE_LOAD(gate[gid]);
     float sg = bf16_to_f32(f32_to_bf16(sigmoid_mlx(g)));

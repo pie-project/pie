@@ -15,8 +15,6 @@ pub mod quant;
 pub mod rope;
 pub mod ssm;
 
-pub type Plane = crate::plane::Metal;
-
 mod stamped {
     include!(concat!(env!("OUT_DIR"), "/entrypoints.rs"));
 }

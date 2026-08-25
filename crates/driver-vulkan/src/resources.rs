@@ -694,7 +694,7 @@ impl Frame {
     /// gather's output is one row per READOUT. `driver-metal` reaches the same
     /// number by the same route, from the same table.
     ///
-    /// **A whole fire may not use this**, and `turns::Serving::step` does not.
+    /// **A whole fire may not use this**, and `turns::Serving::step` did not.
     /// qwen3's text spells its epilogue as plain launches, so the head runs
     /// over the token window whatever the sampling says; a step therefore
     /// tells the lowering every row samples and stages the identity, and the
@@ -706,37 +706,28 @@ impl Frame {
         self.sampling_indices.len()
     }
 
-    /// The rows to lower this fire against.
-    ///
-    /// The lowering takes a per-row `samples` flag and the tables take a list
-    /// of indices, and the two are the same claim said twice. Producing both
-    /// from one place is what keeps a fire whose gather reads row 2 from being
-    /// lowered as a fire whose row 2 does not sample -- which lowers to a plan
-    /// with no gather in it at all, and passes.
-    #[must_use]
-    pub fn seriation(&self) -> Vec<model_compiler::lower::Row> {
-        let mut rows = vec![model_compiler::lower::Row::default(); self.rows()];
-        // A request contributing more than one row is a prefill, and
-        // `multi_token` is how the lowering is told. It matters here and not
-        // only in the attention: `n_requests` is the count of rows that are
-        // NOT multi-token, maxed with the count that sample, and a prefill
-        // whose rows all claimed to be single-token would size the epilogue
-        // for one readout per TOKEN.
-        for &of in &self.request_of_token {
-            let many = self.request_of_token.iter().filter(|&&r| r == of).count() > 1;
-            for (row, &owner) in rows.iter_mut().zip(&self.request_of_token) {
-                if owner == of {
-                    row.multi_token = many;
-                }
-            }
-        }
-        for &at in &self.sampling_indices {
-            if let Some(row) = rows.get_mut(at as usize) {
-                row.samples = true;
-            }
-        }
-        rows
-    }
+    // `seriation` STOOD HERE and left with the lowering it fed.
+    //
+    // It answered "the rows to lower this fire against" as a
+    // `Vec<model_compiler::lower::Row>`: one row per token, `multi_token` set
+    // for every row of a request contributing more than one, and `samples` set
+    // for every index in `sampling_indices`. The lowering took a per-row
+    // `samples` flag and the tables take a list of indices, and the two are the
+    // same claim said twice -- producing both from one place is what kept a
+    // fire whose gather reads row 2 from being lowered as a fire whose row 2
+    // does not sample, which lowers to a plan with no gather in it at all, and
+    // passes.
+    //
+    // `multi_token` mattered here and not only in the attention: `n_requests`
+    // was the count of rows that are NOT multi-token, maxed with the count that
+    // sample, so a prefill whose rows all claimed to be single-token would size
+    // the epilogue for one readout per TOKEN.
+    //
+    // `model_compiler::lower::Row` is deleted, so there is no second spelling
+    // left to keep in step. [`Self::sampling_indices`] and
+    // [`Self::request_of_token`] are still the two facts it derived from, and
+    // whoever states a walk's rows owes the same derivation from the same
+    // place.
 }
 
 /// The driver's own memory for one fire.
@@ -2421,81 +2412,24 @@ mod tests {
         );
     }
 
-    /// The rows this frame lowers against produce the count it staged.
-    ///
-    /// Two ways of saying the same thing meet at the gather: the driver stages
-    /// `sampling_indices` and the lowering computes `n_requests`, and the
-    /// shader reads the first at every index below the second. They are
-    /// computed by different crates from different inputs and nothing has ever
-    /// compared them.
-    ///
-    /// `n_requests` is `max(rows that are not multi-token, rows that sample,
-    /// 1)`, so the fires below are chosen to make those three quantities
-    /// disagree with each other: a pure decode, a lone prefill whose readout
-    /// count is far below its row count, and a mix where the prefill's
-    /// readouts exceed the decodes.
-    #[test]
-    fn the_count_the_lowering_computes_is_the_length_of_the_table_staged() {
-        use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-        use model::shared::llama_like::forward::llama_like_metal;
-        use model_compiler::lower::{Fire, lower};
-        use model_ir::trace::FireClass;
-
-        let fires: [(&str, Vec<Request>); 3] = [
-            (
-                "three decodes",
-                vec![
-                    Request::of(vec![3], vec![0]),
-                    Request::of(vec![9], vec![1, 2, 5]),
-                    Request::of(vec![0], vec![3]),
-                ],
-            ),
-            (
-                "one prefill of five, reading its last",
-                vec![Request::of(vec![0, 1, 2, 3, 4], vec![0, 4])],
-            ),
-            (
-                "two decodes and a prefill reading three of its rows",
-                vec![
-                    Request::of(vec![1], vec![0]),
-                    Request {
-                        positions: vec![0, 1, 2, 3],
-                        pages: vec![1],
-                        samples: vec![0, 2, 3],
-                        mask: Vec::new(),
-                        traced: false,
-                        writes: Vec::new(),
-                    },
-                    Request::of(vec![2], vec![2]),
-                ],
-            ),
-        ];
-        for class in [FireClass::Decode, FireClass::Prefill] {
-            let plan = llama_like_metal(
-                &LlamaLikeFacts::qwen3_0_6b(),
-                &LlamaLikeMetalFacts::synthetic(),
-                class,
-            );
-            for (what, requests) in &fires {
-                let frame = Frame::of(SMALL, requests).expect("a fire");
-                let low = lower(
-                    &plan,
-                    &frame.seriation(),
-                    Fire {
-                        captures_across_splits: false,
-                    },
-                )
-                .expect("the text lowers");
-                assert_eq!(
-                    low.n_requests as usize,
-                    frame.readouts(),
-                    "{class:?}, {what}: the gather would read {} entries of a table of {}",
-                    low.n_requests,
-                    frame.readouts()
-                );
-            }
-        }
-    }
+    // `the_count_the_lowering_computes_is_the_length_of_the_table_staged`
+    // STOOD HERE and went with `Frame::seriation` and the `lower` it called.
+    //
+    // Two ways of saying the same thing met at the gather: the driver stages
+    // `sampling_indices` and the lowering computed `n_requests`, and the
+    // shader reads the first at every index below the second. They were
+    // computed by different crates from different inputs and nothing had ever
+    // compared them, so this lowered qwen3-0.6b in both fire classes against
+    // three frames chosen to make the three quantities inside `n_requests`
+    // -- `max(rows that are not multi-token, rows that sample, 1)` -- disagree
+    // with each other: a pure decode, a lone prefill whose readout count is
+    // far below its row count, and a mix where the prefill's readouts exceed
+    // the decodes.
+    //
+    // There is no `lower` and no `n_requests`. A `Program` states its own row
+    // count and the walk stages the table against it, so the two readings this
+    // held apart are one reading now -- which is the only reason deleting the
+    // check rather than porting it is honest.
 }
 
 /// The tensors a plan names, one buffer each.
@@ -2649,14 +2583,14 @@ pub struct Model<'a> {
     pub weights: &'a Weights,
     /// The cache, the fire's tables and the fire's numbers.
     pub pool: &'a Pool,
-    /// The plan's runtime streams, value id → fire table.
-    ///
-    /// The no-ask channel's staged half: a text's `positions` is a NAMED
-    /// value like a seam's, and this is what tells the two apart at
-    /// [`Resolve::named`]. Per plan, because value ids are the plan's own
-    /// numbering — the step that builds this `Model` builds it from the plan
-    /// it is about to fire.
-    pub runtime: &'a crate::runtime::Streams,
+    // `runtime: &crate::runtime::Streams` STOOD HERE -- value id -> the fire
+    // table a plan's runtime stream stages in, consulted ahead of the seam
+    // stand-in by `named` below. It read its ids off a `ForwardPlan`, and
+    // nothing had built one since R3: `Streams::of` had no caller and this
+    // struct has no constructor, so the precedence it established was between
+    // one live population and one empty one. `walk::fire::Fire`'s `runtime`
+    // answers a stream by NAME, per statement, and is what the executor
+    // actually fires through.
 }
 
 impl Resolve for Model<'_> {
@@ -2665,14 +2599,11 @@ impl Resolve for Model<'_> {
     }
 
     fn named(&self, value: ValueId) -> Option<&Buffer> {
-        // A runtime STREAM binds the fire's own staged table; everything
-        // else named is a seam value and keeps the stand-in the seam sized.
-        // The two id populations are disjoint by construction — the trace
-        // mints runtime values, the seam publishes its own — so there is no
-        // precedence to get wrong, only a lookup that misses.
-        if let Some(which) = self.runtime.table_of(value) {
-            return Resolve::table(self.pool, which);
-        }
+        // A NAMED VALUE IS A SEAM VALUE HERE, and the stand-in is the one the
+        // seam sized. A runtime stream never arrives through this door on this
+        // driver: the walk answers one by name against the fire's own staged
+        // tables, which is where the `Streams` translation this used to
+        // consult first went.
         self.weights.named(value)
     }
 

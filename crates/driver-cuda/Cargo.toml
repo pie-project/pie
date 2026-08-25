@@ -321,10 +321,8 @@ toml = "1.1"
 # at all.
 kernels-cuda = { path = "../kernels-cuda", default-features = false }
 
-# The kernel contract vocabulary: `KernelSig`, `Ty`, and `LaunchRule` -- the
-# grid shape a row states, which `bind::launch` evaluates. A regular
-# dependency for the reason `driver-metal` states: a driver that dispatches
-# by reading a row cannot do it without the words a row is written in.
+# The shared point, operand and launch vocabulary used by claim bodies and the
+# baker's generated dispatch.
 kernels = { path = "../kernels" }
 
 # The launch ABI pilot reads the kernel table and generates both halves of the
@@ -583,7 +581,6 @@ required-features = ["_cuda", "abi"]
 # a second executor over the same kernels; see the test's own head.
 name = "banked_argmaxes"
 required-features = ["_cuda", "abi"]
-
 
 
 

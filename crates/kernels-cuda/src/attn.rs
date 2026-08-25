@@ -548,22 +548,12 @@ impl kv_scheme {
 
 impl crate::jit::Abi for kv_scheme {
     const CPP: &'static str = "::pie::attn::KvScheme";
-    const TY: kernels::Ty = kernels::Ty::KvScheme;
     fn arg(&self) -> crate::jit::ArgValue {
         crate::jit::ArgValue::U8(self.0)
     }
-    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-        match value {
-            crate::jit::ArgValue::U8(v) => Ok(Self(*v)),
-            _ => Err(kernels::Refusal::Kind {
-                at,
-                want: kernels::Ty::KvScheme,
-            }),
-        }
-    }
 }
 
-crate::arg_via_abi!(kv_scheme);
+crate::bind_via_abi!(kv_scheme);
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,22 +569,12 @@ impl kv_dtype {
 
 impl crate::jit::Abi for kv_dtype {
     const CPP: &'static str = "::pie::attn::KvDType";
-    const TY: kernels::Ty = kernels::Ty::KvDType;
     fn arg(&self) -> crate::jit::ArgValue {
         crate::jit::ArgValue::U8(self.0)
     }
-    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-        match value {
-            crate::jit::ArgValue::U8(v) => Ok(Self(*v)),
-            _ => Err(kernels::Refusal::Kind {
-                at,
-                want: kernels::Ty::KvDType,
-            }),
-        }
-    }
 }
 
-crate::arg_via_abi!(kv_dtype);
+crate::bind_via_abi!(kv_dtype);
 
 #[must_use]
 const fn scheme_byte(n: i32) -> u8 {
@@ -922,7 +902,6 @@ pub mod mla_params {
 
     by_value! {
         MlaParams as "::flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int32_t>",
-        untagged,
         probe = "nvrtc-probes/attn_mla_params.py",
         size = 288, align = 8,
         {

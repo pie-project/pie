@@ -36,7 +36,6 @@ pub mod transcode {
 
     crate::by_value! {
         DecodeBf16 as "::pie::transcode::DecodeBf16",
-        untagged,
         probe = "nvrtc-probes/quant_transcode.py",
         size = 16, align = 8,
         {
@@ -47,7 +46,6 @@ pub mod transcode {
 
     crate::by_value! {
         DecodeFp8E4m3PerGroup as "::pie::transcode::DecodeFp8E4m3PerGroup",
-        untagged,
         probe = "nvrtc-probes/quant_transcode.py",
         size = 32, align = 8,
         {
@@ -61,7 +59,6 @@ pub mod transcode {
 
     crate::by_value! {
         EncodeMxfp4 as "::pie::transcode::EncodeMxfp4",
-        untagged,
         probe = "nvrtc-probes/quant_transcode.py",
         size = 24, align = 8,
         {

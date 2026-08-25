@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::plane::{Bind, Ctx, Fire, In, InOut, Out, elementwise, elementwise_rows};
-use crate::views::KvCache;
+use crate::views::AttnFire;
 use kernels::BindMut;
 use kernels::plane::Refusal;
 
@@ -120,42 +120,12 @@ pub fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refu
     ])
 }
 
-struct Fired {
-    positions: crate::points::Handle<i32>,
-    request_of_token: crate::points::Handle<i32>,
-    mask: crate::views::MaskView,
-    split: crate::views::SplitView,
-
-    kv_heads: i32,
-}
-
-impl Fired {
-    fn of(ctx: &Ctx<'_>, kv: &crate::views::PagedKvView) -> Result<Self, Refusal> {
-        use crate::points::Staged;
-
-        let positions = ctx.stream::<i32>("positions")?;
-        let request_of_token = ctx.stream::<i32>("request_of_token")?;
-
-        let mask = unsafe { *ctx.resident::<crate::views::AttnMask>()? };
-        let split = unsafe { *ctx.resident::<crate::views::AttnSplit>()? };
-
-        let (kv_heads, _head_dim) = crate::points::pool_heads(kv)?;
-        Ok(Self {
-            positions,
-            request_of_token,
-            mask,
-            split,
-            kv_heads,
-        })
-    }
-}
-
 #[kernels_macros::claims]
 impl kernels::points::Attention for Ctx<'_> {
     fn decode<T: kernels::points::Scalar>(
         &self,
         q: In<crate::points::Handle<T>>,
-        pages: kernels::plane::Cache<kernels::raises::Struct<KvCache>>,
+        pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
         window: u32,
         head_dim: u32,
         sm_scale: f32,
@@ -169,12 +139,12 @@ impl kernels::points::Attention for Ctx<'_> {
                 what: "the kv pool row this statement names",
             });
         }
-        let kv = unsafe { &*pages.ptr };
+        let fired = unsafe { &*pages.ptr };
+        let kv = &fired.kv;
         let row = q.all("the query row")?;
         let hd = crate::points::stated("the head width this attention states", head_dim)?;
         let q_heads = crate::points::heads("the query heads this row divides into", row.width, hd)?;
         let w = crate::points::stated("the sliding extent this attention states", window)?;
-        let fired = Fired::of(self, kv)?;
         let gqa = if fired.kv_heads > 0 {
             q_heads / fired.kv_heads
         } else {
@@ -269,7 +239,7 @@ impl kernels::points::Attention for Ctx<'_> {
         &self,
         q: In<crate::points::Handle<T>>,
         indptr: In<crate::points::Handle<i32>>,
-        pages: kernels::plane::Cache<kernels::raises::Struct<KvCache>>,
+        pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
         window: u32,
         head_dim: u32,
         kv_heads: u32,
@@ -294,7 +264,7 @@ impl kernels::points::Attention for Ctx<'_> {
         &self,
         q: In<crate::points::Handle<T>>,
         indptr: In<crate::points::Handle<i32>>,
-        pages: kernels::plane::Cache<kernels::raises::Struct<KvCache>>,
+        pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
         window: u32,
         head_dim: u32,
         sm_scale: f32,
@@ -337,7 +307,7 @@ impl kernels::points::Attention for Ctx<'_> {
         &self,
         k: In<crate::points::Handle<T>>,
         v: In<crate::points::Handle<T>>,
-        pages: kernels::plane::Cache<kernels::raises::Struct<KvCache>>,
+        pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
     ) -> Result<(), Refusal> {
         crate::points::at_bf16::<T>(
             "attention.kv_append, at an element this plane does not instantiate",
@@ -347,10 +317,11 @@ impl kernels::points::Attention for Ctx<'_> {
                 what: "the kv pool row this statement names",
             });
         }
-        let kv = unsafe { &*pages.ptr };
+        let fired = unsafe { &*pages.ptr };
+        let kv = &fired.kv;
         let row = k.all("the key rows this fire appends")?;
 
-        let (kv_heads, head_dim) = crate::points::pool_heads(kv)?;
+        let (kv_heads, head_dim) = (fired.kv_heads, fired.head_dim);
         if row.width != kv_heads.saturating_mul(head_dim) {
             return Err(Refusal::Narrow {
                 what: "the appended key row, against the pool's head geometry",
@@ -381,7 +352,7 @@ impl kernels::points::Attention for Ctx<'_> {
 fn tiled<T: kernels::points::Scalar>(
     ctx: &Ctx<'_>,
     q: In<crate::points::Handle<T>>,
-    pages: kernels::plane::Cache<kernels::raises::Struct<KvCache>>,
+    pages: kernels::plane::Cache<kernels::raises::Struct<AttnFire>>,
     window: u32,
     head_dim: u32,
     stated_kv_heads: Option<u32>,
@@ -398,12 +369,12 @@ fn tiled<T: kernels::points::Scalar>(
             what: "the kv pool row this statement names",
         });
     }
-    let kv = unsafe { &*pages.ptr };
+    let fired = unsafe { &*pages.ptr };
+    let kv = &fired.kv;
     let row = q.all("the query rows this window holds")?;
     let hd = crate::points::stated("the head width this attention states", head_dim)?;
     let q_heads = crate::points::heads("the query heads this row divides into", row.width, hd)?;
     let w = crate::points::stated("the sliding extent this attention states", window)?;
-    let fired = Fired::of(ctx, kv)?;
     if let Some(stated) = stated_kv_heads {
         let stated = crate::points::stated("the key heads this attention states", stated)?;
         if stated != fired.kv_heads {

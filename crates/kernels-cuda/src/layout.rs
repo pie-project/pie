@@ -51,7 +51,7 @@ fn stated_width(width: u32, what: &'static str) -> Result<i32, Refusal> {
 }
 
 fn cuts_bf16<T: kernels::points::Scalar>() -> bool {
-    <T as kernels::Elem>::TY_MUT == <bf16 as kernels::Elem>::TY_MUT
+    T::KIND == kernels::points::ScalarKind::Bf16
 }
 
 fn as_bf16_in<T: kernels::points::Scalar>(x: In<Tensor<T>>) -> In<Tensor<bf16>> {

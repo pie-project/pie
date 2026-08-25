@@ -60,3 +60,42 @@ fn pie_sdpa_merge_sink(sink: f32, reference_max: f32, sum_exp: f32) -> PieSdpaSi
     let output_scale = exp(reference_max - merged_max);
     return PieSdpaSink(output_scale, sum_exp * output_scale + exp(sink - merged_max));
 }
+
+// THE BASE AN LSE LEAVES THIS PLANE IN, and it is the floor's base and not
+// this file's.
+//
+// `pie_sdpa_online_update` above accumulates in NATURAL log. WGSL's `exp` is
+// e^x — `exp2` is the base-two one and nothing in this family calls it — and
+// nothing folds `log2(e)` into `params.scale` on the way in, so `max_score`
+// and `sum_exp` are an `exp` pair. flashinfer's are an `exp2` pair, because
+// its HOST multiplies `sm_scale` by `log2(e)` before the launch, and
+// `attention.decode_lse` states THAT base — base two — for every plane,
+// because it is the one the plane whose kernel this tree does not own has for
+// free.
+//
+// So the rebase happens ONCE, here, at the single point where the number stops
+// being an accumulator and becomes an operand of the next statement. One
+// multiply per `(row, query head)` against a launch per reading, never a launch
+// of its own; and `attention.sink` on the far side multiplies by `ln(2)` to
+// meet the checkpoint's natural-log sink logit. A plane that published `ln`
+// instead would answer every value check in this tree and disagree with cuda by
+// a factor of 0.693 at the one place two bases meet, which is the defect
+// `kernels-cuda/kernels/attn/attn_sink.cuh`'s header was written for.
+//
+// `sum_exp == 0` is a row that kept no key — causally masked out, a window with
+// nothing in it, or a mask that took the row's own key away. flashinfer
+// publishes `-inf` there and `attn/attn_sink.wgsl` tests the exponent bits for
+// exactly that row, so `-inf` is the STATED value rather than whatever `log2(0)`
+// happens to be. It is spelled as a bit pattern because WGSL has no infinity
+// literal and a const expression that divides by zero is a shader-creation
+// error — the same reason `sample/argmax.wgsl` spells its own floor that way.
+//
+// Not a `select`: both arms of a `select` are evaluated, and `log2(0.0)` on the
+// dead arm is precisely the value this function exists not to publish.
+fn pie_sdpa_lse_base2(max_score: f32, sum_exp: f32) -> f32 {
+    const kLog2E = 1.44269504088896340736;
+    if (sum_exp > 0.0) {
+        return max_score * kLog2E + log2(sum_exp);
+    }
+    return bitcast<f32>(0xff800000u);
+}

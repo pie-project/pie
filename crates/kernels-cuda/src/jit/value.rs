@@ -108,12 +108,8 @@ impl kernels::plane::Addressed for ArgValue {
     }
 }
 
-impl kernels::plane::Absent for ArgValue {
-    fn is_absent(&self) -> bool {
-        matches!(self, Self::Ptr(p) if p.is_null())
-    }
-
-    fn absent() -> Option<Self> {
-        Some(Self::Ptr(core::ptr::null_mut()))
+impl kernels::plane::NullArg for ArgValue {
+    fn null() -> Self {
+        Self::Ptr(core::ptr::null_mut())
     }
 }

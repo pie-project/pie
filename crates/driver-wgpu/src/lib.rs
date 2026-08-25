@@ -132,7 +132,6 @@ pub mod walk;
 // answers a stream on this driver now, by NAME and per statement.
 pub mod binding;
 pub mod facts;
-pub mod geometry;
 // Not a module of this crate: `driver::names` is the one table, and the copy
 // that stood here was byte-for-byte identical to `driver-vulkan`'s 412 lines.
 // Re-exported rather than referred to directly so `driver_wgpu::names` keeps
@@ -169,7 +168,6 @@ pub mod pages;
 pub mod resources;
 
 pub use binding::{Allocation, Arena, Bound, Resolve};
-pub use geometry::{Dims, Local, Module, Rule, Tile, Ungeometric, groups, groups_within, lanes};
 /// The tier vocabulary this driver was built against.
 ///
 /// `kernels::sig_in` was re-exported beside it -- "the row a symbol belongs

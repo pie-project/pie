@@ -683,7 +683,7 @@ fn the_unreachable_scale_row_agrees_with_the_host_when_fired_by_hand() {
 ///
 /// A zero-row extent is the cheapest way to reach it and the one the archive's
 /// own launchers guarded with `if (rows == 0 || cols == 0) return;` — the
-/// JIT's `LaunchRule::eval` answers `Ungeometric::Empty` for exactly that, and
+/// The claim body's geometry helper answers `Refusal::Empty` for exactly that, and
 /// this asserts the answer travels all the way out rather than becoming a
 /// silent `Ok(false)` that would send the transform to the host.
 #[test]

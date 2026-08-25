@@ -366,7 +366,7 @@ const VISIBILITY: crate::device::Visibility = crate::device::Visibility::Device;
 /// asks `barrier_after` because its DAG states which launches run
 /// concurrently; this walk has no such statement."* The walk does have one
 /// now. [`Dispatch::writes`] is the statement, read off the row's
-/// [`kernels::Source`], and it is not the driver deciding something about a
+/// the old routine source table, and it is not the driver deciding something about a
 /// text — it is the text's own operand directions, arriving late.
 ///
 /// Measured on Llama-3.2-1B-Instruct-4bit / M1 Max, a barrier after every one

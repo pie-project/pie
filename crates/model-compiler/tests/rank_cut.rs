@@ -65,7 +65,20 @@ fn footprint(program: &Program) -> u64 {
     program.slots.iter().map(Slot::bytes).sum()
 }
 
+/// **UNREACHABLE TODAY, AND NOT BECAUSE OF THE HARDWARE.** Every `-tp2` row
+/// in the catalog refuses to bind — all six of them, all on the same point:
+/// `dist.all_reduce`, which no plane claims. This test's whole subject is
+/// what a rank cut does to a two-way lane, so there is nothing for it to
+/// measure until that point is answered.
+///
+/// It is `#[ignore]`d rather than skipped inside, because a skip inside would
+/// leave it reporting `ok` over an empty loop — which is the exact defect
+/// this suite has had to fix three times this week. An ignored test says it
+/// did not run. `model-compiler/tests/arena_liveness.rs::
+/// the_rows_that_refuse_are_named` is where the six rows are asserted, so
+/// this debt is measured even while this test cannot run.
 #[test]
+#[ignore = "every -tp2 row refuses on dist.all_reduce, which no plane claims"]
 fn every_rank_cut_lane_carries_less_than_the_whole_models() {
     for (sku, base) in pairs() {
         let (mine, whole) = (traced(sku), traced(&base));

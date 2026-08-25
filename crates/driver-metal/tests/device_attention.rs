@@ -735,7 +735,7 @@ fn a_page_shaped_decode_answers_the_whole_history() {
     // answers 1.0546875 where the reference is -0.1139, because `simd_gid`
     // runs to 31 over threadgroup arrays sized for 8.
     //
-    // `LaunchRule::SdpaVector` is 1024 threads for every point of this row.
+    // The vector attention claim states 1024 threads for every point here.
     // So the launch geometry is a THIRD thing the page-shape axis silently
     // varies, after the window and the mask, and the one point that needs a
     // different one is the one nothing can select.

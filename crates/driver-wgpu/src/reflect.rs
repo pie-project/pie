@@ -3,8 +3,8 @@
 //! A driver holds the source anyway — `kernels_wgpu::entrypoint_source` hands
 //! it the expanded text — and several of the numbers it needs to dispatch one
 //! are inside that text rather than in any table: the workgroup size, the
-//! bindings a bind-group layout must cover, and, for deciding whether a grid
-//! may be rounded, whether the shader reads its own workgroup count.
+//! bindings a bind-group layout must cover, and the layouts of parameter
+//! blocks the driver binds.
 //!
 //! Reading them here rather than restating them in `kernels-wgpu`'s table is
 //! not a preference. A table entry can drift from the shader it describes; a
@@ -65,25 +65,6 @@
 //! needs. [`Declared::uniform_bytes`] is what a shell compares its block
 //! against, and being OVER is fine.
 //!
-//! **`reads_workgroup_count` survives unchanged.** `@builtin(num_workgroups)`
-//! is a WGSL builtin and means what `gl_NumWorkGroups` means, so the rounding
-//! argument in [`crate::geometry::groups`] transfers word for word.
-//!
-//! **`grid_axes` survives but is WEAKER, and the weakness is structural.** In
-//! SPIR-V, `gl_GlobalInvocationID` is a global variable and every read of a
-//! component is an `OpAccessChain` or an `OpCompositeExtract` in the entry
-//! point's own instruction stream. In WGSL the builtin is a function
-//! ARGUMENT, and this tree's bodies pass the whole `vec3<u32>` to a helper —
-//! `norm/rms.wgsl` calls `row_base(wg)` — so the component that is really read
-//! is indexed against the CALLEE's parameter. This walk follows calls to
-//! recover it (see [`Declared::grid_axes`]), with a depth bound, and where it
-//! cannot follow it answers "every axis" rather than "no axis", because the
-//! unknown answer must not let a wrong grid pass a check. Where it CAN follow
-//! it is exact, and the pair in
-//! `tests::two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read`
-//! is the measurement: two bodies of one file, one `//#if` apart, differing in
-//! exactly the axis they read.
-//!
 //! **`block_bytes` survives for the same reason it existed.** A parameter
 //! struct in a storage buffer is what `rms_single_row`'s `params: Buf` operand
 //! binds, and a buffer shorter than the struct the shader reads is a defect
@@ -106,7 +87,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use naga::{AddressSpace, Binding, BuiltIn, Expression, Handle, Module, ShaderStage};
+use naga::{AddressSpace, Expression, Handle, Module, ShaderStage};
 
 /// The bind group `kernels-wgpu`'s ABI puts every buffer operand in.
 ///
@@ -126,14 +107,6 @@ pub const UNIFORM_GROUP: u32 = 1;
 /// The binding within [`UNIFORM_GROUP`] the block sits at. Always zero: the
 /// group holds one entry, which is the point of giving it a group.
 pub const UNIFORM_BINDING: u32 = 0;
-
-/// How deep the walk will follow a call chain looking for a grid component.
-///
-/// A grid position reaches at most one or two frames in this tree
-/// (`main` -> `row_base`), and a bound is here because the graph is data: a
-/// module `naga` accepted can still recurse, and a reflection pass that hangs
-/// is worse than one that answers conservatively.
-const MAX_CALL_DEPTH: u32 = 8;
 
 /// What a module declares about how it must be launched and bound.
 ///
@@ -156,36 +129,6 @@ pub struct Declared {
     /// its layout entry for entry, so a hole is a slot the shell has to fill
     /// with something rather than one it can leave out.
     pub bindings: u32,
-    /// Does the module read `@builtin(num_workgroups)`?
-    ///
-    /// When it does, the workgroup count is a QUANTITY the shader computes
-    /// with and not merely a bound it is clipped to, so its grid may not be
-    /// rounded up. See [`crate::geometry::groups`].
-    pub reads_workgroup_count: bool,
-    /// Which of the three grid axes the shader is actually indexed by.
-    ///
-    /// The component of `workgroup_id` or `global_invocation_id` it reads.
-    /// This is what makes a grid on the WRONG AXIS detectable, and that is not
-    /// hypothetical: the Vulkan port's first `Rule::Rms` put the row count on
-    /// y while `norm/rms` reads its row from the x workgroup id. Every row but
-    /// the first was left holding the zeros its buffer was born with, four
-    /// dispatches returned success, and the lane-coverage sweeps all passed --
-    /// they counted lanes and never asked which axis carried them.
-    ///
-    /// # Why this is a weaker answer than SPIR-V's, and which way it errs
-    ///
-    /// A WGSL builtin is a function argument, and this tree hands the whole
-    /// `vec3<u32>` to helpers. The walk follows a call whose argument is a
-    /// grid position and asks the same question of the callee's parameter, to
-    /// a bounded depth. Where a grid position is used in a way the walk
-    /// does not model — stored in a local, arithmetic on the whole vector, a
-    /// call past the depth bound — every axis is reported.
-    ///
-    /// That direction is deliberate. "Every axis" makes a check that compares
-    /// a rule's axes against the module's PERMISSIVE, which is a check that
-    /// finds nothing; "no axis" would make the same check REJECT a correct
-    /// grid, and the reader would delete the check.
-    pub grid_axes: [bool; 3],
     /// The byte offset of every member of the `@group(1) @binding(0)` uniform
     /// block, in declaration order.
     ///
@@ -311,9 +254,8 @@ pub enum Unreadable {
     ///
     /// Legal WGSL and a shape this driver cannot dispatch: an override is
     /// resolved at pipeline creation from a value the shell supplies, so the
-    /// number in the IR is not the number that will run, and
-    /// [`crate::geometry`] divides a whole fire's extent by it. Refused rather
-    /// than defaulted -- an undershot grid writes nothing and reports success.
+    /// number in the IR is not the number that will run. Refused rather than
+    /// defaulted -- an undershot grid writes nothing and reports success.
     OverriddenWorkgroup,
     /// The tree has no source for this entrypoint at this tier.
     ///
@@ -443,12 +385,9 @@ pub fn of_module(module: &Module) -> Result<Declared, Unreadable> {
         }
     }
 
-    let builtins = entry_builtins(entry);
     Ok(Declared {
         local: entry.workgroup_size,
         bindings,
-        reads_workgroup_count: builtins.workgroup_count,
-        grid_axes: axes_read(module, &entry.function, &builtins.grid_args, 0),
         uniform_offsets,
         uniform_bytes,
         used,
@@ -516,127 +455,6 @@ pub fn point(name: &str) -> Result<Declared, Unreadable> {
         seen.insert(name.to_owned(), read.clone());
     }
     Ok(read)
-}
-
-/// The builtins an entry point takes, as the two questions this module asks.
-struct Builtins {
-    /// Does it take `@builtin(num_workgroups)`?
-    workgroup_count: bool,
-    /// Which of its arguments carry a grid POSITION -- a workgroup id or a
-    /// global invocation id.
-    ///
-    /// `local_invocation_id` is deliberately not one: it indexes within a
-    /// workgroup and says nothing about which grid axis carries the work,
-    /// which is the question [`Declared::grid_axes`] is for.
-    grid_args: BTreeSet<u32>,
-}
-
-/// Which builtins the entry point's own signature names.
-fn entry_builtins(entry: &naga::EntryPoint) -> Builtins {
-    let mut out = Builtins {
-        workgroup_count: false,
-        grid_args: BTreeSet::new(),
-    };
-    for (at, arg) in entry.function.arguments.iter().enumerate() {
-        // A struct argument carries its builtins on its MEMBERS rather than on
-        // itself, so its own binding is `None`. No shader in this tree writes
-        // one; if one does, its grid positions are simply not found, and
-        // `axes_read` then answers no axis for an argument nobody indexed --
-        // which `grid_axes`'s own doc names as the case where the walk gives a
-        // lower bound.
-        let Some(Binding::BuiltIn(builtin)) = arg.binding else {
-            continue;
-        };
-        match builtin {
-            BuiltIn::NumWorkGroups => out.workgroup_count = true,
-            // `GlobalInvocationId` is `WorkGroupId * WorkGroupSize +
-            // LocalInvocationId`, so it says the same thing about WHICH axis
-            // carries the work.
-            BuiltIn::WorkGroupId | BuiltIn::GlobalInvocationId => {
-                out.grid_args.insert(at as u32);
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Which components of `grid_args` this function reads, following calls.
-///
-/// `grid_args` names argument INDICES of `function` that hold a grid position.
-/// For an entry point they come from its `@builtin` attributes; for a callee
-/// they come from which of the caller's arguments were passed into it, which
-/// is what makes `row_base(wg)` legible.
-fn axes_read(
-    module: &Module,
-    function: &naga::Function,
-    grid_args: &BTreeSet<u32>,
-    depth: u32,
-) -> [bool; 3] {
-    let mut axes = [false; 3];
-    if grid_args.is_empty() {
-        return axes;
-    }
-    // The expressions that ARE a grid position. One per argument at most, but
-    // `naga` may emit the same `FunctionArgument` expression once and reuse
-    // the handle, so this is a set rather than a map.
-    let positions: BTreeSet<Handle<Expression>> = function
-        .expressions
-        .iter()
-        .filter_map(|(handle, expr)| match expr {
-            Expression::FunctionArgument(i) if grid_args.contains(i) => Some(handle),
-            _ => None,
-        })
-        .collect();
-
-    // Every one of them has to be accounted for, or the answer is "every
-    // axis". See `Declared::grid_axes` for why that is the safe direction.
-    let mut explained: BTreeSet<Handle<Expression>> = BTreeSet::new();
-    for (_, expr) in function.expressions.iter() {
-        match expr {
-            // `wg.x` -- the ordinary case, and the only one that names an axis.
-            Expression::AccessIndex { base, index } if positions.contains(base) => {
-                explained.insert(*base);
-                if let Some(slot) = axes.get_mut(*index as usize) {
-                    *slot = true;
-                }
-            }
-            // `wg[i]` for a computed `i`. Legal, and the component is not
-            // knowable, so every axis is in play.
-            Expression::Access { base, .. } if positions.contains(base) => {
-                explained.insert(*base);
-                axes = [true; 3];
-            }
-            _ => {}
-        }
-    }
-
-    // And the calls, which is where this tree's grid positions actually go.
-    if depth < MAX_CALL_DEPTH {
-        for (callee, arguments) in calls(&function.body) {
-            let passed: BTreeSet<u32> = arguments
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| positions.contains(a))
-                .map(|(at, _)| at as u32)
-                .collect();
-            if passed.is_empty() {
-                continue;
-            }
-            for a in arguments.iter().filter(|a| positions.contains(a)) {
-                explained.insert(*a);
-            }
-            let inner = axes_read(module, &module.functions[callee], &passed, depth + 1);
-            for (slot, got) in axes.iter_mut().zip(inner) {
-                *slot |= got;
-            }
-        }
-    }
-
-    if positions.iter().any(|p| !explained.contains(p)) {
-        return [true; 3];
-    }
-    axes
 }
 
 /// Every `Statement::Call` in a block, nested blocks included.
@@ -842,72 +660,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) { out_[gid.x] = 1u; }
         assert_eq!(d.uniform_bytes, 0);
     }
 
-    /// A grid component read through a helper is still found.
-    ///
-    /// The case that separates this walk from a one-function scan. `main`
-    /// never indexes `wg`; `row_base` does, against its own parameter, and a
-    /// reflection that stopped at the entry point would report no axis at all
-    /// for every shader in this tree that factors its addressing out.
-    #[test]
-    fn a_grid_axis_indexed_inside_a_callee_is_followed() {
-        let d = declared(SAMPLE).expect("parses");
-        assert_eq!(
-            d.grid_axes,
-            [true, false, false],
-            "`row_base` reads `wg.x` and nothing reads y or z"
-        );
-    }
-
-    /// Two axes, read directly, are two axes.
-    #[test]
-    fn every_axis_a_body_indexes_is_reported() {
-        let two = r"
-@group(0) @binding(0) var<storage, read_write> out_: array<u32>;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    out_[gid.y * 16u + gid.x] = 1u;
-}
-";
-        assert_eq!(declared(two).unwrap().grid_axes, [true, true, false]);
-    }
-
-    /// A grid position the walk cannot follow reports every axis.
-    ///
-    /// The conservative direction, stated as a test so that it is a decision
-    /// rather than an accident. Here the whole vector is summed, so no
-    /// component is named and the honest answer is "unknown" -- which must
-    /// read as "any", or a check comparing a rule's axis against this would
-    /// reject a correct grid and be deleted for it.
-    #[test]
-    fn a_grid_position_used_whole_is_reported_on_every_axis() {
-        let whole = r"
-@group(0) @binding(0) var<storage, read_write> out_: array<u32>;
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wg: vec3<u32>) {
-    let v = dot(wg, vec3<u32>(1u, 1u, 1u));
-    out_[v] = 1u;
-}
-";
-        assert_eq!(declared(whole).unwrap().grid_axes, [true, true, true]);
-    }
-
-    /// `num_workgroups` is found, and its absence is found too.
-    #[test]
-    fn the_modules_that_read_their_own_workgroup_count_are_named() {
-        assert!(!declared(SAMPLE).unwrap().reads_workgroup_count);
-        let counts = r"
-@group(0) @binding(0) var<storage, read_write> out_: array<u32>;
-@compute @workgroup_size(1)
-fn main(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) n: vec3<u32>,
-) {
-    out_[wg.x] = n.x;
-}
-";
-        assert!(declared(counts).unwrap().reads_workgroup_count);
-    }
-
     /// A declared binding the entry point never reads is a hole.
     ///
     /// The question that survives from SPIR-V unchanged: `naga` keeps the
@@ -983,8 +735,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>) { out_[wg.x] = load(&x, wg.x); }
 
     /// An overridable workgroup is refused rather than read at its default.
     ///
-    /// The number in the IR is not the number that will run, and
-    /// `crate::geometry` divides a whole fire's extent by it -- so taking the
+    /// The number in the IR is not the number that will run, so taking the
     /// default is an undershoot waiting for a shell that supplies a bigger
     /// one, and an undershoot writes nothing and reports success.
     #[test]
@@ -1071,16 +822,32 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
         // it -- and a sweep whose total is not pinned silently covers less.
         //
         // UP is a family crossing and needs this line moved. It was 481 over
-        // 99 rows when this was written and is 490 over 100 now: the rows and
-        // the entrypoints both grew, which is the shape a crossing has.
+        // 99 rows when this was written and 490 over 100 after that: the rows
+        // and the entrypoints both grew, which is the shape a crossing has.
+        // It was 519 over THREE families crossing at once rather than one:
+        // `ssm` whole (the conv, the gate prologue and the two delta scans,
+        // each in a step and a chunked form) with the `norm` and `rope` tails
+        // beside it; the packed activations and the routed points; and `gemm`
+        // -- a dense matmul, which this plane had none of at all. The claim
+        // table went 21 to 50 in the same span, which is the other half of the
+        // same measurement.
+        //
+        // It is 522 now, and that is a family crossing of THREE ENTRY POINTS,
+        // which is the smallest shape one can have: `attention.{decode_lse,
+        // prefill_lse, sink}`, the three points gpt-oss states that this plane
+        // could not answer. Two are the paged bodies publishing the softmax
+        // denominator they were already computing -- one stamp each, at
+        // gpt-oss's head width and no other -- and the third is
+        // `attn/attn_sink.wgsl`, a real rescale pass that reads it. The claim
+        // table went 50 to 53 in the same commit, which is the other half of
+        // this one: three entry points, three claims, one family.
         //
         // DOWN is a loss. An entrypoint that stops being named is a body that
         // stopped being dispatchable, and the number falling on its own is
         // the only thing that reports it.
         assert_eq!(
-            read, 490,
-            "100 rows over 490 entrypoints, the count `kernels-wgpu`'s \
-             `tests/entrypoints.rs` pins from the other side"
+            read, 522,
+            "the entrypoint count `kernels-wgpu`'s shader tree declares"
         );
     }
 
@@ -1147,56 +914,4 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
     // has only the two. And `kv_write.wgsl`'s two entrypoints are no longer
     // singled out at all: they are covered exactly as far as some real text
     // launches them, which that sweep counts rather than asserts per symbol.
-
-    /// One file, two entry points, one axis apart.
-    ///
-    /// # Why this pair and not any other
-    ///
-    /// `attn/kv_write.wgsl` states both `kv_append` bodies, separated by a
-    /// single `//#if defined(PIE_PAGED)`. The paged body reads `gid.z` -- the
-    /// page index -- and the contiguous one does not. So the two agree on
-    /// everything a reader could confuse them by: file, name prefix, workgroup
-    /// size, argument list, even the `gid` binding itself. They differ in one
-    /// axis of one builtin, inside a preprocessor branch.
-    ///
-    /// That makes this the control for the whole of `grid_axes`. A reflection
-    /// that answered from the SOURCE TEXT rather than the compiled module
-    /// would give both the same answer, because both bodies are in the file
-    /// either way; only a walk over the module `kernels_wgpu` actually
-    /// produced can tell them apart.
-    ///
-    /// It also settles a note this crate carried in `geometry.rs`, which read
-    /// the `gid.z` in this file, saw `[true, true, false]` for `kv_append`,
-    /// and recorded a FALSE NEGATIVE in the reflection. The `gid.z` belongs to
-    /// the paged variant. The reflection was right and the note was wrong,
-    /// which is worth a test rather than a correction, because the note was
-    /// written from the same file this test reads.
-    #[test]
-    fn two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read() {
-        let plain = super::entrypoint("kv_append_bfloat16", kernels_wgpu::Capability::Baseline)
-            .expect("the contiguous kv_append is in the table");
-        let paged = super::entrypoint(
-            "kv_append_paged_bfloat16",
-            kernels_wgpu::Capability::Baseline,
-        )
-        .expect("the paged kv_append is in the table");
-        assert_eq!(
-            plain.grid_axes,
-            [true, true, false],
-            "the contiguous body indexes x and y; there is no page axis to read"
-        );
-        assert_eq!(
-            paged.grid_axes,
-            [true, true, true],
-            "the paged body reads `gid.z` for its page, and the walk must find it"
-        );
-        // The control, stated as an assertion so it cannot rot: the two are
-        // NOT the same answer. If they ever are, this test has stopped
-        // distinguishing the thing it exists to distinguish.
-        assert_ne!(
-            plain.grid_axes, paged.grid_axes,
-            "one `//#if` apart is enough to change the answer, or the walk is \
-             reading the file rather than the module"
-        );
-    }
 }

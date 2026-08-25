@@ -226,6 +226,27 @@ jobs:
       # `type_complexity` error and a macOS-only half". The first is gone with
       # `lowering/`; the second is now covered rather than excused.
       #
+      # `driver-vulkan` REJOINS at P5c, and the reason it could not before is
+      # the reason it can now: "wanting `slangc`" was never true of the CRATE,
+      # only of its `native` feature. `default = []`, nothing in this `-p` list
+      # turns it on, and `kernels-vulkan` is here at its own default features
+      # for the same reason -- so the shader tree is not compiled and this step
+      # never reaches a build script that looks for a Slang binary. Measured
+      # under these exact flags with `PIE_SLANGC` unset and no `slangc` on
+      # PATH: zero warnings.
+      #
+      # WHAT THAT LEAVES UNLINTED IS WORTH NAMING, because it is most of the
+      # crate. `native` gates `device`, `resources`, `shell`, `serve`,
+      # `turns`, `hold`, `frames`, `envelope`, `replay`, `dispatch`, `bind`,
+      # `binding`, `encode`, `views`, `pages` and `runtime` -- so what lints
+      # here is `facts`, `geometry`, `phase`, `programs`, `rope`, `spirv` and
+      # `lib.rs`, plus the `pure` and `rules` test targets. That is a smaller
+      # gate than `driver-metal`'s, whose portable half is most of ITS crate,
+      # and it is the same trade the Metal entry above makes: "not the whole
+      # crate" is a smaller gap than "not the crate", and an exclusion would
+      # have made it the larger one. The device half's own gate is a runner
+      # with a Vulkan ICD and a Slang compiler, which this file does not have.
+      #
       # `baker-smoke` and `model-dsl-macros` JOINED, and the first is the
       # interesting one. It reads as a GPU crate -- it links a CUDA shell,
       # `cuda-12`/`cuda-13` are its only features and it declares no default --
@@ -249,7 +270,7 @@ jobs:
             -p kernels-wgpu \
             -p kernels-metal -p kernels-vulkan -p kernels-cuda \
             -p kernels-macros -p points-dispatch \
-            -p driver-metal -p driver-wgpu \
+            -p driver-metal -p driver-wgpu -p driver-vulkan \
             -p model-dsl -p model-ir -p model-dsl-macros \
             -- -D warnings
 
@@ -304,6 +325,14 @@ jobs:
       # workspace now and a `-p` naming one is a hard cargo error; the
       # quarantine note further down carries the rest.
       #
+      # BOTH ARE BACK, and for `driver-vulkan` this is the LARGER of its two
+      # gates rather than the smaller. rustfmt reads every module the manifest
+      # names regardless of `cfg`, so this checks all 23 files -- `device.rs`
+      # and `resources.rs` and `shell.rs` included -- while the clippy step
+      # above only reaches the seven that build without `native`. The sentence
+      # this paragraph was kept for is the one that turned out to be worth
+      # keeping.
+      #
       # `model-dsl-macros` JOINED. It is a proc-macro crate, pure Rust, clean
       # under this exact command, and it had never been in this list -- one of
       # the two members the gate-coverage audit found describing nothing.
@@ -333,6 +362,7 @@ jobs:
             -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer \
             -p kernels-wgpu \
             -p kernels-macros -p points-dispatch -p driver-metal -p driver-wgpu \
+            -p driver-vulkan \
             -p model-dsl -p model-ir -p model-dsl-macros
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the

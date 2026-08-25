@@ -44,26 +44,29 @@
 //!
 //! # THE MEASUREMENT THIS EXECUTOR EXISTS TO MAKE, AND WHAT IT SAYS TODAY
 //!
-//! `kernels-wgpu` claims 21 of the floor's 81 points, and no catalog row's lane
-//! binds on this plane. Every SKU refuses at `gemm.matmul` before it refuses
-//! anywhere else, because **there is no dense matmul on this plane at all**:
-//! every matmul in `kernels/quant/` reads a bank as three weights, and the
-//! three `Gemm` points declare `Const<Self::Tensor<T>>`. `kernels_wgpu::quant`
-//! calls that "one TYPE the floor does not have" rather than three shaders
-//! nobody wrote, and it is right.
+//! THE HEADLINE GAP WAS `gemm.matmul` AND IT IS SHUT. What stood here said
+//! **there is no dense matmul on this plane at all** — every matmul in
+//! `kernels/quant/` reads a bank as three weights while the three `Gemm` points
+//! declare `Const<Self::Tensor<T>>`, which `kernels_wgpu::quant` called "one
+//! TYPE the floor does not have" rather than three shaders nobody wrote. It was
+//! right, and `kernels/gemm/dense.wgsl` is that type answered rather than
+//! worked around: the weight arrives as the dense tensor the declaration
+//! states, and two entry points read it — a staged 32x32x32 tile for
+//! `M >= 32` and a K-split vector arm below it.
 //!
-//! So this driver serves nothing yet, and that is a MEASUREMENT rather than a
-//! defect — the same one `driver-metal` landed with at P5a ("0/35 metal lanes
-//! BUILD; gemm/Bank gates every SKU — asserted so the day one binds is loud").
-//! [`crate::walk::resolve::check`] is what turns it into a load-time sentence
-//! naming the point and the first statement that asked, and [`resolve`]'s own
-//! tests assert the gap so its closing is loud.
+//! No catalog row's lane binds YET, and the reason has moved: `gemm.matmul`,
+//! `layout.embed`, `layout.select` and `layout.split_rows` no longer appear in
+//! any lane's refusal list, and what does is each SKU's own family —
+//! `mlp.geglu_tanh_packed` and `norm.mul_scalar` for gemma, `moe.*` and
+//! `rope.yarn` for gpt-oss, `ssm.*` for qwen3.5. The catalog walk at the foot
+//! of this file is still the measurement and still reports none binding;
+//! [`crate::walk::resolve::check`] is what turns a gap into a load-time
+//! sentence naming the point and the first statement that asked.
 //!
-//! What DOES work is everything either side of that gap, and it is checked
-//! rather than asserted: the walk is mutation-checked with no adapter
-//! (`tests/the_walk_is_the_program.rs`), and one claimed point —
-//! `norm.rmsnorm` — is driven through this whole path onto a real adapter and
-//! compared against a host reference (`tests/device_fire.rs`).
+//! What is CHECKED rather than asserted: the walk is mutation-checked with no
+//! adapter (`tests/the_walk_is_the_program.rs`), and `norm.rmsnorm` is driven
+//! through this whole path onto a real adapter and compared against a host
+//! reference (`tests/device_fire.rs`).
 //!
 //! # ONE CATALOG (R3), and this driver joins it at P5b
 //!
@@ -212,30 +215,32 @@ pub mod resolve {
             assert_eq!(of("norm.rmsnorm"), Some(Some(Site::Out(0))));
         }
 
-        /// THE GAP, ASSERTED SO THE DAY IT CLOSES IS LOUD.
+        /// THE GAP CLOSED, AND THIS IS THE ROW THAT SAYS WHICH POINTS SHUT IT.
         ///
-        /// `kernels-wgpu` claims no `Gemm` point, which is why no catalog row's
-        /// lane binds on this plane: every SKU in the catalog states
-        /// `gemm.matmul`, and this tree has no dense matmul at all — every
-        /// matmul it stamps reads a bank as three weights. That is not three
-        /// shaders nobody wrote; it is one TYPE the floor does not have at
-        /// these points' declarations.
+        /// This row used to be named for the gap and assert the EMPTY set of
+        /// `gemm.` claims, because every SKU in the catalog states
+        /// `gemm.matmul` and this tree had no dense matmul at all — every
+        /// matmul it stamped read a bank as three weights, which was called
+        /// "one TYPE the floor does not have" rather than three shaders nobody
+        /// wrote. `kernels/gemm/dense.wgsl` is that type answered: the weight
+        /// arrives as the `Const<Self::Tensor<T>>` the declaration states, and
+        /// two entry points read it.
         ///
-        /// This is the same shape as `driver-metal`'s "0/35 lanes BUILD"
-        /// assertion and it is here for the same reason: a measurement worth
-        /// failing on when it changes.
+        /// The replacement is the same measurement pointed the other way. All
+        /// THREE `Gemm` points are claimed and no other is, so a fourth
+        /// appearing — or one of these three going away — is a change to this
+        /// plane's headline that fails here rather than passing quietly.
         #[test]
-        fn no_gemm_point_is_claimed_and_that_is_this_planes_headline_gap() {
+        fn the_gemm_family_is_claimed_whole_and_that_is_what_shut_the_gap() {
             let gemm: Vec<&str> = CLAIMED
                 .iter()
                 .map(|(p, _, _)| *p)
                 .filter(|p| p.starts_with("gemm."))
                 .collect();
-            assert!(
-                gemm.is_empty(),
-                "this plane grew a `Gemm` claim: {gemm:?} — if a dense matmul now \
-                 exists here, the catalog's lanes may bind and this test should be \
-                 replaced by one that says which",
+            assert_eq!(
+                gemm,
+                ["gemm.matmul", "gemm.lm_head", "gemm.attention_landing"],
+                "the `Gemm` family this plane answers changed",
             );
         }
     }
@@ -247,15 +252,52 @@ mod tests {
 
     /// EVERY CATALOG ROW TRACES FOR THIS PLANE, and none of them binds a lane.
     ///
-    /// Two assertions in one walk, and the second is the one that will change.
-    /// Tracing is the plane-naming path — `trace(Backend::Wgpu)` — and it must
-    /// work for every row whose pools `model::deployment` can describe. Binding
-    /// is the claim join, and it fails for every row today because no `Gemm`
-    /// point is claimed here.
+    /// The catalog rows with at least one lane that binds on this plane.
     ///
-    /// When a dense matmul lands on this plane, THIS TEST IS THE NOTIFICATION.
+    /// A list and not a count, because WHICH rows bind says which families
+    /// landed: the two gemma rows and the three qwen rows state the dense
+    /// tower — embed, gemm, the norms, rope, the packed activations — and the
+    /// routed qwen row puts the moe family on top of it.
+    ///
+    /// THE TWO GPTOSS ROWS ARE THE NEWEST TWO, and they are here for exactly
+    /// three points. Their text states `attention.{decode_lse, prefill_lse,
+    /// sink}` — publish the softmax denominator, then rescale the output by a
+    /// learned per-head sink against it — and this plane claimed none of the
+    /// three, so both rows failed to bind on an attention statement while every
+    /// other family they name was already answered. `attn/attn_sink.wgsl` and
+    /// the two `_lse` stamps in `attn/sdpa_paged.wgsl` are what moved them, and
+    /// the trace diff reads 16/16 for both where it read 13/16.
+    const BOUND: &[&str] = &[
+        "gemma4-e4b-bf16-kv-bf16",
+        "gemma4-31b-bf16-kv-bf16",
+        "gptoss-20b-bf16-mxfp4-kv-bf16",
+        "gptoss-120b-bf16-mxfp4-kv-bf16",
+        "qwen35-a3b-bf16-kv-bf16",
+        "qwen35-d3b-bf16-kv-bf16",
+        "qwen35-d0.8b-bf16-kv-bf16",
+    ];
+
+    /// Two assertions in one walk, and the second one changed.
+    ///
+    /// Tracing is the plane-naming path — `trace(Backend::Wgpu)` — and it must
+    /// work for every row whose pools `model::deployment` can describe.
+    /// Binding is the claim join, and it used to fail for EVERY row because no
+    /// `Gemm` point was claimed here. This test said in its own words that a
+    /// dense matmul landing would be its notification.
+    ///
+    /// IT LANDED, with `ssm` whole and the packed activations and the routed
+    /// points beside it — 21 claimed points to 50 in one wave — and five rows
+    /// bind. The assertion is INVERTED rather than deleted, into [`BOUND`], so
+    /// that a regression which un-binds a row is as loud as the landing was.
+    ///
+    /// BINDING IS NOT SERVING, and the message this test used to carry asked
+    /// for both: "one that says which lanes bind and fires them". This is the
+    /// first half. A lane that binds has an answer for every point it states;
+    /// whether the whole tower computes the right tokens is what
+    /// `scripts/banked-argmaxes.sh` asks of cuda, and no shader plane can be
+    /// asked it yet.
     #[test]
-    fn every_catalog_row_traces_for_this_plane_and_none_binds_yet() {
+    fn every_catalog_row_traces_for_this_plane_and_the_bound_ones_are_named() {
         let mut bound_rows = Vec::new();
         let mut traced = 0usize;
         for row in model::serve::ROWS {
@@ -277,11 +319,15 @@ mod tests {
             }
         }
         assert!(traced > 0, "no catalog row traced for this plane at all");
-        assert!(
-            bound_rows.is_empty(),
-            "these rows now BIND a lane on the wgpu plane: {bound_rows:?} — that is \
-             the day this driver can serve something, and this test is how you find \
-             out. Replace it with one that says which lanes bind and fires them.",
+        bound_rows.sort_unstable();
+        let mut want = BOUND.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            bound_rows, want,
+            "the rows whose lanes bind on this plane have moved. A row GAINED \
+             belongs in `BOUND` — that edit is the record of the point that \
+             landed. A row LOST is a claim this plane used to answer and does \
+             not, which is a regression rather than a list to edit.",
         );
     }
 }

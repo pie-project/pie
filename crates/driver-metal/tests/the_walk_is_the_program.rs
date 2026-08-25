@@ -100,7 +100,6 @@ enum Arg {
     U32(u32),
     F32(u32),
     Usize(u64),
-    Raised,
 }
 
 struct Recorder<'b> {
@@ -125,17 +124,12 @@ impl<'b> Recorder<'b> {
 impl Encode for Recorder<'_> {
     /// The one thing a metal claim body asks the fire for: a slot the point
     /// does not carry, which the shader still declares.
-    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
-        match (ty, source) {
-            (kernels::Ty::Buf, kernels::Source::Lit(kernels::Lit::Null)) => Ok(ArgValue::Buffer(
-                self.bindings
-                    .borrow_mut()
-                    .take(driver_metal::baker::marks::NOTHING),
-            )),
-            _ => Err(Refusal::Unstated {
-                what: "a value asked for off the fire",
-            }),
-        }
+    fn absent(&self) -> Result<ArgValue, Refusal> {
+        Ok(ArgValue::Buffer(
+            self.bindings
+                .borrow_mut()
+                .take(driver_metal::baker::marks::NOTHING),
+        ))
     }
 
     fn fire(&self, fire: Launch, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -157,13 +151,12 @@ impl Encode for Recorder<'_> {
             args: args
                 .iter()
                 .map(|a| match *a {
-                    ArgValue::Buffer(h) | ArgValue::Shaped { handle: h, .. } => resolve(h, false),
+                    ArgValue::Buffer(h) => resolve(h, false),
                     ArgValue::BufferMut(h) => resolve(h, true),
                     ArgValue::I32(v) => Arg::I32(v),
                     ArgValue::U32(v) => Arg::U32(v),
                     ArgValue::F32(v) => Arg::F32(v.to_bits()),
                     ArgValue::Usize(v) => Arg::Usize(v),
-                    ArgValue::Raised(_) => Arg::Raised,
                 })
                 .collect(),
         });
@@ -843,6 +836,17 @@ const BOUND: &[&str] = &[
     "qwen35-a3b-bf16-kv-bf16",
     "qwen35-d3b-bf16-kv-bf16",
     "qwen35-d0.8b-bf16-kv-bf16",
+    // THE TWO GPT-OSS ROWS ARRIVED LAST, and what they were waiting on says
+    // what a lane is: three points, `attention.{decode_lse, prefill_lse,
+    // sink}`, none of them a kernel this plane lacked. The sdpa arms could
+    // already compute a sink-bearing softmax — they folded it into the
+    // denominator — but `decode_lse` DECLARES an `Out` lse plane, and a
+    // point is a contract about what is written. So the plane published the
+    // number it had been keeping to itself, and the rescale that reads it
+    // is a decomposition rather than a rewrite: fired end to end, the two
+    // roads agree to within a bf16 store.
+    "gptoss-20b-bf16-mxfp4-kv-bf16",
+    "gptoss-120b-bf16-mxfp4-kv-bf16",
 ];
 
 /// The eager resolve pass reports the WHOLE backlog, not the first gap.

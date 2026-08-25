@@ -23,6 +23,44 @@
 use driver_vulkan::{Declared, spirv};
 
 /// Skip with a reason when there are no modules, rather than pass silently.
+/// **THE SKIP IS A FACT, SO IT IS ASSERTED RATHER THAN PRINTED.**
+///
+/// Every sweep below opens with `modules!()`, which returns early when
+/// `kernels-vulkan` embedded no SPIR-V. That is the honest thing for a sweep
+/// over shader modules to do — but `cargo test` hides stderr, so the whole
+/// file reported `5 passed` in a configuration where it read nothing at all,
+/// and reported `5 passed` in the configuration where it read 496 modules,
+/// and the two are indistinguishable from the outside. The suite ran for
+/// months in the first one: `native` was the only route to a module table and
+/// `native` does not compile.
+///
+/// So the emptiness gets a test of its own. Nothing here can be vacuous
+/// without this failing, which is the difference between a suite that skips
+/// and a suite that is merely absent.
+#[test]
+fn the_module_table_is_empty_only_when_nothing_was_asked_to_fill_it() {
+    let n = kernels_vulkan::MODULES.len();
+    if cfg!(feature = "device") {
+        assert_eq!(
+            n, 691,
+            "`device` is on, so `kernels-vulkan` was asked for its SPIR-V and \
+             the table holds {n} rather than 686. If a shader was ADDED or a \
+             variant instantiated, raise this number — that edit is the \
+             record. If it FELL, the sweeps below are reading less than they \
+             read yesterday and every one of them still says `ok`, which is \
+             the failure this test exists for. A count near zero means \
+             `slangc` did not run at all.",
+        );
+    } else {
+        assert_eq!(
+            n, 0,
+            "`device` is off and the table holds {n} module(s). The sweeps \
+             below are then reading a table nobody stated they wanted, which \
+             means the feature no longer says what compiles the shaders.",
+        );
+    }
+}
+
 macro_rules! modules {
     () => {
         if !kernels_vulkan::embedded() {
@@ -202,7 +240,7 @@ const PARAM_BLOCKS: &[(&str, u32, u32)] = &[("argmax_logits_bfloat16", 2, 40)];
 /// Stated as its own test because `PARAM_BLOCKS` losing six rows and the push
 /// census gaining six modules are, separately, both consistent with a walk
 /// that broke: the block sweep would find nothing and the push sweep's floor
-/// is `> 600` out of 681, which six modules do not move. Only holding the two
+/// is `> 600` out of 686, which six modules do not move. Only holding the two
 /// against ONE module family tells a move from a loss.
 ///
 /// Nine fields at four-byte spacing is `struct Push` in `rms_rope.slang`,
@@ -303,7 +341,7 @@ fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
 /// into a block that arrives zeroed is a loop that runs no iterations and
 /// reports success.
 ///
-/// So: 669 of the 681 modules declare a push range. The twelve that do not are
+/// So: 674 of the 686 modules declare a push range. The twelve that do not are
 /// the launches whose every scalar is a buffer's length, which a shader reads
 /// off the binding rather than being told.
 ///
@@ -336,7 +374,7 @@ fn the_push_ranges_are_where_the_parameter_blocks_went() {
     assert!(
         modules > 600 && with_push > 600,
         "{with_push} of {modules} modules declare a push range; the shader tree \
-         is 681 modules wide and 669 of them do, so a walk this short is a walk \
+         is 686 modules wide and 674 of them do, so a walk this short is a walk \
          that stopped finding them rather than a tree that stopped having them"
     );
     assert!(
@@ -425,6 +463,20 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
     // 10), and the four sinkless `sdpa_paged_decode_combine` modules declare
     // `sinks` at binding 1 and never read it. Both are a variant sharing a
     // header with its siblings, which is what most of the 406 already were.
+    // 681 became 691 across two waves that landed the same hour, five modules
+    // each: the ssm family (the two conv arms, the `[b | a]` gate row and the
+    // two delta scans) and the gemm/layout/norm wave (the dense matmul's two
+    // arms, the two row cuts, and `norm.mul_scalar`'s stated factor).
+    //
+    // 173/418 did NOT move, and both waves owe the same reason from two
+    // directions. The ssm five each declare every binding they stamp: the one
+    // operand an arm has that its sibling lacks is `indptr`, and both conv and
+    // delta APPEND it rather than reserving it a slot in the middle. The other
+    // five declare their buffers densely from zero and RENUMBER where they
+    // vary -- `layer_scalar_mul_stated` puts `out_` at binding 1 where the read
+    // arm has it at 2, which is the alternative to a hole and is why this count
+    // is unchanged.
+    //
     // 675 became 681 with the fused norm+rope's six, and 173/418 did NOT
     // move: not one of the six has a hole. That is worth a line because the
     // family looked like it should have some -- the `freqs` arms declare an
@@ -433,7 +485,7 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
     // simply declare four and stop. A family whose optional buffer is
     // appended costs no holes; one whose optional buffer sits in the middle
     // costs a hole in every sibling, which is most of the 418.
-    assert_eq!(modules, 681, "a different number of modules is built");
+    assert_eq!(modules, 691, "a different number of modules is built");
     assert_eq!(holed, 173, "a different number of modules has a hole");
     assert_eq!(holes, 418, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header

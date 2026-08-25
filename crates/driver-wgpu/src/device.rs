@@ -644,7 +644,6 @@ pub mod probe {
 use kernels_wgpu::Capability;
 
 use crate::binding::{Allocation, Bound};
-use crate::geometry::{self, Dims, Module, Rule, Ungeometric};
 use crate::reflect::{self, Declared, STORAGE_GROUP, UNIFORM_BINDING, UNIFORM_GROUP};
 
 /// How long a device wait may take before it is called a failure.
@@ -891,11 +890,6 @@ pub enum Stage {
 /// `wgpu::Error` is not comparable and its useful content is the message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Failed {
-    /// The launch shape could not be worked out.
-    Geometry(
-        /// Why.
-        Ungeometric,
-    ),
     /// The module could not be read.
     ///
     /// Including [`reflect::Unreadable::NoSource`], which at a tier above
@@ -1066,7 +1060,6 @@ impl Failed {
 impl core::fmt::Display for Failed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Geometry(e) => write!(f, "no launch geometry: {e}"),
             Self::Module(e) => write!(f, "the module could not be read: {e}"),
             Self::Bindings { module, bound } => write!(
                 f,
@@ -1132,12 +1125,6 @@ impl core::fmt::Display for Failed {
 }
 
 impl core::error::Error for Failed {}
-
-impl From<Ungeometric> for Failed {
-    fn from(e: Ungeometric) -> Self {
-        Self::Geometry(e)
-    }
-}
 
 impl From<reflect::Unreadable> for Failed {
     fn from(e: reflect::Unreadable) -> Self {
@@ -1362,11 +1349,13 @@ impl Pipeline {
         self.declared.uniform_bytes
     }
 
-    /// The geometry the module imposes: its workgroup, and the tile its name
-    /// encodes.
+    /// Convert the logical lanes stated by a claim into WebGPU workgroups.
+    ///
+    /// The divisor comes from the compiled entrypoint, so claim bodies state
+    /// only their logical extent and cannot duplicate `@workgroup_size`.
     #[must_use]
-    pub fn module(&self) -> Module {
-        Module::loaded(&self.entrypoint, &self.declared)
+    pub fn workgroups(&self, lanes: [u32; 3]) -> [u32; 3] {
+        std::array::from_fn(|axis| lanes[axis].div_ceil(self.declared.local[axis]))
     }
 }
 
@@ -3935,35 +3924,6 @@ impl Pipelines {
             _module: shader,
         })
     }
-}
-
-/// The workgroup count for a fire, from the rule and the module it will run.
-///
-/// The one place [`geometry`] and this module meet, and the reason the LOADED
-/// module is what answers: the divisor and the GEMM tile are the module's, and
-/// asking it is what keeps them from being assumed.
-///
-/// [`geometry::groups_within`] rather than `groups`, because a device is in
-/// hand here and `max_compute_workgroups_per_dimension` is the number a wide
-/// enough elementwise launch reaches. A refusal names the axis.
-///
-/// # Errors
-///
-/// [`Failed::Geometry`] when the rule cannot answer for these dimensions, or
-/// when the grid is past what this adapter dispatches.
-pub fn groups_for(
-    device: &Device,
-    pipeline: &Pipeline,
-    rule: Rule,
-    dims: Dims,
-) -> Result<[u32; 3], Failed> {
-    geometry::groups_within(
-        rule,
-        dims,
-        pipeline.module(),
-        device.limits.workgroups_per_dimension,
-    )
-    .map_err(Failed::Geometry)
 }
 
 #[cfg(test)]

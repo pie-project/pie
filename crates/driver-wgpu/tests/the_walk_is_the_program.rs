@@ -33,9 +33,10 @@
 //!
 //! Every other point rides its input. So a plan that opens on a runtime plane
 //! refuses with `Why::Unsized` at its first statement, whichever claimed point
-//! that is — which [`no_claimed_point_can_seed_a_tower`] measures across all
-//! twenty-one of them, so that the day one can, this file's premise changes
-//! visibly.
+//! that is — which [`the_points_that_can_seed_a_tower_are_named`] measures
+//! across every point this plane claims, so that the day one can, this file's
+//! premise changes visibly. IT DID: the claim table went 21 to 50 and three
+//! of the new points size their own rectangle. See that test.
 //!
 //! What that costs is precise and worth naming: the real width walk and the
 //! real arena carve are NOT exercised here, because nothing on this plane can
@@ -119,7 +120,6 @@ enum Arg {
     U32(u32),
     F32(u32),
     Usize(u64),
-    Raised,
 }
 
 struct Recorder<'b> {
@@ -144,15 +144,8 @@ impl<'b> Recorder<'b> {
 impl Encode for Recorder<'_> {
     /// The one thing a wgpu claim body asks the fire for: a binding the point
     /// does not carry, which the entrypoint still declares.
-    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
-        match (ty, source) {
-            (kernels::Ty::Buf, kernels::Source::Lit(kernels::Lit::Null)) => {
-                Ok(ArgValue::Buffer(self.bindings.borrow_mut().take(NOTHING)))
-            }
-            _ => Err(Refusal::Unstated {
-                what: "a value asked for off the fire",
-            }),
-        }
+    fn absent(&self) -> Result<ArgValue, Refusal> {
+        Ok(ArgValue::Buffer(self.bindings.borrow_mut().take(NOTHING)))
     }
 
     fn fire(&self, fire: Launch, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -173,12 +166,11 @@ impl Encode for Recorder<'_> {
             args: args
                 .iter()
                 .map(|a| match *a {
-                    ArgValue::Buffer(h) | ArgValue::Shaped { handle: h, .. } => resolve(h),
+                    ArgValue::Buffer(h) => resolve(h),
                     ArgValue::I32(v) => Arg::I32(v),
                     ArgValue::U32(v) => Arg::U32(v),
                     ArgValue::F32(v) => Arg::F32(v.to_bits()),
                     ArgValue::Usize(v) => Arg::Usize(v),
-                    ArgValue::Raised(_) => Arg::Raised,
                 })
                 .collect(),
         });
@@ -446,10 +438,36 @@ fn walk(plan: &Plan, program: &Program) -> (Vec<Fired>, usize) {
 /// behind — and the loop says so where it skips.
 ///
 /// THE DAY THIS FAILS IS THE DAY THIS FILE GETS SIMPLER: a claimed point that
+/// The claimed points that can START a tower on this plane, as measured
+/// against the synthetic plan below.
+///
+/// A point can seed only if its shape sizes a rectangle WITHOUT reading an
+/// operand: every other rule rides its input, and a runtime plane has no
+/// rectangle for one to ride.
+///
+/// THE THREE ROUTERS, AND NOT `layout.embed`, WHICH IS THE SURPRISE. The
+/// obvious candidate is the embed — `[fire, table.axis(1)]` is why every
+/// shipping text opens with one — and it is claimed here now. It does not
+/// appear because THIS fixture hands one weight, `norm.weight`, and the
+/// embed's second axis is the TABLE's; sized against the wrong bank it is not
+/// sized at all. What does appear is `moe.topk_*`, whose output is
+/// `[fire, top_k]` and whose `top_k` is a STATED scalar, so the rectangle
+/// comes off the params run and no operand is read.
+///
+/// So this list measures what the fixture can prove rather than what the
+/// plane can do, and the assertion below says the same thing in its own
+/// words: `bound` can build a real Program now, so the fixture should stop
+/// stating one by hand. `driver-vulkan`'s twin already does.
+const SEEDS: &[&str] = &[
+    "moe.topk_sigmoid",
+    "moe.topk_softmax",
+    "moe.topk_sqrt_softplus",
+];
+
 /// can seed means `bound` can build a real `Program` for a synthetic tower, and
 /// [`program`] should be deleted in favour of calling it.
 #[test]
-fn no_claimed_point_can_seed_a_tower() {
+fn the_points_that_can_seed_a_tower_are_named() {
     let mut seeds = Vec::new();
     for (point, _, _) in kernels_wgpu::points_dispatch::CLAIMED {
         // THE RESULT COUNT IS THE DECLARATION'S, read off the floor rather
@@ -496,11 +514,16 @@ fn no_claimed_point_can_seed_a_tower() {
             seeds.push(*point);
         }
     }
-    assert!(
-        seeds.is_empty(),
-        "these claimed points can now seed a tower: {seeds:?} — `bound` can \
-         build a real Program for a synthetic plan, so this file should stop \
-         stating one by hand",
+    seeds.sort_unstable();
+    assert_eq!(
+        seeds, SEEDS,
+        "the claimed points that can seed a tower have moved. A point GAINED \
+         belongs in `SEEDS`; a point LOST means this plane stopped being able \
+         to start a tower with it, which is a regression.\n\nAnd the note this \
+         assertion used to carry still stands: `bound` can build a real \
+         Program for a synthetic plan now, so this file SHOULD stop stating \
+         one by hand. `driver-vulkan`'s twin already does, because \
+         `layout.embed` was claimed there first.",
     );
 }
 
@@ -908,8 +931,14 @@ fn the_resolve_pass_reports_the_backlog_and_dedupes_it() {
     let mut unclaimed = plan.clone();
     let mut program = program();
     for (i, step) in program.steps.iter_mut().enumerate() {
-        unclaimed.ops[i].kernel = "mlp.swiglu".to_string();
-        step.call = Call::Point("mlp.swiglu".into());
+        // `mla.absorb_q`, and it USED TO BE `mlp.swiglu` — which this plane
+        // claims now. A test whose subject is "a point this plane does not
+        // claim" has to be re-pointed the day the plane claims it, or it goes
+        // on passing for a reason that is no longer the one written here. The
+        // whole `mla` family is still unclaimed; so are `index`, `pool`, `hc`
+        // and the three lse points.
+        unclaimed.ops[i].kernel = "mla.absorb_q".to_string();
+        step.call = Call::Point("mla.absorb_q".into());
     }
     let out = driver_wgpu::baker::resolve::check(&unclaimed, &program);
     assert_eq!(out.len(), 1, "four statements of one point are one row");

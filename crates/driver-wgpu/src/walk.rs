@@ -89,9 +89,9 @@ pub mod marks;
 /// The eager resolve pass: every step's `Call` checked at LOAD.
 pub mod resolve;
 
-use kernels::bound::{Axis, BoundOp, Rides, Site};
+use kernels::bound::{BoundOp, Site};
 use kernels::plane::{Cache, Const, In, InOut, Out, Refusal};
-use kernels::points::Repr;
+use kernels::points::{Repr, Scalar, ScalarKind};
 
 pub use fire::{Blit, Cursor, Extent, Fire, Refused};
 pub use lane::{BANK_ALIGN, Baked, Bank, READABLE_BASE, arena_of, join, readable_base, word_of};
@@ -121,7 +121,7 @@ pub type Recurrent<'p, P> = <<P as Fires<'p>>::Ctx as kernels::points::Plane>::R
 /// The shape `kernels-metal` and `kernels-wgpu` both emit for `CLAIMED` and
 /// `TIER2`. Named here so [`Plane`] can carry the pair without either driver
 /// spelling the tuple out again.
-pub type Census = &'static [(&'static str, Option<Site>, &'static [Axis])];
+pub type Census = &'static [(&'static str, Option<Site>, &'static [ScalarKind])];
 
 /// One of the six per-fire planes a `Slot::Runtime` can name.
 ///
@@ -327,26 +327,26 @@ pub trait Fires<'p>: Plane {
     fn recurrent_cache(view: &Self::RecurrentView) -> Cache<Recurrent<'p, Self>>;
 
     /// The operand mark, over a freshly minted handle.
-    fn rin<T: Rides>(
+    fn rin<T: Scalar>(
         b: &mut Bindings<Self::Slice>,
         r: Rect<Self::Slice>,
     ) -> In<Tensor<'p, Self, T>>;
 
     /// The result mark.
-    fn rout<T: Rides>(
+    fn rout<T: Scalar>(
         b: &mut Bindings<Self::Slice>,
         r: Rect<Self::Slice>,
     ) -> Out<Tensor<'p, Self, T>>;
 
     /// The in-place mark: ONE handle standing in two columns, over the RESULT's
     /// rectangle with the operand's bytes already scheduled into it.
-    fn rio<T: Rides>(
+    fn rio<T: Scalar>(
         b: &mut Bindings<Self::Slice>,
         r: Rect<Self::Slice>,
     ) -> InOut<Tensor<'p, Self, T>>;
 
     /// A weight, as a `Const` slot takes it: A REGION AND NO RECTANGLE.
-    fn wconst<T: Rides>(
+    fn wconst<T: Scalar>(
         b: &mut Bindings<Self::Slice>,
         w: Self::Slice,
     ) -> Const<Tensor<'p, Self, T>>;

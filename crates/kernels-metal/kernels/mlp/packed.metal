@@ -37,6 +37,20 @@
 // fire, while an address the kernel computes is layout and belongs to the
 // kernel -- and `I` is on the layout side of it.
 
+// `packed_row` IS NOT CALLED `half`, AND THAT NAME WAS A COMPILE ERROR.
+// `half` is a BUILT-IN TYPE in MSL -- 16-bit float -- so `const size_t half`
+// is "cannot combine with previous 'type-name' declaration specifier", and
+// every use of it after that is a parse error cascading. This file was
+// written on a Linux box with no Metal compiler and shipped with the name in
+// five functions; a real device found it the first time one was reached.
+//
+// The name was also WRONG, which is the part worth keeping. It is not a
+// half: `row` is the OUTPUT row's base and the output row is `intermediate`
+// wide, while the packed input row is `2 * intermediate`, so `row * 2` is
+// where this row's gate half BEGINS. The gate half is at `packed_row + i`
+// and the up half at `packed_row + intermediate + i`, which the two lines
+// below now read as what they are.
+
 #include <metal_stdlib>
 
 using namespace metal;
@@ -57,9 +71,9 @@ template <typename T>
     uint2 gid [[thread_position_in_grid]]) {
   const uint i = gid.x;
   const size_t row = size_t(gid.y) * size_t(intermediate);
-  const size_t half = row * 2;
-  const float g = float(packed[half + i]);
-  const float u = float(packed[half + intermediate + i]);
+  const size_t packed_row = row * 2;
+  const float g = float(packed[packed_row + i]);
+  const float u = float(packed[packed_row + intermediate + i]);
   out[row + i] = static_cast<T>((g / (1.0f + metal::exp(-g))) * u);
 }
 
@@ -85,9 +99,9 @@ template <typename T>
     uint2 gid [[thread_position_in_grid]]) {
   const uint i = gid.x;
   const size_t row = size_t(gid.y) * size_t(intermediate);
-  const size_t half = row * 2;
-  float g = float(packed[half + i]);
-  float u = float(packed[half + intermediate + i]);
+  const size_t packed_row = row * 2;
+  float g = float(packed[packed_row + i]);
+  float u = float(packed[packed_row + intermediate + i]);
   g = min(g, limit);
   u = clamp(u, -limit, limit);
   out[row + i] = static_cast<T>((g / (1.0f + metal::exp(-g))) * u);
@@ -125,9 +139,9 @@ template <typename T>
     uint2 gid [[thread_position_in_grid]]) {
   const uint i = gid.x;
   const size_t row = size_t(gid.y) * size_t(intermediate);
-  const size_t half = row * 2;
-  float g = float(packed[half + i]);
-  float u = float(packed[half + intermediate + i]);
+  const size_t packed_row = row * 2;
+  float g = float(packed[packed_row + i]);
+  float u = float(packed[packed_row + intermediate + i]);
   g = min(g, limit);
   u = clamp(u, -limit, limit);
   const float sig = 1.0f / (1.0f + fast::exp(-alpha * g));
@@ -159,9 +173,9 @@ template <typename T>
   constexpr float k = 0.7978845608028654f;
   const uint i = gid.x;
   const size_t row = size_t(gid.y) * size_t(intermediate);
-  const size_t half = row * 2;
-  const float g = float(packed[half + i]);
-  const float u = float(packed[half + intermediate + i]);
+  const size_t packed_row = row * 2;
+  const float g = float(packed[packed_row + i]);
+  const float u = float(packed[packed_row + intermediate + i]);
   const float inner = k * (g + 0.044715f * g * g * g);
   const float gelu = 0.5f * g * (1.0f + precise::tanh(inner));
   out[row + i] = static_cast<T>(gelu * u);
@@ -196,9 +210,9 @@ template <typename T>
     uint2 gid [[thread_position_in_grid]]) {
   const uint i = gid.x;
   const size_t row = size_t(gid.y) * size_t(intermediate);
-  const size_t half = row * 2;
-  const float g = float(packed[half + i]);
-  float u = float(packed[half + intermediate + i]);
+  const size_t packed_row = row * 2;
+  const float g = float(packed[packed_row + i]);
+  float u = float(packed[packed_row + intermediate + i]);
   const float s = beta * precise::tanh(g / beta) / (1.0f + metal::exp(-g));
   if (up_cap > 0.0f) {
     u = up_cap * precise::tanh(u / up_cap);

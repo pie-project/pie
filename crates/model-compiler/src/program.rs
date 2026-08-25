@@ -438,9 +438,35 @@ fn bind(plan: &Plan, at: usize, lane: &crate::sweep::Lane) -> Result<Program, Re
     })
 }
 
+/// A slot's size, rounded up to the largest storage-buffer offset alignment
+/// a conformant device may demand.
+///
+/// TWO HUNDRED AND FIFTY-SIX, AND IT USED TO BE SIXTEEN. Sixteen was chosen
+/// so a freed hole is aligned too, which keeps every offset aligned with no
+/// separate padding pass — that reasoning is unchanged and the only thing
+/// that moved is the number. What moved it: Vulkan's
+/// `minStorageBufferOffsetAlignment` may be as large as 256 on a conformant
+/// device, a slot's byte base is `offset * rows`, and a decode at one row
+/// binds the carve's own offset. At sixteen, a plan this compiler laid out
+/// was one such a device would refuse to bind — silently on the adapter this
+/// tree happens to test on, which reports sixteen.
+///
+/// `model_compiler::lower` rounded to 256 and `driver-vulkan/tests/arena.rs`
+/// existed to check it; the carve that replaced it dropped to 16 and that
+/// test recorded the loss as a negative, saying the day it is 256 again the
+/// file would say so. This is that day.
+///
+/// MEASURED BEFORE IT WAS CHANGED, over every catalog row that compiles:
+/// the row pitch is IDENTICAL at 16 and at 256 for every SKU but one, and
+/// gpt-oss pays 128 bytes on a 407,936-byte row — 0.03%. A slot count in the
+/// hundreds and sizes already far above 256 is why: the rounding almost
+/// never has anything to round.
 fn align16(bytes: u64) -> u64 {
-    (bytes + 15) & !15
+    bytes.div_ceil(BIND_ALIGN) * BIND_ALIGN
 }
+
+/// The alignment above, named where a reader looking for the number will be.
+const BIND_ALIGN: u64 = 256;
 
 /// The steps one value must survive, in the lane's own issue order.
 ///

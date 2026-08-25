@@ -217,7 +217,7 @@ fn plan() -> Plan {
 /// The program, stated by hand for the reason `tests/the_walk_is_the_program.rs`
 /// gives at length in its header: no point this plane claims can SEED a tower,
 /// so `model_compiler::program::bound` can build nothing here. The measurement
-/// itself is `no_claimed_point_can_seed_a_tower`, which walks all twenty-one
+/// itself is `the_points_that_can_seed_a_tower_are_named`, which walks all twenty-one
 /// claims. Two value-major rectangles, `x` then `y`.
 fn program() -> Program {
     let row = WIDTH * 2;
@@ -344,15 +344,12 @@ fn norm_rmsnorm_fires_through_the_baker_path_and_matches_a_host_reference() {
     let pipeline = pipelines
         .get(&device, d.symbol, Capability::Baseline, &source)
         .expect("the module builds a pipeline on this adapter");
-    let local = pipeline.module().local;
-    let groups = [
-        d.lanes[0].div_ceil(local.at(0)),
-        d.lanes[1].div_ceil(local.at(1)),
-        d.lanes[2].div_ceil(local.at(2)),
-    ];
+    let groups = pipeline.workgroups(d.lanes);
     println!(
         "workgroup {:?} -> {groups:?} groups; bindings {}",
-        [local.at(0), local.at(1), local.at(2)],
+        driver_wgpu::reflect::entrypoint(d.symbol, Capability::Baseline)
+            .expect("the entrypoint reflects")
+            .local,
         pipeline.bindings(),
     );
     assert_eq!(

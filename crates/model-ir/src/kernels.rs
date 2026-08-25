@@ -24,7 +24,6 @@
 //! What is left is the join the baker path does use, and it is two
 //! functions.
 
-pub use kernels::Kind;
 pub use kernels::points;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -42,6 +41,17 @@ pub enum Backend {
     /// `trace(..)` call in `Baked::of`, which is the whole of what used to be
     /// a load-time binding on this plane too.
     Wgpu,
+
+    /// The Vulkan plane, on the terms `Wgpu` arrived on at P5b.
+    ///
+    /// `kernels-vulkan`'s seven `#[claims]` blocks have emitted their
+    /// `*_CLAIMS` tables since they were written and NOTHING HAS EVER READ
+    /// THEM: that crate's own manifest records the consequence — *"`model-ir`'s
+    /// `Backend` has no vulkan arm, so `canon_symbol` never reached this
+    /// crate"* — and without a row here `sweep::resolve` cannot join a lane's
+    /// points against the plane at all, so every lane refuses for a reason that
+    /// is about this table rather than about the plane.
+    Vulkan,
 }
 
 // `Backend::of_family` STOOD HERE: the second segment of a dotted family
@@ -174,6 +184,58 @@ const WGPU_CLAIMS: &[&[&str]] = &[
     kernels_wgpu::points::HC_CLAIMS,
 ];
 
+/// Every family a vulkan `#[claims]` block answers — the same line-per-family
+/// shape as the three above, on the third shader plane to reach this table.
+///
+/// EIGHT LINES AND NOT FOURTEEN, and that is the difference worth naming
+/// rather than padding over. [`METAL_CLAIMS`] lists all fourteen because
+/// `kernels-metal` writes an impl block for every family it does not answer,
+/// so a `*_CLAIMS` const exists to be empty; `kernels-vulkan` writes EIGHT
+/// impl blocks and no more, so for `Dist`, `Mla`, `Index`, `Pool` and `Hc`
+/// there is no const for a line here to name. The join this function makes is
+/// a concatenation, so the two spellings answer the same — what is lost is the
+/// measurement, which is exactly the reading metal's own comment gives: a
+/// family a plane does not implement at all is a hole in the table where a
+/// measurement should be. Five such holes are this plane's backlog, and
+/// `crates/points-dispatch`'s `vulkan()` says the same thing from the other
+/// side.
+///
+/// `Gemm` AND `Ssm` BOTH LEFT THAT LIST, in the same hour and from two
+/// different agents, which is why this paragraph reads as one correction and
+/// not two: the list was six and is five and then four as each family got an
+/// impl block.
+///
+/// `SSM_CLAIMS` IS FIVE POINTS, NOT SEVEN. The two conv arms, `gdn_prep` and
+/// the two gated-delta scans are written; `ssm.kda_step` and
+/// `ssm.kda_chunked` are not in the impl block at all. That is the difference
+/// between a backlog and a lie: `#[points]` gives every point a default body
+/// refusing `unclaimed`, so a point left OUT of the block refuses by name and
+/// is counted nowhere, while a point written INTO it as a refusal would be
+/// counted here and would make this plane read as answering a scan it does
+/// not have. `driver-vulkan/tests/doors.rs` opens on that exact failure, and
+/// this is what not repeating it looks like from the table's side.
+///
+/// `GEMM_CLAIMS` IS THE LINE THAT WAS ADDED, and adding it is the whole of
+/// what this family needed from this file: a plane that answers a point and is
+/// not named here answers it to nobody, because [`point_claims`] is what
+/// `sweep::resolve` binds a lane against. The dense matmul gates every SKU in
+/// the catalog, so the seventh hole closing is the one that lets a lane bind
+/// at all.
+///
+/// `GATE_CLAIMS` reads from `attn` for metal's reason, and `LAYOUT_CLAIMS`
+/// from `layout` while both of its claimed points fire out of `attn/`.
+const VULKAN_CLAIMS: &[&[&str]] = &[
+    kernels_vulkan::norm::NORM_CLAIMS,
+    kernels_vulkan::mlp::MLP_CLAIMS,
+    kernels_vulkan::gemm::GEMM_CLAIMS,
+    kernels_vulkan::rope::ROPE_CLAIMS,
+    kernels_vulkan::moe::MOE_CLAIMS,
+    kernels_vulkan::layout::LAYOUT_CLAIMS,
+    kernels_vulkan::attn::ATTENTION_CLAIMS,
+    kernels_vulkan::attn::GATE_CLAIMS,
+    kernels_vulkan::ssm::SSM_CLAIMS,
+];
+
 /// The points a plane's `#[claims]` impl blocks answer — baker's claim
 /// table, consulted ahead of the routine `canon` attributes. One slice per
 /// migrated family, concatenated; a family lands by adding its line, and the
@@ -183,10 +245,12 @@ pub fn point_claims(backend: Backend) -> &'static [&'static str] {
     static CUDA: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     static METAL: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     static WGPU: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    static VULKAN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     match backend {
         Backend::Cuda => CUDA.get_or_init(|| CUDA_CLAIMS.concat()),
         Backend::Metal => METAL.get_or_init(|| METAL_CLAIMS.concat()),
         Backend::Wgpu => WGPU.get_or_init(|| WGPU_CLAIMS.concat()),
+        Backend::Vulkan => VULKAN.get_or_init(|| VULKAN_CLAIMS.concat()),
     }
 }
 
@@ -214,7 +278,12 @@ pub fn canon_symbol(plane: Backend, claim: &str) -> Option<&'static str> {
         // outside the lowered plan, so no claim ever reaches them. A plane
         // with nothing here answers every unclaimed point as unclaimed, which
         // is the honest report and is what the backlog is for.
-        Backend::Wgpu => &[],
+        //
+        // `Vulkan` states none for the same reason and by the same route: its
+        // 101 `#[routine]` fns and the `linkme` slice that collected them are
+        // deleted, and the `#[claims]` blocks that replaced them answer by
+        // POINT. There is no `CANON` const in `kernels-vulkan` to name.
+        Backend::Wgpu | Backend::Vulkan => &[],
     };
     table
         .iter()

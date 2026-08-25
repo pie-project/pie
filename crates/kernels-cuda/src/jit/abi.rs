@@ -1,35 +1,25 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use kernels::Ty;
-
 pub trait Abi: Copy {
     const CPP: &'static str;
-
-    const TY: Ty;
 
     const NULLABLE: bool = false;
 
     fn arg(&self) -> crate::jit::ArgValue;
-
-    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal>;
 }
 
-const fn wrong_kind(at: usize, want: Ty) -> kernels::Refusal {
-    kernels::Refusal::Kind { at, want }
-}
-
-pub fn unpack_aggregate<T: Copy>(
-    value: &crate::jit::ArgValue,
-    at: usize,
-    want: Ty,
-) -> Result<T, kernels::Refusal> {
-    match value {
-        crate::jit::ArgValue::Bytes { ptr, len } if *len == core::mem::size_of::<T>() => {
-            Ok(unsafe { ptr.cast::<T>().read_unaligned() })
-        }
-        _ => Err(wrong_kind(at, want)),
-    }
+#[macro_export]
+macro_rules! bind_via_abi {
+    ($($rust:ty),* $(,)?) => {
+        $(
+            impl ::kernels::plane::Bind<$crate::jit::ArgValue> for $rust {
+                fn arg(self) -> $crate::jit::ArgValue {
+                    <$rust as $crate::jit::Abi>::arg(&self)
+                }
+            }
+        )*
+    };
 }
 
 #[allow(non_camel_case_types)]
@@ -71,8 +61,6 @@ impl<T: 'static> kernels::Elem for MaybeConst<T> {
     }
 
     const CPP: &'static str = "void";
-    const TY_CONST: Ty = Ty::Buf;
-    const TY_MUT: Ty = Ty::BufMut;
 }
 
 impl<T> MaybeConst<T> {
@@ -88,45 +76,31 @@ impl<T> MaybeConst<T> {
 }
 
 macro_rules! scalar_abi {
-    ($rust:ty, $cpp:literal, $ty:ident, $arg:ident) => {
+    ($rust:ty, $cpp:literal, $arg:ident) => {
         impl Abi for $rust {
             const CPP: &'static str = $cpp;
-            const TY: Ty = Ty::$ty;
             fn arg(&self) -> crate::jit::ArgValue {
                 crate::jit::ArgValue::$arg(*self)
             }
-            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-                match value {
-                    crate::jit::ArgValue::$arg(v) => Ok(*v),
-                    _ => Err(wrong_kind(at, Ty::$ty)),
-                }
-            }
         }
-        $crate::arg_via_abi!($rust);
+        $crate::bind_via_abi!($rust);
     };
 }
 
-scalar_abi!(i32, "int", I32, I32);
-scalar_abi!(u32, "unsigned int", U32, U32);
-scalar_abi!(f32, "float", F32, F32);
-scalar_abi!(bool, "bool", Bool, Bool);
-scalar_abi!(i64, "long long", I64, I64);
-scalar_abi!(usize, "std::size_t", Usize, Usize);
+scalar_abi!(i32, "int", I32);
+scalar_abi!(u32, "unsigned int", U32);
+scalar_abi!(f32, "float", F32);
+scalar_abi!(bool, "bool", Bool);
+scalar_abi!(i64, "long long", I64);
+scalar_abi!(usize, "std::size_t", Usize);
 
 impl Abi for u64 {
     const CPP: &'static str = "std::size_t";
-    const TY: Ty = Ty::Usize;
     fn arg(&self) -> crate::jit::ArgValue {
         crate::jit::ArgValue::Usize(*self as usize)
     }
-    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-        match value {
-            crate::jit::ArgValue::Usize(v) => Ok(*v as u64),
-            _ => Err(wrong_kind(at, Ty::Usize)),
-        }
-    }
 }
-crate::arg_via_abi!(u64);
+crate::bind_via_abi!(u64);
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,75 +109,40 @@ pub struct fp8_kind(pub u32);
 
 impl Abi for fp8_kind {
     const CPP: &'static str = "::__nv_fp8_interpretation_t";
-    const TY: Ty = Ty::Fp8Kind;
     fn arg(&self) -> crate::jit::ArgValue {
         crate::jit::ArgValue::U32(self.0)
     }
-    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-        match value {
-            crate::jit::ArgValue::U32(v) => Ok(Self(*v)),
-            _ => Err(wrong_kind(at, Ty::Fp8Kind)),
-        }
-    }
 }
 
-crate::arg_via_abi!(fp8_kind);
+crate::bind_via_abi!(fp8_kind);
 
 macro_rules! ptr_abi {
-    ($pointee:ty, $const_cpp:literal, $const_ty:ident, $mut_cpp:literal, $mut_ty:ident) => {
+    ($pointee:ty, $const_cpp:literal, $mut_cpp:literal) => {
         impl Abi for *const $pointee {
             const CPP: &'static str = $const_cpp;
-            const TY: Ty = Ty::$const_ty;
             fn arg(&self) -> crate::jit::ArgValue {
                 crate::jit::ArgValue::Ptr(*self as *mut c_void)
-            }
-            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-                match value {
-                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
-                        Ok(p.cast::<$pointee>().cast_const())
-                    }
-                    _ => Err(wrong_kind(at, Ty::$const_ty)),
-                }
             }
         }
         impl Abi for *mut $pointee {
             const CPP: &'static str = $mut_cpp;
-            const TY: Ty = Ty::$mut_ty;
             fn arg(&self) -> crate::jit::ArgValue {
                 crate::jit::ArgValue::Ptr(self.cast::<c_void>())
-            }
-            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-                match value {
-                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
-                        Ok(p.cast::<$pointee>())
-                    }
-                    _ => Err(wrong_kind(at, Ty::$mut_ty)),
-                }
             }
         }
 
         impl Abi for Option<NonNull<$pointee>> {
             const CPP: &'static str = $mut_cpp;
-            const TY: Ty = Ty::$mut_ty;
             const NULLABLE: bool = true;
             fn arg(&self) -> crate::jit::ArgValue {
                 crate::jit::ArgValue::Ptr(
                     self.map_or(core::ptr::null_mut(), |p| p.as_ptr().cast::<c_void>()),
                 )
             }
-            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-                match value {
-                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
-                        Ok(NonNull::new(p.cast::<$pointee>()))
-                    }
-                    _ => Err(wrong_kind(at, Ty::$mut_ty)),
-                }
-            }
         }
 
         impl Abi for MaybeConst<$pointee> {
             const CPP: &'static str = $const_cpp;
-            const TY: Ty = Ty::$const_ty;
             const NULLABLE: bool = true;
             fn arg(&self) -> crate::jit::ArgValue {
                 crate::jit::ArgValue::Ptr(
@@ -211,26 +150,8 @@ macro_rules! ptr_abi {
                         .map_or(core::ptr::null_mut(), |p| p.as_ptr().cast::<c_void>()),
                 )
             }
-            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-                match value {
-                    crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
-                        Ok(MaybeConst(NonNull::new(p.cast::<$pointee>())))
-                    }
-                    _ => Err(wrong_kind(at, Ty::$const_ty)),
-                }
-            }
         }
-        $crate::arg_via_abi!(addressed *const $pointee, *mut $pointee);
-        $crate::arg_via_abi!(Option<NonNull<$pointee>>, MaybeConst<$pointee>);
-    };
-}
-
-macro_rules! elem_agrees {
-    ($($pointee:ty),* $(,)?) => {
-        $(const _: () = {
-            assert!(<*const $pointee as Abi>::TY as u8 == <$pointee as kernels::Elem>::TY_CONST as u8);
-            assert!(<*mut $pointee as Abi>::TY as u8 == <$pointee as kernels::Elem>::TY_MUT as u8);
-        };)*
+        $crate::bind_via_abi!(Option<NonNull<$pointee>>, MaybeConst<$pointee>);
     };
 }
 
@@ -257,12 +178,9 @@ impl<E: kernels::Elem> kernels::Elem for Tensor<E> {
     }
 
     const CPP: &'static str = E::CPP;
-    const TY_CONST: Ty = E::TY_CONST;
-    const TY_MUT: Ty = E::TY_MUT;
 }
 
 impl<E: kernels::Elem> kernels::ConstRun for Tensor<E> {
-    const TY: Ty = E::TY_CONST;
     type Held = E::Read;
 }
 
@@ -284,7 +202,6 @@ pub struct Planes {
 }
 
 impl<R: kernels::points::Repr> kernels::ConstRun for Bank<R> {
-    const TY: Ty = Ty::U8s;
     type Held = Planes;
 }
 
@@ -301,8 +218,6 @@ impl kernels::Elem for bf16 {
     }
 
     const CPP: &'static str = "::pie::bf16";
-    const TY_CONST: Ty = Ty::Bf16s;
-    const TY_MUT: Ty = Ty::Bf16sMut;
 }
 
 impl kernels::Elem for f16 {
@@ -318,127 +233,62 @@ impl kernels::Elem for f16 {
     }
 
     const CPP: &'static str = "::pie::f16";
-    const TY_CONST: Ty = Ty::F16s;
-    const TY_MUT: Ty = Ty::F16sMut;
 }
 
-impl kernels::bound::Rides for bf16 {
-    const AXIS: kernels::bound::Axis = kernels::bound::Axis::Bf16;
+impl kernels::points::Scalar for bf16 {
+    const KIND: kernels::points::ScalarKind = kernels::points::ScalarKind::Bf16;
 }
 
-impl kernels::bound::Rides for f16 {
-    const AXIS: kernels::bound::Axis = kernels::bound::Axis::F16;
+impl kernels::points::Scalar for f16 {
+    const KIND: kernels::points::ScalarKind = kernels::points::ScalarKind::F16;
 }
 
-ptr_abi!(bf16, "const ::pie::bf16*", Bf16s, "::pie::bf16*", Bf16sMut);
-ptr_abi!(f16, "const ::pie::f16*", F16s, "::pie::f16*", F16sMut);
-ptr_abi!(
-    fp8_e4m3,
-    "const ::pie::fp8_e4m3*",
-    Buf,
-    "::pie::fp8_e4m3*",
-    BufMut
-);
-ptr_abi!(
-    i32,
-    "const ::std::int32_t*",
-    I32s,
-    "::std::int32_t*",
-    I32sMut
-);
+ptr_abi!(bf16, "const ::pie::bf16*", "::pie::bf16*");
+ptr_abi!(f16, "const ::pie::f16*", "::pie::f16*");
+ptr_abi!(fp8_e4m3, "const ::pie::fp8_e4m3*", "::pie::fp8_e4m3*");
+ptr_abi!(i32, "const ::std::int32_t*", "::std::int32_t*");
 
-ptr_abi!(
-    i64,
-    "const ::std::int64_t*",
-    I64s,
-    "::std::int64_t*",
-    BufMut
-);
+ptr_abi!(i64, "const ::std::int64_t*", "::std::int64_t*");
 
 ptr_abi!(
     *const bf16,
     "const ::pie::bf16* const*",
-    BufArrayOut,
-    "const ::pie::bf16**",
-    BufArrayOut
+    "const ::pie::bf16**"
 );
-ptr_abi!(
-    *mut bf16,
-    "::pie::bf16* const*",
-    BufArrayOutMut,
-    "::pie::bf16**",
-    BufArrayOutMut
-);
+ptr_abi!(*mut bf16, "::pie::bf16* const*", "::pie::bf16**");
 ptr_abi!(
     *const u8,
     "const ::std::uint8_t* const*",
-    BufArrayOut,
-    "const ::std::uint8_t**",
-    BufArrayOut
+    "const ::std::uint8_t**"
 );
 ptr_abi!(
     *const i32,
     "const ::std::int32_t* const*",
-    BufArrayOut,
-    "const ::std::int32_t**",
-    BufArrayOut
+    "const ::std::int32_t**"
 );
-ptr_abi!(i8, "const ::std::int8_t*", I8s, "::std::int8_t*", I8sMut);
-ptr_abi!(
-    u32,
-    "const ::std::uint32_t*",
-    U32s,
-    "::std::uint32_t*",
-    U32sMut
-);
-ptr_abi!(u8, "const ::std::uint8_t*", U8s, "::std::uint8_t*", U8sMut);
+ptr_abi!(i8, "const ::std::int8_t*", "::std::int8_t*");
+ptr_abi!(u32, "const ::std::uint32_t*", "::std::uint32_t*");
+ptr_abi!(u8, "const ::std::uint8_t*", "::std::uint8_t*");
 
-ptr_abi!(
-    u16,
-    "const ::std::uint16_t*",
-    U16s,
-    "::std::uint16_t*",
-    U16sMut
-);
-ptr_abi!(f32, "const float*", F32s, "float*", F32sMut);
+ptr_abi!(u16, "const ::std::uint16_t*", "::std::uint16_t*");
+ptr_abi!(f32, "const float*", "float*");
 
-ptr_abi!(c_void, "const void*", Buf, "void*", BufMut);
+ptr_abi!(c_void, "const void*", "void*");
 
-ptr_abi!(
-    *const c_void,
-    "const void* const*",
-    BufArray,
-    "const void**",
-    BufArrayOut
-);
-ptr_abi!(
-    *mut c_void,
-    "void* const*",
-    BufArrayMut,
-    "void**",
-    BufArrayOutMut
-);
+ptr_abi!(*const c_void, "const void* const*", "const void**");
+ptr_abi!(*mut c_void, "void* const*", "void**");
 
 #[derive(Clone, Copy, Debug)]
 pub struct Stream(pub *mut c_void);
 
 impl Abi for Stream {
     const CPP: &'static str = "cudaStream_t";
-    const TY: Ty = Ty::Stream;
     fn arg(&self) -> crate::jit::ArgValue {
         crate::jit::ArgValue::Ptr(self.0)
     }
-    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
-        match value {
-            crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => {
-                Ok(Self(*p))
-            }
-            _ => Err(wrong_kind(at, Ty::Stream)),
-        }
-    }
 }
 
-crate::arg_via_abi!(Stream);
+crate::bind_via_abi!(Stream);
 
 pub type DevicePtr = u64;
 
@@ -459,99 +309,20 @@ pub trait ByValue: Abi {
 macro_rules! by_value {
     (
         $rust:ident as $cpp:literal,
-        tag = $tag:ident,
         probe = $probe:literal,
         size = $size:literal, align = $align:literal,
         { $($field:ident @ $at:literal as $cname:literal),* $(,)? }
     ) => {
         impl $crate::jit::Abi for $rust {
             const CPP: &'static str = $cpp;
-            const TY: ::kernels::Ty = ::kernels::Ty::$tag;
-            fn arg(&self) -> $crate::jit::ArgValue {
-
-                $crate::jit::ArgValue::Bytes {
-                    ptr: ::core::ptr::from_ref::<$rust>(self).cast::<u8>(),
-                    len: ::core::mem::size_of::<$rust>(),
-                }
-            }
-            fn unpack(
-                value: &$crate::jit::ArgValue,
-                at: usize,
-            ) -> ::core::result::Result<Self, ::kernels::Refusal> {
-                $crate::jit::abi::unpack_aggregate::<$rust>(value, at, ::kernels::Ty::$tag)
-            }
-        }
-        $crate::arg_via_abi!($rust);
-
-        impl $crate::jit::ByValue for $rust {
-            const LAYOUT: $crate::jit::Layout = $crate::jit::Layout {
-                cpp: $cpp,
-                size: $size,
-                align: $align,
-                fields: &[$(($cname, $at)),*],
-                probe: $probe,
-            };
-        }
-
-        const _: () = assert!(
-            ::kernels::Ty::$tag.needs_mirror(),
-            concat!(
-                stringify!($rust), ": tag = ", stringify!($tag),
-                " is a scalar or pointer kind. A by-value aggregate's tag must be \
-                 a Ty whose needs_mirror() is true.",
-            ),
-        );
-
-        #[cfg(target_pointer_width = "64")]
-        const _: () = assert!(
-            ::core::mem::size_of::<$rust>() == $size,
-            concat!(stringify!($rust), ": sizeof disagrees with the measured ", $cpp),
-        );
-        #[cfg(target_pointer_width = "64")]
-        const _: () = assert!(
-            ::core::mem::align_of::<$rust>() == $align,
-            concat!(stringify!($rust), ": alignof disagrees with the measured ", $cpp),
-        );
-        $(
-            #[cfg(target_pointer_width = "64")]
-            const _: () = assert!(
-                ::core::mem::offset_of!($rust, $field) == $at,
-                concat!(
-                    stringify!($rust), ".", stringify!($field),
-                    ": offset disagrees with the measured ", $cpp, "::", $cname,
-                ),
-            );
-        )*
-    };
-
-    (
-        $rust:ident as $cpp:literal,
-        untagged,
-        probe = $probe:literal,
-        size = $size:literal, align = $align:literal,
-        { $($field:ident @ $at:literal as $cname:literal),* $(,)? }
-    ) => {
-        impl $crate::jit::Abi for $rust {
-            const CPP: &'static str = $cpp;
-            const TY: ::kernels::Ty = ::kernels::Ty::MlaPlanCache;
             fn arg(&self) -> $crate::jit::ArgValue {
                 $crate::jit::ArgValue::Bytes {
                     ptr: ::core::ptr::from_ref::<$rust>(self).cast::<u8>(),
                     len: ::core::mem::size_of::<$rust>(),
                 }
             }
-            fn unpack(
-                value: &$crate::jit::ArgValue,
-                at: usize,
-            ) -> ::core::result::Result<Self, ::kernels::Refusal> {
-                $crate::jit::abi::unpack_aggregate::<$rust>(
-                    value,
-                    at,
-                    ::kernels::Ty::MlaPlanCache,
-                )
-            }
         }
-        $crate::arg_via_abi!($rust);
+        $crate::bind_via_abi!($rust);
 
         impl $crate::jit::ByValue for $rust {
             const LAYOUT: $crate::jit::Layout = $crate::jit::Layout {
@@ -647,8 +418,6 @@ pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
     }
     out
 }
-
-elem_agrees!(bf16, f16, i32, i64, i8, u32, u8, u16, f32, c_void);
 
 pub trait Pointee:
     kernels::plane::Elem<

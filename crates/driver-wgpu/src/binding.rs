@@ -453,9 +453,9 @@ pub enum FireNumber {
     // RETIRED: `FireNumber::Rows` -- nothing asks the fire for it.
     //
     // It was the row count a fire last staged, answered by the pool because a
-    // `Shape` outlives every fire it serves. `LaunchRule::SdpaTiled` is why it
-    // existed: that grid rounds the rows UP to whole tiles, so the threads of a
-    // partial last tile run past the end and this scalar was what told them.
+    // `Shape` outlives every fire it serves. Tiled attention rounds rows UP to
+    // whole tiles, so threads in a partial last tile run past the end and this
+    // scalar was what told them.
     //
     // A routine does not need the fire to tell it: the tiled attention bodies
     // take their row count as an ARGUMENT, and their arm reads it off the
@@ -466,7 +466,7 @@ pub enum FireNumber {
 /// The fire-wide tables a kernel row may name.
 ///
 /// Transcribed from `driver-metal`, which reached the same list by the same
-/// route: these are the [`kernels::Source`] variants that are neither an
+/// route: these are the legacy scalar-source variants that are neither an
 /// operand of the statement nor a scalar, so nothing but the driver can supply
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1116,8 +1116,6 @@ mod tests {
             local: [1, 1, 1],
             bindings: blocks.len() as u32,
             used: vec![true; blocks.len()],
-            reads_workgroup_count: false,
-            grid_axes: [true, false, false],
             uniform_offsets: uniform.to_vec(),
             uniform_bytes: uniform
                 .iter()

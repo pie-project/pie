@@ -34,9 +34,8 @@
 //! [`super::views`] and [`super::dispatch`] where a plane may disagree.
 
 use crate::walk::{BankPlanes, Fires, Plane, Runtime, Tensor};
-use kernels::bound::Rides;
 use kernels::plane::{Cache, Const, In, InOut, Out, Refusal};
-use kernels::points::Repr;
+use kernels::points::{Repr, Scalar};
 use kernels_metal::plane::Ctx;
 use kernels_metal::views::{AttnFireView, RecurrentView};
 
@@ -139,19 +138,19 @@ impl<'p> Fires<'p> for Metal {
         }
     }
 
-    fn rin<T: Rides>(b: &mut Bindings, r: Rect) -> In<Tensor<'p, Self, T>> {
+    fn rin<T: Scalar>(b: &mut Bindings, r: Rect) -> In<Tensor<'p, Self, T>> {
         rin(b, r)
     }
 
-    fn rout<T: Rides>(b: &mut Bindings, r: Rect) -> Out<Tensor<'p, Self, T>> {
+    fn rout<T: Scalar>(b: &mut Bindings, r: Rect) -> Out<Tensor<'p, Self, T>> {
         rout(b, r)
     }
 
-    fn rio<T: Rides>(b: &mut Bindings, r: Rect) -> InOut<Tensor<'p, Self, T>> {
+    fn rio<T: Scalar>(b: &mut Bindings, r: Rect) -> InOut<Tensor<'p, Self, T>> {
         rio(b, r)
     }
 
-    fn wconst<T: Rides>(b: &mut Bindings, w: Slice) -> Const<Tensor<'p, Self, T>> {
+    fn wconst<T: Scalar>(b: &mut Bindings, w: Slice) -> Const<Tensor<'p, Self, T>> {
         wconst(b, w)
     }
 

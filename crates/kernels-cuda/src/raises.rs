@@ -3,24 +3,11 @@ macro_rules! raise_abi {
         $(
             impl $crate::jit::Abi for *const $value {
                 const CPP: &'static str = "";
-                const TY: kernels::Ty = kernels::Ty::Raised;
 
                 fn arg(&self) -> $crate::jit::ArgValue {
                     $crate::jit::ArgValue::Ptr((*self).cast::<core::ffi::c_void>().cast_mut())
                 }
-
-                fn unpack(
-                    value: &$crate::jit::ArgValue,
-                    at: usize,
-                ) -> Result<Self, kernels::Refusal> {
-                    match value {
-                        $crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<$value>().cast_const()),
-                        _ => Err(kernels::Refusal::Kind { at, want: kernels::Ty::Raised }),
-                    }
-                }
             }
-
-            $crate::arg_via_abi!(addressed *const $value);
         )*
     };
 }

@@ -13,7 +13,7 @@ compile_error!(
      loads one libcudart, and the two disagree on `cudaGraphAddNode`'s arity"
 );
 
-pub use kernels::{Lit, Refusal, Source, Ty};
+pub use kernels::Refusal;
 
 pub use kernels::plane::{In, InOut, Out};
 
@@ -48,8 +48,6 @@ mod devtest;
 pub mod tower;
 pub mod views;
 pub mod vision;
-
-pub type Plane = crate::jit::Cuda;
 
 pub const CANON: &[(&str, &str)] = &[
     ("hc.collapse", "norm::hc_head_postprocess"),

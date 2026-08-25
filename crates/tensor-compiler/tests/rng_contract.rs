@@ -280,7 +280,7 @@ fn allowlists() -> Allowlists {
             // crossed. ONE entry covers what was briefly two `driver-cuda`
             // ones, which is the move this list is built to survive.
             "crates/kernels-cuda/src/gemm/dense.rs",
-            // SEEDS, not streams. The four below fill TEST DATA with a
+            // SEEDS, not streams. The three below fill TEST DATA with a
             // seeded generator, and the golden-ratio word is the obvious
             // constant to seed one with -- it is in splitmix64, in boost's
             // `hash_combine`, and in half the fixtures ever written. None of
@@ -288,10 +288,6 @@ fn allowlists() -> Allowlists {
             // for; the scanner cannot tell a seed from a transcription, which
             // is what this list is for.
             //
-            // A per-request weight that breaks ties in an argmax plateau: a
-            // multiplicative hash with no period this side of 2^64, so
-            // distinct rows get distinct weights and a maximum is a maximum.
-            "crates/driver-vulkan/tests/device.rs",
             // The GEMM service parity pair. The seed has to be the SAME word
             // on both sides -- a Rust harness and a C++ oracle comparing
             // element for element -- so it cannot be shared through a helper

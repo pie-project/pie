@@ -72,7 +72,7 @@ pub const PTIR_VERSION: u16 = 1;
 pub const PTIR_VERSION_EXTERN: u16 = 2;
 
 /// FNV-1a 64 — the one implementation, byte-identical to the CUDA driver's
-/// `jit::fnv1a64`.
+/// FNV-1a used by the program and driver caches.
 ///
 /// This is the *primitive*. It is not an identity: what a hash means depends on
 /// what was fed to it, so the named contracts below (and
@@ -144,7 +144,7 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 ///
 /// Because the container encoder is canonical (same trace ⟺ same bytes) this is
 /// a *sound* identity key, and because it is byte-identical to the driver's
-/// `jit::fnv1a64` the host program cache, the driver compile cache, and the
+/// This keeps the host program cache, the driver compile cache, and the
 /// cross-request group key are one mechanism rather than three.
 pub fn container_hash(container_bytes: &[u8]) -> u64 {
     fnv1a64(container_bytes)

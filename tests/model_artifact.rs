@@ -109,26 +109,34 @@ fn write_snapshot(dir: &Path, dtype: &str) {
     .expect("write config");
 }
 
-/// build writes the serve contract's tensors, and NOT the fused banks.
-///
-/// # It used to assert the banks, and that was the old contract
-///
-/// This test named `model.layers.0.self_attn.qkv_proj.fused.weight` and
-/// `model.layers.1.mlp.gate_up_proj.fused.weight` and required them present,
-/// on the reading that a build emits runtime layout and CUDA's runtime layout
-/// is fused. `build_policy` in src/ops/model/build.rs, deleted at R3 authors
-/// `Projections::InPlace` for every backend now, and its doc is where the
-/// reasoning lives -- the short version being that a fusion is a VIEW, so
-/// persisting it persists the bank AND the projections that alias it, which
-/// on Qwen3-0.6B was 56 extra tensors, 587 MB of file and 560 MiB of resident
-/// VRAM for a concatenation measured at no difference.
-///
-/// So the assertion inverts rather than relaxes. The projections must be
-/// there, under their checkpoint names, because that is what the load path
-/// joins from -- and the banks must be ABSENT, because their presence is the
-/// defect. Requiring the absence is what makes this a gate rather than a
-/// deletion: a backend that starts persisting a fusion again fails here and
-/// says so, which is what the old assertion did in the other direction.
+// `build_materializes_the_serve_contract` STOOD HERE, and R3 took the
+// test at `6393b8ddb` while leaving these twenty lines of its doc
+// attached to the test below it. That is the defect clippy's
+// `empty_line_after_doc_comment` was pointing at: a deletion that took
+// an item and left its prose to glue itself onto the next one.
+//
+// WHAT IT ESTABLISHED, kept because the measurement is not recoverable
+// from anything left in the tree:
+// build writes the serve contract's tensors, and NOT the fused banks.
+//
+// # It used to assert the banks, and that was the old contract
+//
+// This test named `model.layers.0.self_attn.qkv_proj.fused.weight` and
+// `model.layers.1.mlp.gate_up_proj.fused.weight` and required them present,
+// on the reading that a build emits runtime layout and CUDA's runtime layout
+// is fused. `build_policy` in src/ops/model/build.rs, deleted at R3 authors
+// `Projections::InPlace` for every backend now, and its doc is where the
+// reasoning lives -- the short version being that a fusion is a VIEW, so
+// persisting it persists the bank AND the projections that alias it, which
+// on Qwen3-0.6B was 56 extra tensors, 587 MB of file and 560 MiB of resident
+// VRAM for a concatenation measured at no difference.
+//
+// So the assertion inverts rather than relaxes. The projections must be
+// there, under their checkpoint names, because that is what the load path
+// joins from -- and the banks must be ABSENT, because their presence is the
+// defect. Requiring the absence is what makes this a gate rather than a
+// deletion: a backend that starts persisting a fusion again fails here and
+// says so, which is what the old assertion did in the other direction.
 
 /// import on an F32 snapshot decodes *everything* — the whole-model case
 /// the streaming executor and the disk spool exist for — and the artifact

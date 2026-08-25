@@ -36,7 +36,7 @@
 //!   it in walk order. See [`crate::walk::Blit`].
 //!
 //! The dtype check is [`rides`] (private, below), and it is owed once for every
-//! slot of every point -- which is what a `Rides` bound on the accessor is for.
+//! slot of every point -- which is what a `Scalar` bound on the accessor is for.
 //! A `tin::<f32>` against a bf16 rectangle is a REINTERPRETATION, not a cast:
 //! it halves every stride inside the kernel and returns a plausible wrong
 //! answer.
@@ -45,9 +45,9 @@
 //! [`Fires::wconst`]: crate::Fires::wconst
 //! [`Fires::wbank`]: crate::Fires::wbank
 
-use kernels::bound::{Axis, BoundOp, Rides, Site};
+use kernels::bound::{BoundOp, Site};
 use kernels::plane::{Cache, Const, In, InOut, Out, Refusal};
-use kernels::points::{Form, Repr};
+use kernels::points::{Form, Repr, Scalar, ScalarKind};
 use model::produce::Dtype;
 use model_compiler::program::Dt;
 use model_ir::plan::Op;
@@ -76,27 +76,27 @@ pub(crate) struct Bound<'f, 'a, 'c, P: Fires<'c>> {
 }
 
 /// What a rectangle the walk sized rides, as the floor names it.
-fn axis(dt: Dt) -> Axis {
+fn axis(dt: Dt) -> ScalarKind {
     match dt {
-        Dt::Bf16 => Axis::Bf16,
-        Dt::F32 => Axis::F32,
-        Dt::I32 => Axis::I32,
-        Dt::U32 => Axis::U32,
-        Dt::U8 => Axis::U8,
+        Dt::Bf16 => ScalarKind::Bf16,
+        Dt::F32 => ScalarKind::F32,
+        Dt::I32 => ScalarKind::I32,
+        Dt::U32 => ScalarKind::U32,
+        Dt::U8 => ScalarKind::U8,
     }
 }
 
 /// What a BANK rides, which is the CHECKPOINT's storage axis and not the plan's
 /// repr column. `None` for a dtype no point can be instantiated at, which reads
 /// as a refusal rather than as a match.
-fn bank_axis(d: Dtype) -> Option<Axis> {
+fn bank_axis(d: Dtype) -> Option<ScalarKind> {
     match d {
-        Dtype::Bf16 => Some(Axis::Bf16),
-        Dtype::F16 => Some(Axis::F16),
-        Dtype::F32 => Some(Axis::F32),
-        Dtype::I32 => Some(Axis::I32),
-        Dtype::U32 => Some(Axis::U32),
-        Dtype::U8 => Some(Axis::U8),
+        Dtype::Bf16 => Some(ScalarKind::Bf16),
+        Dtype::F16 => Some(ScalarKind::F16),
+        Dtype::F32 => Some(ScalarKind::F32),
+        Dtype::I32 => Some(ScalarKind::I32),
+        Dtype::U32 => Some(ScalarKind::U32),
+        Dtype::U8 => Some(ScalarKind::U8),
         _ => None,
     }
 }
@@ -110,8 +110,8 @@ fn bank_axis(d: Dtype) -> Option<Axis> {
 /// slot for the element its declaration pins. `norm.rmsnorm_gated` states an
 /// f32 core and an f32 weight beside a bf16 gate; reading a bf16 rectangle as
 /// f32 halves every stride inside the kernel.
-fn rides<T: Rides>(what: &'static str, have: Axis) -> Result<(), Refusal> {
-    if T::AXIS == have {
+fn rides<T: Scalar>(what: &'static str, have: ScalarKind) -> Result<(), Refusal> {
+    if T::KIND == have {
         return Ok(());
     }
     Err(Refusal::Absent { what })
@@ -124,7 +124,7 @@ impl<'c, P: Fires<'c>> BoundOp for Bound<'_, '_, 'c, P> {
         self.point
     }
 
-    fn dtype(&self, at: Site) -> Result<Axis, Refusal> {
+    fn dtype(&self, at: Site) -> Result<ScalarKind, Refusal> {
         Ok(match at {
             Site::In(i) => axis(self.fire.input(self.op, i)?.dt),
             Site::Out(i) => axis(self.fire.output(self.op, i)?.dt),
@@ -136,7 +136,7 @@ impl<'c, P: Fires<'c>> BoundOp for Bound<'_, '_, 'c, P> {
         })
     }
 
-    fn tin<T: Rides>(&self, at: usize) -> Result<In<Tensor<'c, P, T>>, Refusal> {
+    fn tin<T: Scalar>(&self, at: usize) -> Result<In<Tensor<'c, P, T>>, Refusal> {
         let r = self.fire.input(self.op, at)?;
         rides::<T>(
             "an operand at an element the point does not state",
@@ -145,7 +145,7 @@ impl<'c, P: Fires<'c>> BoundOp for Bound<'_, '_, 'c, P> {
         Ok(P::rin(&mut self.fire.bindings.borrow_mut(), r))
     }
 
-    fn tout<T: Rides>(&self, at: usize) -> Result<Out<Tensor<'c, P, T>>, Refusal> {
+    fn tout<T: Scalar>(&self, at: usize) -> Result<Out<Tensor<'c, P, T>>, Refusal> {
         let r = self.fire.output(self.op, at)?;
         rides::<T>(
             "a result at an element the point does not state",
@@ -154,7 +154,11 @@ impl<'c, P: Fires<'c>> BoundOp for Bound<'_, '_, 'c, P> {
         Ok(P::rout(&mut self.fire.bindings.borrow_mut(), r))
     }
 
-    fn tinout<T: Rides>(&self, from: usize, to: usize) -> Result<InOut<Tensor<'c, P, T>>, Refusal> {
+    fn tinout<T: Scalar>(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> Result<InOut<Tensor<'c, P, T>>, Refusal> {
         // The copy that makes an `InOut` honest here: the walk mints a FRESH
         // rectangle for every result, so the operand's bytes have to be in the
         // result's region before the kernel writes through it. See
@@ -171,7 +175,7 @@ impl<'c, P: Fires<'c>> BoundOp for Bound<'_, '_, 'c, P> {
         Ok(P::rio(&mut self.fire.bindings.borrow_mut(), r))
     }
 
-    fn tconst<T: Rides>(&self, at: usize) -> Result<Const<Tensor<'c, P, T>>, Refusal> {
+    fn tconst<T: Scalar>(&self, at: usize) -> Result<Const<Tensor<'c, P, T>>, Refusal> {
         let bank = self.fire.weight(self.op, at)?;
         let have = bank_axis(bank.dtype).ok_or(Refusal::Absent {
             what: "a bank at an element no point is instantiated at",

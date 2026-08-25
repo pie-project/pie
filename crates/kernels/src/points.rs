@@ -121,9 +121,35 @@ pub trait Plane {
     type Pages: Elem;
 }
 
-pub trait Scalar: Elem<Read = *const Self, Write = *mut Self> + Sized {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    Bf16,
+    F16,
+    F32,
+    I32,
+    U32,
+    U8,
+}
 
-impl<T: Elem<Read = *const T, Write = *mut T>> Scalar for T {}
+pub trait Scalar: Elem<Read = *const Self, Write = *mut Self> + Sized {
+    const KIND: ScalarKind;
+}
+
+impl Scalar for f32 {
+    const KIND: ScalarKind = ScalarKind::F32;
+}
+
+impl Scalar for i32 {
+    const KIND: ScalarKind = ScalarKind::I32;
+}
+
+impl Scalar for u32 {
+    const KIND: ScalarKind = ScalarKind::U32;
+}
+
+impl Scalar for u8 {
+    const KIND: ScalarKind = ScalarKind::U8;
+}
 
 pub trait Repr: 'static {
     const FORM: Form;

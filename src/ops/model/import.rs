@@ -1162,31 +1162,6 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
     tiktoken.exists().then_some(tiktoken)
 }
 
-/// Carries the source's `config.json` into the artifact, verbatim.
-///
-/// # Why this stopped normalizing
-///
-/// It used to compile the config into a `pie.model/1` descriptor: 136 fields
-/// of normalized geometry, which the driver then re-parsed to learn what
-/// model it had. That was the *identity* crossing as a document, and it is
-/// what the catalog refactor removed — identity is now a manifest match
-/// against the tensors, and the tensors are already in the artifact.
-///
-/// What is left for a config to say is the part the tensors cannot: the
-/// declared quantization, because a group size is not an extent of anything.
-/// [`model::serve::encoding::Encoding`] reads exactly that, from the
-/// checkpoint's own words, so the honest thing to carry is the checkpoint's
-/// own words.
-///
-/// It is also why this can no longer fail on content. A config this command
-/// does not understand is not this command's problem — nothing here reads it,
-/// and `Encoding` refuses what it cannot parse at the point that needs it.
-/// Only unreadable bytes or invalid JSON are errors, and JSON is checked so
-/// that an artifact never carries an object no reader can open.
-///
-/// `Ok(None)` when there is no `config.json` — a lone `.gguf` carries its
-/// metadata in its own header, and a directory without one is a weights-only
-/// checkpoint.
 /// Whether the source declares its output head TIED to the embedding.
 ///
 /// # Why the importer cares
@@ -1214,7 +1189,6 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
 // HuggingFace half of `general.architecture`, read so the ingest pass could
 // pick a family's naming table. The pass is gone and nothing else here asks
 // what model this is: import is the family-blind half.
-
 fn declares_tied_head(source: &Source) -> bool {
     if source.path.is_file() {
         return false;
@@ -1295,6 +1269,31 @@ fn tied_head_sources(metadata: &CheckpointMetadata) -> Vec<String> {
 // `tie_word_embeddings` out of the checkpoint's own `config.json` — the file
 // saying so about itself, which is the only source that was ever a fact.
 
+/// Carries the source's `config.json` into the artifact, verbatim.
+///
+/// # Why this stopped normalizing
+///
+/// It used to compile the config into a `pie.model/1` descriptor: 136 fields
+/// of normalized geometry, which the driver then re-parsed to learn what
+/// model it had. That was the *identity* crossing as a document, and it is
+/// what the catalog refactor removed — identity is now a manifest match
+/// against the tensors, and the tensors are already in the artifact.
+///
+/// What is left for a config to say is the part the tensors cannot: the
+/// declared quantization, because a group size is not an extent of anything.
+/// [`model::serve::encoding::Encoding`] reads exactly that, from the
+/// checkpoint's own words, so the honest thing to carry is the checkpoint's
+/// own words.
+///
+/// It is also why this can no longer fail on content. A config this command
+/// does not understand is not this command's problem — nothing here reads it,
+/// and `Encoding` refuses what it cannot parse at the point that needs it.
+/// Only unreadable bytes or invalid JSON are errors, and JSON is checked so
+/// that an artifact never carries an object no reader can open.
+///
+/// `Ok(None)` when there is no `config.json` — a lone `.gguf` carries its
+/// metadata in its own header, and a directory without one is a weights-only
+/// checkpoint.
 pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
     if source.path.is_file() {
         return Ok(None);

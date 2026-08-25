@@ -128,6 +128,95 @@ impl kernels::points::Layout for Ctx<'_> {
         )
     }
 
+    fn split_rows<T: kernels::points::Scalar>(
+        &self,
+        x: In<crate::points::Handle<T>>,
+        width: u32,
+        left: Out<crate::points::Handle<T>>,
+        right: Out<crate::points::Handle<T>>,
+    ) -> Result<(), Refusal> {
+        crate::points::at_bf16::<T>(
+            "layout.split_rows, at an element this plane does not instantiate",
+        )?;
+        let src = x.all("the row this cut divides")?;
+        let l = left.all("the left half this cut writes")?;
+        let r = right.all("the right half this cut writes")?;
+        let stated = crate::points::stated("the left width this cut states", width)?;
+        if l.width != stated {
+            return Err(Refusal::Narrow {
+                what: "the left half, against the width this cut states",
+                at: i64::from(l.width),
+            });
+        }
+        if l.width.saturating_add(r.width) != src.width {
+            return Err(Refusal::Narrow {
+                what: "the two halves, against the row they divide",
+                at: i64::from(src.width),
+            });
+        }
+        self.fire(
+            Fire::at(
+                crate::plane::module_path("split_rows_bfloat16", self.best()),
+                "split_rows_bfloat16",
+            )
+            .apply(elementwise_rows(src.width, src.rows)?),
+            &[
+                x.arg(),
+                left.arg(),
+                right.arg(),
+                l.width.arg(),
+                r.width.arg(),
+            ],
+        )
+    }
+
+    fn select<T: kernels::points::Scalar>(
+        &self,
+        table: In<crate::points::Handle<T>>,
+        layer: u32,
+        width: u32,
+        y: Out<crate::points::Handle<T>>,
+    ) -> Result<(), Refusal> {
+        crate::points::at_bf16::<T>(
+            "layout.select, at an element this plane does not instantiate",
+        )?;
+        let dst = y.all("the selected slice's width")?;
+        let stated = crate::points::stated("the slice width this select states", width)?;
+        if dst.width != stated {
+            return Err(Refusal::Narrow {
+                what: "the selected slice, against the width this select states",
+                at: i64::from(dst.width),
+            });
+        }
+        let src = table.over(dst.rows, "the relayed table's row")?;
+        let at = crate::points::stated("the layer this select names", layer)?;
+        let offset = at.checked_mul(stated).ok_or(Refusal::Wide {
+            what: "the layer this select names, times the slice width",
+            at: i64::from(at) * i64::from(stated),
+            max: i64::from(i32::MAX),
+        })?;
+        if offset.checked_add(stated).is_none_or(|end| end > src.width) {
+            return Err(Refusal::Narrow {
+                what: "the relayed row does not reach this layer's slice",
+                at: i64::from(src.width),
+            });
+        }
+        self.fire(
+            Fire::at(
+                crate::plane::module_path("select_slice_bfloat16", self.best()),
+                "select_slice_bfloat16",
+            )
+            .apply(elementwise_rows(dst.width, dst.rows)?),
+            &[
+                table.arg(),
+                y.arg(),
+                src.width.arg(),
+                offset.arg(),
+                stated.arg(),
+            ],
+        )
+    }
+
     fn split_q_gate<T: kernels::points::Scalar>(
         &self,
         packed: In<crate::points::Handle<T>>,

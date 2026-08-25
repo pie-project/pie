@@ -152,11 +152,7 @@ fn lay_out(values: &[ArgValue], bindings: &Bindings) -> Result<LaidOut, Refusal>
 
     for value in values {
         match *value {
-            // A `Shaped` HANDLE IS STILL A HANDLE: it carries the rectangle
-            // the statement gave the operand, which the marks read and an
-            // encoder does not. There is no `BufferMut` on this plane — see
-            // this module's header.
-            ArgValue::Buffer(handle) | ArgValue::Shaped { handle, .. } => {
+            ArgValue::Buffer(handle) => {
                 args.push(bindings.at(handle).ok_or(Refusal::Absent {
                     what: "a buffer handle this fire did not mint",
                 })?);
@@ -178,12 +174,6 @@ fn lay_out(values: &[ArgValue], bindings: &Bindings) -> Result<LaidOut, Refusal>
                 // little-endian buffer.
                 &[(v & 0xffff_ffff) as u32, (v >> 32) as u32],
             ),
-            ArgValue::Raised(_) => {
-                return Err(Refusal::Unstated {
-                    what: "a raised view in a dispatch argument list: a view is \
-                           host data a body reads, not a slot it binds",
-                });
-            }
         }
     }
     Ok((args, slots, params))
@@ -215,29 +205,15 @@ fn scalar(
 }
 
 impl Encode for Encoder<'_> {
-    /// The `Asks` door, and this plane answers exactly one question through it.
-    ///
-    /// `Asks::absent()` resolves `(Ty::Buf, Source::Lit(Lit::Null))` and is
-    /// what a body says when the entrypoint declares a buffer the point does
+    /// Mint the empty buffer used when an entrypoint declares a slot the point does
     /// not carry — six of `kernels_wgpu::attn`'s sdpa arms say it, through that
     /// crate's own `points::absent` wrapper. That is a real binding with a real
     /// number, so it is answered with a real handle onto nothing: the encoder
     /// binds a zero-size binding and a shader that reads it reads nothing
     /// loudly rather than reading a neighbour.
     ///
-    /// Everything else refuses. `Asks::param(n)` reaches for the STATEMENT's
-    /// scalar run, which is the routine era's way of taking an operand a
-    /// declaration does not state; a claim body is handed its scalars.
-    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
-        match (ty, source) {
-            (kernels::Ty::Buf, kernels::Source::Lit(kernels::Lit::Null)) => {
-                Ok(ArgValue::Buffer(self.bindings.borrow_mut().take(NOTHING)))
-            }
-            _ => Err(Refusal::Unstated {
-                what: "a value asked for off the fire: a claim body is handed \
-                       every operand its point declares",
-            }),
-        }
+    fn absent(&self) -> Result<ArgValue, Refusal> {
+        Ok(ArgValue::Buffer(self.bindings.borrow_mut().take(NOTHING)))
     }
 
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {

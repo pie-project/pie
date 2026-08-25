@@ -48,7 +48,8 @@
 
 use std::collections::BTreeSet;
 
-use kernels::bound::{Axis, Site};
+use kernels::bound::Site;
+use kernels::points::ScalarKind;
 use model_compiler::program::{Call, Dt, Program, Slot};
 use model_ir::plan::{Op, Plan, ValueId};
 
@@ -180,13 +181,13 @@ fn dtype_of(program: &Program, value: ValueId) -> Option<Dt> {
 
 /// What a rectangle the walk sized rides -- the same mapping
 /// `crate::bound::axis` makes at the fire.
-fn axis(dt: Dt) -> Axis {
+fn axis(dt: Dt) -> ScalarKind {
     match dt {
-        Dt::Bf16 => Axis::Bf16,
-        Dt::F32 => Axis::F32,
-        Dt::I32 => Axis::I32,
-        Dt::U32 => Axis::U32,
-        Dt::U8 => Axis::U8,
+        Dt::Bf16 => ScalarKind::Bf16,
+        Dt::F32 => ScalarKind::F32,
+        Dt::I32 => ScalarKind::I32,
+        Dt::U32 => ScalarKind::U32,
+        Dt::U8 => ScalarKind::U8,
     }
 }
 
@@ -217,7 +218,11 @@ mod tests {
     /// happens to instantiate that point at Bf16 and not at I32. The second
     /// half stayed with the plane (see each driver's `baker::resolve`); this is
     /// the first half, asked of the function rather than of a table.
-    const ONE: Census = &[("norm.rmsnorm", Some(Site::Out(0)), &[Axis::Bf16, Axis::F32])];
+    const ONE: Census = &[(
+        "norm.rmsnorm",
+        Some(Site::Out(0)),
+        &[ScalarKind::Bf16, ScalarKind::F32],
+    )];
 
     /// The three answers, on a census row that exists.
     #[test]

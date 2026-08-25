@@ -337,6 +337,18 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // `driver-vulkan` has one: there is no `DEP_..._SPV_DIR` to relay,
         // because the shaders are in the rlib.
         "kernels-wgpu",
+        // THE VULKAN SHADER BUILD, and this driver has never named that crate.
+        // It arrives through `model-ir`, which is the ONE join over every
+        // plane's `*_CLAIMS` and so must take all four plane crates. The row
+        // is new rather than newly noticed: `model-ir` had no `Backend::Vulkan`
+        // at all until P5c, so vulkan's claim tables had never been read by
+        // anything and the edge did not exist to be listed.
+        //
+        // It is here rather than invisible because its build script runs
+        // `slangc` over the `.slang` tree — behind `native`, which this
+        // closure does not turn on, so no toolchain is reached and this test
+        // stays runnable on a machine with no Slang compiler.
+        "kernels-vulkan",
         // `model-compiler` STOOD HERE, described as *"content-hashes its own
         // `.rs` files to fingerprint the tracer"*. That script is `model-dsl`'s
         // now, and `model-dsl` is the AUTHORING surface -- a driver lowers a

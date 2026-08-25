@@ -13,11 +13,11 @@ impl kernels::points::Mlp for Ctx<'_> {
         let cut = halves(self, packed, intermediate)?;
         self.fire(
             Fire::at(
-                crate::plane::module_path("silu_mul_bfloat16", self.best()),
-                "silu_mul_bfloat16",
+                crate::plane::module_path("silu_mul_strided_bfloat16", self.best()),
+                "silu_mul_strided_bfloat16",
             )
             .apply(elementwise(cut.width, cut.rows)?),
-            &[cut.gate.arg(), cut.up.arg(), y.arg()],
+            &cut.args(y),
         )
     }
 
@@ -53,11 +53,11 @@ impl kernels::points::Mlp for Ctx<'_> {
         let cut = halves(self, packed, intermediate)?;
         self.fire(
             Fire::at(
-                crate::plane::module_path("geglu_tanh_bfloat16", self.best()),
-                "geglu_tanh_bfloat16",
+                crate::plane::module_path("geglu_tanh_strided_bfloat16", self.best()),
+                "geglu_tanh_strided_bfloat16",
             )
             .apply(elementwise(cut.width, cut.rows)?),
-            &[cut.gate.arg(), cut.up.arg(), y.arg()],
+            &cut.args(y),
         )
     }
 
@@ -72,21 +72,14 @@ impl kernels::points::Mlp for Ctx<'_> {
         crate::points::at_bf16::<T>(
             "mlp.swiglu_clamp_alpha, at an element this plane does not instantiate",
         )?;
-        let cut = halves(self, packed, intermediate)?;
-        self.fire(
-            Fire::at(
-                crate::plane::module_path("gptoss_swiglu_bfloat16", self.best()),
-                "gptoss_swiglu_bfloat16",
-            )
-            .apply(elementwise(cut.width, cut.rows)?),
-            &[
-                cut.gate.arg(),
-                cut.up.arg(),
-                y.arg(),
-                limit.arg(),
-                alpha.arg(),
-            ],
-        )
+        let _ = (packed, intermediate, limit, alpha, y);
+        Err(Refusal::Absent {
+            what: "mlp.swiglu_clamp_alpha over a packed `[gate | up]` row: \
+                   `gptoss_swiglu_bfloat16` indexes gate, up and out by one \
+                   flat id and declares no pitch, so the window this plane can \
+                   open on the row's second half is one the entrypoint cannot \
+                   read — `gated.slang` stamps no strided gpt-oss arm",
+        })
     }
 }
 
@@ -97,6 +90,22 @@ struct Halves<T> {
 
     rows: i32,
     width: i32,
+    pitch: i32,
+}
+
+impl<T: kernels::points::Scalar> Halves<T> {
+    fn args(&self, y: Out<crate::points::Handle<T>>) -> [crate::plane::ArgValue; 8] {
+        [
+            self.gate.arg(),
+            self.up.arg(),
+            y.arg(),
+            self.width.arg(),
+            self.rows.arg(),
+            self.pitch.arg(),
+            self.pitch.arg(),
+            self.width.arg(),
+        ]
+    }
 }
 
 fn halves<T: kernels::points::Scalar>(
@@ -115,9 +124,10 @@ fn halves<T: kernels::points::Scalar>(
         });
     }
     Ok(Halves {
-        gate: ctx.window(packed.ptr, 0, half)?,
-        up: ctx.window(packed.ptr, i64::from(half), half)?,
+        gate: packed.ptr,
+        up: ctx.window(packed.ptr, i64::from(half))?,
         rows: row.rows,
         width: half,
+        pitch: row.width,
     })
 }

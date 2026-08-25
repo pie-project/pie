@@ -82,9 +82,27 @@
 // One name for the attribute below and for the width `pie_inv_rms` folds.
 const PIE_LANES = 256u;
 
+// THE CORE PLANE AND ITS GAINS ARE `f32` IN THE CLAIMED ARMS, and that is the
+// point's declaration rather than a preference. `norm.rmsnorm_gated` and
+// `norm.rmsnorm_gated_by` both state `x: In<Tensor<f32>>` and
+// `weight: Const<Tensor<f32>>` beside a `T` gate and a `T` result -- qwen3.5
+// ships RMSNormGated weights in fp32 alongside bf16 activations, and the GDN
+// recurrence hands its output over in f32 without ever narrowing it.
+//
+// Reading an f32 rectangle through `pie_bf16_at` halves every stride: element
+// `i` lands at word `i >> 1`, so the kernel reads element `2i` or `2i + 1` of
+// the thing it was given and walks off the end of the tensor past `vd / 2`.
+// `kernels-metal`'s own header records that defect from its own history. Hence
+// two declarations for two element types rather than one and a cast.
+//#if defined(PIE_CORE_F32)
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> z: array<u32>;
+@group(0) @binding(2) var<storage, read_write> w: array<f32>;
+//#else
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> z: array<u32>;
 @group(0) @binding(2) var<storage, read_write> w: array<u32>;
+//#endif
 // Atomic for the odd-`vd` edge alone -- `store_half` says why -- and the host
 // binds the same read_write storage buffer of 4-byte words either way.
 @group(0) @binding(3) var<storage, read_write> out_: array<atomic<u32>>;
@@ -111,17 +129,29 @@ struct Params {
 // rather than the buffer because core WGSL allows a pointer parameter only in
 // the `function`, `private` and `workgroup` address spaces -- a shared
 // `load(&buffer, i)` parses and then fails validation.
+//#if defined(PIE_CORE_F32)
+fn x_at(i: u32) -> f32 {
+    return x[i];
+}
+//#else
 fn x_at(i: u32) -> f32 {
     return pie_bf16_at(x[i >> 1u], i);
 }
+//#endif
 
 fn z_at(i: u32) -> f32 {
     return pie_bf16_at(z[i >> 1u], i);
 }
 
+//#if defined(PIE_CORE_F32)
+fn w_at(i: u32) -> f32 {
+    return w[i];
+}
+//#else
 fn w_at(i: u32) -> f32 {
     return pie_bf16_at(w[i >> 1u], i);
 }
+//#endif
 
 // One bf16 of a word this invocation does not own outright.
 //
@@ -152,10 +182,26 @@ fn stable_sigmoid(v: f32) -> f32 {
 // One output element. `abs` addresses the head's data; `at` is the channel,
 // which is what indexes the gate-norm weight -- one vector shared by every
 // head, so feeding it the absolute index would read the next head's gains.
+// THE TWO POINTS DIFFER IN THIS ONE LINE, and in nothing else at all.
+//
+// `norm.rmsnorm_gated` multiplies by `silu(z) = z * sigmoid(z)`;
+// `norm.rmsnorm_gated_by` multiplies by `sigmoid(z)` alone. cuda routes them to
+// two different files -- `norm/rmsnorm.cuh`'s `rmsnorm_gated_f32_in` against
+// `ssm/kda.cuh`'s `kda_o_norm_gated` -- and metal to one body with a `SILU`
+// template flag, which is what this is.
+//
+// It is worth naming because the two have the SAME operand list, the same
+// launch and the same shape, so a body that took the wrong arm produces
+// finite, plausible, correctly-shaped output wrong by a factor of `z` per
+// channel. `kernels-vulkan` fires the silu arm for both points today.
 fn gated(abs: u32, at: u32, inv: f32) -> f32 {
     let zr = z_at(abs);
     let normed = x_at(abs) * inv * w_at(at);
+//#if defined(PIE_GATE_SIGMOID)
+    return normed * stable_sigmoid(zr);
+//#else
     return normed * (zr * stable_sigmoid(zr));
+//#endif
 }
 
 @compute @workgroup_size(PIE_LANES)
@@ -217,3 +263,5 @@ fn main(
 
 // pie:instantiate gated_rms_bfloat16
 // pie:instantiate gated_rms_strided_bfloat16 PIE_STRIDED=1
+// pie:instantiate gated_rms_f32_bfloat16 PIE_CORE_F32=1
+// pie:instantiate gated_rms_by_f32_bfloat16 PIE_CORE_F32=1 PIE_GATE_SIGMOID=1

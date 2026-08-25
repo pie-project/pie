@@ -492,7 +492,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
 /// comparison: "a test that asserts WHICH refusal came back is the only way
 /// an alignment failure stays distinguishable from a length one."
 ///
-/// It is a principle this crate mostly keeps — **forty-nine of fifty-six**
+/// It is a principle this crate mostly keeps — **forty-one of forty-eight**
 /// refusal variants are named in a test — and nothing measured the rest. A
 /// refusal nothing names is one whose condition could be inverted, or whose
 /// message could describe a different fault, with every suite still green: it
@@ -652,9 +652,15 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // `src/walk/` is in `src/`, so what this crate can return by name is
     // what it owes a test for -- which is the reading to keep, and the
     // reason the number is allowed to move in both directions.
+    //
+    // IT MOVED DOWN TO FORTY-EIGHT when the unused `LaunchRule` geometry
+    // evaluator was removed. Its eight refusal variants could only be raised
+    // by `groups_for`, which no production path called; claim bodies now state
+    // lanes directly and the pipeline performs the sole lanes-to-workgroups
+    // conversion.
     assert_eq!(
         refusals.len(),
-        56,
+        48,
         "the refusal census moved. If variants were added, name them in a \
          test and raise this; if they were removed, say which in the commit \
          and lower it. If it collapsed to a handful, the parser has stopped \
@@ -742,8 +748,8 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (56, 49),
-        "this test's own doc says forty-nine of fifty-six refusal variants \
+        (48, 41),
+        "this test's own doc says forty-one of forty-eight refusal variants \
          are named by a test. Update the sentence with the number."
     );
 }

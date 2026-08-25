@@ -114,7 +114,7 @@ tensor-compiler = { path = "../tensor-compiler" }
 # THE DECLARATION FLOOR. `kernels::bound::BoundOp` is the trait
 # `baker_walk::bound` implements -- the one data->type crossing, whose accessors
 # hand back the marks (`In`, `Out`, `InOut`, `Const`, `Cache`) a claim body
-# takes -- and `kernels::routine::Refusal` is what every one of them answers
+# takes -- and `kernels::Refusal` is what every one of them answers
 # with. `kernels::raises::{Class, Struct}` beside them for the by-key door.
 #
 # It was here for `LaunchRule` and `sig_in`: which grid shape a ROW states,
@@ -373,6 +373,38 @@ name = "device_gdn"
 required-features = ["metal-4"]
 
 [[test]]
+name = "device_layout"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_packed"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_gates"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_dense"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_cuda_vectors"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_routing"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_recurrence"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_neox"
+required-features = ["metal-4"]
+
+[[test]]
 name = "device_fused"
 required-features = ["metal-4"]
 
@@ -425,6 +457,10 @@ name = "device_runtime"
 required-features = ["metal-4"]
 
 [[test]]
+name = "device_sink"
+required-features = ["metal-4"]
+
+[[test]]
 name = "device_split_qkv"
 required-features = ["metal-4"]
 
@@ -447,4 +483,3 @@ required-features = ["metal-4"]
 [[test]]
 name = "real_kernels"
 required-features = ["metal-4"]
-

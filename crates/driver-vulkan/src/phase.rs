@@ -25,7 +25,9 @@
 //! A fire is one thread from `Serving::once` to `run_all`, so the totals want
 //! no lock, and two threads firing at once want SEPARATE totals rather than a
 //! sum nobody can attribute. A caller reads back on the thread that fired,
-//! which is the thread that called [`crate::shell::Shell::step`].
+//! which is the thread that called `shell::Shell::step` -- and that verb went
+//! with `shell`, so what a caller reads back on is now whatever thread drove
+//! `serve::run`. The rule is unchanged and the name of the caller is not.
 
 use std::cell::RefCell;
 use std::time::Instant;

@@ -69,11 +69,11 @@ _cuda = ["dep:cudarc"]
 # question the registry was still asked — "which symbol answers this claim's
 # canon" — is `CANON`, four rows in `src/lib.rs`.
 #
-# The vocabulary a launch is written in: `Fire`, `LaunchRule`, `Ty`,
-# `Source`, the marks. Layer 1 is this crate's re-export of it.
+# The portable claim vocabulary: `Fire`, operand marks, scalar kinds and the
+# data-to-type dispatch trait.
 kernels = { path = "../kernels" }
-# `#[routine]`, which reads a launcher's Rust signature and derives the
-# `Source` per parameter. A separate crate because `proc-macro = true`
+# `#[claims]`, which records the point methods this plane implements. A
+# separate crate because `proc-macro = true`
 # forbids exporting anything else and because `kernels` keeps its "no
 # dependencies, and none is wanted" line. The edge is compile-time only:
 # nothing of `syn` reaches a built artifact.
@@ -139,7 +139,6 @@ tracing = "0.1"
 # `required-features` does not soften that; it gates the build, not the
 # target's existence. `cargo metadata` drops the section silently, so the
 # error appears first at the next real build.
-
 
 
 

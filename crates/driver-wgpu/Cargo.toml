@@ -18,7 +18,7 @@ name = "driver-wgpu"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "The WebGPU execution shell, in Rust: adapters and devices, bind groups, WGSL pipelines and command encoding. Grows beside driver-vulkan and driver-metal, sharing their launch vocabulary and needing neither an SDK nor a C toolchain."
+description = "The WebGPU execution shell, in Rust: adapters and devices, bind groups, WGSL pipelines and command encoding. Shares the claim vocabulary with the other drivers and needs neither an SDK nor a C toolchain."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
@@ -94,9 +94,8 @@ driver-api = { path = "../driver-api", default-features = false }
 # executor is in the portable half for the same reason it is: `Ctx` is
 # `dyn Encode`, so nothing on that path names a `wgpu` type.
 
-# The launch vocabulary. `LaunchRule` is the same enum both siblings match on,
-# and that sharing is load-bearing rather than tidy: the three shells disagree
-# about the GRID and must not disagree about which rule a row names.
+# Claim bodies state their logical lanes with the shared operand vocabulary;
+# the loaded WGSL pipeline supplies the workgroup divisor.
 kernels = { path = "../kernels" }
 
 # The WebGPU signature table, the launch ABI, the WGSL sources themselves --
@@ -247,6 +246,21 @@ required-features = ["native"]
 # offer no cooperative matrix, which the tests print and skip on.
 [[test]]
 name = "cooperative"
+required-features = ["native"]
+
+# The lse plane and the sink rescale: `attention.{decode_lse, prefill_lse,
+# sink}`, fired through the shipped claim bodies onto the adapter. Same stanza
+# and the same skip protocol as `device` above.
+#
+# A separate target from `device_fire` because the question is different again.
+# That one asks whether the BAKER PATH computes a number; this one asks whether
+# three specific points compute the RIGHT numbers, and it drives the claim
+# bodies directly (`Ctx` is `dyn Encode`, so a recorder is a whole plane) rather
+# than through a plan. Two of its six items are fault injections that compile
+# the shipped expansion with one constant changed and assert the comparison goes
+# red.
+[[test]]
+name = "device_sink"
 required-features = ["native"]
 
 # `[[test]] name = "serving"` STOOD HERE and left with its file. That suite

@@ -30,7 +30,7 @@ impl<T> Clone for Payload<T> {
 }
 impl<T> Copy for Payload<T> {}
 
-impl<T: kernels::Elem> kernels::Elem for Payload<T> {
+impl<T: kernels::points::Scalar> kernels::Elem for Payload<T> {
     type Read = Handle;
     type Write = Handle;
 
@@ -43,12 +43,9 @@ impl<T: kernels::Elem> kernels::Elem for Payload<T> {
     }
 
     const CPP: &'static str = "";
-    const TY_CONST: kernels::Ty = <T as kernels::Elem>::TY_CONST;
-    const TY_MUT: kernels::Ty = <T as kernels::Elem>::TY_MUT;
 }
 
-impl<T: kernels::Elem> kernels::ConstRun for Payload<T> {
-    const TY: kernels::Ty = <T as kernels::Elem>::TY_CONST;
+impl<T: kernels::points::Scalar> kernels::ConstRun for Payload<T> {
     type Held = Handle;
 }
 
@@ -70,12 +67,11 @@ impl<R> Clone for Bank<R> {
 impl<R> Copy for Bank<R> {}
 
 impl<R: kernels::points::Repr> kernels::ConstRun for Bank<R> {
-    const TY: kernels::Ty = kernels::Ty::U8s;
     type Held = BankHandles;
 }
 
 pub fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Refusal> {
-    if matches!(<T as kernels::Elem>::TY_CONST, kernels::Ty::Bf16s) {
+    if T::KIND == kernels::points::ScalarKind::Bf16 {
         Ok(())
     } else {
         Err(Refusal::Absent { what })
@@ -83,7 +79,7 @@ pub fn at_bf16<T: kernels::points::Scalar>(what: &'static str) -> Result<(), Ref
 }
 
 pub(crate) fn absent(ctx: &Ctx<'_>) -> Result<ArgValue, Refusal> {
-    kernels::plane::Asks::<crate::plane::Wgpu>::absent(ctx)
+    ctx.absent()
 }
 
 impl kernels::points::Plane for Ctx<'_> {

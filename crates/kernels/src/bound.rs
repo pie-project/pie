@@ -1,40 +1,5 @@
 use crate::plane::{Cache, Const, In, InOut, Out, Refusal};
-use crate::points::{Form, Plane, Repr, Scalar};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Axis {
-    Bf16,
-
-    F16,
-
-    F32,
-
-    I32,
-
-    U32,
-
-    U8,
-}
-
-pub trait Rides: Scalar {
-    const AXIS: Axis;
-}
-
-impl Rides for f32 {
-    const AXIS: Axis = Axis::F32;
-}
-
-impl Rides for i32 {
-    const AXIS: Axis = Axis::I32;
-}
-
-impl Rides for u32 {
-    const AXIS: Axis = Axis::U32;
-}
-
-impl Rides for u8 {
-    const AXIS: Axis = Axis::U8;
-}
+use crate::points::{Form, Plane, Repr, Scalar, ScalarKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Site {
@@ -50,19 +15,20 @@ pub trait BoundOp {
 
     fn point(&self) -> &str;
 
-    fn dtype(&self, at: Site) -> Result<Axis, Refusal>;
+    fn dtype(&self, at: Site) -> Result<ScalarKind, Refusal>;
 
-    fn tin<T: Rides>(&self, at: usize) -> Result<In<<Self::Plane as Plane>::Tensor<T>>, Refusal>;
+    fn tin<T: Scalar>(&self, at: usize) -> Result<In<<Self::Plane as Plane>::Tensor<T>>, Refusal>;
 
-    fn tout<T: Rides>(&self, at: usize) -> Result<Out<<Self::Plane as Plane>::Tensor<T>>, Refusal>;
+    fn tout<T: Scalar>(&self, at: usize)
+    -> Result<Out<<Self::Plane as Plane>::Tensor<T>>, Refusal>;
 
-    fn tinout<T: Rides>(
+    fn tinout<T: Scalar>(
         &self,
         from: usize,
         to: usize,
     ) -> Result<InOut<<Self::Plane as Plane>::Tensor<T>>, Refusal>;
 
-    fn tconst<T: Rides>(
+    fn tconst<T: Scalar>(
         &self,
         at: usize,
     ) -> Result<Const<<Self::Plane as Plane>::Tensor<T>>, Refusal>;

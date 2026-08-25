@@ -30,18 +30,6 @@ default = []
 # `native` is still the BUILD-time hop and costs `slangc` on `PATH`, which is
 # an external binary and not a Rust dependency.
 native = []
-# THE RUNTIME COMPILER, AND ITS OWN FEATURE. `shader-slang` links `libslang`
-# through `shader-slang-sys`, which is a `-sys` crate built with `bindgen` --
-# so enabling it costs a C TOOLCHAIN, and `driver-vulkan/tests/pure.rs` exists
-# to say when this crate's closure has started needing one.
-#
-# It is its own feature because nothing calls `runtime::` yet
-# (`.wiki/kernel-x/remaining-jit.md` §1: "No body calls it yet"). Folding it
-# into `native` made every `native` build need a C compiler for a module that
-# is dark, which is a real cost for no reader. When §1 lands and the bodies
-# name a `.slang`, this is the feature that turns on with them -- and that is
-# the moment the purity claim is renegotiated rather than broken by accident.
-runtime = ["dep:shader-slang"]
 
 [dependencies]
 # `linkme` AND `inventory` STOOD HERE, and they were the routine registry:
@@ -55,14 +43,6 @@ runtime = ["dep:shader-slang"]
 # that answers them.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }
-
-# The Slang compiler, as a LIBRARY rather than the `slangc` program the build
-# script used to shell. Optional and behind `native` for the same reason
-# `slangc` was: the portable half of this crate is an entrypoint census and
-# the claim bodies over it, and linking a shader compiler into that would
-# undo the split. Needs the Slang SDK at build time (`SLANG_DIR`) to compile its FFI,
-# and `libslang` beside the binary at run time.
-shader-slang = { version = "0.1.0", optional = true }
 
 # NO `[[example]]` sections, and the absence is load-bearing for the reason
 # `kernels-cuda/Cargo.toml` states at length: a `[[example]]` whose file is

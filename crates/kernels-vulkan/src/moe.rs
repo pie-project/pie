@@ -190,8 +190,6 @@ impl kernels::points::Moe for Ctx<'_> {
         weights: In<crate::points::Handle<f32>>,
         y: Out<crate::points::Handle<T>>,
     ) -> Result<(), Refusal> {
-        use crate::points::Staged;
-
         crate::points::at_bf16::<T>(
             "moe.weighted_sum, at an element this plane does not instantiate",
         )?;
@@ -203,25 +201,15 @@ impl kernels::points::Moe for Ctx<'_> {
                 at: i64::from(src.rows),
             });
         }
-        let top_k = src.rows / out.rows;
-
-        let inv = self.scratch::<i32>("moe.route_inv", i64::from(src.rows))?;
-        self.fire(
-            Fire::at(
-                crate::plane::module_path("combine_sorted", self.best()),
-                "combine_sorted",
-            )
-            .apply(elementwise_rows(out.width, out.rows)?),
-            &[
-                routed.arg(),
-                weights.arg(),
-                y.arg(),
-                inv.arg(),
-                out.width.arg(),
-                top_k.arg(),
-                0u32.arg(),
-            ],
-        )
+        let _ = weights;
+        Err(Refusal::Unstated {
+            what: "the inverse permutation `combine_sorted` folds through: it \
+                   reads `inv[row * top_k + e]` and `route_sort` is what writes \
+                   one, which no point of this plane claims — so the slab is \
+                   not a slab this fire has forgotten to size, it is a table \
+                   nothing on this plane fills, and `route.slang` stamps no \
+                   unsorted combine to fold without it",
+        })
     }
 
     fn sigmoid_gate_add<T: kernels::points::Scalar>(

@@ -201,7 +201,7 @@ pub unsafe fn build_window_page_view(
 
 /// `build_full_split_view`: describes one request's page span as `splits`
 /// consecutive sub-requests, so a long prefill is attended in pieces against
-/// one page table. 32 threads (`LaunchRule::SingleWarp`), since the body is a
+/// one page table. 32 threads, since the body is a
 /// serial walk with only one thread active past the first step.
 ///
 /// # Errors

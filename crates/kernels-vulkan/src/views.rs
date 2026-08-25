@@ -41,19 +41,6 @@ pub struct MaskView {
     pub stride: u32,
 }
 
-kernels::raise!(
-
-    KvCache = "kv_cache" => PagedKvView
-);
-kernels::raise!(
-
-    RecurrentState = "recurrent_state" => RecurrentView
-);
-kernels::raise!(
-
-    AttnMask = "attention_mask" => MaskView
-);
-
 #[derive(Debug, Clone, Copy)]
 pub struct SplitView {
     pub partials: Tensor<f32>,
@@ -61,7 +48,29 @@ pub struct SplitView {
     pub splits: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AttnFireView {
+    pub kv: PagedKvView,
+
+    pub positions: Tensor<i32>,
+
+    pub request_of_token: Tensor<i32>,
+
+    pub mask: MaskView,
+
+    pub split: SplitView,
+
+    pub kv_heads: i32,
+
+    pub head_dim: i32,
+}
+
 kernels::raise!(
 
-    AttnSplit = "attn.split_policy" => SplitView
+    AttnFire = "attn.fire" => AttnFireView
+);
+
+kernels::raise!(
+
+    RecurrentState = "recurrent_state" => RecurrentView
 );

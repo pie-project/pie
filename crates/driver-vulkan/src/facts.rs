@@ -46,7 +46,7 @@ pub const GUARANTEED_STORAGE_ALIGNMENT: u32 = 256;
 /// # Panics
 ///
 /// Never: every field is a constant or a limit the device must report.
-#[cfg(feature = "native")]
+#[cfg(feature = "device")]
 #[must_use]
 pub fn of(device: &crate::device::Device) -> driver_api::DeviceFacts {
     driver_api::DeviceFacts {

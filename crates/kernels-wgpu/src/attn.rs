@@ -1,11 +1,19 @@
 use kernels::BindMut;
 
-use crate::plane::{Bind, Ctx, Fire, In, InOut, Out};
+use crate::plane::{Bind, Const, Ctx, Fire, In, InOut, Out};
 use crate::points::{Payload, absent, at_bf16};
 use crate::views::{AttnFire, AttnFireView};
 use kernels::plane::{Cache, Refusal};
 use kernels::raises::Struct;
 use kernels::shader::{elementwise, elementwise_rows};
+
+/// The widths the `_lse` arms are stamped at.
+///
+/// One, and it is gpt-oss's: that family is the only one whose text states
+/// `attention.{decode_lse, prefill_lse}` and its heads are 64 wide. Every other
+/// width refuses by name here rather than at a missing pipeline. See the
+/// instantiation block in `attn/sdpa_paged.wgsl`.
+const SDPA_LSE_WIDTHS: [i32; 1] = [64];
 
 fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
     points
@@ -188,8 +196,44 @@ fn heads_of(width: i32, head_dim: i32, what: &'static str) -> Result<i32, Refusa
     Ok(width / head_dim)
 }
 
+/// The kv head count a statement states, against the one the pool row was laid
+/// out with. Shared by `prefill` and `prefill_lse`, which state it identically.
+fn kv_heads_agree(view: &AttnFireView, kv_heads: u32) -> Result<(), Refusal> {
+    let stated = width_of(kv_heads, "the kv head count this attention states")?;
+    if stated != view.kv_heads {
+        return Err(Refusal::Narrow {
+            what: "the kv head count this statement states, against the pool row's own",
+            at: i64::from(stated),
+        });
+    }
+    Ok(())
+}
+
 const fn gqa(q_heads: i32, kv_heads: i32) -> i32 {
     if kv_heads > 0 { q_heads / kv_heads } else { 0 }
+}
+
+/// The log-sum-exp plane an `_lse` reading writes beside its output.
+///
+/// `#[shape(o = q, lse = [q.rows, q.width / head_dim])]` is what the point
+/// declares, and this is that read back off the mark the statement bound: one
+/// f32 per query head per row. Checked rather than assumed because the shader
+/// addresses it as `row * n_q_heads + q_head` with only its own
+/// `arrayLength` to stop it, and a plane one head narrower than stated would
+/// write every row's last head into the next row's first.
+fn lse_plane(
+    lse: Out<Payload<f32>>,
+    rows: i32,
+    q_heads: i32,
+    what: &'static str,
+) -> Result<Out<Payload<f32>>, Refusal> {
+    if lse.rows != rows || lse.width != q_heads {
+        return Err(Refusal::Narrow {
+            what,
+            at: i64::from(lse.width),
+        });
+    }
+    Ok(lse)
 }
 
 fn paged_run(
@@ -363,6 +407,85 @@ impl kernels::points::Attention for Ctx<'_> {
         )
     }
 
+    /// `attention.decode`'s reading, plus the denominator that normalised it.
+    ///
+    /// THE UNSPLIT ARM AND ONLY IT. `decode` above cuts the key range into
+    /// slices when the grid is too small to fill the device and merges them in
+    /// a second pass; that is a decision this backend makes about ITS occupancy
+    /// and a split arm publishes no lse — a slice holds only its own
+    /// denominator, and the one the point states exists after the combine. So
+    /// this reading takes the arm that has the whole row in one workgroup,
+    /// which is correct at every batch and slower only where the split would
+    /// have been faster. The day a deployment measures that, the combine grows
+    /// the plane and this picks it up; nothing here has to change first.
+    fn decode_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<Payload<T>>,
+        pages: Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Payload<T>>,
+        lse: Out<Payload<f32>>,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.decode_lse at an element other than bf16")?;
+        let view = fire_view(&pages)?;
+        let head_dim = width_of(head_dim, "the head width this attention states")?;
+        let window = width_of(window, "the sliding window this attention states")?;
+        let q_heads = heads_of(q.width, head_dim, "the query rectangle's row")?;
+        let kv_heads = view.kv_heads;
+        let rows = q.rows;
+        head_point(head_dim, &SDPA_LSE_WIDTHS)?;
+        let lse = lse_plane(
+            lse,
+            rows,
+            q_heads,
+            "`attention.decode_lse`'s log-sum-exp plane",
+        )?;
+        let run = paged_run(
+            view,
+            q.arg(),
+            o.arg(),
+            gqa(q_heads, kv_heads),
+            kv_heads,
+            sm_scale,
+        );
+        // NO `absent` FOR THE SINK SLOT, which every arm beside this one
+        // passes. A `_lse` variant reaches no sink, so `attn/sdpa_paged.wgsl`'s
+        // binding 10 is declared and unread — and on this plane an unread
+        // binding is not in the bind group layout at all (`reflect::of_module`
+        // derives the layout from what the entry point REACHES). The buffer run
+        // is therefore the ten this body reads plus the plane it writes, and
+        // the lse takes the place in the run that the absent buffer holds next
+        // door rather than a place after it.
+        self.fire(
+            Fire::at(
+                "attn/sdpa_paged.wgsl",
+                "sdpa_paged_decode_lse_bfloat16_d_64",
+            )
+            .apply(paged_decode_grid(head_dim, q_heads, rows)?),
+            &[
+                run[0],
+                run[1],
+                run[2],
+                run[3],
+                run[4],
+                run[5],
+                run[6],
+                run[7],
+                run[8],
+                run[9],
+                run[10],
+                run[11],
+                run[12],
+                run[13],
+                run[14],
+                window.arg(),
+                lse.arg(),
+            ],
+        )
+    }
+
     fn prefill<T: kernels::points::Scalar>(
         &self,
         q: In<Payload<T>>,
@@ -377,14 +500,115 @@ impl kernels::points::Attention for Ctx<'_> {
         let _ = indptr;
         at_bf16::<T>("attention.prefill at an element other than bf16")?;
         let view = fire_view(&pages)?;
-        let stated = width_of(kv_heads, "the kv head count this attention states")?;
-        if stated != view.kv_heads {
+        kv_heads_agree(view, kv_heads)?;
+        tiled(self, q, o, view, window, head_dim, sm_scale)
+    }
+
+    /// `attention.prefill`'s reading, plus the denominator that normalised it.
+    /// See [`Attention::decode_lse`] for the sink slot this run does not fill.
+    fn prefill_lse<T: kernels::points::Scalar>(
+        &self,
+        q: In<Payload<T>>,
+        indptr: In<Payload<i32>>,
+        pages: Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: Out<Payload<T>>,
+        lse: Out<Payload<f32>>,
+    ) -> Result<(), Refusal> {
+        let _ = indptr;
+        at_bf16::<T>("attention.prefill_lse at an element other than bf16")?;
+        let view = fire_view(&pages)?;
+        kv_heads_agree(view, kv_heads)?;
+        let head_dim = width_of(head_dim, "the head width this attention states")?;
+        let window = width_of(window, "the sliding window this attention states")?;
+        let q_heads = heads_of(q.width, head_dim, "the query rectangle's row")?;
+        let rows = q.rows;
+        head_point(head_dim, &SDPA_LSE_WIDTHS)?;
+        let lse = lse_plane(
+            lse,
+            rows,
+            q_heads,
+            "`attention.prefill_lse`'s log-sum-exp plane",
+        )?;
+        let run = paged_run(
+            view,
+            q.arg(),
+            o.arg(),
+            gqa(q_heads, view.kv_heads),
+            view.kv_heads,
+            sm_scale,
+        );
+        self.fire(
+            Fire::at("attn/sdpa_paged.wgsl", "sdpa_paged_tiled_lse_bfloat16_d_64")
+                .apply(tiled_grid(q_heads, head_dim, rows)?),
+            &[
+                run[0],
+                run[1],
+                run[2],
+                run[3],
+                run[4],
+                run[5],
+                run[6],
+                run[7],
+                run[8],
+                run[9],
+                run[10],
+                run[11],
+                run[12],
+                run[13],
+                run[14],
+                window.arg(),
+                rows.arg(),
+                lse.arg(),
+            ],
+        )
+    }
+
+    /// gpt-oss's learned per-head sink, applied to an output the softmax has
+    /// already normalised, against the log-sum-exp that normalised it.
+    ///
+    /// The point states `lse` in BASE TWO and the sink in the checkpoint's own
+    /// natural log, so the shader rebases one to meet the other; see
+    /// `attn/attn_sink.wgsl`, which is the whole argument.
+    fn sink<T: kernels::points::Scalar>(
+        &self,
+        o: InOut<Payload<T>>,
+        lse: In<Payload<f32>>,
+        sink: Const<Payload<T>>,
+        head_dim: u32,
+    ) -> Result<(), Refusal> {
+        at_bf16::<T>("attention.sink at an element other than bf16")?;
+        let head_dim = width_of(head_dim, "the head width this sink states")?;
+        let heads = heads_of(
+            o.width,
+            head_dim,
+            "the attention output's row, against the head width this sink states",
+        )?;
+        if lse.rows != o.rows || lse.width != heads {
             return Err(Refusal::Narrow {
-                what: "the kv head count this statement states, against the pool row's own",
-                at: i64::from(stated),
+                what: "the log-sum-exp plane this sink reads is not one f32 per head per row",
+                at: i64::from(lse.width),
             });
         }
-        tiled(self, q, o, view, window, head_dim, sm_scale)
+        self.fire(
+            Fire::at("attn/attn_sink.wgsl", "attn_sink_rescale_bfloat16")
+                .apply(head_grid(head_dim, heads, o.rows)?),
+            &[
+                // The in-place mark, cut into a read half and a write half at
+                // one handle — `attention.logit_softcap` below binds the same
+                // shape, and both halves of the shader are `read_write` so the
+                // alias needs no shadow copy.
+                o.ptr.arg(),
+                o.arg(),
+                lse.arg(),
+                sink.v.arg(),
+                head_dim.arg(),
+                heads.arg(),
+            ],
+        )
     }
 
     fn masked<T: kernels::points::Scalar>(

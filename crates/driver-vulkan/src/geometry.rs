@@ -49,7 +49,169 @@
 //! Reading these from the module is also the only way the agreement can be
 //! CHECKED, and `tests/rules.rs` checks it for all 480 entrypoints.
 
-pub use kernels::LaunchRule as Rule;
+// `LaunchRule` CAME DOWN OFF THE FLOOR AND IS THIS DRIVER'S NOW.
+//
+// It stood in `kernels` as "the union of every backend's blocks" -- 42
+// variants, of which this plane has geometry for seventeen and refuses
+// twenty-four. That was a shared enum for something each plane knows
+// PRIVATELY, and the floor retired it: a claim body states its own grid now,
+// and a generated entrypoint name is interned rather than enumerated.
+//
+// What survives is not the floor's business but this file's: a table from a
+// launch shape to the workgroup count that covers it, checked against the
+// module's own declared `LocalSize`. `driver-wgpu` deleted its copy outright
+// because nothing but its tests read it; here `device::groups_for` is the
+// hand-built launch every device test states, and `spirv::declared` is what
+// it is checked against. So the enum moves rather than dies, and it moves
+// with the file that was always its only real reader.
+
+/// A launch shape this plane has geometry for, or [`Rule::Unstated`] for a
+/// row that names none.
+///
+/// **THE VARIANTS CARRY NO DOC COMMENTS AND THAT IS INHERITED, NOT LAZY.**
+/// This enum lived in `kernels`, which carries no comments at all — the user
+/// removed every one from `kernels*` on purpose (`62142432b`, `e77f3ce82`) —
+/// so it arrives here with none. Writing forty-two now would be inventing
+/// meaning rather than recording it: each variant is named for the launch
+/// shape it IS, and what a shape costs in workgroups is stated once, below,
+/// in the table that reads it. That table is the documentation.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Rule {
+    #[default]
+    Unstated,
+
+    Qmv,
+
+    Rms,
+
+    Rope,
+
+    Elementwise,
+
+    ElementwiseRows,
+
+    PerHead,
+
+    SdpaVector,
+
+    SdpaTiled,
+
+    SdpaMma,
+
+    PerHeadElementwise,
+
+    GatedRms,
+
+    RouterLane,
+
+    RouterSort,
+
+    RouteRows,
+
+    RoutedQmv,
+
+    SplitPacked,
+
+    Qmm,
+
+    RecurrentScan,
+
+    PerRow,
+
+    PerChannel,
+
+    ElementwiseIn,
+
+    RowScores,
+
+    RowsPerHead,
+
+    RowsFlat,
+
+    Slab,
+
+    Tile16,
+
+    AxialRope,
+
+    WarpTiledScan,
+
+    PerRowNarrow,
+
+    PagedScores,
+
+    PagedScoresDecode,
+
+    MlaPrepare,
+
+    RowsPackedHeads,
+
+    RowsPackedHeadsNarrow,
+
+    WarpPackedHeads,
+
+    RoutedQmvTransposed,
+
+    AltUpStreams,
+
+    RoutedQmvQuad,
+
+    Single,
+
+    SingleWarp,
+
+    PerRequest,
+}
+
+impl Rule {
+    /// Every launch shape, in declaration order — what a sweep walks when
+    /// it asks this plane which shapes it covers.
+    pub const ALL: &'static [Self] = &[
+        Self::Unstated,
+        Self::Qmv,
+        Self::Rms,
+        Self::Rope,
+        Self::Elementwise,
+        Self::ElementwiseRows,
+        Self::PerHead,
+        Self::SdpaVector,
+        Self::SdpaTiled,
+        Self::SdpaMma,
+        Self::PerHeadElementwise,
+        Self::GatedRms,
+        Self::RouterLane,
+        Self::RouterSort,
+        Self::RouteRows,
+        Self::RoutedQmv,
+        Self::SplitPacked,
+        Self::Qmm,
+        Self::RecurrentScan,
+        Self::PerRow,
+        Self::PerChannel,
+        Self::ElementwiseIn,
+        Self::RowScores,
+        Self::RowsPerHead,
+        Self::RowsFlat,
+        Self::Slab,
+        Self::Tile16,
+        Self::AxialRope,
+        Self::WarpTiledScan,
+        Self::PerRowNarrow,
+        Self::PagedScores,
+        Self::PagedScoresDecode,
+        Self::MlaPrepare,
+        Self::RowsPackedHeads,
+        Self::RowsPackedHeadsNarrow,
+        Self::WarpPackedHeads,
+        Self::RoutedQmvTransposed,
+        Self::AltUpStreams,
+        Self::RoutedQmvQuad,
+        Self::Single,
+        Self::SingleWarp,
+        Self::PerRequest,
+    ];
+}
 
 /// The fire-time quantities a launch rule may read.
 ///
@@ -238,7 +400,7 @@ pub enum Ungeometric {
     },
     /// A rule this backend compiles no module for.
     ///
-    /// `kernels::LaunchRule` is the whole fleet's vocabulary and CUDA states
+    /// `Rule` is the whole fleet's vocabulary and CUDA states
     /// rules for blocks nothing here implements -- mamba's scans, MLA's
     /// prepare, gemma-4's alt-up streams, the packed-head attentions. A text
     /// naming one is a model this backend does not serve, and the refusal is
@@ -607,7 +769,7 @@ mod tests {
             [32, 8, 1],
         ];
         let mut checked = 0;
-        for &rule in kernels::LaunchRule::ALL {
+        for &rule in Rule::ALL {
             for local in locals {
                 // Only a GEMM carries a tile, and only a GEMM is allowed to.
                 let m = Module {
@@ -655,7 +817,7 @@ mod tests {
 
     /// Every launch rule this backend lays a grid out for.
     ///
-    /// `kernels::LaunchRule` is the whole fleet's vocabulary, and most of it
+    /// `Rule` is the whole fleet's vocabulary, and most of it
     /// is CUDA's: mamba scans, MLA, the paged-score taps, packed-head
     /// attentions, gemma-4's alt-up. `lanes` answers for exactly the rules
     /// below and refuses the rest by name.
@@ -714,7 +876,7 @@ mod tests {
             local: Local([32, 2, 2]),
             tile: Some(Tile { rows: 32, cols: 64 }),
         };
-        for &rule in kernels::LaunchRule::ALL {
+        for &rule in Rule::ALL {
             let module = Module {
                 tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
                 ..m
@@ -785,7 +947,7 @@ mod tests {
             .join("\n");
 
         let mut unnamed = Vec::new();
-        for &rule in kernels::LaunchRule::ALL {
+        for &rule in Rule::ALL {
             if SERVED.contains(&rule) || rule == Rule::Unstated {
                 continue;
             }
@@ -856,7 +1018,7 @@ mod tests {
         ];
         let mut answered = 0;
         let mut empty = Vec::new();
-        for &rule in kernels::LaunchRule::ALL {
+        for &rule in Rule::ALL {
             for local in locals {
                 let m = Module {
                     local: Local(local),
@@ -923,7 +1085,7 @@ mod tests {
     /// it reads `local_size_x` and ignores `y`.
     #[test]
     fn no_rule_launches_a_whole_spare_workgroup() {
-        for &rule in kernels::LaunchRule::ALL {
+        for &rule in Rule::ALL {
             let m = Module {
                 local: Local([32, 2, 2]),
                 tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
@@ -1014,7 +1176,7 @@ mod tests {
     #[test]
     fn a_rectangle_of_no_rows_still_launches_one() {
         let none = Dims { rows: 0, ..dims() };
-        for &rule in kernels::LaunchRule::ALL {
+        for &rule in Rule::ALL {
             let Ok(g) = groups(
                 rule,
                 none,

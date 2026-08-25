@@ -50,11 +50,16 @@
 //! module rather than assumed from the row that names it, and where the two
 //! are computed separately they are checked against each other.
 //!
-//! [`lowering`] and [`dispatch`] turn one of a plan's rectangles into one
+//! [`baker`] and [`walk`] turn one of a plan's STATEMENTS into one
 //! `vkCmdDispatch`: which buffers, at which offsets, with which scalars, over
-//! which grid. [`binding`] is where a row's operand ORDER meets a module's
-//! binding order, which are not the same order and were not the same order for
-//! 2898 of the 3992 rectangles three real texts state.
+//! which grid. `lowering` and `dispatch` did it from a lowered row and both
+//! are deleted; the difference is that a `#[claims]` body writes its own
+//! argument list in the SHADER's order, so the reorder pass they needed is
+//! gone. That pass is worth remembering by its number: a row's operand order
+//! and a module's binding order were not the same order for **2,898 of the
+//! 3,992 rectangles** three real texts stated, and every one of them went
+//! through a permutation read off a column. [`binding`] is what is left of
+//! it -- where a run of scalar words meets the block a module declares.
 //!
 //! [`device`] is the Vulkan itself, and the only place in the crate with
 //! `unsafe` in it. [`Device::run`](device::Device::run) submits one dispatch
@@ -94,17 +99,22 @@
 //! rescaling config asks for. A text that stated any of them would be right for
 //! one server and quietly wrong for the next.
 //!
-//! [`shell`] is one assembled server: it owns the device, the two plans, the
-//! cache, the book and the weights, and takes turns. Everything in it existed
-//! already and none of it was a server -- until this, every caller assembled
+//! `shell` WAS one assembled server: it owned the device, the two plans, the
+//! cache, the book and the weights, and took turns. Everything in it existed
+//! already and none of it was a server -- until it, every caller assembled
 //! thirty lines of pieces that all had to agree, and nothing checked that any
-//! pair did. It does not derive the model, because `crates/model` is a
+//! pair did. It did not derive the model, because `crates/model` is a
 //! dev-dependency here on purpose: a driver executes a text somebody else
-//! authored. It CHECKS the pieces instead, which is stronger than deriving
+//! authored. It CHECKED the pieces instead, which is stronger than deriving
 //! -- deriving assumes one set of facts went in and cannot notice when two
 //! did. Owning a device also found a leak nothing else could: every caller
 //! shared one static device that outlived the process, so nothing had ever
 //! destroyed a device with buffers still on it.
+//!
+//! It is deleted with the lowering it fired, and the assembly it replaced is
+//! owed again: [`walk::lane::Baked`] is the half of a load that is a fact
+//! about the CATALOG, and nothing yet joins it to a device, a pool and a
+//! book.
 //!
 //! [`facts`] is the first line the engine's seam reads: what this driver says
 //! about the device it opened. `driver-metal` states its as constants and is
@@ -123,7 +133,7 @@
 //! and every layer; [`device::Device::copy_within`] is the copy under it, on
 //! the copy engine because a host `memmove` of write-combined VRAM costs
 //! eighteen times what `vkCmdCopyBuffer` does. Only
-//! [`shell::Shell::fork`] has both halves, which is the point: a caller who
+//! `shell::Shell::fork` had both halves, which is the point: a caller who
 //! could take the seat without copying the bytes would have a conversation
 //! attending over whatever those pages last held -- zeros, which are finite
 //! and plausible and wrong. Five mutations were tried against the whole-
@@ -375,17 +385,29 @@
 //! That loader is not missing work in this crate, which is worth stating
 //! because it looks like it should be. `tests/checkpoint.rs` measured a real
 //! `Qwen/Qwen3-0.6B` snapshot against a real qwen3 plan: ZERO of 704 weight
-//! names agree. The plan says `layer.0.down` where the checkpoint says
-//! `model.layers.0.mlp.down_proj.weight`, and the plan wants `embed.scales`
+//! names agree. The plan said `layer.0.down` where the checkpoint says
+//! `model.layers.0.mlp.down_proj.weight`, and the plan wanted `embed.scales`
 //! and `embed.zeros`, which no bfloat16 checkpoint holds under any spelling
-//! because they are outputs of quantizing. Loading is therefore a CONVERSION,
-//! it already has a home in `model-loader`, and what this crate owes is
-//! exactly `Weights::hold` -- a name, some bytes, and no opinion about where
-//! they came from. Running that conversion and comparing again still leaves
-//! 704 of 704 disagreeing, because the remaining gap is a naming convention;
-//! [`names`] closes it.
+//! because they are outputs of quantizing. Loading was therefore a
+//! CONVERSION, and running that conversion and comparing again still left
+//! 704 of 704 disagreeing, because the remaining gap was a naming convention
+//! that [`names`] closed.
 //!
-//! A sampler OF ITS OWN. [`turns::Serving::step`] drives fire after fire and
+//! **THAT FILE IS GONE, AND SO IS THE QUESTION IT ASKED.** `tests/checkpoint.
+//! rs` was deleted with the legacy load contract it was written against --
+//! `model::shared::llama_like`, `model_compiler::lower`, `model::catalog` and
+//! `model::boot::compile_load_plan_for`, all four removed by R3. Its finding
+//! is kept above because a measurement does not stop being true when the
+//! apparatus that took it is retired, but the shape of the work it settled
+//! has changed underneath it: `model::produce` answers with the tensors a
+//! plan's `params` name, already dense and canonical, so identification and
+//! loadability are one question and there are no longer two name spaces to
+//! join. `driver-metal/src/serve/weights.rs` is what that looks like when it
+//! lands, and `driver-wgpu` deleted its own copy of this same file at P5b for
+//! the same reason. Three tests went with it, and they are named in the
+//! commit rather than paraphrased here.
+//!
+//! A sampler OF ITS OWN. `turns::Serving::step` drove fire after fire and
 //! [`serve::logits`] names where the distribution is, but no code in this
 //! crate chooses a token from it. That is deliberate and matches
 //! `driver-metal`: sampling is policy -- temperature, top-p, penalties, a
@@ -2235,9 +2257,9 @@
 //! itself. It took two conversations at once to see it, and what it looks like
 //! is the second one answering the first one's question fluently.
 //!
-//! So [`shell::Shell::launch`] does not touch the book at all. [`frames`]
+//! So `shell::Shell::launch` did not touch the book at all. [`frames`]
 //! splits a frame's CSRs into this driver's [`resources::Request`]s and
-//! [`turns::Serving::over`] fires them, which is [`turns::Serving::step`]
+//! `turns::Serving::over` fired them, which is `turns::Serving::step`
 //! minus the growth. Measured on a real qwen3: one conversation served both
 //! ways, BIT FOR BIT the same distribution, with a control proving the
 //! frame's pages are what attention actually reads.
@@ -2262,7 +2284,7 @@
 //! a wrong answer rather than a crash. `try_reserve_exact` refusing was
 //! reported as a FAULT, and so was a device that would not give the memory --
 //! and neither is one. A growth that fails for want of memory is the
-//! definition of [`frames::Launched::Exhausted`]: evict and re-post. That
+//! definition of `frames::Launched::Exhausted`: evict and re-post. That
 //! variant was declared here, documented here, and matched on at the engine
 //! seam, and **nothing in this crate had ever produced it**. Every full pool
 //! took the fault path instead, which since a driver lane began answering its
@@ -2313,7 +2335,7 @@
 //! It costs one invariant, and the invariant is worth naming because it was
 //! deliberate: a frame of envelope steps CANNOT be converted whole and then
 //! fired, since step n+1 does not exist until step n has run. The engine seam
-//! drives those one at a time; [`shell::Shell::launch`] keeps the stronger
+//! drives those one at a time; `shell::Shell::launch` kept the stronger
 //! order for a frame of ordinary host-wire steps, which is why it splits into
 //! `admit`, `prepare` and `serve`.
 //!
@@ -2443,39 +2465,103 @@
 )]
 #![deny(clippy::print_stdout)]
 
-#[cfg(feature = "native")]
-pub mod bind;
+// The baker executor and the walk it runs. UNGATED, and that is the whole
+// design: the walk reads a `Program`, carves an arena and asks a generated
+// dispatch through a `dyn Encode`, so what a device does is behind the `dyn`
+// and the order it fires in is checkable with no adapter in the process. See
+// `walk::fire`'s header and `tests/the_walk_is_the_program.rs`.
+pub mod baker;
+pub mod walk;
+
+// THE LEGACY EXECUTION PATH STOOD HERE -- eight modules, 5,125 lines, deleted
+// whole rather than patched. Every one of them named a type R3 or the
+// `#[routine]` retirement removed (`model_compiler::lower::{Arg, Launch,
+// Lowered, Row}`, `model_ir::trace::{ForwardPlan, Dim}`,
+// `kernels_vulkan::{ROUTINES, routines, routine}`), so none of them had
+// compiled since; what replaces all eight is [`baker`] over [`walk`].
+// `driver-wgpu` cut the same shape in one commit and this list is the same
+// list with this crate's names on it.
+//
+// * `bind` (305) -- this backend's half of `kernels::bind`: `Held`, the
+//   mapping from a `kernels::keys` KEY to the buffer this driver holds under
+//   that name, so the `sources` column of a routine's argument list was read
+//   once for every backend instead of once per crossed kernel. The column it
+//   read is gone with `#[routine]`; a `#[claims]` body states its own operands
+//   in ordinary Rust and there is nothing left to read.
+// * `dispatch` (308) -- `Geometry`, `Undispatchable` and the join: `binding`
+//   answered where an operand lived, `geometry` answered how many workgroups a
+//   `Rule` wanted, and `plan_one` turned one `Launch` plus one `KernelSig` row
+//   into a `Dispatch`. It was the last reader of `kernels_vulkan::KERNELS` in
+//   this crate. [`baker::dispatch::Dispatch`] is what a dispatch is now, and it
+//   is built by a claim body rather than by a join against a row.
+// * `encode` (855) -- `Encoder`, the `Reflect` seam and the legacy
+//   `kernels_vulkan::routine::Encode` impl. [`baker::encode::Encoder`] is the
+//   same idea against the `#[claims]` vocabulary, and it is 335 lines because
+//   the scalar packing it used to do is `binding::params_from`'s.
+// * `hold` (1619) -- the `routines()` table walk: a symbol to its routine, its
+//   arm and its facts. `kernels_vulkan::routines` does not exist;
+//   `kernels_vulkan::points_dispatch` is the generated table now and the walk
+//   over it is [`walk::fire`].
+// * `replay` (602) -- a captured command buffer re-submitted when nothing that
+//   built it had changed. It keyed on a `Lowered` and the buffers a `Resolve`
+//   answered with, and there is no `Lowered` to key on. Nothing in the baker
+//   path replays today and this file is not the design for one: a `Program`
+//   walk re-runs the same statements against the same arena, so what a replay
+//   would skip is the BINDING and not the recording.
+// * `shell` (1121) -- one assembled server: the device, the two plans, the
+//   pool and the book, plus `launch`, `fork` and `resize_pool`. Its verbs are
+//   the engine seam's and they are named where they are still owed --
+//   `resources::Pool::ceiling` and `Pool::copy_rows` both carry the paragraph
+//   that used to point here.
+// * `views` (246) -- the raised views for `In<Struct<..>>` operands, minted
+//   through `bind::Handles`' doors. [`baker::views`] is the same construction
+//   off [`baker::stage`]'s pools, and it is 157 lines because a claim body
+//   asks for a view by mark rather than by key.
+// * `runtime` (69) -- `Streams`, value id -> the fire table a plan's runtime
+//   stream stages in, built from `ForwardPlan::runtime`. `walk::fire`'s
+//   `runtime` answers a stream by NAME, per statement, which is the door a
+//   `#[claims]` body actually knocks on.
+//
+// `pub mod lowering` STOOD HERE BEFORE ANY OF THEM -- 539 lines that read a
+// `KernelSig`'s operand kinds and answered which of a call's values was a
+// descriptor and which a push field, plus the `Call`, `Value` and `Mismatch`
+// vocabulary for saying so. Its production caller was `dispatch::plan_one`.
+// What packs a statement's scalars is `binding::params_from` feeding
+// `baker::encode::Encoder`.
 #[cfg(feature = "native")]
 pub mod binding;
-#[cfg(feature = "native")]
+// `device`, and not `native`, because this module is the half that WORKS: it
+// imports `geometry` and `spirv` and nothing else in the crate, so it does not
+// reach the R5-deleted IR the legacy walk was built on. `native` forwards to
+// `device`, so every existing caller is unaffected; what the narrower name
+// buys is a build in which the card can be opened without the serving half.
+#[cfg(feature = "device")]
 pub mod device;
 #[cfg(feature = "native")]
-pub mod dispatch;
-#[cfg(feature = "native")]
-pub mod hold;
-
-#[cfg(feature = "native")]
-pub mod encode;
-#[cfg(feature = "native")]
 pub mod envelope;
-// The raised views the binder builds for `In<Struct<..>>` operands, and the
-// runtime-stream map the resolver answers `Arg::Named` through. Both halves
-// of the no-ask runtime channel, native-gated with the binder they feed.
+// What this driver answers `driver_api::DeviceFacts` with. Ungated, and it is
+// the module that most needs to be: `facts::floor` is the answer a caller with
+// no card gets, and `facts::of` -- the two fields a real device overwrites --
+// carries the `device` gate itself rather than taking the whole file with it.
 pub mod facts;
 #[cfg(feature = "native")]
 pub mod frames;
+// WHAT IS LEFT OF IT AND WHO READS IT, because the cull that named this file a
+// delete was reasoning from the callers it had: `Module::named` in `encode` and
+// `serve`, `Ungeometric` in `dispatch` and `turns`, `Dims`/`Rule` in `device`.
+// The first four are deleted with their modules and the fifth is not --
+// `device::groups_for` still asks `geometry::groups(rule, dims,
+// Module::loaded(..))`, `device::Failed::Geometry` still carries an
+// `Ungeometric`, and both device test targets still name `Dims` and `Rule`. So
+// this module is the LAUNCH-RULE half of the plane capital, not part of the
+// legacy walk, and it stays.
+//
+// `Module::named`, `lanes` and `Tile` have no reader left in this crate. They
+// are `pub` and re-exported, so nothing warns; they are named here so that the
+// commit which retires `kernels::LaunchRule` -- and it is coming, on another
+// branch -- knows it is retiring three dead items and one live one rather than
+// a whole module.
 pub mod geometry;
-#[cfg(feature = "native")]
-pub mod runtime;
-#[cfg(feature = "native")]
-pub mod views;
-// `pub mod lowering` STOOD HERE -- 539 lines that read a `KernelSig`'s
-// operand kinds and answered which of a call's values was a descriptor and
-// which a push field, plus the `Call`, `Value` and `Mismatch` vocabulary for
-// saying so. Its production caller was `dispatch::plan_one`, which is gone,
-// and its last caller of any kind was one GPU test that now transcribes the
-// twenty-four bytes `attn/kv_write.slang` declares. What packs a routine's
-// scalars is `binding::params_from` feeding `encode::Encoder`.
 
 // Strings and a static table, so it is ungated: a caller that only wants to
 // know what a checkpoint calls `layer.3.down` should not have to link Vulkan.
@@ -2493,8 +2579,6 @@ pub use driver::names;
 #[cfg(feature = "native")]
 pub mod pages;
 #[cfg(feature = "native")]
-pub mod replay;
-#[cfg(feature = "native")]
 pub mod resources;
 // Wall-clock accounting for the HOST side of a step. Ungated: it holds no
 // device handle and a caller with no GPU can still read the totals.
@@ -2506,13 +2590,18 @@ pub mod programs;
 pub mod rope;
 #[cfg(feature = "native")]
 pub mod serve;
-#[cfg(feature = "native")]
-pub mod shell;
 pub mod spirv;
 #[cfg(feature = "native")]
 pub mod turns;
 
+// `Unbindable`, `bind` and `resolve` STOOD in this list. All three took a
+// `model_compiler::lower::Launch` -- the flat argument row a lowering handed a
+// driver -- and turned it into a run of `Slot`s over an `Arena`. There is no
+// `Launch`; `walk::fire` binds a statement's operands from the statement, and
+// what survives here is the vocabulary both readings share: an [`Arena`], a
+// [`Resolve`] to ask, and the [`binding::Misplaced`]/[`binding::Unlayoutable`]
+// refusals that are about a RECTANGLE rather than about a row.
 #[cfg(feature = "native")]
-pub use binding::{Arena, Resolve, Unbindable, bind, resolve};
+pub use binding::{Arena, Resolve};
 pub use geometry::{Dims, Local, Module, Rule, Tile, Ungeometric, groups, lanes};
 pub use spirv::Declared;

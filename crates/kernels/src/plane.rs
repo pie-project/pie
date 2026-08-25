@@ -1,49 +1,10 @@
-use crate::Ty;
-
-pub trait Absent: Sized {
-    fn is_absent(&self) -> bool {
-        false
-    }
-
-    fn absent() -> Option<Self> {
-        None
-    }
-}
-
-pub trait Backend: Copy + 'static {
-    type Value: Copy + Absent;
-
-    type Ctx<'a>: ?Sized;
-
-    fn region(value: &Self::Value) -> Result<Extent, Refusal> {
-        let _ = value;
-        Err(Refusal::Absent {
-            what: "a region's shape: this binder binds addresses only",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Extent {
-    pub rows: i32,
-
-    pub width: i32,
+pub trait NullArg: Sized {
+    fn null() -> Self;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct Stride(pub i32);
-
-impl<B: Backend> Arg<B> for Stride
-where
-    i32: Arg<B>,
-{
-    const TY: Ty = <i32 as Arg<B>>::TY;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        <i32 as Arg<B>>::unpack(value, at).map(Stride)
-    }
-}
 
 impl core::ops::Deref for Stride {
     type Target = i32;
@@ -97,12 +58,6 @@ pub enum Refusal {
 
     Undeclared,
 
-    Kind {
-        at: usize,
-
-        want: Ty,
-    },
-
     Device {
         why: &'static str,
     },
@@ -136,44 +91,12 @@ impl core::fmt::Display for Refusal {
             Self::Absent { what } => write!(f, "the fire does not carry {what}"),
             Self::Unstated { what } => write!(f, "nothing states {what}"),
             Self::Undeclared => write!(f, "nothing declares it"),
-            Self::Kind { at, want } => write!(f, "argument {at} is {want:?} and arrived otherwise"),
             Self::Device { why } => write!(f, "the device refused: {why}"),
         }
     }
 }
 
 impl core::error::Error for Refusal {}
-
-pub trait Arg<B: Backend>: Sized {
-    const TY: Ty;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal>;
-}
-
-pub trait Answers<B: Backend> {
-    fn resolve(&self, ty: Ty, source: crate::Source) -> Result<B::Value, Refusal>;
-}
-
-pub trait Asks<B: Backend>: Answers<B> {
-    fn param(&self, n: u8) -> Result<i32, Refusal>
-    where
-        i32: Arg<B>,
-    {
-        <i32 as Arg<B>>::unpack(
-            &self.resolve(
-                <i32 as Arg<B>>::TY,
-                crate::Source::Slot(crate::Kind::Param, n),
-            )?,
-            usize::from(n),
-        )
-    }
-
-    fn absent(&self) -> Result<B::Value, Refusal> {
-        self.resolve(Ty::Buf, crate::Source::Lit(crate::Lit::Null))
-    }
-}
-
-impl<B: Backend, T: Answers<B> + ?Sized> Asks<B> for T {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fire {
@@ -355,7 +278,7 @@ impl Geometry for Grid {
 }
 
 macro_rules! mark {
-    ($(#[$m:meta])* $name:ident, $side:ident, $advance:ident, $ty:ident, $bind:ident, $arg:ident) => {
+    ($(#[$m:meta])* $name:ident, $side:ident, $advance:ident, $bind:ident, $arg:ident) => {
         $(#[$m])*
         #[derive(Debug)]
         pub struct $name<E: Elem> {
@@ -443,26 +366,14 @@ macro_rules! mark {
             }
         }
 
-        impl<B: Backend, E: Elem> Arg<B> for $name<E>
-        where
-            E::$side: Arg<B>,
-        {
-            const TY: Ty = E::$ty;
-
-            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-                let ptr = <E::$side as Arg<B>>::unpack(value, at)?;
-                let Extent { rows, width } = extent_of::<B>(value)?;
-                Ok($name { ptr, rows, width })
-            }
-        }
     };
 }
 
-mark!(In, Read, advance_read, TY_CONST, Bind, arg);
+mark!(In, Read, advance_read, Bind, arg);
 
-mark!(Out, Write, advance_write, TY_MUT, BindMut, arg_mut);
+mark!(Out, Write, advance_write, BindMut, arg_mut);
 
-mark!(InOut, Write, advance_write, TY_MUT, BindMut, arg_mut);
+mark!(InOut, Write, advance_write, BindMut, arg_mut);
 
 #[derive(Debug)]
 pub struct Cache<E: Elem> {
@@ -493,38 +404,30 @@ pub struct Const<C: ConstRun> {
 }
 
 pub trait ConstRun {
-    const TY: Ty;
-
     type Held: Copy;
 }
 
 impl ConstRun for i32 {
-    const TY: Ty = Ty::I32;
     type Held = i32;
 }
 
 impl ConstRun for u32 {
-    const TY: Ty = Ty::U32;
     type Held = u32;
 }
 
 impl ConstRun for f32 {
-    const TY: Ty = Ty::F32;
     type Held = f32;
 }
 
 impl ConstRun for bool {
-    const TY: Ty = Ty::Bool;
     type Held = bool;
 }
 
 impl ConstRun for i64 {
-    const TY: Ty = Ty::I64;
     type Held = i64;
 }
 
 impl ConstRun for usize {
-    const TY: Ty = Ty::Usize;
     type Held = u64;
 }
 
@@ -563,14 +466,10 @@ pub trait Elem: 'static {
     unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write;
 
     const CPP: &'static str;
-
-    const TY_CONST: Ty;
-
-    const TY_MUT: Ty;
 }
 
 macro_rules! elem {
-    ($t:ty, $cpp:literal, $tc:ident, $tm:ident) => {
+    ($t:ty, $cpp:literal) => {
         impl Elem for $t {
             type Read = *const $t;
             type Write = *mut $t;
@@ -583,35 +482,23 @@ macro_rules! elem {
                 unsafe { write.add(elems) }
             }
             const CPP: &'static str = $cpp;
-            const TY_CONST: Ty = Ty::$tc;
-            const TY_MUT: Ty = Ty::$tm;
         }
     };
 }
 
-elem!(i32, "::std::int32_t", I32s, I32sMut);
-elem!(i64, "::std::int64_t", I64s, BufMut);
-elem!(i8, "::std::int8_t", I8s, I8sMut);
-elem!(u32, "::std::uint32_t", U32s, U32sMut);
-elem!(u8, "::std::uint8_t", U8s, U8sMut);
-elem!(u16, "::std::uint16_t", U16s, U16sMut);
-elem!(f32, "float", F32s, F32sMut);
-elem!(core::ffi::c_void, "void", Buf, BufMut);
+elem!(i32, "::std::int32_t");
+elem!(i64, "::std::int64_t");
+elem!(i8, "::std::int8_t");
+elem!(u32, "::std::uint32_t");
+elem!(u8, "::std::uint8_t");
+elem!(u16, "::std::uint16_t");
+elem!(f32, "float");
+elem!(core::ffi::c_void, "void");
 
-elem!(
-    *const core::ffi::c_void,
-    "const void*",
-    BufArray,
-    BufArrayOut
-);
-elem!(*mut core::ffi::c_void, "void*", BufArrayMut, BufArrayOutMut);
-elem!(*const u8, "const ::std::uint8_t*", BufArrayOut, BufArrayOut);
-elem!(
-    *const i32,
-    "const ::std::int32_t*",
-    BufArrayOut,
-    BufArrayOut
-);
+elem!(*const core::ffi::c_void, "const void*");
+elem!(*mut core::ffi::c_void, "void*");
+elem!(*const u8, "const ::std::uint8_t*");
+elem!(*const i32, "const ::std::int32_t*");
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region<P> {
     pub ptr: P,
@@ -630,43 +517,11 @@ impl<P> Region<P> {
     }
 }
 
-impl<B: Backend, C: ConstRun> Arg<B> for Const<C>
-where
-    C::Held: Arg<B>,
-{
-    const TY: Ty = C::TY;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        <C::Held as Arg<B>>::unpack(value, at).map(|v| Const { v })
-    }
-}
-
-impl<B: Backend, M: Arg<B>> Arg<B> for Option<M> {
-    const TY: Ty = M::TY;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        if value.is_absent() {
-            return Ok(None);
-        }
-        M::unpack(value, at).map(Some)
-    }
-}
-
-impl<V: Absent, M: Bind<V>> Bind<V> for Option<M> {
+impl<V: NullArg, M: Bind<V>> Bind<V> for Option<M> {
     fn arg(self) -> V {
         match self {
             Some(m) => m.arg(),
-            None => V::absent().expect(
-                "a body holds `None` for an operand on a plane whose binder cannot mint one",
-            ),
+            None => V::null(),
         }
-    }
-}
-
-fn extent_of<B: Backend>(value: &B::Value) -> Result<Extent, Refusal> {
-    match B::region(value) {
-        Ok(e) => Ok(e),
-        Err(Refusal::Absent { .. } | Refusal::Unstated { .. }) => Ok(Extent { rows: 0, width: 0 }),
-        Err(e) => Err(e),
     }
 }

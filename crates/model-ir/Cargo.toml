@@ -22,3 +22,9 @@ kernels-metal = { path = "../kernels-metal", default-features = false }
 # `kernels-wgpu` has no features to drop -- WGSL is not a build product, so
 # there is no `native` and no toolchain behind one.
 kernels-wgpu = { path = "../kernels-wgpu" }
+# The vulkan claim tables, for the sentence above. `default-features = false`
+# is load-bearing here in a way it is not for wgpu: SPIR-V IS a build product,
+# and `native` is the `slangc` hop that makes it. Every crate that reads a
+# `Plan` reads this crate, so an edge that took `native` would put a shader
+# compiler in the closure of the whole model toolchain.
+kernels-vulkan = { path = "../kernels-vulkan", default-features = false }

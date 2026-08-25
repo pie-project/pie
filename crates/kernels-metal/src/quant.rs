@@ -40,7 +40,7 @@ pub(crate) fn qmm_point(
     check(&[4, 8], bits, "the bit width")?;
     check(&[16, 32, 64], bm, "the row tile")?;
     check(&[16, 32, 64], bn, "the column tile")?;
-    let entry = kernels::jit::symbol(&format!(
+    let entry = kernels::intern::symbol(&format!(
         "affine_qmm_t{form}_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}"
     ));
     Ok(Point {
@@ -48,7 +48,7 @@ pub(crate) fn qmm_point(
         stamp: if stamp.is_empty() {
             ""
         } else {
-            kernels::jit::symbol(&format!(
+            kernels::intern::symbol(&format!(
                 "{stamp}(\"{entry}\", {group}, {bits}, {bm}, {QMM_BK}, {bn})"
             ))
         },
@@ -73,14 +73,14 @@ pub fn qmm_precast_name(
 ) -> Result<&'static str, Refusal> {
     check(&[16, 32, 64], bm, "the row tile")?;
     check(&[16, 32, 64], bn, "the column tile")?;
-    Ok(kernels::jit::symbol(&format!(
+    Ok(kernels::intern::symbol(&format!(
         "affine_qmm_t{before}_fp16_precast{after}_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"
     )))
 }
 
 pub fn qmv_wide_strided_name(bits: i32) -> Result<&'static str, Refusal> {
     check(&[4, 8], bits, "the bit width")?;
-    Ok(kernels::jit::symbol(&format!(
+    Ok(kernels::intern::symbol(&format!(
         "affine_qmv_wide_strided_bfloat16_gs_64_b_{bits}_v_4_kl_8"
     )))
 }
@@ -88,7 +88,7 @@ pub fn qmv_wide_strided_name(bits: i32) -> Result<&'static str, Refusal> {
 pub fn qmv_name(form: &str, group: i32, bits: i32) -> Result<&'static str, Refusal> {
     check(&[32, 64, 128], group, "the group size")?;
     check(&[4, 8], bits, "the bit width")?;
-    Ok(kernels::jit::symbol(&format!(
+    Ok(kernels::intern::symbol(&format!(
         "affine_qmv_{form}_bfloat16_gs_{group}_b_{bits}"
     )))
 }

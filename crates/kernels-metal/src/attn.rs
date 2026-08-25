@@ -4,7 +4,7 @@ use kernels::plane::Refusal;
 use kernels::points::Scalar;
 
 use crate::plane::{
-    Asks, Bind, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
+    Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows,
 };
 use crate::points::{self, Handle};
 use crate::views::{AttnFire, AttnFireView};
@@ -29,6 +29,12 @@ const SDPA_TILED: [&str; 4] = [
     "sdpa_paged_tiled_bfloat16_d_256",
     "sdpa_paged_tiled_bfloat16_d_512",
 ];
+
+const SDPA_LSE_WIDTHS: [i32; 1] = [64];
+
+const SDPA_DECODE_LSE: [&str; 1] = ["sdpa_paged_decode_lse_bfloat16_d_64"];
+
+const SDPA_TILED_LSE: [&str; 1] = ["sdpa_paged_tiled_lse_bfloat16_d_64"];
 
 fn head_point(head_dim: i32, points: &[i32]) -> Result<usize, Refusal> {
     points
@@ -207,6 +213,18 @@ fn pool_heads(view: &crate::views::PagedKvView, head_dim: i32) -> Result<i32, Re
     })
 }
 
+fn kv_heads_agree(view: &AttnFireView, head_dim: u32, kv_heads: u32) -> Result<(), Refusal> {
+    let width = points::stated(head_dim, "the head width this attention states")?;
+    let stated = points::stated(kv_heads, "the kv head count this attention states")?;
+    if stated != pool_heads(&view.kv, width)? {
+        return Err(Refusal::Narrow {
+            what: "the kv head count this attention states, against the pool row's own",
+            at: i64::from(stated),
+        });
+    }
+    Ok(())
+}
+
 fn row_heads(width: i32, head_dim: i32) -> Result<i32, Refusal> {
     if width <= 0 || width % head_dim != 0 {
         return Err(Refusal::Narrow {
@@ -227,6 +245,8 @@ struct Paged {
     window: i32,
 
     rows: i32,
+
+    head_dim: i32,
 
     at: usize,
 }
@@ -258,11 +278,34 @@ impl Paged {
             gqa: q_heads / kv_heads,
             window: points::stated(window, "the sliding extent this attention states")?,
             rows: q.rows,
+            head_dim,
             at: head_point(head_dim, &SDPA_WIDTHS)?,
         })
     }
 }
 
+/// The log-sum-exp plane a `_lse` reading writes beside its output: one f32
+/// per query head per row, which is the shape the point declares.
+fn lse_plane(
+    lse: Out<Tensor<f32>>,
+    shape: &Paged,
+    what: &'static str,
+) -> Result<Out<Tensor<f32>>, Refusal> {
+    if lse.rows != shape.rows || lse.width != shape.q_heads {
+        return Err(Refusal::Narrow {
+            what,
+            at: i64::from(lse.width),
+        });
+    }
+    Ok(lse)
+}
+
+/// The tiled reading, with or without the log-sum-exp plane beside its output.
+///
+/// Two entry points and one argument run: the `_lse` twin is the same
+/// nineteen-wide binding with the plane appended, because the shader is the
+/// same body and only the seat past `n_rows` is new.
+#[allow(clippy::too_many_arguments)]
 fn tiled(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -271,33 +314,90 @@ fn tiled(
     window: u32,
     head_dim: u32,
     sm_scale: f32,
+    lse: Option<Out<Tensor<f32>>>,
 ) -> Result<(), Refusal> {
     let shape = Paged::of(q, view, window, head_dim)?;
+    let entry = match lse {
+        None => SDPA_TILED[shape.at],
+        Some(_) => SDPA_TILED_LSE[head_point(shape.head_dim, &SDPA_LSE_WIDTHS)?],
+    };
+    let mut args = vec![
+        q.arg(),
+        view.kv.keys.arg(),
+        view.kv.values.arg(),
+        o.arg(),
+        shape.gqa.arg(),
+        view.positions.arg(),
+        view.request_of_token.arg(),
+        view.kv.page_indices.arg(),
+        view.kv.page_indptr.arg(),
+        view.kv.page_size.arg(),
+        shape.kv_heads.arg(),
+        sm_scale.arg(),
+        view.mask.mask.arg(),
+        view.mask.stride.arg(),
+        view.mask.enabled.arg(),
+        shape.window.arg(),
+        ctx.absent()?,
+        shape.rows.arg(),
+    ];
+    if let Some(lse) = lse {
+        args.push(lse_plane(lse, &shape, "`attention.prefill_lse`'s log-sum-exp plane")?.arg());
+    }
     ctx.fire(
-        Fire::at("attn/sdpa_paged.metal", SDPA_TILED[shape.at]).apply(Grid::of(
+        Fire::at("attn/sdpa_paged.metal", entry).apply(Grid::of(
             tiled_grid(shape.q_heads, shape.rows)?,
             [SDPA_THREADS, 1, 1],
         )),
-        &[
-            q.arg(),
-            view.kv.keys.arg(),
-            view.kv.values.arg(),
-            o.arg(),
-            shape.gqa.arg(),
-            view.positions.arg(),
-            view.request_of_token.arg(),
-            view.kv.page_indices.arg(),
-            view.kv.page_indptr.arg(),
-            view.kv.page_size.arg(),
-            shape.kv_heads.arg(),
-            sm_scale.arg(),
-            view.mask.mask.arg(),
-            view.mask.stride.arg(),
-            view.mask.enabled.arg(),
-            shape.window.arg(),
-            ctx.absent()?,
-            shape.rows.arg(),
-        ],
+        &args,
+    )
+}
+
+/// The per-row reading, with or without the log-sum-exp plane. See [`tiled`].
+#[allow(clippy::too_many_arguments)]
+fn vector(
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>,
+    view: &AttnFireView,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    lse: Option<Out<Tensor<f32>>>,
+) -> Result<(), Refusal> {
+    let shape = Paged::of(q, view, window, head_dim)?;
+    let entry = match lse {
+        None => SDPA_DECODE[shape.at],
+        Some(_) => SDPA_DECODE_LSE[head_point(shape.head_dim, &SDPA_LSE_WIDTHS)?],
+    };
+    let mut args = vec![
+        q.arg(),
+        view.kv.keys.arg(),
+        view.kv.values.arg(),
+        o.arg(),
+        shape.gqa.arg(),
+        view.positions.arg(),
+        view.request_of_token.arg(),
+        view.kv.page_indices.arg(),
+        view.kv.page_indptr.arg(),
+        view.kv.page_size.arg(),
+        shape.kv_heads.arg(),
+        sm_scale.arg(),
+        view.mask.mask.arg(),
+        view.mask.stride.arg(),
+        view.mask.enabled.arg(),
+        shape.window.arg(),
+        ctx.absent()?,
+    ];
+    if let Some(lse) = lse {
+        args.push(lse_plane(lse, &shape, "`attention.decode_lse`'s log-sum-exp plane")?.arg());
+    }
+    ctx.fire(
+        Fire::at("attn/sdpa_paged.metal", entry).apply(Grid::of(
+            vector_grid(shape.q_heads, shape.rows)?,
+            [SDPA_THREADS, 1, 1],
+        )),
+        &args,
     )
 }
 
@@ -313,34 +413,41 @@ impl kernels::points::Attention for Ctx<'_> {
         o: Out<Handle<T>>,
     ) -> Result<(), Refusal> {
         const WHAT: &str = "`attention.decode`, at an element this plane does not stamp";
-        let q = points::input::<T, bf16>(q, WHAT)?;
-        let o = points::result::<T, bf16>(o, WHAT)?;
-        let view = pages_of(pages)?;
-        let shape = Paged::of(q, view, window, head_dim)?;
-        self.fire(
-            Fire::at("attn/sdpa_paged.metal", SDPA_DECODE[shape.at]).apply(Grid::of(
-                vector_grid(shape.q_heads, shape.rows)?,
-                [SDPA_THREADS, 1, 1],
-            )),
-            &[
-                q.arg(),
-                view.kv.keys.arg(),
-                view.kv.values.arg(),
-                o.arg(),
-                shape.gqa.arg(),
-                view.positions.arg(),
-                view.request_of_token.arg(),
-                view.kv.page_indices.arg(),
-                view.kv.page_indptr.arg(),
-                view.kv.page_size.arg(),
-                shape.kv_heads.arg(),
-                sm_scale.arg(),
-                view.mask.mask.arg(),
-                view.mask.stride.arg(),
-                view.mask.enabled.arg(),
-                shape.window.arg(),
-                self.absent()?,
-            ],
+        vector(
+            self,
+            points::input::<T, bf16>(q, WHAT)?,
+            points::result::<T, bf16>(o, WHAT)?,
+            pages_of(pages)?,
+            window,
+            head_dim,
+            sm_scale,
+            None,
+        )
+    }
+
+    fn decode_lse<T: Scalar>(
+        &self,
+        q: In<Handle<T>>,
+        pages: kernels::plane::Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: Out<Handle<T>>,
+        lse: Out<Handle<f32>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`attention.decode_lse`, at an element this plane does not stamp";
+        vector(
+            self,
+            points::input::<T, bf16>(q, WHAT)?,
+            points::result::<T, bf16>(o, WHAT)?,
+            pages_of(pages)?,
+            window,
+            head_dim,
+            sm_scale,
+            Some(points::result::<f32, f32>(
+                lse,
+                "`attention.decode_lse`'s log-sum-exp plane, at an element other than f32",
+            )?),
         )
     }
 
@@ -358,14 +465,7 @@ impl kernels::points::Attention for Ctx<'_> {
         const WHAT: &str = "`attention.prefill`, at an element this plane does not stamp";
         let _ = indptr;
         let view = pages_of(pages)?;
-        let width = points::stated(head_dim, "the head width this attention states")?;
-        let stated = points::stated(kv_heads, "the kv head count this attention states")?;
-        if stated != pool_heads(&view.kv, width)? {
-            return Err(Refusal::Narrow {
-                what: "the kv head count this attention states, against the pool row's own",
-                at: i64::from(stated),
-            });
-        }
+        kv_heads_agree(view, head_dim, kv_heads)?;
         tiled(
             self,
             points::input::<T, bf16>(q, WHAT)?,
@@ -374,6 +474,79 @@ impl kernels::points::Attention for Ctx<'_> {
             window,
             head_dim,
             sm_scale,
+            None,
+        )
+    }
+
+    fn prefill_lse<T: Scalar>(
+        &self,
+        q: In<Handle<T>>,
+        indptr: In<Handle<i32>>,
+        pages: kernels::plane::Cache<Struct<AttnFire>>,
+        window: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: Out<Handle<T>>,
+        lse: Out<Handle<f32>>,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`attention.prefill_lse`, at an element this plane does not stamp";
+        let _ = indptr;
+        let view = pages_of(pages)?;
+        kv_heads_agree(view, head_dim, kv_heads)?;
+        tiled(
+            self,
+            points::input::<T, bf16>(q, WHAT)?,
+            points::result::<T, bf16>(o, WHAT)?,
+            view,
+            window,
+            head_dim,
+            sm_scale,
+            Some(points::result::<f32, f32>(
+                lse,
+                "`attention.prefill_lse`'s log-sum-exp plane, at an element other than f32",
+            )?),
+        )
+    }
+
+    /// gpt-oss's learned per-head sink, applied to an output the softmax has
+    /// already normalised, against the log-sum-exp that normalised it.
+    ///
+    /// The point states `lse` in BASE TWO and the sink in the checkpoint's own
+    /// natural log, so the shader rebases one to meet the other; see
+    /// `attn/attn_sink.metal`, which is the whole argument.
+    fn sink<T: Scalar>(
+        &self,
+        o: InOut<Handle<T>>,
+        lse: In<Handle<f32>>,
+        sink: Const<Handle<T>>,
+        head_dim: u32,
+    ) -> Result<(), Refusal> {
+        const WHAT: &str = "`attention.sink`, at an element this plane does not stamp";
+        let o = points::in_place::<T, bf16>(o, WHAT)?;
+        let lse = points::input::<f32, f32>(
+            lse,
+            "`attention.sink`'s log-sum-exp plane, at an element other than f32",
+        )?;
+        let sinks = points::weight::<T, bf16>(sink, WHAT)?;
+        let width = points::stated(head_dim, "the head width this sink states")?;
+        let heads = row_heads(o.width, width)?;
+        if lse.rows != o.rows || lse.width != heads {
+            return Err(Refusal::Narrow {
+                what: "the log-sum-exp plane this sink reads is not one f32 per head per row",
+                at: i64::from(lse.width),
+            });
+        }
+        let lanes = head_grid(width, heads, o.rows)?;
+        self.fire(
+            Fire::at("attn/attn_sink.metal", "attn_sink_rescale_bfloat16")
+                .apply(Grid::of(lanes, head_group(lanes))),
+            &[
+                points::read_half(o).arg(),
+                points::write_half(o).arg(),
+                lse.arg(),
+                sinks.arg(),
+            ],
         )
     }
 
@@ -397,6 +570,7 @@ impl kernels::points::Attention for Ctx<'_> {
             window,
             head_dim,
             sm_scale,
+            None,
         )
     }
 

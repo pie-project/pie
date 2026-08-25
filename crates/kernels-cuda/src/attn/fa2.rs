@@ -17,14 +17,14 @@ use crate::attn::fa2::params::{
     make_decode_params, make_prefill_params,
 };
 use crate::jit::abi::Tensor;
-use crate::jit::abi::{bf16, unpack_aggregate};
-use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
+use crate::jit::abi::bf16;
+use crate::jit::{ArgValue, Ctx, Launch, Root};
 use crate::raises::{Fa2Decode, Fa2Prefill};
 use crate::views::{AttnMask, KvCache, KvPageIndptrHost, QoIndptrHost};
+use kernels::Refusal;
 use kernels::plane::Fire;
-use kernels::plane::{Arg, Const, In, Out};
+use kernels::plane::{Const, In, Out};
 use kernels::raises::Struct;
-use kernels::{Refusal, Ty};
 
 fn dequant_prelude(
     ctx: &Ctx<'_>,
@@ -1072,22 +1072,6 @@ pub fn prefill_custom_arm(logits_soft_cap: f32) -> PrefillArm {
         PrefillArm::CustomSoftcap
     } else {
         PrefillArm::Custom
-    }
-}
-
-impl Arg<Cuda> for DecodePlan {
-    const TY: Ty = Ty::DecodePlanCache;
-
-    fn unpack(value: &ArgValue, at: usize) -> Result<Self, Refusal> {
-        unpack_aggregate::<Self>(value, at, Ty::DecodePlanCache)
-    }
-}
-
-impl Arg<Cuda> for PrefillPlan {
-    const TY: Ty = Ty::PrefillPlanCache;
-
-    fn unpack(value: &ArgValue, at: usize) -> Result<Self, Refusal> {
-        unpack_aggregate::<Self>(value, at, Ty::PrefillPlanCache)
     }
 }
 

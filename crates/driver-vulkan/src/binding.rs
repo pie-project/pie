@@ -1,6 +1,6 @@
-//! Turning a lowering's operands into descriptor ranges.
+//! Turning a statement's operands into descriptor ranges.
 //!
-//! [`model_compiler::lower`] hands a driver a flat list of [`Arg`]s and says
+//! `model_compiler::lower` handed a driver a flat list of `Arg`s and said
 //! *"bind these"*. On Metal that is nearly free: `setBuffer:offset:` takes an
 //! address and a byte offset and no length at all, so `driver-metal`'s binder
 //! resolves each operand to its base plus its offset, reports the rest of the
@@ -22,7 +22,8 @@
 //! That zero is the useful part. It says the formula is not a lower bound that
 //! happens to be safe, it is the real extent: if it were an under-estimate the
 //! slack would never reach zero, and if it were an over-estimate it would have
-//! run past. `tests/arena.rs` keeps that number.
+//! run past. `tests/arena.rs` kept that number and is deleted with the
+//! lowering it measured; the number is written down here instead.
 //!
 //! # Why the range matters more here than a length usually does
 //!
@@ -34,17 +35,34 @@
 //! So the range is not bookkeeping. It is the only thing standing between a
 //! stray index and another tensor's bytes.
 //!
+//! # `extent`, `resolve` and `bind` STOOD HERE, and what carries the claim now
+//!
+//! All three took a `model_compiler::lower::Launch` -- the flat argument row a
+//! lowering handed a driver -- and turned it into a run of
+//! [`crate::device::Bound`]s. There
+//! is no `Launch`. [`crate::walk::fire::Fire::rect`] answers where a value
+//! lives from the STATEMENT, and [`crate::baker::marks`] is the region type it
+//! answers in.
+//!
+//! The extent arithmetic is not retired with them, it MOVED, and the
+//! measurement that pinned it is worth keeping: an arena operand is `rows ×
+//! width × bytes`, and over every arena operand six real texts produced in
+//! both fire classes -- 14,324 of them -- every extent landed inside the arena
+//! and the tightest fit had **zero** bytes to spare. That zero is the useful
+//! part. It says the formula is not a lower bound that happens to be safe: if
+//! it were an under-estimate the slack would never reach zero, and if it were
+//! an over-estimate it would have run past.
+//!
 //! # What this module does not do
 //!
-//! It resolves operands. It does not build the parameter side of the call:
-//! seven of the reachable symbols want their scalars as push constants and six
-//! want them as a buffer of their own, which `tests/arena.rs` measures and a
-//! later layer will act on.
+//! It resolves operands. It does not build the parameter side of the call --
+//! [`params_from`] decides only WHERE a run of scalar words goes, push block
+//! or storage struct, and the reachable symbols split almost evenly on it, so
+//! neither answer could be assumed.
 
-use model_compiler::lower::{Arg, Launch, Lowered};
-use model_ir::trace::ValueId;
+use model_ir::plan::ValueId;
 
-use crate::device::{Bound, Buffer};
+use crate::device::Buffer;
 
 /// The frame's arena: one buffer, every activation.
 #[derive(Clone, Copy, Debug)]
@@ -62,9 +80,9 @@ pub struct Arena<'a> {
 
 /// Where the operands this crate cannot resolve come from.
 ///
-/// Two of the three [`Arg`] kinds name something the plan does not hold: a
-/// weight by its trace name and a seam value by its id. Both are the driver's
-/// own tables, so both are asked for rather than looked up.
+/// Two of the three operand kinds a statement can name are not the plan's to
+/// hold: a weight by its trace name and a seam value by its id. Both are the
+/// driver's own tables, so both are asked for rather than looked up.
 ///
 /// Takes `&self` rather than `&mut self` -- unlike the Metal one, which can
 /// return a copied address -- because a Vulkan binding borrows the buffer it
@@ -83,8 +101,9 @@ pub trait Resolve {
     ///
     /// Defaulted to `None` so that a resolver serving a text without paged
     /// attention does not have to state a method it will never be asked for.
-    /// The refusal that produces is [`Unbindable::NoDriverResource`], which
-    /// names what was missing.
+    /// The refusal that produces is `kernels::plane::Refusal::Absent`, raised
+    /// by [`crate::walk::fire::Fire`] where the cache is asked for, which
+    /// names the layer as well as the fact.
     fn kv(&self, _layer: u16, _values: bool) -> Option<&Buffer> {
         None
     }
@@ -131,10 +150,12 @@ pub enum FireNumber {
     /// One past the largest position any row of the fire attends from, which
     /// is how many keys the busiest decode row walks. It decides how many ways
     /// [`kernels_vulkan::attn::decode_splits`] cuts the key range, and it is
-    /// bucketed because that grid is RECORDED: `crate::replay` re-submits a
+    /// bucketed because that grid was RECORDED: `crate::replay` re-submitted a
     /// decode's command buffer across tokens, so a number that moved every
     /// token would re-plan every token. A power-of-two bucket moves a handful
-    /// of times in a sequence's life.
+    /// of times in a sequence's life. `replay` is deleted and the bucket is
+    /// kept, because the reason survives the mechanism: a grid that changes
+    /// every token is a pipeline barrier's worth of re-planning every token.
     ///
     /// Zero from a resolver that does not know -- and zero means one split,
     /// which is the single-pass path this backend has always taken.
@@ -185,260 +206,110 @@ pub enum FireTable {
     AttnPartials,
 }
 
-impl std::fmt::Display for Unbindable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PastArena { at, extent, arena } => {
-                write!(f, "{extent} bytes at {at} runs off an arena of {arena}")
-            }
-            Self::UnknownWeight(name) => write!(f, "no buffer holds the weight `{name}`"),
-            Self::UnknownNamed(value) => write!(f, "no buffer holds the named value {value}"),
-            Self::Constant(name) => {
-                write!(
-                    f,
-                    "`{name}` is a dispatch constant riding a weight slot, not a buffer"
-                )
-            }
-            Self::NoOperand => write!(f, "the row names an operand this statement does not state"),
-            Self::NoKvCache { layer, values } => write!(
-                f,
-                "no {} cache for layer {layer}",
-                if *values { "value" } else { "key" }
-            ),
-            Self::NoDriverResource(what) => write!(f, "the driver holds no {what:?} table"),
-            Self::NotOnThisPlane { key } => write!(
-                f,
-                "the raise `{key}` is a host aggregate and no Vulkan plane binds one"
-            ),
-            Self::Unaddressable(why) => write!(f, "{why}"),
-        }
+impl FireTable {
+    /// The table a runtime NAME lands in, or `None` for a name this driver
+    /// stages nothing under.
+    ///
+    /// ONE TRANSLATION AND NOT TWO. The no-ask channel reaches this driver
+    /// twice: a plan may mint a stream as a runtime VALUE, which
+    /// `crate::runtime::Streams` mapped by value id -- deleted with the
+    /// `ForwardPlan` it read -- and a claim body may ask for one by name
+    /// through
+    /// [`Encode::staged`](kernels_vulkan::plane::Encode::staged). Both are the
+    /// same question -- *which buffer holds `positions` this fire?* -- and a
+    /// second list of the same five names is a second thing to keep right.
+    /// `Streams::of` walked the plan's runtime table through THIS, so the two
+    /// halves could not disagree; with it gone, [`crate::walk::fire::Fire`]'s
+    /// `runtime` is the one reader left and this is still the one list.
+    ///
+    /// # What is deliberately absent
+    ///
+    /// `qo_indptr`, `row_valid` and `first_token` are tier-1 names this driver
+    /// stages nothing for, and they are left out rather than pointed at
+    /// something plausible: a launch that names one is refused by name instead
+    /// of reading a stand-in of zeros fluently.
+    ///
+    /// `rope.yarn_inv_freq` is the interesting absence. This driver DOES stage
+    /// a rope frequency table and it is not that one --
+    /// [`crate::rope::frequencies`] raises llama-3's piecewise-in-wavelength
+    /// rescale, where YaRN's ramp between `beta_fast` and `beta_slow` is a
+    /// different ladder entirely. Answering `rope.yarn_inv_freq` with
+    /// `rope.frequencies` would rotate a YaRN deployment against the wrong
+    /// frequencies and report success, which is the failure this whole table
+    /// exists to make impossible.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "positions" => Self::Positions,
+            "token_ids" => Self::TokenIds,
+            "request_of_token" => Self::RequestOfToken,
+            "sampling_indices" => Self::SamplingIndices,
+            // Tier-2 on the vocabulary, tier-1 on this driver: the rope table
+            // is staged every fire and the rope routines take it as an
+            // operand. The name is dotted because the load-time signature
+            // check refuses an undotted runtime name outside the tier-1 floor
+            // -- the plane owns the spelling, not the vocabulary.
+            "rope.frequencies" => Self::RopeFrequencies,
+            _ => return None,
+        })
     }
 }
 
-impl std::error::Error for Unbindable {}
+// `SCALE_PREFIX`, `pub enum Unbindable`, `extent`, `resolve` and `bind` STOOD
+// HERE -- 224 lines, and all five were about a `model_compiler::lower::Arg`.
+//
+// `bind` walked one `Launch`'s argument span and `resolve` turned each `Arg`
+// into a `Bound`: an `Arena` operand against `extent`'s `rows × width ×
+// bytes`, a `Named` or a `Weight` against the `Resolve` below, a `Raised`
+// against the arena as a PLACEHOLDER so the positional list stayed aligned
+// with the trace. Nothing partial ever came back, and that was the point --
+// a dispatch with some ranges resolved would read whatever the descriptor set
+// happened to hold in the others, which on a reused set is the PREVIOUS
+// launch's operand and not garbage, so it would look plausible.
+//
+// `Unbindable` named the five ways it could fail: `PastArena` (a rectangle
+// running past the arena the plan sized), `UnknownWeight`, `UnknownNamed`,
+// `NoDriverResource`, `Constant` (a `scale.`-prefixed weight name --
+// `dsl::cuda::scalar_mul` put a scalar in an operand slot so the launch's
+// arity held, and Vulkan cannot bind the zero-length region metal calls
+// honest) and `Unaddressable` (what `Bound::within` said).
+//
+// WHAT REPLACES THE WHOLE OF IT is one statement's worth of the same
+// arithmetic done by the walk: `walk::fire::Fire::rect` resolves a `ValueId`
+// against the arena, the banks and the fire's tables, and `baker::marks`
+// mints the region. The refusals are `kernels::plane::Refusal`, raised where
+// the operand is asked for rather than collected into a per-launch enum, and
+// `crate::device::Failed` for the addressability half -- which is the one
+// check that is still Vulkan's alone and still lives on `Bound::within`.
 
-/// The marker a constant rides the weight-name slot under.
-///
-/// Transcribed from `driver-metal`: `dsl::cuda::scalar_mul` puts a scalar in
-/// an operand slot so the launch's arity holds, and states that no binder
-/// looks for it. Metal binds a zero-length region and calls that honest.
-///
-/// This backend cannot. A descriptor of range zero is invalid in Vulkan --
-/// `Bound::within` refuses it as an overrun -- so a slot under this prefix is one
-/// the caller must fill some other way, and saying so is the only correct
-/// answer. It is [`Unbindable::Constant`] rather than a silent empty range.
-const SCALE_PREFIX: &str = "scale.";
-
-/// Why an operand could not become a descriptor range.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Unbindable {
-    /// An arena operand's rectangle runs past the arena the plan sized.
-    ///
-    /// Never seen in a real lowering -- and the tightest real operand ends
-    /// exactly AT the end, so a plan one row wider would land here.
-    PastArena {
-        /// Where in the arena the operand starts.
-        at: usize,
-        /// The rectangle it wanted: `rows × width × bytes`.
-        extent: u64,
-        /// What the plan said the arena holds.
-        arena: u64,
-    },
-    /// The plan names a weight the resolver does not hold.
-    UnknownWeight(
-        /// The name the plan stated.
-        String,
-    ),
-    /// The plan names a seam value the resolver does not bind.
-    UnknownNamed(
-        /// The value id the plan stated.
-        ValueId,
-    ),
-    /// The slot holds a dispatch constant, not a buffer.
-    ///
-    /// See `SCALE_PREFIX`. The refusal is the finding: there is no range
-    /// that means "nothing" in Vulkan.
-    Constant(
-        /// The constant's name, with the `scale.` prefix removed.
-        String,
-    ),
-    /// The row names an operand of the statement that the statement does not
-    /// have.
-    ///
-    /// A row states the shape of every deployment its kernel serves, so a
-    /// statement reaching only part of that shape is ordinary -- but a slot
-    /// left holding nothing is a descriptor the shader reads, so it is a
-    /// refusal rather than a gap. A row says "gap" by stating `None`.
-    NoOperand,
-    /// The row names the KV cache and the resolver does not hold one.
-    NoKvCache {
-        /// Which layer was asked for.
-        layer: u16,
-        /// Values rather than keys.
-        values: bool,
-    },
-    /// The row names a fire table the resolver does not hold.
-    NoDriverResource(
-        /// Which table.
-        FireTable,
-    ),
-    /// The plan places a raise and no shader plane binds one.
-    ///
-    /// Not "not yet": a raise is a HOST aggregate a routine body reads to fill
-    /// the block a kernel takes, and this plane's bodies read their parameters
-    /// out of a push range or a storage block. Nothing here has one to hold,
-    /// so a lowering that reached this arm states an operand for a backend
-    /// that cannot have it -- a trace built for the wrong plane.
-    NotOnThisPlane {
-        /// The word the raise was declared under.
-        key: String,
-    },
-    /// The device cannot address the offset or extent this operand needs.
-    ///
-    /// Carries what [`Bound::within`] said, so an alignment failure and a
-    /// length failure stay distinguishable at the point they are reported.
-    Unaddressable(
-        /// What the range check said.
-        crate::device::Failed,
-    ),
-}
-
-/// How many bytes one operand of this launch covers.
-///
-/// `None` for the operand kinds whose extent is not the plan's to state: a
-/// weight is as big as its tensor and a seam value is as big as the backend
-/// made it, and in both cases the resolver's buffer already says so.
-#[must_use]
-pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
-    match arg {
-        Arg::Arena { width, bytes, .. } => {
-            let rows = u64::from(launch.rows.end - launch.rows.start);
-            // Saturating rather than wrapping: a plan with an absurd width
-            // should produce a refusal below, not a small number that binds.
-            Some(
-                rows.saturating_mul(u64::from(*width))
-                    .saturating_mul(u64::from(*bytes)),
-            )
-        }
-        // NO RECTANGLE TO MEASURE. A raise is a host aggregate the body reads
-        // whole; it has no rows, no width and no element size, which is why it
-        // is its own `Arg` and not a `Named` with zeros in it.
-        Arg::Named { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
-    }
-}
-
-/// Resolve one operand into a descriptor range.
-///
-/// `min_offset` is the device's `minStorageBufferOffsetAlignment`, which the
-/// range is checked against here rather than at dispatch: an operand that
-/// cannot be addressed is a fact about the plan and the device together, and
-/// the earliest place both are known is here.
-///
-/// # Errors
-///
-/// [`Unbindable`], naming which of the rules could not be applied.
-pub fn resolve<'a, R: Resolve>(
-    arg: &Arg,
-    launch: &Launch,
-    arena: Arena<'a>,
-    resolver: &'a R,
-    min_offset: u64,
-) -> Result<Bound<'a>, Unbindable> {
-    match arg {
-        Arg::Arena { at, .. } => {
-            let extent = extent(arg, launch).expect("an arena operand states its rectangle");
-            let at64 = *at as u64;
-            // Checked before `Bound::within` so the refusal names the ARENA. The
-            // buffer may well be larger than the plan's arena, in which case
-            // `Bound::within` would accept a range the plan had no right to.
-            if at64.saturating_add(extent) > arena.bytes {
-                return Err(Unbindable::PastArena {
-                    at: *at,
-                    extent,
-                    arena: arena.bytes,
-                });
-            }
-            Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
-        }
-        // A RAISED OPERAND RESOLVES TO NO RANGE OF ITS OWN. The routine
-        // binder builds it into a HOST view (`crate::views`) and the carrier
-        // crosses as `ArgValue::Raised(address)`; what this positional list
-        // needs from it is only that the operand HOLD ITS PLACE, so the
-        // split's indices stay aligned with the trace. The arena stands in —
-        // nothing takes this entry's handle, because `crate::bind::bind`
-        // intercepts the `Ty::Raised` argument before `Handles::input` is
-        // ever asked for it.
-        Arg::Raised { .. } => Ok(Bound::whole(arena.buffer)),
-        Arg::Named { value, .. } => resolver
-            .named(*value)
-            .map(Bound::whole)
-            .ok_or(Unbindable::UnknownNamed(*value)),
-        Arg::Weight(name) => {
-            if let Some(rest) = name.strip_prefix(SCALE_PREFIX) {
-                return Err(Unbindable::Constant(rest.to_owned()));
-            }
-            resolver
-                .weight(name)
-                .map(Bound::whole)
-                .ok_or_else(|| Unbindable::UnknownWeight(name.clone()))
-        }
-    }
-}
-
-/// Resolve every operand of one launch, in the order the plan states them.
-///
-/// # Errors
-///
-/// The first [`Unbindable`] any operand produces, and the index of the operand
-/// that produced it. Nothing partial comes back: a dispatch with some ranges
-/// resolved is a dispatch that would read whatever the descriptor set happened
-/// to hold in the others, which on a reused set is the previous launch's
-/// operand and not garbage -- so it would look plausible.
-pub fn bind<'a, R: Resolve>(
-    lowered: &Lowered,
-    launch: &Launch,
-    arena: Arena<'a>,
-    resolver: &'a R,
-    min_offset: u64,
-) -> Result<Vec<Bound<'a>>, (usize, Unbindable)> {
-    let span = launch.args.start as usize..launch.args.end as usize;
-    let mut bound = Vec::with_capacity(span.len());
-    for (i, arg) in lowered.args[span].iter().enumerate() {
-        bound.push(resolve(arg, launch, arena, resolver, min_offset).map_err(|e| (i, e))?);
-    }
-    Ok(bound)
-}
-
-/// What one of a module's binding slots holds.
-///
-/// The middle term the positional binder did not have. A plan states its
-/// operands in TRACE order -- inputs, then outputs, then weights -- and a
-/// shader binds them in the order its kernel row states, and those are not
-/// the same order. `rms_single_row`'s row is `In(0), Weight(0), Out(0),
-/// params`, and `norm/rms.slang` decorates exactly that; the trace hands over
-/// `In(0), Out(0), Weight(0)`.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Slot<'a> {
-    /// A range of a buffer: an operand, a weight, or a driver resource.
-    Buffer(Bound<'a>),
-    /// The slot the row reserves for this launch's scalars.
-    ///
-    /// The caller allocates and fills it -- see [`params`] -- because a
-    /// buffer needs a device and this module is arithmetic.
-    Params,
-    /// A slot the row states and nothing fills.
-    ///
-    /// Source `None`. `kv_append_paged` has six, kept so that the rest of
-    /// its row stays at the positions a shared ring ABI put them; the module
-    /// leaves them as descriptor holes and nothing reads them.
-    Nothing,
-}
+// `pub enum Slot<'a>` and `pub enum Unlayoutable` STOOD HERE, one at each end
+// of this file, and they were two halves of a function that had ALREADY LEFT:
+// `descriptors`, which cut a row's slot list down to the module's declared
+// bindings. It went at `5bd280339`, its two vocabularies did not, and both
+// have had no reader since -- so this is a deletion the culling found rather
+// than one the baker forced.
+//
+// `Slot` was the middle term the positional binder did not have: `Buffer` (a
+// range), `Params` (the slot a row reserves for its scalars) and `Nothing` (a
+// slot the row states and nothing fills). A plan stated its operands in TRACE
+// order -- inputs, then outputs, then weights -- and a shader binds them in
+// the order its kernel row states, and those are not the same order.
+// `Unlayoutable` named the three ways the two readings disagreed.
+//
+// THE DESCRIPTOR HOLES THEY EXISTED FOR ARE STILL REAL AND ARE ANSWERED
+// ELSEWHERE. `kv_append_paged` declares six bindings nothing reads, kept so
+// that the rest of its row stays at the positions a shared ring ABI put them.
+// A `#[claims]` body writes its argument list in the SHADER's order -- see
+// `baker::dispatch::Dispatch::args`, which is why the `reorder` pass is gone
+// -- and what a module actually declares is `spirv::Declared::bindings`, which
+// `device::Pipelines::get` takes the maximum of against the caller's count.
 
 /// Where a launch's scalars go.
 ///
 /// A plan states its operands and its scalars separately, which is already the
 /// shape Vulkan wants -- descriptors on one side, a push block on the other.
 /// But only half the reachable kernels take them that way. `tests/arena.rs`
+/// measured it before it was deleted with the lowering:
 /// measures the split over every symbol three real texts launch: six take
 /// their scalars as a push block, and six take them as a plain struct in a
 /// storage buffer of their own. Seven, once descriptor holes are subtracted:
@@ -454,9 +325,9 @@ pub enum Params {
     /// The bytes are laid out at the offsets the SHADER declares, not packed
     /// end to end, because those are not always the same thing and the
     /// difference is silent. `crate::lowering::pack` stood for that reason and
-    /// this named it; the row packer is deleted on all three shader backends
-    /// and `lowering::routine::bind` applies the same rule from a body's own
-    /// arguments.
+    /// this named it; the row packer is deleted on all three shader backends,
+    /// and what applies the same rule from a body's own arguments is
+    /// [`crate::baker::encode`]'s `lay_out` feeding [`params_from`].
     Push(Vec<u8>),
     /// The scalars are a struct in a storage buffer, at this binding.
     ///
@@ -558,94 +429,44 @@ pub enum Misplaced {
     },
 }
 
-/// Place one launch's scalars the way its module wants them.
+/// Place a run of scalar words the way its module wants them.
+///
+/// PUSH BLOCK OR STORAGE STRUCT, and the decision is read off the compiled
+/// module rather than off a naming convention: of the reachable symbols,
+/// seven take their scalars as a push block and six take them as a plain
+/// struct in a storage buffer of their own. Neither answer could be assumed
+/// and the split is almost even.
+///
+/// `stated` is one word per scalar in signature order, two for a `Usize` with
+/// the low half first and the pair aligned to an even word --
+/// `baker::encode`'s `lay_out` is what produces it and
+/// `baker::dispatch::Dispatch::params` states the convention.
+///
+/// # `params` and `push_from` STOOD BESIDE THIS
+///
+/// `params` was the same call with a `model_compiler::lower::Lowered` and a
+/// `Launch` in front of it, slicing the launch's own scalar span out of the
+/// plan; there is no plan-wide scalar run to slice.
+///
+/// `push_from` placed a routine's arguments MEMBER by member rather than word
+/// by word, and it went with `kernels_vulkan::routine::ArgValue`. Its reason
+/// is worth keeping because this function still cannot do what it did: this
+/// one zips `stated` against [`crate::spirv::Declared::push_offsets`] and
+/// writes FOUR BYTES at each, which reads every member as one 32-bit word.
+/// That is true of every scalar a lowering stated and false of a 64-bit
+/// stride. `kv_append`'s block is `{ int head_dim; PIE_STRIDE k_head_stride;
+/// PIE_STRIDE k_seq_stride; }` -- three members at offsets 0, 8 and 16 -- and
+/// the words that fill it are six. Six against three is [`Misplaced::Count`],
+/// and had the counts happened to agree the writer would still have put four
+/// bytes where eight go. The 64-bit strides belong to the contiguous KV path,
+/// which no text in this tree launches, which is why a block that could not be
+/// filled at all went unnoticed for as long as it did.
 ///
 /// # Errors
 ///
 /// [`Misplaced::Count`] when neither of the module's two shapes can hold what
-/// the plan states.
-pub fn params(
-    lowered: &Lowered,
-    launch: &Launch,
-    declared: &crate::spirv::Declared,
-) -> Result<Params, Misplaced> {
-    let stated = &lowered.params[launch.params.start as usize..launch.params.end as usize];
-    params_from(stated, declared)
-}
-
-/// Place a routine's scalars into the push block its module declares, MEMBER
-/// by member rather than word by word.
-///
-/// [`params_from`] cannot do this. It zips a run of `u32` against
-/// [`crate::spirv::Declared::push_offsets`] and writes four bytes at each,
-/// which reads every member as one 32-bit word -- true of every scalar a
-/// LOWERING states, and false of a routine that asks for a 64-bit stride.
-/// `kv_append`'s block is `{ int head_dim; PIE_STRIDE k_head_stride;
-/// PIE_STRIDE k_seq_stride; }`, three members at offsets 0, 8 and 16, and the
-/// words that fill it are six: the head width, a padding word, and two halves
-/// each. Six against three is `Misplaced::Count`, and had the counts happened
-/// to agree the writer would still have put four bytes where eight go and
-/// stopped the range four bytes short of the last member.
-///
-/// So the routine plane places by VALUE, which is the thing that knows its own
-/// width. It agrees with `params_from` exactly wherever every member is one
-/// word, which is every module this tree ships today -- the 64-bit strides
-/// belong to the contiguous KV path, which no text in the tree launches, which
-/// is why a block that could not be filled at all went unnoticed.
-///
-/// `None` when the count does not match, which hands the caller back to
-/// [`params_from`] and its search for a parameter BUFFER of the right size.
-pub(crate) fn push_from(
-    values: &[kernels_vulkan::routine::ArgValue],
-    declared: &crate::spirv::Declared,
-) -> Option<Params> {
-    use kernels_vulkan::routine::ArgValue;
-
-    let scalars: Vec<&ArgValue> = values
-        .iter()
-        // A raised view is HOST data the body already read: it names no
-        // binding and pushes no scalar, so it belongs to neither run.
-        .filter(|v| !matches!(v, ArgValue::Buffer { .. } | ArgValue::Raised(_)))
-        .collect();
-    if scalars.is_empty() || scalars.len() != declared.push_offsets.len() {
-        return None;
-    }
-    let width = |v: &ArgValue| {
-        if matches!(v, ArgValue::Usize(_)) {
-            8
-        } else {
-            4
-        }
-    };
-    // From the block's own extent, not from the count: a member sitting past
-    // a gap needs the gap inside the pushed range or the range does not cover
-    // it, and `vkCmdPushConstants` takes a size.
-    let end = scalars
-        .iter()
-        .zip(&declared.push_offsets)
-        .map(|(v, o)| *o as usize + width(v))
-        .max()
-        .unwrap_or(0);
-    let mut bytes = vec![0u8; end];
-    for (v, o) in scalars.iter().zip(&declared.push_offsets) {
-        let at = *o as usize;
-        match **v {
-            ArgValue::I32(x) => bytes[at..at + 4].copy_from_slice(&x.to_le_bytes()),
-            ArgValue::U32(x) => bytes[at..at + 4].copy_from_slice(&x.to_le_bytes()),
-            ArgValue::F32(x) => bytes[at..at + 4].copy_from_slice(&x.to_le_bytes()),
-            ArgValue::Usize(x) => {
-                bytes[at..at + 8].copy_from_slice(&(x as u64).to_le_bytes());
-            }
-            ArgValue::Buffer { .. } | ArgValue::Raised(_) => unreachable!("filtered above"),
-        }
-    }
-    Some(Params::Push(bytes))
-}
-
-pub(crate) fn params_from(
-    stated: &[u32],
-    declared: &crate::spirv::Declared,
-) -> Result<Params, Misplaced> {
+/// the caller states.
+pub fn params_from(stated: &[u32], declared: &crate::spirv::Declared) -> Result<Params, Misplaced> {
     // Asked in this order because push is the stronger claim: it accounts for
     // every descriptor as well as every scalar, and a module that declares a
     // push block of the right size is not also hiding a parameter buffer.
@@ -707,394 +528,5 @@ pub(crate) fn params_from(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    /// A `Buffer` this test can name without a device.
-    ///
-    /// Binding never dereferences the handle -- it produces offsets and
-    /// lengths against it -- so a zeroed one is enough to ask every question
-    /// in this module, and asking them without a GPU is the point.
-    fn buffer(bytes: u64) -> Buffer {
-        Buffer::placeholder(bytes)
-    }
-
-    #[derive(Default)]
-    struct Store {
-        weights: BTreeMap<String, Buffer>,
-        named: BTreeMap<ValueId, Buffer>,
-    }
-
-    impl Resolve for Store {
-        fn weight(&self, name: &str) -> Option<&Buffer> {
-            self.weights.get(name)
-        }
-        fn named(&self, value: ValueId) -> Option<&Buffer> {
-            self.named.get(&value)
-        }
-    }
-
-    /// A launch over `rows` rows with `n` operands starting at zero.
-    fn launch(rows: u32, n: u32) -> Launch {
-        Launch {
-            kernel: 0,
-            rows: 0..rows,
-            layers: 0..1,
-            op: 0,
-            args: 0..n,
-            params: 0..0,
-            peel: None,
-            cond: 0,
-        }
-    }
-
-    #[test]
-    fn an_arena_operands_extent_is_its_rectangle_and_not_one_row() {
-        let arg = Arg::Arena {
-            at: 0,
-            width: 128,
-            bytes: 2,
-        };
-        // The distinction Metal never had to draw: one row is 256 bytes, and
-        // a 64-row prefill launch of the same operand covers 64 times that.
-        assert_eq!(extent(&arg, &launch(1, 1)), Some(256));
-        assert_eq!(extent(&arg, &launch(64, 1)), Some(64 * 256));
-    }
-
-    #[test]
-    fn a_weight_and_a_seam_value_do_not_get_their_extent_from_the_plan() {
-        assert_eq!(extent(&Arg::Weight("w".into()), &launch(1, 1)), None);
-        assert_eq!(
-            extent(
-                &Arg::Named {
-                    value: 0,
-                    width: 8,
-                    bytes: 2,
-                },
-                &launch(1, 1)
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn an_arena_operand_is_bound_at_its_offset_for_its_rectangle() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let arg = Arg::Arena {
-            at: 512,
-            width: 64,
-            bytes: 2,
-        };
-        let store = Store::default();
-        let b = resolve(&arg, &launch(4, 1), arena, &store, 16).expect("bindable");
-        assert_eq!(b.offset(), 512);
-        // Four rows of 64 elements at 2 bytes -- NOT the 512 one row would
-        // give, and not the rest of the arena `VK_WHOLE_SIZE` would give.
-        assert_eq!(b.len(), 512);
-    }
-
-    #[test]
-    fn an_operand_whose_rectangle_runs_past_the_arena_is_refused() {
-        let buf = buffer(1 << 20);
-        // The buffer is a megabyte; the PLAN said the arena is 1024 bytes.
-        // The refusal has to come from the plan's number, or a driver holding
-        // a generously sized arena would accept an operand that addresses
-        // another fire's bytes.
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1024,
-        };
-        let arg = Arg::Arena {
-            at: 768,
-            width: 64,
-            bytes: 2,
-        };
-        let err =
-            resolve(&arg, &launch(4, 1), arena, &Store::default(), 16).expect_err("runs past");
-        assert_eq!(
-            err,
-            Unbindable::PastArena {
-                at: 768,
-                extent: 512,
-                arena: 1024
-            }
-        );
-    }
-
-    #[test]
-    fn an_operand_the_device_cannot_address_from_is_refused_as_such() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        // 260 is inside the arena and a multiple of 4, so the plan and Metal
-        // are both content. It is not a multiple of 256.
-        let arg = Arg::Arena {
-            at: 260,
-            width: 64,
-            bytes: 2,
-        };
-        let err =
-            resolve(&arg, &launch(1, 1), arena, &Store::default(), 256).expect_err("misaligned");
-        assert!(
-            matches!(
-                err,
-                Unbindable::Unaddressable(crate::device::Failed::Unaligned { .. })
-            ),
-            "an offset the device cannot use is not the same refusal as one the \
-             plan oversized: {err:?}"
-        );
-    }
-
-    #[test]
-    fn a_weight_and_a_seam_value_come_from_the_resolver_whole() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let mut store = Store::default();
-        store.weights.insert("layer.3.q_proj".into(), buffer(4096));
-        store.named.insert(7, buffer(64));
-
-        let w = resolve(
-            &Arg::Weight("layer.3.q_proj".into()),
-            &launch(1, 1),
-            arena,
-            &store,
-            16,
-        )
-        .expect("held");
-        // Whole, because the plan does not state a weight's extent and the
-        // tensor's own size is the right answer.
-        assert_eq!((w.offset(), w.len()), (0, 4096));
-
-        let n = resolve(
-            &Arg::Named {
-                value: 7,
-                width: 8,
-                bytes: 2,
-            },
-            &launch(1, 1),
-            arena,
-            &store,
-            16,
-        )
-        .expect("bound");
-        assert_eq!((n.offset(), n.len()), (0, 64));
-    }
-
-    #[test]
-    fn a_name_the_resolver_does_not_hold_is_named_in_the_refusal() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let store = Store::default();
-        assert_eq!(
-            resolve(
-                &Arg::Weight("layer.3.q_proj".into()),
-                &launch(1, 1),
-                arena,
-                &store,
-                16
-            )
-            .expect_err("not held"),
-            Unbindable::UnknownWeight("layer.3.q_proj".into())
-        );
-        assert_eq!(
-            resolve(
-                &Arg::Named {
-                    value: 7,
-                    width: 8,
-                    bytes: 2,
-                },
-                &launch(1, 1),
-                arena,
-                &store,
-                16
-            )
-            .expect_err("not bound"),
-            Unbindable::UnknownNamed(7)
-        );
-    }
-
-    /// The one place this backend must refuse where Metal proceeds.
-    #[test]
-    fn a_slot_holding_a_dispatch_constant_cannot_be_a_range_on_this_backend() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        // Metal binds `{address: 0, bytes: 0}` here and calls it honest,
-        // because a zero-length Metal binding is legal and unread. Vulkan has
-        // no such descriptor, so the honest answer is a refusal that says
-        // which constant the caller still owes.
-        assert_eq!(
-            resolve(
-                &Arg::Weight("scale.rope_theta".into()),
-                &launch(1, 1),
-                arena,
-                &Store::default(),
-                16
-            )
-            .expect_err("a constant is not a range"),
-            Unbindable::Constant("rope_theta".into())
-        );
-    }
-
-    #[test]
-    fn a_launch_binds_whole_or_not_at_all() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let mut store = Store::default();
-        store.weights.insert("held".into(), buffer(64));
-        let lowered = lowered(vec![
-            Arg::Arena {
-                at: 0,
-                width: 8,
-                bytes: 2,
-            },
-            Arg::Weight("held".into()),
-            Arg::Weight("absent".into()),
-        ]);
-
-        let (i, err) = bind(&lowered, &launch(1, 3), arena, &store, 16).expect_err("one is absent");
-        // The index is reported because a refusal that only names the weight
-        // cannot say WHICH operand slot the dispatch was going to leave stale.
-        assert_eq!(i, 2);
-        assert_eq!(err, Unbindable::UnknownWeight("absent".into()));
-
-        // The same launch minus the absent operand binds all of what remains.
-        assert_eq!(
-            bind(&lowered, &launch(1, 2), arena, &store, 16)
-                .expect("both held")
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn operands_come_back_in_the_order_the_plan_states_them() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        // Three arena operands at distinguishable offsets. Descriptor slots
-        // are positional, so an order this crate rearranged would hand every
-        // kernel its inputs shuffled and no test of one operand would notice.
-        let lowered = lowered(
-            [1024usize, 256, 2048]
-                .into_iter()
-                .map(|at| Arg::Arena {
-                    at,
-                    width: 8,
-                    bytes: 2,
-                })
-                .collect(),
-        );
-        let store = Store::default();
-        let bound = bind(&lowered, &launch(1, 3), arena, &store, 16).expect("bindable");
-        assert_eq!(
-            bound.iter().map(Bound::offset).collect::<Vec<_>>(),
-            [1024, 256, 2048]
-        );
-    }
-
-    /// A `Lowered` holding nothing but the operands under test.
-    fn lowered(args: Vec<Arg>) -> Lowered {
-        Lowered {
-            launches: Vec::new(),
-            kernels: Vec::new(),
-            preps: Vec::new(),
-            arg_rows: Vec::new(),
-            rectangles: 0,
-            arena_bytes: 0,
-            value_offset: Vec::new(),
-            value_owner: Vec::new(),
-            epilogue_gather: usize::MAX,
-            epilogue_norm: usize::MAX,
-            args,
-            structural: Vec::new(),
-            residue: Vec::new(),
-            params: Vec::new(),
-            n_requests: 0,
-            conds: Vec::new(),
-            readout: None,
-        }
-    }
-}
-
-/// The refusals [`descriptors`] produces.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Unlayoutable {
-    /// The row states more slots than the module declares, and the excess is
-    /// not all unbound.
-    ///
-    /// A row states every deployment its kernel serves, so a row longer than
-    /// one module is ordinary -- but only where the tail is `None`. A
-    /// buffer past the end is a buffer nothing can hold.
-    Overlong {
-        /// How many slots the row states.
-        stated: usize,
-        /// How many the module declares.
-        module: u32,
-    },
-    /// The scalar block's slot is not where the row puts its parameters.
-    ///
-    /// The module says which binding is the block; the row says which operand
-    /// is `Const { v: 0 }`. Both are read off separately, so their disagreement is
-    /// a finding rather than a fact -- and it means the shader would read its
-    /// scalars out of an operand.
-    BlockElsewhere {
-        /// Where the SPIR-V puts the block.
-        module: usize,
-        /// Where the row's parameters land.
-        row: usize,
-    },
-    /// The row leaves a slot unbound that the module decorates and reads.
-    ///
-    /// Measured to be exactly the descriptor holes, on both the modules that
-    /// have any: `affine_qmv_routed` 1 and 1, `kv_append_paged` 6 and 6. So a
-    /// mismatch means one of the two readings is wrong.
-    Unfilled {
-        /// The slot the row leaves empty.
-        at: usize,
-    },
-}
-
-impl core::fmt::Display for Unlayoutable {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Overlong { stated, module } => {
-                write!(
-                    f,
-                    "the row states {stated} slots and the module declares {module}"
-                )
-            }
-            Self::BlockElsewhere { module, row } => {
-                write!(
-                    f,
-                    "the module's block is binding {module} and the row's is {row}"
-                )
-            }
-            Self::Unfilled { at } => write!(f, "binding {at} is read and nothing fills it"),
-        }
-    }
-}
-
-impl core::error::Error for Unlayoutable {}
+// `impl core::fmt::Display for Unlayoutable` and its `Error` impl stood
+// below the enum. Both went with it.

@@ -27,18 +27,71 @@ fn traced(sku: &str) -> Plan {
 
 /// Every lane of every shipping row, bound. A row that refuses is a refusal
 /// this file reports rather than skips.
+/// Every catalog row whose lanes BIND, with the plan and programs each one
+/// compiled to.
+///
+/// A ROW THAT REFUSES IS SKIPPED, NOT A PANIC. This helper used to unwrap,
+/// and every test that used it died on `dsv4-base-bf16-kv-bf16-tp2` — whose
+/// lanes refuse `dist.all_reduce`, a point no plane claims. That is a
+/// truthful refusal about a backlog, not a compiler defect, and six tests
+/// about ARENA LIVENESS reporting it said nothing about arena liveness.
+///
+/// The set that refuses is not swallowed: [`the_rows_that_refuse_are_named`]
+/// asserts it, so a row that starts refusing is as loud as it was here and
+/// says which point it is short of.
 fn catalogue() -> Vec<(&'static str, Plan, Vec<Program>)> {
     model::catalog()
         .into_iter()
-        .map(|(sku, _)| {
+        .filter_map(|(sku, _)| {
             let plan = traced(sku);
-            let lanes = model_compiler::program::programs(&plan).unwrap_or_else(|refused| {
-                let told: Vec<String> = refused.iter().map(ToString::to_string).collect();
-                panic!("`{sku}` refused: {}", told.join(" | "))
-            });
-            (sku, plan, lanes)
+            let lanes = model_compiler::program::programs(&plan).ok()?;
+            Some((sku, plan, lanes))
         })
         .collect()
+}
+
+/// The catalog rows whose lanes do not bind, and the point each is short of.
+///
+/// This is the assertion [`catalogue`]'s skip would otherwise hide. It is a
+/// list rather than a count because WHICH row refuses says which point is
+/// missing, and here the list says something a count could not: EVERY ROW
+/// THAT REFUSES IS A `-tp2` ROW, and every one of them is short of the same
+/// point. `dist.all_reduce` is claimed by no plane, a two-way row cannot
+/// resolve without it, and a one-way row never asks. So this is one backlog
+/// row wearing six names.
+///
+/// The panic this replaced showed only the FIRST of the six, because the
+/// helper unwrapped and died there — which is how a six-row gap read as a
+/// one-row gap for as long as anyone looked at it.
+#[test]
+fn the_rows_that_refuse_are_named() {
+    let mut refused: Vec<&str> = model::catalog()
+        .into_iter()
+        .filter(|(sku, _)| model_compiler::program::programs(&traced(sku)).is_err())
+        .map(|(sku, _)| sku)
+        .collect();
+    refused.sort_unstable();
+    assert_eq!(
+        refused,
+        [
+            "dsv4-base-bf16-kv-bf16-tp2",
+            "gemma4-31b-bf16-kv-bf16-tp2",
+            "glm5-a12b-bf16-bf16-kv-bf16-tp2",
+            "gptoss-120b-bf16-mxfp4-kv-bf16-tp2",
+            "kimik3-bf16-mxfp4-kv-bf16-tp2",
+            "qwen35-a3b-bf16-kv-bf16-tp2",
+        ],
+        "the rows that refuse have moved. A row GAINED is a point that stopped \
+         being claimed; a row LOST is a backlog row that closed, and that edit \
+         is the record of it."
+    );
+    let told = model_compiler::program::programs(&traced("dsv4-base-bf16-kv-bf16-tp2"))
+        .expect_err("it refuses");
+    assert!(
+        told.iter()
+            .any(|r| r.to_string().contains("dist.all_reduce")),
+        "the refusal names the point it is short of: {told:?}"
+    );
 }
 
 /// THE INVARIANT. No two values a lane holds live at one step share a byte.
@@ -71,14 +124,23 @@ fn every_rectangle_fits_the_pitch() {
                     continue;
                 };
                 arena += 1;
-                assert_eq!(offset % 16, 0, "`{sku}` lane {at}: value {id} is unaligned");
+                assert_eq!(
+                    offset % 256,
+                    0,
+                    "`{sku}` lane {at}: value {id} is not bindable on a device that \
+                     demands 256 — see `program::BIND_ALIGN`"
+                );
                 assert!(
                     offset + slot.bytes() <= lane.row_pitch,
                     "`{sku}` lane {at}: value {id} runs past the row pitch"
                 );
             }
             assert!(arena > 0, "`{sku}` lane {at} allocates nothing");
-            assert_eq!(lane.row_pitch % 16, 0, "`{sku}` lane {at}: unaligned pitch");
+            assert_eq!(
+                lane.row_pitch % 256,
+                0,
+                "`{sku}` lane {at}: unaligned pitch"
+            );
         }
     }
 }
@@ -161,8 +223,14 @@ fn the_pitch_is_the_busiest_instant() {
 #[test]
 fn the_layout_is_deterministic() {
     for (sku, _) in model::catalog() {
-        let once = model_compiler::program::programs(&traced(sku)).expect("a shipping row binds");
-        let twice = model_compiler::program::programs(&traced(sku)).expect("a shipping row binds");
+        // A row that refuses is skipped for [`catalogue`]'s reason, and
+        // [`the_rows_that_refuse_are_named`] is what keeps the skip honest.
+        let (Ok(once), Ok(twice)) = (
+            model_compiler::program::programs(&traced(sku)),
+            model_compiler::program::programs(&traced(sku)),
+        ) else {
+            continue;
+        };
         for (at, (a, b)) in once.iter().zip(&twice).enumerate() {
             assert_eq!(a.row_pitch, b.row_pitch, "`{sku}` lane {at}: two pitches");
             assert_eq!(a.slots, b.slots, "`{sku}` lane {at}: two layouts");

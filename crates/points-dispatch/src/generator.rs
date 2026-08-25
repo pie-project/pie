@@ -724,10 +724,11 @@ pub fn generate(plane: &Plane, surfaces: &[Surface]) -> String {
 // prelude does not.
 #![allow(unused_imports)]
 
-use kernels::bound::{{Axis, BoundOp, Site}};
+use kernels::bound::{{BoundOp, Site}};
+use kernels::points::ScalarKind;
 // `Form` and the reprs beside the family traits: a bank axis's arm matches
 // on the one and turbofishes the other, exactly as an element axis matches
-// on `Axis` and turbofishes `{half}`.
+// on `ScalarKind` and turbofishes `{half}`.
 use kernels::points::{{Form, Mxfp4}};
 use kernels::points::{{{traits}}};
 use kernels::plane::Refusal;
@@ -741,7 +742,7 @@ use kernels::plane::Refusal;
 /// fires whether a lane's every statement will resolve cannot walk a
 /// `match`; it walks this. `None` is a point that quantifies over nothing and
 /// resolves by name alone.
-pub const CLAIMED: &[(&str, Option<Site>, &[Axis])] = &[
+pub const CLAIMED: &[(&str, Option<Site>, &[ScalarKind])] = &[
 {census}];
 
 /// The same, for this plane's TIER-2 surface — the points an inherent method
@@ -752,7 +753,7 @@ pub const CLAIMED: &[(&str, Option<Site>, &[Axis])] = &[
 /// "does this plane claim the tier-1 point this lane routed as
 /// `Call::Point`"; this answers the same of a `Call::Tier2`. A row in the
 /// wrong table would be a row no call can reach.
-pub const TIER2: &[(&str, Option<Site>, &[Axis])] = &[
+pub const TIER2: &[(&str, Option<Site>, &[ScalarKind])] = &[
 {tier2}];
 
 /// Fire one bound statement through this plane's claims and its tier-2

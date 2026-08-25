@@ -48,7 +48,8 @@
 
 use std::collections::BTreeSet;
 
-use kernels::bound::{Axis, Site};
+use kernels::bound::Site;
+use kernels::points::ScalarKind;
 use kernels_cuda::points_dispatch::{CLAIMED, TIER2};
 use model_compiler::program::{Call, Dt, Program, Slot};
 use model_ir::plan::Plan;
@@ -184,7 +185,7 @@ enum Claim {
 /// statement does not carry; both resolve by name and refuse at the fire if
 /// the statement is malformed.
 fn witness_dt(
-    census: &[(&str, Option<Site>, &[Axis])],
+    census: &[(&str, Option<Site>, &[ScalarKind])],
     program: &Program,
     op: &model_ir::plan::Op,
     point: &str,
@@ -212,17 +213,17 @@ fn dtype_of(program: &Program, value: model_ir::plan::ValueId) -> Option<Dt> {
 
 /// What a rectangle the walk sized rides, as the floor names it — the same
 /// mapping `baker::bound::axis` makes at the fire.
-fn axis(dt: Dt) -> Axis {
+fn axis(dt: Dt) -> ScalarKind {
     match dt {
-        Dt::Bf16 => Axis::Bf16,
-        Dt::F32 => Axis::F32,
-        Dt::I32 => Axis::I32,
-        Dt::U32 => Axis::U32,
-        Dt::U8 => Axis::U8,
+        Dt::Bf16 => ScalarKind::Bf16,
+        Dt::F32 => ScalarKind::F32,
+        Dt::I32 => ScalarKind::I32,
+        Dt::U32 => ScalarKind::U32,
+        Dt::U8 => ScalarKind::U8,
     }
 }
 
-fn claimed(census: &[(&str, Option<Site>, &[Axis])], point: &str, dt: Option<Dt>) -> Claim {
+fn claimed(census: &[(&str, Option<Site>, &[ScalarKind])], point: &str, dt: Option<Dt>) -> Claim {
     let Some((_, _, elements)) = census.iter().find(|(p, _, _)| *p == point) else {
         return Claim::NoPoint;
     };

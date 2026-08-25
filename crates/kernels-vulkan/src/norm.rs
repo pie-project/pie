@@ -287,6 +287,25 @@ impl kernels::points::Norm for Ctx<'_> {
         )
     }
 
+    fn mul_scalar<T: kernels::points::Scalar>(
+        &self,
+        s: f32,
+        x: InOut<crate::points::Handle<T>>,
+    ) -> Result<(), Refusal> {
+        crate::points::at_bf16::<T>(
+            "norm.mul_scalar, at an element this plane does not instantiate",
+        )?;
+        let row = x.all("the scaled rectangle's row width")?;
+        self.fire(
+            Fire::at(
+                crate::plane::module_path("layer_scalar_mul_stated_bfloat16", self.best()),
+                "layer_scalar_mul_stated_bfloat16",
+            )
+            .apply(elementwise(row.width, row.rows)?),
+            &[x.ptr.arg(), x.arg(), s.arg()],
+        )
+    }
+
     fn scale<T: kernels::points::Scalar>(
         &self,
         s: Const<crate::points::Handle<T>>,

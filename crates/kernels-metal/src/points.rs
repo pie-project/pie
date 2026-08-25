@@ -1,9 +1,8 @@
 use core::marker::PhantomData;
 
-use kernels::Ty;
 use kernels::plane::{Const, ConstRun, Elem, In, InOut, Out, Refusal};
-use kernels::points::Scalar;
-use kernels::shader::{Element, Tensor};
+use kernels::points::{Scalar, ScalarKind};
+use kernels::shader::Tensor;
 
 use crate::plane::Ctx;
 
@@ -58,13 +57,9 @@ impl<T: Scalar> Elem for Handle<T> {
     }
 
     const CPP: &'static str = "";
-
-    const TY_CONST: Ty = <T as Elem>::TY_CONST;
-    const TY_MUT: Ty = <T as Elem>::TY_MUT;
 }
 
 impl<T: Scalar> ConstRun for Handle<T> {
-    const TY: Ty = <T as Elem>::TY_CONST;
     type Held = Self;
 }
 
@@ -95,7 +90,6 @@ impl<R> Clone for Planes<R> {
 impl<R> Copy for Planes<R> {}
 
 impl<R: kernels::points::Repr> ConstRun for Planes<R> {
-    const TY: Ty = Ty::U8s;
     type Held = Self;
 }
 
@@ -127,19 +121,17 @@ impl Elem for bfloat {
     }
 
     const CPP: &'static str = "";
-    const TY_CONST: Ty = Ty::Bf16s;
-    const TY_MUT: Ty = Ty::Bf16sMut;
 }
 
-impl kernels::bound::Rides for bfloat {
-    const AXIS: kernels::bound::Axis = kernels::bound::Axis::Bf16;
+impl Scalar for bfloat {
+    const KIND: ScalarKind = ScalarKind::Bf16;
 }
 
-fn rides<T: Scalar, E: Element>() -> bool {
-    <T as Elem>::TY_CONST == <E as Element>::TY_CONST
+fn rides<T: Scalar, E: Scalar>() -> bool {
+    T::KIND == E::KIND
 }
 
-pub fn input<T: Scalar, E: Element>(
+pub fn input<T: Scalar, E: Scalar>(
     x: In<Handle<T>>,
     what: &'static str,
 ) -> Result<In<Tensor<E>>, Refusal> {
@@ -153,7 +145,7 @@ pub fn input<T: Scalar, E: Element>(
     })
 }
 
-pub fn result<T: Scalar, E: Element>(
+pub fn result<T: Scalar, E: Scalar>(
     y: Out<Handle<T>>,
     what: &'static str,
 ) -> Result<Out<Tensor<E>>, Refusal> {
@@ -167,7 +159,7 @@ pub fn result<T: Scalar, E: Element>(
     })
 }
 
-pub fn in_place<T: Scalar, E: Element>(
+pub fn in_place<T: Scalar, E: Scalar>(
     x: InOut<Handle<T>>,
     what: &'static str,
 ) -> Result<InOut<Tensor<E>>, Refusal> {
@@ -181,7 +173,7 @@ pub fn in_place<T: Scalar, E: Element>(
     })
 }
 
-pub fn weight<T: Scalar, E: Element>(
+pub fn weight<T: Scalar, E: Scalar>(
     w: Const<Handle<T>>,
     what: &'static str,
 ) -> Result<Const<Tensor<E>>, Refusal> {
@@ -192,7 +184,7 @@ pub fn weight<T: Scalar, E: Element>(
 }
 
 #[must_use]
-pub fn read_half<E: Element>(x: InOut<Tensor<E>>) -> In<Tensor<E>> {
+pub fn read_half<E: Scalar>(x: InOut<Tensor<E>>) -> In<Tensor<E>> {
     In {
         ptr: x.ptr,
         rows: x.rows,
@@ -201,7 +193,7 @@ pub fn read_half<E: Element>(x: InOut<Tensor<E>>) -> In<Tensor<E>> {
 }
 
 #[must_use]
-pub fn write_half<E: Element>(x: InOut<Tensor<E>>) -> Out<Tensor<E>> {
+pub fn write_half<E: Scalar>(x: InOut<Tensor<E>>) -> Out<Tensor<E>> {
     Out {
         ptr: x.ptr,
         rows: x.rows,

@@ -119,7 +119,7 @@ fn rotates_bf16<T: kernels::points::Scalar>(
     r: InOut<Tensor<T>>,
     what: &'static str,
 ) -> Result<InOut<Tensor<bf16>>, Refusal> {
-    if <T as kernels::Elem>::TY_MUT != <bf16 as kernels::Elem>::TY_MUT {
+    if T::KIND != kernels::points::ScalarKind::Bf16 {
         return Err(Refusal::Absent { what });
     }
     Ok(InOut {

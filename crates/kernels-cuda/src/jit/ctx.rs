@@ -1,28 +1,11 @@
 use core::ffi::c_void;
 use kernels::plane::Fire;
 
-use kernels::plane::{Backend, Extent, In, Refusal};
+use kernels::plane::{In, Refusal};
 use kernels::raises::Struct;
 
 use crate::comm::Plane;
 use crate::jit::{ArgValue, Root};
-
-#[derive(Clone, Copy, Debug)]
-pub struct Cuda;
-
-impl Backend for Cuda {
-    type Value = ArgValue;
-    type Ctx<'a> = Ctx<'a>;
-
-    fn region(value: &ArgValue) -> Result<Extent, Refusal> {
-        match *value {
-            ArgValue::Region { rows, width, .. } => Ok(Extent { rows, width }),
-            _ => Err(Refusal::Absent {
-                what: "a region's shape: the bound value carries only an address",
-            }),
-        }
-    }
-}
 
 impl kernels::points::Plane for Ctx<'_> {
     type Tensor<T: kernels::points::Scalar> = crate::jit::abi::Tensor<T>;
@@ -32,17 +15,6 @@ impl kernels::points::Plane for Ctx<'_> {
     type Recurrent = kernels::raises::Struct<crate::views::RecurrentState>;
 
     type Pages = kernels::raises::Struct<crate::views::KvCache>;
-}
-
-impl kernels::plane::Answers<Cuda> for Ctx<'_> {
-    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
-        self.env
-            .ok_or(Refusal::Unstated {
-                what: "a fact, on a context built for a hand-written call: \
-                       nothing behind it holds this fire's answers",
-            })?
-            .resolve(ty, source)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,8 +122,6 @@ pub struct Ctx<'a> {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: Option<Plane>,
-    env: Option<&'a (dyn kernels::plane::Answers<Cuda> + 'a)>,
-
     raised: Option<&'a (dyn kernels::raises::Answered + 'a)>,
     held: core::marker::PhantomData<&'a ()>,
 }
@@ -163,7 +133,6 @@ impl<'a> Ctx<'a> {
             stream,
             cublas: core::ptr::null_mut(),
             comm: None,
-            env: None,
             raised: None,
             held: core::marker::PhantomData,
         }
@@ -178,12 +147,6 @@ impl<'a> Ctx<'a> {
     #[must_use]
     pub const unsafe fn with_comm(mut self, plane: Plane) -> Self {
         self.comm = Some(plane);
-        self
-    }
-
-    #[must_use]
-    pub const fn with_env(mut self, env: &'a (dyn kernels::plane::Answers<Cuda> + 'a)) -> Self {
-        self.env = Some(env);
         self
     }
 

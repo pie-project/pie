@@ -43,6 +43,29 @@
 @group(0) @binding(8) var<storage, read_write> attention_mask: array<u32>;
 @group(0) @binding(9) var<storage, read_write> attention_mask_enabled: array<u32>;
 @group(0) @binding(10) var<storage, read_write> sinks: array<u32>;
+//#if defined(PIE_LSE)
+// THE LOG-SUM-EXP PLANE `attention.{decode_lse, prefill_lse}` DECLARE, and the
+// reason those points are not the sink arms below wearing a different name.
+//
+// `#[shape(o = q, lse = [q.rows, q.width / head_dim])]`: one f32 per query head
+// per row, in base two — `pie_sdpa_lse_base2` in the online include is where
+// this file's natural-log accumulator becomes that. `f32` and not bf16 for the
+// reason `pie_split_state` above gives: it is accumulator state crossing to the
+// next statement, and eight mantissa bits is not enough to normalise against.
+//
+// Binding 11 is `pie_split_state`'s number under `PIE_SPLITK`, and the two are
+// never compiled together: a split states its partials there and an `_lse` arm
+// states this, so the number is reused rather than shared.
+//
+// AN `_lse` ARM READS ELEVEN OF THE TWELVE IT NUMBERS, and the hole is `sinks`
+// at 10 — a `_lse` reading reaches no sink, so nothing here calls `sink_at` and
+// `reflect::of_module` leaves that slot out of the bind group layout entirely.
+// The claim body's buffer run is therefore ten operands and this plane, with no
+// `Asks::absent` standing in for the sink the way `attention.decode`'s run has
+// one. Eleven bindings either way, which is still over WebGPU's guaranteed
+// floor of eight and still under this adapter's real limit — see the header.
+@group(0) @binding(11) var<storage, read_write> lse_out: array<f32>;
+//#endif
 //#if defined(PIE_SPLITK)
 // THE SPLIT'S PARTIAL SOFTMAX STATES, and the only buffer in this file that
 // belongs to neither the statement nor the model.
@@ -1485,6 +1508,29 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     }
 }
 //#else
+//#if defined(PIE_LSE)
+    // THE DENOMINATOR, PUBLISHED, and this is the whole of what `_lse` adds.
+    //
+    // ONE writer for the whole workgroup: `lane == 0` is `cl == 0 && kx == 0`
+    // and `ky == 0` picks one of the `PIE_KB` y lanes, so this is a single
+    // invocation. It can be any of them — every lane ran the `PIE_KY` merge
+    // fold above and therefore holds the same `(max_score, sum_exp)` — which is
+    // the same redundancy the channel writeout below already rests on.
+    //
+    // BEFORE any sink folding, which is why it sits above the `PIE_WITH_SINK`
+    // arm rather than below it. The two are never compiled together, but the
+    // ORDER is the statement: `attention.decode_lse` publishes the log-sum-exp
+    // of the softmax it normalised by, and `attention.sink` is the separate
+    // statement that extends that denominator afterwards. A sink folded in
+    // first would publish a denominator no downstream `sigmoid(lse - sink)`
+    // could undo.
+    if (lane == 0u && ky == 0u) {
+        let lse_at = row * n_q_heads + q_head;
+        if (lse_at < arrayLength(&lse_out)) {
+            lse_out[lse_at] = pie_sdpa_lse_base2(max_score, sum_exp);
+        }
+    }
+//#endif
 //#if defined(PIE_WITH_SINK)
     let merged = pie_sdpa_merge_sink(sink_at(q_head), max_score, sum_exp);
     for (var p = 0u; p < PIE_DP; p = p + 1u) { acc[p] = acc[p] * merged.output_scale; }
@@ -1962,6 +2008,18 @@ fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
                     * vec2<f32>(pie_bf16_to_f32(v1 & 0xffffu), pie_bf16_to_f32(v1 >> 16u));
         }
     }
+//#if defined(PIE_LSE)
+    // One writer per `(row, query head)`: the `PIE_TX` x lanes all walked the
+    // whole key history and all hold this row's state, so `lane == 0` picks
+    // one. See the decode arm's twin of this block for why it stands above the
+    // sink fold and not below it.
+    if (lane == 0u) {
+        let lse_at = row * n_q_heads + q_head;
+        if (lse_at < arrayLength(&lse_out)) {
+            lse_out[lse_at] = pie_sdpa_lse_base2(max_score, sum_exp);
+        }
+    }
+//#endif
 //#if defined(PIE_WITH_SINK)
     let merged = pie_sdpa_merge_sink(sink_at(q_head), max_score, sum_exp);
     sum_exp = merged.sum_exp;
@@ -2103,6 +2161,18 @@ fn main(
 // pie:instantiate sdpa_paged_decode_bfloat16_d_128_p32 PIE_HEAD_DIM=128 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1
 // pie:instantiate sdpa_paged_decode_bfloat16_d_64_p32_sg8 PIE_HEAD_DIM=64 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1 PIE_SHORT_GROUP=8
 // pie:instantiate sdpa_paged_decode_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_WITH_SINK=1
+// THE PUBLISHED DENOMINATOR, at gpt-oss's width and no other.
+//
+// `attention.decode_lse` is stated by one family on this plane and its heads
+// are 64 wide, so one stamp is what the tree carries; `head_point` refuses
+// every other width BY NAME at the fire, which is a better answer than three
+// more pipelines nothing states. Add one the day a model states one.
+//
+// A SEPARATE ENTRY POINT AND NOT AN ARGUMENT THE UNSPLIT ARM LEARNS TO IGNORE:
+// a variant's buffer list IS its binding contract here — `src/reflect.rs`
+// derives the bind group layout from what the module reaches — so a twelfth
+// operand is a new entry point by construction.
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1
 // The split pair, at the widths a decode reaches. No sink point: a sink is a
 // logit that joins the FINAL softmax, so it belongs to the combine arm alone,
 // and no deployment with sinks has yet been narrow enough to want the split.
@@ -2132,4 +2202,7 @@ fn main(
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_WITH_SINK=1
+// `attention.prefill_lse`, at the one width that states it. See the decode
+// twin above for why there is one stamp and not four.
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1
 // pie:instantiate sdpa_paged_tiled_strided_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_STRIDED=1

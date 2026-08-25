@@ -52,7 +52,6 @@
 
 use driver_wgpu::binding::Bound;
 use driver_wgpu::device::{Buffer, Ceiling, Device, Failed, Pipelines, Recorded};
-use driver_wgpu::geometry::Dims;
 use driver_wgpu::resources::{Frame, Pool, Request, Shape};
 use driver_wgpu::serve::{Embedded, pick};
 use kernels_wgpu::Capability;
@@ -465,40 +464,6 @@ fn an_adapter_opens_and_reports_what_it_offers() {
     assert!(limits.storage_buffers >= 8);
 }
 
-/// The launch rule for a kernel whose family has RETIRED its rows.
-///
-/// `groups_for` takes a `Rule`, and these two kernels no longer have a row to
-/// read one from. The rule is the same fact the ROUTINE now states as its
-/// `lanes` — `norm/rms.wgsl` reduces one row per workgroup and
-/// `norm/residual_add.wgsl` walks a flat run — and stating it here keeps two
-/// real device checks alive rather than deleting them with the table.
-///
-/// Not derived from the routine because a body needs a `Ctx` to state
-/// anything and that is the whole plan path; these tests are about what the
-/// SHADER computes.
-fn rule_of(name: &str) -> kernels::LaunchRule {
-    match name {
-        "rms_single_row_bfloat16" => kernels::LaunchRule::Rms,
-        "residual_add_bfloat16" => kernels::LaunchRule::Elementwise,
-        // `kv_append_paged`'s row said `PerHead`, which is `[1, kv_heads,
-        // rows]` -- the shape this file's paged-append test asserts.
-        "kv_append_paged_bfloat16" => kernels::LaunchRule::PerHead,
-        // EXHAUSTIVE, and it has to be: this fell back to the row's `launch`
-        // column, which no longer exists. A grid is the ROUTINE's to state
-        // now, and a routine needs a `Ctx` to state anything -- which is the
-        // whole plan path, and these two tests are about what the SHADER
-        // computes rather than about planning. So the three rules they need
-        // are written here, with the reason, and a fourth caller has to add
-        // its own rather than get a wrong answer from a lookup that cannot
-        // fail loudly.
-        other => panic!(
-            "`{other}` has no stated rule in this file. These tests bypass the \
-             plan path deliberately, so a rule they need is stated here or not \
-             at all -- add it above with why it is that shape."
-        ),
-    }
-}
-
 /// 2a. A real `rms_single_row_bfloat16` produces the right numbers.
 ///
 /// The clearest row in the table to check: `out = w * x / rms(x)` has an
@@ -529,18 +494,7 @@ fn a_norm_computes_what_its_closed_form_says() {
     let out = device.buffer(&vec![0u8; x_bytes.len()]).expect("out");
     let params = rms_params(eps, WIDTH, 1, 0, 1.0);
 
-    let groups = driver_wgpu::device::groups_for(
-        &device,
-        pipeline,
-        rule_of(name),
-        Dims {
-            rows: ROWS,
-            width: WIDTH,
-            axis: WIDTH,
-            ..Dims::default()
-        },
-    )
-    .expect("a grid");
+    let groups = pipeline.workgroups([ROWS * 256, 1, 1]);
     assert_eq!(groups, [ROWS, 1, 1], "one workgroup per row, on x");
 
     device
@@ -587,17 +541,16 @@ fn a_residual_add_is_the_sum_of_what_it_was_given() {
         .buffer(&SENTINEL.to_le_bytes().repeat(x_bytes.len() / 4))
         .expect("out");
 
-    let groups = driver_wgpu::device::groups_for(
-        &device,
-        pipeline,
-        rule_of(name),
-        Dims {
-            rows: ROWS,
-            width: WIDTH,
-            ..Dims::default()
-        },
-    )
-    .expect("a grid");
+    // `[words, 1, 1]` AND NOT `[WIDTH, ROWS, 1]`, which is the shape this
+    // launch had until the numbers said otherwise. `norm/residual_add.wgsl`
+    // reads `gid.x` ALONE over a flat run of bf16 PAIRS, so a 2D grid gives
+    // it `WIDTH` distinct indices for `WIDTH * ROWS / 2` words: everything
+    // past word 460 keeps the sentinel, and element 1024 comes back as
+    // 65536. The claim body in `kernels_wgpu::norm` states the right count
+    // (`words(y.width, y.rows)`); this test hand-builds its own launch and
+    // has to state the same one.
+    let words = (WIDTH * ROWS).div_ceil(2);
+    let groups = pipeline.workgroups([words, 1, 1]);
 
     device
         .run(
@@ -729,29 +682,9 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
     let residual = device.buffer(&r_bytes).expect("residual");
     let params = rms_params(1e-6, WIDTH, 1, 0, 1.0);
 
-    let norm_grid = driver_wgpu::device::groups_for(
-        &device,
-        norm,
-        kernels::LaunchRule::Rms,
-        Dims {
-            rows: ROWS,
-            width: WIDTH,
-            axis: WIDTH,
-            ..Dims::default()
-        },
-    )
-    .expect("a grid");
-    let add_grid = driver_wgpu::device::groups_for(
-        &device,
-        add,
-        kernels::LaunchRule::Elementwise,
-        Dims {
-            rows: ROWS,
-            width: WIDTH,
-            ..Dims::default()
-        },
-    )
-    .expect("a grid");
+    let norm_grid = norm.workgroups([ROWS * 256, 1, 1]);
+    // The same flat-word run as above, for the same reason.
+    let add_grid = add.workgroups([(WIDTH * ROWS).div_ceil(2), 1, 1]);
 
     // Four regions in each half of the ping-pong, at offsets a storage binding
     // can start from. `min_storage_offset` is ASKED rather than assumed: 256 is
@@ -1129,18 +1062,7 @@ fn a_paged_append_lands_where_the_layout_says_and_leaves_the_rest_alone() {
     }
     assert_eq!(uniform.len(), 16, "three words, rounded to WGSL's 16");
 
-    let groups = driver_wgpu::device::groups_for(
-        &device,
-        pipeline,
-        rule_of(name),
-        Dims {
-            rows,
-            head_dim: shape.head_dim,
-            kv_heads: shape.kv_heads,
-            ..Dims::default()
-        },
-    )
-    .expect("a grid");
+    let groups = pipeline.workgroups([shape.head_dim, shape.kv_heads, rows]);
     assert_eq!(groups, [1, shape.kv_heads, rows]);
 
     device
@@ -1338,18 +1260,6 @@ fn every_refusal_is_a_named_error_and_not_a_panic() {
             limit: limits.buffer_size,
         })
     );
-
-    // Geometry: a rule this backend has no shader for, refused by name through
-    // the same `Failed`.
-    assert!(matches!(
-        driver_wgpu::device::groups_for(
-            &device,
-            pipeline,
-            kernels::LaunchRule::RecurrentScan,
-            Dims::default()
-        ),
-        Err(Failed::Geometry(_))
-    ));
 
     // Wgpu: a real validation failure, captured rather than panicked. A uniform
     // buffer carries `UNIFORM | COPY_DST` and a storage binding wants
@@ -2124,10 +2034,15 @@ fn every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter() {
         "the sweep built {built} of {declared} declared entrypoints without \
          refusing any, which means it did not walk all of them"
     );
+    // 519 -> 522: `attention.{decode_lse, prefill_lse, sink}`, the three points
+    // gpt-oss states that this plane could not answer. Two `_lse` stamps on
+    // `attn/sdpa_paged.wgsl` at gpt-oss's head width, and `attn/attn_sink.wgsl`,
+    // which is a whole new file. `src/reflect.rs` holds the same number and its
+    // note is where the argument for the crossing is.
     assert_eq!(
-        declared, 490,
+        declared, 522,
         "`kernels_wgpu::source::declared()` holds {declared} entrypoints, not \
-         the 490 this was measured against. If the tree gained rows, say so \
+         the 522 this was measured against. If the tree gained rows, say so \
          here; if it lost them, this is the sweep telling you which way."
     );
 }

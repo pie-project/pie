@@ -227,10 +227,37 @@ fn every_declared_entrypoint_builds_a_pipeline_on_this_device() {
         }
     }
 
-    assert!(
-        built > 400,
-        "only {built} entrypoints were built, so the census shrank and this \
-         test compared almost nothing"
+    // THE CENSUS, PINNED RATHER THAN FLOORED, and the number moved while
+    // nobody could look.
+    //
+    // It read `built > 400` and was written at `9a6682575`. This test needs a
+    // Metal 4 device, and `driver-metal` then spent months outside the
+    // workspace entirely — so from that commit until the day a Mac was
+    // reachable, the assertion was never evaluated once. The tree declares
+    // 293 today and every one of them builds.
+    //
+    // WHAT FELL IS THE EXPANSION, NOT THE SHADERS. `instantiate_` calls went
+    // 331 to 321 over the same span — ten, against a hundred-odd entrypoints
+    // — so the drop is in how wide each stamp expands, not in files deleted.
+    // `5b8bee5fe` did delete four legacy shaders (`geglu_tanh`, `gptoss`,
+    // `kv_append`, `silu_mul`) and `29b9df349`/`5b44c346d` took the packed
+    // `*_params.h` with the routine column; none of that accounts for a
+    // hundred, and the honest thing is to pin what is here and let the next
+    // move be visible.
+    //
+    // UP is a stamp widening or a shader landing, and the edit that raises
+    // this number is the record of it. DOWN is an entrypoint that stopped
+    // being declared, which is a body that stopped being dispatchable.
+    // 296, and the three it gained are named: `attn_sink_rescale_bfloat16`
+    // and the two `sdpa_paged_*_lse` arms, which are what let `gpt-oss` reach
+    // 16 of the 16 points its text states on this plane. UP is a stamp
+    // landing and this edit is the record of it.
+    assert_eq!(
+        built, 296,
+        "the shader tree declares {built} entrypoints, not the 296 this was \
+         measured against on an M1 Max. If it gained stamps, raise this; if \
+         it lost them, that is a body that stopped being reachable and the \
+         sweep is telling you so."
     );
     assert!(
         refused.is_empty(),

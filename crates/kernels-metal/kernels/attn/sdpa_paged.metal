@@ -64,36 +64,62 @@ using namespace metal;
 // head attend to nothing. A template parameter rather than a second kernel: the
 // paging, the CSR walk and the online softmax are identical, and two copies of
 // them would be two things to keep true.
+//
+// WITH_LSE publishes the softmax's log-sum-exp beside the output, in base two
+// -- see `sdpa_lse_base2`. It is a DIFFERENT decomposition of the same
+// arithmetic from WITH_SINK, not a companion to it: a kernel that folded the
+// sink into its denominator and then published an lse would be publishing a
+// normaliser the sink is already inside, and `attention.sink` downstream would
+// apply it twice. The two are mutually exclusive and the static_assert below
+// is what says so at the instantiation rather than at the fire.
+//
+// # The body, and why the decode grew one
+//
+// `sdpa_paged_tiled_body` was already split this way, for the reason repeated
+// here: an entry point's buffer list IS its binding contract, so a body with
+// one more operand has to be a NEW entry point rather than an argument the old
+// one learns to ignore. The threadgroup arrays come down as pointers because
+// Metal forbids a non-kernel function from declaring threadgroup memory.
 template <
     typename T,
     int D,
-    int V = D,
-    bool WITH_SINK = false,
-    int PAGE_SIZE = 0,
-    bool FAST_FULL = false,
-    int BN = 32>
-[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode(
-    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
-    const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
-    const device T* v_pages     [[buffer(2)]],
-    device T* out               [[buffer(3)]],   // [N, n_q_heads, V]
-    const constant int& gqa_factor          [[buffer(4)]],
-    const device int* position_ids          [[buffer(5)]],   // [N] abs pos → causal bound
-    const device int* req_of_token          [[buffer(6)]],   // [N] owning request r
-    const device uint* kv_page_indices      [[buffer(7)]],   // [total_pages]
-    const device uint* kv_page_indptr       [[buffer(8)]],   // [R+1]
-    const constant int& page_size           [[buffer(9)]],
-    const constant int& n_kv_heads          [[buffer(10)]],
-    const constant float& scale             [[buffer(11)]],
-    const device uchar* attention_mask      [[buffer(12)]],
-    const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
-    const constant int& window                 [[buffer(15)]],
-    const device T* sinks                      [[buffer(16)]],  // [n_q_heads], WITH_SINK only
-    uint3 tid       [[threadgroup_position_in_grid]],
-    uint3 tpg       [[threadgroups_per_grid]],
-    uint simd_gid   [[simdgroup_index_in_threadgroup]],
-    uint simd_lid   [[thread_index_in_simdgroup]]) {
+    int V,
+    bool WITH_SINK,
+    bool WITH_LSE,
+    int PAGE_SIZE,
+    bool FAST_FULL,
+    int BN>
+inline void sdpa_paged_decode_body(
+    const device T* queries,
+    const device T* k_pages,
+    const device T* v_pages,
+    device T* out,
+    const int gqa_factor,
+    const device int* position_ids,
+    const device int* req_of_token,
+    const device uint* kv_page_indices,
+    const device uint* kv_page_indptr,
+    const int page_size,
+    const int n_kv_heads,
+    const float scale,
+    const device uchar* attention_mask,
+    const uint attention_mask_stride,
+    const device uchar* attention_mask_enabled,
+    const int window,
+    const device T* sinks,
+    device float* lse,
+    threadgroup float* outputs,
+    threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores,
+    threadgroup float* factors,
+    threadgroup float* final_sum,
+    uint3 tid,
+    uint3 tpg,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      !(WITH_SINK && WITH_LSE),
+      "a folded sink and a published lse are two readings of one denominator");
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
@@ -104,12 +130,6 @@ template <
   thread U k[qk_per_thread];
   thread U v[v_per_thread];
   thread U o[v_per_thread];
-
-  threadgroup U outputs[BN * BD];
-  threadgroup U max_scores[BN];
-  threadgroup U sum_exp_scores[BN];
-  threadgroup U factors[BN];
-  threadgroup U final_sum[1];
 
   const int q_batch_head_idx = tid.x;         // 0..n_q_heads-1
   const int row              = tid.y;         // query token index in [0, N)
@@ -253,6 +273,18 @@ template <
     U factor = fast::exp(max_score - new_max);
     sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
+    // BEFORE the sink, always, because `sdpa_merge_sink` mutates the
+    // denominator this reads and the static_assert above is not the only place
+    // that ordering should be legible. Every simdgroup ran the reduction over
+    // the same thirty-two entries, so `new_max` and `sum_exp_score` are
+    // threadgroup-uniform here and one lane of one simdgroup owns the store.
+    if constexpr (WITH_LSE) {
+      if (simd_gid == 0 && simd_lid == 0) {
+        lse[size_t(row) * size_t(n_q_heads) + size_t(q_batch_head_idx)] =
+            sdpa_lse_base2(new_max, sum_exp_score);
+      }
+    }
+
     U orescale = 1;
     if (WITH_SINK) {
       const U sink = static_cast<U>(sinks[tid.x]);
@@ -278,6 +310,12 @@ template <
           simd_lid < BN ? sum_exp_scores[simd_lid] * factor : U(0));
       if (simd_lid < BN) factors[simd_lid] = factor;
       if (simd_lid == 0) {
+        // Before the sink for the same reason as the wide shape above: `total`
+        // is the denominator the lse names, and `sdpa_merge_sink` grows it.
+        if constexpr (WITH_LSE) {
+          lse[size_t(row) * size_t(n_q_heads) + size_t(q_batch_head_idx)] =
+              sdpa_lse_base2(new_max, total);
+        }
         if (WITH_SINK) {
           const U sink = static_cast<U>(sinks[tid.x]);
           const U rescale = sdpa_merge_sink(sink, new_max, total);
@@ -302,6 +340,101 @@ template <
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
+}
+
+// The threadgroup memory the decode body is handed, declared where Metal
+// requires it. `BD` is 32 in the body and the two entry points below have to
+// spell the same product, so it is written once here rather than twice there.
+template <int BN> constexpr int sdpa_decode_outputs() { return BN * 32; }
+
+/// The decode as every family but gpt-oss's lse arms fires it: seventeen
+/// buffers, no log-sum-exp plane.
+template <
+    typename T,
+    int D,
+    int V = D,
+    bool WITH_SINK = false,
+    int PAGE_SIZE = 0,
+    bool FAST_FULL = false,
+    int BN = 32>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode(
+    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
+    const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],   // [N, n_q_heads, V]
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],   // [N] abs pos → causal bound
+    const device int* req_of_token          [[buffer(6)]],   // [N] owning request r
+    const device uint* kv_page_indices      [[buffer(7)]],   // [total_pages]
+    const device uint* kv_page_indptr       [[buffer(8)]],   // [R+1]
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],  // [n_q_heads], WITH_SINK only
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  threadgroup float outputs[sdpa_decode_outputs<BN>()];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+  threadgroup float factors[BN];
+  threadgroup float final_sum[1];
+  sdpa_paged_decode_body<T, D, V, WITH_SINK, false, PAGE_SIZE, FAST_FULL, BN>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, /*lse=*/nullptr, outputs, max_scores, sum_exp_scores, factors,
+      final_sum, tid, tpg, simd_gid, simd_lid);
+}
+
+/// `attention.decode_lse`: the same decode, publishing its denominator.
+///
+/// An eighteenth buffer and therefore an entry point of its own — see the body
+/// for why a contract cannot grow an operand in place. `WITH_SINK` is not a
+/// parameter here because a sunk decode has no lse to state: the point that
+/// wants the sink states it as a SECOND statement (`attention.sink`) reading
+/// the plane this one writes, and that is the decomposition the floor declares.
+template <typename T, int D, int V = D>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode_lse(
+    const device T* queries     [[buffer(0)]],
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],  // unread; the seat is the contract
+    device float* lse                          [[buffer(17)]],  // [N, n_q_heads], base two
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  threadgroup float outputs[sdpa_decode_outputs<BN>()];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+  threadgroup float factors[BN];
+  threadgroup float final_sum[1];
+  sdpa_paged_decode_body<T, D, V, false, true, 0, false, BN>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, lse, outputs, max_scores, sum_exp_scores, factors, final_sum, tid,
+      tpg, simd_gid, simd_lid);
 }
 
 // ── the same attention, with the query rows tiled ──
@@ -363,7 +496,7 @@ template <int D, bool KPL> constexpr int sdpa_kstride() { return KPL ? D + 2 : D
 /// gemma4, gpt-oss and llama all run the packed pipeline: a buffer the kernel
 /// DECLARES and their bind tables do not set is not a slot they waste, it is
 /// their attention reading an unbound argument.
-template <typename T, int D, int V, bool WITH_SINK, bool KEY_PER_LANE>
+template <typename T, int D, int V, bool WITH_SINK, bool KEY_PER_LANE, bool WITH_LSE>
 inline void sdpa_paged_tiled_body(
     const device T* queries,
     const device T* k_pages,
@@ -382,6 +515,7 @@ inline void sdpa_paged_tiled_body(
     const device uchar* attention_mask_enabled,
     const int window,
     const device T* sinks,
+    device float* lse,
     const int n_rows,
     const int q_row_pitch,
     const int o_row_pitch,
@@ -398,6 +532,9 @@ inline void sdpa_paged_tiled_body(
   // one does not, it fails to compile rather than reading V's values out of a
   // buffer sized for K's.
   static_assert(V == D, "the tiled path stages one shape for K and V");
+  static_assert(
+      !(WITH_SINK && WITH_LSE),
+      "a folded sink and a published lse are two readings of one denominator");
 
   constexpr int QT = 32;          // query rows per threadgroup == simdgroups
   constexpr int KT = 4096 / D;    // kv positions staged per pass (16 KB of T)
@@ -605,6 +742,16 @@ inline void sdpa_paged_tiled_body(
 
   if (!live) return;
 
+  // A row is a simdgroup here, so the denominator this publishes needs no
+  // merge to be complete -- and, as above, it is read before the sink can
+  // grow it. `simd_lid == 0` because thirty-two lanes hold the same number.
+  if constexpr (WITH_LSE) {
+    if (simd_lid == 0) {
+      lse[size_t(row) * size_t(n_q_heads) + size_t(q_head)] =
+          sdpa_lse_base2(max_score, sum_exp_score);
+    }
+  }
+
   // The sink joins the denominator at a shared reference, exactly as above --
   // there is just no cross-simdgroup merge to carry it through any more.
   U orescale = 1;
@@ -651,11 +798,54 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
   threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
-  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE>(
+  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE, false>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
-      sinks, n_rows,
+      sinks, /*lse=*/nullptr, n_rows,
+      /*q_row_pitch=*/0, /*o_row_pitch=*/0,
+      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+}
+
+/// `attention.prefill_lse`: the packed tiling, publishing its denominator.
+///
+/// A nineteenth buffer, so an entry point of its own for the reason the decode
+/// twin above gives. `WITH_SINK` is again absent, and again because the point
+/// that wants a sink states it as the separate rescale that reads this plane.
+template <typename T, int D, int V = D, bool KEY_PER_LANE = false>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled_lse(
+    const device T* queries     [[buffer(0)]],
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],  // unread; the seat is the contract
+    const constant int& n_rows                 [[buffer(17)]],
+    device float* lse                          [[buffer(18)]],  // [N, n_q_heads], base two
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, KEY_PER_LANE>()];
+  threadgroup T vtile[sdpa_kt<D>() * D];
+  threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
+  threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
+  sdpa_paged_tiled_body<T, D, V, false, KEY_PER_LANE, true>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, lse, n_rows,
       /*q_row_pitch=*/0, /*o_row_pitch=*/0,
       ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
 }
@@ -691,11 +881,11 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
   threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
-  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE>(
+  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE, false>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
-      sinks, n_rows,
+      sinks, /*lse=*/nullptr, n_rows,
       q_row_pitch, o_row_pitch,
       ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
 }
@@ -738,6 +928,28 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 512, 512, fals
 // one, because the family that has sinks was not tiling.
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, true, true)
 
+#define instantiate_sdpa_tiled_lse(fn, name, itype, d, v, kpl)             \
+  template [[host_name(fn "_" #name "_d_" #d)]]                            \
+  [[kernel]] void sdpa_paged_tiled_lse<itype, d, v, kpl>(                  \
+      const device itype*, const device itype*, const device itype*,       \
+      device itype*, const constant int&, const device int*,               \
+      const device int*, const device uint*, const device uint*,           \
+      const constant int&, const constant int&, const constant float&,     \
+      const device uchar*, const device uint&, const device uchar*,        \
+      const constant int&, const device itype*, const constant int&,       \
+      device float*, uint3, uint3, uint, uint);
+
+// gpt-oss's head width, and ONLY gpt-oss's.
+//
+// `attention.prefill_lse` is stated by two texts in this tree and neither of
+// the other two SKUs on this plane is one of them: gpt-oss states it at 64,
+// and deepseek-v4 states it on the `Mla` family, which this plane does not
+// claim at all. A width nothing states would be one more entry point compiled
+// into every build, signed, pipeline-buildable and unreachable, which is what
+// the `_p32` note further down is about. `head_point` refuses the widths that
+// are not here, by name, at the fire.
+instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 64, 64, true)
+
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
   [[kernel]] void sdpa_paged_decode<itype, d, v, sink, 0, false, 32>(      \
@@ -760,6 +972,20 @@ instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)  // gemma4 full-attn (head_di
 instantiate_sdpa_paged(bfloat16, bfloat, 128, 128)  // llama / qwen (head_dim 128)
 instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)  // llama 3.2 1B/3B (head_dim 64)
 instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)  // gpt-oss (head_dim 64)
+
+#define instantiate_sdpa_paged_lse(name, itype, d, v)                      \
+  template [[host_name("sdpa_paged_decode_lse_" #name "_d_" #d)]]          \
+  [[kernel]] void sdpa_paged_decode_lse<itype, d, v>(                      \
+      const device itype*, const device itype*, const device itype*,       \
+      device itype*, const constant int&, const device int*,               \
+      const device int*, const device uint*, const device uint*,           \
+      const constant int&, const constant int&, const constant float&,     \
+      const device uchar*, const device uint&, const device uchar*,        \
+      const constant int&, const device itype*, device float*,             \
+      uint3, uint3, uint, uint);
+
+// gpt-oss (head_dim 64), for the reason the tiled twin's block gives.
+instantiate_sdpa_paged_lse(bfloat16, bfloat, 64, 64)
 
 #define instantiate_sdpa_paged_p32(name, itype, d, v)                       \
   template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32")]]        \

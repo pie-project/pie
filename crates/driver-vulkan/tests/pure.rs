@@ -179,6 +179,28 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // gets the signature table with no toolchain behind it, which is what
         // keeps THIS test runnable on a machine with no `slangc`.
         "kernels-vulkan",
+        // The WGSL table crate, reached from here the way `kernels-cuda` is:
+        // by way of `model-ir`, which is the ONE join over every plane's
+        // `*_CLAIMS` and so must name every plane's table crate whether or not
+        // this driver fires on that plane.
+        //
+        // ADDED, and the date it should have been added is `c7bad6cf4` -- the
+        // commit that gave `model-ir` this edge, which is the same commit that
+        // landed `driver-wgpu`'s baker while `driver-vulkan` was outside the
+        // workspace. So the list did not go stale slowly; it went stale at the
+        // exact moment nothing was running this suite, and it stayed wrong for
+        // as long as the crate could not be resolved. That is the failure this
+        // whole file is an argument against, arriving in the file that makes
+        // the argument.
+        //
+        // It satisfies the first claim for the plainest possible reason: its
+        // `build.rs` walks `kernels/` and emits a `&[(&str, &str)]` of WGSL
+        // SOURCE. WGSL is not a build product -- there is no `native` on that
+        // crate and no toolchain behind one -- so unlike `kernels-vulkan`
+        // there is not even a feature under which it could reach a compiler.
+        // It declares `links = "pie_kernels_wgpu"`, which is why it is on this
+        // list rather than invisible to it.
+        "kernels-wgpu",
         // `model-compiler` STOOD HERE, described as *"content-hashes its own
         // `.rs` files to fingerprint the tracer"*. That script is `model-dsl`'s
         // now, and `model-dsl` is the AUTHORING surface -- a driver lowers a
@@ -479,9 +501,17 @@ fn the_half_that_builds_without_a_driver_contains_no_unsafe() {
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs is readable");
 
     // A module is portable unless the line before its declaration gates it.
-    // Only `native` exists today; any other gate is unknown and treated as
-    // portable so that a new one shows up as a failure rather than a silent
-    // exemption.
+    // Any gate not named here is unknown and treated as PORTABLE, so that a
+    // new one shows up as a failure rather than as a silent exemption.
+    //
+    // IT DID. `native` was the only name until the Vulkan shell came back and
+    // `device` was split out of it: the half that opens a card, builds a
+    // pipeline and dispatches needs `ash` and nothing else, while the half
+    // that walks a plan needs surfaces R3 deleted and does not compile at all.
+    // Splitting them is what let a kernel fire before the walk exists. Both
+    // are gates and both carry `unsafe`; the portable half is what is left
+    // when neither is on, and that is still the claim this test makes.
+    const GATES: [&str; 2] = ["native", "device"];
     let mut portable = Vec::new();
     let mut gated = 0usize;
     let lines: Vec<&str> = lib.lines().collect();
@@ -493,8 +523,11 @@ fn the_half_that_builds_without_a_driver_contains_no_unsafe() {
         else {
             continue;
         };
-        let native = i > 0 && lines[i - 1].trim() == "#[cfg(feature = \"native\")]";
-        if native {
+        let gate = i > 0
+            && GATES
+                .iter()
+                .any(|g| lines[i - 1].trim() == format!("#[cfg(feature = \"{g}\")]"));
+        if gate {
             gated += 1;
         } else {
             portable.push(name.to_string());
@@ -513,10 +546,50 @@ fn the_half_that_builds_without_a_driver_contains_no_unsafe() {
     // check that reports zero findings because it looked at zero files.
     let mut scanned = 0usize;
     let mut unsafes = Vec::new();
+    // A MODULE IS ONE FILE OR A DIRECTORY OF THEM, and reading only the first
+    // shape is how this scan reported a clean portable half while never
+    // opening `baker/`'s seven files. `walk` is `walk.rs` beside `walk/`;
+    // `baker` is a directory with a `mod.rs`. Both are scanned whole.
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
     for name in &portable {
+        let one = src.join(format!("{name}.rs"));
+        if one.is_file() {
+            files.push((format!("{name}.rs"), one));
+        }
+        let dir = src.join(name);
+        if dir.is_dir() {
+            let mut stack = vec![dir];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d)
+                    .expect("a readable module directory")
+                    .flatten()
+                {
+                    let path = e.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().is_some_and(|x| x == "rs") {
+                        let shown = path
+                            .strip_prefix(&src)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned();
+                        files.push((shown, path));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        files.len() >= portable.len(),
+        "{} portable modules resolved to {} file(s) -- a module that names \
+         neither a file nor a directory means this scan is reading the wrong \
+         tree",
+        portable.len(),
+        files.len(),
+    );
+    for (name, path) in &files {
         scanned += 1;
-        let path = src.join(format!("{name}.rs"));
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}.rs: {e}"));
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{name}: {e}"));
         // Word-bounded, so `unsafely` in prose is not a finding. Comments and
         // strings are NOT excluded: this is a claim about what the file says,
         // and a false positive costs a rename while a false negative costs the
@@ -526,15 +599,21 @@ fn the_half_that_builds_without_a_driver_contains_no_unsafe() {
                 .split(|c: char| !c.is_alphanumeric() && c != '_')
                 .any(|w| w == "unsafe")
             {
-                unsafes.push(format!("{name}.rs:{}: {}", n + 1, line.trim()));
+                unsafes.push(format!("{name}:{}: {}", n + 1, line.trim()));
             }
         }
     }
+    // THE CONTROL, and it used to read `scanned == portable.len()` because a
+    // module was a file. `baker` is a directory of seven and `walk` is a file
+    // beside a directory of six, so the honest form of the same claim is that
+    // every file the resolve above found is a file this loop opened — a scan
+    // that quietly read fewer than it resolved is the shape this guards.
     assert_eq!(
         scanned,
+        files.len(),
+        "resolved {} file(s) from {} portable module(s) and scanned {scanned}",
+        files.len(),
         portable.len(),
-        "read {} portable modules and scanned {scanned}",
-        portable.len()
     );
     assert!(
         unsafes.is_empty(),

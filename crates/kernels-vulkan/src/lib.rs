@@ -4,13 +4,13 @@ pub use crate::capability::Capability;
 pub mod module;
 pub use crate::module::{MODULES, code, embedded};
 
-pub mod runtime;
-
 pub mod plane;
 pub mod points;
+pub mod points_dispatch;
 pub mod views;
 
 pub mod attn;
+pub mod gemm;
 pub mod layout;
 pub mod mlp;
 pub mod moe;

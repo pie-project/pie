@@ -24,9 +24,9 @@
 //! The dtype check the shim owed is [`rides`], and it is now owed once for
 //! every slot of every point rather than at the two the shim remembered.
 
-use kernels::bound::{Axis, BoundOp, Rides, Site};
+use kernels::bound::{BoundOp, Site};
 use kernels::plane::{Cache, Const, In, InOut, Out, Refusal};
-use kernels::points::{Form, Repr};
+use kernels::points::{Form, Repr, Scalar, ScalarKind};
 use kernels::raises::Struct;
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::jit::abi::{Bank as CudaBank, Planes, Tensor};
@@ -48,27 +48,27 @@ pub(crate) struct Bound<'f, 'a> {
 }
 
 /// What a rectangle the walk sized rides, as the floor names it.
-fn axis(dt: Dt) -> Axis {
+fn axis(dt: Dt) -> ScalarKind {
     match dt {
-        Dt::Bf16 => Axis::Bf16,
-        Dt::F32 => Axis::F32,
-        Dt::I32 => Axis::I32,
-        Dt::U32 => Axis::U32,
-        Dt::U8 => Axis::U8,
+        Dt::Bf16 => ScalarKind::Bf16,
+        Dt::F32 => ScalarKind::F32,
+        Dt::I32 => ScalarKind::I32,
+        Dt::U32 => ScalarKind::U32,
+        Dt::U8 => ScalarKind::U8,
     }
 }
 
 /// What a BANK rides, which is the checkpoint's storage axis and not the
 /// plan's repr column. `None` for a dtype no point can be instantiated at,
 /// which reads as a refusal rather than as a match.
-fn bank_axis(d: Dtype) -> Option<Axis> {
+fn bank_axis(d: Dtype) -> Option<ScalarKind> {
     match d {
-        Dtype::Bf16 => Some(Axis::Bf16),
-        Dtype::F16 => Some(Axis::F16),
-        Dtype::F32 => Some(Axis::F32),
-        Dtype::I32 => Some(Axis::I32),
-        Dtype::U32 => Some(Axis::U32),
-        Dtype::U8 => Some(Axis::U8),
+        Dtype::Bf16 => Some(ScalarKind::Bf16),
+        Dtype::F16 => Some(ScalarKind::F16),
+        Dtype::F32 => Some(ScalarKind::F32),
+        Dtype::I32 => Some(ScalarKind::I32),
+        Dtype::U32 => Some(ScalarKind::U32),
+        Dtype::U8 => Some(ScalarKind::U8),
         _ => None,
     }
 }
@@ -80,8 +80,8 @@ fn bank_axis(d: Dtype) -> Option<Axis> {
 /// f32 core and an f32 weight beside a bf16 gate, and reading a bf16
 /// rectangle as f32 is a reinterpretation, not a cast — it halves every
 /// stride inside the kernel and returns a plausible wrong answer.
-fn rides<T: Rides>(what: &'static str, have: Axis) -> Result<(), Refusal> {
-    if T::AXIS == have {
+fn rides<T: Scalar>(what: &'static str, have: ScalarKind) -> Result<(), Refusal> {
+    if T::KIND == have {
         return Ok(());
     }
     Err(Refusal::Absent { what })
@@ -94,7 +94,7 @@ impl<'a> BoundOp for Bound<'_, 'a> {
         self.point
     }
 
-    fn dtype(&self, at: Site) -> Result<Axis, Refusal> {
+    fn dtype(&self, at: Site) -> Result<ScalarKind, Refusal> {
         Ok(match at {
             Site::In(i) => axis(self.fire.input(self.op, i)?.dt),
             Site::Out(i) => axis(self.fire.output(self.op, i)?.dt),
@@ -106,7 +106,7 @@ impl<'a> BoundOp for Bound<'_, 'a> {
         })
     }
 
-    fn tin<T: Rides>(&self, at: usize) -> Result<In<Tensor<T>>, Refusal> {
+    fn tin<T: Scalar>(&self, at: usize) -> Result<In<Tensor<T>>, Refusal> {
         let r = self.fire.input(self.op, at)?;
         rides::<T>(
             "an operand at an element the point does not state",
@@ -115,7 +115,7 @@ impl<'a> BoundOp for Bound<'_, 'a> {
         Ok(rin(r))
     }
 
-    fn tout<T: Rides>(&self, at: usize) -> Result<Out<Tensor<T>>, Refusal> {
+    fn tout<T: Scalar>(&self, at: usize) -> Result<Out<Tensor<T>>, Refusal> {
         let r = self.fire.output(self.op, at)?;
         rides::<T>(
             "a result at an element the point does not state",
@@ -124,7 +124,7 @@ impl<'a> BoundOp for Bound<'_, 'a> {
         Ok(rout(r))
     }
 
-    fn tinout<T: Rides>(&self, from: usize, to: usize) -> Result<InOut<Tensor<T>>, Refusal> {
+    fn tinout<T: Scalar>(&self, from: usize, to: usize) -> Result<InOut<Tensor<T>>, Refusal> {
         // The D2D that makes an `InOut` honest here: the walk mints a FRESH
         // rectangle for every result, so the operand's bytes have to be in
         // the result's rectangle before the kernel writes through it. See
@@ -140,7 +140,7 @@ impl<'a> BoundOp for Bound<'_, 'a> {
         Ok(rio(r))
     }
 
-    fn tconst<T: Rides>(&self, at: usize) -> Result<Const<Tensor<T>>, Refusal> {
+    fn tconst<T: Scalar>(&self, at: usize) -> Result<Const<Tensor<T>>, Refusal> {
         let bank = self.fire.weight(self.op, at)?;
         let have = bank_axis(bank.dtype).ok_or(Refusal::Absent {
             what: "a bank at an element no point is instantiated at",

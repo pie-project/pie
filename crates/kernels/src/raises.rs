@@ -1,4 +1,3 @@
-use crate::Ty;
 use crate::plane::Elem;
 
 pub trait Raise: 'static {
@@ -56,9 +55,6 @@ impl<T: Raise> Elem for Struct<T> {
     }
 
     const CPP: &'static str = "";
-
-    const TY_CONST: Ty = Ty::Raised;
-    const TY_MUT: Ty = Ty::Raised;
 }
 
 #[macro_export]

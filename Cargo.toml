@@ -157,11 +157,17 @@ members = [
     # `cargo check -p driver-wgpu --all-targets` is what CI runs, and a machine
     # with an adapter adds `--features native`.
     "crates/driver-wgpu",
-    # `driver-vulkan` STOOD BESIDE THEM and is still out of the workspace
-    # entirely -- not a member, not a path dep of any member, and named in
-    # `exclude` below so cargo cannot re-adopt it. It comes back on the same
-    # terms these two did: an executor. `kernels-vulkan` carries 32 claims and
-    # that driver has no walk.
+    # The Vulkan shell, BACK AT P5c on the two siblings' terms. It was the
+    # last crate outside the workspace: R3 deleted `model-legacy` and
+    # `model-dsl-legacy` while this crate's manifest went on naming both, so
+    # cargo could not resolve the package, let alone build it.
+    #
+    # A MEMBER AND NOT A DEFAULT MEMBER, on `driver-wgpu`'s reasoning rather
+    # than `driver-cuda`'s: `default = []` pulls in no Vulkan API, and the
+    # shader half is behind `native`, which needs a Slang compiler on the box.
+    # `cargo check -p driver-vulkan --all-targets` is what CI runs; a machine
+    # with a loader and an ICD adds `--features native`.
+    "crates/driver-vulkan",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
     # THE catalog, singular since R3 -- there were two registries here
@@ -353,27 +359,9 @@ default-members = [
     "tests/gpu",
 ]
 exclude = [
-    # ── ONE SHADER PLANE IS STILL OUT OF THE WORKSPACE (R3) ────────────────
-    #
-    # `driver-metal`, `driver-vulkan` and `driver-wgpu` were the last
-    # consumers of `model-legacy` and `model_compiler::lower`, and R3 deleted
-    # both. They could not be brought forward without their baker executors,
-    # which is P5 ("Shader planes — impl the families for metal/vulkan/wgpu
-    # Ctx; the tier-1 law's other half"), so they stayed in tree and stayed
-    # UNBUILT: no member path-depends on one, and `exclude` is what keeps
-    # cargo from re-adopting them (a path dependency inside the workspace
-    # directory becomes a member automatically, which is why deleting the
-    # three `engine` dependency lines was the actual cut).
-    #
-    # `driver-metal` CAME BACK at P5a and `driver-wgpu` at P5b, on exactly
-    # those terms — see their lines in `members`. `driver-vulkan` waits for the
-    # same thing: `kernels-vulkan` carries 32 claims and that driver has no
-    # walk.
-    #
-    # `kernels-metal`, `kernels-vulkan` and `kernels-wgpu` are NOT here. They
-    # compile green, they carry the claim tables P5 is measured against, and
-    # nothing in them reads a legacy declaration.
-    "crates/driver-vulkan",
+    # ALL THREE SHADER PLANES ARE IN THE WORKSPACE NOW. `driver-metal` came
+    # back at P5a, `driver-wgpu` at P5b and `driver-vulkan` at P5c; this list
+    # held the last of them for the whole of the quarantine and holds none.
     "tests/inferlets",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
     # THIS manifest when cargo walks up from a worktree's excluded package

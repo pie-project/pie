@@ -2,7 +2,7 @@ use kernels::Grid;
 use kernels::plane::Refusal;
 use kernels::points::{Form, Repr, Scalar};
 
-use crate::plane::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
+use crate::plane::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
 use crate::points::{self, Handle, Planes};
 
 fn router_lanes(n_experts: u32) -> Result<u32, Refusal> {

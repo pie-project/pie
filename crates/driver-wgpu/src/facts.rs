@@ -90,7 +90,14 @@ mod tests {
         // sixteen, read off the row rather than restated.
         let narrowest = kernels_wgpu::entrypoints()
             .into_iter()
-            .filter_map(|e| crate::geometry::Tile::from_entrypoint(&e).map(|t| t.rows))
+            .filter_map(|name| {
+                let rest = &name[name.find("_bm_")? + 4..];
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            })
             .min()
             .expect("the table has tiled GEMM entrypoints");
         assert_eq!(

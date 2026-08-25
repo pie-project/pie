@@ -15,7 +15,7 @@
 # A DEFAULT MEMBER. It names every plane crate and not one device API:
 # `kernels-cuda` builds on a box with no CUDA (`cudarc` is
 # fallback-dynamic-loading and this tool never launches anything), and the
-# two shader planes need no toolchain to hand over a `&'static` table.
+# three shader planes need no toolchain to hand over a `&'static` table.
 [package]
 name = "points-dispatch"
 version = "0.1.0"
@@ -38,3 +38,8 @@ kernels = { path = "../kernels" }
 kernels-cuda = { path = "../kernels-cuda" }
 kernels-metal = { path = "../kernels-metal", default-features = false }
 kernels-wgpu = { path = "../kernels-wgpu" }
+# The Vulkan plane, on the terms metal is taken. `default-features = false`
+# drops `native`, which is the `slangc` hop, so this tool reads the claim
+# tables with no shader toolchain anywhere near it -- which is the same
+# sentence the header makes about the other two shader planes.
+kernels-vulkan = { path = "../kernels-vulkan", default-features = false }

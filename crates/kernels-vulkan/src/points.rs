@@ -1,12 +1,10 @@
 use core::marker::PhantomData;
 
-use kernels::Ty;
-use kernels::bound::{Axis, Rides};
 use kernels::plane::{ConstRun, Elem, Refusal};
-use kernels::points::Scalar;
+use kernels::points::{Scalar, ScalarKind};
 use kernels::shader::ShaderValue;
 
-use crate::plane::Ctx;
+use crate::plane::{Ctx, Encode};
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,7 +15,7 @@ pub struct bf16(pub u16);
 pub struct f16(pub u16);
 
 macro_rules! plane_elem {
-    ($t:ty, $tc:ident, $tm:ident, $axis:ident) => {
+    ($t:ty, $kind:ident) => {
         impl Elem for $t {
             type Read = *const $t;
             type Write = *mut $t;
@@ -31,18 +29,16 @@ macro_rules! plane_elem {
             }
 
             const CPP: &'static str = "";
-            const TY_CONST: Ty = Ty::$tc;
-            const TY_MUT: Ty = Ty::$tm;
         }
 
-        impl Rides for $t {
-            const AXIS: Axis = Axis::$axis;
+        impl Scalar for $t {
+            const KIND: ScalarKind = ScalarKind::$kind;
         }
     };
 }
 
-plane_elem!(bf16, Bf16s, Bf16sMut, Bf16);
-plane_elem!(f16, F16s, F16sMut, F16);
+plane_elem!(bf16, Bf16);
+plane_elem!(f16, F16);
 
 #[derive(Debug)]
 pub struct Handle<T> {
@@ -93,12 +89,9 @@ impl<T: Scalar> Elem for Handle<T> {
     }
 
     const CPP: &'static str = "";
-    const TY_CONST: Ty = <T as Elem>::TY_CONST;
-    const TY_MUT: Ty = <T as Elem>::TY_MUT;
 }
 
 impl<T: Scalar> ConstRun for Handle<T> {
-    const TY: Ty = <T as Elem>::TY_CONST;
     type Held = Self;
 }
 
@@ -110,6 +103,17 @@ pub struct Planes<R> {
     held: PhantomData<fn() -> R>,
 }
 
+impl<R> Planes<R> {
+    #[must_use]
+    pub const fn new(codes: Handle<u32>, scales: Handle<u8>) -> Self {
+        Self {
+            codes,
+            scales,
+            held: PhantomData,
+        }
+    }
+}
+
 impl<R> Clone for Planes<R> {
     fn clone(&self) -> Self {
         *self
@@ -118,7 +122,6 @@ impl<R> Clone for Planes<R> {
 impl<R> Copy for Planes<R> {}
 
 impl<R: kernels::points::Repr> ConstRun for Planes<R> {
-    const TY: Ty = Ty::U8s;
     type Held = Self;
 }
 
@@ -141,7 +144,7 @@ impl kernels::points::Plane for Ctx<'_> {
 
     type Recurrent = kernels::raises::Struct<crate::views::RecurrentState>;
 
-    type Pages = kernels::raises::Struct<crate::views::KvCache>;
+    type Pages = kernels::raises::Struct<crate::views::AttnFire>;
 }
 
 pub fn at_bf16<T: Scalar>(what: &'static str) -> Result<(), Refusal> {
@@ -173,14 +176,6 @@ pub fn heads(what: &'static str, row: i32, each: i32) -> Result<i32, Refusal> {
     Ok(row / each)
 }
 
-pub fn pool_heads(view: &crate::views::PagedKvView) -> Result<(i32, i32), Refusal> {
-    let _ = view;
-    Err(Refusal::Unstated {
-        what: "the paged pool's `(kv_heads, head_dim)`: no point states both \
-               and `PagedKvView` carries neither",
-    })
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Bank<T> {
     pub words: Handle<u32>,
@@ -199,53 +194,36 @@ pub struct Bank<T> {
 pub trait Staged {
     fn stream<T: Scalar>(&self, name: &'static str) -> Result<Handle<T>, Refusal>;
 
-    fn scratch<T: Scalar>(&self, name: &'static str, elements: i64) -> Result<Handle<T>, Refusal>;
-
-    fn window<T: Scalar>(&self, of: Handle<T>, at: i64, width: i32) -> Result<Handle<T>, Refusal>;
-
-    fn resident<R: kernels::raises::Raise>(&self) -> Result<*const R::Value, Refusal>;
+    fn window<T: Scalar>(&self, of: Handle<T>, at: i64) -> Result<Handle<T>, Refusal>;
 
     fn bank<T: Scalar>(&self, of: kernels::plane::Const<Handle<T>>) -> Result<Bank<T>, Refusal>;
 }
 
 impl Staged for Ctx<'_> {
     fn stream<T: Scalar>(&self, name: &'static str) -> Result<Handle<T>, Refusal> {
-        let _ = name;
-        Err(Refusal::Unstated {
-            what: "a tier-1 runtime stream, asked for by name: `Encode` \
-                   resolves an operand by COLUMN and a claim body has no column",
-        })
+        Encode::staged(self, name).map(Handle::new)
     }
 
-    fn scratch<T: Scalar>(&self, name: &'static str, elements: i64) -> Result<Handle<T>, Refusal> {
-        let _ = (name, elements);
-        Err(Refusal::Unstated {
-            what: "a named device scratch slab: this plane's `Encode` has no \
-                   arena door, where cuda's `Ctx::scratch` is one",
-        })
-    }
-
-    fn window<T: Scalar>(&self, of: Handle<T>, at: i64, width: i32) -> Result<Handle<T>, Refusal> {
-        let _ = (of, at, width);
-        Err(Refusal::Unstated {
-            what: "a windowed binding: a descriptor names a whole allocation, \
-                   so a packed row's second half is not addressable here",
-        })
-    }
-
-    fn resident<R: kernels::raises::Raise>(&self) -> Result<*const R::Value, Refusal> {
-        Err(Refusal::Unstated {
-            what: "a resident view, asked for by key: `views::raise` answers \
-                   only a raise found at a routine's own input slot",
-        })
+    fn window<T: Scalar>(&self, of: Handle<T>, at: i64) -> Result<Handle<T>, Refusal> {
+        let bytes = u64::try_from(at)
+            .ok()
+            .and_then(|e| e.checked_mul(core::mem::size_of::<T>() as u64))
+            .ok_or(Refusal::Wide {
+                what: "the element a window opens at",
+                at,
+                max: i64::MAX,
+            })?;
+        Encode::windowed(self, of.handle, bytes).map(Handle::new)
     }
 
     fn bank<T: Scalar>(&self, of: kernels::plane::Const<Handle<T>>) -> Result<Bank<T>, Refusal> {
         let _ = of;
         Err(Refusal::Unstated {
-            what: "a quantised weight's scale and bias planes: the floor's \
-                   `Const<Tensor<T>>` carries one address and every matmul \
-                   on this plane reads three",
+            what: "a quantised weight's scale and bias planes: the point marks \
+                   this operand `Const<Tensor<T>>`, one weight and one address, \
+                   where `Const<Bank<R>>` is the floor's mark for a weight that \
+                   crosses in planes — so the two sidecars are not operands of \
+                   this statement, and a fire holds no door that names them",
         })
     }
 }
