@@ -110,7 +110,10 @@ pub mod open {
     // Every function below is gated on a driver feature, so with none
     // selected -- which is how the workspace clippy gate builds this crate --
     // the import has no user and `-D warnings` refuses the crate.
-    #[cfg(feature = "_driver-cuda")]
+    #[cfg(any(
+        feature = "_driver-cuda",
+        all(feature = "driver-metal", target_vendor = "apple")
+    ))]
     use super::{DriverBackend, Result};
 
     /// Open a CUDA device.
@@ -133,29 +136,62 @@ pub mod open {
         let (driver, ranks) = super::cuda::CudaDriver::create_group(config_blobs)?;
         Ok((Box::new(driver), ranks))
     }
+
+    /// Open the default Metal 4 device.
+    ///
+    /// # Errors
+    ///
+    /// No Metal 4 device, or a device whose queue could not be created.
+    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+    pub fn metal(config_bytes: &[u8]) -> Result<DriverBackend> {
+        Ok(Box::new(super::metal::MetalDriver::create(config_bytes)?))
+    }
 }
 
-// `settle_control` STOOD HERE — the helper a HOST-SIDE seam (one whose memory
-// is coherent, so `copy_kv` is a `memmove`) used to publish a terminal cell
-// and notify the broker itself, because it has nobody to hand the target to.
-// Its three callers were the metal, vulkan and wgpu seams, and R3 took all
-// three out of the workspace with the legacy declarations two of them read.
-// `cuda` and `remote` never used it and must not: they are asynchronous, so
-// each hands the whole target to whatever finishes the work.
-//
-// The 850-second hang it exists to prevent is worth carrying forward with it:
-// a seam that minted a `control_completion` and dropped the target parked a
-// real `pie run`, with the scheduler's watchdog naming it exactly —
-// `in_flight_control: KV copy pipeline Some(..) settled=false`. Publishing
-// without notifying trips the engine's own check on the way out. Whoever
-// brings a host-side seam back at P5 owes both halves, in that order.
+/// Settle a control-plane submission a HOST-SIDE seam has already finished.
+///
+/// A seam whose memory is coherent — where `copy_kv` is a `memmove` — has
+/// nobody to hand the completion target to, so it publishes the terminal cell
+/// and notifies the broker itself. `cuda` and `remote` never use this and must
+/// not: they are asynchronous, so each hands the whole target to whatever
+/// finishes the work.
+///
+/// BOTH HALVES, IN THAT ORDER. The 850-second hang this exists to prevent came
+/// from a seam that minted a `control_completion` and dropped the target: it
+/// parked a real `pie run`, with the scheduler's watchdog naming it exactly —
+/// `in_flight_control: KV copy pipeline Some(..) settled=false`. Publishing
+/// without notifying trips the engine's own check on the way out.
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+pub(crate) fn settle_control(
+    broker: &driver_api::CompletionBroker,
+) -> driver_api::SubmissionCompletion {
+    let (raw, completion) = broker.control_completion(1);
+    if !raw.terminal_cell.is_null() {
+        // SAFETY: the broker owns this cell for the life of the completion it
+        // was minted with, and `publish` is a release store into an
+        // `AtomicU32` the engine only ever reads.
+        unsafe {
+            (*raw.terminal_cell).publish(driver_api::PIE_TERMINAL_OUTCOME_SUCCESS);
+        }
+    }
+    broker.notify(completion.wait_id(), raw.target_epoch);
+    completion
+}
 
 #[cfg(feature = "_driver-cuda")]
 mod cuda;
+// TARGET-GATED as well as feature-gated, unlike the seams that stood beside it:
+// `driver-metal` is Apple-only at the crate level, so the feature alone is not
+// a build that links. Vulkan is a loader and wgpu is pure Rust; neither needed
+// this, and both are still out at P5.
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+mod metal;
 mod remote;
 
 #[cfg(feature = "_driver-cuda")]
 pub use cuda::CudaDriver;
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+pub use metal::MetalDriver;
 pub use remote::{RemoteDisconnectHandle, RemoteDriver};
 
 struct DriverRegistration {

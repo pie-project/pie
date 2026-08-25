@@ -224,6 +224,16 @@ impl Shell {
             2,
         )
         .map_err(|why| unserved(format!("`{sku}`'s KV pool cannot be laid out: {why}")))?;
+        // WHO SHARES WHOSE PAGES, verbatim from the deployment. `Shape` is
+        // arithmetic over nine `u32`s and says nothing about sharing: gemma-4's
+        // trailing layers alias on no period this could narrow to, so the pool
+        // reads the column rather than being handed a rule that fits one tower.
+        let sources: Vec<u32> = baked
+            .deployment
+            .attention
+            .iter()
+            .map(|a| a.kv_source)
+            .collect();
         // The previous pool's memory goes back to the arena BEFORE the next
         // one asks for any: holding a whole model's KV while allocating a
         // second is how a reload gets refused for memory about to be free.
@@ -233,12 +243,16 @@ impl Shell {
             &mut self.stepper,
             &self.arena,
             shape,
+            &sources,
         )?;
-        for l in 0..shape.layers {
-            if let Some(layer) = pool.layer(l) {
-                layer.k.register(&mut self.regions);
-                layer.v.register(&mut self.regions);
-            }
+        // OVER THE ROWS AND NOT THE LAYERS. gemma-4's forty-two layers attend
+        // through twenty-four regions, so walking layers would register the
+        // shared ones twice — and a region registered twice is two `Regions`
+        // entries over one address, which is one more than the fire can be
+        // right about.
+        for row in pool.rows() {
+            row.k.register(&mut self.regions);
+            row.v.register(&mut self.regions);
         }
         self.pool = Some(pool);
 

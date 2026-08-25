@@ -116,17 +116,42 @@ impl Shape {
                         nothing to allocate pages for"
                 .to_string());
         };
-        if let Some((l, a)) = attention
-            .iter()
-            .enumerate()
-            .find(|(l, a)| a.kv_source as usize != *l)
-        {
-            return Err(format!(
-                "layer {l} reads layer {}'s KV pages, and this pool allocates \
-                 every layer its own — a shared layer would read pages nothing \
-                 ever wrote, at a stride that need not even be its own",
-                a.kv_source
-            ));
+        // **A SHARED LAYER READS AT ITS SOURCE'S STRIDE**, so the two have to
+        // attend at the same width. That is the whole constraint: which layer
+        // owns which pages is the POOL's business — `Pool::build` allocates one
+        // region per source and hands every sharer the same one — and the only
+        // thing this arithmetic can be wrong about is the shape of the pages
+        // being aliased.
+        //
+        // Sharing itself was refused here until gemma-4 asked for it, on the
+        // reading that a sharer would "read pages nothing ever wrote". That was
+        // true of the allocation and not of the deployment: a layer with no KV
+        // projection attends through its source's pages precisely BECAUSE its
+        // source wrote them.
+        for (l, a) in attention.iter().enumerate() {
+            let at = a.kv_source as usize;
+            let Some(src) = attention.get(at) else {
+                return Err(format!(
+                    "layer {l} reads layer {at}'s KV pages and this stack has \
+                     {} layer(s)",
+                    attention.len(),
+                ));
+            };
+            if (src.kv_heads, src.head_dim) != (a.kv_heads, a.head_dim) {
+                return Err(format!(
+                    "layer {l} attends {} head(s) at {} through layer {at}'s \
+                     pages, which are packed {} at {} — an alias reads at its \
+                     source's stride and cannot also read at its own",
+                    a.kv_heads, a.head_dim, src.kv_heads, src.head_dim,
+                ));
+            }
+            if attention[at].kv_source as usize != at {
+                return Err(format!(
+                    "layer {l} reads layer {at}'s pages and layer {at} reads \
+                     layer {}'s; this pool follows one link and not a chain",
+                    attention[at].kv_source,
+                ));
+            }
         }
         let base = (first.kv_heads, first.head_dim);
         let mut global: Option<(u32, u32)> = None;
@@ -272,6 +297,39 @@ impl Shape {
         } else {
             None
         }
+    }
+
+    /// Which region each layer attends through, and which layer OWNS each.
+    ///
+    /// `(owners, row_of)`: `owners[r]` is the layer whose shape row `r` was
+    /// packed at, and `row_of[l]` is the row layer `l` reads. The identity for
+    /// every stack but gemma-4, whose trailing layers project no KV and attend
+    /// through their source's pages — forty-two layers over twenty-four rows.
+    ///
+    /// Here rather than beside the allocation because it is arithmetic over a
+    /// `u32` column and is correct without a GPU, which is rule 2 of
+    /// `.wiki/driver/north-star.md` and the reason this file exists. A pool
+    /// that allocated per LAYER would give gemma-4 eighteen regions of pages
+    /// nothing ever writes and then attend through them.
+    ///
+    /// `sources` is the deployment's own `kv_source` column, already checked
+    /// by [`Self::periodic`]: no chain, and no alias across two widths. A
+    /// layer past the end of it owns its own pages, which is what a stack that
+    /// states no sharing looks like.
+    #[must_use]
+    pub fn rows(&self, sources: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        let mut owners = Vec::new();
+        let mut row_of = vec![0u32; self.layers as usize];
+        for l in 0..self.layers {
+            let src = sources.get(l as usize).copied().unwrap_or(l);
+            if src == l {
+                row_of[l as usize] = u32::try_from(owners.len()).unwrap_or(u32::MAX);
+                owners.push(l);
+            } else {
+                row_of[l as usize] = row_of[src as usize];
+            }
+        }
+        (owners, row_of)
     }
 
     /// The grid `layout::kv_move` plans against, where every layer agrees.
@@ -441,19 +499,72 @@ mod tests {
         assert!(why.contains("third shape"), "{why}");
     }
 
-    /// A layer that reads another's pages is refused, because this pool
-    /// allocates every layer its own.
-    ///
-    /// gemma-4's trailing layers project no KV and attend through their
-    /// source's. Sizing them as though they owned pages allocates memory
-    /// nothing writes and then reads it: no fault, and an answer drawn from
-    /// whatever the allocator left there.
+    /// A layer may read another's pages, and gemma-4's trailing layers do:
+    /// they project no KV and attend through their source's.
     #[test]
-    fn a_layer_that_reads_anothers_pages_is_refused() {
+    fn a_layer_may_read_anothers_pages_at_the_same_width() {
         let mut rows: Vec<_> = (0..6).map(|l| layer(8, 128, l)).collect();
         rows[5] = layer(8, 128, 4);
-        let why = Shape::periodic(&rows, 16, 64, 2).expect_err("this pool has no aliasing");
-        assert!(why.contains("layer 5 reads layer 4"), "{why}");
+        Shape::periodic(&rows, 16, 64, 2).expect("an alias at one width");
+    }
+
+    /// **BUT NOT AT ANOTHER WIDTH.** An alias reads at the stride its source's
+    /// pages were packed at, so a sliding layer pointed at a full one's pages
+    /// would read every row a head short and never fault.
+    #[test]
+    fn an_alias_across_two_widths_is_refused() {
+        let mut rows: Vec<_> = (0..6)
+            .map(|l| {
+                if l == 5 {
+                    layer(4, 256, l)
+                } else {
+                    layer(8, 128, l)
+                }
+            })
+            .collect();
+        rows[4] = layer(8, 128, 5);
+        let why = Shape::periodic(&rows, 16, 64, 2).expect_err("two widths, one alias");
+        assert!(why.contains("cannot also read at its own"), "{why}");
+    }
+
+    /// A chain is refused: this pool follows one link, so `a -> b -> c` would
+    /// hand `a` pages `b` never wrote.
+    #[test]
+    fn a_chain_of_aliases_is_refused() {
+        let mut rows: Vec<_> = (0..6).map(|l| layer(8, 128, l)).collect();
+        rows[4] = layer(8, 128, 3);
+        rows[5] = layer(8, 128, 4);
+        let why = Shape::periodic(&rows, 16, 64, 2).expect_err("a chain");
+        assert!(why.contains("not a chain"), "{why}");
+    }
+
+    /// **ONE ROW PER OWNER, AND EVERY SHARER READS ITS SOURCE'S.**
+    ///
+    /// gemma-4's column, in miniature: four owners under six layers.
+    #[test]
+    fn a_shared_layer_reads_its_sources_row_and_not_one_of_its_own() {
+        let s = Shape {
+            layers: 6,
+            ..shape()
+        };
+        let (owners, row_of) = s.rows(&[0, 1, 2, 3, 2, 3]);
+        assert_eq!(owners, vec![0, 1, 2, 3]);
+        assert_eq!(row_of, vec![0, 1, 2, 3, 2, 3]);
+    }
+
+    /// A stack that states no sharing gets the identity, which is what makes
+    /// the shared reading a strict generalisation rather than a second path.
+    #[test]
+    fn a_stack_that_shares_nothing_gets_one_row_per_layer() {
+        let s = Shape {
+            layers: 6,
+            ..shape()
+        };
+        let (owners, row_of) = s.rows(&[0, 1, 2, 3, 4, 5]);
+        assert_eq!(owners, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(row_of, owners);
+        // And so does one that states nothing at all.
+        assert_eq!(s.rows(&[]), (owners, row_of));
     }
 
     #[test]

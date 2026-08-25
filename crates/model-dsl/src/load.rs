@@ -55,6 +55,22 @@ pub enum Source {
     /// which is what keeps this from becoming a blanket squeeze that would
     /// eat the leading `1` a `[1, hidden]` gate genuinely has.
     Squeeze(String, u32),
+    /// One contiguous run along ONE axis: `[at, at + extent)`, the inverse of
+    /// [`Source::Pack`].
+    ///
+    /// **A CHECKPOINT MAY SHIP ONE TENSOR WHERE THE TEXT WANTS SEVERAL**, and
+    /// until this verb the text had to want the one. `gemma-4`'s
+    /// `embed_tokens_per_layer` is `[vocab, layers * ple_dim]` — one bank of
+    /// 5.25 GiB, which no shader plane can BIND: WebGPU's guaranteed floor for
+    /// a storage binding is 128 MiB and Vulkan's `maxStorageBufferRange` is
+    /// `UINT32_MAX`. Cut per layer it is forty-two banks of 128 MiB, which
+    /// every plane holds with room, and the arithmetic downstream is the same
+    /// elementwise.
+    ///
+    /// THE AXIS IS SPELLED, for the reason [`Source::Deinterleave`] gives at
+    /// length: an axis a reader can check is an axis that cannot be the wrong
+    /// one silently. A slice off the end is a fault and not a clamp.
+    Slice(String, u32, u64, u64),
 }
 
 impl Import {
@@ -152,6 +168,12 @@ where
 
 pub fn deinterleave(name: impl Into<String>, axis: u32, groups: u32) -> Source {
     Source::Deinterleave(name.into(), axis, groups)
+}
+
+/// One run of `extent` along `axis`, starting at `at`. See [`Source::Slice`].
+#[must_use]
+pub fn slice(name: impl Into<String>, axis: u32, at: u64, extent: u64) -> Source {
+    Source::Slice(name.into(), axis, at, extent)
 }
 
 pub fn squeeze(name: impl Into<String>, axis: u32) -> Source {

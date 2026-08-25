@@ -23,12 +23,23 @@ tensor-compiler = { path = "../tensor-compiler" }
 # the seam linked was the whole switch and `backend/cuda.rs` was unchanged
 # either way. There is one now, and it has the name.
 driver-cuda = { path = "../driver-cuda", optional = true }
-# `driver-metal` STOOD HERE. R3 took the three shader drivers out of the
-# workspace (they were the last consumers of `model-legacy` and
-# `model_compiler::lower`), and an optional path dependency is enough to drag
+# BACK AT P5, and only this one of the three. R3 cut the edge rather than
+# gating it, on the reading that "an optional path dependency is enough to drag
 # one back in: cargo adopts a path dep inside the workspace directory as a
-# member whatever its features say. So the edge is cut, not merely gated. It
-# comes back with the driver at P5.
+# member whatever its features say" -- which was right while `driver-metal` was
+# NOT a member. It is one now (see the root manifest's `members`), CI builds it
+# with `--features metal-4`, and it walks a `model_compiler::program::Program`
+# through a baker executor of its own. That was the stated P5 precondition, and
+# it is met; `driver-vulkan` and `driver-wgpu` are still waiting on theirs.
+driver-metal = { path = "../driver-metal", optional = true }
+# `metal-4` IS NOT LISTED THERE, and that is the whole shape of this feature.
+# It is the driver's DEVICE half, and that crate `compile_error!`s it off an
+# Apple target -- so naming it in the line above would make
+# `--features driver-metal` a build error everywhere else, rather than a build
+# with no metal seam in it. The target table below turns it on exactly where it
+# can exist; cargo unifies the two entries on Apple and applies only the first
+# anywhere else. See the seam's own `#[cfg(all(feature = .., target_vendor =
+# "apple"))]`, which is the same rule stated in the code.
 
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
@@ -128,6 +139,9 @@ smallvec = "1"
 lru = "0.18.1"
 ipnet = "2"
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+driver-metal = { path = "../driver-metal", optional = true, features = ["metal-4"] }
+
 [features]
 default = []
 # The CUDA shell. It used to share these symbols with a C++ archive of the
@@ -155,7 +169,12 @@ default = []
 _driver-cuda = ["dep:driver-cuda", "driver-cuda/abi"]
 driver-cuda-12 = ["_driver-cuda", "driver-cuda/cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "driver-cuda/cuda-13"]
-# The `driver-metal` feature STOOD HERE, and went with the dependency above.
+# The Metal shell. APPLE-ONLY at the crate level, so unlike the CUDA features
+# above, the flag alone is not a build that links -- every `#[cfg]` reading it
+# pairs it with `target_vendor = "apple"`. There is no ABI to choose and so no
+# version in the name: Metal 4 is the one the driver's device half is gated on
+# (`driver-metal/metal-4`) and the one it states.
+driver-metal = ["dep:driver-metal"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in

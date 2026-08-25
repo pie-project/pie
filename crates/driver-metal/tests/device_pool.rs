@@ -540,7 +540,9 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
         global_kv_heads: 0,
         full_attn_every: 0,
     };
-    let pool = Pool::allocate(&context, shape).expect("the pool allocates");
+    // `&[]` is a stack that shares nothing, which is what every row but
+    // gemma-4 states — see `a_shared_stack_allocates_one_region_per_owner`.
+    let pool = Pool::allocate(&context, shape, &[]).expect("the pool allocates");
 
     assert_eq!(pool.pages(), 64);
     assert_eq!(
@@ -572,6 +574,49 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
     );
 }
 
+/// **A STACK THAT SHARES ALLOCATES ONE REGION PER OWNER, AND THE SHARERS BIND
+/// THE SAME ADDRESS.**
+///
+/// gemma-4's column in miniature. The addresses are the assertion because the
+/// sharing IS the address: a pool that allocated per layer would answer two
+/// distinct regions here and never fault — layer 4 would attend through pages
+/// nothing wrote, and read whatever the allocator left in them.
+#[test]
+fn a_shared_stack_allocates_one_region_per_owner() {
+    use driver_metal::layout::kv::Shape;
+    use driver_metal::pools::kv::Pool;
+
+    let Some(context) = context() else {
+        return;
+    };
+    let shape = Shape {
+        layers: 6,
+        kv_heads: 8,
+        head_dim: 128,
+        page_size: 16,
+        pages: 4,
+        element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
+    };
+    let pool = Pool::allocate(&context, shape, &[0, 1, 2, 3, 2, 3]).expect("the pool allocates");
+
+    assert_eq!(pool.rows().count(), 4, "four owners under six layers");
+    assert_eq!(
+        pool.bytes(),
+        shape.layer_bytes_at(0) * 2 * 4,
+        "and the pool is sized for four, not six",
+    );
+    let at = |l: u32| {
+        let layer = pool.layer(l).expect("a layer within the stack");
+        (layer.k.gpu_address(), layer.v.gpu_address())
+    };
+    assert_eq!(at(4), at(2), "layer 4 attends through layer 2's pages");
+    assert_eq!(at(5), at(3), "and layer 5 through layer 3's");
+    assert_ne!(at(0), at(1), "and an owner still gets its own");
+}
+
 /// A KV move, run on the pool, checked byte for byte.
 ///
 /// The pages are `StorageModeShared`, so a move is a `memmove` and needs no
@@ -599,7 +644,7 @@ fn a_move_plan_slides_rows_without_smearing_them() {
         global_kv_heads: 0,
         full_attn_every: 0,
     };
-    let pool = Pool::allocate(&context, shape).expect("the pool allocates");
+    let pool = Pool::allocate(&context, shape, &[]).expect("the pool allocates");
     let layer = pool.layer(0).expect("layer 0");
     let row = shape.row_bytes().expect("a uniform pool") as usize;
 

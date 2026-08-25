@@ -83,7 +83,7 @@ use driver_vulkan::baker::stage::{FireTable, KvGeometry, Pools, Slab};
 use driver_vulkan::baker::walk::{Extent, Fire};
 use driver_vulkan::baker::{Baked, Bank, Vulkan, arenas_of, encode::Encoder, join, readable_base};
 use driver_vulkan::device::{Buffer, Device, Pipelines};
-use driver_vulkan::resources::{Pool, Shape};
+use driver_vulkan::resources::{Pool, Recurrent, RecurrentPool, Shape};
 use driver_vulkan::serve::Embedded;
 use kernels_vulkan::Capability;
 use model_compiler::program::{Dt, Program};
@@ -92,26 +92,68 @@ use model_ir::plan::{CacheRow, FireClass, Plan};
 // ── the banked answer ──────────────────────────────────────────────────
 
 /// The catalog row.
-const SKU: &str = "gptoss-20b-bf16-mxfp4-kv-bf16";
+/// One row of `driver-cuda`'s `BANKED`, which is the table this file answers
+/// against and does not extend: an entry here is a claim CUDA published.
+struct Banked {
+    /// The catalog row.
+    sku: &'static str,
+    /// Where its snapshot sits under `~/.cache/huggingface/hub`.
+    cache: &'static str,
+    /// The argmax token id.
+    id: usize,
+    /// Its logit **as rendered to four decimals**.
+    logit: &'static str,
+}
 
-/// Where its snapshot sits under `~/.cache/huggingface/hub`.
-const CACHE: &str = "models--openai--gpt-oss-20b";
+/// **THE PURE-ATTENTION TOWER, and it was this plane's first for a reason.**
+///
+/// Twenty-four layers of attention with a sink, alternating sliding and full,
+/// over mxfp4 experts, and no recurrence at all — which is what let it fire
+/// here before `resources::RecurrentPool` existed.
+const GPTOSS: Banked = Banked {
+    sku: "gptoss-20b-bf16-mxfp4-kv-bf16",
+    cache: "models--openai--gpt-oss-20b",
+    id: 11,
+    logit: "14.4375",
+};
+
+/// **THE HYBRID.** Six of its twenty-four layers are attention and eighteen
+/// are gated DeltaNet, so it wants a recurrent slab per linear layer —
+/// three planes each — and this plane allocated NONE until
+/// `resources::RecurrentPool` landed beside the KV one. `Pools::slab` answered
+/// `None` for every layer, so a walk over a hybrid refused at its first scan.
+const QWEN35: Banked = Banked {
+    sku: "qwen35-d0.8b-bf16-kv-bf16",
+    cache: "models--Qwen--Qwen3.5-0.8B",
+    id: 198,
+    logit: "12.3125",
+};
+
+/// **THE TOWER THAT ATTENDS AT TWO WIDTHS AND SHARES ITS CACHES.**
+///
+/// Forty-two layers over twenty-four caches: one each for layers 0..21, then
+/// `kv.22` between every later sliding layer and `kv.23` between every later
+/// full one. And the two kinds do not attend at the same width — sliding at
+/// `head_dim` 256, full at 512 — so a fixture that opens one pool per layer at
+/// one width is wrong about this tower twice. It also carries a per-layer
+/// embedding relay, which is the only reason `model_ir` has a sliced source at
+/// all.
+const GEMMA4: Banked = Banked {
+    sku: "gemma4-e4b-bf16-kv-bf16",
+    cache: "models--google--gemma-4-E4B-it",
+    id: 785,
+    logit: "7.5938",
+};
+
+// ── the fire's shape ───────────────────────────────────────────────────
 
 /// **The token every banked answer was fired from.** `baker-smoke`'s default
 /// prompt was the single id 785 and `banked-argmaxes.sh` never overrode it, so
-/// the answer below is "one fire, one row, position zero".
+/// the answers above are "one fire, one row, position zero".
 const PROMPT: u32 = 785;
 
-/// The argmax cuda banked.
-const BANKED_ID: usize = 11;
-
-/// Its logit **as rendered to four decimals**, which is how cuda's gate
-/// compares it and for the reason that file gives: a bf16 logit carries no
-/// more digits than that, and comparing parsed floats would fail on a number
-/// that is right.
-const BANKED_LOGIT: &str = "14.4375";
-
-// ── the fire's shape ───────────────────────────────────────────────────
+/// Recurrent seats. One, because this fire is one request.
+const SLOTS: u32 = 1;
 
 /// Token rows per KV page. Not a knob — cuda's `boot::KV_PAGE_SIZE`.
 const PAGE: u32 = 16;
@@ -181,6 +223,9 @@ struct Live {
     kv: BTreeMap<u32, (Slice, Slice)>,
     /// The staged planes.
     tables: BTreeMap<FireTable, Slice>,
+    /// Per gated-DeltaNet layer, `(state, conv, new_conv)`. Empty for a tower
+    /// with no recurrence, which is most of them.
+    slabs: BTreeMap<u32, (Slice, Slice, Slice)>,
     /// **Per layer, because a tower may attend at more than one width.**
     /// gpt-oss does not — every layer is `kv_heads: 8, head_dim: 64` — and
     /// this is a map anyway, because the trait takes a layer and a fixture
@@ -196,11 +241,17 @@ impl Pools for Live {
             .map(|(k, v)| if values { *v } else { *k })
     }
 
-    fn slab(&self, _layer: u32, _which: Slab) -> Option<Slice> {
-        // gpt-oss declares no recurrence, and `None` is what a driver holding
-        // no slab must answer: a scan handed a null carry answers fluently and
-        // wrongly. This plane allocates none for any SKU — see the header.
-        None
+    fn slab(&self, layer: u32, which: Slab) -> Option<Slice> {
+        // `None` for a layer with no slab, which is what a driver holding none
+        // must answer: a scan handed a null carry answers fluently and wrongly.
+        // Every layer of a pure-attention tower answers `None` here and every
+        // gated-DeltaNet layer of a hybrid answers three planes.
+        let (state, conv, new_conv) = self.slabs.get(&layer)?;
+        Some(match which {
+            Slab::State => *state,
+            Slab::Conv => *conv,
+            Slab::NewConv => *new_conv,
+        })
     }
 
     fn kv_geometry(&self, layer: u32) -> KvGeometry {
@@ -229,9 +280,18 @@ struct Loaded {
     /// The weight arenas, then the activation arena, then the staged planes.
     /// The KV pool's buffers are numbered after them by [`Loaded::buffers`].
     held: Vec<Buffer>,
-    pool: Pool,
-    /// Which layers this pool holds, in the order their buffers are numbered.
-    kv_layers: Vec<u32>,
+    /// ONE POOL PER ATTENTION WIDTH. A `resources::Shape` states one width for
+    /// every layer it holds, and `gemma4-e4b` attends at two.
+    kv_pools: Vec<Pool>,
+    /// The recurrent planes, when the tower has any. Held for the same reason
+    /// the KV pools are: a `Buffer` here is a raw handle, not a refcount.
+    recurrent: Option<RecurrentPool>,
+    /// `(pool, row)` for every KV plane pair, in the order their buffers are
+    /// numbered. A ROW is a CACHE and not a layer — see `kv_layers`.
+    kv_rows: Vec<(usize, u16)>,
+    /// Which layers own a slab, in the order their three planes are numbered
+    /// — after every KV plane.
+    rs_layers: Vec<u32>,
     pools: Live,
     banks: BTreeMap<String, Bank>,
     /// Which buffer the activation arena is. Not a constant: the weights take
@@ -245,17 +305,21 @@ impl Loaded {
     /// One borrow per [`BufferId`], in the order the ids were handed out.
     fn buffers(&self) -> Vec<&Buffer> {
         let mut all: Vec<&Buffer> = self.held.iter().collect();
-        for layer in &self.kv_layers {
-            all.push(
-                self.pool
-                    .cache(*layer as u16, false)
-                    .expect("the pool holds this layer"),
-            );
-            all.push(
-                self.pool
-                    .cache(*layer as u16, true)
-                    .expect("the pool holds this layer"),
-            );
+        for (pool, row) in &self.kv_rows {
+            let pool = &self.kv_pools[*pool];
+            all.push(pool.cache(*row, false).expect("the pool holds this row"));
+            all.push(pool.cache(*row, true).expect("the pool holds this row"));
+        }
+        // AFTER EVERY KV PLANE, three per layer in `(state, conv, new_conv)`
+        // order — which is the order `open` mints their ids in and the only
+        // thing that keeps this list and those `BufferId`s the same numbering.
+        if let Some(rs) = self.recurrent.as_ref() {
+            for layer in &self.rs_layers {
+                let at = *layer as u16;
+                all.push(rs.state(at).expect("the pool holds this layer"));
+                all.push(rs.conv(at).expect("the pool holds this layer"));
+                all.push(rs.new_conv(at).expect("the pool holds this layer"));
+            }
         }
         all
     }
@@ -264,7 +328,12 @@ impl Loaded {
         for b in self.held {
             device.free(b);
         }
-        self.pool.close(device);
+        for pool in self.kv_pools {
+            pool.close(device);
+        }
+        if let Some(rs) = self.recurrent {
+            rs.close(device);
+        }
     }
 }
 
@@ -274,21 +343,49 @@ impl Loaded {
 /// difference is not cosmetic: `Deployment` fills the layers that state no
 /// attention from the widest one that does, so its vector says something about
 /// every layer of the tower and cannot say which of them actually hold pages.
-fn kv_layers(plan: &Plan) -> Vec<u32> {
-    let mut kv = Vec::new();
+/// **A LAYER TO A CACHE IS NOT ONE TO ONE**, and reading the layer out of the
+/// cache row's NAME assumed it was. It works for `qwen35-d0.8b` and
+/// `gptoss-20b`, whose rows are `kv.<stack layer>` — and `gemma4-e4b` SHARES:
+/// its forty-two layers hold twenty-four caches, one each for layers 0..21 and
+/// then two between all the rest, `kv.22` for the sliding ones and `kv.23` for
+/// the full ones.
+///
+/// So the map comes from the STATEMENTS, which is where the association
+/// actually lives: an op carries the layer it is at and the cache it names.
+/// Nothing has to be parsed and sharing costs nothing to express.
+fn kv_layers(plan: &Plan) -> BTreeMap<u32, String> {
+    let mut kv = BTreeMap::new();
+    for op in &plan.ops {
+        let (Some(cache), Some(layer)) = (op.cache.as_deref(), op.layer) else {
+            continue;
+        };
+        if plan
+            .caches
+            .iter()
+            .any(|row| matches!(row, CacheRow::Kv { name, .. } if name == cache))
+        {
+            kv.insert(layer, cache.to_string());
+        }
+    }
+    kv
+}
+
+/// Which layers own a RECURRENT slab, off the same column.
+fn rs_layers(plan: &Plan) -> Vec<u32> {
+    let mut rs = Vec::new();
     for row in &plan.caches {
-        let CacheRow::Kv { name, .. } = row else {
+        let CacheRow::State { name, .. } = row else {
             continue;
         };
         let Some(at) = name.rsplit('.').next().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if !kv.contains(&at) {
-            kv.push(at);
+        if !rs.contains(&at) {
+            rs.push(at);
         }
     }
-    kv.sort_unstable();
-    kv
+    rs.sort_unstable();
+    rs
 }
 
 /// A staged plane, appended to the buffer table and answered as a whole region.
@@ -303,8 +400,8 @@ fn staged(device: &Device, held: &mut Vec<Buffer>, words: &[u32]) -> Slice {
 /// Produce the weights, upload them, allocate the pool, stage the fire.
 ///
 /// `None` when the checkpoint is not cached.
-fn open(device: &Device, baked: &Baked, program: &Program) -> Option<Loaded> {
-    let snap = model::snapshot::Snapshot::open(CACHE)?;
+fn open(device: &Device, row: &Banked, baked: &Baked, program: &Program) -> Option<Loaded> {
+    let snap = model::snapshot::Snapshot::open(row.cache)?;
     println!(
         "checkpoint {} — {} shard(s), {} tensors",
         snap.dir.display(),
@@ -313,8 +410,8 @@ fn open(device: &Device, baked: &Baked, program: &Program) -> Option<Loaded> {
     );
 
     // ── the weights ────────────────────────────────────────────────────
-    let base = readable_base(SKU).expect("the SKU offers a safetensors import");
-    let import = model::import_of(SKU, base).expect("the import table holds that flavor");
+    let base = readable_base(row.sku).expect("the SKU offers a safetensors import");
+    let import = model::import_of(row.sku, base).expect("the import table holds that flavor");
     let produced = model::produce::produce(&import, &baked.plan.params, 0, &|n| snap.read(n))
         .unwrap_or_else(|why| panic!("the checkpoint does not produce this plan: {why}"));
 
@@ -435,78 +532,146 @@ fn open(device: &Device, baked: &Baked, program: &Program) -> Option<Loaded> {
 
     // ── the pool ───────────────────────────────────────────────────────
     let layers = kv_layers(&baked.plan);
-    let at = baked
-        .deployment
-        .attention
-        .first()
-        .copied()
-        .expect("a tower");
-    for layer in &layers {
-        let this = baked.deployment.attention[*layer as usize];
-        assert_eq!(
-            (this.head_dim, this.kv_heads),
-            (at.head_dim, at.kv_heads),
-            "gpt-oss attends at one width and this fixture opens one pool; a \
-             tower with two -- gemma-4 -- wants one pool per width, which \
-             `driver-wgpu/tests/banked_argmax.rs` does",
-        );
+    // ONE POOL PER WIDTH AND ONE ROW PER CACHE. `gemma4-e4b`'s sliding layers
+    // take `head_dim` 256 and its full-attention ones 512, and a
+    // `resources::Shape` states one width for every layer it holds — so two
+    // widths are two pools. Within a pool the rows are CACHES, not layers,
+    // because a cache may be shared.
+    let width_of = |layer: u32| {
+        let a = baked.deployment.attention[layer as usize];
+        (a.kv_heads, a.head_dim)
+    };
+    let mut caches: BTreeMap<(u32, u32), Vec<&str>> = BTreeMap::new();
+    for (layer, cache) in &layers {
+        let of = caches.entry(width_of(*layer)).or_default();
+        if !of.contains(&cache.as_str()) {
+            of.push(cache.as_str());
+        }
     }
-    let pool = Pool::open(
-        device,
-        Shape {
-            layers: baked.deployment.layers as u16,
-            kv_heads: at.kv_heads,
-            head_dim: at.head_dim,
-            page_size: PAGE,
-            pages: PAGES,
-            bytes: 2,
-        },
-    )
-    .expect("the kv pool opens");
-    println!(
-        "pool: kv {} layer(s) x {PAGES} pages of {PAGE}, no recurrent slab",
-        layers.len(),
-    );
+    for of in caches.values_mut() {
+        of.sort_unstable();
+    }
 
-    // The pool's buffers are numbered AFTER everything in `held`, two per
-    // layer, keys then values — which is the order `Loaded::buffers` rebuilds.
+    // The pools' buffers are numbered AFTER everything in `held`, two per ROW,
+    // keys then values, pool by pool — which is the order `Loaded::buffers`
+    // rebuilds and nothing else states, so the two have to be read together.
+    let mut pools = Vec::new();
+    let mut rows: Vec<(usize, u16)> = Vec::new();
     let mut kv = BTreeMap::new();
     let mut geometry = BTreeMap::new();
     let mut next = held.len() as u32;
-    for layer in &layers {
-        let bytes = pool.shape().layer_bytes();
-        let keys = Slice::whole(BufferId(next), bytes);
-        let values = Slice::whole(BufferId(next + 1), bytes);
-        next += 2;
-        kv.insert(*layer, (keys, values));
-        let this = baked.deployment.attention[*layer as usize];
-        geometry.insert(
-            *layer,
-            KvGeometry {
-                page_size: PAGE.cast_signed(),
-                // Elements between one token and the next WITHIN A HEAD, which
-                // on this plane is the whole row. `resources::Shape::row` is
-                // `kv_heads * head_dim` and the pool is laid out
-                // `[page][token][head][dim]`, so a token step crosses every
-                // head and a head is `head_dim` wide. Metal lays the same pool
-                // out `[page][head][token]` and states a different pair; the
-                // planes agree about the MEANING of the fields and not about
-                // the layout, which is why each states its own.
-                seq_stride: u64::from(this.kv_heads) * u64::from(this.head_dim),
-                head_stride: u64::from(this.head_dim),
-                kv_heads: this.kv_heads.cast_signed(),
-                head_dim: this.head_dim.cast_signed(),
+    for (&(kv_heads, head_dim), names) in &caches {
+        let pool = Pool::open(
+            device,
+            Shape {
+                layers: names.len() as u16,
+                kv_heads,
+                head_dim,
+                page_size: PAGE,
+                pages: PAGES,
+                bytes: 2,
             },
-        );
+        )
+        .expect("the kv pool opens");
+        let bytes = pool.shape().layer_bytes();
+        let at_pool = pools.len();
+        let mut planes = Vec::with_capacity(names.len());
+        for row in 0..names.len() {
+            planes.push((
+                Slice::whole(BufferId(next), bytes),
+                Slice::whole(BufferId(next + 1), bytes),
+            ));
+            rows.push((at_pool, row as u16));
+            next += 2;
+        }
+        pools.push(pool);
+        for (layer, cache) in layers
+            .iter()
+            .filter(|(l, _)| width_of(**l) == (kv_heads, head_dim))
+        {
+            let at = names
+                .iter()
+                .position(|n| *n == cache.as_str())
+                .expect("a cache of this width");
+            kv.insert(*layer, planes[at]);
+            let this = baked.deployment.attention[*layer as usize];
+            geometry.insert(
+                *layer,
+                KvGeometry {
+                    page_size: PAGE.cast_signed(),
+                    // Elements between one token and the next WITHIN A HEAD,
+                    // which on this plane is the whole row.
+                    // `resources::Shape::row` is `kv_heads * head_dim` and the
+                    // pool is laid out `[page][token][head][dim]`, so a token
+                    // step crosses every head and a head is `head_dim` wide.
+                    // Metal lays the same pool out `[page][head][token]` and
+                    // states a different pair; the planes agree about the
+                    // MEANING of the fields and not about the layout, which is
+                    // why each states its own.
+                    seq_stride: u64::from(this.kv_heads) * u64::from(this.head_dim),
+                    head_stride: u64::from(this.head_dim),
+                    kv_heads: this.kv_heads.cast_signed(),
+                    head_dim: this.head_dim.cast_signed(),
+                },
+            );
+        }
     }
+
+    // ── the recurrent planes ───────────────────────────────────────────
+    //
+    // Numbered after every KV plane, three per layer in `(state, conv,
+    // new_conv)` order — which `Loaded::buffers` rebuilds and nothing else
+    // states, so the two have to be read together.
+    let linear = rs_layers(&baked.plan);
+    let mut slabs = BTreeMap::new();
+    let recurrent = (!linear.is_empty()).then(|| {
+        let rs = baked
+            .deployment
+            .recurrent
+            .as_ref()
+            .expect("a tower with recurrent cache rows states its geometry");
+        let shape = Recurrent {
+            linear_layers: linear.len() as u32,
+            conv_dim: rs.conv_dim.unsigned_abs(),
+            conv_k: rs.conv_k.unsigned_abs(),
+            v_heads: rs.v_h.unsigned_abs(),
+            v_dim: rs.v_d.unsigned_abs(),
+            k_dim: rs.k_d.unsigned_abs(),
+            slots: SLOTS,
+        };
+        let pool = RecurrentPool::open(
+            device,
+            shape,
+            linear.iter().map(|l| *l as u16).collect::<Vec<_>>(),
+        )
+        .expect("the recurrent pool opens");
+        for layer in &linear {
+            let state = Slice::whole(BufferId(next), shape.state_bytes_per_layer());
+            let conv = Slice::whole(BufferId(next + 1), shape.conv_bytes_per_layer());
+            let new_conv = Slice::whole(BufferId(next + 2), shape.conv_bytes_per_layer());
+            next += 3;
+            slabs.insert(*layer, (state, conv, new_conv));
+        }
+        pool
+    });
+    println!(
+        "pool: kv {} cache(s) over {} layer(s) x {PAGES} pages of {PAGE}, \
+         recurrent {} layer(s) x {SLOTS} slot",
+        rows.len(),
+        layers.len(),
+        linear.len(),
+    );
 
     Some(Loaded {
         held,
-        pool,
-        kv_layers: layers,
+        kv_pools: pools,
+        recurrent,
+        kv_rows: rows,
+        rs_layers: linear,
         pools: Live {
             kv,
             tables,
+            slabs,
             geometry,
         },
         banks,
@@ -538,17 +703,23 @@ fn widen(bytes: &[u8], dt: Dt) -> Vec<f32> {
 ///
 /// `None` when the checkpoint is not cached, which the callers turn into a
 /// printed skip.
-fn fire(device: &Device, tier: Capability, class: FireClass) -> Option<(usize, f32, usize, usize)> {
+fn fire(
+    device: &Device,
+    row: &Banked,
+    tier: Capability,
+    class: FireClass,
+) -> Option<(usize, f32, usize, usize)> {
+    let sku = row.sku;
     let baked =
-        Baked::of::<Vulkan>(SKU).unwrap_or_else(|why| panic!("`{SKU}` does not bake: {why}"));
+        Baked::of::<Vulkan>(sku).unwrap_or_else(|why| panic!("`{sku}` does not bake: {why}"));
     let unresolved = baked.unresolved::<Vulkan>();
     assert!(
         unresolved.is_empty(),
-        "this plane does not claim every point `{SKU}` states: {unresolved:?}",
+        "this plane does not claim every point `{sku}` states: {unresolved:?}",
     );
     let (word, program) = baked
         .lane(class, false)
-        .unwrap_or_else(|why| panic!("no lane serves a {} of `{SKU}`: {why}", class.suffix()));
+        .unwrap_or_else(|why| panic!("no lane serves a {} of `{sku}`: {why}", class.suffix()));
     println!(
         "{} lane {word:#b}: {} steps over {} slots, row pitch {}",
         class.suffix(),
@@ -557,7 +728,7 @@ fn fire(device: &Device, tier: Capability, class: FireClass) -> Option<(usize, f
         program.row_pitch,
     );
 
-    let loaded = open(device, &baked, program)?;
+    let loaded = open(device, row, &baked, program)?;
     let layers = baked.deployment.layers as usize;
 
     // ── the walk ───────────────────────────────────────────────────────
@@ -578,7 +749,41 @@ fn fire(device: &Device, tier: Capability, class: FireClass) -> Option<(usize, f
         .walk(&encoder)
         .unwrap_or_else(|why| panic!("the walk refused: {why}"));
     let planned = encoder.finish();
-    let blits = fired.blits.borrow().clone();
+    let mut planned = planned;
+    let mut blits = fired.blits.borrow().clone();
+    if std::env::var_os("PIE_VULKAN_DUMP_SLOTS").is_some() {
+        // WHICH STATEMENT EACH DISPATCH BELONGS TO, and what each statement
+        // WRITES. Before any truncation: a bisect needs the whole mapping to
+        // choose the n it is about to cut at.
+        for (i, d) in planned.iter().enumerate() {
+            println!("PIE_DISPATCH {i} op{}", d.op);
+        }
+        for (at, step) in program.steps.iter().enumerate() {
+            let op = &baked.plan.ops[step.op as usize];
+            println!(
+                "PIE_STEP {at} op{} {} outs {:?}",
+                step.op, op.kernel, op.outputs
+            );
+        }
+    }
+    // STOP AFTER `n` DISPATCHES, so the arena at the end holds that statement's
+    // output rather than whatever `carve` reused its slot for. `driver-wgpu`'s
+    // gate takes the same variable and `driver-metal` has
+    // `PIE_METAL_MAX_DISPATCH`, which is where that plane's own bisect lives —
+    // the three print the same lines so two of them can be diffed.
+    let stop: Option<usize> = std::env::var("PIE_STOP_AFTER")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(n) = stop {
+        planned.truncate(n);
+        // The copies of the statements that remain, and no others: `serve::run`
+        // refuses an `InOut` copy filed against a dispatch the run does not
+        // hold, which is right for a real fire and an obstacle for a truncated
+        // one.
+        let kept: std::collections::BTreeSet<u32> = planned.iter().map(|d| d.op).collect();
+        blits.retain(|b| kept.contains(&b.op));
+        println!("STOPPED AFTER {n} of {} dispatches", planned.len());
+    }
     println!(
         "walk: {} statements planned {} dispatches and {} in-place copies",
         program.steps.len(),
@@ -644,6 +849,35 @@ fn fire(device: &Device, tier: Capability, class: FireClass) -> Option<(usize, f
          walk asked for",
     );
 
+    if std::env::var_os("PIE_VULKAN_DUMP_SLOTS").is_some() {
+        // EVERY SLOT'S RECTANGLE, in the form `driver-wgpu` and `driver-metal`
+        // print. Raw bytes reduced to mean, rms and max rather than a
+        // checksum: two planes reducing in two orders differ by a bf16 ulp on
+        // every statement, and a byte comparison calls that a difference and
+        // leaves a bisect with nothing to bisect.
+        let all = device
+            .read_at(&loaded.held[loaded.arena.0 as usize], 0, loaded.arena_bytes)
+            .expect("the arena reads back");
+        for v in 0..program.slots.len() as u32 {
+            let Ok(r) = fired.rect(v) else { continue };
+            let span = r.rows.unsigned_abs() as u64 * r.width.unsigned_abs() as u64 * r.dt.size();
+            if span == 0 || r.slice.at + span > loaded.arena_bytes {
+                continue;
+            }
+            let raw = &all[r.slice.at as usize..(r.slice.at + span) as usize];
+            println!(
+                "PIE_SLOT {v} at{} {}",
+                r.slice.at,
+                summary(raw, r.dt.size())
+            );
+        }
+        if stop.is_some() {
+            // A truncated fire answers nothing and is not asked to: the point
+            // is the arena it leaves behind.
+            return None;
+        }
+    }
+
     let bytes = device
         .read_at(
             &loaded.held[loaded.arena.0 as usize],
@@ -671,13 +905,13 @@ fn fire(device: &Device, tier: Capability, class: FireClass) -> Option<(usize, f
 /// optimisation with a fallback and every symbol keeps a baseline module, so
 /// baseline is the one configuration every device shares — which is what makes
 /// a banked answer a claim about this tree rather than about this card.
-/// **THE WHOLE TOWER FIRES AND THE ARGMAX IS THE BANKED TOKEN. The logit is
-/// not.**
+/// **THE PLANE SERVES.** 579 dispatches in one submission, 240 staged `InOut`
+/// copies, no refusal, and **token 11 at 14.5000** — the banked token, one
+/// bf16 step off the banked 14.4375.
 ///
-/// 579 dispatches in one submission, 240 staged `InOut` copies, no refusal —
-/// and **token 11**, which is what cuda banked. The logit is 10.1250 against
-/// a banked 14.4375, which is not a rounding gap and not one this file can
-/// explain yet.
+/// The logit was 10.1250 when the tower first fired end to end. Three defects
+/// closed the gap, and none was reachable by anything narrower than a
+/// value-by-value comparison against a plane that answers correctly.
 ///
 /// Getting here closed four refusals, one per walk, each a real point that
 /// could fire for nothing: op 0 `layout.embed` (no dense arm at all), op 8
@@ -687,22 +921,48 @@ fn fire(device: &Device, tier: Capability, class: FireClass) -> Option<(usize, f
 /// point of this plane writes). `tests/doors.rs` held each against its
 /// sentence and now holds all four fired.
 ///
-/// **The next step is the bisect the other two planes have.**
-/// `driver-wgpu`'s `PIE_STOP_AFTER` and `PIE_WGPU_DUMP_SLOTS`, and
-/// `driver-metal`'s `PIE_METAL_MAX_DISPATCH` and `PIE_METAL_DUMP_SLOTS`,
-/// compare two planes statement by statement on the identical program — which
-/// is what found metal's `InOut` copies being staged before the fire ran, at
-/// the first statement that could show it. This plane has no such probe yet
-/// and wants one.
-#[test]
-#[ignore = "the tower fires and answers the banked token; the logit is 10.1250 against 14.4375"]
-fn gptoss_20b_answers_the_argmax_cuda_banked() {
+/// **THE BISECT IS HERE NOW**, in the form the other two planes have:
+/// `PIE_STOP_AFTER` cuts the dispatch list and `PIE_VULKAN_DUMP_SLOTS` prints
+/// every rectangle as mean, rms and max — the same lines `driver-wgpu`
+/// prints, so the two can be diffed statement by statement on the identical
+/// program. It has found three things here already:
+///
+/// ```text
+///   19  norm.add_bias           AGREE  rel 0.0000
+///   20  moe.topk_softmax        was the first divergence, TWICE
+///   22  mlp.swiglu_clamp_alpha  AGREE  rel 0.0000
+///   23  moe.matmul_select_bias  DIFFER rel 0.28  — where it stands
+/// ```
+///
+/// `moe.topk_softmax` was wrong in two independent ways and each hid behind
+/// the other: it normalised the softmax over ALL thirty-two experts instead of
+/// the four it kept, and it fired the `PIE_ACT` weight arm at a slot the point
+/// declares `f32`. The EXPERTS CHOSEN were identical throughout — only the
+/// weight plane beside them moved.
+///
+/// `moe.matmul_select_bias` then passed `x_slot_stride = 0` unconditionally,
+/// which is right for an activation with one row per TOKEN and wrong for one
+/// with a row per ROUTE. gpt-oss hands it the second, so all four experts
+/// contracted against route zero's activations. `activation_strides` derives
+/// the pair now, as `kernels-wgpu`'s `selected` always has.
+/// Open a device, fire one banked row's lane, and compare — or say plainly
+/// that it measured nothing.
+///
+/// **THE ID IS THE CLAIM AND THE LOGIT IS THE WITNESS**, asserted differently
+/// for the reason `driver-metal`'s gate gives: cuda's and `driver-wgpu`'s
+/// compare the rendered logit exactly and both can, because an L40S runs both
+/// of them through one vendor's compiler. This is the same card through Slang
+/// and SPIR-V, reducing in its own order, and gpt-oss answers 14.5000 where
+/// cuda banked 14.4375 — one bf16 step, since the ulp at fourteen is 0.0625.
+///
+/// Loosening the ID would be giving up the claim; loosening the logit to one
+/// ulp is saying what a bf16 logit is worth. A second ulp fails.
+fn gate(row: &Banked, class: FireClass) {
     let device = gpu!();
-    println!("device: {}", device.name());
-    let Some((id, logit, dispatches, staged)) =
-        fire(&device, Capability::Baseline, FireClass::Decode)
+    println!("device: {} — {} {}", device.name(), row.sku, class.suffix());
+    let Some((id, logit, dispatches, staged)) = fire(&device, row, Capability::Baseline, class)
     else {
-        eprintln!("skipped: `{CACHE}` is not cached");
+        eprintln!("skipped: `{}` is not cached", row.cache);
         return;
     };
     let rendered = format!("{logit:.4}");
@@ -710,12 +970,126 @@ fn gptoss_20b_answers_the_argmax_cuda_banked() {
     assert!(
         staged > 0,
         "this tower states `InOut` points and the walk found none, which would \
-         make the staged-copy path below untested rather than passing",
+         make the staged-copy path untested rather than passing",
     );
     assert_eq!(
-        (id, rendered.as_str()),
-        (BANKED_ID, BANKED_LOGIT),
-        "the banked answer for `{SKU}` is {BANKED_ID} at {BANKED_LOGIT} and \
-         this fire answered {id} at {rendered}",
+        id, row.id,
+        "the banked answer for `{}` is token {} and this fire answered {id} at \
+         {rendered}",
+        row.sku, row.id,
     );
+    let banked: f32 = row.logit.parse().expect("the banked logit parses");
+    // DERIVED, NOT WRITTEN DOWN. A bf16 carries eight mantissa bits, so its
+    // ulp is `2^(exponent - 7)`: 0.0625 at fourteen, where gpt-oss banks, and
+    // 0.03125 at seven, where gemma-4 does. A constant is right for one row
+    // and a trap for the next.
+    let ulp = (banked.abs().log2().floor() - 7.0).exp2();
+    assert!(
+        (logit - banked).abs() <= ulp,
+        "`{}` is banked at {banked} and this fire answered {rendered}, which is \
+         {} away — past the {ulp} one bf16 step is at this magnitude",
+        row.sku,
+        (logit - banked).abs(),
+    );
+    if rendered != row.logit {
+        println!("(one bf16 step off the banked {}, and no more)", row.logit);
+    }
+}
+
+/// **THE PURE-ATTENTION TOWER.** See [`GPTOSS`].
+#[test]
+#[ignore = "loads a 20B checkpoint; `--ignored` runs it"]
+fn gptoss_20b_answers_the_argmax_cuda_banked() {
+    gate(&GPTOSS, FireClass::Decode);
+}
+
+/// **THE HYBRID, and the first fire on this plane to carry a recurrent slab.**
+///
+/// Eighteen of twenty-four layers are gated DeltaNet, and `Pools::slab`
+/// answered `None` for every one of them until `resources::RecurrentPool`
+/// landed — so a walk over this tower refused at its first scan and this plane
+/// could serve only the pure-attention rows.
+#[test]
+#[ignore = "needs a Vulkan device and a cached checkpoint"]
+fn qwen35_d0_8b_answers_the_argmax_cuda_banked() {
+    gate(&QWEN35, FireClass::Decode);
+}
+
+/// **THE TOWER AT TWO WIDTHS.** See [`GEMMA4`].
+///
+/// Every earlier row here attends at one width over one cache per layer, and
+/// this one does neither: twenty-four caches under forty-two layers, at two
+/// head widths. Both were fixture assumptions rather than driver ones — the
+/// `Pools` trait has always taken a layer and answered a geometry — but a
+/// fixture that opens one pool per layer cannot express either.
+#[test]
+#[ignore = "loads a 15G checkpoint; `--ignored` runs it"]
+fn gemma4_e4b_answers_the_argmax_cuda_banked() {
+    gate(&GEMMA4, FireClass::Decode);
+}
+
+/// **THE OTHER LANE, AND THIS PLANE HAD NEVER FIRED IT.**
+///
+/// A one-row fire is a decode by the `qo_one` fact and cuda banked its answers
+/// from one, so every row above spells the tower one way. The prefill lane is a
+/// DIFFERENT PROGRAM over the same plan: `attention.prefill` where the decode
+/// states `attention.decode`, and — for the hybrid — `ssm.causal_conv1d_chunked`
+/// and `ssm.gated_delta_chunked` where it states the unchunked arms. Those arms
+/// are claimed here and nothing had ever walked a real tower through them.
+///
+/// **The token must be the same token.** A prefill of one row at position zero
+/// and a decode of one row at position zero are the same forward pass over the
+/// same weights into the same empty pools; they differ in how the tower is
+/// SPELLED and not in what it computes. So this asserts against the banked
+/// answer rather than against the decode's, which is the stronger of the two
+/// claims and the one that does not go stale if the decode regresses.
+#[test]
+#[ignore = "needs a Vulkan device and a cached checkpoint"]
+fn the_qwen35_prefill_lane_answers_the_same_token() {
+    gate(&QWEN35, FireClass::Prefill);
+}
+
+/// gpt-oss's prefill lane, which reaches `attention.prefill_lse` and the
+/// `attention.sink` that merges its partials.
+#[test]
+#[ignore = "the second load of a 20B checkpoint; `--ignored` runs it"]
+fn the_gptoss_prefill_lane_answers_the_same_token() {
+    gate(&GPTOSS, FireClass::Prefill);
+}
+
+/// gemma-4's prefill lane, over two attention widths and twenty-four shared
+/// caches.
+#[test]
+#[ignore = "the second load of a 15G checkpoint; `--ignored` runs it"]
+fn the_gemma4_prefill_lane_answers_the_same_token() {
+    gate(&GEMMA4, FireClass::Prefill);
+}
+
+/// A rectangle's bytes as three comparable numbers — `driver-wgpu`'s twin, and
+/// `driver-metal`'s. Mean, rms and max rather than a checksum: two planes
+/// reducing in two orders differ by a bf16 ulp on every statement, and a byte
+/// comparison calls that a difference and leaves a bisect with nothing to
+/// bisect.
+fn summary(raw: &[u8], width: u64) -> String {
+    let vals: Vec<f64> = if width == 2 {
+        raw.chunks_exact(2)
+            .map(|b| {
+                f64::from(f32::from_bits(
+                    u32::from(u16::from_le_bytes([b[0], b[1]])) << 16,
+                ))
+            })
+            .collect()
+    } else {
+        raw.chunks_exact(4)
+            .map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .collect()
+    };
+    let n = vals.len().max(1) as f64;
+    let mean = vals.iter().sum::<f64>() / n;
+    let rms = (vals.iter().map(|x| x * x).sum::<f64>() / n).sqrt();
+    let max = vals.iter().fold(0.0f64, |a, x| a.max(x.abs()));
+    format!(
+        "n{} mean {mean:.6e} rms {rms:.6e} max {max:.6e}",
+        vals.len()
+    )
 }

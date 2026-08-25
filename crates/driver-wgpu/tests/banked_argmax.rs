@@ -264,30 +264,53 @@ struct Loaded {
     arena_bytes: u64,
 }
 
-/// Which layers own a KV pool, and which own a recurrent one, off the PLAN.
+/// Which cache each layer USES, and which layers own a recurrent slab.
 ///
-/// Read from `plan.caches` rather than from `Deployment::attention`, and the
-/// difference is not cosmetic: `Deployment` fills the layers that state no
-/// attention from the widest one that does, so its vector says something about
-/// every layer of the tower and cannot say which six of them actually hold
-/// pages. The cache rows can, because a row exists only where a layer declared
-/// one.
-fn cache_layers(plan: &Plan) -> (Vec<u32>, Vec<u32>) {
-    let mut kv = Vec::new();
+/// **A LAYER TO A CACHE IS NOT ONE TO ONE**, and reading the layer out of the
+/// cache row's NAME assumed it was. It works for `qwen35-d0.8b` and
+/// `gptoss-20b`, whose rows are `kv.<stack layer>` — and `gemma4-e4b` SHARES:
+/// its forty-two layers hold twenty-four caches, one each for layers 0..21 and
+/// then two between all the rest, `kv.22` for the sliding ones and `kv.23` for
+/// the full ones. Parsing `22` out of `kv.22` and calling it a layer left every
+/// statement past 22 without a page table, and the walk said so — *"the fire
+/// does not carry a kv page table for the layer this statement names"*, at
+/// op 754.
+///
+/// So the map comes from the STATEMENTS, which is where the association
+/// actually lives: an op carries the layer it is at and the cache it names.
+/// Nothing has to be parsed and sharing costs nothing to express.
+///
+/// The recurrent half is still read off the rows, and can be: a slab is a
+/// layer's own and nothing shares one. It is read from `plan.caches` rather
+/// than from `Deployment::recurrent` for the reason that column exists —
+/// `Deployment` fills the layers that state no attention from the widest one
+/// that does, so its vector says something about every layer of the tower.
+fn cache_layers(plan: &Plan) -> (BTreeMap<u32, String>, Vec<u32>) {
+    let mut kv: BTreeMap<u32, String> = BTreeMap::new();
+    for op in &plan.ops {
+        let (Some(cache), Some(layer)) = (op.cache.as_deref(), op.layer) else {
+            continue;
+        };
+        if plan
+            .caches
+            .iter()
+            .any(|row| matches!(row, CacheRow::Kv { name, .. } if name == cache))
+        {
+            kv.insert(layer, cache.to_string());
+        }
+    }
     let mut recurrent = Vec::new();
     for row in &plan.caches {
-        let (name, into) = match row {
-            CacheRow::Kv { name, .. } => (name, &mut kv),
-            CacheRow::State { name, .. } => (name, &mut recurrent),
+        let CacheRow::State { name, .. } = row else {
+            continue;
         };
         let Some(at) = name.rsplit('.').next().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if !into.contains(&at) {
-            into.push(at);
+        if !recurrent.contains(&at) {
+            recurrent.push(at);
         }
     }
-    kv.sort_unstable();
     recurrent.sort_unstable();
     (kv, recurrent)
 }
@@ -426,9 +449,19 @@ impl Loaded {
             let a = baked.deployment.attention[layer as usize];
             (a.kv_heads, a.head_dim)
         };
-        let mut widths: Vec<(u32, u32)> = kv_layers.iter().map(|l| width_of(*l)).collect();
-        widths.sort_unstable();
-        widths.dedup();
+        // ONE ROW PER CACHE AND NOT PER LAYER, because a cache may be shared —
+        // see `cache_layers`. Grouped by width first, since a pool holds one
+        // shape; every layer that names a cache takes the row that cache got.
+        let mut caches: BTreeMap<(u32, u32), Vec<&str>> = BTreeMap::new();
+        for (layer, cache) in &kv_layers {
+            let of = caches.entry(width_of(*layer)).or_default();
+            if !of.contains(&cache.as_str()) {
+                of.push(cache.as_str());
+            }
+        }
+        for of in caches.values_mut() {
+            of.sort_unstable();
+        }
 
         // NO RECURRENT POOL FOR A TOWER THAT DECLARES NO RECURRENCE, and the
         // question is asked of the PLAN rather than of the deployment. A
@@ -470,11 +503,11 @@ impl Loaded {
         // staged tables alike.
         let mut kv = BTreeMap::new();
         let mut geometry = BTreeMap::new();
-        for &(kv_heads, head_dim) in &widths {
+        for (&(kv_heads, head_dim), names) in &caches {
             let pool = Pool::open(
                 device,
                 Shape {
-                    layers: baked.deployment.layers as u16,
+                    layers: names.len() as u16,
                     kv_heads,
                     head_dim,
                     page_size: PAGE,
@@ -483,22 +516,31 @@ impl Loaded {
                 },
             )
             .expect("the kv pool opens");
-            for layer in kv_layers
+            // One row per CACHE, then handed to every layer that names it.
+            let rows: Vec<(Slice, Slice)> = (0..names.len())
+                .map(|at| {
+                    let mut region = |values: bool| {
+                        let buffer = pool
+                            .cache(at as u16, values)
+                            .expect("the pool holds this row")
+                            .clone();
+                        let slice = Slice::whole(BufferId(held.len() as u32), buffer.size());
+                        held.push(buffer);
+                        slice
+                    };
+                    let keys = region(false);
+                    (keys, region(true))
+                })
+                .collect();
+            for (layer, cache) in kv_layers
                 .iter()
-                .filter(|l| width_of(**l) == (kv_heads, head_dim))
+                .filter(|(l, _)| width_of(**l) == (kv_heads, head_dim))
             {
-                let mut region = |values: bool| {
-                    let buffer = pool
-                        .cache(*layer as u16, values)
-                        .expect("the pool holds this layer")
-                        .clone();
-                    let slice = Slice::whole(BufferId(held.len() as u32), buffer.size());
-                    held.push(buffer);
-                    slice
-                };
-                let keys = region(false);
-                let values = region(true);
-                kv.insert(*layer, (keys, values));
+                let at = names
+                    .iter()
+                    .position(|n| *n == cache.as_str())
+                    .expect("a cache of this width");
+                kv.insert(*layer, rows[at]);
                 geometry.insert(
                     *layer,
                     KvGeometry {
@@ -683,9 +725,19 @@ fn fire(
     let mut planned = planned;
     let mut blits = fired.blits.borrow().clone();
     if std::env::var_os("PIE_WGPU_DUMP_SLOTS").is_some() {
-        // WHICH STATEMENT EACH DISPATCH BELONGS TO — see `driver-metal`'s twin.
+        // WHICH STATEMENT EACH DISPATCH BELONGS TO, and what each statement
+        // WRITES — see `driver-metal`'s twin and `driver-vulkan`'s. Printed
+        // before any truncation, because a bisect needs the whole mapping to
+        // choose the n it is about to cut at.
         for (i, d) in planned.iter().enumerate() {
             println!("PIE_DISPATCH {i} op{}", d.op);
+        }
+        for (at, step) in program.steps.iter().enumerate() {
+            let op = &baked.plan.ops[step.op as usize];
+            println!(
+                "PIE_STEP {at} op{} {} outs {:?}",
+                step.op, op.kernel, op.outputs
+            );
         }
     }
     let stop: Option<usize> = std::env::var("PIE_STOP_AFTER")
@@ -814,16 +866,6 @@ fn fire(
             Some((loaded.arena, 0, loaded.arena_bytes)),
         )
         .expect("a read of the whole arena");
-        // WHICH STATEMENT LAST WROTE EACH SLOT, in program order. A slot is
-        // reused by `carve`, so a slot that differs between two planes only
-        // localises a statement once you know which one left it that way.
-        for (at, step) in program.steps.iter().enumerate() {
-            let op = &baked.plan.ops[step.op as usize];
-            println!(
-                "PIE_STEP {at} op{} {} outs {:?}",
-                step.op, op.kernel, op.outputs
-            );
-        }
         for v in 0..program.slots.len() as u32 {
             let Ok(r) = fired.rect(v) else { continue };
             let span = r.rows.unsigned_abs() as u64 * r.width.unsigned_abs() as u64 * r.dt.size();
@@ -873,15 +915,40 @@ fn gate(banked: &Banked, tier: Capability, class: FireClass, why: &str) {
     };
     let rendered = format!("{logit:.4}");
     println!("ARGMAX {id} at {rendered} over {dispatches} dispatches");
+
+    // **THE ID IS THE CLAIM AND THE LOGIT IS THE WITNESS.**
+    //
+    // qwen3.5 and gpt-oss answer this plane's logits EXACTLY — the same L40S
+    // runs cuda and this, and for those two towers the two compilers agree to
+    // the bit. `gemma4-e4b` does not: it answers 7.6250 where cuda banked
+    // 7.5938, which is one bf16 step and not two.
+    //
+    // THE STEP IS DERIVED, NOT WRITTEN DOWN. A bf16 carries eight mantissa
+    // bits, so its ulp is `2^(exponent - 7)` and it is 0.03125 at seven and
+    // 0.0625 at twelve — `driver-metal`'s gate and `driver-vulkan`'s each
+    // hard-code the one their row needs, which is right for one row and a trap
+    // for the next. A second step fails here.
     assert_eq!(
-        (id, rendered.as_str()),
-        (banked.id, banked.logit),
-        "{why}: `{}` is banked at {} at {} and this fire answered {id} at \
+        id, banked.id,
+        "{why}: `{}` is banked at token {} and this fire answered {id} at \
          {rendered}",
-        banked.sku,
-        banked.id,
-        banked.logit,
+        banked.sku, banked.id,
     );
+    let want: f32 = banked.logit.parse().expect("the banked logit parses");
+    let ulp = (want.abs().log2().floor() - 7.0).exp2();
+    assert!(
+        (logit - want).abs() <= ulp,
+        "{why}: `{}` is banked at {want} and this fire answered {rendered}, \
+         which is {} away — past the {ulp} one bf16 step is at this magnitude",
+        banked.sku,
+        (logit - want).abs(),
+    );
+    if rendered != banked.logit {
+        println!(
+            "(one bf16 step off the banked {}, and no more)",
+            banked.logit
+        );
+    }
 }
 
 /// **THE MILESTONE.** A cached checkpoint, through this driver, onto the card,
@@ -935,7 +1002,7 @@ fn gptoss_20b_answers_the_argmax_cuda_banked() {
 /// carries the `masked` fact, so its attention is `attention.masked` where the
 /// other two rows state `attention.decode`.
 #[test]
-#[ignore = "one bank is past what this plane can bind; see the test below"]
+#[ignore = "the third load; `--ignored` runs it"]
 fn gemma4_e4b_answers_the_argmax_cuda_banked() {
     gate(
         &GEMMA4,
@@ -987,6 +1054,23 @@ fn the_gptoss_prefill_lane_answers_the_same_token() {
     );
 }
 
+/// gemma-4's prefill lane, over two attention widths and twenty-four shared
+/// caches.
+///
+/// The row this plane answered LAST and the lane it had never been asked for,
+/// so it was the one cell of the four-plane by three-SKU by two-lane matrix
+/// still empty when `driver-{cuda,metal,vulkan}` filled theirs.
+#[test]
+#[ignore = "the second load of a 15G checkpoint; `--ignored` runs it"]
+fn the_gemma4_prefill_lane_answers_the_same_token() {
+    gate(
+        &GEMMA4,
+        Capability::Baseline,
+        FireClass::Prefill,
+        "the prefill lane is the same tower spelled differently",
+    );
+}
+
 /// The same fire at whatever tier this adapter offers, which must not move the
 /// answer.
 ///
@@ -1014,55 +1098,48 @@ fn the_argmax_does_not_move_at_this_adapters_own_tier() {
     gate(&QWEN35, tier, FireClass::Decode, "this adapter's own tier")
 }
 
-/// **WHAT GEMMA-4 IS ACTUALLY BLOCKED ON, and it is not what it looked like.**
+/// **WHAT GEMMA-4 WAS BLOCKED ON, AND THE TEST THAT SAID SO WHEN IT STOPPED
+/// BEING TRUE.**
 ///
-/// Two things were in the way and only one of them was true.
+/// This held two claims and promised to fail the day either stopped being
+/// true. One did.
 ///
-/// THE FIRST WAS REAL AND IS FIXED. `gemma4-e4b` attends at two widths, and
-/// `baker::stage::Pools` used to answer `kv_geometry()` once per FIRE with no
-/// layer argument — so the strides a claim body read would have been right for
-/// one half of the tower and wrong for the other, which here means attending
-/// over the wrong bytes rather than refusing. `kv_geometry(layer)` is the fix
-/// and `Loaded::open` opens one `resources::Pool` per width.
+/// **STILL TRUE: it attends at two widths.** Its sliding layers take
+/// `kv_heads: 2, head_dim: 256` and its full-attention ones `global_head_dim:
+/// 512`, and `baker::stage::Pools` used to answer `kv_geometry()` once per
+/// FIRE — right for one half of the tower and wrong for the other, which here
+/// means attending over the wrong bytes rather than refusing.
+/// `kv_geometry(layer)` is the fix and this fixture opens one pool per width.
 ///
-/// THE SECOND IS A BANK. `ple.table` is `[262144, 10752]` in bf16 — **5.25
-/// GiB in one tensor**, and `layout.embed` binds it WHOLE. Splitting the arena
-/// does not help and cannot: `arenas_of` packs banks into allocations, and
-/// this is one bank past what one allocation may be BOUND at. This adapter
-/// states 2 GiB; NVIDIA's Vulkan driver states `UINT32_MAX`, which is 4; the
-/// WebGPU floor is 128 MiB. No shader plane can bind it as it stands.
+/// **NO LONGER TRUE: one bank past what a plane can bind.** `ple.table` was
+/// `[262144, 10752]` in bf16 — 5.25 GiB in one tensor, which no shader plane
+/// can bind and no arrangement of arenas can help, because it is one BANK
+/// past what one allocation may be BOUND at. The model text states it per
+/// layer now (`PleLayer::table`, forty-two of `[vocab, 256]`), so the widest
+/// bank gemma-4 carries is its `embed` at 1.25 GiB. **The gate above is not
+/// `#[ignore]`d for want of a binding any more; it runs.**
 ///
-/// Closing it is a change to the POINT and not to any driver: `layout.embed`
-/// would have to take a table in shards and select among them, which is a new
-/// shape of operand on the floor and a new indexing in four kernels. Until
-/// then `gemma4_e4b_answers_the_argmax_cuda_banked` is `#[ignore]`d — and this
-/// test is what keeps that `#[ignore]` honest, because it fails the day either
-/// half of the sentence stops being true.
-///
-/// Needs no device and no checkpoint: both facts are in the plan.
+/// So this asserts the current sentence: two widths, and no bank past two
+/// gigabytes — which is the smallest ceiling this tree's own adapters state
+/// and well under WebGPU's guaranteed floor question. Needs no device and no
+/// checkpoint: both facts are in the plan.
 #[test]
-fn gemma4_attends_at_two_widths_and_is_blocked_on_one_bank() {
+fn gemma4_attends_at_two_widths_and_no_bank_is_past_a_binding() {
     let baked = Baked::of::<Wgpu>(GEMMA4.sku).expect("gemma-4 bakes");
-
-    // Every point it states is claimed here. The blocker is not arithmetic.
     assert!(
         baked.unresolved::<Wgpu>().is_empty(),
-        "this plane claims every point `{}` states; if that stopped being \
-         true the blocker below is no longer the interesting one",
+        "this plane claims every point `{}` states",
         GEMMA4.sku,
     );
 
     let widths: BTreeSet<(u32, u32)> = baked
         .plan
-        .caches
+        .ops
         .iter()
-        .filter_map(|row| match row {
-            CacheRow::Kv { name, .. } => name.rsplit('.').next()?.parse::<usize>().ok(),
-            CacheRow::State { .. } => None,
-        })
-        .map(|l| {
-            let a = baked.deployment.attention[l];
-            (a.kv_heads, a.head_dim)
+        .filter_map(|op| {
+            op.cache.as_deref()?;
+            let a = baked.deployment.attention[op.layer? as usize];
+            Some((a.kv_heads, a.head_dim))
         })
         .collect();
     assert_eq!(
@@ -1072,21 +1149,21 @@ fn gemma4_attends_at_two_widths_and_is_blocked_on_one_bank() {
          because its tower holds two KV geometries: {widths:?}",
     );
 
-    // The bank, from the plan's own column. `Repr` is bf16, so two bytes an
-    // element, which is what `model::produce` will hand the arena.
-    let table = baked
+    // The widest bank, from the plan's own column. Every param here is bf16,
+    // so two bytes an element — which is what `model::produce` hands the arena.
+    let (name, bytes) = baked
         .plan
         .params
         .iter()
-        .find(|p| p.name == "ple.table")
-        .expect("gemma-4 carries a per-layer embedding table");
-    let bytes: u64 = table.shape.iter().product::<u64>() * 2;
+        .map(|p| (p.name.as_str(), p.shape.iter().product::<u64>() * 2))
+        .max_by_key(|(_, bytes)| *bytes)
+        .expect("a plan with params");
     assert!(
-        bytes > 4 * 1024 * 1024 * 1024,
-        "`ple.table` is {bytes} bytes. This test claims it is past every \
-         shader plane's binding ceiling, and the largest any of them states \
-         is 4 GiB — if it has shrunk below that, the `#[ignore]` beside it \
-         should come off and this assertion with it",
+        bytes <= 2 * 1024 * 1024 * 1024,
+        "`{name}` is {bytes} bytes, past the two gigabytes this tree's own \
+         adapters state as a storage binding's ceiling. `PleLayer::table` is \
+         the paragraph about why one bank being too big is not an arena \
+         problem, and the model text is where it was fixed",
     );
 }
 

@@ -185,7 +185,18 @@ pub struct Pool {
     /// makes a shrink permanent -- measured, by a resize down and back up
     /// that was refused on the way up.
     reserved: u32,
-    layers: Vec<Layer>,
+    /// One entry per allocated region, which is one per layer that OWNS its
+    /// pages — not one per layer. See [`Self::row_of`].
+    rows: Vec<Layer>,
+    /// The layer that OWNS each row, which is what sized it. A shared row is
+    /// packed at its source's shape and every sharer attends at that shape --
+    /// `Shape::periodic` refuses an alias where the two disagree -- so this is
+    /// the only layer a resize may ask for a row's page size.
+    owners: Vec<u32>,
+    /// Layer to the row it attends through. The identity for every stack but
+    /// gemma-4, whose trailing layers project no KV and read their source's
+    /// pages: forty-two layers over twenty-four rows.
+    row_of: Vec<u32>,
 }
 
 impl Pool {
@@ -196,8 +207,8 @@ impl Pool {
     /// Any layer's allocation. Nothing partial survives: the vector is local
     /// until every layer is in it, so a pool that half-allocated releases the
     /// half it got rather than being bound against.
-    pub fn allocate(context: &Context, shape: Shape) -> Result<Self> {
-        let pool = Self::build(shape, |bytes| {
+    pub fn allocate(context: &Context, shape: Shape, sources: &[u32]) -> Result<Self> {
+        let pool = Self::build(shape, sources, |bytes| {
             Ok(Pages::Fixed(Allocation::new(context, bytes, "kv pages")?))
         })?;
         pool.zero_all()?;
@@ -222,8 +233,9 @@ impl Pool {
         stepper: &mut crate::device::Stepper,
         arena: &Arena,
         shape: Shape,
+        sources: &[u32],
     ) -> Result<Self> {
-        let mut pool = Self::build(shape, |bytes| {
+        let mut pool = Self::build(shape, sources, |bytes| {
             Ok(Pages::Elastic(create_elastic(context, arena, bytes)?))
         })?;
         // Address space costs nothing; the memory under it is what a fire
@@ -232,7 +244,7 @@ impl Pool {
         // for, declared mandatory, because a pool that pressure can unmap
         // underneath a bound address is not a pool.
         let mut targets: Vec<(&mut Elastic, u64)> = Vec::new();
-        for layer in &mut pool.layers {
+        for layer in &mut pool.rows {
             for side in [&mut layer.k, &mut layer.v] {
                 if let Pages::Elastic(e) = side {
                     let want = e.len();
@@ -264,9 +276,19 @@ impl Pool {
     /// Whatever `make` refuses. Nothing partial survives: the vector is local
     /// until every layer is in it, so a pool that half-allocated releases the
     /// half it got rather than being bound against.
-    fn build(shape: Shape, mut make: impl FnMut(u64) -> Result<Pages>) -> Result<Self> {
-        let mut layers = Vec::with_capacity(shape.layers as usize);
-        for l in 0..shape.layers {
+    fn build(
+        shape: Shape,
+        sources: &[u32],
+        mut make: impl FnMut(u64) -> Result<Pages>,
+    ) -> Result<Self> {
+        // **ONE REGION PER OWNER, AND EVERY SHARER POINTS AT IT.** The
+        // mapping is `Shape::rows` -- arithmetic over the deployment's own
+        // `kv_source` column, correct without a GPU and tested there. This
+        // half is only the allocation: a layer that projects no KV is not
+        // given pages nothing writes, it is handed the ones its source wrote.
+        let (owners, row_of) = shape.rows(sources);
+        let mut rows = Vec::with_capacity(owners.len());
+        for &l in &owners {
             // THIS layer's size. gemma-4's full-attention layers pack their
             // pages at a different shape from its sliding ones, and
             // `kv_append_paged` derives its row stride from the statement's
@@ -274,7 +296,7 @@ impl Pool {
             // self-consistent at its own shape, and each allocation has to
             // match. Uniform stacks answer the same number for every layer.
             let bytes = shape.layer_bytes_at(l).max(1);
-            layers.push(Layer {
+            rows.push(Layer {
                 k: make(bytes)?,
                 v: make(bytes)?,
             });
@@ -282,7 +304,9 @@ impl Pool {
         Ok(Self {
             shape,
             reserved: shape.pages,
-            layers,
+            rows,
+            owners,
+            row_of,
         })
     }
 
@@ -307,7 +331,7 @@ impl Pool {
     /// A span that is not addressable, which for an elastic pool means one
     /// the commit did not reach.
     fn zero_all(&self) -> Result<()> {
-        for layer in &self.layers {
+        for layer in &self.rows {
             for side in [&layer.k, &layer.v] {
                 // SAFETY: freshly allocated; nothing is encoded against it.
                 unsafe { side.zero(0, side.len())? };
@@ -322,10 +346,20 @@ impl Pool {
         self.shape
     }
 
-    /// Layer `l`'s pages, or `None` past the end.
+    /// The pages layer `l` attends through, or `None` past the end.
+    ///
+    /// Not `rows[l]`: a layer that shares gets its source's region, and two
+    /// layers answering the same `Layer` is the sharing.
     #[must_use]
     pub fn layer(&self, l: u32) -> Option<&Layer> {
-        self.layers.get(l as usize)
+        self.rows.get(*self.row_of.get(l as usize)? as usize)
+    }
+
+    /// The regions this pool allocated, once each — what a caller registering
+    /// them must walk, since [`Self::layer`] would hand a shared one over
+    /// twice.
+    pub fn rows(&self) -> impl Iterator<Item = &Layer> {
+        self.rows.iter()
     }
 
     /// Physical pages the pool holds — what a frame's `required_kv_pages` is
@@ -365,7 +399,7 @@ impl Pool {
     /// back; a target past what was allocated; or an arena without room to
     /// grow into.
     pub fn resize(&mut self, stepper: &mut crate::device::Stepper, target: u32) -> Result<()> {
-        if !matches!(self.layers.first().map(|l| &l.k), Some(Pages::Elastic(_))) {
+        if !matches!(self.rows.first().map(|l| &l.k), Some(Pages::Elastic(_))) {
             return Err(crate::Error::Create {
                 what: "kv resize",
                 message: "this pool's pages are one fixed allocation per \
@@ -386,18 +420,22 @@ impl Pool {
         if target == was {
             return Ok(());
         }
-        // The size each layer's pages want, at the new count. Per layer,
-        // because a stack with two attention shapes has two page sizes and
-        // one of them times the count is neither.
-        let want: Vec<u64> = (0..self.shape.layers)
-            .map(|l| (self.shape.page_bytes_at(l) * u64::from(target)).max(1))
+        // The size each ROW's pages want, at the new count. Per row, because a
+        // stack with two attention shapes has two page sizes and one of them
+        // times the count is neither -- and keyed by the row's OWNER, because
+        // a shared row is one region under several layers and its size is the
+        // one it was packed at.
+        let want: Vec<u64> = self
+            .owners
+            .iter()
+            .map(|l| (self.shape.page_bytes_at(*l) * u64::from(target)).max(1))
             .collect();
 
         if target > was {
             // Priced and mapped in one ask, so a growth that does not fit
             // leaves the pool at the size it was rather than half-grown.
             let mut targets: Vec<(&mut Elastic, u64)> = Vec::new();
-            for (l, layer) in self.layers.iter_mut().enumerate() {
+            for (l, layer) in self.rows.iter_mut().enumerate() {
                 let bytes = want[l];
                 for side in [&mut layer.k, &mut layer.v] {
                     if let Pages::Elastic(e) = side {
@@ -419,7 +457,7 @@ impl Pool {
         self.shape.pages = target;
 
         if target > was {
-            for (l, layer) in self.layers.iter().enumerate() {
+            for (l, layer) in self.rows.iter().enumerate() {
                 let from = self.shape.page_bytes_at(l as u32) * u64::from(was);
                 for side in [&layer.k, &layer.v] {
                     // SAFETY: the pages past `was` were not in the pool a
@@ -432,7 +470,7 @@ impl Pool {
             // Shrinking last, and only after the count is down: the trim
             // waits for the GPU to pass the unmap, but the count is what
             // stops a new frame from naming these pages in the first place.
-            for (l, layer) in self.layers.iter_mut().enumerate() {
+            for (l, layer) in self.rows.iter_mut().enumerate() {
                 let bytes = want[l];
                 for side in [&mut layer.k, &mut layer.v] {
                     if let Pages::Elastic(e) = side {
@@ -477,10 +515,13 @@ impl Pool {
     /// Total bytes this pool holds, across every layer and both tensors.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        // Summed rather than multiplied: a stack with two attention shapes
-        // has two page sizes, and one layer's times the count is neither.
-        (0..self.shape.layers)
-            .map(|l| self.shape.layer_bytes_at(l) * 2)
+        // Summed rather than multiplied, and over ROWS rather than layers: a
+        // stack with two attention shapes has two page sizes, and a stack that
+        // shares has fewer regions than layers. Multiplying either way
+        // over-reports gemma-4 by eighteen layers of pages that do not exist.
+        self.owners
+            .iter()
+            .map(|l| self.shape.layer_bytes_at(*l) * 2)
             .sum()
     }
 
@@ -530,7 +571,7 @@ impl Pool {
                     .to_owned(),
             });
         }
-        for layer in &self.layers {
+        for layer in &self.rows {
             for side in [&layer.k, &layer.v] {
                 for copy in &plan.copies {
                     // SAFETY: both spans are checked against the pages' own
@@ -648,7 +689,9 @@ mod tests {
         Pool {
             shape: Shape { pages, ..shape() },
             reserved: pages,
-            layers: Vec::new(),
+            rows: Vec::new(),
+            owners: Vec::new(),
+            row_of: Vec::new(),
         }
     }
 

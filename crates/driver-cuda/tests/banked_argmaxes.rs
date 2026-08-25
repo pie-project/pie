@@ -117,7 +117,25 @@ fn boot(snap: &std::path::Path) -> String {
 }
 
 /// One fire of one token, and the whole logit row it published.
-fn logits_of(snap: &std::path::Path, vocab: usize, tag: u64) -> Vec<f32> {
+/// Which way the tower is SPELLED for a fire.
+///
+/// Not a knob on the shell: the class is derived from the frame, one row per
+/// request being a decode and anything wider a prefill. So this is a shape of
+/// `LaunchPlan` and not an argument to one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// One token, one request. Every banked answer was fired from this.
+    Decode,
+    /// Two tokens, one request, and the read-out is row ZERO.
+    ///
+    /// Row 0 of a causal prefill attends only to key 0, so it is the SAME
+    /// forward pass the decode above runs — the same weights into the same
+    /// empty pools, spelled differently. That is what lets it be asserted
+    /// against the banked answer rather than against the decode's.
+    Prefill,
+}
+
+fn logits_of(snap: &std::path::Path, vocab: usize, tag: u64, lane: Lane) -> Vec<f32> {
     let broker = CompletionBroker::new();
     let mut d = Shell::open(boot(snap).as_bytes(), broker.clone()).expect("the driver creates");
 
@@ -169,12 +187,47 @@ fn logits_of(snap: &std::path::Path, vocab: usize, tag: u64) -> Vec<f32> {
     let cell_ptr: *mut driver_api::local::TerminalCell = &mut cell;
     let step = StepSubmission {
         plan: LaunchPlan {
-            token_ids: vec![PROMPT],
-            position_ids: vec![0],
+            // **THE FRAME IS WHAT PICKS THE LANE**, one row per request being
+            // a decode and anything wider a prefill — so a prefill of this
+            // tower is two tokens in one request, and the read-out is then row
+            // 0, which attends only to key 0 and is therefore the decode's
+            // forward pass under another spelling.
+            token_ids: match lane {
+                Lane::Decode => vec![PROMPT],
+                Lane::Prefill => vec![PROMPT; 2],
+            },
+            position_ids: match lane {
+                Lane::Decode => vec![0],
+                Lane::Prefill => vec![0, 1],
+            },
             kv_page_indices: vec![0],
             kv_page_indptr: vec![0, 1],
-            kv_last_page_lens: vec![1],
-            qo_indptr: vec![0, 1],
+            kv_last_page_lens: match lane {
+                Lane::Decode => vec![1],
+                Lane::Prefill => vec![2],
+            },
+            qo_indptr: match lane {
+                Lane::Decode => vec![0, 1],
+                Lane::Prefill => vec![0, 2],
+            },
+            // **EVERY ROW, AND THAT IS NOT A DETAIL.** Naming row 0 alone is
+            // refused by name, and rightly:
+            //
+            //     this fire samples 1 of 2 rows; the lane states no gather
+            //     epilogue
+            //
+            // This gate registers `ProgramRegistration::default()`, so the
+            // lane's `out` seam holds every row and the delivery agrees with
+            // it exactly when every row is sampled. A fire that compacts would
+            // deliver row `k` as row `j`, so the driver refuses instead.
+            sampling_indices: match lane {
+                Lane::Decode => Vec::new(),
+                Lane::Prefill => vec![0, 1],
+            },
+            sampling_indptr: match lane {
+                Lane::Decode => Vec::new(),
+                Lane::Prefill => vec![0, 2],
+            },
             rs_slot_ids: vec![0],
             rs_slot_flags: vec![PIE_RS_FLAG_RESET],
             ..Default::default()
@@ -231,6 +284,99 @@ fn logits_of(snap: &std::path::Path, vocab: usize, tag: u64) -> Vec<f32> {
 #[test]
 #[ignore = "needs a CUDA device and three cached checkpoints"]
 fn the_three_banked_argmaxes() {
+    every_banked_argmax(Lane::Decode, "the decode lane");
+}
+
+/// **THE OTHER LANE FIRES, AND THIS GATE CANNOT ASK IT FOR A BANKED NUMBER.**
+///
+/// Every banked answer was fired from ONE ROW, which is a decode — so the
+/// prefill spelling of a real tower went unmeasured on the plane that banked
+/// them. That is not a small gap: `driver-metal`'s prefill lane turned out not
+/// to fire AT ALL when it was finally asked, refusing at its first attention
+/// for two runtime planes `serve::launch` had never staged.
+///
+/// So this fires it: two tokens in one request, which is a prefill by the
+/// class rule, over the whole of `attention.prefill`, `attention.prefill_lse`
+/// and — for the hybrid — the chunked SSM arms the decode lane never states.
+///
+/// # Why the LOGIT is not compared, and what is instead
+///
+/// The banked answer belongs to row 0, and row 0 of this fire has no path out
+/// of this gate. Naming it alone is refused — *"this fire samples 1 of 2 rows;
+/// the lane states no gather epilogue"* — because a `ProgramRegistration::
+/// default()` program states no compacting epilogue and the driver will not
+/// deliver row `k` as row `j`. Naming BOTH rows is accepted and the ring then
+/// publishes one cell per REQUEST, holding its LAST row: measured, cell 0 was
+/// `198 at 15.9375` and cell 1 was untouched zeros.
+///
+/// Row 1's continuation of `[785, 785]` is a number nothing outside this plane
+/// has ever stated, so asserting it would be banking from the plane under
+/// test. **And it is not stable.** Two runs over code `gemma4-e4b` cannot tell
+/// apart — that tower routes no experts, so a MoE kernel edit between them
+/// reached none of it — answered `785 at 7.6250` and then `785 at 7.6562`, one
+/// bf16 ulp apart at seven. A gate that pinned it would be flaky as well as
+/// circular. What is asserted instead is everything that does not need a bank: the
+/// fire is ACCEPTED, it completes, and its read-out is a finite distribution
+/// of the right width that is not the zeros a fire publishes when it computes
+/// nothing. That is exactly the claim metal failed, and it is checked here
+/// without inventing a number.
+///
+/// `driver-{metal,vulkan,wgpu}/tests/banked_argmax.rs` compare the banked
+/// logit through this lane, because each of those three can read row 0.
+#[test]
+#[ignore = "needs a CUDA device and three cached checkpoints"]
+fn the_prefill_lane_fires_over_every_banked_tower() {
+    let _gpu = gpu_guard();
+    let Some(_dev) = device_or_skip("the prefill lane") else {
+        return;
+    };
+
+    let mut fired = 0usize;
+    for (tag, b) in BANKED.iter().enumerate() {
+        let Some(snap) = snapshot_of(b.cache) else {
+            eprintln!("[skip] {} — {} is not cached", b.sku, b.cache);
+            continue;
+        };
+        let vocab = model::serve::row(b.sku)
+            .unwrap_or_else(|| panic!("`{}` is not a catalog row", b.sku))
+            .vocab as usize;
+
+        // `logits_of` asserts the fire is ACCEPTED and that it COMPLETED; a
+        // lane that refuses, as metal's did on all three towers, never
+        // reaches the lines below.
+        let row = logits_of(&snap, vocab, 0xBA_5E_00 + tag as u64, Lane::Prefill);
+        assert_eq!(row.len(), vocab, "the read-out is not one whole row");
+        assert!(
+            row.iter().all(|v| v.is_finite()),
+            "`{}`'s prefill published a non-finite logit",
+            b.sku,
+        );
+        let (id, logit) = row
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .expect("a non-empty vocabulary");
+        // NOT ZEROS. A fire that runs a whole tower and publishes nothing
+        // leaves the ring as it found it, and an argmax over zeros picks the
+        // LAST index — which is what this gate's decode lane saw once and is
+        // the failure a "the lane fired" claim must not pass over.
+        assert!(
+            *logit != 0.0 && id + 1 != vocab,
+            "`{}`'s prefill published {id} at {logit}, which is what an argmax              over an unwritten ring answers",
+            b.sku,
+        );
+        println!("{}: prefill fired, {id} at {logit:.4}", b.sku);
+        fired += 1;
+    }
+
+    assert!(
+        fired > 0,
+        "no checkpoint was cached, so this gate measured nothing; it must not \
+         pass quietly",
+    );
+}
+
+fn every_banked_argmax(lane: Lane, why: &str) {
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("banked argmaxes") else {
         return;
@@ -246,7 +392,7 @@ fn the_three_banked_argmaxes() {
             .unwrap_or_else(|| panic!("`{}` is not a catalog row", b.sku))
             .vocab as usize;
 
-        let row = logits_of(&snap, vocab, 0xBA_5E_00 + tag as u64);
+        let row = logits_of(&snap, vocab, 0xBA_5E_00 + tag as u64, lane);
         let (id, logit) = row
             .iter()
             .enumerate()
@@ -257,19 +403,19 @@ fn the_three_banked_argmaxes() {
         assert_eq!(
             (id, rendered.as_str()),
             (b.id, b.logit),
-            "the banked answer for `{}` is {} at {} and this fire answered \
-             {id} at {rendered}",
+            "{why}: the banked answer for `{}` is {} at {} and this fire \
+             answered {id} at {rendered}",
             b.sku,
             b.id,
             b.logit,
         );
-        println!("{}: {} at {} — matched", b.sku, b.id, b.logit);
+        println!("{}: {} at {} — matched, {why}", b.sku, b.id, b.logit);
         fired += 1;
     }
 
     assert!(
         fired > 0,
-        "no checkpoint was cached, so this gate measured nothing; it must \
-         not pass quietly",
+        "{why}: no checkpoint was cached, so this gate measured nothing; it \
+         must not pass quietly",
     );
 }

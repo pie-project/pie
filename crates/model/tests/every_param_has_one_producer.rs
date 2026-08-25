@@ -24,7 +24,10 @@ use model_dsl::load::Source;
 /// Every name a `Source` reads out of the checkpoint.
 fn cites(source: &Source) -> Vec<&str> {
     match source {
-        Source::Copy(n) | Source::Deinterleave(n, _, _) | Source::Squeeze(n, _) => vec![n.as_str()],
+        Source::Copy(n)
+        | Source::Deinterleave(n, _, _)
+        | Source::Squeeze(n, _)
+        | Source::Slice(n, _, _, _) => vec![n.as_str()],
         Source::Pack(parts) | Source::Stack(parts) => parts.iter().flat_map(cites).collect(),
     }
 }
@@ -96,12 +99,23 @@ fn a_producer_reads_each_source_name_once() {
     // a scalar. Two rows citing it the SAME way is not: it is the same bytes
     // written twice under different names, which is a copy-paste fault every
     // time.
+    //
+    // **THE DISCRIMINANT ALONE IS NOT "THE SAME WAY" FOR A SLICE.** Gemma's
+    // safetensors leg reads `embed_tokens_per_layer` forty-two times, once per
+    // layer, and each read is a different run of columns -- different bytes
+    // under different names, which is the opposite of the fault. So a
+    // `Source::Slice` carries its RANGE into the key: two rows slicing the
+    // same run out of the same tensor are still a copy-paste, and forty-two
+    // rows slicing forty-two runs are forty-two answers.
     let mut faults = Vec::new();
     for row in model::imports() {
         let table = (row.make)();
         let mut seen: Vec<(&str, String)> = Vec::new();
         for r in &table.rows {
-            let shape = format!("{:?}", std::mem::discriminant(&r.source));
+            let shape = match &r.source {
+                Source::Slice(_, axis, at, extent) => format!("slice{axis}:{at}:{extent}"),
+                other => format!("{:?}", std::mem::discriminant(other)),
+            };
             for name in cites(&r.source) {
                 if let Some((first, _)) = seen
                     .iter()

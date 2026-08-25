@@ -419,7 +419,18 @@ __global__ void build_moe_ptrs_decode(
     if (k >= top_k) return;
     const long long stride_gu = 2LL * I_moe * H;
     const long long stride_dn = (long long)H * I_moe;
-    const int e = topk_idx[k];
+    // **A POINTER TABLE MUST HOLD A POINTER**, so an unrouted slot is CLAMPED
+    // rather than skipped: `topk_idx` holds -1 by design (`topk_softmax.cuh`
+    // mints it for every `k >= num_experts`), and `base + -1 * stride` is one
+    // whole expert below the bank — a pointer this kernel then hands to a
+    // batched GEMM, which reads it. Expert 0's row is in bounds and finite,
+    // and the combine multiplies its result by the zero weight the router
+    // pairs with the -1.
+    //
+    // This is `build_moe_ptrs_aligned`'s rule, which has clamped since it was
+    // written; these two never did.
+    int e = topk_idx[k];
+    if (e < 0) e = 0;
 
     a_gu_ptrs[k] = gate_up_base + e * stride_gu;
     b_gu_ptrs[k] = norm_x;
@@ -462,7 +473,18 @@ __global__ void build_moe_ptrs_decode_batched(
     const long long stride_gu = 2LL * I_moe * H;
     const long long stride_dn = static_cast<long long>(H) * I_moe;
     const int token = r / top_k;
-    const int e = topk_idx[r];
+    // **A POINTER TABLE MUST HOLD A POINTER**, so an unrouted slot is CLAMPED
+    // rather than skipped: `topk_idx` holds -1 by design (`topk_softmax.cuh`
+    // mints it for every `k >= num_experts`), and `base + -1 * stride` is one
+    // whole expert below the bank — a pointer this kernel then hands to a
+    // batched GEMM, which reads it. Expert 0's row is in bounds and finite,
+    // and the combine multiplies its result by the zero weight the router
+    // pairs with the -1.
+    //
+    // This is `build_moe_ptrs_aligned`'s rule, which has clamped since it was
+    // written; these two never did.
+    int e = topk_idx[r];
+    if (e < 0) e = 0;
 
     a_gu_ptrs[r] = gate_up_base + static_cast<long long>(e) * stride_gu;
     b_gu_ptrs[r] = norm_x + static_cast<long long>(token) * H;
@@ -507,7 +529,13 @@ __device__ __forceinline__ void moe_decode_wmma_body(
     const int n0 = blockIdx.x * N_TILE;
     const int route = blockIdx.y;
     const int expert = topk_idx[route];
-    if (expert < 0 || n0 >= N) return;
+    // Rows past the end are rows that do not exist and are not written. An
+    // UNROUTED route is a row that does exist, and it is written with zero for
+    // the reason `moe_decode_gemv_body` gives: `topk_idx` holds -1 by design,
+    // -1 times the expert stride reads before the bank, and the combine's zero
+    // weight kills a finite value and propagates a NaN. The two conditions
+    // stood in one `return` and only one of them meant "do not write".
+    if (n0 >= N) return;
 
     extern __shared__ __align__(16) unsigned char wmma_smem[];
     auto* a_tile = reinterpret_cast<T*>(wmma_smem);
@@ -515,6 +543,13 @@ __device__ __forceinline__ void moe_decode_wmma_body(
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
     const int n_warp = n0 + warp_id * 16;
+    if (expert < 0) {
+        if (lane < 16) {
+            out[static_cast<long long>(route) * N + n0 + warp_id * 16 + lane] =
+                Elem<T>::from_f32(0.0f);
+        }
+        return;
+    }
 
     const int token = route / top_k;
     const T* act_row = act + static_cast<long long>(ActByToken ? token : route) * K;
@@ -626,11 +661,39 @@ __device__ __forceinline__ void moe_decode_gemv_body(
     const int route = blockIdx.y;
     const int row = blockIdx.x * kWarps + threadIdx.y;
     if (row >= N) return;
+    const int lane = threadIdx.x;
     const int expert = topk_idx[route];
+    // **AN UNROUTED ROUTE WRITES ZERO, AND WRITING IS THE POINT.**
+    //
+    // `topk_idx` holds -1 by design, and `topk_softmax.cuh` is where: both
+    // block-argmax writers store `out_idx[k] = best_i` with `best_i` still -1
+    // when no expert is left to pick, which is every `k >= num_experts`. The
+    // second one pairs it with `weight = 0.f`, which is this file's own
+    // convention -- padding computes something and the combine multiplies it
+    // by zero.
+    //
+    // That convention needs the something to be FINITE, and this had neither
+    // half. `weight_base + expert * expert_stride` at -1 is one whole expert's
+    // stride BEFORE the bank: an in-arena read of another statement's slot,
+    // which does not fault and is not a number this kernel chose. Then
+    // `batched_weighted_sum` multiplies it by zero -- and `0 * NaN` is `NaN`,
+    // for the whole token's hidden state.
+    //
+    // So: not `return`. `dst` is a carved arena slot and nothing zeroes it per
+    // fire, so skipping the store leaves whatever the previous statement put
+    // there and the same multiply reads THAT. The store is the fix; zero is
+    // the value the zero weight was always meant to be multiplying.
+    //
+    // `expert` is uniform across the warp -- it depends on `blockIdx.y` alone
+    // -- so every lane takes this branch together and the full-mask shuffle
+    // below is never reached by a partial warp.
+    if (expert < 0) {
+        if (lane == 0) out[(long long)route * N + row] = Elem<T>::from_f32(0.f);
+        return;
+    }
     const T* w = weight_base + expert * expert_stride + (long long)row * K;
     const T* x = act + (long long)(ActByToken ? route / top_k : route) * K;
 
-    const int lane = threadIdx.x;
     float acc = 0.f;
     const int vec = K / kMoeVecWidth;
     const float4* w4 = reinterpret_cast<const float4*>(w);

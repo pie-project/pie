@@ -63,15 +63,30 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
         //
         // Measured against a transformers 5.15.1 forward on the cached
         // checkpoint, which is the third party that decides.
+        // **THE TABLE IS GATHERED PER LAYER NOW, AND THE `select` MOVED RATHER
+        // THAN WENT AWAY.**
+        //
+        // This built the whole relay here — one `layout.embed` of the whole
+        // `[vocab, layers * ple_dim]` row, added to the projection, and then a
+        // `layout.select` of the RELAY inside the loop. The gather is the one
+        // thing that could not stay: `PleLayer::table` says why a 5.25 GiB bank
+        // is a bank no shader plane can bind, and the fix is one param per
+        // layer.
+        //
+        // So the projection is what survives to the loop, and the loop selects
+        // IT. Elementwise nothing changes: the same slice of the same
+        // normalised projection meets the same 256 embedded columns, scaled by
+        // the same two constants. What changes is the statement graph — one
+        // wide embed and one wide add become forty-two narrow ones — and
+        // `driver-cuda`'s banked 785 at 7.5938 is what says the arithmetic did
+        // not move with it.
         let relay = m.ple.as_ref().map(|ple| {
-            let table = kernels::layout::embed(&ids, &ple.table, m.vocab) * (ple.dim as f32).sqrt();
             let proj =
                 kernels::gemm::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
             let n = &ple.model_norm;
-            let proj = kernels::norm::rmsnorm_per_head(&proj, &n.weight, ple.dim, n.eps);
             (
                 ple,
-                kernels::norm::residual_add(&table, &proj) * std::f32::consts::FRAC_1_SQRT_2,
+                kernels::norm::rmsnorm_per_head(&proj, &n.weight, ple.dim, n.eps),
             )
         });
 
@@ -147,12 +162,14 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
             let pfn = &w.post_ffw_norm;
             y = kernels::norm::residual_add(&kernels::norm::rmsnorm(&f, &pfn.weight, pfn.eps), &y);
 
-            if let Some((ple, relay)) = &relay {
+            if let Some((ple, proj)) = &relay {
                 let lp = &ple.per_layer[l as usize];
-                let gated = kernels::mlp::geglu_tanh(
-                    &kernels::gemm::matmul(&y, &lp.gate),
-                    &kernels::layout::select(relay, l, ple.dim),
-                );
+                let table =
+                    kernels::layout::embed(&ids, &lp.table, m.vocab) * (ple.dim as f32).sqrt();
+                let relay =
+                    kernels::norm::residual_add(&table, &kernels::layout::select(proj, l, ple.dim))
+                        * std::f32::consts::FRAC_1_SQRT_2;
+                let gated = kernels::mlp::geglu_tanh(&kernels::gemm::matmul(&y, &lp.gate), &relay);
                 let out = kernels::gemm::matmul(&gated, &lp.proj);
                 let out = kernels::norm::rmsnorm(&out, &lp.norm.weight, lp.norm.eps);
                 // THE SCALAR RIDES THE WHOLE LAYER, NOT THE RELAY'S BRANCH.

@@ -584,23 +584,27 @@ fn the_real_bound_seeds_a_tower_on_this_plane() {
     );
 }
 
-/// AND IT REFUSES AT THE FIRE, because the door its body reaches through is
-/// shut.
+/// AND IT FIRES — which it did not, and the paragraph that stood here said what
+/// to do on the day it did.
 ///
-/// `kernels_vulkan::layout::embed` asks `Staged::bank(table)` for the code,
-/// scale and bias planes of a quantised embedding table, and
-/// `kernels_vulkan::points`'s blanket `impl Staged for Ctx<'_>` refuses that
-/// method — *"the floor's `Const<Tensor<T>>` carries one address and every
-/// matmul on this plane reads three"*. It is a blanket impl on `dyn Encode`, so
-/// no encoder this driver writes can answer it.
+/// `kernels_vulkan::layout::embed` asked `Staged::bank(table)` for the code,
+/// scale and bias planes of a QUANTISED embedding table, unconditionally, and
+/// `Staged::bank` is an unconditional refusal. So this point passed the
+/// load-time pass and refused mid-fire — exactly the shape
+/// `crate::walk::resolve` exists to prevent and cannot, because the door was on
+/// the floor.
 ///
-/// This is exactly the shape `crate::walk::resolve` exists to prevent — a point
-/// that passes the load-time pass and refuses mid-fire — and it cannot be
-/// prevented from the driver: the door is on the floor. THE DAY THIS TEST
-/// FAILS, the door opened, and the fixture below should be bound rather than
-/// stated.
+/// The door did not open. The ARM beside it was missing: every row in the
+/// catalog states a `bf16` embedding and this plane had no dense gather at all,
+/// so `layout.embed` could fire for NOTHING. `layout/embed.slang` is that
+/// gather, and this test is the one that has to change shape when a refusal
+/// becomes an answer — which is what it was written to do.
+///
+/// It now asserts the walk SUCCEEDS and that the transcript holds the one
+/// dispatch a gather is. A test that only asserted `is_ok` would pass for a
+/// body that fired nothing.
 #[test]
-fn the_seeded_tower_refuses_at_the_fire_because_the_staged_door_is_shut() {
+fn the_seeded_tower_fires_its_embed_now_that_the_dense_arm_exists() {
     let plan = seeded();
     let lanes = model_compiler::program::bound(&plan);
     let program = lanes[0].as_ref().expect("the seeded tower binds");
@@ -621,14 +625,17 @@ fn the_seeded_tower_refuses_at_the_fire_because_the_staged_door_is_shut() {
     let pools = Staging::new();
     let fire = over(&plan, program, &banks, &pools);
     let recorder = Recorder::over(&fire.bindings);
-    let why = fire
-        .walk(&recorder)
-        .expect_err("`Staged::bank` refuses on this plane");
-    assert_eq!(why.op, 0, "the embed is the first statement");
-    assert_eq!(why.kernel, "layout.embed");
-    assert!(
-        recorder.transcript().is_empty(),
-        "nothing should fire before the refusal",
+    fire.walk(&recorder)
+        .unwrap_or_else(|why| panic!("the seeded tower refused at {}: {why}", why.kernel));
+    // ONE DISPATCH PER STATEMENT, and the count comes from the PLAN rather than
+    // being written down: a body may state more than one launch, and if one of
+    // these ever does, that is the day this number should be derived
+    // differently rather than raised.
+    assert_eq!(
+        recorder.transcript().len(),
+        plan.ops.len(),
+        "the seeded tower's {} statements should each have fired once",
+        plan.ops.len(),
     );
 }
 

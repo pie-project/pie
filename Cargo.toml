@@ -428,8 +428,12 @@ default = []
 _driver-cuda = ["worker/_driver-cuda"]
 driver-cuda-12 = ["_driver-cuda", "worker/driver-cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "worker/driver-cuda-13"]
-# `driver-metal` STOOD HERE, forwarding to `worker`. It went with the three
-# shader drivers at R3; see this file's `exclude`.
+# BACK, forwarding to `worker`. No ABI in the name because Metal has none to
+# choose: `driver-metal/metal-4` is the device half's gate and the version it
+# states. Apple-only, and the seam that reads it says so with a target cfg
+# rather than this flag -- so a non-Apple build with the feature on is a build
+# with no metal seam in it, not a link error.
+driver-metal = ["worker/driver-metal"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 

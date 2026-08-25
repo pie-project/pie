@@ -245,7 +245,10 @@ fn matches(
 fn leaves<'a>(source: &'a model_dsl::load::Source, into: &mut Vec<&'a str>) {
     use model_dsl::load::Source;
     match source {
-        Source::Copy(n) | Source::Deinterleave(n, _, _) | Source::Squeeze(n, _) => into.push(n),
+        Source::Copy(n)
+        | Source::Deinterleave(n, _, _)
+        | Source::Squeeze(n, _)
+        | Source::Slice(n, _, _, _) => into.push(n),
         Source::Pack(each) | Source::Stack(each) => {
             for one in each {
                 leaves(one, into);

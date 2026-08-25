@@ -303,6 +303,38 @@ def build_config(args: argparse.Namespace):
             driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
+    elif args.driver == "metal":
+        # Apple Silicon. The Metal driver sizes its own heap from the
+        # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
+        # `gpu_mem_utilization` has nowhere to go; the batching caps are the
+        # only tunables it reads.
+        driver_options = {}
+        # Same key, same name, both backends -- the switch is a residency trade
+        # an operator makes about a model, not a backend detail.
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
+        # The bounded form of the same trade, and the only one that can admit a
+        # checkpoint bigger than the machine: streaming maps the bank and every
+        # mapped page is wired, so it moves bytes off the heap without capping
+        # them, while a slab caps them and pays a submit-and-wait per layer.
+        if getattr(args, "expert_slab_mb", 0):
+            driver_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
+        if getattr(args, "max_forward_tokens", 0):
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if getattr(args, "max_forward_requests", 0):
+            driver_options["max_forward_requests"] = args.max_forward_requests
+        if getattr(args, "total_pages", 0):
+            driver_options["total_pages"] = args.total_pages
+        # `--max-model-len` is the cross-engine context knob (llama.cpp takes
+        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
+        # engine it means ONE REQUEST's context. The Metal driver's knob is
+        # the whole fleet's ring -- it is one shared linear ring, not a
+        # per-request allocation -- so the fair translation multiplies by the
+        # fleet the client will actually offer. Sending the per-request number
+        # straight through would hand a 16-way run 128 tokens per request and
+        # measure a starved engine against unstarved ones.
+        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
+        driver_options["max_model_len"] = args.max_model_len * fleet
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -1356,8 +1388,11 @@ def build_parser() -> argparse.ArgumentParser:
                  "(or set PIE_BENCH_INFERLET_DIR).",
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
+        # `metal` is back: its driver is wired into `pie serve` again (P5), and
+        # `EMBEDDED_CLI_DRIVERS` above has named it the whole time. `vulkan`
+        # and `wgpu` are still absent because no build of pie hosts them.
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "vllm", "sglang",
+                        choices=["cuda_native", "metal", "vllm", "sglang",
                                  "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)

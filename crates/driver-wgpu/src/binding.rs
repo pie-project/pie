@@ -303,6 +303,22 @@ impl<'a, B: Allocation> Bound<'a, B> {
                 size: buffer.size(),
             });
         }
+        // **A STORAGE BINDING IS A RUN OF WORDS**, and every module in this
+        // tree declares one as `array<u32>` or a struct of them, so a length
+        // that is not a whole number of four-byte words is refused by
+        // `create_bind_group` with nothing but "Validation Error" to say why.
+        //
+        // `gemma4-e4b`'s `layer.N.ple_scalar` is a `[1]` bf16 tensor — TWO
+        // BYTES — and `norm.scale` binds it whole. It is the first bank in
+        // this tree narrower than a word, and it took a whole tower to reach:
+        // every other bank is a row of a matrix.
+        //
+        // Rounding UP is safe because `walk::lane::arenas_of` pads every bank
+        // to `BANK_ALIGN`, which is 256 — the bytes exist, they are this
+        // bank's own, and no shader reads past the element it was given. The
+        // round is clamped to the buffer, which is what keeps a bank at the
+        // very end of an arena from asking for bytes the arena does not have.
+        let len = len.next_multiple_of(4).min(buffer.size() - offset);
         Ok(Self {
             buffer,
             offset,

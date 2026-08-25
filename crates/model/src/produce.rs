@@ -202,6 +202,14 @@ pub enum Fault {
         shape: Vec<u64>,
         groups: u32,
     },
+    /// `Slice`: no such axis, or the run leaves it.
+    Unsliceable {
+        name: String,
+        axis: u32,
+        shape: Vec<u64>,
+        at: u64,
+        extent: u64,
+    },
     /// A verb this interpreter does not perform yet.
     Refused { verb: &'static str, why: String },
     /// The plan's shard column and the checkpoint's own rectangle do not
@@ -258,6 +266,17 @@ impl std::fmt::Display for ProduceError {
             } => write!(
                 f,
                 "`{name}` is {shape:?}, whose axis {axis} is not a whole {groups} groups"
+            ),
+            Fault::Unsliceable {
+                name,
+                axis,
+                shape,
+                at,
+                extent,
+            } => write!(
+                f,
+                "`{name}` is {shape:?}, whose axis {axis} does not hold {extent} \
+                 starting at {at}"
             ),
             Fault::Refused { verb, why } => write!(f, "{verb} is refused: {why}"),
             Fault::Uncuttable { axis, whole, mine } => write!(
@@ -481,6 +500,9 @@ fn run(s: &Source, read: &dyn Fn(&str) -> Option<HostTensor>) -> Result<HostTens
             deinterleave(fetch(name, read)?, name, *axis, *groups)
         }
         Source::Squeeze(name, axis) => squeeze(fetch(name, read)?, name, *axis),
+        Source::Slice(name, axis, at, extent) => {
+            slice(fetch(name, read)?, name, *axis, *at, *extent)
+        }
     }
 }
 
@@ -619,6 +641,44 @@ fn deinterleave(t: HostTensor, name: &str, axis: u32, groups: u32) -> Result<Hos
 
 /// Drop one extent-1 axis. Bytes do not move; the rectangle loses a
 /// degenerate axis the checkpoint's framework put there.
+/// One contiguous run along `axis`, gathered.
+///
+/// STRIDED BY CONSTRUCTION, and cheap anyway. Slicing `[vocab, 10752]` down to
+/// `[vocab, 256]` copies 256 elements out of every 10752, once per row — a
+/// load-time gather of 128 MiB, against a bank the plane could not have bound
+/// at all. `Source::Slice` says why the text wants it.
+fn slice(t: HostTensor, name: &str, axis: u32, at: u64, extent: u64) -> Result<HostTensor, Fault> {
+    let a = axis as usize;
+    let unsliceable = || Fault::Unsliceable {
+        name: name.to_string(),
+        axis,
+        shape: t.shape.clone(),
+        at,
+        extent,
+    };
+    let n = *t.shape.get(a).ok_or_else(unsliceable)?;
+    if extent == 0 || at.saturating_add(extent) > n {
+        return Err(unsliceable());
+    }
+    let width = t.dtype.width() as u64;
+    // Everything under the axis travels together; everything above it is a
+    // separate run. Both are products rather than a special case for the
+    // leading axis, which is what lets one body serve `[vocab, cols]` and a
+    // fused `[experts, out, in]` alike.
+    let inner: u64 = t.shape[a + 1..].iter().product::<u64>() * width;
+    let outer: u64 = t.shape[..a].iter().product();
+    let src = n * inner;
+    let dst = extent * inner;
+    let mut bytes = Vec::with_capacity((outer * dst) as usize);
+    for o in 0..outer {
+        let from = (o * src + at * inner) as usize;
+        bytes.extend_from_slice(&t.bytes[from..from + dst as usize]);
+    }
+    let mut shape = t.shape.clone();
+    shape[a] = extent;
+    Ok(HostTensor::new(shape, t.dtype, bytes))
+}
+
 fn squeeze(mut t: HostTensor, name: &str, axis: u32) -> Result<HostTensor, Fault> {
     let a = axis as usize;
     if t.shape.get(a) != Some(&1) {

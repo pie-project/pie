@@ -14,12 +14,16 @@ use crate::config::DriverKind;
 pub enum Flavor {
     #[cfg(feature = "_driver-cuda")]
     Cuda,
-    // `Metal`, `Vulkan` and `Wgpu` STOOD HERE. Their drivers left the
-    // workspace at R3 — the last two were the last consumers of
-    // `model-legacy` and `model_compiler::lower`, and none of the three can
-    // be brought forward without a baker executor of its own (P5).
-    // `DriverKind` still NAMES all three, so a deployment that asks for one
-    // is told what happened instead of being told its config is malformed.
+    // BACK AT P5, and only this one. `driver-metal` walks a
+    // `model_compiler::program::Program` through a baker executor of its own,
+    // which was the stated precondition for all three.
+    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+    Metal,
+    // `Vulkan` and `Wgpu` STOOD HERE and are still out: they were the last
+    // consumers of `model-legacy` and `model_compiler::lower`, and neither has
+    // its executor yet. `DriverKind` still NAMES both, so a deployment that
+    // asks for one is told what happened instead of being told its config is
+    // malformed.
 }
 
 impl Flavor {
@@ -28,6 +32,8 @@ impl Flavor {
         match self {
             #[cfg(feature = "_driver-cuda")]
             Flavor::Cuda => "cuda",
+            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+            Flavor::Metal => "metal",
         }
     }
 
@@ -46,10 +52,32 @@ impl Flavor {
                     Err(missing_feature_msg("cuda_native", "driver-cuda"))
                 }
             }
-            // METAL IS BACK IN THE WORKSPACE and still hosted by no build,
-            // which are two different facts and this arm now states the
-            // second one only. See `unhosted_msg`.
-            DriverKind::Metal => Err(unhosted_msg()),
+            // HOSTED NOW. The wiring `unhosted_msg` stood here to describe —
+            // "`worker` states no `driver-metal` feature to select it with" —
+            // is this feature, so the arm is the same cfg pair CUDA's is. The
+            // message a non-Apple or featureless build gets is the ordinary
+            // "rebuild with a feature", which is advice that works.
+            DriverKind::Metal => {
+                // THREE ANSWERS, because there are three states and only one
+                // of them is "rebuild with a feature". Metal's device half is
+                // Apple-only at the crate level, so a Linux build with the
+                // feature ON still hosts nothing — and telling that operator
+                // to enable a flag they already enabled is advice that cannot
+                // work, which is the failure `retired_msg` exists to avoid one
+                // case over.
+                #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+                {
+                    Ok(Flavor::Metal)
+                }
+                #[cfg(all(feature = "driver-metal", not(target_vendor = "apple")))]
+                {
+                    Err(non_apple_msg())
+                }
+                #[cfg(not(feature = "driver-metal"))]
+                {
+                    Err(missing_feature_msg("metal", "driver-metal"))
+                }
+            }
             DriverKind::Vulkan => Err(retired_msg("vulkan")),
             DriverKind::Wgpu => Err(retired_msg("wgpu")),
         }
@@ -62,10 +90,10 @@ impl Flavor {
 /// is advice that would not work, because the crate the feature would name is
 /// not in the workspace.
 ///
-/// TWO OF THE THREE, since P5. `driver-metal` is a member again and has the
-/// baker executor R3 named as the condition of its return, so the sentence
-/// below stopped being true of it; [`unhosted_msg`] is the half that still
-/// is.
+/// TWO OF THE THREE. `driver-metal` is a member again, has the baker executor
+/// R3 named as the condition of its return, and is now wired through to a
+/// binary — so the sentence below is false of it and it takes the ordinary
+/// `missing_feature_msg` instead. `vulkan` and `wgpu` are what is left.
 fn retired_msg(toml_type: &str) -> String {
     format!(
         "driver type {toml_type:?} is not hosted by any build of pie right \
@@ -76,30 +104,24 @@ fn retired_msg(toml_type: &str) -> String {
     )
 }
 
-/// Metal: IN the workspace, and hosted by nothing.
+/// The feature is on and the target cannot host it.
 ///
-/// Worth a second function rather than a reworded first. `driver-metal` came
-/// back at P5 with the executor R3 named as the condition, and its portable
-/// half — the walk, the bound statements, the layout arithmetic — builds and
-/// tests on every host in the tree. What no build hosts is the SERVING half,
-/// which is behind that crate's `metal-4` feature and `compile_error!`s off
-/// an Apple target. So "rebuild with a feature" is advice that would work, on
-/// a Mac, once `worker` grows the feature to name it with — and saying "it
-/// left the workspace" would send a reader looking for a crate that is right
-/// there.
-fn unhosted_msg() -> String {
+/// Not [`missing_feature_msg`], whose advice is "rebuild with a feature" — it
+/// is already on. Not [`retired_msg`] either: the crate is right there and
+/// builds, it is the DEVICE half that has no implementation off Apple, which
+/// `driver-metal`'s own `compile_error!` says in as many words.
+#[cfg(all(feature = "driver-metal", not(target_vendor = "apple")))]
+fn non_apple_msg() -> String {
     format!(
-        "driver type \"metal\" is not hosted by any build of pie right now. \
-         `driver-metal` IS in the workspace and has its baker executor (P5); \
-         what is missing is the wiring — its serving half is behind that \
-         crate\'s `metal-4` feature, which needs an Apple target, and `worker` \
-         states no `driver-metal` feature to select it with. Compiled \
-         flavors: {compiled}.",
+        "driver type \"metal\" needs an Apple target and this binary was \
+         built for another. The `driver-metal` feature IS on — what it selects \
+         off Apple is the driver's portable half, which answers questions no \
+         GPU changes and serves nothing. Compiled flavors: {compiled}.",
         compiled = compiled_summary(),
     )
 }
 
-#[cfg(not(feature = "_driver-cuda"))]
+#[cfg(not(all(feature = "_driver-cuda", feature = "driver-metal")))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
         "driver type {toml_type:?} is not built into this binary. \
@@ -118,12 +140,17 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
 )]
 pub fn compiled_summary() -> String {
     #[cfg_attr(
-        not(feature = "_driver-cuda"),
-        allow(unused_mut, reason = "the push below is feature-gated")
+        not(any(
+            feature = "_driver-cuda",
+            all(feature = "driver-metal", target_vendor = "apple")
+        )),
+        allow(unused_mut, reason = "the pushes below are feature-gated")
     )]
     let mut out: Vec<&'static str> = Vec::new();
     #[cfg(feature = "_driver-cuda")]
     out.push("cuda");
+    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+    out.push("metal");
     out.join(", ")
 }
 
@@ -137,9 +164,13 @@ pub fn compiled_summary() -> String {
 pub fn compiled_embedded() -> [(&'static str, bool); 4] {
     [
         ("cuda_native", cfg!(feature = "_driver-cuda")),
-        // FALSE, and not because a feature is off: these three drivers are
-        // out of the workspace until P5. See `retired_msg`.
-        ("metal", false),
+        // A FEATURE NOW, like cuda's. Metal is wired through to a binary; the
+        // two below are still false for the reason `retired_msg` gives, which
+        // is not a feature being off.
+        (
+            "metal",
+            cfg!(all(feature = "driver-metal", target_vendor = "apple")),
+        ),
         ("vulkan", false),
         ("wgpu", false),
     ]

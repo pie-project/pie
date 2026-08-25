@@ -460,6 +460,10 @@ required-features = ["_cuda"]
 name = "entry_validation"
 required-features = ["_cuda"]
 
+[[test]]
+name = "moe_unrouted"
+required-features = ["_cuda"]
+
 # `gpu_plan_load` STOOD HERE. It compiled a `model_legacy` load contract for
 # a cached Qwen3-0.6B and staged it into device memory; R3 deleted the
 # contract, so its subject is gone. What replaced it is `baker_serve`, which

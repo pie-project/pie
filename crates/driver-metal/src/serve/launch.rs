@@ -384,6 +384,10 @@ impl Shell {
                     token_ids: &plan.token_ids,
                     position_ids: &plan.position_ids,
                     req_of_token: &req,
+                    // THE WIRE'S OWN CSR. The prefill lane's attention reads
+                    // it; the decode lane's does not, which is why it went
+                    // unstaged for as long as one lane was all that fired.
+                    qo_indptr: &plan.qo_indptr,
                     kv_page_indices: &plan.kv_page_indices,
                     kv_page_indptr: &plan.kv_page_indptr,
                     // The pool's, so `stage` can check the run reaches the
@@ -566,7 +570,27 @@ impl Shell {
                 regions: &mut self.regions,
                 recordings: Some(&mut self.recordings),
             };
+            // **THE ONE SPLIT THAT SAYS KERNEL OR DRIVER.** Everything up to
+            // and including `submit` is HOST work — the walk, the staging, the
+            // recording lookup, the encode or the ICB replay — and the wait in
+            // `retire` is the GPU. A decode step that is slow because of its
+            // kernels and one that is slow because of what runs before them
+            // are the same wall-clock number and different problems, and
+            // nothing here could tell them apart.
+            let began = std::time::Instant::now();
             let fire = crate::fire::run::submit(&mut machine, arena, &dispatches, &blits)?;
+            #[allow(
+                clippy::print_stderr,
+                reason = "a probe that splits host from device is the job"
+            )]
+            if std::env::var_os("PIE_METAL_TRACE_FIRE").is_some() {
+                eprintln!(
+                    "PIE_FIRE host {:.3} ms over {} dispatches ({} blits)",
+                    began.elapsed().as_secs_f64() * 1e3,
+                    dispatches.len(),
+                    blits.len(),
+                );
+            }
             // Committed, not waited for. The `Fire` is dropped at the end
             // of this iteration, so the read-out's shape travels with it.
             //
@@ -676,7 +700,22 @@ fn retire(
     faults: &mut Vec<(u64, String)>,
 ) -> Result<()> {
     for (step, committed) in in_flight.drain(..) {
+        let began = std::time::Instant::now();
         stepper.wait_for(committed.fire.value)?;
+        // THE DEVICE'S HALF. Submission is asynchronous, so this is the fire's
+        // GPU time minus whatever of it overlapped the host work above — which
+        // is the right reading for a decode, where there is one fire in flight
+        // and nothing to overlap with.
+        #[allow(
+            clippy::print_stderr,
+            reason = "a probe that splits host from device is the job"
+        )]
+        if std::env::var_os("PIE_METAL_TRACE_FIRE").is_some() {
+            eprintln!(
+                "PIE_FIRE wait {:.3} ms",
+                began.elapsed().as_secs_f64() * 1e3
+            );
+        }
         // What this fire's gated-DeltaNet layers wrote becomes what the
         // next one reads. After the wait, because it is a host `memmove`
         // over the same planes the fire was writing.
@@ -969,8 +1008,14 @@ impl crate::baker::Pools for FireStaging<'_> {
     // layer it holds is laid out alike and the argument changes nothing
     // here. A tower that attends at two widths -- gemma-4 -- wants two
     // pools, and this is the method that would tell them apart.
-    fn kv_geometry(&self, _layer: u32) -> crate::baker::KvGeometry {
+    fn kv_geometry(&self, layer: u32) -> crate::baker::KvGeometry {
         let shape = self.pool.shape();
+        // **THIS LAYER'S WIDTH, NOT THE POOL'S FIRST.** `Shape` has stated two
+        // since gemma-4 — `heads_at` is what answers which — and this read the
+        // base pair for every layer, so a full-attention layer of an
+        // alternating tower got the sliding one's heads and per-head width.
+        // Nothing in the tree had a row that attends at two widths to say so.
+        let (kv_heads, head_dim) = shape.heads_at(layer);
         crate::baker::KvGeometry {
             page_size: i32::try_from(shape.page_size).unwrap_or(0),
             // **BOTH IN ELEMENTS OVER THE PAGE'S OWN AXES, AND `head_stride`
@@ -991,8 +1036,8 @@ impl crate::baker::Pools for FireStaging<'_> {
             // builds its own view. `tests/banked_argmax.rs` is what found it,
             // at op 66 of a qwen3.5 decode, and the refusal named the number:
             // an appended row of 512 against a head stride of 2048.
-            seq_stride: u64::from(shape.kv_heads) * u64::from(shape.head_dim),
-            head_stride: u64::from(shape.head_dim),
+            seq_stride: u64::from(kv_heads) * u64::from(head_dim),
+            head_stride: u64::from(head_dim),
         }
     }
 

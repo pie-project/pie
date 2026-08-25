@@ -1356,6 +1356,123 @@ impl Default for CudaNativeDriverOptions {
     }
 }
 
+/// `[model.driver.options]` for `type = "metal"` (Apple Silicon MLX/Metal
+/// driver) — page geometry, forward limits, and timeouts; the metal driver
+/// speaks the embedded in-process ABI. `device` is the `metal:N` selector
+/// filled from `model.driver.device`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetalDriverOptions {
+    /// `[model] id`: the operator's answer to "which model is this".
+    ///
+    /// Absent — the ordinary case — the driver identifies the checkpoint
+    /// from its TENSORS against the catalog every driver links. Present,
+    /// it names a row directly, for a checkpoint that is genuinely a
+    /// known model under an unknown name: a fine-tune, a re-upload, a
+    /// mirror that renamed the directory.
+    ///
+    /// It is an OVERRIDE and not a bypass. The named row's manifest is
+    /// still matched, so this cannot be used to load a checkpoint as
+    /// something it is not — which is the failure the whole arrangement
+    /// exists to prevent.
+    pub model_id: Option<String>,
+    /// KV page size in tokens. Used as given -- unlike the CUDA driver, the
+    /// Metal driver has no planner to derive one.
+    pub kv_page_size: u32,
+    /// KV pages to allocate. Used directly, and 1024 is a real default.
+    ///
+    /// The CUDA driver's nearest equivalent is `max_total_pages`, which is a
+    /// different quantity with a name that now says so: a ceiling over a
+    /// derived number, usually absent.
+    pub total_pages: u32,
+    /// Tokens one forward pass may carry, across all requests in the batch.
+    pub max_forward_tokens: u32,
+    /// Requests one forward pass may carry. Also what `max_concurrent_processes`
+    /// derives from when the operator leaves it unset.
+    pub max_forward_requests: u32,
+    /// Host-memory KV pages to swap into. `0` disables swapping.
+    pub cpu_pages: u32,
+    /// Tokens the KV ring holds across the whole resident fleet. Absent -- the
+    /// default -- keeps the driver's own constant, which is what a `pie serve`
+    /// fleet wants and what every run got before this existed.
+    ///
+    /// The one knob that shrinks the KV, and it only shrinks: the driver
+    /// clamps to its own ceiling, so this cannot ask for a ring it will not
+    /// build. `total_pages` is NOT that knob and never was -- the simple
+    /// families derive their pool from this context and discard it.
+    pub max_model_len: Option<u32>,
+    /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
+    /// a narrower one buys pages at some accuracy.
+    pub kv_cache_dtype: String,
+    /// Page routed MoE experts in from a mapping of the checkpoint instead of
+    /// keeping every expert resident in the heap.
+    ///
+    /// The same knob, spelled the same way, as the CUDA driver's -- because it
+    /// is the same decision: a residency trade the operator makes about a
+    /// model. What the two backends *do* with it differs (CUDA copies through
+    /// a bounded slab, Metal binds over a file-backed mapping and lets the
+    /// kernel evict), which is a backend's business and not the operator's.
+    ///
+    /// Off by default: it trades resident memory for page faults, which only
+    /// pays when the weights do not comfortably fit.
+    pub stream_routed_experts: bool,
+    /// How many bytes the routed experts may occupy on the device, or `None`
+    /// to keep the whole bank resident.
+    ///
+    /// A stronger statement than `stream_routed_experts` and a different
+    /// mechanism, not a dial on the same one. Streaming binds the bank over a
+    /// mapping, and on Apple Silicon every mapped page is WIRED -- so it moves
+    /// bytes out of the heap but bounds nothing. A budget turns the mapping
+    /// off and pages experts through a slab of exactly this size, which is the
+    /// only setting under which a checkpoint larger than the machine can be
+    /// admitted at all. It costs a submit-and-wait per mixture layer, so it is
+    /// for when the alternative is not running.
+    ///
+    /// `None` and not 0 for "unset", the way the CUDA driver spells
+    /// `expert_cache`: the C++ side already reads an absent key as "keep the
+    /// bank resident", so a sentinel would be a second spelling of one thing.
+    ///
+    /// The C++ has read `[model].expert_slab_bytes` since the slab landed;
+    /// what was missing was any way for an operator to say it, which made the
+    /// one feature that admits an oversized model reachable only from a test
+    /// binary's environment variable.
+    pub expert_slab_bytes: Option<u64>,
+    /// Metal device string, e.g. `"metal:0"`. Populated from
+    /// `model.driver.device` rather than written here.
+    #[serde(skip)]
+    pub device: String,
+    /// Driver-side verbose logging. Populated from `server.verbose` rather
+    /// than written here.
+    #[serde(skip)]
+    pub verbose: bool,
+    /// How long to wait for the driver's caps handshake before giving up.
+    /// Generous because it covers loading the weights.
+    pub ready_timeout: Duration,
+    /// How long to wait for the driver to drain before abandoning it.
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for MetalDriverOptions {
+    fn default() -> Self {
+        Self {
+            model_id: None,
+            kv_page_size: 32,
+            total_pages: 1024,
+            max_forward_tokens: 10240,
+            max_forward_requests: 512,
+            cpu_pages: 0,
+            max_model_len: None,
+            kv_cache_dtype: "auto".to_string(),
+            stream_routed_experts: false,
+            expert_slab_bytes: None,
+            device: "metal:0".to_string(),
+            verbose: false,
+            ready_timeout: Duration::from_secs(120),
+            shutdown_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 impl CudaNativeDriverOptions {
     fn validate(&self) -> Result<()> {
         ensure!(

@@ -49,7 +49,7 @@
 //! the third party, and it is the one that decides.
 
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::load::{Import, SfBase, copy, pack};
+use model_dsl::load::{Import, SfBase, copy, pack, slice};
 
 use super::model::{AttnBanks, Model};
 
@@ -119,10 +119,17 @@ pub fn import_hf<B: SfBase, W1: Dtype, K: KvDtype, const TP: usize>(
         );
     }
     if m.ple.is_some() {
-        i.write("ple.table", copy("embed_tokens_per_layer"));
         i.write("ple.model_proj", copy("per_layer_model_projection"));
         i.write("ple.model_norm", copy("per_layer_projection_norm"));
+        // ONE SLICE PER LAYER OUT OF THE ONE CHECKPOINT TENSOR. See
+        // `PleLayer::table`: `embed_tokens_per_layer` is `[vocab, layers *
+        // ple_dim]` and no shader plane can bind it whole.
+        let ple_dim = m.ple.as_ref().map_or(0, |p| u64::from(p.dim));
         for l in 0..m.layers.len() {
+            i.write(
+                format!("layer.{l}.ple_table"),
+                slice("embed_tokens_per_layer", 1, l as u64 * ple_dim, ple_dim),
+            );
             i.write(
                 format!("layer.{l}.ple_gate"),
                 copy(format!("layer.{l}.per_layer_input_gate")),

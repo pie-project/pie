@@ -1,6 +1,29 @@
 use crate::plane::{Bind, Const, Ctx, Fire, In, Out, elementwise_rows};
 use kernels::plane::Refusal;
 
+/// **RENORMALISE OVER THE CHOSEN k, NOT OVER EVERY EXPERT.**
+///
+/// `route.slang`'s `softmax_over_all` field, and it was a bare `1` here — so
+/// this plane's router divided each chosen logit by the sum over ALL thirty-two
+/// experts where every other plane divides by the sum over the four it kept.
+/// The four weights came out summing to 0.31 instead of 1, the mixture's output
+/// was three and a half times small, and the tower still answered a plausible
+/// token: `gptoss-20b`'s argmax was RIGHT and its logit 10.1250 against a
+/// banked 14.4375.
+///
+/// The experts chosen were identical, which is what made it invisible to
+/// everything but a value-by-value bisect: `moe.topk_softmax`'s route plane
+/// agreed EXACTLY between this plane and `driver-wgpu`, and only the weight
+/// plane beside it moved.
+///
+/// Named rather than written as a literal for exactly that reason. A `1` and a
+/// `0` in an argument list are two plausible numbers and neither says which
+/// question it is answering; `kernels-wgpu` names both and this now does too.
+const SOFTMAX_OVER_SELECTED: u32 = 0;
+
+/// The router's logit row has no pitch of its own — it is `n_experts` wide.
+const LOGITS_TIGHTLY_PACKED: u32 = 0;
+
 pub fn routed_qmv_grid(rows: i32, out_vec_size: i32, slots: i32) -> Result<[u32; 3], Refusal> {
     if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
@@ -56,6 +79,54 @@ pub fn router_grid(rows: i32) -> Result<[u32; 3], Refusal> {
     Ok([1024, rows.unsigned_abs(), 1])
 }
 
+/// The activation's two strides, from the shape it actually arrives in.
+///
+/// **A ROUTED MATVEC IS HANDED ONE OF TWO RECTANGLES** and the pair says which:
+///
+/// * one row per TOKEN, shared by every route — `(width, 0)`, so every slot of
+///   a row reads the same activation.
+/// * one row per ROUTE, already fanned out — `(width * top_k, width)`, so slot
+///   `s` of token `n` is at `n * top_k + s`.
+///
+/// This plane passed `(width, 0)` UNCONDITIONALLY. `gptoss-20b` hands it the
+/// second rectangle — `mlp.swiglu_clamp_alpha` lands four rows for one token —
+/// so all four experts contracted against route zero's activations and three
+/// of the four answers were of the wrong vector. The tower still answered the
+/// banked TOKEN, at a logit a whole point low.
+///
+/// `kernels-wgpu`'s `selected` derives the same pair for the same reason and
+/// refuses a third shape by name, which is what this now does.
+///
+/// # Errors
+///
+/// A rectangle that is neither, which is a plan this point cannot serve.
+fn activation_strides(
+    x_rows: i32,
+    x_width: i32,
+    tokens: i32,
+    top_k: i32,
+) -> Result<(i32, i32), Refusal> {
+    let routed = tokens.checked_mul(top_k).ok_or(Refusal::Grid {
+        what: "the route run, which is the tokens times the fan-out",
+        at: i64::from(tokens) * i64::from(top_k),
+    })?;
+    if x_rows == tokens {
+        return Ok((x_width, 0));
+    }
+    if x_rows == routed {
+        let row = x_width.checked_mul(top_k).ok_or(Refusal::Grid {
+            what: "the activation's row, which is the fan-out times its slot",
+            at: i64::from(x_width) * i64::from(top_k),
+        })?;
+        return Ok((row, x_width));
+    }
+    Err(Refusal::Narrow {
+        what: "the activation's rows, which are the fire's tokens or its routes and \
+               neither here",
+        at: i64::from(x_rows),
+    })
+}
+
 #[kernels_macros::claims]
 impl kernels::points::Moe for Ctx<'_> {
     fn topk_softmax<T: kernels::points::Scalar>(
@@ -80,8 +151,13 @@ impl kernels::points::Moe for Ctx<'_> {
 
         self.fire(
             Fire::at(
-                crate::plane::module_path("router_topk_bfloat16", self.best()),
-                "router_topk_bfloat16",
+                crate::plane::module_path("router_topk_f32w_bfloat16", self.best()),
+                // THE `f32w` ARM, because the point declares the weight plane
+                // `Out<Self::Tensor<f32>>`. `kernels-wgpu` fires its twin for
+                // the same reason; this plane fired the bf16 one, which writes
+                // half as many bytes into the slot and leaves the reader
+                // decoding two weights as one float.
+                "router_topk_f32w_bfloat16",
             )
             .apply(router_grid(row.rows)?),
             &[
@@ -90,8 +166,8 @@ impl kernels::points::Moe for Ctx<'_> {
                 weights.arg(),
                 experts.arg(),
                 top_k.arg(),
-                1u32.arg(),
-                0u32.arg(),
+                SOFTMAX_OVER_SELECTED.arg(),
+                LOGITS_TIGHTLY_PACKED.arg(),
             ],
         )
     }
@@ -111,6 +187,8 @@ impl kernels::points::Moe for Ctx<'_> {
         let act = x.all("the activation row this route selects against")?;
         let out = y.all("the routed result's row")?;
         let route = routes.all("the router's chosen experts")?;
+        let (row_stride, slot_stride) =
+            activation_strides(act.rows, act.width, route.rows, route.width)?;
 
         let bank = self.bank(bank)?;
         if bank.exponents.is_some() || bank.group != 64 || bank.bits != 4 {
@@ -135,8 +213,8 @@ impl kernels::points::Moe for Ctx<'_> {
                 act.width.arg(),
                 out.width.arg(),
                 routes.arg(),
-                0i32.arg(),
-                act.width.arg(),
+                slot_stride.arg(),
+                row_stride.arg(),
                 route.width.arg(),
             ],
         )
@@ -156,6 +234,8 @@ impl kernels::points::Moe for Ctx<'_> {
         let act = x.all("the activation row this route selects against")?;
         let out = y.all("the routed result's row")?;
         let route = routes.all("the router's chosen experts")?;
+        let (row_stride, slot_stride) =
+            activation_strides(act.rows, act.width, route.rows, route.width)?;
         let planes = bank.get();
         match R::FORM {
             kernels::points::Form::Mxfp4 => self.fire(
@@ -176,8 +256,8 @@ impl kernels::points::Moe for Ctx<'_> {
                     out.width.arg(),
                     bias.arg(),
                     routes.arg(),
-                    0i32.arg(),
-                    act.width.arg(),
+                    slot_stride.arg(),
+                    row_stride.arg(),
                     route.width.arg(),
                 ],
             ),

@@ -30,14 +30,23 @@
 #           BOUND at, and the largest ceiling any shader plane states is 4 GiB.
 #           Closing it is a change to the POINT, not to a driver.
 #
-#   vulkan  COMPUTES THROUGH THE POINTS PATH, and has not been driven end to
-#           end yet. A device opens, every module becomes a real pipeline, and
-#           a `norm.rmsnorm` goes Plan -> Program -> walk -> generated dispatch
-#           -> claim body -> vkCmdDispatch and lands inside one bf16 ulp of an
-#           f64 reference. `attention.sink` here is BIT-IDENTICAL to the CUDA
-#           twin over all 96 words, checked against a third harness built with
-#           nvcc rather than against carried constants. What it is short of is
-#           a `serve::run` of its own -- not a kernel.
+#   vulkan  SERVES BOTH. `gptoss-20b-bf16-mxfp4-kv-bf16` walks 555 statements
+#           into 579 dispatches on one submission with 240 staged `InOut`
+#           copies and answers token 11 at 14.5000 -- the banked token, one
+#           bf16 step off the banked 14.4375. `attention.sink` here is
+#           BIT-IDENTICAL to the CUDA twin over all 96 words, checked against a
+#           third harness built with nvcc rather than against carried
+#           constants.
+#
+#           `qwen35-d0.8b-bf16-kv-bf16` answers token 198 at 12.2500, the same
+#           one step off, and is the first fire on this plane ever to carry a
+#           recurrent slab -- `resources::RecurrentPool` did not exist and
+#           `Pools::slab` answered `None` for every layer, so a hybrid refused
+#           at its first scan.
+#
+#           Getting there opened four refused doors and closed five silent
+#           defects, none reachable by anything narrower than a whole tower
+#           compared to one that answers correctly.
 #
 #   metal   SERVES TWO OF THE THREE, on an Apple box and only there.
 #           `gptoss-20b-bf16-mxfp4-kv-bf16` answers 11 at 14.4375 EXACTLY, and

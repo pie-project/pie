@@ -107,6 +107,21 @@ const GPTOSS: Banked = Banked {
     logit: "14.4375",
 };
 
+/// **THE TOWER THAT ATTENDS AT TWO WIDTHS AND SHARES ITS CACHES.**
+///
+/// Forty-two layers over twenty-four caches — one each for layers 0..21, then
+/// one between every later sliding layer and one between every later full one
+/// — and the two kinds do not attend at the same width. `layout::kv::Shape`
+/// already states the second width (`global_head_dim`, `global_kv_heads`,
+/// `full_attn_every`) and already REFUSES a shared `kv_source`, so this row is
+/// the first thing to ask this plane for either.
+const GEMMA4: Banked = Banked {
+    sku: "gemma4-e4b-bf16-kv-bf16",
+    cache: "models--google--gemma-4-E4B-it",
+    id: 785,
+    logit: "7.5938",
+};
+
 /// The newest cached snapshot directory, or `None`.
 ///
 /// The `.index.json` arm is not optional politeness: this snapshot carries no
@@ -129,9 +144,29 @@ fn snapshot_of(cache_dir: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// One fire of one token through the Shell, and the whole logit row it
-/// published.
-fn logits_of(snap: &std::path::Path, sku: &str, vocab: usize, prompt: u32) -> Vec<f32> {
+/// Which way the tower is SPELLED for a fire.
+///
+/// Not a knob on the shell: `walk::frame::fire_class` derives it from the
+/// frame, one row per request being a decode and anything wider a prefill. So
+/// this is a shape of `LaunchPlan` and not an argument to one, which is why it
+/// lives here rather than being passed through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// One token, one request. Every banked answer was fired from this.
+    Decode,
+    /// Two tokens, one request, and the read-out is row ZERO.
+    ///
+    /// Row 0 of a causal prefill attends only to key 0, so it is the SAME
+    /// forward pass the decode above runs — the same weights into the same
+    /// empty pools, spelled differently. That is what lets it be asserted
+    /// against the banked answer rather than against the decode's, which is
+    /// the stronger of the two claims and the one that does not go stale if
+    /// the decode regresses.
+    Prefill,
+}
+
+/// One fire through the Shell, and the whole logit row it published.
+fn logits_of(snap: &std::path::Path, sku: &str, vocab: usize, prompt: u32, lane: Lane) -> Vec<f32> {
     // `Some(sku)` and not `None`: `[model] id` outranks the checkpoint's own
     // `config.json`, and naming the row is what makes this a fire of the row
     // the banked answer belongs to rather than of whatever the reader guessed.
@@ -250,12 +285,42 @@ fn logits_of(snap: &std::path::Path, sku: &str, vocab: usize, prompt: u32) -> Ve
     let cell_ptr: *mut driver_api::local::TerminalCell = &mut cell;
     let step = StepSubmission {
         plan: LaunchPlan {
-            token_ids: vec![prompt],
-            position_ids: vec![0],
+            // **THE FRAME IS WHAT PICKS THE LANE.** `fire_class` reads one row
+            // per request as a decode and anything wider as a prefill, so a
+            // prefill of this tower is two tokens in one request — and the
+            // read-out is then row 0, which attends only to key 0 and is
+            // therefore the decode's forward pass under another spelling.
+            token_ids: match lane {
+                Lane::Decode => vec![prompt],
+                Lane::Prefill => vec![prompt; 2],
+            },
+            position_ids: match lane {
+                Lane::Decode => vec![0],
+                Lane::Prefill => vec![0, 1],
+            },
             kv_page_indices: vec![0],
             kv_page_indptr: vec![0, 1],
-            kv_last_page_lens: vec![1],
-            qo_indptr: vec![0, 1],
+            kv_last_page_lens: match lane {
+                Lane::Decode => vec![1],
+                Lane::Prefill => vec![2],
+            },
+            qo_indptr: match lane {
+                Lane::Decode => vec![0, 1],
+                Lane::Prefill => vec![0, 2],
+            },
+            // WHICH ROW IS READ OUT, and a prefill has to say. An empty table
+            // is `sampled_rows` answering the empty list, which is right for a
+            // one-row fire and would publish two rows into a ring sized for
+            // one here. `0` is numbered inside the request, which is the
+            // numbering the wire uses.
+            sampling_indices: match lane {
+                Lane::Decode => Vec::new(),
+                Lane::Prefill => vec![0],
+            },
+            sampling_indptr: match lane {
+                Lane::Decode => Vec::new(),
+                Lane::Prefill => vec![0, 1],
+            },
             rs_slot_ids: vec![0],
             // THE SLAB IS THIS FIRE'S FIRST WRITE and must not be read as a
             // carry. A hybrid's eighteen gated-DeltaNet layers each hold a
@@ -313,25 +378,24 @@ fn logits_of(snap: &std::path::Path, sku: &str, vocab: usize, prompt: u32) -> Ve
     row
 }
 
-/// **THE MILESTONE.** A cached checkpoint, through the Shell that serves, on
-/// an Apple GPU, to the token cuda banked.
+/// **THE MILESTONE, ONCE.** A cached checkpoint, through the Shell that
+/// serves, on an Apple GPU, to the token cuda banked.
 ///
-/// `#[ignore]`d because it needs a Metal 4 device and 1.4 GiB of cached
-/// weights, which is the same reason `scripts/banked-argmaxes.sh` is not part
-/// of a default sweep.
-#[test]
-#[ignore = "needs a Metal 4 device and a cached checkpoint"]
-fn qwen35_d0_8b_answers_the_argmax_cuda_banked() {
-    let Some(snap) = snapshot_of(QWEN35.cache) else {
-        driver_metal::skip::skipped(&format!("`{}` is not cached", QWEN35.cache));
+/// One body for every row, because the rows differ in three constants and
+/// nothing else, and the two that were written out separately had drifted:
+/// one compared the rendered logit exactly and the other allowed a step, so
+/// which tolerance a row got depended on which body it had been copied from.
+fn gate(banked: &Banked, lane: Lane) {
+    let Some(snap) = snapshot_of(banked.cache) else {
+        driver_metal::skip::skipped(&format!("`{}` is not cached", banked.cache));
         return;
     };
-    let vocab = model::serve::row(QWEN35.sku)
-        .unwrap_or_else(|| panic!("`{}` is not a catalog row", QWEN35.sku))
+    let vocab = model::serve::row(banked.sku)
+        .unwrap_or_else(|| panic!("`{}` is not a catalog row", banked.sku))
         .vocab as usize;
     println!("checkpoint {} — vocabulary {vocab}", snap.display());
 
-    let row = logits_of(&snap, QWEN35.sku, vocab, PROMPT);
+    let row = logits_of(&snap, banked.sku, vocab, PROMPT, lane);
     assert_eq!(row.len(), vocab, "the read-out is not one whole row");
     let (id, logit) = row
         .iter()
@@ -348,15 +412,8 @@ fn qwen35_d0_8b_answers_the_argmax_cuda_banked() {
     // failures and the shape of the row tells them apart: a near-miss puts the
     // banked id in the top few and is precision; a row of zeros is a read-out
     // that never got published; a flat row with the banked id far down is a
-    // real forward of something else.
-    //
-    // AS OF THIS COMMIT IT IS THE THIRD. `driver-wgpu`, on the identical plan,
-    // answers 198 at 12.3125 with its top eight all under id 400 and a row
-    // mean of -0.3911. This plane answers 93126 at 10.9375, its top eight
-    // scattered across the whole 248320, mean 0.0651, and 198 at rank 8359.
-    // Same lane (Decode 0b1, 381 steps, row pitch 498688 — byte for byte what
-    // wgpu prints), same weights, and a prompt that provably reaches the embed
-    // (`a_different_prompt_moves_the_answer`). What is left is arithmetic.
+    // real forward of something else. Every metal defect this file found was
+    // read off these three lines before anything was opened.
     let mut order: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
     order.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / row.len() as f64;
@@ -367,44 +424,112 @@ fn qwen35_d0_8b_answers_the_argmax_cuda_banked() {
             .take(8)
             .map(|(i, v)| (*i, format!("{v:.4}")))
             .collect::<Vec<_>>(),
-        QWEN35.id,
-        order.iter().position(|(i, _)| *i == QWEN35.id),
-        row[QWEN35.id],
+        banked.id,
+        order.iter().position(|(i, _)| *i == banked.id),
+        row[banked.id],
     );
-    // **THE ID IS THE CLAIM AND THE LOGIT IS THE WITNESS**, and on this plane
-    // they are asserted differently.
+
+    // **THE ID IS THE CLAIM AND THE LOGIT IS THE WITNESS.**
     //
     // `driver-cuda`'s gate and `driver-wgpu`'s compare the rendered logit
     // exactly, and both can: an L40S runs both of them. This is an Apple GPU
-    // reducing in its own order, and it answers 12.2500 where cuda banked
-    // 12.3125 — **one bf16 step**, since the ulp at twelve is 0.0625. gpt-oss
-    // through this same shell answers 14.4375 exactly, so the difference is
-    // this tower's reductions and not this driver.
+    // reducing in its own order, and qwen3.5 answers 12.2500 where cuda banked
+    // 12.3125 — one bf16 step. gpt-oss through this same shell answers 14.4375
+    // exactly, so the difference is that tower's reductions and not this
+    // driver.
     //
     // Loosening the ID would be giving up the claim; loosening the logit to
-    // one ulp is saying what a bf16 logit is worth. A second ulp fails, which
-    // is what keeps this a comparison.
+    // one step is saying what a bf16 logit is worth. A second step fails.
     assert_eq!(
-        id, QWEN35.id,
+        id, banked.id,
         "the banked answer for `{}` is token {} and this fire answered {id} at \
          {rendered}",
-        QWEN35.sku, QWEN35.id,
+        banked.sku, banked.id,
     );
-    let banked: f32 = QWEN35.logit.parse().expect("the banked logit parses");
-    let ulp = 0.0625_f32;
+    let want: f32 = banked.logit.parse().expect("the banked logit parses");
+    // DERIVED, NOT WRITTEN DOWN. A bf16 carries eight mantissa bits, so its
+    // ulp is `2^(exponent - 7)`: 0.0625 at twelve and at fourteen, 0.03125 at
+    // seven. The constant this file used to hold was right for the two rows it
+    // had and would have handed gemma-4 twice the tolerance it is owed.
+    let ulp = (want.abs().log2().floor() - 7.0).exp2();
     assert!(
-        (logit - banked).abs() <= ulp,
-        "`{}` is banked at {banked} and this fire answered {rendered}, which is \
+        (logit - want).abs() <= ulp,
+        "`{}` is banked at {want} and this fire answered {rendered}, which is \
          {} away — past the {ulp} one bf16 step is at this magnitude",
-        QWEN35.sku,
-        (logit - banked).abs(),
+        banked.sku,
+        (logit - want).abs(),
     );
-    if rendered != QWEN35.logit {
+    if rendered != banked.logit {
         println!(
-            "(one bf16 step under the banked {}, and no more)",
-            QWEN35.logit
+            "(one bf16 step off the banked {}, and no more)",
+            banked.logit
         );
     }
+}
+
+/// **THE HYBRID.** See [`QWEN35`].
+///
+/// `#[ignore]`d because it needs a Metal 4 device and 1.4 GiB of cached
+/// weights, which is the same reason `scripts/banked-argmaxes.sh` is not part
+/// of a default sweep.
+#[test]
+#[ignore = "needs a Metal 4 device and a cached checkpoint"]
+fn qwen35_d0_8b_answers_the_argmax_cuda_banked() {
+    gate(&QWEN35, Lane::Decode);
+}
+
+/// **THE PURE-ATTENTION TOWER, and the bisect that exonerated the SSM family.**
+///
+/// See [`GPTOSS`]. This tower has no recurrence at all and it was once wrong
+/// the same way qwen3.5 was — 35698 at 9.3750 against a banked 11 at 14.4375,
+/// the whole 24-layer tower fired with no refusal. Both SKUs wrong meant the
+/// fault was in what they SHARE, and not in the eighteen gated-DeltaNet layers
+/// that are qwen3.5's alone. It was the host-staged `InOut` copies.
+#[test]
+#[ignore = "12.82 GiB of weights; the bisect against the hybrid above"]
+fn gptoss_20b_answers_the_argmax_cuda_banked() {
+    gate(&GPTOSS, Lane::Decode);
+}
+
+/// **THE TOWER AT TWO WIDTHS, OVER SHARED CACHES.** See [`GEMMA4`].
+#[test]
+#[ignore = "15 GiB of weights; the first row to ask this pool for two widths"]
+fn gemma4_e4b_answers_the_argmax_cuda_banked() {
+    gate(&GEMMA4, Lane::Decode);
+}
+
+/// **THE OTHER LANE, AND NO PLANE BUT wgpu HAD EVER FIRED IT.**
+///
+/// Every banked answer was fired from one row, which is a decode by the
+/// `qo_one` fact — so the prefill spelling of a real tower had never run
+/// through this shell. It is a different program over the same plan:
+/// `attention.prefill` where the decode states `attention.decode`, and for the
+/// hybrid `ssm.causal_conv1d_chunked` and `ssm.gated_delta_chunked` where it
+/// states the unchunked arms. Those arms are claimed here; nothing had walked
+/// a tower through them.
+///
+/// See [`Lane::Prefill`] for why row 0 must answer the BANKED token and not
+/// merely the same token the decode answers.
+#[test]
+#[ignore = "needs a Metal 4 device and a cached checkpoint"]
+fn the_qwen35_prefill_lane_answers_the_same_token() {
+    gate(&QWEN35, Lane::Prefill);
+}
+
+/// gpt-oss's prefill lane, which reaches `attention.prefill_lse` and the
+/// `attention.sink` that merges its partials.
+#[test]
+#[ignore = "the second load of a 20B checkpoint"]
+fn the_gptoss_prefill_lane_answers_the_same_token() {
+    gate(&GPTOSS, Lane::Prefill);
+}
+
+/// gemma-4's prefill lane, over two attention widths and twenty-four shared
+/// caches.
+#[test]
+#[ignore = "the second load of a 15G checkpoint"]
+fn the_gemma4_prefill_lane_answers_the_same_token() {
+    gate(&GEMMA4, Lane::Prefill);
 }
 
 /// **THE PROMPT IS LOAD-BEARING, and this is what says so.**
@@ -434,7 +559,7 @@ fn a_different_prompt_moves_the_answer() {
         .vocab as usize;
 
     let top = |prompt: u32| {
-        let row = logits_of(&snap, QWEN35.sku, vocab, prompt);
+        let row = logits_of(&snap, QWEN35.sku, vocab, prompt, Lane::Decode);
         let (id, logit) = row
             .iter()
             .enumerate()
@@ -450,53 +575,5 @@ fn a_different_prompt_moves_the_answer() {
         a, b,
         "two different prompts answered the same thing, which means the token \
          ids this fire staged never reached `layout.embed`",
-    );
-}
-
-/// gpt-oss through the same shell — see [`GPTOSS`] for why it is here.
-///
-/// **THE BISECT ANSWERED, AND IT EXONERATED THE SSM FAMILY.** This tower has
-/// no recurrence at all and it is wrong the same way: 35698 at 9.3750 against
-/// a banked 11 at 14.4375, the whole 24-layer tower fired with no refusal.
-/// Both SKUs wrong means the fault is in what they SHARE — the norms, the
-/// rope, the gemms, `layout.embed`, the attention families, or what this
-/// shell binds for them — and not in the eighteen gated-DeltaNet layers that
-/// are qwen3.5's alone.
-#[test]
-#[ignore = "12.82 GiB of weights; the bisect against the hybrid above"]
-fn gptoss_20b_answers_the_argmax_cuda_banked() {
-    let Some(snap) = snapshot_of(GPTOSS.cache) else {
-        driver_metal::skip::skipped(&format!("`{}` is not cached", GPTOSS.cache));
-        return;
-    };
-    let vocab = model::serve::row(GPTOSS.sku)
-        .unwrap_or_else(|| panic!("`{}` is not a catalog row", GPTOSS.sku))
-        .vocab as usize;
-    println!("checkpoint {} — vocabulary {vocab}", snap.display());
-
-    let row = logits_of(&snap, GPTOSS.sku, vocab, PROMPT);
-    let (id, logit) = row
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .expect("a non-empty vocabulary");
-    let rendered = format!("{logit:.4}");
-    println!("ARGMAX {id} at {rendered}");
-    let mut order: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
-    order.sort_by(|a, b| b.1.total_cmp(&a.1));
-    println!(
-        "banked {} ranks {:?} at {:.4}",
-        GPTOSS.id,
-        order.iter().position(|(i, _)| *i == GPTOSS.id),
-        row[GPTOSS.id],
-    );
-    assert_eq!(
-        (id, rendered.as_str()),
-        (GPTOSS.id, GPTOSS.logit),
-        "the banked answer for `{}` is {} at {} and this fire answered {id} at \
-         {rendered}",
-        GPTOSS.sku,
-        GPTOSS.id,
-        GPTOSS.logit,
     );
 }

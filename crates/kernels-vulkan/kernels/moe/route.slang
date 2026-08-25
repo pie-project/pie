@@ -53,7 +53,24 @@
 #if defined(PIE_ROUTER_TOPK)
 PIE_BUFFER_RO(0, logits);
 [[vk::binding(1)]] RWStructuredBuffer<int> expert_ids;
+// **THE WEIGHT PLANE'S ELEMENT IS THE POINT'S, NOT THIS FILE'S DEFAULT.**
+// `Moe::topk_softmax` declares `weights: Out<Self::Tensor<f32>>` — a router
+// weight is a probability and every plane folds with it in float — while the
+// legacy routed families stage theirs at `PIE_ACT`. Both arms exist for that
+// reason, exactly as `kernels-wgpu`'s `PIE_F32W` does.
+//
+// Firing the bf16 arm at an f32 slot is what this plane did, and it is
+// PLAUSIBLE rather than obviously broken: bf16 IS the top half of an f32, so
+// two adjacent weights read as one float come back with the second one's
+// exponent and the first one's bits as mantissa — a small, ordinary-looking
+// number. `gptoss-20b`'s four weights summed to 0.31 instead of 1, the mixture
+// came out three and a half times small, and the tower answered the right
+// token at the wrong logit.
+#if defined(PIE_F32W)
+[[vk::binding(2)]] RWStructuredBuffer<float> expert_weights;
+#else
 PIE_BUFFER_RW(2, expert_weights);
+#endif
 // MOVED DOWN A BINDING: `RouterParams` was 3 and this was 4. The binding stays
 // declared outside the `PIE_SCALED` guard so the descriptor exists in both
 // modules -- slangc deletes it from the unscaled one for being unread, which is
@@ -130,7 +147,11 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
             w *= PIE_LOAD(per_expert_scale[e]);
 #endif
             expert_ids[row * k + r] = int(e);
+#if defined(PIE_F32W)
+            expert_weights[row * k + r] = w;
+#else
             expert_weights[row * k + r] = PIE_STORE(w);
+#endif
         }
     }
 }
@@ -390,6 +411,7 @@ void main(uint3 thread: SV_DispatchThreadID) {
 // pie:instantiate route_gather PIE_ROUTE_GATHER=1
 // pie:instantiate route_sort PIE_ROUTE_SORT=1
 // pie:instantiate router_topk_bfloat16 PIE_ROUTER_TOPK=1
+// pie:instantiate router_topk_f32w_bfloat16 PIE_ROUTER_TOPK=1 PIE_F32W=1
 // pie:instantiate router_topk_scaled_bfloat16 PIE_ROUTER_TOPK=1 PIE_SCALED=1
 // pie:instantiate shared_expert_combine
 // pie:instantiate shared_expert_combine_strided PIE_STRIDED=1

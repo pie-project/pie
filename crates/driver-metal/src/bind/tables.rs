@@ -40,6 +40,14 @@ pub struct Frame<'a> {
     pub position_ids: &'a [u32],
     /// Which request owns each token.
     pub req_of_token: &'a [u32],
+    /// The request CSR: `qo_indptr[r]..qo_indptr[r + 1]` are request `r`'s
+    /// rows. **ROWS ARE THE REQUEST COUNT AND THE WIDTH IS ONE MORE** — the
+    /// shape `walk::fire`'s `runtime` states for it.
+    ///
+    /// The PREFILL lane's attention reads it and the decode lane's does not,
+    /// which is why a driver that never staged it served every banked answer
+    /// and refused its other lane at op 9.
+    pub qo_indptr: &'a [u32],
     /// The page list, and the CSR into it.
     pub kv_page_indices: &'a [u32],
     /// See [`Self::kv_page_indices`].
@@ -141,12 +149,15 @@ impl Staged {
             FireTable::AttentionMaskEnabled => 8,
             FireTable::RecurrentSlots => 9,
             FireTable::AttentionMask => return None,
-            // `QoIndptr` and `RowValid` are rows of `kernels::runtime::TIER1`
-            // that this path does not stage: `serve::launch` builds a fire's
-            // frame from the wire's own plan and neither plane is on it. A
-            // slot naming one gets `None` — a refusal at the walk — rather
-            // than an address into somebody else's table.
-            FireTable::QoIndptr | FireTable::RowValid => return None,
+            // TEN AND ELEVEN, appended rather than inserted: this list IS the
+            // order and renumbering it moves every table under every slot.
+            //
+            // They were `None` until the prefill lane was fired — *"serve::launch
+            // builds a fire's frame from the wire's own plan and neither plane
+            // is on it"*, which was true, and made every prefill of every tower
+            // refuse at its first attention. Both are on it now.
+            FireTable::QoIndptr => 10,
+            FireTable::RowValid => 11,
         };
         let (at, len) = *self.spans.get(i)?;
         (len > 0).then(|| Slice {
@@ -308,6 +319,26 @@ pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<S
     // reads. Empty for a stack with no linear layers.
     spans.push((blob.len(), frame.recurrent_slots.len()));
     blob.extend_from_slice(frame.recurrent_slots);
+    // Index TEN: the request CSR, which only the prefill lane's attention
+    // reads.
+    spans.push((blob.len(), frame.qo_indptr.len()));
+    blob.extend_from_slice(frame.qo_indptr);
+    // Index ELEVEN: `row_valid`, ONE BYTE PER ROW and every row of a fire this
+    // driver builds is valid.
+    //
+    // Packed four to a word, which is the whole subtlety: a word per row would
+    // put `01 00 00 00` under row 0 and hand rows 1, 2 and 3 a zero — "this
+    // row is not valid" — and the kernel would drop three quarters of a
+    // prefill without failing. The declared element is `i32` and the buffer
+    // must not be; `walk::fire`'s `runtime` states `Dt::U8` for exactly this.
+    //
+    // The span is in words, so the length `Staged::at` reports rounds UP to
+    // the word — three bytes past the rows, inside a region that holds them.
+    spans.push((blob.len(), frame.token_ids.len().div_ceil(4)));
+    blob.extend(std::iter::repeat_n(
+        0x0101_0101u32,
+        frame.token_ids.len().div_ceil(4),
+    ));
     let region = scratch.take(context, ((blob.len() * 4).max(4)) as u64, "fire tables")?;
     // SAFETY: leased for this fire, and no fire that could still be reading a
     // previous lease of it is in flight -- `Scratch` hands a region back only
@@ -327,6 +358,49 @@ pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<S
 #[allow(clippy::print_stderr)]
 mod tests {
     use super::*;
+
+    /// **`row_valid` IS ONE BYTE PER ROW AND THE FOURTH ROW IS THE TEST.**
+    ///
+    /// A word per row is the plausible packing and it is wrong in a way no
+    /// fire would report: rows 1, 2 and 3 would read the zero bytes of row 0's
+    /// word and be dropped as invalid, so a five-row prefill would compute one
+    /// row and answer fluently. Five rows is the shortest fire that crosses
+    /// the boundary in both directions -- one full word and one partial.
+    #[test]
+    fn row_valid_is_a_byte_a_row_and_not_a_word_a_row() {
+        let Ok(context) = Context::new() else {
+            crate::skip::skipped("no Metal 4 device");
+            return;
+        };
+        let ids = [7u32, 8, 9, 10, 11];
+        let staged = stage(
+            &context,
+            &Scratch::new(),
+            Frame {
+                token_ids: &ids,
+                qo_indptr: &[0, 5],
+                ..Frame::default()
+            },
+        )
+        .expect("it stages");
+        let valid = staged.at(FireTable::RowValid).expect("five rows are valid");
+        // Two words for five rows: the span rounds UP, inside a region that
+        // holds them.
+        assert_eq!(valid.bytes, 8);
+        // THROUGH THE REGION AND NOT THROUGH THE ADDRESS. A `Slice::address`
+        // is a GPU address; on this plane it is not a host pointer, and
+        // dereferencing it is a SIGBUS rather than a wrong number.
+        let at = (valid.address - staged.region().gpu_address()) as usize;
+        // SAFETY: shared storage the line above just wrote, and `at + 5` is
+        // inside the span `valid.bytes` names.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(staged.region().contents().as_ptr().cast::<u8>().add(at), 5)
+        };
+        assert_eq!(bytes, &[1, 1, 1, 1, 1], "a row of this fire is not valid");
+
+        let csr = staged.at(FireTable::QoIndptr).expect("one request");
+        assert_eq!(csr.bytes, 8, "the CSR is one more than the request count");
+    }
 
     #[test]
     fn a_table_this_fire_has_none_of_answers_nothing() {

@@ -124,9 +124,15 @@ fn split(b: &mut Bindings, pools: &dyn Pools) -> SplitView {
 ///
 /// `None` when the layer has no KV pool, for [`kv`]'s reason.
 pub(crate) fn attn_fire(b: &mut Bindings, pools: &dyn Pools, layer: u32) -> Option<AttnFireView> {
+    // THE POOL ROW FIRST, so a layer with none leaves before anything is asked
+    // ABOUT one. `Pools::kv_geometry` says in its own doc that it is only asked
+    // of a layer `kv` answered for, and this read it a line too early — which
+    // is invisible on a tower where every layer attends and a panic on a hybrid
+    // the moment the trait started taking a layer at all.
+    let kv = kv(b, pools, layer)?;
     let g = pools.kv_geometry(layer);
     Some(AttnFireView {
-        kv: kv(b, pools, layer)?,
+        kv,
         positions: Tensor::new(plane(b, pools.table(FireTable::Positions))),
         request_of_token: Tensor::new(plane(b, pools.table(FireTable::RequestOfToken))),
         mask: mask(b, pools),

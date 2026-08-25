@@ -1484,6 +1484,199 @@ impl Pool {
     }
 }
 
+/// Both recurrent planes are `f32`, and that is the KERNEL's property.
+///
+/// `ssm/gdn_prep.slang` and `ssm/gdn_core.slang` declare `conv_state` and
+/// `rstate` as `float`, so a driver sizing these from a model's `state_elem` —
+/// which some texts state as 2, meaning the bf16 a CUDA build uses — would
+/// allocate half a slab and index off the end of it on the first slot past
+/// zero. `driver-wgpu` and `driver-metal` both state this rather than derive
+/// it, for the same reason.
+pub const RECURRENT_ELEM_BYTES: u64 = 4;
+
+/// Two conv planes per layer: the one a fire READS and the one it WRITES.
+///
+/// A count rather than a `+ conv` folded into one expression, because it is
+/// the thing a reader doubts. The planes are the same size, the kernel takes
+/// both, and the second is not scratch that could be shared between layers —
+/// the carry back happens after the whole fire, so every layer's second plane
+/// is still live when the next layer runs.
+pub const CONV_PLANES: u64 = 2;
+
+/// What a hybrid's recurrent stack is, in the numbers a pool is sized from.
+///
+/// **THIS PLANE ALLOCATED NO RECURRENT SLAB AT ALL** until it was asked to
+/// serve one: `Pools::slab` answered `None` for every layer, so a walk over a
+/// hybrid refused at its first scan and `driver-vulkan` could serve only the
+/// pure-attention rows. `driver-wgpu`'s `Recurrent` is the same six numbers
+/// and `driver-metal`'s pool the same three planes; each plane owns its own
+/// because each allocates differently, which is this tree's standing law about
+/// two kernels that look alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recurrent {
+    /// How many layers of the stack are LINEAR-attention layers.
+    ///
+    /// Not the stack's depth: a hybrid interleaves full-attention layers that
+    /// carry KV pages and no state at all, and those allocate nothing here.
+    /// qwen3.5-0.8b is 24 layers of which 18 are linear.
+    pub linear_layers: u32,
+    /// Conv channel count — the width of the mixed q|k|v bank.
+    pub conv_dim: u32,
+    /// Conv kernel width, the window's depth in rows.
+    pub conv_k: u32,
+    /// Value heads.
+    pub v_heads: u32,
+    /// Value head dim.
+    pub v_dim: u32,
+    /// Key head dim — the recurrent state's inner extent.
+    pub k_dim: u32,
+    /// How many requests can hold a seat at once.
+    pub slots: u32,
+}
+
+impl Recurrent {
+    /// Bytes of one slot's conv window — the stride a conv plane is indexed by.
+    #[must_use]
+    pub const fn conv_bytes_per_slot(&self) -> u64 {
+        self.conv_k as u64 * self.conv_dim as u64 * RECURRENT_ELEM_BYTES
+    }
+
+    /// Bytes one slot's recurrent state occupies in ONE layer.
+    #[must_use]
+    pub const fn state_bytes_per_slot(&self) -> u64 {
+        self.v_heads as u64 * self.v_dim as u64 * self.k_dim as u64 * RECURRENT_ELEM_BYTES
+    }
+
+    /// Bytes of ONE of a layer's two conv planes.
+    #[must_use]
+    pub const fn conv_bytes_per_layer(&self) -> u64 {
+        self.conv_bytes_per_slot() * self.slots as u64
+    }
+
+    /// Bytes of one layer's whole recurrent-state plane.
+    #[must_use]
+    pub const fn state_bytes_per_layer(&self) -> u64 {
+        self.state_bytes_per_slot() * self.slots as u64
+    }
+
+    /// Bytes one slot costs across the WHOLE stack.
+    #[must_use]
+    pub const fn bytes_per_slot(&self) -> u64 {
+        self.linear_layers as u64
+            * (CONV_PLANES * self.conv_bytes_per_slot() + self.state_bytes_per_slot())
+    }
+}
+
+/// Three planes for every linear layer of a hybrid.
+pub struct RecurrentPool {
+    shape: Recurrent,
+    /// One per linear layer, keyed by the layer's position in the STACK.
+    ///
+    /// Sparse by layer NUMBER: a hybrid's linear layers are interleaved with
+    /// full-attention ones, and a kernel asks by the layer it is planning. So
+    /// the map is keyed on that number rather than packed, which costs a
+    /// lookup and cannot be indexed off by one.
+    conv: BTreeMap<u16, Buffer>,
+    fresh: BTreeMap<u16, Buffer>,
+    state: BTreeMap<u16, Buffer>,
+}
+
+impl RecurrentPool {
+    /// Allocate three planes for each of `layers`, zeroed.
+    ///
+    /// ZEROED BY THE DEVICE, one `vkCmdFillBuffer` per plane, for the reason
+    /// [`Pool::open`] gives at length — and here the zero is not merely tidy:
+    /// a carry that came up holding the previous deployment's state would make
+    /// the first token of a conversation depend on the last token of somebody
+    /// else's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::empty`]. A partial failure frees what it got, so a second
+    /// call fails for its own reason rather than for the first one's leak.
+    pub fn open(
+        device: &Device,
+        shape: Recurrent,
+        layers: impl IntoIterator<Item = u16>,
+    ) -> Result<Self, Failed> {
+        let conv_bytes = shape.conv_bytes_per_layer();
+        let state_bytes = shape.state_bytes_per_layer();
+        let mut conv = BTreeMap::new();
+        let mut fresh = BTreeMap::new();
+        let mut state = BTreeMap::new();
+        let zeroed = |device: &Device, bytes: u64| -> Result<Buffer, Failed> {
+            let b = device.empty(bytes)?;
+            device.zero(&b, 0, bytes).inspect_err(|_| device.free(b))?;
+            Ok(b)
+        };
+        for layer in layers {
+            let got = zeroed(device, conv_bytes)
+                .and_then(|c| zeroed(device, conv_bytes).map(|f| (c, f)))
+                .and_then(|(c, f)| zeroed(device, state_bytes).map(|s| (c, f, s)));
+            match got {
+                Ok((c, f, s)) => {
+                    conv.insert(layer, c);
+                    fresh.insert(layer, f);
+                    state.insert(layer, s);
+                }
+                Err(e) => {
+                    for b in conv
+                        .into_values()
+                        .chain(fresh.into_values())
+                        .chain(state.into_values())
+                    {
+                        device.free(b);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self {
+            shape,
+            conv,
+            fresh,
+            state,
+        })
+    }
+
+    /// What the pool was built to.
+    #[must_use]
+    pub const fn shape(&self) -> Recurrent {
+        self.shape
+    }
+
+    /// One layer's conv window — the plane a fire READS.
+    #[must_use]
+    pub fn conv(&self, layer: u16) -> Option<&Buffer> {
+        self.conv.get(&layer)
+    }
+
+    /// One layer's SECOND conv plane — the one a fire writes the shifted
+    /// window into. See [`CONV_PLANES`].
+    #[must_use]
+    pub fn new_conv(&self, layer: u16) -> Option<&Buffer> {
+        self.fresh.get(&layer)
+    }
+
+    /// One layer's recurrent state.
+    #[must_use]
+    pub fn state(&self, layer: u16) -> Option<&Buffer> {
+        self.state.get(&layer)
+    }
+
+    /// Free every plane.
+    pub fn close(self, device: &Device) {
+        for b in self
+            .conv
+            .into_values()
+            .chain(self.fresh.into_values())
+            .chain(self.state.into_values())
+        {
+            device.free(b);
+        }
+    }
+}
+
 impl Resolve for Pool {
     fn weight(&self, _name: &str) -> Option<&Buffer> {
         self.named.as_ref()

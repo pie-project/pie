@@ -780,8 +780,8 @@ fn a_resized_kv_pool_keeps_every_address_it_handed_out() {
     };
     let arena = Arena::new(256 * 1024 * 1024, 0);
     let mut stepper = Stepper::new(&context).expect("stepper");
-    let mut pool =
-        Pool::allocate_elastic(&context, &mut stepper, &arena, shape).expect("an elastic pool");
+    let mut pool = Pool::allocate_elastic(&context, &mut stepper, &arena, shape, &[])
+        .expect("an elastic pool");
     assert_eq!(pool.pages(), 64);
 
     let addresses: Vec<(u64, u64)> = (0..shape.layers)
@@ -867,7 +867,7 @@ fn a_fixed_pool_says_it_cannot_be_resized_rather_than_pretending() {
         global_kv_heads: 0,
         full_attn_every: 0,
     };
-    let mut pool = Pool::allocate(&context, shape).expect("a fixed pool");
+    let mut pool = Pool::allocate(&context, shape, &[]).expect("a fixed pool");
     let mut stepper = Stepper::new(&context).expect("stepper");
     assert!(
         pool.resize(&mut stepper, 4).is_err(),
@@ -877,8 +877,8 @@ fn a_fixed_pool_says_it_cannot_be_resized_rather_than_pretending() {
     assert_eq!(pool.pages(), 8, "a refused resize must change nothing");
 
     let arena = Arena::new(64 * 1024 * 1024, 0);
-    let mut elastic =
-        Pool::allocate_elastic(&context, &mut stepper, &arena, shape).expect("an elastic pool");
+    let mut elastic = Pool::allocate_elastic(&context, &mut stepper, &arena, shape, &[])
+        .expect("an elastic pool");
     assert!(
         elastic.resize(&mut stepper, 9).is_err(),
         "growing past the count the pool reserved address space for has \
@@ -915,8 +915,8 @@ fn a_pool_that_gave_memory_back_stops_reserving_it() {
     };
     let arena = Arena::new(256 * 1024 * 1024, 0);
     let mut stepper = Stepper::new(&context).expect("stepper");
-    let mut pool =
-        Pool::allocate_elastic(&context, &mut stepper, &arena, shape).expect("an elastic pool");
+    let mut pool = Pool::allocate_elastic(&context, &mut stepper, &arena, shape, &[])
+        .expect("an elastic pool");
 
     let full = arena.budget();
     assert!(

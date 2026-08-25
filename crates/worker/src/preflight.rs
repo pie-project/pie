@@ -6,6 +6,8 @@ use anyhow::{Result, anyhow};
 
 #[cfg(feature = "_driver-cuda")]
 use crate::config::CudaNativeDriverOptions;
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+use crate::config::MetalDriverOptions;
 use crate::config::{self, DriverKind};
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
@@ -105,6 +107,21 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
             })?;
             c.device = device.clone();
             Ok(DriverOptions::CudaNative(c))
+        }
+        // NO DEVICE SELECTOR, unlike the arm above. `Shell::open` takes the
+        // DEFAULT Metal 4 device and offers no way to name another, so filling
+        // one in here would be a setting nothing acts on —
+        // `MetalDriverOptions::device` exists for the startup TOML an operator
+        // reads, and is `#[serde(skip)]` for the same reason.
+        #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+        Flavor::Metal => {
+            let p: MetalDriverOptions = m
+                .driver
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+            Ok(DriverOptions::Metal(p))
         }
     }
 }

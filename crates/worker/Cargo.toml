@@ -21,8 +21,8 @@ crate-type = ["rlib"]
 # Default = no embedded backend feature. Enable `driver-cuda-12` /
 # `driver-cuda-13` (Linux/NVIDIA -- the number is the CUDA runtime ABI this
 # binary will LOAD) to reach a device; without it, this crate builds and
-# serves nothing locally. The three shader flavors (`driver-metal`,
-# `driver-vulkan`, `driver-wgpu`) left the workspace with R3 and return at
+# serves nothing locally. `driver-metal` returned at P5; the other two shader
+# flavors (`driver-vulkan`, `driver-wgpu`) left the workspace with R3 and return at
 # P5 — see the root manifest's `exclude`.
 #
 # There used to be a third: an always-linked `driver-dummy` selected at
@@ -39,6 +39,12 @@ default = []
 _driver-cuda = ["engine/_driver-cuda"]
 driver-cuda-12 = ["_driver-cuda", "engine/driver-cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "engine/driver-cuda-13"]
+# The Metal shell, BACK AT P5. Apple-only at the crate level, so unlike the
+# CUDA pair there is no ABI in the name and the flag alone is not a build that
+# links -- `engine`'s seam pairs it with `target_vendor = "apple"`. Named
+# without an underscore because `worker` has no private gate to hide behind:
+# every `#[cfg]` here reads this flag directly.
+driver-metal = ["engine/driver-metal"]
 nixl = ["dep:transport", "transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's

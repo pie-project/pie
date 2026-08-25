@@ -17,9 +17,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 // Every `with_context` in this file is inside cuda-gated code: the one
 // bootstrap-TOML writer left, and the two seams that read back what it wrote.
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 use anyhow::Context;
 
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+use crate::config::MetalDriverOptions;
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 #[cfg(any(feature = "_driver-cuda", test))]
 use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions};
 use crate::driver_ffi::Flavor;
@@ -77,6 +88,8 @@ fn nccl_unique_id_hex() -> Result<String> {
 pub enum DriverOptions {
     #[cfg(feature = "_driver-cuda")]
     CudaNative(CudaNativeDriverOptions),
+    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+    Metal(MetalDriverOptions),
     // `Metal`, `Vulkan` and `Wgpu` STOOD HERE, with their drivers, until R3
     // took all three out of the workspace. They return at P5; see
     // `driver_ffi::retired_msg`.
@@ -94,7 +107,12 @@ impl DriverOptions {
         match self {
             #[cfg(feature = "_driver-cuda")]
             DriverOptions::CudaNative(_) => Flavor::Cuda,
-            #[cfg(not(feature = "_driver-cuda"))]
+            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+            DriverOptions::Metal(_) => Flavor::Metal,
+            #[cfg(not(any(
+                feature = "_driver-cuda",
+                all(feature = "driver-metal", target_vendor = "apple")
+            )))]
             _ => unreachable!("`DriverOptions` has no variants in this build"),
         }
     }
@@ -171,7 +189,11 @@ pub fn set_cache_dir(dir: String) {
 /// Gated as `write_cuda_startup_toml` is, like `weight_cache_dir` above and
 /// for the same reason: emitting a bootstrap TOML is all this and the nine
 /// helpers under it are for, and the one seam still emitting one is cuda's.
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn cache_dir() -> String {
     CACHE_DIR.get().cloned().unwrap_or_default()
 }
@@ -181,7 +203,11 @@ fn cache_dir() -> String {
 /// Omitted when unset so a driver launched with a hand-written TOML (its own
 /// `dev.toml`, say) keeps the XDG derivation rather than losing its cache to
 /// an empty path.
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn insert_cache_table(doc: &mut toml::Table) {
     let dir = cache_dir();
     if dir.is_empty() {
@@ -192,27 +218,47 @@ fn insert_cache_table(doc: &mut toml::Table) {
     insert_table(doc, "cache", table);
 }
 
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
     table.insert(key.into(), toml::Value::Integer(value.into()));
 }
 
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
 
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn insert_bool(table: &mut toml::Table, key: &str, value: bool) {
     table.insert(key.into(), toml::Value::Boolean(value));
 }
 
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn insert_table(doc: &mut toml::Table, key: &str, table: toml::Table) {
     doc.insert(key.into(), toml::Value::Table(table));
 }
 
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn path_string(path: &Path) -> String {
     path.display().to_string()
 }
@@ -232,7 +278,11 @@ fn path_string(path: &Path) -> String {
 /// old name meant a `pie.model/1` document — ~40 resolved fields, a schema, a
 /// reader in each driver — and that document is deleted. What travels here is
 /// the checkpoint's own `config.json`, verbatim, read for exactly one field.
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn write_config_beside(out_path: &Path, config: &[u8], model: &mut toml::Table) -> Result<()> {
     let beside = out_path.with_file_name("model.config.json");
     std::fs::write(&beside, config).with_context(|| format!("write model config {beside:?}"))?;
@@ -276,14 +326,22 @@ fn write_config_beside(out_path: &Path, config: &[u8], model: &mut toml::Table) 
 /// OVERRIDE, for the case where a checkpoint is genuinely a known model
 /// under an unknown name — a fine-tune, a re-upload, a mirror that
 /// renamed the directory — and it does not skip the manifest check.
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn insert_model_id(model: &mut toml::Table, id: Option<&str>) {
     if let Some(id) = id.filter(|s| !s.is_empty()) {
         insert_str(model, "id", id);
     }
 }
 
-#[cfg(any(feature = "_driver-cuda", test))]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple"),
+    test
+))]
 fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
     let serialized = toml::to_string(&doc).map_err(|e| anyhow!("serialize bootstrap TOML: {e}"))?;
     if let Some(parent) = out_path.parent() {
@@ -521,11 +579,88 @@ pub(crate) fn write_cuda_startup_toml(
     write_toml_table(out_path, doc)
 }
 
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+/// Emit the metal driver's bootstrap TOML — same `[model]` + `[batching]` +
+/// `[runtime]` layout consumed by `crates/driver-metal/csrc/src/config.hpp`. The metal
+/// launch state is identical apart from the `metal:N` backend selector.
+///
+/// Not gated on `driver-metal`: what it produces is a TOML file, and whether
+/// the operator's settings survive into that file is a question a machine
+/// without a Metal device can still answer. Gating it would put the test out
+/// of reach of every machine that is not a Mac.
+pub(crate) fn write_metal_startup_toml(
+    out_path: &Path,
+    options: &MetalDriverOptions,
+    snapshot_dir: &Path,
+    _group_id: usize,
+    config: &[u8],
+) -> Result<()> {
+    let mut doc = toml::Table::new();
+
+    let mut model = toml::Table::new();
+    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
+    // Same arrangement as the CUDA driver.
+    write_config_beside(out_path, config, &mut model)?;
+    insert_model_id(&mut model, options.model_id.as_deref());
+    insert_str(&mut model, "backend", &options.device);
+    insert_bool(
+        &mut model,
+        "stream_routed_experts",
+        options.stream_routed_experts,
+    );
+    // Omitted when unset rather than written as 0: the driver reads an absent
+    // key as "the whole bank stays resident", which is the same statement.
+    if let Some(bytes) = options.expert_slab_bytes {
+        model.insert(
+            "expert_slab_bytes".into(),
+            toml::Value::Integer(bytes as i64),
+        );
+    }
+    insert_table(&mut doc, "model", model);
+
+    let mut batching = toml::Table::new();
+    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
+    insert_int(&mut batching, "total_pages", options.total_pages);
+    insert_int(
+        &mut batching,
+        "max_forward_tokens",
+        options.max_forward_tokens,
+    );
+    insert_int(
+        &mut batching,
+        "max_forward_requests",
+        options.max_forward_requests,
+    );
+    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
+    // Omitted when unset rather than written as 0: the driver reads absent and
+    // zero the same way, and a config that does not mention the knob is the
+    // honest record of a run that did not use it.
+    if let Some(len) = options.max_model_len {
+        insert_int(&mut batching, "max_model_len", len);
+    }
+    insert_table(&mut doc, "batching", batching);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", options.verbose);
+    insert_table(&mut doc, "runtime", runtime);
+    insert_cache_table(&mut doc);
+
+    write_toml_table(out_path, doc)
+}
+
 // -----------------------------------------------------------------------------
 // Native driver creation helpers.
 // -----------------------------------------------------------------------------
 
-#[cfg(feature = "_driver-cuda")]
+#[cfg(any(
+    feature = "_driver-cuda",
+    all(feature = "driver-metal", target_vendor = "apple")
+))]
 fn local_driver_state_dir(group_id: usize, tp: Option<&TpLaunch>) -> Result<PathBuf> {
     let rank_suffix = tp
         .as_ref()
@@ -676,7 +811,10 @@ pub(crate) fn create_driver_backend(
     // fall back to.
     let (mut backend, runtime_quant, mxfp4_moe): (::engine::driver::DriverBackend, &str, &str) =
         match options {
-            #[cfg(not(feature = "_driver-cuda"))]
+            #[cfg(not(any(
+                feature = "_driver-cuda",
+                all(feature = "driver-metal", target_vendor = "apple")
+            )))]
             _ => unreachable!("`DriverOptions` has no variants in this build"),
             #[cfg(feature = "_driver-cuda")]
             DriverOptions::CudaNative(opts) => {
@@ -714,12 +852,32 @@ pub(crate) fn create_driver_backend(
                     opts.runtime_quant.as_str(),
                     opts.mxfp4_moe.as_str(),
                 )
-            } // THE METAL, VULKAN AND WGPU ARMS STOOD HERE, and with them the
-              // one difference between the seams: `open::cuda` and
-              // `open::metal` open the file they are named, while
-              // `open::vulkan` and `open::wgpu` parsed the bytes they were
-              // given. All three drivers left the workspace at R3 and return
-              // at P5.
+            }
+            // METAL, BACK AT P5, AND IT HANDS OVER THE DOCUMENT — the same
+            // shape as the CUDA arm above, which it did NOT have before R3.
+            // `open::metal` used to be given the PATH, on the reading that the
+            // driver opened the file itself; the driver does not, and says so:
+            // `Shell::open` takes `[model] id` already parsed, because "a boot
+            // TOML is the engine's format, and a driver that read one would be
+            // the second thing entitled to an opinion about its shape." The
+            // file is still written — it is what an operator reads to see what
+            // the launch actually asked for — and then read back, so exactly
+            // one thing parses it.
+            //
+            // THE VULKAN AND WGPU ARMS STOOD HERE TOO and are still out:
+            // neither driver has the baker executor R3 named as the condition
+            // of its return.
+            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+            DriverOptions::Metal(opts) => {
+                let state_dir = local_driver_state_dir(group_id, tp)?;
+                let toml_path = state_dir.join("driver.toml");
+                write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id, config)?;
+                let boot_doc = std::fs::read(&toml_path).with_context(|| {
+                    format!("read the driver boot config just written to {toml_path:?}")
+                })?;
+                let backend = ::engine::driver::backend::open::metal(&boot_doc)?;
+                (backend, "", "")
+            }
         };
     // Uniform across backends now that the load is a request rather than a
     // compiled plan (§10.3). Unreachable in a build with no `driver-*`

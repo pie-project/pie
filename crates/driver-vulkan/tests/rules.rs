@@ -42,9 +42,9 @@ fn the_module_table_is_empty_only_when_nothing_was_asked_to_fill_it() {
     let n = kernels_vulkan::MODULES.len();
     if cfg!(feature = "device") {
         assert_eq!(
-            n, 698,
+            n, 699,
             "`device` is on, so `kernels-vulkan` was asked for its SPIR-V and \
-             the table holds {n} rather than 698. If a shader was ADDED or a \
+             the table holds {n} rather than 699. If a shader was ADDED or a \
              variant instantiated, raise this number — that edit is the \
              record. If it FELL, the sweeps below are reading less than they \
              read yesterday and every one of them still says `ok`, which is \
@@ -530,7 +530,13 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
     // `moe.weighted_sum` was missing — the sorted arm beside it folds through
     // an inverse permutation `route_sort` writes and no point of this plane
     // claims, so the point was in the claim table and could fire for nothing.
-    assert_eq!(modules, 698, "a different number of modules is built");
+    // AND 699 WITH THE f32-WEIGHT ROUTER. `router_topk_f32w_bfloat16` is the
+    // arm `Moe::topk_softmax` actually wants — the point declares its weight
+    // plane `Out<Self::Tensor<f32>>` and this plane fired the `PIE_ACT` one,
+    // which writes half as many bytes into the slot. It shares every binding
+    // with the arm beside it and differs only in one element type, so the
+    // holes do not move.
+    assert_eq!(modules, 699, "a different number of modules is built");
     assert_eq!(holed, 175, "a different number of modules has a hole");
     assert_eq!(holes, 420, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header

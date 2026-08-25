@@ -291,12 +291,29 @@ __device__ __forceinline__ void topk_softmax_body(
         float best_v = -1.f;
         int best_i = -1;
         block_argmax(probs, num_experts, -1.f, buf, ibuf, best_v, best_i);
+        // **A SLOT WITH NO EXPERT LEFT WEIGHS NOTHING**, and taking `best_v`
+        // here took the FLOOR. `block_argmax` seeds `best_value` at the floor
+        // and wins only strictly above it, so once every expert has been
+        // excluded it answers `(-1.f, -1)` — and `-1.f` went into `out_w` and
+        // into the normaliser.
+        //
+        // At `K == num_experts + 1` that is exactly fatal: the real weights are
+        // normalised probabilities summing to 1, so `w_sum` is `1 - 1 == 0`,
+        // `inv_w` is `+inf`, and EVERY weight in the row — including the real
+        // ones — comes out infinite. One more spare slot and they come out
+        // negated instead. Nothing faults either way.
+        //
+        // The other two routers in this file already answer zero here: the
+        // warp rungs by construction, since `expf(-flt_max() - row_max)` is
+        // `0`, and `topk_sqrt_softplus_body` by writing `best_i >= 0 ?
+        // probs[best_i] : 0.f` in as many words. This one was the odd one out.
+        const float w = best_i >= 0 ? best_v : 0.f;
         if (tid == 0) {
             out_idx[k] = best_i;
-            out_w[k] = best_v;
+            out_w[k] = w;
             if (best_i >= 0) probs[best_i] = -1.f;  // exclude on next pass
         }
-        w_sum += best_v;
+        w_sum += w;
         __syncthreads();
     }
     if (tid == 0) {
@@ -499,6 +516,11 @@ __global__ void apply_per_expert_scale(
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= total) return;
     const int e = topk_idx[t];
+    // An unrouted slot has no scale to apply and its weight is already the
+    // zero the router gave it, so leaving it alone is the whole right answer.
+    // Reading `per_expert_scale[-1]` instead is one element before the table
+    // and `0 * NaN` is `NaN`, which the combine would fold into the token.
+    if (e < 0) return;
     const float s = Logit<T>::to_f32(per_expert_scale[e]);
     topk_w[t] *= s;
 }

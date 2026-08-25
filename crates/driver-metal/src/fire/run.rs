@@ -271,7 +271,27 @@ pub fn submit(
         Some(recordings) => {
             match recordings.get_or_record(context, pipelines, &params, regions, dispatches) {
                 Ok(r) => Some((objc2::rc::Retained::from(r.buffer()), r.commands())),
-                Err(Error::Unrecordable { .. }) => None,
+                // THE REFUSAL GETS A READER, behind a switch. `Recordings::
+                // refusals` was written for "whoever has to say so" and had
+                // nobody: serving swallows this on purpose — an unrecordable
+                // fire is encoded instead, which is slower and right — so a
+                // deployment paying the encode every step had no way to learn
+                // it. The file's own words for what that costs are "a 374x
+                // slowdown deserves better than a count".
+                Err(err @ Error::Unrecordable { .. }) => {
+                    #[allow(
+                        clippy::print_stderr,
+                        reason = "a probe that says why a fire re-encodes is the job"
+                    )]
+                    if std::env::var_os("PIE_METAL_TRACE_RECORD").is_some() {
+                        eprintln!(
+                            "PIE_RECORD refused ({} dispatches, {} recorded so far): {err}",
+                            dispatches.len(),
+                            recordings.recorded(),
+                        );
+                    }
+                    None
+                }
                 Err(other) => return Err(other),
             }
         }

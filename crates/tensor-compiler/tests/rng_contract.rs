@@ -208,15 +208,32 @@ struct Allowlists {
     stride: &'static [&'static str],
     mask: &'static [&'static str],
     shift: &'static [&'static str],
+    /// The divisor of the same float conversion [`Allowlists::shift`] names.
+    ///
+    /// **HALF AN IDIOM HAD A LIST AND HALF DID NOT.** The shift and the
+    /// divisor are one reduction — take the top twenty-four bits, scale to
+    /// `[0, 1)` — and a file writing one writes the other. So an exemption
+    /// that could excuse the shift and not the divisor could excuse nothing,
+    /// and the only way past the guard was to claim the file OWNS the
+    /// contract, which is a much stronger and quite false statement.
+    ///
+    /// Found by `driver-metal/tests/fixtures/cuda_reference.cu`, which is a
+    /// splitmix64 input generator and not a PTIR stream.
+    ///
+    /// (Named in prose rather than written out, for the reason the `shift`
+    /// list gives about its own first draft: a comment that spells the
+    /// constant makes THIS file a transcription, and the guard says so.)
+    unit: &'static [&'static str],
 }
 
 impl Allowlists {
-    fn lists(&self) -> [(&'static str, &'static [&'static str]); 4] {
+    fn lists(&self) -> [(&'static str, &'static [&'static str]); 5] {
         [
             ("owners", self.owners),
             ("unrelated_stride_users", self.stride),
             ("unrelated_mask_users", self.mask),
             ("unrelated_shift_users", self.shift),
+            ("unrelated_unit_users", self.unit),
         ]
     }
 }
@@ -242,6 +259,11 @@ fn allowlists() -> Allowlists {
             STAGED_RNG_PREAMBLE,
         ],
         stride: &[
+            // The CUDA reference generator's splitmix64 increment. See this
+            // file's `shift` list for the whole argument: the fixture is an
+            // input generator for a cross-language comparison, and canonical
+            // splitmix happens to share the golden-ratio word.
+            "crates/driver-metal/tests/fixtures/cuda_reference.cu",
             "crates/gateway/src/route.rs",
             "crates/engine/src/inferlet/linker.rs",
             // splitmix64 id generation: the canonical splitmix increment
@@ -326,7 +348,23 @@ fn allowlists() -> Allowlists {
         // file stopped needing the exemption" from "the file stopped
         // existing", and only one of those is progress. Nothing outside the
         // contract writes this shift today either way.
-        shift: &[],
+        // **A SPLITMIX64 INPUT GENERATOR, NOT A PTIR STREAM**, which is the
+        // distinction the comment above already draws for this needle.
+        //
+        // `driver-metal/tests/fixtures/cuda_reference.cu` drives the CUDA
+        // kernels so a Metal one can be compared to what they produce, and it
+        // needs reproducible INPUTS to do it. Its generator is canonical
+        // splitmix64 — the golden-ratio increment, then the two published
+        // mixers, neither of which is a PTIR constant — and its `unit()` is the
+        // standard sixty-four-to-float reduction. There is nothing for it to
+        // include:
+        // the contract's C header was deleted with the C++ drivers, and the
+        // `.metal` one is not a thing `nvcc` reads.
+        shift: &["crates/driver-metal/tests/fixtures/cuda_reference.cu"],
+        // The same file and the same reason: the divisor is the other half of
+        // the shift's reduction, and until this list existed a file could be
+        // excused for one and not the other.
+        unit: &["crates/driver-metal/tests/fixtures/cuda_reference.cu"],
     }
 }
 
@@ -371,6 +409,9 @@ struct Needles {
     stride: String,
     mask: String,
     shift: String,
+    /// The divisor. See [`Allowlists::unit`] — it and [`Self::shift`] are one
+    /// idiom and only one of them used to be nameable.
+    unit: String,
     all: Vec<String>,
 }
 
@@ -378,18 +419,20 @@ fn needles() -> Needles {
     let stride = ["9e37", "79b9", "7f4a", "7c15"].concat();
     let mask = ["a5a5", "a5a5"].concat();
     let shift = [">>", "40"].concat();
+    let unit = ["16777216", ".0"].concat();
     let all = vec![
         ["3c79", "ac49", "2ba7", "b653"].concat(),
         ["1c69", "b3f7", "4ac4", "ae35"].concat(),
         stride.clone(),
         mask.clone(),
         shift.clone(),
-        ["16777216", ".0"].concat(),
+        unit.clone(),
     ];
     Needles {
         stride,
         mask,
         shift,
+        unit,
         all,
     }
 }
@@ -424,6 +467,7 @@ fn allowlist_entries_still_carry_what_they_excuse() {
         ("unrelated_stride_users", allow.stride, &needles.stride),
         ("unrelated_mask_users", allow.mask, &needles.mask),
         ("unrelated_shift_users", allow.shift, &needles.shift),
+        ("unrelated_unit_users", allow.unit, &needles.unit),
     ] {
         for entry in list {
             let contents =
@@ -471,6 +515,9 @@ fn rng_magic_is_owned_by_the_contract() {
                 continue;
             }
             if needle == &needles.shift && path_in(allow.shift, &relative) {
+                continue;
+            }
+            if needle == &needles.unit && path_in(allow.unit, &relative) {
                 continue;
             }
             found.push(format!("`{needle}` in {}", relative.display()));

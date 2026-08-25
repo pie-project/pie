@@ -18,13 +18,29 @@ pub struct Model<W1: Dtype, K: KvDtype, const TP: usize = 1> {
 
 pub struct Ple<W1: Dtype> {
     pub dim: u32,
-    pub table: Tensor<W1>,
     pub model_proj: Tensor<W1>,
     pub model_norm: Norm<W1>,
     pub per_layer: Vec<PleLayer<W1>>,
 }
 
 pub struct PleLayer<W1: Dtype> {
+    /// **THIS LAYER'S SLICE OF THE PER-LAYER EMBEDDING TABLE**, and it is one
+    /// param per layer because one param for all of them is a bank no shader
+    /// plane can bind.
+    ///
+    /// The checkpoint ships `embed_tokens_per_layer` as `[vocab, layers *
+    /// ple_dim]` — for `gemma4-e4b` that is `[262144, 10752]` in bf16, **5.25
+    /// GiB in one tensor**, and `layout.embed` binds a table whole. WebGPU's
+    /// guaranteed floor for a storage binding is 128 MiB, this tree's L40S
+    /// states 2 GiB, and Vulkan's `maxStorageBufferRange` is `UINT32_MAX`; none
+    /// of them holds it. Cut per layer it is 128 MiB, which every plane holds
+    /// with room.
+    ///
+    /// The tower used to gather the whole row once and take a
+    /// `layout.select` of the RELAY per layer. It gathers this slice per layer
+    /// and selects the PROJECTION instead — the same arithmetic elementwise,
+    /// and a `select` that moved rather than one that went away.
+    pub table: Tensor<W1>,
     pub gate: Tensor<W1>,
     pub proj: Tensor<W1>,
     pub norm: Norm<W1>,
@@ -318,7 +334,6 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
             let ple = d.ple_dim as u64;
             Ple {
                 dim: d.ple_dim,
-                table: Tensor::sym("ple.table", [d.vocab as u64, d.layers as u64 * ple]),
                 model_proj: Tensor::sym("ple.model_proj", [d.layers as u64 * ple, hidden]),
                 model_norm: Norm {
                     weight: Tensor::sym("ple.model_norm", [ple]),
@@ -326,6 +341,7 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                 },
                 per_layer: (0..d.layers)
                     .map(|l| PleLayer {
+                        table: Tensor::sym(format!("layer.{l}.ple_table"), [d.vocab as u64, ple]),
                         gate: Tensor::sym(format!("layer.{l}.ple_gate"), [ple, hidden]),
                         proj: Tensor::sym(format!("layer.{l}.ple_proj"), [hidden, ple]),
                         norm: Norm {

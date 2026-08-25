@@ -27,9 +27,22 @@
 
 #define PIE_GROUP_X 256
 
-PIE_BUFFER_RO(0, x);
+// **`x` AND `w` ARE f32 AND THE GATE IS NOT.** `Norm::rmsnorm_gated` declares
+// `x: In<Self::Tensor<f32>>` and `weight: Const<Self::Tensor<f32>>` beside a
+// `gate: In<Self::Tensor<T>>` and a `T` result, and `rmsnorm_gated_by` states
+// the same four. Both of this file's callers are those two, so the elements
+// are stated here rather than switched on — `kernels-wgpu`'s twin carries two
+// arms because WGSL has no 16-bit storage and its bf16 arm has to pack, which
+// is a reason this plane does not have.
+//
+// ALL FOUR WERE `PIE_ACT`. Reading an f32 plane as bf16 walks half the row and
+// reads every value's mantissa as an exponent, which on a gain vector produces
+// NaN as readily as anything else — `qwen35-d0.8b` came back NaN at the first
+// gated norm of its first gated-DeltaNet layer, from inputs that matched
+// `driver-wgpu`'s bit for bit.
+[[vk::binding(0)]] StructuredBuffer<float> x;
 PIE_BUFFER_RO(1, z);
-PIE_BUFFER_RO(2, w);
+[[vk::binding(2)]] StructuredBuffer<float> w;
 PIE_BUFFER_RW(3, out_);
 
 #if defined(PIE_STRIDED)
@@ -68,15 +81,15 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // honour it.
     float sum_sq = 0.0;
     for (uint at = lid; at < pc.vd; at += uint(PIE_GROUP_X)) {
-        float v = PIE_LOAD(x[base + at]);
+        float v = x[base + at];
         sum_sq += v * v;
     }
     float inv = pie_inv_rms(sum_sq, pc.vd, pc.eps);
     for (uint at = lid; at < pc.vd; at += uint(PIE_GROUP_X)) {
-        float xi = PIE_LOAD(x[base + at]);
+        float xi = x[base + at];
         float zr = PIE_LOAD(z[base + at]);
         out_[base + at] =
-            PIE_STORE((xi * inv * PIE_LOAD(w[at])) * (zr * stable_sigmoid(zr)));
+            PIE_STORE((xi * inv * w[at]) * (zr * stable_sigmoid(zr)));
     }
 }
 
