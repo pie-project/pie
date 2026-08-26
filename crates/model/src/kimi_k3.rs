@@ -1,31 +1,24 @@
-use model_dsl::axes::{Bf16, Mxfp4, NativeKv};
-use model_dsl::load::SfBf16;
+//! Kimi K3 on the menlo stack: a hybrid decoder interleaving KDA
+//! (delta-attention) layers with full MLA layers, residual blending every
+//! few layers, and situ-activated dense or routed mlps. The
+//! declaration lives in [`model`], the forward pass in [`forward`];
+//! `import.rs` (checkpoint mapping) is deferred to the loader port.
 
 pub mod forward;
-pub mod import;
 pub mod model;
 
-use import::import_hf;
 use model::Model;
-
-pub type ShippedW1 = Bf16;
-pub type ShippedW2 = Mxfp4;
-pub type ShippedKv = NativeKv;
+use model_dsl::Dtype;
 
 pub const CATALOG: &[(&str, model_dsl::TraceFn)] = model_dsl::catalog![
     (
         "kimik3-bf16-mxfp4-kv-bf16",
         model_dsl::trace_hybrid,
-        Model::<ShippedW1, ShippedW2, ShippedKv>::k3(),
+        Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
         "kimik3-bf16-mxfp4-kv-bf16-tp2",
         model_dsl::trace_hybrid,
-        Model::<ShippedW1, ShippedW2, ShippedKv, 2>::k3(),
+        Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, Dtype::Bf16, 2)
     ),
 ];
-
-model_dsl::allow_import! {
-    import_hf::<SfBf16, ShippedW1, ShippedW2, ShippedKv> => ("kimik3-bf16-mxfp4-kv-bf16", Model::<ShippedW1, ShippedW2, ShippedKv>::k3()),
-    import_hf::<SfBf16, ShippedW1, ShippedW2, ShippedKv> => ("kimik3-bf16-mxfp4-kv-bf16-tp2", Model::<ShippedW1, ShippedW2, ShippedKv, 2>::k3()),
-}

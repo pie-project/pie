@@ -1,7 +1,13 @@
+//! A compilation root: one carried `.cuh`, the options it compiles under,
+//! the header set it resolves against, and the cache key all of that folds
+//! into. Most units take the defaults; the exceptions are configured by
+//! name.
+
 use core::fmt;
 
 use crate::source::{self, ALL_HEADERS, DEVICE_HEADERS, Header};
 
+/// The NVRTC floor a unit states, `0.0` meaning any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Toolchain {
     pub major: u32,
@@ -37,6 +43,8 @@ impl fmt::Display for Toolchain {
     }
 }
 
+/// Which header closure a unit compiles against: the plane's own text, or
+/// that plus the internalised upstream (FlashInfer/XQA) tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Headers {
     Library,
@@ -71,9 +79,12 @@ pub struct Root {
     pub floor: Toolchain,
 }
 
+/// The units that do not take the defaults. The rows live here rather than
+/// with the entries that fire them, so the configuration travels with the
+/// file name — the attn wave landed on rows that were already waiting.
 const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
     (
-        "attn/attention_mla_fa2.cuh",
+        "attn/mla.cuh",
         &[
             "--device-as-default-execution-space",
             "--relocatable-device-code=true",
@@ -82,19 +93,13 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
         Toolchain::ANY,
     ),
     (
-        "cascade/merge_states.cuh",
-        &["--device-as-default-execution-space"],
-        Headers::LibraryAndUpstream,
-        Toolchain::ANY,
-    ),
-    (
-        "comm/all_reduce.cuh",
+        "collective/all_reduce.cuh",
         &[],
         Headers::LibraryAndUpstream,
         Toolchain::ANY,
     ),
     (
-        "attn/fa2.cuh",
+        "attn/attention.cuh",
         &["--device-as-default-execution-space"],
         Headers::LibraryAndUpstream,
         Toolchain::ANY,
@@ -114,19 +119,8 @@ const fn configured_for(file: &str) -> (&'static [&'static str], Headers, Toolch
 }
 
 impl Root {
-    #[must_use]
-    pub const fn new(file: &'static str) -> Self {
-        let (options, headers, floor) = configured_for(file);
-        Self {
-            name: strip_cuh(file),
-            text: source::carried(file),
-            file,
-            options,
-            headers,
-            floor,
-        }
-    }
-
+    /// The carried unit with this name, or `None` — a [`Fire`](crate::jit::Fire)
+    /// naming a file the binary does not carry is refused, not conjured.
     #[must_use]
     pub fn of(file: &'static str) -> Option<Self> {
         let text = source::text_of(file)?;
@@ -140,19 +134,6 @@ impl Root {
             headers,
             floor,
         })
-    }
-
-    #[must_use]
-    pub const fn variant(name: &'static str, file: &'static str) -> Self {
-        let (options, headers, floor) = configured_for(file);
-        Self {
-            name,
-            text: source::carried(file),
-            file,
-            options,
-            headers,
-            floor,
-        }
     }
 
     #[must_use]
@@ -185,6 +166,7 @@ impl Root {
             .any(|o| *o == "--relocatable-device-code=true" || *o == "-dc" || *o == "--device-c")
     }
 
+    /// The disk/memory cache key: everything that can change the cubin.
     #[must_use]
     pub fn key(&self, instantiation: &str, arch: &str) -> String {
         format!(
@@ -232,15 +214,3 @@ impl Root {
 }
 
 const FLOAT_CONTRACT: &str = "fmad=false,prec-div=true,prec-sqrt=true";
-
-const fn strip_cuh(file: &'static str) -> &'static str {
-    let bytes = file.as_bytes();
-    let Some(stem) = bytes.len().checked_sub(4) else {
-        panic!("a root's file is a `.cuh` under `kernels/`")
-    };
-    let (name, extension) = file.split_at(stem);
-    if !matches!(extension.as_bytes(), b".cuh") {
-        panic!("a root's file is a `.cuh` under `kernels/`")
-    }
-    name
-}

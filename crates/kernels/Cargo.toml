@@ -1,20 +1,18 @@
 [package]
 name = "kernels"
-version = "0.4.0"
+version = "0.1.0"
 edition = "2024"
-authors = ["In Gim <in.gim@yale.edu>"]
-description = "The declaration floor: the point families a text may state, the In/Out/InOut/Const/Cache marks a point is declared in, and the Refusal an unclaimed one answers with."
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The contract between the IR and the drivers, and the one walk written over it: one Dispatch trait per op family, the aggregate exec over a Node, the KernelError a backend may answer with, and the prepare/capture walk. No kernels, no execution state."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
-publish = false
 
 [lib]
 name = "kernels"
 path = "src/lib.rs"
 
 [dependencies]
-# `#[points]`, which reads a family trait on the floor and states its point
-# table beside it. The one edge the "no dependencies" line allows, and only
-# because it is not one at run time: a proc macro is a compiler plugin, so
-# nothing of `syn` reaches this crate's artifact.
-kernels-macros = { path = "../kernels-macros" }
+# The whole vocabulary this crate speaks: the 15 family enums, `Node`, and
+# `Dtype`. Deliberately the only edge — the old `kernels` sat above every
+# backend; this one sits above none (design §0).
+model-ir = { path = "../model-ir" }

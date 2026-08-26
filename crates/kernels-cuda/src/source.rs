@@ -1,3 +1,8 @@
+//! The carried device text: every `.cuh` a unit compiles, the shim headers
+//! it resolves standard spellings against, and the upstream closure — plus
+//! the digests the jit cache keys them by. NVRTC resolves includes against
+//! this set and nothing else.
+
 use std::ffi::CString;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,18 +46,6 @@ const fn join<const N: usize>(left: &[Header], right: &[Header]) -> [Header; N] 
 }
 
 #[must_use]
-pub const fn carried(name: &'static str) -> &'static str {
-    let mut i = 0;
-    while i < LIBRARY.len() {
-        if str_eq(LIBRARY[i].name, name) {
-            return LIBRARY[i].text;
-        }
-        i += 1;
-    }
-    panic!("no file under `kernels/` is carried under that name")
-}
-
-#[must_use]
 pub fn text_of(name: &str) -> Option<&'static str> {
     LIBRARY
         .iter()
@@ -91,27 +84,6 @@ pub fn as_nvrtc_arrays(headers: &[Header]) -> Result<(Vec<CString>, Vec<CString>
     Ok((texts, names))
 }
 
-pub fn reachable(from: &str, root: &str, headers: &[Header]) -> Result<Vec<&'static str>, String> {
-    let mut seen: Vec<&'static str> = Vec::new();
-    let mut queue: Vec<(&str, &str)> = vec![(from, root)];
-    while let Some((at, text)) = queue.pop() {
-        for included in quoted_includes(text) {
-            let Some(header) = headers.iter().find(|h| h.name == included) else {
-                return Err(format!(
-                    "`{from}` reaches `{included}` from `{at}`, and the header set it \
-                     compiles against does not carry it -- NVRTC resolves against the \
-                     set and nothing else, so this compiles nowhere"
-                ));
-            };
-            if !seen.contains(&header.name) {
-                seen.push(header.name);
-                queue.push((header.name, header.text));
-            }
-        }
-    }
-    Ok(seen)
-}
-
 #[must_use]
 pub fn digest(headers: &[Header]) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
@@ -122,18 +94,6 @@ pub fn digest(headers: &[Header]) -> u64 {
         hash = fold(hash, &[0]);
     }
     hash
-}
-
-#[must_use]
-pub fn quoted_includes(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix("#include")?;
-            let rest = rest.strip_prefix(|c: char| c == ' ' || c == '\t')?;
-            rest.trim_start().strip_prefix('"')?.split('"').next()
-        })
-        .collect()
 }
 
 pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {

@@ -2,7 +2,8 @@
 name = "model"
 version = "0.1.0"
 edition = "2024"
-authors = ["In Gim <in.gim@yale.edu>"]
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The model catalog of the menlo stack: each model is a declaration (weights, dims, cache spaces) plus a forward pass written in model-dsl. Qwen 3.5 is ported first, end-to-end; the others follow the same shape."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -10,27 +11,9 @@ repository = "https://github.com/pie-project/pie"
 name = "model"
 path = "src/lib.rs"
 
-[features]
-# HOST-SIDE MEDIA DECODE, off by default. `image` alone is twenty crates, and
-# `driver-cuda`, `model-compiler` and `baker-smoke` all take this crate
-# without wanting one of them.
-#
-# It gated the whole of `serve` when the module arrived from `model-legacy`'s
-# `chat` feature, on the argument that a driver fires kernels and does not
-# write a turn of conversation. R3 made that line wrong in one direction: a
-# driver reads `serve::ROWS` for the architecture label and the context
-# ceiling it advertises, which are two `&'static str`-shaped facts and no
-# codec at all. So the gate moved down to the one module that needs one,
-# `serve::multimodal`, and the feature keeps its name because `engine` and
-# `worker` — still its only consumers — ask for it by that name.
-default = []
-serve = ["dep:image"]
-
 [dependencies]
+# What a forward pass is written in: Recorder/Value, the per-family kernel
+# wrappers, split/merge/Facts, and the `Weight` declaration. A model's whole
+# vocabulary comes from here — the IR names it needs (`Dtype`, `GeomKind`)
+# arrive through the dsl's re-exports, so `model-ir` is never named directly.
 model-dsl = { path = "../model-dsl" }
-model-ir = { path = "../model-ir" }
-serde_json = "1"
-tokenizer = { path = "../tokenizer" }
-# Host-side media decode for the model-agnostic multimodal API (`serve::multimodal`).
-# Came with that module from `model-legacy`, where it rode the `chat` feature.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }

@@ -1,32 +1,34 @@
-//! The supergraph recorder: the text runs once, conditions ride as data.
+//! The trace machinery: a `Recorder` accumulating a `Plan`, and the `Value`
+//! handles a forward pass passes around. Re-imagined from the old `record.rs`
+//! for the `Def` × `Ty` world — the string `Stmt` builder is gone; wrappers
+//! build typed op variants, declare their outputs with `fresh`, and `push`
+//! stitches the def-use bookkeeping through the `Operands` marks.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Mul;
 use std::rc::Rc;
 
-use model_ir::plan::{CacheRow, Cond, Op, Param, Plan, Seam, Shard, ValueDef, ValueId};
+use model_ir::{
+    CacheRow, Cond, Def, Dim, Dtype, Node, Operands, Operation, Param, Plan, Plane, RuntimeInput,
+    Seam, Shard, Ty, ValueDecl, ValueId,
+};
 
-use crate::Plane;
-use crate::axes::Dtype;
-use crate::declare::{Norm, Tensor};
+use crate::declare::Weight;
 use crate::facts::Predicate;
 
+/// A `fresh` value's node index until an op claims it. It cannot be a real
+/// index, and an unclaimed sentinel survives to the validator, which names it
+/// — the trace does not guess at what a wrapper forgot.
+const UNCLAIMED: u32 = u32::MAX;
+
+/// Records one forward pass. Cloned freely — every `Value` carries one — and
+/// `finish` insists the trace let go of all of them.
 #[derive(Clone)]
 pub struct Recorder {
     inner: Rc<RefCell<Plan>>,
 
-    /// WHICH LAYER THE TEXT IS INSIDE, and the whole of how a statement
-    /// learns its own. A text states its tower as one loop
-    /// (`crate::forward::Layers`, reached as `inputs.layers(&m.layers)`) and
-    /// that loop is the only thing that writes here: every statement
-    /// recorded while it holds an item carries that item's index, and
-    /// everything recorded outside it -- the embedding, the final norm, the
-    /// head -- carries `None`, because there is no layer to carry.
-    ///
-    /// A CELL AND NOT A COLUMN OF THE PLAN: this is where the RECORDER is,
-    /// not something the plan holds. It is `Rc` for the same reason `inner`
-    /// is -- every `Value` carries a `Recorder` and they must all be inside
-    /// the same layer.
+    /// The layer the trace is inside, driven by `enter`/`leave` (the
+    /// `Layers` iterator in `forward.rs` is the usual driver).
     at: Rc<Cell<Option<u32>>>,
 }
 
@@ -40,289 +42,339 @@ impl Recorder {
                 params: Vec::new(),
                 caches,
                 values: Vec::new(),
-                ops: Vec::new(),
+                nodes: Vec::new(),
                 seams: Vec::new(),
             })),
             at: Rc::new(Cell::new(None)),
         }
     }
 
-    pub(crate) fn finish(self) -> Plan {
-        Rc::try_unwrap(self.inner)
-            .unwrap_or_else(|_| panic!("a Value outlived its trace"))
-            .into_inner()
-    }
-
-    pub(crate) fn runtime(&self, name: &str) -> Value {
+    /// Declare a value with a placeholder def; the next `push` that lists its
+    /// id among an op's outputs patches it to `Def::Op(node_index)`.
+    pub fn fresh(&self, ty: Ty) -> Value {
         let mut p = self.inner.borrow_mut();
-        let id = p
-            .values
-            .iter()
-            .position(|v| matches!(v, ValueDef::Runtime(n) if n == name))
-            .unwrap_or_else(|| {
-                p.values.push(ValueDef::Runtime(name.to_string()));
-                p.values.len() - 1
-            }) as ValueId;
+        p.values.push(ValueDecl {
+            def: Def::Op(UNCLAIMED),
+            ty: ty.clone(),
+        });
+        let id = ValueId((p.values.len() - 1) as u32);
+        drop(p);
         Value {
             rec: self.clone(),
             id,
-            cond: Cond::Always,
+            over: None,
+            ty,
         }
     }
 
-    pub(crate) fn param<W: Dtype>(&self, t: &Tensor<W>) {
-        self.plane(&t.name, &t.shape, &t.shard, W::NAME);
-    }
-
-    /// One parameter row, at a name, shape and repr the caller has already
-    /// decided.
-    ///
-    /// [`Recorder::param`] is the dense reading of this and passes the
-    /// tensor's own three columns straight through; a bank's planes differ
-    /// from the tensor in all three, which is what this exists for — see
-    /// [`restated`] for the cut, which is the column that used to be copied
-    /// verbatim and was wrong for every quantized bank in the catalog.
-    pub(crate) fn plane(&self, name: &str, shape: &[u64], shard: &Shard, repr: &str) {
-        let mut p = self.inner.borrow_mut();
-        if let Some(seen) = p.params.iter().find(|q| q.name == name) {
+    /// Append one node. `ins` are the condition-carrying operands: the node's
+    /// guard is the meet of their conds, and mixing arms of one split is a
+    /// panic here, at the line that mixed them. Outputs are read back through
+    /// the `Operands` derive and their placeholder defs patched — the field
+    /// marks stay the single source of truth for def-use, one more reason the
+    /// derive wires the recorder rather than the wrapper doing it by hand.
+    pub fn push(&self, op: impl Into<Operation>, ins: &[&Value]) {
+        let op = op.into();
+        let mut cond = Cond::Always;
+        for v in ins {
+            let c = v.cond();
             assert!(
-                seen.shape == shape && &seen.shard == shard,
-                "`{name}` is declared twice with two shapes"
+                compatible(&cond, &c),
+                "`{}` mixes values from different split arms",
+                op.name(),
             );
-            return;
+            cond = meet(cond, c);
         }
-        p.params.push(Param {
-            name: name.to_string(),
-            shape: shape.to_vec(),
-            shard: shard.clone(),
-            repr: repr.to_string(),
+        let mut outs = Vec::new();
+        op.outputs(&mut outs);
+        let mut p = self.inner.borrow_mut();
+        let index = p.nodes.len() as u32;
+        for id in outs {
+            // Claim only placeholders. A wrapper naming a weight or another
+            // node's value as its output is a fault the validator gets to
+            // report in full, not something to paper over here.
+            if let Some(decl) = p.values.get_mut(id.0 as usize)
+                && decl.def == Def::Op(UNCLAIMED)
+            {
+                decl.def = Def::Op(index);
+            }
+        }
+        p.nodes.push(Node {
+            op,
+            cond,
+            layer: self.at.get(),
         });
     }
 
-    pub(crate) fn seam(&self, seam: &str, values: &[&Value]) {
+    /// Intern a weight — one `Param` per stored plane, one `ValueId` per
+    /// weight name. The value's ty is the LOGICAL tensor (all-const dims,
+    /// activation dtype): what an mxfp4 bank stores is the params' business,
+    /// what it multiplies as is the trace's.
+    pub fn weight(&self, w: &Weight) -> ValueId {
+        let mut p = self.inner.borrow_mut();
+        let mut first = None;
+        for plane in w.planes() {
+            let name = format!("{}{}", w.name, plane.suffix);
+            let shard = restated(&w.shard, &w.shape, &plane.shape, &name);
+            let index = intern(&mut p, name, plane.shape, shard, plane.dtype);
+            first.get_or_insert(index);
+        }
+        let first = first.expect("a weight stores at least one plane");
+        if let Some(seen) = p.values.iter().position(|v| v.def == Def::Weight(first)) {
+            return ValueId(seen as u32);
+        }
+        p.values.push(ValueDecl {
+            def: Def::Weight(first),
+            ty: Ty::Tensor {
+                shape: w.shape.iter().copied().map(Dim::Const).collect(),
+                dtype: w.compute_dtype(),
+            },
+        });
+        ValueId((p.values.len() - 1) as u32)
+    }
+
+    /// The value standing for one cache space — dedup'd by index, so a layer
+    /// touching its cache twice touches one id.
+    pub fn cache(&self, name: &str) -> ValueId {
+        let mut p = self.inner.borrow_mut();
+        let index = p
+            .caches
+            .iter()
+            .position(|row| cache_name(row) == name)
+            .unwrap_or_else(|| panic!("`{name}` is not a cache the model's caches() declares"))
+            as u32;
+        if let Some(seen) = p.values.iter().position(|v| v.def == Def::Cache(index)) {
+            return ValueId(seen as u32);
+        }
+        // Deliberately shapeless: a cache value is the pool pointer and
+        // nothing more (design §7). Its geometry enters the graph as
+        // `RuntimeInput::Geometry`, and its element layout is the cache row's
+        // load-time business.
+        p.values.push(ValueDecl {
+            def: Def::Cache(index),
+            ty: Ty::Tensor {
+                shape: Vec::new(),
+                dtype: Dtype::U8,
+            },
+        });
+        ValueId((p.values.len() - 1) as u32)
+    }
+
+    /// The value the driver binds for `which`, declared once per input no
+    /// matter how many layers ask.
+    pub fn input(&self, which: RuntimeInput, ty: Ty) -> Value {
+        let mut p = self.inner.borrow_mut();
+        let id = match p.values.iter().position(|v| v.def == Def::Input(which)) {
+            Some(seen) => {
+                assert!(
+                    p.values[seen].ty == ty,
+                    "`{which:?}` is bound twice with two types",
+                );
+                ValueId(seen as u32)
+            }
+            None => {
+                p.values.push(ValueDecl {
+                    def: Def::Input(which),
+                    ty: ty.clone(),
+                });
+                ValueId((p.values.len() - 1) as u32)
+            }
+        };
+        drop(p);
+        Value {
+            rec: self.clone(),
+            id,
+            over: None,
+            ty,
+        }
+    }
+
+    pub fn seam(&self, name: &str, values: &[&Value]) {
         let ids = values.iter().map(|v| v.id).collect();
         self.inner.borrow_mut().seams.push(Seam {
-            seam: seam.to_string(),
+            seam: name.to_string(),
             values: ids,
             layer: self.at.get(),
         });
     }
 
-    /// Enter the layer the text's loop is on. See [`Recorder::at`].
-    pub(crate) fn enter(&self, l: u32) {
-        self.at.set(Some(l));
+    pub fn enter(&self, layer: u32) {
+        self.at.set(Some(layer));
     }
 
-    /// Leave it -- what the loop's own end does, and what a `break` does
-    /// through the iterator's `Drop`.
-    pub(crate) fn leave(&self) {
+    pub fn leave(&self) {
         self.at.set(None);
     }
-}
 
-/// One statement under construction; every role fn builds one.
-pub(crate) struct Stmt<'r> {
-    rec: &'r Recorder,
-    kernel: &'static str,
-    inputs: Vec<ValueId>,
-    weights: Vec<String>,
-    params: Vec<u64>,
-    cache: Option<String>,
-    cond: Cond,
-}
-
-impl<'r> Stmt<'r> {
-    pub(crate) fn value(mut self, v: &Value) -> Self {
-        assert!(
-            compatible(&self.cond, &v.cond),
-            "`{}` mixes values from different split arms",
-            self.kernel
-        );
-        self.cond = meet(self.cond, v.cond.clone());
-        self.inputs.push(v.id);
-        self
-    }
-
-    pub(crate) fn weight<W: Dtype>(mut self, t: &Tensor<W>) -> Self {
-        self.rec.param(t);
-        self.weights.push(t.name.clone());
-        self
-    }
-
-    /// A QUANTISED bank: one thing a text names, however many parameters the
-    /// repr stores it as.
-    ///
-    /// `weight` above is this with the plane count pinned at one, and that
-    /// is not a coincidence — it is the same slot with a repr whose storage
-    /// is its logical shape. What the two differ in is what the DECLARATION
-    /// said: a `Const<Self::Tensor<T>>` slot promises one rectangle of
-    /// elements, a `Const<Self::Bank<R>>` slot promises `R::PLANES` planes
-    /// of bytes, and the columns a statement records have to match the slot
-    /// the point declared or the dispatch reads the wrong one.
-    ///
-    /// THE PLANE ORDER IS THE CONTRACT. `Dtype::planes` states it, this
-    /// records it, `BoundOp::bank` reads it back positionally, and nothing
-    /// in between re-derives it from a name.
-    pub(crate) fn bank<W: Dtype>(mut self, t: &Tensor<W>) -> Self {
-        for plane in W::planes(&t.shape) {
-            let name = format!("{}{}", t.name, plane.suffix);
-            let shard = restated(&t.shard, &t.shape, &plane.shape, &name);
-            self.rec.plane(&name, &plane.shape, &shard, plane.repr);
-            self.weights.push(name);
+    /// Unwrap the plan and run the validator — the trace's first error
+    /// surface. A bad trace panics with every fault sentence at once, so one
+    /// forgotten `#[out]` reads as itself and not as ten downstream mysteries.
+    pub fn finish(self) -> Plan {
+        let plan = Rc::try_unwrap(self.inner)
+            .unwrap_or_else(|_| panic!("a Value outlived its trace"))
+            .into_inner();
+        if let Err(faults) = model_ir::check(&plan) {
+            let mut msg = format!("`{}` did not trace to a valid plan:", plan.name);
+            for fault in &faults {
+                msg.push_str("\n  ");
+                msg.push_str(&fault.to_string());
+            }
+            panic!("{msg}");
         }
-        self
+        plan
     }
 
-    pub(crate) fn norm<W: Dtype>(self, n: &Norm<W>) -> Self {
-        let eps = n.eps;
-        self.weight(&n.weight).float(eps)
-    }
-
-    pub(crate) fn int(mut self, v: u32) -> Self {
-        self.params.push(u64::from(v));
-        self
-    }
-
-    pub(crate) fn float(mut self, v: f32) -> Self {
-        self.params.push(u64::from(v.to_bits()));
-        self
-    }
-
-    pub(crate) fn window(self, w: Option<u32>) -> Self {
-        self.int(w.unwrap_or(0))
-    }
-
-    pub(crate) fn cache(mut self, name: &str) -> Self {
-        self.cache = Some(name.to_string());
-        self
-    }
-
-    pub(crate) fn done(self) -> Value {
-        let (rec, cond) = (self.rec.clone(), self.cond.clone());
-        let id = self.push(1)[0];
-        Value { rec, id, cond }
-    }
-
-    pub(crate) fn pair(self) -> (Value, Value) {
-        let (rec, cond) = (self.rec.clone(), self.cond.clone());
-        let ids = self.push(2);
-        (
-            Value {
-                rec: rec.clone(),
-                id: ids[0],
-                cond: cond.clone(),
-            },
-            Value {
-                rec,
-                id: ids[1],
-                cond,
-            },
-        )
-    }
-
-    pub(crate) fn triple(self) -> (Value, Value, Value) {
-        let (rec, cond) = (self.rec.clone(), self.cond.clone());
-        let ids = self.push(3);
-        (
-            Value {
-                rec: rec.clone(),
-                id: ids[0],
-                cond: cond.clone(),
-            },
-            Value {
-                rec: rec.clone(),
-                id: ids[1],
-                cond: cond.clone(),
-            },
-            Value {
-                rec,
-                id: ids[2],
-                cond,
-            },
-        )
-    }
-
-    pub(crate) fn effect(self) {
-        self.push(0);
-    }
-
-    fn push(self, outputs: usize) -> Vec<ValueId> {
-        let mut p = self.rec.inner.borrow_mut();
-        let op_index = p.ops.len() as u32;
-        let ids: Vec<ValueId> = (0..outputs)
-            .map(|_| {
-                p.values.push(ValueDef::Stmt(op_index));
-                (p.values.len() - 1) as ValueId
-            })
-            .collect();
-        p.ops.push(Op {
-            kernel: self.kernel.to_string(),
-            inputs: self.inputs,
-            outputs: ids.clone(),
-            weights: self.weights,
-            params: self.params,
-            cache: self.cache,
-            // THE LAYER IS NOT THE STATEMENT'S TO SPELL. It is where in the
-            // tower the text is standing, which the text said once, in its
-            // loop; a builder that took it as an argument would be asking
-            // every statement to repeat the loop's own index.
-            layer: self.rec.at.get(),
-            cond: self.cond,
-        });
-        ids
+    /// The guard a value settled under. Op outputs read their node's cond off
+    /// the plan itself — which is why `fresh` needs no cond up front and
+    /// `push` never has to reach into handles already given out.
+    fn guard(&self, id: ValueId) -> Cond {
+        let p = self.inner.borrow();
+        match &p.values[id.0 as usize].def {
+            Def::Op(i) => p
+                .nodes
+                .get(*i as usize)
+                .map(|n| n.cond.clone())
+                .unwrap_or(Cond::Always),
+            // Merges carry their or-cond in the handle; inputs, weights and
+            // caches are bound before the first node and guard nothing.
+            _ => Cond::Always,
+        }
     }
 }
 
+fn intern(p: &mut Plan, name: String, shape: Vec<u64>, shard: Shard, dtype: Dtype) -> u32 {
+    if let Some(i) = p.params.iter().position(|q| q.name == name) {
+        let seen = &p.params[i];
+        assert!(
+            seen.shape == shape && seen.shard == shard && seen.dtype == dtype,
+            "`{name}` is declared twice with two shapes"
+        );
+        return i as u32;
+    }
+    p.params.push(Param {
+        name,
+        shape,
+        shard,
+        dtype,
+    });
+    (p.params.len() - 1) as u32
+}
+
+pub(crate) fn cache_name(row: &CacheRow) -> &str {
+    match row {
+        CacheRow::Kv { name, .. } | CacheRow::State { name, .. } => name,
+    }
+}
+
+/// One traced value. Carries its ty so shape queries never re-borrow the
+/// plan, and reads its guard through the recorder — only a split arm
+/// overrides it.
 #[derive(Clone)]
 pub struct Value {
-    pub(crate) rec: Recorder,
-    pub(crate) id: ValueId,
-    pub(crate) cond: Cond,
+    rec: Recorder,
+    id: ValueId,
+    /// `None` reads the producing node's guard off the plan; a split arm
+    /// carries its refinement here.
+    over: Option<Cond>,
+    ty: Ty,
 }
 
 impl Value {
-    pub(crate) fn stmt(&self, kernel: &'static str) -> Stmt<'_> {
-        Stmt {
-            rec: &self.rec,
-            kernel,
-            inputs: Vec::new(),
-            weights: Vec::new(),
-            params: Vec::new(),
-            cache: None,
-            cond: Cond::Always,
+    #[must_use]
+    pub fn id(&self) -> ValueId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn rec(&self) -> &Recorder {
+        &self.rec
+    }
+
+    #[must_use]
+    pub fn ty(&self) -> &Ty {
+        &self.ty
+    }
+
+    /// The leading dim — `Tokens` for fire-aligned activations, and what a
+    /// wrapper folds `top_k` into for routed rows.
+    #[must_use]
+    pub fn rows(&self) -> Dim {
+        let Ty::Tensor { shape, .. } = &self.ty else {
+            panic!("a struct value has no rows");
+        };
+        *shape
+            .first()
+            .unwrap_or_else(|| panic!("a rank-0 value has no rows"))
+    }
+
+    /// The trailing dim, which for an activation is always a const width.
+    #[must_use]
+    pub fn width(&self) -> u64 {
+        let Ty::Tensor { shape, .. } = &self.ty else {
+            panic!("a struct value has no width");
+        };
+        match shape.last() {
+            Some(Dim::Const(n)) => *n,
+            Some(dim) => panic!("a value's trailing axis is {dim:?}, not the const a width needs"),
+            None => panic!("a rank-0 value has no width"),
         }
-        .value(self)
+    }
+
+    #[must_use]
+    pub fn dtype(&self) -> Dtype {
+        let Ty::Tensor { dtype, .. } = &self.ty else {
+            panic!("a struct value has no dtype");
+        };
+        *dtype
+    }
+
+    pub(crate) fn cond(&self) -> Cond {
+        match &self.over {
+            Some(c) => c.clone(),
+            None => self.rec.guard(self.id),
+        }
     }
 
     pub fn split<S: SplitSpec>(&self, spec: S) -> S::Arms {
         spec.arms(self)
     }
 
+    /// The φ: a `Def::Merge` value, not an op — the compiler resolves it to
+    /// slot aliasing and nothing ever dispatches it.
     #[must_use]
     pub fn merge(arms: Vec<Value>) -> Value {
         assert!(arms.len() >= 2, "merge! wants at least two arms");
         let rec = arms[0].rec.clone();
-        let joined = arms
-            .iter()
-            .map(|a| (a.id, a.cond.clone()))
-            .collect::<Vec<_>>();
-        let cond = arms
+        // Arms must agree on ty; the validator's MergeArmTy rule names the
+        // odd one out, so the first arm's ty stands for the merge here.
+        let ty = arms[0].ty.clone();
+        let joined = arms.iter().map(|a| (a.id, a.cond())).collect::<Vec<_>>();
+        let cond = joined
             .iter()
             .skip(1)
-            .fold(arms[0].cond.clone(), |c, a| Cond::or(c, a.cond.clone()))
+            .fold(joined[0].1.clone(), |c, (_, a)| Cond::or(c, a.clone()))
             .simplified();
         let mut p = rec.inner.borrow_mut();
-        p.values.push(ValueDef::Merge(joined));
-        let id = (p.values.len() - 1) as ValueId;
+        p.values.push(ValueDecl {
+            def: Def::Merge(joined),
+            ty: ty.clone(),
+        });
+        let id = ValueId((p.values.len() - 1) as u32);
         drop(p);
-        Value { rec, id, cond }
+        Value {
+            rec,
+            id,
+            over: Some(cond),
+            ty,
+        }
     }
 
     fn refined(&self, cond: Cond) -> Value {
         Value {
             rec: self.rec.clone(),
             id: self.id,
-            cond: Cond::and(self.cond.clone(), cond),
+            over: Some(Cond::and(self.cond(), cond)),
+            ty: self.ty.clone(),
         }
     }
 }
@@ -331,15 +383,17 @@ impl Mul<f32> for Value {
     type Output = Value;
 
     fn mul(self, rhs: f32) -> Value {
-        self.stmt("norm.mul_scalar").float(rhs).done()
+        let y = self.rec.fresh(self.ty.clone());
+        self.rec.push(
+            model_ir::Elementwise::MulScalar {
+                s: rhs,
+                x: self.id,
+                x_out: y.id(),
+            },
+            &[&self],
+        );
+        y
     }
-}
-
-/// A token-rowed stream paired with the fire's request boundaries.
-#[derive(Clone)]
-pub struct Windows {
-    pub data: Value,
-    pub indptr: Value,
 }
 
 pub trait SplitSpec {
@@ -376,23 +430,8 @@ impl<const N: usize> SplitSpec for [Predicate; N] {
     }
 }
 
-/// A bank's logical cut, said in one stored plane's own extents.
-///
-/// THE COLUMN THAT WAS COPIED AND SHOULD NOT HAVE BEEN. A text declares a
-/// bank at its LOGICAL rectangle — gpt-oss's `expert_down_bank` is
-/// `[experts, hidden, inter]` and the cut runs along `inter` — and the repr
-/// decides what the bytes look like: mxfp4 stores that same bank as codes
-/// `[experts, hidden, inter/32, 16]` beside scales `[experts, hidden,
-/// inter/32]`. Handing both planes the logical mark said "cut axis 2 into
-/// one segment of `inter`" about an axis that is `inter/32` long, which is a
-/// row a load could not slice and a row `model/tests/
-/// a_rank_cut_is_the_shard_column.rs` catches the moment it is asked.
-///
-/// The axis SURVIVES and the extent does not. A repr in this tree stores the
-/// leading axes verbatim and blocks the contracted one, so a logical axis
-/// keeps its index and may shrink by the block; the segments shrink with it,
-/// which is also the check that a cut lands on a whole number of blocks —
-/// half a block is a code word no scale describes.
+/// A plane of a stored shard restated against what the plane actually holds:
+/// an mxfp4 codes plane cuts by blocks, not logical columns.
 fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard {
     let Shard::Cut { axis, segments } = shard else {
         return Shard::Replicated;

@@ -57,7 +57,7 @@ tree, of the nine headers our own text names --
 `attention/{cascade,decode,default_decode_params,default_prefill_params,
 mask,mla,mla_params,prefill,variants}.cuh`, in ten directives across
 `kernels/attn/{fa2,attention_mla_fa2,attention_score_capture}.cuh` and
-`kernels/cascade/merge_states.cuh`. 13,662 lines, 589,556 bytes.
+`kernels/attn/merge_states.cuh`. 13,662 lines, 589,556 bytes.
 
 That seed list used to read `attention/{...,state,...}.cuh` and
 `{fastdiv,layout,page,pos_enc,utils}.cuh`, which described the ahead-of-time
@@ -65,7 +65,7 @@ crate's `.cu` roots rather than ours. Those six are still carried and are
 still reached -- they are inside the closure rather than seeds of it. The set
 does not change; only the reason given for it does. Walking quoted includes
 from the four compilation roots -- `attn/fa2.cuh`, `attn/attention_mla_fa2.cuh`,
-`attn/attention_xqa_mha.cuh`, `cascade/merge_states.cuh` -- reaches **all 38**
+`attn/attention_xqa_mha.cuh`, `attn/merge_states.cuh` -- reaches **all 38**
 of the internalised files at this revision, both trees, with nothing orphaned.
 It reached 40 of 43 when the four host-only files were still here, which is
 what identified them; there is no such residue now.
@@ -95,9 +95,9 @@ the part to read first:
     fp4_layout.cuh                      37 lines     1,482 bytes
 
 They are the transitive closure, inside the FlashInfer tree, of
-`kernels/comm/all_reduce.cuh`, which is `kernels_cuda::comm`'s NVRTC root and
-the device text the tensor-parallel collectives fire. The other two files that
-closure reaches -- `utils.cuh` and `vec_dtypes.cuh` -- were already carried and
+`kernels/collective/all_reduce.cuh`, which is `kernels_cuda::collective`'s
+NVRTC root and the device text the tensor-parallel collectives fire. The
+other two files that closure reaches -- `utils.cuh` and `vec_dtypes.cuh` -- were already carried and
 are unchanged.
 
 **They came from the flashinfer PYTHON WHEEL, not from the CPM checkout the
@@ -339,7 +339,7 @@ by the same markers, and tested by the same tests as everything beside it.
 
 The second move took it out from under `attn/`, and that is a correction
 rather than a preference: `flashinfer/comm/` holds the two all-reduce headers
-that are `kernels_cuda::comm`'s NVRTC root, and an all-reduce is not
+that are `kernels_cuda::collective`'s NVRTC root, and an all-reduce is not
 attention. Under `attn/` the path made a claim about the text that two of its
 files contradicted. At `kernels/flashinfer/` it makes none -- the directory
 says what the text IS and not which of our families happens to use it, which

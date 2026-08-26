@@ -1,29 +1,39 @@
-use std::marker::PhantomData;
+//! The GLM 5 declaration, de-genericized (design §5, decision #18): the old
+//! `Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>` phantom tree is
+//! gone — `tp` is a runtime field, each weight carries its `Dtype`, and the
+//! SKU constructors take every element choice as an argument: the catalog row
+//! spells the dense-weight, routed-expert, activation and kv-cache elements it
+//! wants, and the model keeps the last two as fields for the forward pass.
+//! Names and the per-layer scheme are unchanged from the old crate: weights
+//! intern by name, so the checkpoint mapping carries over untouched.
 
-use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::{CacheRef, Norm, Tensor};
+use model_dsl::{Dtype, Weight};
 
-pub struct Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize = 1> {
+pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub embed: Tensor<W1>,
-    /// The lm head's own bank. This text does NOT tie: the tied reading was
-    /// an enum arm no geometry constructed, and `tie_word_embeddings` is
-    /// false in the config these dims are read from.
-    pub head: Tensor<W1>,
-    pub layers: Vec<Layer<W1, W2>>,
-    pub final_norm: Norm<W1>,
-    _kv: PhantomData<K>,
+    pub tp: u32,
+    /// Activation element — stated, not inherited silently.
+    pub act: Dtype,
+    /// Kv-cache element layout — drives the append kernel and row bytes.
+    pub kv: Dtype,
+    pub embed: Weight,
+    pub head: Weight,
+    pub layers: Vec<Layer>,
+    pub final_norm: Weight,
+    pub final_norm_eps: f32,
 }
 
-pub struct Layer<W1: Dtype, W2: Dtype> {
-    pub attn: Attn<W1>,
-    pub attn_norm: Norm<W1>,
-    pub mlp_norm: Norm<W1>,
-    pub mlp: Mlp<W1, W2>,
+pub struct Layer {
+    pub attn: Attn,
+    pub attn_norm: Weight,
+    pub attn_norm_eps: f32,
+    pub mlp_norm: Weight,
+    pub mlp_norm_eps: f32,
+    pub mlp: Mlp,
 }
 
-pub struct Attn<W1: Dtype> {
+pub struct Attn {
     pub heads: u32,
     pub kv_lora_rank: u32,
     pub qk_nope_head_dim: u32,
@@ -31,41 +41,44 @@ pub struct Attn<W1: Dtype> {
     pub v_head_dim: u32,
     pub theta: f32,
     pub sm_scale: f32,
-    pub q_a_proj: Tensor<W1>,
-    pub q_a_norm: Norm<W1>,
-    pub q_b_proj: Tensor<W1>,
-    pub kv_a_proj: Tensor<W1>,
-    pub kv_a_norm: Norm<W1>,
-    pub kv_b_proj: Tensor<W1>,
-    pub o_proj: Tensor<W1>,
-    pub indexer: Indexer<W1>,
-    pub kv: CacheRef,
+    pub q_a_proj: Weight,
+    pub q_a_norm: Weight,
+    pub q_a_norm_eps: f32,
+    pub q_b_proj: Weight,
+    pub kv_a_proj: Weight,
+    pub kv_a_norm: Weight,
+    pub kv_a_norm_eps: f32,
+    pub kv_b_proj: Weight,
+    pub o_proj: Weight,
+    pub indexer: Indexer,
+    pub kv: String,
 }
 
-pub struct Indexer<W1: Dtype> {
+pub struct Indexer {
     pub heads: u32,
     pub head_dim: u32,
     pub top_k: u32,
-    pub q_proj: Tensor<W1>,
-    pub k_proj: Tensor<W1>,
-    pub weights_proj: Tensor<W1>,
-    pub k_norm: Norm<W1>,
-    pub k_norm_bias: Tensor<W1>,
-    pub keys: CacheRef,
+    pub q_proj: Weight,
+    pub k_proj: Weight,
+    pub weights_proj: Weight,
+    pub k_norm: Weight,
+    pub k_norm_eps: f32,
+    pub k_norm_bias: Weight,
+    pub keys: String,
 }
 
-#[allow(clippy::large_enum_variant)] // a per-layer weight-bank record, built once at trace; boxing buys nothing and costs every reader a deref
-pub enum Mlp<W1: Dtype, W2: Dtype> {
+#[allow(clippy::large_enum_variant)]
+pub enum Mlp {
     Dense {
-        gate_up: Tensor<W1>,
-        down: Tensor<W1>,
+        gate_up: Weight,
+        down: Weight,
         inter: u32,
     },
     Routed {
-        router: Tensor<W1>,
-        gate_up: Tensor<W2>,
-        down: Tensor<W2>,
-        shared: Option<Shared<W1>>,
+        router: Weight,
+        gate_up: Weight,
+        down: Weight,
+        shared: Option<Shared>,
         experts: u32,
         top_k: u32,
         inter: u32,
@@ -74,9 +87,9 @@ pub enum Mlp<W1: Dtype, W2: Dtype> {
     },
 }
 
-pub struct Shared<W1: Dtype> {
-    pub gate_up: Tensor<W1>,
-    pub down: Tensor<W1>,
+pub struct Shared {
+    pub gate_up: Weight,
+    pub down: Weight,
     pub inter: u32,
 }
 
@@ -109,23 +122,8 @@ struct Dims {
     norm_eps: f32,
 }
 
-/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
-/// ways, with `..d` saying that everything else is replicated.
-///
-/// The attention heads and the three intermediates. THE LATENT DOES NOT
-/// DIVIDE, and that is what makes MLA cheap under a rank cut: `kv_a_proj`
-/// writes the `[1, kv_lora_rank + qk_rope_head_dim]` row this text caches
-/// and every rank writes and holds the whole of it, so `kv_lora_rank`,
-/// `qk_rope_head_dim` and the `q_lora_rank` beside them stay put while
-/// `q_b_proj` and `kv_b_proj` cut the head fan they expand it into.
-///
-/// The sparse indexer does not divide either: every one of its banks is
-/// replicated, so each rank scores the same keys and reaches the same
-/// `index.topk` selection — which is the only way a selection two ranks
-/// attend through can be the same selection without a statement to make it
-/// so.
-fn per_rank<const TP: usize>(d: Dims) -> Dims {
-    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+fn per_rank(d: Dims, tp: u32) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, tp as usize);
     Dims {
         heads: cut("heads", d.heads),
         dense_inter: cut("dense inter", d.dense_inter),
@@ -138,51 +136,46 @@ fn per_rank<const TP: usize>(d: Dims) -> Dims {
     }
 }
 
-impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Model<W1, W2, K, TP> {
-    /// UNVERIFIED against a checkpoint — no GLM-5 file is cached, so nothing
-    /// has been held against these numbers.
-    ///
-    /// `serve::ROWS` advertises `glm5-a12b-bf16-bf16-kv-bf16` as arch
-    /// `glm_moe_dsa`, and unlike deepseek-v4's and kimi's rows this text is
-    /// a FULL-DEPTH reading: 46 layers with 3 dense, from the published
-    /// A12B config. That makes it the more dangerous kind of unverified —
-    /// it looks like a transcription and may be one, but the DSA index
-    /// tower (`index_heads` / `index_head_dim` / `index_top_k`) and the
-    /// MoE block are the parts a file would most likely disagree with, and
-    /// `tie_word_embeddings` is read as false with nothing to check it
-    /// against.
-    pub fn a12b() -> Self {
-        assemble(Dims {
-            hidden: 4096,
-            layers: 46,
-            dense_layers: 3,
-            heads: 96,
-            q_lora_rank: 1536,
-            kv_lora_rank: 512,
-            qk_nope_head_dim: 128,
-            qk_rope_head_dim: 64,
-            v_head_dim: 128,
-            theta: 10_000.0,
-            index_heads: 64,
-            index_head_dim: 128,
-            index_top_k: 2048,
-            dense_inter: 10_944,
-            moe: MoeDims {
-                experts: 128,
-                top_k: 8,
-                inter: 1408,
-                shared_inter: 1408,
-                norm_weights: true,
-                scaling: 2.5,
+impl Model {
+    pub fn a12b(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        assemble(
+            w,
+            experts,
+            act,
+            kv,
+            tp,
+            Dims {
+                hidden: 4096,
+                layers: 46,
+                dense_layers: 3,
+                heads: 96,
+                q_lora_rank: 1536,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                theta: 10_000.0,
+                index_heads: 64,
+                index_head_dim: 128,
+                index_top_k: 2048,
+                dense_inter: 10_944,
+                moe: MoeDims {
+                    experts: 128,
+                    top_k: 8,
+                    inter: 1408,
+                    shared_inter: 1408,
+                    norm_weights: true,
+                    scaling: 2.5,
+                },
+                vocab: 151_552,
+                norm_eps: 1e-5,
             },
-            vocab: 151_552,
-            norm_eps: 1e-5,
-        })
+        )
     }
 }
 
-fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, W2, K, TP> {
-    let d = per_rank::<TP>(d);
+fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    let d = per_rank(d, tp);
     let hidden = d.hidden as u64;
     let q_lora = d.q_lora_rank as u64;
     let kv_lora = d.kv_lora_rank as u64;
@@ -197,10 +190,7 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
     let layers = (0..d.layers)
         .map(|l| {
             let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, w: u64| Norm {
-                weight: Tensor::sym(n(s), [w]),
-                eps: d.norm_eps,
-            };
+            let norm = |s: &str, width: u64| Weight::sym(n(s), [width], w);
             let attn = Attn {
                 heads: d.heads,
                 kv_lora_rank: d.kv_lora_rank,
@@ -209,31 +199,38 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
                 v_head_dim: d.v_head_dim,
                 theta: d.theta,
                 sm_scale: (qk_head_dim as f32).sqrt().recip(),
-                q_a_proj: Tensor::sym(n("q_a_proj"), [q_lora, hidden]),
+                q_a_proj: Weight::sym(n("q_a_proj"), [q_lora, hidden], w),
                 q_a_norm: norm("q_a_norm", q_lora),
-                q_b_proj: Tensor::sym(n("q_b_proj"), [q_b_width, q_lora]).columns(),
-                kv_a_proj: Tensor::sym(n("kv_a_proj"), [kv_a_width, hidden]),
+                q_a_norm_eps: d.norm_eps,
+                q_b_proj: Weight::sym(n("q_b_proj"), [q_b_width, q_lora], w).columns(),
+                kv_a_proj: Weight::sym(n("kv_a_proj"), [kv_a_width, hidden], w),
                 kv_a_norm: norm("kv_a_norm", kv_lora),
-                kv_b_proj: Tensor::sym(n("kv_b_proj"), [kv_b_width, kv_lora]).columns(),
-                o_proj: Tensor::sym(n("o_proj"), [hidden, v_width]).rows(),
+                kv_a_norm_eps: d.norm_eps,
+                kv_b_proj: Weight::sym(n("kv_b_proj"), [kv_b_width, kv_lora], w).columns(),
+                o_proj: Weight::sym(n("o_proj"), [hidden, v_width], w).rows(),
                 indexer: Indexer {
                     heads: d.index_heads,
                     head_dim: d.index_head_dim,
                     top_k: d.index_top_k,
-                    q_proj: Tensor::sym(n("index_q_proj"), [index_width, q_lora]),
-                    k_proj: Tensor::sym(n("index_k_proj"), [d.index_head_dim as u64, hidden]),
-                    weights_proj: Tensor::sym(n("index_weights"), [d.index_heads as u64, q_lora]),
+                    q_proj: Weight::sym(n("index_q_proj"), [index_width, q_lora], w),
+                    k_proj: Weight::sym(n("index_k_proj"), [d.index_head_dim as u64, hidden], w),
+                    weights_proj: Weight::sym(
+                        n("index_weights"),
+                        [d.index_heads as u64, q_lora],
+                        w,
+                    ),
                     k_norm: norm("index_k_norm", d.index_head_dim as u64),
-                    k_norm_bias: Tensor::sym(n("index_k_norm_bias"), [d.index_head_dim as u64]),
-                    keys: CacheRef::to(format!("index.{l}")),
+                    k_norm_eps: d.norm_eps,
+                    k_norm_bias: Weight::sym(n("index_k_norm_bias"), [d.index_head_dim as u64], w),
+                    keys: format!("index.{l}"),
                 },
-                kv: CacheRef::to(format!("kv.{l}")),
+                kv: format!("kv.{l}"),
             };
             let mlp = if dense_at(l) {
                 let iw = d.dense_inter as u64;
                 Mlp::Dense {
-                    gate_up: Tensor::sym(n("gate_up"), [2 * iw, hidden]).packed([iw, iw]),
-                    down: Tensor::sym(n("down"), [hidden, iw]).rows(),
+                    gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
+                    down: Weight::sym(n("down"), [hidden, iw], w).rows(),
                     inter: d.dense_inter,
                 }
             } else {
@@ -241,14 +238,19 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
                 let iw = m.inter as u64;
                 let sw = m.shared_inter as u64;
                 Mlp::Routed {
-                    router: Tensor::sym(n("router"), [m.experts as u64, hidden]),
-                    gate_up: Tensor::sym(n("experts_gate_up"), [m.experts as u64, 2 * iw, hidden])
-                        .bank([iw, iw]),
-                    down: Tensor::sym(n("experts_down"), [m.experts as u64, hidden, iw]).rows(),
+                    router: Weight::sym(n("router"), [m.experts as u64, hidden], w),
+                    gate_up: Weight::sym(
+                        n("experts_gate_up"),
+                        [m.experts as u64, 2 * iw, hidden],
+                        experts,
+                    )
+                    .bank([iw, iw]),
+                    down: Weight::sym(n("experts_down"), [m.experts as u64, hidden, iw], experts)
+                        .rows(),
                     shared: (m.shared_inter > 0).then(|| Shared {
-                        gate_up: Tensor::sym(n("shared_gate_up"), [2 * sw, hidden])
+                        gate_up: Weight::sym(n("shared_gate_up"), [2 * sw, hidden], w)
                             .packed([sw, sw]),
-                        down: Tensor::sym(n("shared_down"), [hidden, sw]).rows(),
+                        down: Weight::sym(n("shared_down"), [hidden, sw], w).rows(),
                         inter: m.shared_inter,
                     }),
                     experts: m.experts,
@@ -261,7 +263,9 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
             Layer {
                 attn,
                 attn_norm: norm("attn_norm", hidden),
+                attn_norm_eps: d.norm_eps,
                 mlp_norm: norm("mlp_norm", hidden),
+                mlp_norm_eps: d.norm_eps,
                 mlp,
             }
         })
@@ -270,13 +274,13 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
     Model {
         hidden: d.hidden,
         vocab: d.vocab,
-        embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
-        head: Tensor::sym("lm_head", [d.vocab as u64, hidden]),
+        tp,
+        act,
+        kv,
+        embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
+        head: Weight::sym("lm_head", [d.vocab as u64, hidden], w),
         layers,
-        final_norm: Norm {
-            weight: Tensor::sym("final_norm", [hidden]),
-            eps: d.norm_eps,
-        },
-        _kv: PhantomData,
+        final_norm: Weight::sym("final_norm", [hidden], w),
+        final_norm_eps: d.norm_eps,
     }
 }

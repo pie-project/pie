@@ -1,24 +1,6 @@
-// Raw-Metal port of the tied-quantized embedding gather for Phase-0 decode.
-//
-// Source semantics: weights.hpp apply_embedding (quantized path) ==
-//   take(weight, id, axis0) + take(scales/biases) + dequantize(gs, bits).
-// qwen3.6 uses a TIED 4-bit lm_head as the embed table (dense embed dropped for
-// true-4-bit parity): gather + affine-dequant ONE row [hidden] for the token.
-// Port notes (M=1 decode, group_size=64, bits=4, hidden=1024):
-//   * token_id IS the per-token IO scalar -> read from a *buffer* (id[0]) per
-//     decode_abi I1, never setBytes.
-//   * Same affine packing as qmv: 32/bits codes per uint32, per-group scale+bias.
-//   * One thread per output channel k -> out[k] = scale[g]*nibble_k + bias[g].
-//   * Output goes to the resident hidden slot (logits path is the separate qmv).
-// Launch: dispatchThreads grid=(hidden, 1, 1). bfloat native on Metal 4.
-
 #include <metal_stdlib>
 using namespace metal;
 
-// One row of a quantized table, at either width mlx_lm ships. The `bits`
-// template parameter used to be decorative -- the body divided by 8 and masked
-// a nibble -- so an 8-bit table would have been gathered as if it were 4-bit,
-// which is exactly the class of error that produces a fluent wrong answer.
 template <int bits>
 inline uint dequant_code(const device uint32_t* row, int k) {
   constexpr int per_word = 32 / bits;
@@ -44,11 +26,11 @@ METAL_FUNC void embed_gather_body(
 
 template <typename T, int group_size, int bits>
 [[kernel]] void embed_gather_4bit(
-    const device uint32_t* w   [[buffer(0)]],  // [vocab, hidden/8] packed
-    const device T* scales     [[buffer(1)]],  // [vocab, hidden/group_size]
-    const device T* biases     [[buffer(2)]],  // [vocab, hidden/group_size]
-    const device int* id       [[buffer(3)]],  // IO scalar (I1): id[0] = token
-    device T* out              [[buffer(4)]],  // [hidden]
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device int* id       [[buffer(3)]],
+    device T* out              [[buffer(4)]],
     const constant int& hidden [[buffer(5)]],
     uint k [[thread_position_in_grid]]) {
   embed_gather_body<T, group_size, bits, false>(
@@ -68,12 +50,6 @@ instantiate_embed(bfloat16, bfloat, 64, 8)
 instantiate_embed(bfloat16, bfloat, 32, 8)
 instantiate_embed(bfloat16, bfloat, 128, 8)
 
-// ── Scaled variant (gemma4): out[k] = embed_scale * dequant(row, k). ─────────────
-// gemma4 multiplies the gathered embedding by a constant (embed_tokens: sqrt(hidden);
-// embed_tokens_per_layer: sqrt(per_layer_emb_dim)). Same tied 4-bit table as the
-// unscaled gather + lm_head — the scale must NOT be folded into the shared weights
-// (lm_head reuses them), so it is applied here on the embed path only. Extra buffer 6
-// = const float scale; qwen's `embed_gather_4bit` (no buffer 6) is untouched.
 template <typename T, int group_size, int bits>
 [[kernel]] void embed_gather_scaled_4bit(
     const device uint32_t* w   [[buffer(0)]],
@@ -102,17 +78,13 @@ instantiate_embed_scaled(bfloat16, bfloat, 64, 8)
 instantiate_embed_scaled(bfloat16, bfloat, 32, 8)
 instantiate_embed_scaled(bfloat16, bfloat, 128, 8)
 
-// ── M>1 batched gather (multi-batch lane). ───────────────────────────────────
-// One thread per (channel k, token row m); token m gathers row id[m] (per-row IO
-// read — the M>1 relaxation of the sealed id[0]). out is token-major [N, hidden].
-// Reduces to embed_gather_4bit at N=1 (m=0, id[0]). Launch grid=(hidden, N, 1).
 template <typename T, int group_size, int bits>
 [[kernel]] void embed_gather_mb_4bit(
     const device uint32_t* w   [[buffer(0)]],
     const device T* scales     [[buffer(1)]],
     const device T* biases     [[buffer(2)]],
-    const device int* id       [[buffer(3)]],  // [N] per-token ids
-    device T* out              [[buffer(4)]],  // [N, hidden]
+    const device int* id       [[buffer(3)]],
+    device T* out              [[buffer(4)]],
     const constant int& hidden [[buffer(5)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int k = int(gid.x);
@@ -135,7 +107,6 @@ instantiate_embed_mb(bfloat16, bfloat, 64, 8)
 instantiate_embed_mb(bfloat16, bfloat, 32, 8)
 instantiate_embed_mb(bfloat16, bfloat, 128, 8)
 
-// gemma4 scaled batched variant.
 template <typename T, int group_size, int bits>
 [[kernel]] void embed_gather_scaled_mb_4bit(
     const device uint32_t* w   [[buffer(0)]],

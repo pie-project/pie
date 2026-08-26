@@ -1,19 +1,9 @@
 #pragma once
 
-// Device-side RoPE primitives, shared so that a fused kernel and the standalone
-// `rope_bf16_kernel` cannot drift apart numerically. Anything that rotates a
-// bf16 pair in this driver must call through here; a second copy of these three
-// lines is a bit-exactness bug waiting to happen.
-
-// The scalar layer, and the reason there is no `<cuda_bf16.h>` above it:
-// NVRTC resolves this include against a header set carried in the Rust
-// binary, never from a path, so a machine with no CUDA toolkit compiles
-// these rotations. See `driver-cuda/src/bind/headers.rs`.
 #include "prelude/device.cuh"
 
 namespace pie {
 
-// NeoX / half-and-half pairing: dim `i` rotates against `i + head_dim/2`.
 __device__ __forceinline__ void rotate_pair(
     bf16* h_ptr, int half, int dim_pair, float cos_v, float sin_v)
 {
@@ -23,8 +13,6 @@ __device__ __forceinline__ void rotate_pair(
     h_ptr[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
 }
 
-// GPT-J / interleaved pairing: adjacent dims (2i, 2i+1). Required by GLM
-// (`rope_interleave=true`) and by DeepSeek-V2/V3/Kimi's q_pe/k_pe.
 __device__ __forceinline__ void rotate_pair_interleaved(
     bf16* h_ptr, int dim_pair, float cos_v, float sin_v)
 {
@@ -34,7 +22,6 @@ __device__ __forceinline__ void rotate_pair_interleaved(
     h_ptr[2 * dim_pair + 1] = f32_to_bf16(b * cos_v + a * sin_v);
 }
 
-// Out-of-place interleaved rotation: `src` and `dst` may alias.
 __device__ __forceinline__ void rotate_pair_interleaved_to(
     const bf16* src, bf16* dst,
     int dim_pair, float cos_v, float sin_v)
@@ -55,8 +42,6 @@ __device__ __forceinline__ void rotate_pair_to(
     dst[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
 }
 
-// The angle for one (position, dim_pair). Kept as one expression because the
-// `powf`/`__sincosf` pair is what every rope variant has to reproduce exactly.
 __device__ __forceinline__ void rope_cos_sin(
     float theta, int dim_pair, int head_dim, int pos,
     float& cos_v, float& sin_v)
@@ -67,9 +52,6 @@ __device__ __forceinline__ void rope_cos_sin(
     __sincosf(ang, &sin_v, &cos_v);
 }
 
-// Linear ramp over dim index: 0 below low_dim, 1 above high_dim. Blends
-// between unscaled (high freq) and `1/factor`-scaled (low freq) inv_freq, in
-// the dim-index domain rather than the wavelen domain Llama-3 YaRN uses.
 __device__ __forceinline__ float yarn_original_freq(
     float base_freq, float factor,
     float low_dim, float high_dim, int dim_pair)
@@ -96,19 +78,6 @@ __device__ __forceinline__ void rope_cos_sin_yarn_original(
     sin_v *= mscale;
 }
 
-// Ramp bounds for the original-YaRN variant. Shared so a fused kernel and
-// `kernels::rope::rope_yarn_original_bf16` cannot disagree about where the
-// ramp starts, which would silently change every position > 0.
-//
-// `__host__ __device__` and not bare `inline`. Both callers are host
-// launchers, so this ran as host code and nvcc was content to leave it
-// unannotated -- but an unannotated function in a header NVRTC compiles is a
-// hard error ("host functions are not allowed in JIT mode"), and so is the
-// lambda below, whose execution space is inferred from its enclosing
-// function. Saying which spaces it belongs to is what lets one header serve
-// a launcher and a JIT compile; `-default-device` would paper over it by
-// inferring `__device__` for every unannotated function in the unit, which is
-// a much larger claim than this file needs to make.
 __host__ __device__ inline void yarn_original_ramp_bounds(
     int head_dim, float theta, float beta_fast, float beta_slow,
     int original_max_position, float& low_dim, float& high_dim)
@@ -127,4 +96,4 @@ __host__ __device__ inline void yarn_original_ramp_bounds(
     if (high_dim < low_dim) high_dim = low_dim;
 }
 
-}  // namespace pie
+}

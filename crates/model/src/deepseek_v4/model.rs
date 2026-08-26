@@ -1,17 +1,28 @@
-use std::marker::PhantomData;
+//! The DeepSeek V4 declaration, de-genericized (design §5, decision #18): the
+//! old `Model<W1: Dtype, K: KvDtype, const TP: usize>` phantom tree is gone —
+//! `tp` is a runtime field, each weight carries its `Dtype`, and the SKU
+//! constructors take every element choice as an argument: the catalog row
+//! spells the weight, activation and kv-cache elements outright, and the model
+//! carries the latter two as fields. Names and the per-layer scheme are
+//! unchanged from the old crate: weights intern by name, so the checkpoint
+//! mapping carries over untouched.
 
-use model_dsl::axes::{Dtype, F32, KvDtype};
-use model_dsl::{CacheRef, Norm, Tensor};
+use model_dsl::{Dtype, Weight};
 
-pub struct Model<W1: Dtype, K: KvDtype, const TP: usize = 1> {
+pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
+    pub tp: u32,
+    /// Activation element — stated, not inherited silently.
+    pub act: Dtype,
+    /// Kv-cache element layout — drives the append kernel and row bytes.
+    pub kv: Dtype,
     pub hyper: Hyper,
-    /// The embedding table, AND the lm head: this text ties them.
-    pub embed: Tensor<W1>,
-    pub layers: Vec<Layer<W1>>,
-    pub final_norm: Norm<W1>,
-    _kv: PhantomData<K>,
+
+    pub embed: Weight,
+    pub layers: Vec<Layer>,
+    pub final_norm: Weight,
+    pub final_norm_eps: f32,
 }
 
 pub struct Hyper {
@@ -20,70 +31,58 @@ pub struct Hyper {
     pub gate_eps: f32,
     pub alpha: f32,
     pub sinkhorn: u32,
-    /// THE HEAD GATE IS F32, and the floor is what says so: `hc.collapse`
-    /// declares `head_scale` and `head_base` `Const<Self::Tensor<f32>>`,
-    /// beside `hc.gates`' `scale`/`base` in [`Mix`]. Riding them on the
-    /// model's `W1` made the plan's repr column say bf16 for a slot the
-    /// dispatch binds as `float*` — an address with no repr check, so the
-    /// kernel would have read twice the bytes the checkpoint wrote.
-    ///
-    /// UNVERIFIED FROM THE OTHER SIDE: no deepseek-v4 checkpoint is cached,
-    /// so the join has never run on these rows. The kernel is the only
-    /// witness here, which is why the declaration is the one that decides.
-    pub head_scale: Tensor<F32>,
-    pub head_base: Tensor<F32>,
 }
 
-/// The per-block mix pair, `hc.gates`' two `Const<Self::Tensor<f32>>`
-/// slots. F32 for [`Hyper::head_scale`]'s reason, one point over.
 pub struct Mix {
-    pub scale: Tensor<F32>,
-    pub base: Tensor<F32>,
+    pub scale: Weight,
+    pub base: Weight,
 }
 
-pub struct Layer<W1: Dtype> {
+pub struct Layer {
     pub attn_mix: Mix,
-    pub attn: Attn<W1>,
+    pub attn: Attn,
     pub mlp_mix: Mix,
-    pub mlp: Mlp<W1>,
+    pub mlp: Mlp,
 }
 
-pub struct Attn<W1: Dtype> {
+pub struct Attn {
     pub heads: u32,
     pub head_dim: u32,
     pub rope_dim: u32,
     pub theta: f32,
     pub sm_scale: f32,
     pub window: u32,
-    pub q_down: Tensor<W1>,
-    pub q_norm: Norm<W1>,
-    pub q_up: Tensor<W1>,
-    pub kv_down: Tensor<W1>,
-    pub kv_norm: Norm<W1>,
-    pub o_down: Tensor<W1>,
-    pub o_up: Tensor<W1>,
-    pub sink: Tensor<W1>,
-    pub kv: CacheRef,
+    pub q_down: Weight,
+    pub q_norm: Weight,
+    pub q_norm_eps: f32,
+    pub q_up: Weight,
+    pub kv_down: Weight,
+    pub kv_norm: Weight,
+    pub kv_norm_eps: f32,
+    pub o_down: Weight,
+    pub o_up: Weight,
+    pub sink: Weight,
+    pub kv: String,
     pub pool: Option<Pool>,
 }
 
 pub struct Pool {
     pub ratio: u32,
-    pub entries: CacheRef,
+    pub entries: String,
 }
 
-pub enum Mlp<W1: Dtype> {
+pub enum Mlp {
     Dense {
-        gate_up: Tensor<W1>,
-        down: Tensor<W1>,
+        gate_up: Weight,
+        down: Weight,
         inter: u32,
         limit: f32,
     },
     Routed {
-        router: Tensor<W1>,
-        bias: Tensor<W1>,
-        gate_up: Tensor<W1>,
-        down: Tensor<W1>,
+        router: Weight,
+        bias: Weight,
+        gate_up: Weight,
+        down: Weight,
         experts: u32,
         top_k: u32,
         inter: u32,
@@ -120,36 +119,8 @@ struct Dims {
     norm_eps: f32,
 }
 
-/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
-/// ways, with `..d` saying that everything else is replicated.
-///
-/// The attention heads and both intermediates. `q_lora` and `o_lora` do not
-/// divide: `q_down` and `o_up` sit on the replicated side of the two
-/// projections that DO cut (`q_up` expands the lora into the head fan,
-/// `o_down` contracts the head fan back into it), and `o_down`'s partial
-/// rows are exactly what the `dist.all_reduce` immediately after it sums.
-/// The hyper-connection stack (`streams`) is a factor of the residual width,
-/// which the reduce closes over and no rank holds a piece of.
-///
-/// THE COMPRESSED PLANE CUTS WITH THE HEADS, and it is the reason `kv_down`
-/// carries a mark at all. This family's cache row is `[1, heads * head_dim]`
-/// — one plane per token serving as both k and v — so it is per-head, and a
-/// rank attending its own `heads / world` slice of the query fan must hold
-/// the matching slice of the plane. A plane replicated whole beside a cut
-/// query fan would need a HEAD OFFSET at the fire, which no statement here
-/// carries.
-///
-/// A SEAM THIS CUT DOES NOT CLOSE: `kv_norm` is a whole-row `norm.rmsnorm`
-/// over that now-cut plane, and a root-mean-square over a row split across
-/// ranks is a cross-rank sum that no point in this tree states. Every other
-/// norm this text applies is either over a replicated row (`q_norm` on the
-/// lora, the hyper norms on the stack) or per head
-/// (`norm.rmsnorm_no_scale` at `head_dim`), so this is the one. The fix is a
-/// model-truth question — DeepSeek normalizes the compressed latent, and
-/// whether this plane's norm is per head is a checkpoint's answer, and no
-/// dsv4 checkpoint is cached.
-fn per_rank<const TP: usize>(d: Dims) -> Dims {
-    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+fn per_rank(d: Dims, tp: u32) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, tp as usize);
     Dims {
         heads: cut("heads", d.heads),
         dense_inter: cut("dense inter", d.dense_inter),
@@ -158,56 +129,45 @@ fn per_rank<const TP: usize>(d: Dims) -> Dims {
     }
 }
 
-impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
-    /// UNVERIFIED — a 6-LAYER STAND-IN, and no deepseek-v4 checkpoint is
-    /// cached to make it anything else.
-    ///
-    /// `serve::ROWS` advertises `dsv4-base-bf16-kv-bf16` as arch
-    /// `deepseek_v4`, which is the real architecture's name; `layers: 6`
-    /// with `dense_layers: 1` is not the real architecture's depth. What
-    /// this text is FOR today is the hyper-connection statements — the
-    /// `hc.*` family has no other caller, and a six-layer tower exercises
-    /// every one of them at a size a trace can read. Every number here is
-    /// therefore a plausible shape rather than a config key, and the join
-    /// that would settle them has never run.
-    ///
-    /// Two further debts are named where they stand: `hc.collapse` is a
-    /// `CANON` row that refuses at load (no text produces the head-mix
-    /// plane it reads and no import ships a bank it could come from), and
-    /// the four f32 head-mix slots in [`Hyper`] and [`Mix`] are typed off
-    /// the KERNEL because there is no checkpoint to type them off.
-    pub fn base() -> Self {
-        assemble(Dims {
-            hidden: 2048,
-            layers: 6,
-            dense_layers: 1,
-            ratios: &[1, 2, 4],
-            heads: 16,
-            head_dim: 128,
-            q_lora: 768,
-            o_lora: 512,
-            rope_dim: 64,
-            theta: 10_000.0,
-            window: 2048,
-            streams: 4,
-            gate_eps: 1e-6,
-            alpha: 2.0,
-            sinkhorn: 20,
-            dense_inter: 5632,
-            experts: 64,
-            top_k: 6,
-            moe_inter: 1024,
-            renorm: false,
-            scaling: 2.5,
-            swiglu_limit: 7.0,
-            vocab: 129_280,
-            norm_eps: 1e-5,
-        })
+impl Model {
+    pub fn base(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        assemble(
+            w,
+            act,
+            kv,
+            tp,
+            Dims {
+                hidden: 2048,
+                layers: 6,
+                dense_layers: 1,
+                ratios: &[1, 2, 4],
+                heads: 16,
+                head_dim: 128,
+                q_lora: 768,
+                o_lora: 512,
+                rope_dim: 64,
+                theta: 10_000.0,
+                window: 2048,
+                streams: 4,
+                gate_eps: 1e-6,
+                alpha: 2.0,
+                sinkhorn: 20,
+                dense_inter: 5632,
+                experts: 64,
+                top_k: 6,
+                moe_inter: 1024,
+                renorm: false,
+                scaling: 2.5,
+                swiglu_limit: 7.0,
+                vocab: 129_280,
+                norm_eps: 1e-5,
+            },
+        )
     }
 }
 
-fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP> {
-    let d = per_rank::<TP>(d);
+fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    let d = per_rank(d, tp);
     let hidden = d.hidden as u64;
     let mult = d.streams as u64;
     let q_w = d.heads as u64 * d.head_dim as u64;
@@ -219,13 +179,10 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
     let layers = (0..d.layers)
         .map(|l| {
             let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, w: u64| Norm {
-                weight: Tensor::sym(n(s), [w]),
-                eps: d.norm_eps,
-            };
+            let norm = |s: &str, dim: u64| Weight::sym(n(s), [dim], w);
             let mix = |s: &str| Mix {
-                scale: Tensor::<F32>::sym(n(&format!("{s}_scale")), [3]),
-                base: Tensor::<F32>::sym(n(&format!("{s}_base")), [2 * mult + mult * mult]),
+                scale: Weight::sym(n(&format!("{s}_scale")), [3], Dtype::F32),
+                base: Weight::sym(n(&format!("{s}_base")), [2 * mult + mult * mult], Dtype::F32),
             };
             Layer {
                 attn_mix: mix("attn_mix"),
@@ -236,18 +193,17 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                     theta: d.theta,
                     sm_scale: (d.head_dim as f32).sqrt().recip(),
                     window: d.window,
-                    q_down: Tensor::sym(n("q_down"), [q_lora, hidden]),
+                    q_down: Weight::sym(n("q_down"), [q_lora, hidden], w),
                     q_norm: norm("q_norm", q_lora),
-                    q_up: Tensor::sym(n("q_up"), [q_w, q_lora]).columns(),
-                    kv_down: Tensor::sym(n("kv_down"), [q_w, hidden]).columns(),
-                    kv_norm: Norm {
-                        weight: Tensor::sym(n("kv_norm"), [q_w]).columns(),
-                        eps: d.norm_eps,
-                    },
-                    o_down: Tensor::sym(n("o_down"), [o_lora, q_w]).rows(),
-                    o_up: Tensor::sym(n("o_up"), [hidden, o_lora]),
-                    sink: Tensor::sym(n("attn_sink"), [d.heads as u64]).columns(),
-                    kv: CacheRef::to(format!("kv.{l}")),
+                    q_norm_eps: d.norm_eps,
+                    q_up: Weight::sym(n("q_up"), [q_w, q_lora], w).columns(),
+                    kv_down: Weight::sym(n("kv_down"), [q_w, hidden], w).columns(),
+                    kv_norm: Weight::sym(n("kv_norm"), [q_w], w).columns(),
+                    kv_norm_eps: d.norm_eps,
+                    o_down: Weight::sym(n("o_down"), [o_lora, q_w], w).rows(),
+                    o_up: Weight::sym(n("o_up"), [hidden, o_lora], w),
+                    sink: Weight::sym(n("attn_sink"), [d.heads as u64], w).columns(),
+                    kv: format!("kv.{l}"),
                     pool: d
                         .ratios
                         .get(l as usize)
@@ -255,29 +211,34 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                         .filter(|r| *r > 0)
                         .map(|ratio| Pool {
                             ratio,
-                            entries: CacheRef::to(format!("pool.{l}")),
+                            entries: format!("pool.{l}"),
                         }),
                 },
                 mlp_mix: mix("mlp_mix"),
                 mlp: if l < d.dense_layers {
                     Mlp::Dense {
-                        gate_up: Tensor::sym(n("gate_up"), [2 * dense_inter, hidden])
+                        gate_up: Weight::sym(n("gate_up"), [2 * dense_inter, hidden], w)
                             .packed([dense_inter, dense_inter]),
-                        down: Tensor::sym(n("down"), [hidden, dense_inter]).rows(),
+                        down: Weight::sym(n("down"), [hidden, dense_inter], w).rows(),
                         inter: d.dense_inter,
                         limit: d.swiglu_limit,
                     }
                 } else {
                     Mlp::Routed {
-                        router: Tensor::sym(n("router"), [d.experts as u64, hidden]),
-                        bias: Tensor::sym(n("router_bias"), [d.experts as u64]),
-                        gate_up: Tensor::sym(
+                        router: Weight::sym(n("router"), [d.experts as u64, hidden], w),
+                        bias: Weight::sym(n("router_bias"), [d.experts as u64], w),
+                        gate_up: Weight::sym(
                             n("experts_gate_up"),
                             [d.experts as u64, 2 * moe_inter, hidden],
+                            w,
                         )
                         .bank([moe_inter, moe_inter]),
-                        down: Tensor::sym(n("experts_down"), [d.experts as u64, hidden, moe_inter])
-                            .rows(),
+                        down: Weight::sym(
+                            n("experts_down"),
+                            [d.experts as u64, hidden, moe_inter],
+                            w,
+                        )
+                        .rows(),
                         experts: d.experts,
                         top_k: d.top_k,
                         inter: d.moe_inter,
@@ -293,21 +254,19 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
     Model {
         hidden: d.hidden,
         vocab: d.vocab,
+        tp,
+        act,
+        kv,
         hyper: Hyper {
             streams: d.streams,
             norm_eps: d.norm_eps,
             gate_eps: d.gate_eps,
             alpha: d.alpha,
             sinkhorn: d.sinkhorn,
-            head_scale: Tensor::<F32>::sym("hyper.head_scale", [1]),
-            head_base: Tensor::<F32>::sym("hyper.head_base", [mult]),
         },
-        embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
+        embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
         layers,
-        final_norm: Norm {
-            weight: Tensor::sym("final_norm", [hidden]),
-            eps: d.norm_eps,
-        },
-        _kv: PhantomData,
+        final_norm: Weight::sym("final_norm", [hidden], w),
+        final_norm_eps: d.norm_eps,
     }
 }

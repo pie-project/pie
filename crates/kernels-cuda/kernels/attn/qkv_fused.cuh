@@ -1,119 +1,8 @@
-//===-- qkv_fused.cuh - the three fused QKV epilogues ---------------------===//
-//
-// Three `__global__`s, all of them templates, and no host code. `qkv_fused.cu`
-// includes this and keeps all FIVE `<<<>>>`, so the ahead-of-time build and
-// NVRTC compile ONE text. §21.7 is the record of what two texts cost: fourteen
-// kernels duplicated for a week with every gate green, because the split
-// renamed them and the duplicate-name gate compares names.
-//
-// # What these three are
-//
-// Everything that happens between the QKV projection GEMM and attention, in
-// one launch: unpack the fused `[q | k | v]` row, RMSNorm q and k per head,
-// RoPE q and k, write k and v into the paged cache. The models here run this
-// once per layer per step, so at decode shapes the standalone chain was
-// almost entirely launch latency.
-//
-//  * `qkv_decode_qk_norm_rope_vnorm_write_kv<BLOCK, USE_ROPE_TABLE>` -- one
-//    block per (request, head). The general form: any head dim, `BLOCK`
-//    threads striding it.
-//  * `qkv_decode_qk_norm_rope_vnorm_write_kv_warp<HEAD_DIM, USE_ROPE_TABLE>` -- one
-//    WARP per (request, head), `HEAD_DIM` known at compile time so
-//    `ELEMS_PER_THREAD` is a constant and the norm reduction is
-//    `__shfl_xor_sync` with no shared memory and no `__syncthreads`. Chosen
-//    for head_dim 64/128/256; the block form is the fallback.
-//  * `qkv_packed_qk_norm_rope_vnorm_write_kv<BLOCK>` -- the prefill/packed
-//    form, one block per (row, head).
-//
-// ALL THREE RMSNORM V. The two decode forms did not until it was measured
-// against a transformers forward on gemma-4-E4B: they copied v through
-// while their own point is named `..._vnorm_write` and the unfused text
-// states `norm.rmsnorm_no_scale` in the same place. A single-token fire
-// cannot see the difference -- one v is one direction, and the
-// post-attention norm downstream removes its scale -- so five layers of
-// smoke had fired this arm without the error being reachable.
-//
-// # `USE_ROPE_TABLE` is a real arm, not a decoration
-//
-// `false` computes the angle with `powf` and `__sincosf`; `true` reads a
-// precomputed `[max_pos, head_dim]` table. Those are different numbers --
-// close, not equal -- so the parameter selects between two answers and §18's
-// measurement applies directly: *a wrong specialisation arm was 99.83% of the
-// right answer, 7 of 4,095 values moved and 0 of the 4,088 actually written.*
-// A row that names the wrong arm would pass any tolerance loose enough to
-// admit reassociation. The host picks it on `rope_table != nullptr` and both
-// values are instantiated and reachable.
-//
-// `BLOCK` and `HEAD_DIM` are equally real: `BLOCK` sizes `__shared__ float
-// buf[BLOCK]` and fixes the halving reduction over it; `HEAD_DIM` fixes
-// `ELEMS_PER_THREAD = HEAD_DIM / 32` and every `#pragma unroll` under it.
-//
-// # Which launcher becomes a row, and which does not
-//
-// **All five do now.** This section opened *"None of the five, and for one
-// reason each"*, and closed *"All five are stated below for whoever writes
-// them, with the line they were read from, because `runtime::launch` says a
-// rule with no cited launcher is a guess."* Someone wrote them, from those
-// lines. Both reasons named were geometric and both were answered:
-//
-//  * The two warp-form launches (`<<<warp_grid, 256>>>`) size the grid as
-//    `ceil(num_requests * (num_q_heads + num_kv_heads) / (256/32))` -- units
-//    of WARPS, not blocks, not rows, not heads. No rule divided a product of
-//    two head counts by a warps-per-block. `LaunchRule::WarpPackedHeads`
-//    does, cited at `qkv_fused.cu:51-53, :57-58, :70-71`.
-//  * The two block-form launches and the packed one use `dim3 grid(rows,
-//    num_q_heads + num_kv_heads)` -- a second axis that is the SUM of two head
-//    counts. `LaunchRule::RowsPackedHeads` (256-wide, `qkv_fused.cu:245-248`)
-//    and `RowsPackedHeadsNarrow` (128-wide, `:98-102`, `:126-127`) state it.
-//    The two differ only in block width, and that is not a tuning difference:
-//    the halving reduction is `__shfl_xor_sync` at one width and `__shared__`
-//    at the other.
-//
-// # What is still NOT reproduced here, and it is not the grid
-//
-// Two selectors on these kernels remain unspellable, and both are recorded
-// where the rows are rather than here:
-//
-//  * `USE_ROPE_TABLE` is `rope_table != nullptr`, a pointer-null test.
-//    `Term::Aligned` **holds of address 0**, so an alignment clause picks the
-//    table arm for a fire that has no table -- measured. `Term::Present`
-//    exists for this and reads `Fact::Address`.
-//  * `HEAD_DIM` is chosen by `if (head_dim == 64 / 128 / 256)` at
-//    `qkv_fused.cu:81, :85, :89`. `Term::Multiple { of: 64 }` holds of 192
-//    too, so an ordered arm list would send a 192-wide head to the 64
-//    expansion, where `ELEMS_PER_THREAD` is 2 and 6 is needed -- a wrong
-//    answer, not a fault. **The decode rows therefore PIN 128** and are not
-//    dispatchable until a term can say "exactly this value".
-//
-// # Linkage
-//
-// **Template-only.** All three are templates, so no host stub takes external
-// linkage until something instantiates one, and this header has NO
-// single-includer constraint -- unlike the `write_mla` half of
-// `mla_paged.cuh`, which holds a non-template `__global__` and may be included
-// by exactly one translation unit (§21.6). Nothing was templated here to get
-// that; all three arrived as templates.
-//
-// This list used to open with `pack_dense_mask.cuh`, which held two more
-// non-template `__global__`s under the same constraint. It is gone: the driver
-// packs the element bitmap on the HOST (`driver-cuda/src/fire/page_mask.rs`,
-// `mask[base + (index >> 3)] |= 1 << (index & 7)`, with tests that read it
-// back the way the kernels index it), so the device packers were never fired
-// and nothing included them.
-//
-// # NVRTC
-//
-// The only include is the prelude. `__sincosf`, `powf`, `rsqrtf` and
-// `__shfl_xor_sync` are builtins NVRTC accepts without a header -- measured,
-// same as `dsa_indexer.cuh` records. `<cstdint>` was the one external include
-// and it is gone: the fixed-width names come from `pie`.
-//
-//===----------------------------------------------------------------------===//
 #pragma once
 
 #include "prelude/device.cuh"
 
-namespace pie::attn {
+namespace pie::custom {
 
 template <int BLOCK, bool USE_ROPE_TABLE>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
@@ -141,11 +30,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     float eps)
 {
     const int r = blockIdx.x;
-    // Peel device window (prefix form): this kernel owns rows
-    // [0, win[0]) — the hook-free prefix — and the grid spans the full
-    // lane count so a captured launch replays across row splits. The
-    // early-out is uniform per block (r is blockIdx.x) and sits before
-    // any __syncthreads, so the shared reduction never diverges.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
@@ -161,15 +46,6 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
         : src_row + q_dim + local_head * head_dim;
     const bf16* weight = is_q ? q_weight : k_weight;
 
-    // V IS NORMED TOO, and its sum of squares rides the same reduction:
-    // `qkv_packed_qk_norm_rope_vnorm_write_kv` below has always done this and
-    // this kernel COPIED v through, which is a different model. Gemma-4's
-    // `v_norm` is `Gemma4RMSNorm(head_dim, with_scale=False)` — the
-    // `norm.rmsnorm_no_scale` an unfused text states between the split and the
-    // append — and it is invisible at one token (the reading is a single v,
-    // and the post-attention norm downstream divides the scale straight back
-    // out) and wrong at every prefix longer than that, because a mixture of
-    // un-normed v's points somewhere a mixture of normed ones does not.
     const bf16* v_src =
         is_q ? nullptr : src_row + q_dim + kv_dim + local_head * head_dim;
     float local = 0.f;
@@ -310,9 +186,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     if (unit >= num_requests * total_qk_heads) return;
 
     const int r = unit / total_qk_heads;
-    // Peel device window (prefix form): rows [0, win[0]) only. One warp
-    // is one (row, head) unit, so the early-out is warp-uniform and the
-    // FULL_MASK shuffles below never see a partial warp.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int head_idx = unit - r * total_qk_heads;
     const bool is_q = head_idx < num_q_heads;
@@ -328,10 +202,6 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         : src_row + q_dim + local_head * HEAD_DIM;
     const bf16* weight = is_q ? q_weight : k_weight;
 
-    // V IS NORMED TOO — see the block form above for why a copy is a
-    // different model. The v sum of squares rides the same warp reduction,
-    // and the early-outs before this point are all warp-uniform, so the
-    // FULL_MASK shuffle sees a whole warp for both.
     const bf16* v_src =
         is_q ? nullptr : src_row + q_dim + kv_dim + local_head * HEAD_DIM;
     float vals[ELEMS_PER_THREAD];
@@ -572,4 +442,4 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv(
     }
 }
 
-}  // namespace pie::attn
+}

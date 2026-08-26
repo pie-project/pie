@@ -1,24 +1,31 @@
-// Raw-Metal port of MLX sdpa_vector (single-pass), scoped to Phase-0 decode.
-//
-// Source: mlx/backend/metal/kernels/sdpa_vector.h (sdpa_vector, single-pass).
-// Port notes (M=1 decode, B=1):
-//   * Single query token attends all N past keys -> the causal mask is trivially
-//     all-true (use_key always true), so do_causal / has_mask / bool_mask /
-//     float_mask / has_sinks / query_transposed function-constants are all DROPPED
-//     and their branches removed. qwen3.6 full-attn has no sinks, no mask at decode.
-//   * N == kv_len IS a per-token IO-derived scalar (grows each step) -> kept as a
-//     constant *buffer* (buffer 5), NOT setBytes, per decode_abi I1 so the CB stays
-//     byte-identical (executor writes the new kv_len into the slot each token).
-//   * head/seq strides are STATIC paged-KV geometry -> constant buffers, fine.
-//   * Limits<U>::finite_min replaced with an explicit lowest-float constant.
-//   * scale = 1/sqrt(head_dim), applied to q. bfloat native on Metal 4.
-// Launch: group=(1024,1,1), grid=(n_q_heads,1,1). D=V=256, gqa_factor=4 for qwen3.6.
-
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
 
-#include "sdpa_online.h"
+METAL_FUNC void sdpa_online_update(
+    float score, thread float& max_score, thread float& sum_exp_score,
+    thread float& history_scale, thread float& score_scale) {
+  const float new_max = max(max_score, score);
+  history_scale = fast::exp(max_score - new_max);
+  score_scale = fast::exp(score - new_max);
+  max_score = new_max;
+  sum_exp_score = sum_exp_score * history_scale + score_scale;
+}
+
+METAL_FUNC float sdpa_merge_sink(
+    float sink, float reference_max, thread float& sum_exp_score) {
+  const float merged_max = max(reference_max, sink);
+  const float output_scale = fast::exp(reference_max - merged_max);
+  sum_exp_score =
+      sum_exp_score * output_scale + fast::exp(sink - merged_max);
+  return output_scale;
+}
+
+METAL_FUNC float sdpa_lse_base2(float max_score, float sum_exp_score) {
+  constexpr float kLog2E = 1.44269504088896340736f;
+  return sum_exp_score > 0.0f ? (max_score * kLog2E + log2(sum_exp_score))
+                              : -INFINITY;
+}
 
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector_decode(
@@ -41,7 +48,7 @@ template <typename T, int D, int V = D>
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
-  constexpr float NEG_INF = -3.0e38f;  // < -FLT_MAX/... finite lowest sentinel
+  constexpr float NEG_INF = -3.0e38f;
   int inner_k_stride = BN * int(k_seq_stride);
   int inner_v_stride = BN * int(v_seq_stride);
 
@@ -55,10 +62,10 @@ template <typename T, int D, int V = D>
   threadgroup U sum_exp_scores[BN];
 
   const int q_batch_head_idx = tid.x;
-  const int q_seq_idx = tid.y;  // 0 at decode
+  const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
   const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
-  const int q_offset = o_offset;  // query_transposed == false
+  const int q_offset = o_offset;
 
   queries += q_offset * D + simd_lid * qk_per_thread;
   keys += kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
@@ -110,10 +117,7 @@ template <typename T, int D, int V = D>
       const constant float&, uint3, uint3, uint, uint);
 
 instantiate_sdpa_decode(bfloat16, bfloat, 256, 256)
-// llama / mistral / qwen2 / qwen3 and the Qwen MoEs, all of which use a
-// 128-wide head. The template is parameterised on D precisely so a new head
-// width is an instantiation and not a kernel.
+
 instantiate_sdpa_decode(bfloat16, bfloat, 128, 128)
-// Llama 3.2's small sizes halve the head instead of the head count: 1B and 3B
-// are 32 query heads of 64. Same template, one more width.
+
 instantiate_sdpa_decode(bfloat16, bfloat, 64, 64)

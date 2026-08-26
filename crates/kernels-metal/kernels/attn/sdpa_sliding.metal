@@ -1,46 +1,31 @@
-// Raw-Metal sliding-window SDPA (single-pass decode), gemma4 lane.
-//
-// Derived from delta's sdpa_vector.metal (full-attn single-pass decode). The ONLY
-// structural change is the key/value iteration window:
-//
-//   * gemma4 sliding layers attend only the last `window` (=512) positions; full
-//     layers attend all past keys. At M=1 decode the query sits at logical position
-//     N-1 (the current token's K/V is already appended), so the sliding window
-//     [p-window+1 .. p] maps to key indices [max(0, N-window) .. N-1]. Causal mask
-//     stays trivially all-true WITHIN the window, so no mask branch is needed.
-//
-//   * `window <= 0` selects full attention (kv_start = 0) -> this single kernel also
-//     serves gemma4's full-attn layers {4,9,14,19,24,29,34}; the encode_fn binds the
-//     per-layer window (512 sliding / 0 full).
-//
-//   * kv_start = (window > 0 && N > window) ? N - window : 0. We advance the keys/
-//     values base pointers by kv_start*seq_stride and treat the window as a
-//     contiguous sub-sequence of length Nw = N - kv_start, leaving the inner
-//     simd-reduction identical to the full-attn port.
-//
-// Buffers mirror sdpa_vector_decode; `window` is appended at buffer(11) (static
-// geometry, but kept a constant *buffer* to match the decode_abi I1 convention so
-// the command buffer stays byte-identical step-to-step).
-//
-// M>1 (prefill). The kernel already carried a query-row dimension in tid.y; what
-// it lacked was a per-row causal position, so every row would have attended all N
-// keys. Row m of an M-row launch holds the token at logical end N-(M-1-m), which
-// is the ONLY thing that changes -- `kv_start`/`Nw` are then the existing
-// expressions with N replaced by that. Decode is M=1, where N-(M-1-m) == N, so
-// the two paths run the same arithmetic rather than two spellings of it.
-//
-// The query/output row strides are stated by the caller (buffers 12/13) instead
-// of inferred. mlx's original infers [head][row][D] from `q_seq_idx`, but a
-// prefill GEMM writes [row][head][D]; an inferred layout that disagrees with the
-// producer reads plausible garbage rather than failing.
-//
-// Launch: group=(1024,1,1), grid=(n_q_heads,M,1). D=V=256, gqa_factor=8 for gemma4.
-
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
 
-#include "sdpa_online.h"
+METAL_FUNC void sdpa_online_update(
+    float score, thread float& max_score, thread float& sum_exp_score,
+    thread float& history_scale, thread float& score_scale) {
+  const float new_max = max(max_score, score);
+  history_scale = fast::exp(max_score - new_max);
+  score_scale = fast::exp(score - new_max);
+  max_score = new_max;
+  sum_exp_score = sum_exp_score * history_scale + score_scale;
+}
+
+METAL_FUNC float sdpa_merge_sink(
+    float sink, float reference_max, thread float& sum_exp_score) {
+  const float merged_max = max(reference_max, sink);
+  const float output_scale = fast::exp(reference_max - merged_max);
+  sum_exp_score =
+      sum_exp_score * output_scale + fast::exp(sink - merged_max);
+  return output_scale;
+}
+
+METAL_FUNC float sdpa_lse_base2(float max_score, float sum_exp_score) {
+  constexpr float kLog2E = 1.44269504088896340736f;
+  return sum_exp_score > 0.0f ? (max_score * kLog2E + log2(sum_exp_score))
+                              : -INFINITY;
+}
 
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector_decode_swa(
@@ -68,12 +53,9 @@ template <typename T, int D, int V = D>
   constexpr int v_per_thread = V / BD;
   constexpr float NEG_INF = -3.0e38f;
 
-  // Where this row's token sits. The M rows of a prefill are the last M
-  // positions, so row m ends at N-(M-1-m); at decode M==1 and this is N.
   const int n_rows = int(tpg.y);
   const int N_row = N - (n_rows - 1 - int(tid.y));
 
-  // Sliding window: restrict to the last `window` keys. window<=0 => full attention.
   const int kv_start = (window > 0 && N_row > window) ? (N_row - window) : 0;
   const int Nw = N_row - kv_start;
 
@@ -90,14 +72,14 @@ template <typename T, int D, int V = D>
   threadgroup U sum_exp_scores[BN];
 
   const int q_batch_head_idx = tid.x;
-  const int q_seq_idx = tid.y;  // 0 at decode
+  const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
-  // Row-major over tokens: row m starts at m*row_stride, head h at h*D within it.
+
   const int q_offset = q_seq_idx * q_row_stride + q_batch_head_idx * D;
   const int o_offset = q_seq_idx * o_row_stride + q_batch_head_idx * V;
 
   queries += q_offset + simd_lid * qk_per_thread;
-  // Advance the K/V base past the keys outside the window, then index within [0, Nw).
+
   keys += kv_head_idx * k_head_stride + (kv_start + simd_gid) * k_seq_stride +
       simd_lid * qk_per_thread;
   values += kv_head_idx * v_head_stride + (kv_start + simd_gid) * v_seq_stride +
@@ -150,9 +132,6 @@ template <typename T, int D, int V = D>
 
 instantiate_sdpa_swa(bfloat16, bfloat, 256, 256)
 
-// gemma4 full-attention layers {4,9,14,19,24,29,34} use head_dim 512 (theta 1e6,
-// full rotation). The kernel is compile-time templated on D, so a distinct PSO is
-// required; the encode_fn selects it per-layer for is_full_attn() dispatches.
 instantiate_sdpa_swa(bfloat16, bfloat, 512, 512)
 
 template <typename T, int D, int V = D>
@@ -182,12 +161,9 @@ template <typename T, int D, int V = D>
   constexpr int v_per_thread = V / BD;
   constexpr float NEG_INF = -3.0e38f;
 
-  // Where this row's token sits. The M rows of a prefill are the last M
-  // positions, so row m ends at N-(M-1-m); at decode M==1 and this is N.
   const int n_rows = int(tpg.y);
   const int N_row = N - (n_rows - 1 - int(tid.y));
 
-  // Sliding window: restrict to the last `window` keys. window<=0 => full attention.
   const int kv_start = (window > 0 && N_row > window) ? (N_row - window) : 0;
   const int Nw = N_row - kv_start;
 
@@ -204,14 +180,14 @@ template <typename T, int D, int V = D>
   threadgroup U sum_exp_scores[BN];
 
   const int q_batch_head_idx = tid.x;
-  const int q_seq_idx = tid.y;  // 0 at decode
+  const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
-  // Row-major over tokens: row m starts at m*row_stride, head h at h*D within it.
+
   const int q_offset = q_seq_idx * q_row_stride + q_batch_head_idx * D;
   const int o_offset = q_seq_idx * o_row_stride + q_batch_head_idx * V;
 
   queries += q_offset + simd_lid * qk_per_thread;
-  // Advance the K/V base past the keys outside the window, then index within [0, Nw).
+
   keys += kv_head_idx * k_head_stride + (kv_start + simd_gid) * k_seq_stride +
       simd_lid * qk_per_thread;
   values += kv_head_idx * v_head_stride + (kv_start + simd_gid) * v_seq_stride +
@@ -258,11 +234,6 @@ template <typename T, int D, int V = D>
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-  // The sink: a learned per-head scalar that joins the softmax denominator as
-  // though it were one more key, with no value to contribute. It is what lets a
-  // head attend to nothing -- as the sink grows, every real weight shrinks and
-  // the output goes to zero. Folded in at a shared reference so a sink larger
-  // than every logit does not overflow the exponential.
   const U sink = static_cast<U>(sinks[tid.x]);
   const U orescale = sdpa_merge_sink(sink, new_max, sum_exp_score);
 
@@ -281,8 +252,6 @@ template <typename T, int D, int V = D>
   }
 }
 
-
-// ── GPT-OSS: the same attention with per-head sinks ─────────────────────────
 #define instantiate_sdpa_sink(name, itype, d, v)                         \
   template [[host_name("sdpa_vector_decode_sink_" #name "_d_" #d)]]       \
   [[kernel]] void sdpa_vector_decode_sink<itype, d, v>(                  \

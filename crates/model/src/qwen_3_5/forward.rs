@@ -1,24 +1,19 @@
-use model_dsl::axes::{Dtype, KvDtype};
+//! The Qwen 3.5 forward pass over the typed IR — the old forward minus the
+//! machinery the design killed (design §10): attention plans are built once
+//! up front and shared visibly across layers (§6), kv-append geometry is a
+//! declared input fetched where it is used — the recorder declares each input
+//! once no matter how many layers ask (§7), raggedness is ambient so the
+//! prefill/chunked arms lose their `query_windows` plumbing (§5), and tensor
+//! parallelism is plain control flow on `m.tp` (§9, decision #18).
+
 use model_dsl::{
-    Classify, Facts, ForwardHybrid, HybridInput, HybridSpec, Request, Value, kernels, merge, seam,
+    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Request, Value, kernels, merge, seam,
 };
 
 use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model};
 
-// EVERY NORM OF THIS FAMILY IS AN OFFSET BANK. Qwen3.5 stores its RMSNorm
-// scales the way Gemma does -- the kernel applies `1 + weight`, not `weight`
-// -- and the one exception is the GDN gated out-norm, whose bank is plain.
-// The legacy deployment says the same thing in its own vocabulary
-// (`model-legacy/src/qwen_3_5/spec.rs`: `norm_variant: NormVariant::Gemma`
-// on every fact struct, `NormVariant::Plain` on the gate norm alone), and a
-// live census of the legacy fire confirms it: `norm::rmsnorm_gemma` for
-// `attn_norm`, `mlp_norm`, `q_norm`, `k_norm` and `final_norm`,
-// `norm::rmsnorm_gated_fp32_in` for the gate norm. Stating the plain point
-// here computed a different model and nothing refused.
-
-#[derive(Facts)]
-pub struct Facts {
-    pub qo_one: bool,
+model_dsl::facts! {
+    pub struct Facts { qo_one }
 }
 
 impl Classify for Facts {
@@ -29,32 +24,22 @@ impl Classify for Facts {
     }
 }
 
-impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> {
+impl ForwardHybrid for Model {
     type Facts = Facts;
 
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
+        let kv = c.kv_space(self.kv);
         for (l, w) in self.layers.iter().enumerate() {
             match &w.mixer {
                 Mixer::Attn(a) => {
                     c.kv(
+                        kv,
                         format!("kv.{l}"),
                         [2, a.kv_heads as u64 * a.head_dim as u64],
                     );
                 }
-                // THE CONV SLAB IS `[K, C]`, WHICH IS NOT THE ROLLING
-                // WINDOW. `causal_conv1d_update_batched` holds the last
-                // `conv_kernel` input rows oldest-first, convolves over rows
-                // `1..K-1` plus the incoming column, shifts every row down
-                // one and lands the new column at row `K - 1`
-                // (`kernels-cuda/kernels/ssm/causal_conv1d.cuh:396-411`). So
-                // `K - 1` rows are LIVE between fires and row 0 is where the
-                // shift's tail goes -- written every step, read by nothing --
-                // and the rectangle the kernel indexes is `K` rows of `C`
-                // channels. A declaration states the rectangle: this row used
-                // to say `[C, K - 1]`, the live window, which is neither the
-                // extent the pool must allocate nor the axis order the kernel
-                // walks (`state[k * C + c]`, so `C` is the fast axis).
+
                 Mixer::Gdn(g) => {
                     let conv_ch = (2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim) as u64;
                     c.state(format!("conv.{l}"), [g.conv_kernel as u64, conv_ch]);
@@ -68,28 +53,37 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> 
         c
     }
 
-    fn forward(&self, inputs: HybridInput<Facts>) -> Value {
+    fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
-        let ids = inputs.token_ids();
+        // The decode and prefill plans, built once and shared visibly by
+        // every attention layer (§6).
+        let positions = inputs.positions();
+        let plan_d = kernels::attn::plan_decode(positions.rec(), inputs.kv_space());
+        let plan_p = kernels::attn::plan_prefill(positions.rec(), inputs.kv_space());
+        let ids = inputs.tokens();
         let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
 
-        for (_, w) in inputs.layers(&m.layers) {
-            let x = kernels::norm::rmsnorm_plus_one(&y, &w.mixer_norm.weight, w.mixer_norm.eps);
+        for (l, w) in inputs.layers(&m.layers) {
+            let x = kernels::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
-                Mixer::Attn(a) => attn_mixer(&x, &inputs, a),
+                Mixer::Attn(a) => attn_mixer(&x, &inputs, &plan_d, &plan_p, a, l),
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
             };
-            let o = kernels::dist::reduce::<TP>(o);
-            y = kernels::norm::residual_add(&o, &y);
+            let o = if m.tp > 1 {
+                kernels::collective::all_reduce(&o)
+            } else {
+                o
+            };
+            y = kernels::elemwise::residual_add(&o, &y);
 
-            let x = kernels::norm::rmsnorm_plus_one(&y, &w.mlp_norm.weight, w.mlp_norm.eps);
+            let x = kernels::elemwise::rmsnorm_plus_one(&y, &w.mlp_norm, w.mlp_norm_eps);
             let f = match &w.mlp {
                 Mlp::Dense {
                     gate_up,
                     down,
                     inter,
-                } => kernels::gemm::matmul(
-                    &kernels::mlp::swiglu(&kernels::gemm::matmul(&x, gate_up), *inter),
+                } => kernels::linear::matmul(
+                    &kernels::linear::mlp_swiglu(&kernels::linear::matmul(&x, gate_up), *inter),
                     down,
                 ),
                 Mlp::Routed {
@@ -104,79 +98,89 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> ForwardHybrid for Model<W1, K, TP> 
                     inter,
                     shared_inter,
                 } => {
-                    let (routes, weights) = kernels::moe::topk_softmax(
-                        &kernels::gemm::matmul(&x, router),
+                    let (routes, weights) = kernels::linear::moe_topk_softmax(
+                        &kernels::linear::matmul(&x, router),
                         *experts,
                         *top_k,
                     );
-                    let hidden = kernels::mlp::swiglu(
-                        &kernels::moe::matmul_select(&x, gate_up, &routes),
+                    let hidden = kernels::linear::mlp_swiglu(
+                        &kernels::linear::moe_matmul_select(&x, gate_up, &routes, *top_k),
                         *inter,
                     );
-                    let routed = kernels::moe::weighted_sum(
-                        &kernels::moe::matmul_select(&hidden, down, &routes),
+                    let routed = kernels::linear::moe_weighted_sum(
+                        &kernels::linear::moe_matmul_select(&hidden, down, &routes, *top_k),
                         &weights,
                     );
-                    let shared = kernels::gemm::matmul(
-                        &kernels::mlp::swiglu(
-                            &kernels::gemm::matmul(&x, shared_gate_up),
+                    let shared = kernels::linear::matmul(
+                        &kernels::linear::mlp_swiglu(
+                            &kernels::linear::matmul(&x, shared_gate_up),
                             *shared_inter,
                         ),
                         shared_down,
                     );
-                    kernels::moe::sigmoid_gate_add(
+                    kernels::linear::moe_sigmoid_gate_add(
                         &routed,
                         &shared,
-                        &kernels::gemm::matmul(&x, shared_gate),
+                        &kernels::linear::matmul(&x, shared_gate),
                     )
                 }
             };
-            let f = kernels::dist::reduce::<TP>(f);
-            y = kernels::norm::residual_add(&f, &y);
+            let f = if m.tp > 1 {
+                kernels::collective::all_reduce(&f)
+            } else {
+                f
+            };
+            y = kernels::elemwise::residual_add(&f, &y);
         }
 
-        let fin = &m.final_norm;
-        let x = kernels::norm::rmsnorm_plus_one(&y, &fin.weight, fin.eps);
+        let x = kernels::elemwise::rmsnorm_plus_one(&y, &m.final_norm, m.final_norm_eps);
         match &m.head {
-            Head::Tied => kernels::gemm::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::gemm::lm_head(&x, bank),
+            Head::Tied => kernels::linear::lm_head(&x, &m.embed),
+            Head::Bank(bank) => kernels::linear::lm_head(&x, bank),
         }
     }
 }
 
-fn attn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, a: &Attn<W1>) -> Value {
+fn attn_mixer(
+    x: &Value,
+    inputs: &Input<Facts>,
+    plan_d: &Value,
+    plan_p: &Value,
+    a: &Attn,
+    layer: u32,
+) -> Value {
     let pages = inputs.kv(&a.kv);
+    let positions = inputs.positions();
+    let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
+    let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
     let d = a.head_dim;
-    let (q, gate) = kernels::layout::split_q_gate(&kernels::gemm::matmul(x, &a.qg_proj), d);
-    let k = kernels::gemm::matmul(x, &a.k_proj);
-    let v = kernels::gemm::matmul(x, &a.v_proj);
+    let (q, gate) = kernels::layout::split_q_gate(&kernels::linear::matmul(x, &a.qg_proj), d);
+    let k = kernels::linear::matmul(x, &a.k_proj);
+    let v = kernels::linear::matmul(x, &a.v_proj);
     seam::at(seam::ATTN_QV, (&q, &v));
-    let q = kernels::norm::rmsnorm_per_head_plus_one(&q, &a.q_norm.weight, d, a.q_norm.eps);
-    let k = kernels::norm::rmsnorm_per_head_plus_one(&k, &a.k_norm.weight, d, a.k_norm.eps);
-    let (q, k) = kernels::rope::partial(&q, &k, &inputs.positions(), a.rotary_dim, d, a.theta);
-    kernels::attention::kv_append(&k, &v, &pages);
+    let q = kernels::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
+    let k = kernels::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
+    let (q, k) = kernels::elemwise::rope_partial(&q, &k, &positions, a.rotary_dim, d, a.theta);
+    kernels::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, (&q,));
     let (dq, p) = q.split(&Facts::qo_one());
     let o = merge![
-        kernels::attention::decode(&dq, &pages, None, d, a.sm_scale),
-        kernels::attention::prefill(
-            &kernels::query_windows(&p),
-            &pages,
-            None,
-            d,
-            a.kv_heads,
-            a.sm_scale
-        ),
+        kernels::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
+        kernels::attn::prefill(&p, plan_p, pages, None, d, a.kv_heads, a.sm_scale),
     ];
     seam::at(seam::ATTN_OUT, (&o,));
-    kernels::gemm::attention_landing(&kernels::gate::sigmoid_mul(&o, &gate), &a.o_proj)
+    kernels::linear::attention_landing(
+        &kernels::elemwise::gate_sigmoid_mul(&o, &gate),
+        &a.o_proj,
+        layer,
+    )
 }
 
-fn gdn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, g: &Gdn<W1>) -> Value {
+fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let conv_state = inputs.state(&g.conv_state);
     let delta_state = inputs.state(&g.delta_state);
-    let qkvz = kernels::gemm::matmul(x, &g.in_qkvz);
-    let ba = kernels::gemm::matmul(x, &g.in_ba);
+    let qkvz = kernels::linear::matmul(x, &g.in_qkvz);
+    let ba = kernels::linear::matmul(x, &g.in_ba);
     seam::at(seam::RECURRENT, (&qkvz,));
     let width = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
     let one = Facts::qo_one();
@@ -184,13 +188,13 @@ fn gdn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, g: &Gdn<W1>) -> 
     let (ba_d, ba_p) = ba.split(&one);
     let (core_d, z_d) = {
         let (qkv, z) = kernels::layout::split_rows(&qkvz_d, width);
-        let qkv = kernels::ssm::causal_conv1d(&qkv, &g.conv, &conv_state, g.conv_kernel);
-        let gates = kernels::ssm::gdn_prep(&ba_d, &g.dt_bias, &g.a_log);
-        let core = kernels::ssm::gated_delta(
+        let qkv = kernels::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);
+        let gates = kernels::attn::ssm_gdn_prep(&ba_d, &g.dt_bias, &g.a_log);
+        let core = kernels::attn::ssm_gated_delta(
             &qkv,
             &z,
             &gates,
-            &delta_state,
+            delta_state,
             g.k_heads,
             g.v_heads,
             g.k_dim,
@@ -200,18 +204,14 @@ fn gdn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, g: &Gdn<W1>) -> 
     };
     let (core_p, z_p) = {
         let (qkv, z) = kernels::layout::split_rows(&qkvz_p, width);
-        let qkv = kernels::ssm::causal_conv1d_chunked(
-            &kernels::query_windows(&qkv),
-            &g.conv,
-            &conv_state,
-            g.conv_kernel,
-        );
-        let gates = kernels::ssm::gdn_prep(&ba_p, &g.dt_bias, &g.a_log);
-        let core = kernels::ssm::gated_delta_chunked(
-            &kernels::query_windows(&qkv),
+        let qkv =
+            kernels::attn::ssm_causal_conv1d_chunked(&qkv, &g.conv, conv_state, g.conv_kernel);
+        let gates = kernels::attn::ssm_gdn_prep(&ba_p, &g.dt_bias, &g.a_log);
+        let core = kernels::attn::ssm_gated_delta_chunked(
+            &qkv,
             &z,
             &gates,
-            &delta_state,
+            delta_state,
             g.k_heads,
             g.v_heads,
             g.k_dim,
@@ -221,10 +221,7 @@ fn gdn_mixer<W1: Dtype>(x: &Value, inputs: &HybridInput<Facts>, g: &Gdn<W1>) -> 
     };
     let o = merge![core_d, core_p];
     let z = merge![z_d, z_p];
-    // `g.v_dim`, because the gate norm is PER HEAD: its weight is one row of
-    // `value_head_dim` floats and the mean of the square is taken across a
-    // single head's channels, not across the mixer's whole
-    // `value_heads * value_head_dim` output.
-    let o = kernels::norm::rmsnorm_gated(&o, &z, &g.norm.weight, g.v_dim, g.norm.eps);
-    kernels::gemm::matmul(&o, &g.out_proj)
+
+    let o = kernels::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps);
+    kernels::linear::matmul(&o, &g.out_proj)
 }

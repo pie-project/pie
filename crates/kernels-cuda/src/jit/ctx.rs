@@ -1,22 +1,16 @@
+//! The context every entry takes: the stream a driver `Run` wraps, with the
+//! cuBLAS handle and device probes beside it. `fire` resolves a [`Fire`]'s
+//! unit through the module cache and enqueues the launch — enqueue only,
+//! never sync.
+
 use core::ffi::c_void;
-use kernels::plane::Fire;
 
-use kernels::plane::{In, Refusal};
-use kernels::raises::Struct;
+use kernels::KernelError;
 
-use crate::comm::Plane;
-use crate::jit::{ArgValue, Root};
+use crate::jit::{ArgValue, refuse};
 
-impl kernels::points::Plane for Ctx<'_> {
-    type Tensor<T: kernels::points::Scalar> = crate::jit::abi::Tensor<T>;
-
-    type Bank<R: kernels::points::Repr> = crate::jit::abi::Bank<R>;
-
-    type Recurrent = kernels::raises::Struct<crate::views::RecurrentState>;
-
-    type Pages = kernels::raises::Struct<crate::views::KvCache>;
-}
-
+/// Dispatch geometry: grid x block, dynamic shared memory, and the
+/// cooperative flag a grid-synchronising kernel needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Launch {
     pub grid: [u32; 3],
@@ -25,13 +19,8 @@ pub struct Launch {
     pub cooperative: bool,
 }
 
-impl kernels::plane::Geometry for Launch {
-    fn apply_to(self, fire: Fire) -> Fire {
-        self.apply_to_impl(fire)
-    }
-}
-
 impl Launch {
+    /// One thread per element, flattened: `ceil(n / block)` blocks.
     #[must_use]
     pub const fn flat(n: u32, block: u32) -> Self {
         let grid = if block == 0 { 0 } else { n.div_ceil(block) };
@@ -43,6 +32,7 @@ impl Launch {
         }
     }
 
+    /// One block per row.
     #[must_use]
     pub const fn per_row(rows: u32, block: u32) -> Self {
         Self {
@@ -76,38 +66,6 @@ impl Launch {
     }
 
     #[must_use]
-    fn apply_to_impl(self, fire: Fire) -> Fire {
-        fire.geometry(
-            [
-                self.grid[0].saturating_mul(self.block[0]),
-                self.grid[1].saturating_mul(self.block[1]),
-                self.grid[2].saturating_mul(self.block[2]),
-            ],
-            self.block,
-            self.smem,
-            self.cooperative,
-        )
-    }
-
-    #[must_use]
-    pub const fn at(self, file: &'static str, entrypoint: &'static str) -> Fire {
-        Fire {
-            file,
-            entrypoint,
-            unit: "",
-            lanes: [
-                self.grid[0].saturating_mul(self.block[0]),
-                self.grid[1].saturating_mul(self.block[1]),
-                self.grid[2].saturating_mul(self.block[2]),
-            ],
-            group: self.block,
-            smem: self.smem,
-            cooperative: self.cooperative,
-            stamp: "",
-        }
-    }
-
-    #[must_use]
     pub const fn empty(&self) -> bool {
         self.grid[0] == 0
             || self.grid[1] == 0
@@ -118,73 +76,74 @@ impl Launch {
     }
 }
 
-pub struct Ctx<'a> {
-    stream: *mut c_void,
-    cublas: *mut c_void,
-    comm: Option<Plane>,
-    raised: Option<&'a (dyn kernels::raises::Answered + 'a)>,
-    held: core::marker::PhantomData<&'a ()>,
+/// One launch, fully named: the `.cuh` unit under `kernels/`, the
+/// instantiation NVRTC lowers, and the geometry it dispatches at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fire {
+    pub file: &'static str,
+
+    /// The C++ instantiation expression — `::pie::` spelling, dtype stamped
+    /// in (composed names go through [`symbol`](crate::jit::symbol)).
+    pub entrypoint: &'static str,
+
+    pub launch: Launch,
 }
 
-impl<'a> Ctx<'a> {
+impl Fire {
+    #[must_use]
+    pub const fn at(file: &'static str, entrypoint: &'static str) -> Self {
+        Self {
+            file,
+            entrypoint,
+            launch: Launch::grid([0, 0, 0], [0, 0, 0]),
+        }
+    }
+
+    #[must_use]
+    pub const fn apply(mut self, launch: Launch) -> Self {
+        self.launch = launch;
+        self
+    }
+}
+
+/// The stream and its companions. Long-lived state (jit cache, scratch
+/// slabs, device probes) is process-global behind it; the `Ctx` itself is
+/// what a driver `Run` builds per fire and lends to every entry.
+pub struct Ctx {
+    stream: *mut c_void,
+    cublas: *mut c_void,
+    comm: *mut c_void,
+}
+
+impl Ctx {
+    /// # Safety
+    /// `stream` must be a live `cudaStream_t` for as long as this context
+    /// fires on it.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
             stream,
             cublas: core::ptr::null_mut(),
-            comm: None,
-            raised: None,
-            held: core::marker::PhantomData,
+            comm: core::ptr::null_mut(),
         }
     }
 
+    /// # Safety
+    /// `handle` must be a live `cublasHandle_t` bound to this context's
+    /// stream.
     #[must_use]
     pub const unsafe fn with_cublas(mut self, handle: *mut c_void) -> Self {
         self.cublas = handle;
         self
     }
 
+    /// # Safety
+    /// `comm` must be a live `ncclComm_t` whose clique this context's stream
+    /// belongs to, for as long as this context fires collectives on it.
     #[must_use]
-    pub const unsafe fn with_comm(mut self, plane: Plane) -> Self {
-        self.comm = Some(plane);
+    pub const unsafe fn with_comm(mut self, comm: *mut c_void) -> Self {
+        self.comm = comm;
         self
-    }
-
-    #[must_use]
-    pub const fn with_raised(mut self, staged: &'a (dyn kernels::raises::Answered + 'a)) -> Self {
-        self.raised = Some(staged);
-        self
-    }
-
-    pub fn raised<R: kernels::raises::Raise>(&self) -> Result<In<Struct<R>>, Refusal> {
-        self.raised_at::<R>(kernels::raises::Class::ANY)
-    }
-
-    pub fn raised_at<R: kernels::raises::Raise>(
-        &self,
-        class: kernels::raises::Class,
-    ) -> Result<In<Struct<R>>, Refusal> {
-        let ptr = self
-            .raised
-            .and_then(|staged| staged.raised(R::KEY, class))
-            .ok_or(Refusal::Absent { what: R::KEY })?;
-        Ok(In {
-            ptr: ptr.cast::<R::Value>(),
-            rows: 0,
-            width: 0,
-        })
-    }
-
-    #[must_use]
-    pub fn staged<R: kernels::raises::Raise>(&self) -> In<Struct<R>> {
-        In {
-            ptr: self
-                .raised
-                .and_then(|staged| staged.raised(R::KEY, kernels::raises::Class::ANY))
-                .map_or(core::ptr::null(), |p| p.cast::<R::Value>()),
-            rows: 0,
-            width: 0,
-        }
     }
 
     #[must_use]
@@ -192,36 +151,51 @@ impl<'a> Ctx<'a> {
         self.stream
     }
 
-    pub fn cublas(&self) -> Result<*mut c_void, Refusal> {
+    pub fn cublas(&self, op: &'static str) -> Result<*mut c_void, KernelError> {
         if self.cublas.is_null() {
-            return Err(Refusal::Absent {
-                what: "a cuBLAS handle",
-            });
+            return Err(refuse(op, "this context carries no cuBLAS handle"));
         }
         Ok(self.cublas)
     }
 
-    pub fn comm(&self) -> Result<Plane, Refusal> {
-        let Some(plane) = self.comm else {
-            return Err(Refusal::Absent {
-                what: "a tensor-parallel plane",
-            });
-        };
-        Ok(plane)
+    /// The NCCL communicator a tensor-parallel run carries. Absent on a
+    /// single-rank context — a collective fired there is a typed refusal,
+    /// not a hang.
+    pub fn comm(&self, op: &'static str) -> Result<*mut c_void, KernelError> {
+        if self.comm.is_null() {
+            return Err(refuse(op, "this context carries no communicator"));
+        }
+        Ok(self.comm)
     }
 
+    /// A named process-global scratch slab, grown but never shrunk — the
+    /// workspace an entry may not allocate per fire (graph capture forbids
+    /// it).
+    ///
+    /// **The contract, both ways.** Growth is `cudaFree` + `cudaMalloc`,
+    /// which would poison a capture in progress. The driver's side: warm
+    /// every scratch-consuming entry with an eager fire at full fire shape
+    /// before capturing, so a captured fire only ever re-reads a slab that
+    /// is already big enough. This plane's side: the cheap runtime guard in
+    /// `device::take` — if this context's stream is mid-capture
+    /// (`cudaStreamIsCapturing`) and the slab would have to grow, the fire
+    /// comes back as a [`KernelError::Backend`] refusal naming the
+    /// un-warmed slab instead of corrupting the capture.
     #[allow(clippy::unused_self)]
-    pub fn scratch(&self, name: &'static str, bytes: usize) -> Result<*mut c_void, Refusal> {
+    pub fn scratch(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, KernelError> {
         #[cfg(feature = "_cuda")]
         {
-            crate::jit::device::take(name, bytes)
+            crate::jit::device::take(self.stream, name, bytes).map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "_cuda"))]
         {
             let _ = (name, bytes);
-            Err(Refusal::Device {
-                why: "this build selected no CUDA runtime",
-            })
+            Err(crate::jit::runtimeless(op))
         }
     }
 
@@ -239,98 +213,76 @@ impl<'a> Ctx<'a> {
     }
 
     #[allow(clippy::unused_self)]
-    pub fn multiprocessors(&self) -> Result<u32, Refusal> {
+    #[must_use]
+    pub fn multiprocessors(&self) -> Option<u32> {
         #[cfg(feature = "_cuda")]
         {
             crate::jit::device::multiprocessors()
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            Err(Refusal::Device {
-                why: "this build selected no CUDA runtime",
-            })
+            None
         }
     }
 
-    pub fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-        let root = if fire.unit.is_empty() {
-            match Root::of(fire.file) {
-                Some(root) => root,
-                None => return Err(Refusal::Undeclared),
-            }
-        } else {
-            Root::variant(fire.unit, fire.file)
+    /// Enqueue one launch. `Ok` means the launch is on the stream, not that
+    /// it ran; every failure comes back attributed to `op`.
+    pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), KernelError> {
+        let Some(root) = crate::jit::Root::of(fire.file) else {
+            return Err(refuse(
+                op,
+                format!("no carried unit is named `{}`", fire.file),
+            ));
         };
-
-        if crate::jit::warm::warming() {
-            crate::jit::warm::resolve_only(&root, fire.entrypoint);
-            return Ok(());
+        if fire.launch.empty() {
+            return Err(refuse(op, "the grid is empty"));
         }
-        let launch = Launch {
-            grid: fire.grid(),
-            block: fire.group,
-            smem: fire.smem,
-            cooperative: fire.cooperative,
-        };
-
-        unsafe { self.launch_at(&root, fire.entrypoint, launch, args) }
-    }
-
-    unsafe fn launch_at(
-        &self,
-        root: &Root,
-        instantiation: &str,
-        launch: Launch,
-        args: &[ArgValue],
-    ) -> Result<(), Refusal> {
-        if launch.empty() {
-            return Err(Refusal::Empty { what: "the grid" });
-        }
-
-        unsafe { self.issue(root, instantiation, launch, args) }
+        self.issue(op, &root, fire.entrypoint, fire.launch, args)
     }
 
     #[cfg(feature = "_cuda")]
-    unsafe fn issue(
+    fn issue(
         &self,
-        root: &Root,
-        instantiation: &str,
+        op: &'static str,
+        root: &crate::jit::Root,
+        instantiation: &'static str,
         launch: Launch,
         args: &[ArgValue],
-    ) -> Result<(), Refusal> {
+    ) -> Result<(), KernelError> {
         let resolved = match crate::jit::cache::resolve(root, instantiation) {
             Ok(resolved) => resolved,
-            Err(why) => return Err(said(root.name, instantiation, &why.to_string())),
+            Err(why) => return Err(said(root.name, instantiation, why).at(op)),
         };
 
-        let mut bound = unsafe { crate::jit::value::Bound::new(args) };
+        let mut bound = crate::jit::abi::Bound::new(args);
 
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };
         match fired {
             Ok(()) => Ok(()),
-            Err(why) => Err(said(root.name, instantiation, &why.to_string())),
+            Err(why) => Err(said(root.name, instantiation, why).at(op)),
         }
     }
 
     #[cfg(not(feature = "_cuda"))]
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
-    unsafe fn issue(
+    fn issue(
         &self,
-        _root: &Root,
-        _instantiation: &str,
+        op: &'static str,
+        _root: &crate::jit::Root,
+        _instantiation: &'static str,
         _launch: Launch,
         _args: &[ArgValue],
-    ) -> Result<(), Refusal> {
-        Err(Refusal::Device {
-            why: "this build selected no CUDA runtime",
-        })
+    ) -> Result<(), KernelError> {
+        Err(crate::jit::runtimeless(op))
     }
 }
 
+/// Report a refusal once per instantiation — the same broken row is fired
+/// once per layer per token, and the caller already gets the error back.
 #[cfg(feature = "_cuda")]
-fn said(root: &str, instantiation: &str, why: &str) -> Refusal {
+fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
@@ -342,11 +294,9 @@ fn said(root: &str, instantiation: &str, why: &str) -> Refusal {
         tracing::error!(
             root,
             instantiation,
-            why,
+            why = %why,
             "a device instantiation will not fire"
         );
     }
-    Refusal::Device {
-        why: "the compile, the load or the launch refused; see the log",
-    }
+    why
 }

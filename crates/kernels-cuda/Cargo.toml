@@ -2,149 +2,86 @@
 name = "kernels-cuda"
 version = "0.1.0"
 edition = "2024"
-authors = ["In Gim <in.gim@yale.edu>"]
-description = "CUDA kernels as a JIT: the signature table, the device sources carried in the binary, and the runtime that compiles and fires them."
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pure CUDA kernel definitions: jit unit names, argument marshalling, and launch geometry over a stream. Knows nothing about the IR; a driver Run resolves plan ids to handles and calls these entry functions."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
 
-# A `build.rs` AGAIN, and it is the one that was here before `384aaeed0`.
-#
-# That commit folded `kernels-cuda-new` in and checked the carried header set
-# into `src/source.rs` as 187 hand-written lines, for "one less compile stage".
-# The script it deleted had already argued the other way, about this exact
-# list, and the argument did not stop being true:
-#
-#   "A checked-in output with a test that regenerates and diffs it was the
-#    other candidate and it loses on one property: a stale file still COMPILES.
-#    Generated into `OUT_DIR`, it cannot be stale by construction. That property
-#    is what the carried set needs most -- it names the `.cuh` files the JIT
-#    carries, and a stale list is a failure at first fire on a machine with a
-#    GPU, which is the run-time failure generation exists to convert into a
-#    build-time one."
-#
-# What came back is narrower than what left. The old script also emitted a
-# typed call surface per row and pulled fourteen modules in by `#[path]` to
-# read them; this one walks two directories and reads `#include` lines, depends
-# on nothing, and needs no toolkit -- which is what keeps the `links` note
-# below true.
+# The build script regenerates the carried-header table into OUT_DIR, for the
+# same reason the old crate's did: a checked-in list still COMPILES when it is
+# stale, and a stale list is a first-fire failure on a machine with a GPU —
+# exactly the run-time failure generation exists to convert into a build-time
+# one. It walks two directories, reads `#include` lines, and depends on
+# nothing, so a box with no CUDA toolkit still builds.
 
 [lib]
 name = "kernels_cuda"
 path = "src/lib.rs"
 
-# NO `links` key, and that absence is the design. The ARCHIVE crate that held
-# this name until `85c6c674b` declared `links = "pie_kernels_cuda"`, because
-# it BUILT an archive with CMake and had to publish its include trees to the
-# one crate that compiled against them. This crate builds no archive: a kernel
-# is text in the binary and NVRTC turns it into a cubin at run time, so there
-# is nothing to link, nothing to publish, and no toolkit needed at build time.
 [features]
-# The table alone. This is the surface `model-ir` takes -- it reads a
-# row on every trace and must never pay for a GPU dependency to look one up --
-# and it is why `cudarc` is optional rather than a plain dependency. See
-# `src/lib.rs` for the three layers this gates.
+# Nothing by default: the handle vocabulary and every entry function compile
+# on a machine with no toolkit, and a fire without a runtime answers with a
+# typed refusal. This keeps a plain workspace build green everywhere.
 default = []
 
-# Exactly one of these turns on layer 3, and it must match the CUDA runtime
-# that will be LOADED. The split is `driver-cuda`'s and it is not a style
-# choice: `cudaGraphAddNode` has five parameters in `libcudart.so.12` and six
-# in `libcudart.so.13`, so a binary that picked the wrong one segfaults inside
-# the driver. Cargo unifies features across a graph, so a crate that hard-coded
-# either would silently decide for every other crate in the build --
-# `model-loader`'s Cargo.toml records that exact collision having happened.
+# Exactly one of these turns the runtime on, and it must match the CUDA
+# runtime that will be LOADED. The split is the driver's and it is not a
+# style choice: `cudaGraphAddNode` has five parameters in `libcudart.so.12`
+# and six in `libcudart.so.13`, so a binary that picked the wrong one
+# segfaults inside the driver. Cargo unifies features across a graph, so a
+# crate that hard-coded either would silently decide for every other crate
+# in the build.
 cuda-12 = ["_cuda", "cudarc/cuda-12080"]
 cuda-13 = ["_cuda", "cudarc/cuda-13000"]
 
-# Private: "some CUDA version was chosen". Layer 3 is gated on this rather
-# than on the two above, so that a build with no version selected produces one
-# actionable error instead of burying it under every use of `cudarc`.
+# Private: "some CUDA version was chosen". The runtime layers gate on this
+# rather than on the two above, so that a build with no version selected
+# produces one actionable error instead of burying it under every use of
+# `cudarc`.
 _cuda = ["dep:cudarc"]
 
 [dependencies]
-# `linkme` AND `inventory` STOOD HERE, and they were the routine registry: a
-# `distributed_slice` of `Routine<Cuda>` on every host target and an
-# `inventory` collection on wasm, filled by 208 `#[routine]` fns. Every
-# launch is a `#[claims]` body or a function beside one now, and the one
-# question the registry was still asked — "which symbol answers this claim's
-# canon" — is `CANON`, four rows in `src/lib.rs`.
-#
-# The portable claim vocabulary: `Fire`, operand marks, scalar kinds and the
-# data-to-type dispatch trait.
+# `KernelError` — the shared answer vocabulary every kernel entry returns
+# (design §8: `Unsupported`/`DtypeUnsupported` exist exactly for these fns).
 kernels = { path = "../kernels" }
-# `#[claims]`, which records the point methods this plane implements. A
-# separate crate because `proc-macro = true`
-# forbids exporting anything else and because `kernels` keeps its "no
-# dependencies, and none is wanted" line. The edge is compile-time only:
-# nothing of `syn` reaches a built artifact.
-kernels-macros = { path = "../kernels-macros" }
+# `Dtype` only. kernels does not re-export it, so this edge is named
+# directly — it adds a name, not a dependency: kernels already carries
+# model-ir into the tree. Nothing else of the IR is spoken here.
+model-ir = { path = "../model-ir" }
 
-# NO dependency on the ARCHIVE crate, and the absence is worth stating even
-# now that the archive is deleted and this crate has taken its name. This
-# crate took its rows FROM there through a `default-features = false` edge,
-# because while both the ahead-of-time and the JIT path had to run a symbol
-# has to have exactly ONE contract and two copies of a table are two contracts
-# waiting to disagree. The seam closed by moving the rows HERE rather than by
-# retiring the archive -- 109 of the 198 rows had no JIT twin at that point --
-# and the archive took them back through an edge in the OPPOSITE direction,
-# re-exporting them under the paths it used to own. That inversion is why the
-# archive could be deleted at `85c6c674b` without a line of this crate moving:
-# the arrow already pointed here.
-
-# Layer 3, and the whole reason this crate can exist at all. Dynamically
+# The runtime, and the whole reason this crate can exist at all. Dynamically
 # loaded (`fallback-dynamic-loading`), so nothing links against a toolkit and
 # a build on a machine with no CUDA still produces a binary that RUNS on one
 # that has a driver.
 #
-# `nvrtc` is not an optimisation here the way it is for `driver-cuda`'s PTIR
-# plane: a kernel in this crate exists only as text, so a process that cannot
-# open `libnvrtc.so` cannot fire one.
+# `nvrtc` is not an optimisation: a kernel in this crate exists only as text,
+# so a process that cannot open `libnvrtc.so` cannot fire one.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
     "runtime",
     "nvrtc",
-    # `x::gemm`'s host programs. The dense autotuner and the plan cache are
-    # `cublasLtMatmul` and nothing else, and `x::gemm::dense` issues them —
-    # they came in from `driver-cuda/src/fire/gemm.rs` in §5 step 5 and the
-    # calls did not change, only the crate they live in.
+    # `linear::gemm`'s host programs. The dense autotuner and the plan cache
+    # are `cublasLtMatmul` and nothing else, and `linear::dense` issues
+    # them.
     #
     # Enabling these generates BINDINGS, not link flags:
     # `fallback-dynamic-loading` still resolves every symbol with `dlopen` on
     # first use, so **a box with no CUDA toolkit still builds** — the property
-    # `driver-cuda` has had since the first cuBLAS call and the one that is
-    # easiest to break by reaching for a linked symbol instead.
+    # that is easiest to break by reaching for a linked symbol instead.
     "cublas",
     "cublaslt",
+    # `collective`'s entries. Bindings only, same as the two above: the symbols
+    # resolve on first use, and the first use requires a communicator the
+    # driver could only have built with libnccl already open. A box with no
+    # NCCL still builds AND serves — single-rank contexts carry no
+    # communicator, and `collective::` answers them with a typed refusal.
+    "nccl",
     "fallback-dynamic-loading",
 ] }
 
 # A refusal on the launch path is reported, not returned twice: `fire` gives
 # the caller an error AND says once per symbol what went wrong, because the
-# same broken row is fired once per layer per token.
+# same broken instantiation is fired once per layer per token.
 tracing = "0.1"
-
-# NO `[build-dependencies]`, because there is no build script. The section
-# carried `kernels` for a generator that read this crate's row tables through
-# `#[path]` modules, which cost compiling those tables twice -- once into the
-# script and once into the library. Both the generator and the walk that
-# outlived it are gone.
-
-# NO `[[example]]` sections, and their absence is load-bearing rather than
-# incidental. Three probes lived here -- `mma_probe`, `halftype_parity` and
-# `fp8_pipeline_probe`, each `required-features = ["_cuda"]` -- and they were
-# deleted with the rest of `examples/`. A `[[example]]` whose file is gone is
-# not a skipped target: cargo fails to PARSE this manifest, and because this
-# crate is a workspace member, every command in the workspace fails with it.
-# `required-features` does not soften that; it gates the build, not the
-# target's existence. `cargo metadata` drops the section silently, so the
-# error appears first at the next real build.
-
-
-
-
-
-
-
-
-

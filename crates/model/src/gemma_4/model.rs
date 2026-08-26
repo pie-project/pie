@@ -1,75 +1,74 @@
-use std::marker::PhantomData;
+//! The Gemma 4 declaration, de-genericized (design §5, decision #18): the
+//! old `Model<W1: Dtype, K: KvDtype, const TP: usize>` phantom tree is gone —
+//! `tp` is a runtime field, each weight carries its `Dtype`, and the SKU
+//! constructors take every element choice as an argument: the catalog row
+//! spells the weight, activation, and kv-cache elements at the call site, and
+//! the model keeps the latter two as fields. Names and the per-layer scheme
+//! are unchanged from the old crate: weights intern by name, so the
+//! checkpoint mapping carries over untouched.
 
-use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::{CacheRef, Norm, Tensor};
+use model_dsl::{Dtype, Weight};
 
-pub struct Model<W1: Dtype, K: KvDtype, const TP: usize = 1> {
+pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
+    pub tp: u32,
+    /// Activation element — stated, not inherited silently.
+    pub act: Dtype,
+    /// Kv-cache element layout — drives the append kernel and row bytes.
+    pub kv: Dtype,
     pub softcap: Option<f32>,
-    /// The embedding table, AND the lm head: gemma-4 ties them on every
-    /// geometry, so there is no second bank and no enum to choose one with.
-    pub embed: Tensor<W1>,
-    pub ple: Option<Ple<W1>>,
-    pub layers: Vec<Layer<W1>>,
-    pub final_norm: Norm<W1>,
-    _kv: PhantomData<K>,
+    pub embed: Weight,
+    pub ple: Option<Ple>,
+    pub layers: Vec<Layer>,
+    pub final_norm: Weight,
+    pub final_norm_eps: f32,
 }
 
-pub struct Ple<W1: Dtype> {
+pub struct Ple {
     pub dim: u32,
-    pub model_proj: Tensor<W1>,
-    pub model_norm: Norm<W1>,
-    pub per_layer: Vec<PleLayer<W1>>,
+    pub model_proj: Weight,
+    pub model_norm: Weight,
+    pub model_norm_eps: f32,
+    pub per_layer: Vec<PleLayer>,
 }
 
-pub struct PleLayer<W1: Dtype> {
-    /// **THIS LAYER'S SLICE OF THE PER-LAYER EMBEDDING TABLE**, and it is one
-    /// param per layer because one param for all of them is a bank no shader
-    /// plane can bind.
-    ///
-    /// The checkpoint ships `embed_tokens_per_layer` as `[vocab, layers *
-    /// ple_dim]` — for `gemma4-e4b` that is `[262144, 10752]` in bf16, **5.25
-    /// GiB in one tensor**, and `layout.embed` binds a table whole. WebGPU's
-    /// guaranteed floor for a storage binding is 128 MiB, this tree's L40S
-    /// states 2 GiB, and Vulkan's `maxStorageBufferRange` is `UINT32_MAX`; none
-    /// of them holds it. Cut per layer it is 128 MiB, which every plane holds
-    /// with room.
-    ///
-    /// The tower used to gather the whole row once and take a
-    /// `layout.select` of the RELAY per layer. It gathers this slice per layer
-    /// and selects the PROJECTION instead — the same arithmetic elementwise,
-    /// and a `select` that moved rather than one that went away.
-    pub table: Tensor<W1>,
-    pub gate: Tensor<W1>,
-    pub proj: Tensor<W1>,
-    pub norm: Norm<W1>,
-    pub scalar: Tensor<W1>,
+pub struct PleLayer {
+    pub table: Weight,
+    pub gate: Weight,
+    pub proj: Weight,
+    pub norm: Weight,
+    pub norm_eps: f32,
+    pub scalar: Weight,
 }
 
-pub struct Layer<W1: Dtype> {
-    pub attn: Attn<W1>,
-    pub o_proj: Tensor<W1>,
-    pub attn_norm: Norm<W1>,
-    pub post_attn_norm: Norm<W1>,
-    pub pre_ffw_norm: Norm<W1>,
-    pub post_ffw_norm: Norm<W1>,
-    /// The FUSED gate/up bank and the width one half of it is. Gemma ships
-    /// `gate_up_proj` as one `[2 * inter, hidden]` tensor on every layer of
-    /// every geometry, so `mlp.geglu_tanh_packed` is the only activation
-    /// this text states.
-    pub gate_up: Tensor<W1>,
+pub struct Layer {
+    pub attn: Attn,
+    pub o_proj: Weight,
+    pub attn_norm: Weight,
+    pub attn_norm_eps: f32,
+    pub post_attn_norm: Weight,
+    pub post_attn_norm_eps: f32,
+    pub pre_ffw_norm: Weight,
+    pub pre_ffw_norm_eps: f32,
+    pub post_ffw_norm: Weight,
+    pub post_ffw_norm_eps: f32,
+
+    pub gate_up: Weight,
     pub inter: u32,
-    pub down: Tensor<W1>,
+    pub down: Weight,
 }
 
-pub struct Attn<W1: Dtype> {
+pub struct Attn {
     pub kind: AttnKind,
     pub q_heads: u32,
     pub sm_scale: f32,
-    pub q_norm: Norm<W1>,
-    pub kv: CacheRef,
-    pub banks: AttnBanks<W1>,
+    pub q_norm: Weight,
+    pub q_norm_eps: f32,
+    /// The kv space row this layer reads and writes — the sharing tail names
+    /// an earlier layer's row.
+    pub kv: String,
+    pub banks: AttnBanks,
 }
 
 pub enum AttnKind {
@@ -114,19 +113,16 @@ impl AttnKind {
     }
 }
 
-/// WHETHER THIS LAYER PROJECTS ITS OWN KV, which is the one bank choice
-/// gemma-4 really makes: the trailing `shared_tail` layers read an earlier
-/// layer's pages and carry a `q_proj` alone, and both arms ship (e4b shares
-/// 18 of 42, the 31b geometry shares none).
-///
-/// An owned layer's `qkv` is ONE FUSED BANK. Every gemma-4 checkpoint this
-/// tree reads ships `qkv_proj` fused and the text splits it with
-/// `layout.split_qkv`; the three-bank reading was an enum arm no geometry
-/// constructed.
-#[allow(clippy::large_enum_variant)] // a per-layer weight-bank record, built once at trace; boxing buys nothing and costs every reader a deref
-pub enum AttnBanks<W1: Dtype> {
-    Owned { qkv: Tensor<W1>, k_norm: Norm<W1> },
-    Shared { q_proj: Tensor<W1> },
+#[allow(clippy::large_enum_variant)]
+pub enum AttnBanks {
+    Owned {
+        qkv: Weight,
+        k_norm: Weight,
+        k_norm_eps: f32,
+    },
+    Shared {
+        q_proj: Weight,
+    },
 }
 
 struct Dims {
@@ -151,22 +147,8 @@ struct Dims {
     norm_eps: f32,
 }
 
-/// THE CUT, AND THE WHOLE OF IT: the dims a rank holds a share of at `TP`
-/// ways, with `..d` saying that everything else is replicated.
-///
-/// BOTH KV HEAD COUNTS, because this family alternates two attention
-/// geometries down one tower and each states its own fan: the sliding layers
-/// take `kv_heads` at `head_dim` and the full-attention ones
-/// `global_kv_heads` at `global_head_dim`. Cutting one and not the other
-/// would shard half a tower.
-///
-/// `q_heads` is shared by both kinds and cuts once. The two head widths and
-/// `global_rotary_dim` are one head's own extents and do not divide, and
-/// neither does the per-layer embedding tower (`ple_dim`, its table and its
-/// projections): PLE is read per token out of a table every rank holds, and
-/// a cut of it would be a cut of the residual it is added to.
-fn per_rank<const TP: usize>(d: Dims) -> Dims {
-    let cut = |what, whole| model_dsl::per_rank(what, whole, TP);
+fn per_rank(d: Dims, tp: u32) -> Dims {
+    let cut = |what, whole| model_dsl::per_rank(what, whole, tp as usize);
     Dims {
         q_heads: cut("q_heads", d.q_heads),
         kv_heads: cut("kv_heads", d.kv_heads),
@@ -176,85 +158,70 @@ fn per_rank<const TP: usize>(d: Dims) -> Dims {
     }
 }
 
-impl<W1: Dtype, K: KvDtype, const TP: usize> Model<W1, K, TP> {
-    /// `google/gemma-4-E4B-it`, its cached `config.json` read through the
-    /// `text_config` wrapper and cross-checked against the safetensors
-    /// headers — and then against the model itself, which is the third
-    /// party this tree's law says has to decide. It VERIFIES: 890 of 890
-    /// steps fire, `baker_load` joins 575 of 575 params with every repr
-    /// truthful, the argmax is 785 ("ite") at 7.5938, and six teacher-forced
-    /// positions match a transformers 5.15.1 forward (three bit-equal,
-    /// three within one ulp).
-    ///
-    /// `sm_scale: 1.0` IS MEASURED HERE and nowhere else. Gemma-4 folds the
-    /// attention temperature into `q_norm`/`k_norm`: their product times
-    /// `sqrt(head_dim)` is exactly 2.000 at all 35 sliding layers and
-    /// 1.4142 at all 7 global ones on THIS checkpoint (`import.rs` has the
-    /// arithmetic), so nothing else divides by `sqrt(d)`. [`Self::b31`]
-    /// carries the same 1.0 by transplant, not by measurement.
-    pub fn e4b() -> Self {
-        assemble(Dims {
-            hidden: 2560,
-            layers: 42,
-            full_every: 6,
-            q_heads: 8,
-            kv_heads: 2,
-            head_dim: 256,
-            global_head_dim: 512,
-            global_kv_heads: 2,
-            global_rotary_dim: 128,
-            theta_local: 10_000.0,
-            theta_global: 1_000_000.0,
-            sm_scale: 1.0,
-            intermediate: 10_240,
-            vocab: 262_144,
-            shared_tail: 18,
-            ple_dim: 256,
-            softcap: Some(30.0),
-            window: 512,
-            norm_eps: 1e-6,
-        })
+impl Model {
+    pub fn e4b(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        assemble(
+            w,
+            act,
+            kv,
+            tp,
+            Dims {
+                hidden: 2560,
+                layers: 42,
+                full_every: 6,
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+                global_head_dim: 512,
+                global_kv_heads: 2,
+                global_rotary_dim: 128,
+                theta_local: 10_000.0,
+                theta_global: 1_000_000.0,
+                sm_scale: 1.0,
+                intermediate: 10_240,
+                vocab: 262_144,
+                shared_tail: 18,
+                ple_dim: 256,
+                softcap: Some(30.0),
+                window: 512,
+                norm_eps: 1e-6,
+            },
+        )
     }
 
-    /// UNVERIFIED against a checkpoint — no gemma-4-31B is cached, so no
-    /// file has been held against these numbers the way E4B's have. The
-    /// layer count and geometry come from the published 31B config; what to
-    /// distrust specifically is:
-    ///
-    /// * `sm_scale: 1.0` — TRANSPLANTED from [`Self::e4b`], where it is a
-    ///   measurement of that checkpoint's own `q_norm`/`k_norm` product. A
-    ///   31B release that folds the temperature differently would need a
-    ///   different number and nothing here would say so.
-    /// * `ple_dim: 0` — this text states NO per-layer embedding, while the
-    ///   reference applies one unconditionally. One of the two is wrong and
-    ///   only a file can say which.
-    pub fn b31() -> Self {
-        assemble(Dims {
-            hidden: 5376,
-            layers: 60,
-            full_every: 6,
-            q_heads: 32,
-            kv_heads: 16,
-            head_dim: 256,
-            global_head_dim: 512,
-            global_kv_heads: 4,
-            global_rotary_dim: 128,
-            theta_local: 10_000.0,
-            theta_global: 1_000_000.0,
-            sm_scale: 1.0,
-            intermediate: 21_504,
-            vocab: 262_144,
-            shared_tail: 0,
-            ple_dim: 0,
-            softcap: Some(30.0),
-            window: 512,
-            norm_eps: 1e-6,
-        })
+    pub fn b31(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        assemble(
+            w,
+            act,
+            kv,
+            tp,
+            Dims {
+                hidden: 5376,
+                layers: 60,
+                full_every: 6,
+                q_heads: 32,
+                kv_heads: 16,
+                head_dim: 256,
+                global_head_dim: 512,
+                global_kv_heads: 4,
+                global_rotary_dim: 128,
+                theta_local: 10_000.0,
+                theta_global: 1_000_000.0,
+                sm_scale: 1.0,
+                intermediate: 21_504,
+                vocab: 262_144,
+                shared_tail: 0,
+                ple_dim: 0,
+                softcap: Some(30.0),
+                window: 512,
+                norm_eps: 1e-6,
+            },
+        )
     }
 }
 
-fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP> {
-    let d = per_rank::<TP>(d);
+fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    let d = per_rank(d, tp);
     let hidden = d.hidden as u64;
     let full_at = |l: u32| l % d.full_every == d.full_every - 1;
     let shared_at = |l: u32| l >= d.layers - d.shared_tail;
@@ -285,10 +252,7 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
     let layers = (0..d.layers)
         .map(|l| {
             let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, w: u64| Norm {
-                weight: Tensor::sym(n(s), [w]),
-                eps: d.norm_eps,
-            };
+            let norm = |s: &str, len: u64| Weight::sym(n(s), [len], w);
             let ki = kind(l);
             let hd = ki.head_dim() as u64;
             let q_w = d.q_heads as u64 * hd;
@@ -299,28 +263,34 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
                     q_heads: d.q_heads,
                     sm_scale: d.sm_scale,
                     q_norm: norm("q_norm", hd),
-                    kv: CacheRef::to(format!("kv.{}", if shared_at(l) { source(l) } else { l })),
+                    q_norm_eps: d.norm_eps,
+                    kv: format!("kv.{}", if shared_at(l) { source(l) } else { l }),
                     banks: if shared_at(l) {
                         AttnBanks::Shared {
-                            q_proj: Tensor::sym(n("q_proj"), [q_w, hidden]).columns(),
+                            q_proj: Weight::sym(n("q_proj"), [q_w, hidden], w).columns(),
                         }
                     } else {
                         AttnBanks::Owned {
-                            qkv: Tensor::sym(n("qkv"), [q_w + 2 * kv_w, hidden])
+                            qkv: Weight::sym(n("qkv"), [q_w + 2 * kv_w, hidden], w)
                                 .packed([q_w, kv_w, kv_w]),
                             k_norm: norm("k_norm", hd),
+                            k_norm_eps: d.norm_eps,
                         }
                     },
                     kind: ki,
                 },
-                o_proj: Tensor::sym(n("o_proj"), [hidden, q_w]).rows(),
+                o_proj: Weight::sym(n("o_proj"), [hidden, q_w], w).rows(),
                 attn_norm: norm("attn_norm", hidden),
+                attn_norm_eps: d.norm_eps,
                 post_attn_norm: norm("post_attn_norm", hidden),
+                post_attn_norm_eps: d.norm_eps,
                 pre_ffw_norm: norm("pre_ffw_norm", hidden),
+                pre_ffw_norm_eps: d.norm_eps,
                 post_ffw_norm: norm("post_ffw_norm", hidden),
-                gate_up: Tensor::sym(n("gate_up"), [2 * iw, hidden]).packed([iw, iw]),
+                post_ffw_norm_eps: d.norm_eps,
+                gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
                 inter: d.intermediate,
-                down: Tensor::sym(n("down"), [hidden, iw]).rows(),
+                down: Weight::sym(n("down"), [hidden, iw], w).rows(),
             }
         })
         .collect();
@@ -328,36 +298,36 @@ fn assemble<W1: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model<W1, K, TP>
     Model {
         hidden: d.hidden,
         vocab: d.vocab,
+        tp,
+        act,
+        kv,
         softcap: d.softcap,
-        embed: Tensor::sym("embed", [d.vocab as u64, hidden]),
+        embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
         ple: (d.ple_dim > 0).then(|| {
             let ple = d.ple_dim as u64;
             Ple {
                 dim: d.ple_dim,
-                model_proj: Tensor::sym("ple.model_proj", [d.layers as u64 * ple, hidden]),
-                model_norm: Norm {
-                    weight: Tensor::sym("ple.model_norm", [ple]),
-                    eps: d.norm_eps,
-                },
+                model_proj: Weight::sym("ple.model_proj", [d.layers as u64 * ple, hidden], w),
+                model_norm: Weight::sym("ple.model_norm", [ple], w),
+                model_norm_eps: d.norm_eps,
                 per_layer: (0..d.layers)
                     .map(|l| PleLayer {
-                        table: Tensor::sym(format!("layer.{l}.ple_table"), [d.vocab as u64, ple]),
-                        gate: Tensor::sym(format!("layer.{l}.ple_gate"), [ple, hidden]),
-                        proj: Tensor::sym(format!("layer.{l}.ple_proj"), [hidden, ple]),
-                        norm: Norm {
-                            weight: Tensor::sym(format!("layer.{l}.ple_norm"), [hidden]),
-                            eps: d.norm_eps,
-                        },
-                        scalar: Tensor::sym(format!("layer.{l}.ple_scalar"), [1]),
+                        table: Weight::sym(
+                            format!("layer.{l}.ple_table"),
+                            [d.vocab as u64, ple],
+                            w,
+                        ),
+                        gate: Weight::sym(format!("layer.{l}.ple_gate"), [ple, hidden], w),
+                        proj: Weight::sym(format!("layer.{l}.ple_proj"), [hidden, ple], w),
+                        norm: Weight::sym(format!("layer.{l}.ple_norm"), [hidden], w),
+                        norm_eps: d.norm_eps,
+                        scalar: Weight::sym(format!("layer.{l}.ple_scalar"), [1], w),
                     })
                     .collect(),
             }
         }),
         layers,
-        final_norm: Norm {
-            weight: Tensor::sym("final_norm", [hidden]),
-            eps: d.norm_eps,
-        },
-        _kv: PhantomData,
+        final_norm: Weight::sym("final_norm", [hidden], w),
+        final_norm_eps: d.norm_eps,
     }
 }

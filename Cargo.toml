@@ -52,8 +52,6 @@ members = [
     "crates/driver-api",
 
     # -- driver-*: execution shells ----------------------------------------
-    # `driver` is the C++ substrate both shells interpret the ABI with; the two
-    # native shells build their own `csrc/` and are OS-exclusive.
     # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
     # inside `driver-metal` until the CUDA shell reached the same file, and
     # the move cost nothing because not one line of it named a Metal type --
@@ -62,235 +60,13 @@ members = [
     # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
     # not carry its tests.
     "crates/driver",
-    # `baker-walk` STOOD HERE, and it was the half of a baker executor that is
-    # not a plane: the walk over a `Program`, the bound statement, the frame's
-    # numbering, the load-time resolve. It was extracted because metal's and
-    # wgpu's copies came out 96% identical.
-    #
-    # IT DID NOT REMOVE THE DUPLICATION, it moved it. `driver-cuda/src/baker/`
-    # never joined -- it kept its own `bound.rs` and `resolve.rs` defining the
-    # same `axis`, `bank_axis`, `rides`, `check`, `witness_dt`, `dtype_of` and
-    # `claimed`, in that order -- and `baker-smoke` held a third copy of the
-    # first three. So the crate was the one copy for two of four sites, and
-    # the price of that sharing was a second trait: `Fires<'p>` exists only to
-    # carry the lifetime invariance of `dyn Encode + 'a` across two planes,
-    # and a driver whose `Ctx` is concrete needs no such thing.
-    #
-    # Two of three or none. Each shader shell owns its walk now, in its own
-    # `src/walk/`, which is the honest-duplication rule this tree already
-    # applies to the kernels themselves.
-    # The CUDA shell. It was `driver-cuda-new` while the C++ `driver-cuda`
-    # still existed, on the same terms the Metal one was, and took the name
-    # when that one went. Unlike either C++ shell it builds ANYWHERE:
-    # `cudarc` is pinned to a named CUDA version with `fallback-dynamic-loading`,
-    # so there is no link line and no toolkit probe, and the host logic this
-    # crate is mostly made of stays testable on a box with no GPU. It is
-    # outside `default-members` all the same -- linking a CUDA shell into a
-    # sweep should be a choice, and that is the rule the siblings follow.
-    "crates/driver-cuda",
-    # `baker-smoke` STOOD HERE: one decode step of a catalog SKU fired out of
-    # a `model_compiler::program::Program`, on a real GPU, against real
-    # weights. It reached `kernels-cuda` DIRECTLY -- it named no `driver_cuda`
-    # symbol and did not depend on the crate -- so it was a second executor
-    # over one set of kernels, with its own pools, staging, binding and fire,
-    # 1,740 lines of it in one file. Two executors drift, and only one of them
-    # was ever measured against a checkpoint.
-    #
-    # What it alone held was the gate: three banked argmaxes, one of them
-    # gpt-oss-20b's, which no other test fired. That moved to
-    # `driver-cuda/tests/banked_argmaxes.rs`, where it runs through the shell
-    # that actually serves. `scripts/banked-argmaxes.sh` runs it.
-    # The Metal shell, BACK AT P5 with a baker executor. R3 put it in
-    # `exclude` and named the condition for its return -- "a `#[claims] impl`
-    # for its plane and a `Program` walk of its own" -- and it has both:
-    # `kernels-metal` claims 22 points across all 14 families, and
-    # `driver-metal/src/baker/` walks a `model_compiler::program::Program`
-    # through the dispatch generated from those claims.
-    #
-    # A MEMBER AND NOT A DEFAULT MEMBER, and the choice is measured rather
-    # than inherited. The crate's device half is gated behind `metal-4`, which
-    # `compile_error!`s off an Apple target, so a `cargo check --workspace`
-    # sweep on Linux compiles the PORTABLE half -- the executor, the layout
-    # arithmetic, the envelope -- and that half is green everywhere. What
-    # keeps it out of `default-members` is the rule its two siblings already
-    # follow: `driver-cuda` sits outside because linking a
-    # device shell into an unqualified `cargo test` should be a choice, and a
-    # crate whose serving half only exists on macOS is the same choice said
-    # louder. `cargo check -p driver-metal --all-targets` is what CI runs, and
-    # the macOS job adds `--features metal-4`.
-    "crates/driver-metal",
-    # The WebGPU shell, BACK AT P5b on the same terms. `kernels-wgpu` claims 21
-    # points across all 14 families and `driver-wgpu/src/baker/` walks a
-    # `model_compiler::program::Program` through the dispatch generated from
-    # them.
-    #
-    # A MEMBER AND NOT A DEFAULT MEMBER, and this one had the best case of the
-    # three for being a default member -- which is why the argument is written
-    # out rather than inherited.
-    #
-    # The case FOR: unlike `driver-cuda` (which links a CUDA shell) and
-    # `driver-metal` (whose device half `compile_error!`s off Apple), this
-    # crate's `default = []` pulls in NO GPU API at all. `wgpu` is behind
-    # `native`, so an unqualified `cargo test` would build `naga` and pure Rust
-    # and would link nothing -- and the half it would cover is the whole baker
-    # executor, since `Ctx` is `dyn Encode` and `baker/` names no `wgpu` type.
-    #
-    # The case AGAINST, which wins on two counts. The first is the rule its
-    # three siblings already follow, stated at `driver-cuda` above: linking --
-    # or in this case BUILDING -- a device shell into an unqualified sweep
-    # should be a choice. A reader who finds `driver-cuda` and
-    # `driver-metal` outside the list and `driver-wgpu` inside it has to
-    # discover that the difference is a feature default rather than a mistake,
-    # and a rule with one exception is a rule people stop trusting.
-    #
-    # The second is measured, and it makes the case FOR collapse. This crate's
-    # DEV-dependencies name `wgpu` unconditionally -- `tests/cooperative.rs`
-    # opens its own adapter and an integration test cannot reach a
-    # `[dependencies]` entry, so the edge is restated in `[dev-dependencies]`
-    # with no `optional`. `cargo tree -p driver-wgpu -e normal,dev` at DEFAULT
-    # features prints `wgpu v30.0.1` under it. A default member is a member of
-    # `cargo test`, `cargo test` builds test targets, and a test target links
-    # every dev-dependency -- so a sweep would carry the whole wgpu closure
-    # whatever `default = []` says, and the feature default does not buy what
-    # the case above claims for it.
-    #
-    # `cargo check -p driver-wgpu --all-targets` is what CI runs, and a machine
-    # with an adapter adds `--features native`.
-    "crates/driver-wgpu",
-    # The Vulkan shell, BACK AT P5c on the two siblings' terms. It was the
-    # last crate outside the workspace: R3 deleted `model-legacy` and
-    # `model-dsl-legacy` while this crate's manifest went on naming both, so
-    # cargo could not resolve the package, let alone build it.
-    #
-    # A MEMBER AND NOT A DEFAULT MEMBER, on `driver-wgpu`'s reasoning rather
-    # than `driver-cuda`'s: `default = []` pulls in no Vulkan API, and the
-    # shader half is behind `native`, which needs a Slang compiler on the box.
-    # `cargo check -p driver-vulkan --all-targets` is what CI runs; a machine
-    # with a loader and an ICD adds `--features native`.
-    "crates/driver-vulkan",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
-    # THE catalog, singular since R3 -- there were two registries here
-    # (`model_type` -> load-contract author, `arch_name` -> the forward text)
-    # and the load contract went with `model-legacy`. One model text per
-    # family (the declarations `#[points]` is traced through), one import
-    # table per checkpoint flavor, and the serving face `engine` and every
-    # driver read: the SKU, its tower depth and logits width, its architecture
-    # label and context ceiling, and its chat template.
-    #
-    # `model-legacy` STOOD BESIDE IT -- the config-projected registries, the
-    # hand-written manifests, the load contract and the legacy forward texts,
-    # 16 312 lines -- and R3 deleted it. `model-dsl-legacy`, the frozen eDSL
-    # it was written against (18 235 lines), went with it.
-    "crates/model",
-    "crates/model-dsl-macros",
-    # The forward-pass toolchain, in the three layers `tensor-*` is already in
-    # and for the same reason. It was ONE crate (`model-compiler`, all five
-    # modules) until the consumer sets were read off the tree and found to be
-    # DISJOINT: `crates/model` writes declarations and never lowers one,
-    # every driver lowers and never writes one, and no crate in the workspace
-    # wanted both halves. What that cost was `driver-metal`, `driver-vulkan`
-    # and `driver-wgpu` each compiling `dsl::cuda`'s 4,469 lines -- an
-    # authoring surface for a backend they are not -- to reach `lower`, which
-    # they reached without calling a line of it. `lower` is deleted now (R3):
-    # those three were its last consumers and they left with it.
-    #
-    # The traced form: the op vocabulary, the plan container and the
-    # `TraceBuilder` a declaration records onto, the seam words, and the
-    # signature tables a plan is checked against at trace time. The floor both
-    # halves stand on. It carries no tape and no authoring value -- a
-    # declaration is recorded THROUGH it, not written in it -- but it is not
-    # device-blind: `kernels::Backend` names Cuda and Metal, and the claim
-    # tables `check_plan` reads are `kernels-cuda`'s and `kernels-metal`'s
-    # own, re-exported from here so that trace time and lowering time cannot
-    # be looking at two differently featured copies of one table.
-    "crates/model-ir",
-    # The authoring eDSL: typed weight handles, tape-carrying values, and the
-    # backend-neutral role points (`kernels`) a model text states, which the
-    # planes answer with claims. `crates/model` is the reader it exists for and
-    # `model-compiler` takes it as a DEV edge so its width table can be
-    # measured against the shipping texts rather than a fixture.
-    "crates/model-dsl",
-    # Lowering, and after R3 the baker path is all of it: `sweep` derives
-    # which ops a fact word runs and joins role points against the plane's
-    # claims, `program` binds each surviving lane into steps and slots. Keeps
-    # the name because a compiler is what turns a representation into what a
-    # machine runs, which is what is left here once the surface and the IR are
-    # their own crates. `lower`, the legacy launch-list half, is deleted --
-    # see this crate's `lib.rs` for its headstone.
-    "crates/model-compiler",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime. One crate: the drivers
     # link the rlib and pass Rust types, and a device's arena crosses as an
     # `ArenaBacking` rather than as a second executor inside each driver.
     "crates/model-loader",
-
-    # -- kernels-*: the device kernels, and the words their tables use ------
-    # `kernels` is bare for the reason `driver` is: it is the shared floor
-    # under the prefixed backends, holding what all of their tables are
-    # written in rather than anything any one of them does.
-    "crates/kernels",
-    # `#[points]`, `#[claims]`, `#[routine]`: the table a family, a plane and
-    # a launcher each state, every one of them derived from the Rust it is
-    # written on. Separate from `kernels` because a `proc-macro = true` crate
-    # can export NOTHING but macros, so it could not have been a module.
-    # `kernels` itself takes the edge now -- `#[points]` expands on the
-    # floor's own family traits -- and it costs the floor nothing it cared
-    # about: a proc macro is a compiler plugin, so no `syn` reaches an
-    # artifact and the "no dependencies" line still holds where it meant to.
-    "crates/kernels-macros",
-    # The dispatch generator, restored as a tool. `kernels*` carries no tests
-    # any more, so the check that says three generated files are still a
-    # function of their claim tables has to live somewhere that may have one.
-    "crates/points-dispatch",
-    # The JIT-native shape of the CUDA half: the table, the device sources
-    # carried in the binary, and the runtime that NVRTC-compiles and fires
-    # them. No CMake, no archive, no `links` key -- a kernel is text, so
-    # there is nothing to build ahead of time and nothing to link.
-    #
-    # It carried a `-new` suffix until it took this line, and a headstone
-    # STOOD HERE in its place: the plain name belonged to an ahead-of-time
-    # archive crate -- `libpie_kernels_cuda.a` out of CMake, a
-    # `links = "pie_kernels_cuda"` key, a `native` feature that cost nvcc --
-    # deleted at `85c6c674b`. The `-new` was never a version. It was the
-    # contrast with that crate, and a name that distinguishes A from B
-    # distinguishes nothing once B is gone; holding the plain name vacant for
-    # a crate that will not return is the same mistake pointing the other
-    # way. So the suffix came off. The archive is still discussed all over
-    # this tree's comments, because it is where most of this device code came
-    # from, and every one of those mentions now says which crate it means at
-    # the point where it stands.
-    #
-    # The sentence above this block used to end "-- the two implementation
-    # crates default to table-only, `native` is what costs nvcc." There is no
-    # CUDA pair left to be the floor under, and nothing on this side costs
-    # nvcc.
-    #
-    # What let the archive go was inverting the edge between the two while
-    # both paths still had to run: the rows moved HERE, and the archive took
-    # them back through a `default-features = false` dependency, re-exporting
-    # them under the paths it used to own. The arrow pointed at this crate,
-    # so nothing here had to move when the other end went. A symbol still has
-    # exactly one contract; the crate that authors it is the one a row is
-    # written for.
-    "crates/kernels-cuda",
-    "crates/kernels-metal",
-    # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
-    # the two are comparable rather than merely parallel; what differs is the
-    # launch ABI (buffers to descriptor bindings, scalars to one push-constant
-    # block), which is the API's shape and not any kernel's. `native` is what
-    # costs `glslc` -- Vulkan has no runtime shader compiler, so GLSL -> SPIR-V
-    # is a BUILD-time hop where Metal's is a run-time one.
-    "crates/kernels-vulkan",
-    # The WebGPU tree. Its table is `kernels-metal`'s coverage, row for row, so
-    # all three are comparable rather than merely parallel. What differs is that
-    # this one costs NO TOOLCHAIN: WGSL is compiled by `naga`, which is Rust and
-    # ships inside `wgpu`, so a module is built by the process that dispatches
-    # it. There is no `native` feature here because there is no build product to
-    # gate -- the table, the shaders and every structural test are reachable on
-    # any machine that can build Rust, which is why this one is a
-    # `default-member` where its two siblings' device halves are not.
-    "crates/kernels-wgpu",
 
     # -- tensor-*: the guest-program toolchain ------------------------------
     # authoring eDSL -> PTIR -> planning -> CUDA/Metal codegen, plus the
@@ -309,20 +85,29 @@ members = [
     "crates/inferlet-macros",
 
     # -- menlo: the typed-IR rewrite (.wiki/menlo/design.md) ------------------
-    # Fresh-rewrite successors of the model/kernel stack. They coexist with the
-    # crates they replace until the qwen end-to-end milestone, then the old
-    # stack is deleted in one commit and these drop the `new-` prefix.
-    "crates/new-model-ir",
-    "crates/new-model-ir-macros",
-    "crates/new-model-dsl-macros",
-    "crates/new-driver",
-    "crates/new-driver-metal",
-    "crates/new-driver-cuda",
-    "crates/new-kernels",
-    "crates/new-kernels-cuda",
-    "crates/new-kernels-metal",
-    "crates/new-model-dsl",
-    "crates/new-model",
+    # The old model/kernel stack (string plans, #[points], claim tables, the
+    # per-plane baker shells) was deleted in one commit and these took the
+    # names. Layering: model-ir is a leaf of pure data; kernels is the
+    # dispatch contract; kernels-* are entry functions with no IR knowledge;
+    # kernels also carries the one walk written over that contract;
+    # driver-* own the Run.
+    # The IR: typed op enums, Def x Ty value declarations, the validator.
+    "crates/model-ir",
+    # The authoring surface: Recorder/Value, wrappers that own their shapes.
+    "crates/model-dsl",
+    # The model catalog: six forwards on the new surface, SKU names verbatim.
+    "crates/model",
+    # The dispatch contract (15 traits, aggregate exec) and the shared walk.
+    "crates/kernels",
+    # Pure CUDA kernel definitions: jit machinery, owned attention plans,
+    # NCCL collectives; device text carried in-tree.
+    "crates/kernels-cuda",
+    # Pure Metal kernel definitions over the encode sink.
+    "crates/kernels-metal",
+    # The CUDA Run: one resolver, host-twin geometry, plan staging.
+    "crates/driver-cuda",
+    # The Metal Run over dyn Encode -- OS-portable like the walk it uses.
+    "crates/driver-metal",
 
     # -- Rust that lives outside crates/ on purpose -------------------------
     # The python SDK's backend: pyo3/maturin want the Rust half beside its
@@ -359,29 +144,14 @@ default-members = [
     "crates/model",
     "crates/model-ir",
     "crates/model-dsl",
-    "crates/model-compiler",
     "crates/model-loader",
     "crates/kernels",
     "crates/kernels-cuda",
     "crates/kernels-metal",
-    "crates/kernels-vulkan",
-    "crates/kernels-wgpu",
-    "crates/points-dispatch",
     "crates/tensor-ir",
     "crates/tensor-dsl",
     "crates/tensor-compiler",
     "crates/inferlet-macros",
-    "crates/new-model-ir",
-    "crates/new-model-ir-macros",
-    "crates/new-model-dsl-macros",
-    "crates/new-driver",
-    "crates/new-driver-metal",
-    "crates/new-driver-cuda",
-    "crates/new-kernels",
-    "crates/new-kernels-cuda",
-    "crates/new-kernels-metal",
-    "crates/new-model-dsl",
-    "crates/new-model",
     "sdk/server/python",
     "tests/gpu",
 ]

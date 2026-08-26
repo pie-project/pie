@@ -3,7 +3,7 @@ name = "model-dsl"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The forward-pass authoring eDSL: model texts state backend-neutral role points onto a plan. What a model family's forward pass is WRITTEN IN; it names no family and reaches no device."
+description = "The forward-pass authoring eDSL over the typed IR: the Recorder/Value trace machinery, per-family wrappers that compute shapes in plain Rust, weight declarations without dtype generics, and split/merge/Facts guard tracking. What a model's forward pass is WRITTEN IN; it names no backend and reaches no device."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -12,24 +12,7 @@ name = "model_dsl"
 path = "src/lib.rs"
 
 [dependencies]
-model-dsl-macros = { path = "../model-dsl-macros" }
 # The plan this surface records onto. The ONLY substantive dependency, and
 # that is the point of the split: an authoring surface reaches the IR and
 # nothing else -- not the lowering, and not a device.
 model-ir = { path = "../model-ir" }
-
-[dev-dependencies]
-# THE DECLARATION FLOOR, AS A DEV-DEPENDENCY AND NOWHERE ELSE. The line
-# above says an authoring surface reaches the IR and nothing else, and that
-# stays true of the artifact: `tests/builders_are_the_points.rs` reads the
-# `*_POINTS` tables to check that every builder in `src/kernels.rs` IS the
-# point its declaration states. A test binary is not the library.
-kernels = { path = "../kernels" }
-# The check GENERATES the builder it expects and diffs token streams, so it
-# parses both sides rather than matching text. `model-dsl-legacy`'s
-# `tests/wrappers_are_current.rs` reached for `syn` as a dev-dep for the
-# same reason, at the same version and features as `kernels-macros`, which
-# parses the same signatures.
-syn = { version = "3.0", features = ["full"] }
-quote = "1.0"
-proc-macro2 = "1.0"

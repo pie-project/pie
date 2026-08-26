@@ -1,0 +1,2043 @@
+#pragma once
+
+#include <cuda_bf16.h>
+
+#include "prelude/device.cuh"
+
+namespace pie::attn {
+
+using f32 = float;
+using state_bf16 = __nv_bfloat16;
+
+constexpr int gqa_smem_bv = 128;
+
+__device__ __forceinline__ float silu_f(float z) {
+    return z / (1.f + __expf(-z));
+}
+
+template <class T, bool SILU>
+__global__ void ssm_causal_conv1d_chunked(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ y,
+    T* __restrict__ state_out,
+    int N, int C, int K)
+{
+    const int c = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    if (c >= C) return;
+
+    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+
+    for (int t = tid; t < N; t += block_size) {
+        float acc = bias_v;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= K) break;
+            const int src_t = t - (K - 1) + k;
+            float xv = 0.f;
+            if (src_t < 0) {
+                if (state_out) {
+                    xv = Elem<T>::to_f32(state_out[(K + src_t) * C + c]);
+                }
+            } else {
+                xv = Elem<T>::to_f32(x[src_t * C + c]);
+            }
+            const float wv = Elem<T>::to_f32(weight[c * K + k]);
+            acc += wv * xv;
+        }
+        y[t * C + c] = Elem<T>::from_f32(SILU ? silu_f(acc) : acc);
+    }
+
+    __syncthreads();
+
+    if (state_out && tid == 0) {
+        for (int s = 0; s < K; ++s) {
+            const int src_t = N - K + s;
+            const float v = (src_t < 0)
+                ? Elem<T>::to_f32(state_out[(K + src_t) * C + c])
+                : Elem<T>::to_f32(x[src_t * C + c]);
+            state_out[s * C + c] = Elem<T>::from_f32(v);
+        }
+    }
+}
+
+template <class T>
+__global__ void ssm_causal_conv1d_update(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ state,
+    T* __restrict__ y,
+    int C, int K)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+
+    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+    const float new_x  = Elem<T>::to_f32(x[c]);
+
+    float acc = bias_v;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K) break;
+        float xv;
+        if (k < K - 1) {
+            xv = Elem<T>::to_f32(state[(k + 1) * C + c]);
+        } else {
+            xv = new_x;
+        }
+        const float wv = Elem<T>::to_f32(weight[c * K + k]);
+        acc += wv * xv;
+    }
+    y[c] = Elem<T>::from_f32(silu_f(acc));
+
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K - 1) break;
+        state[k * C + c] = state[(k + 1) * C + c];
+    }
+    state[(K - 1) * C + c] = Elem<T>::from_f32(new_x);
+}
+
+template <class T>
+__global__ void ssm_causal_conv1d_chunked_batched(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ y,
+    T* __restrict__ state_out_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    int C, int K, bool write_state,
+    const u8* __restrict__ write_state_mask,
+    const int* commit_len)
+{
+    const int c = blockIdx.x;
+    const int r = blockIdx.y;
+    if (c >= C) return;
+
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+
+    if (commit_len != nullptr) {
+        const int c = commit_len[r];
+        if (c < Nr) Nr = c;
+    }
+    if (Nr <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    const T* x_r = x + (long long)t0 * C;
+    T* y_r = y + (long long)t0 * C;
+    T* state = state_out_base + (long long)slot * slot_stride_elems;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+
+    for (int t = tid; t < Nr; t += block_size) {
+        float acc = bias_v;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= K) break;
+            const int src_t = t - (K - 1) + k;
+            float xv = 0.f;
+            if (src_t < 0) {
+                xv = Elem<T>::to_f32(state[(K + src_t) * C + c]);
+            } else {
+                xv = Elem<T>::to_f32(x_r[src_t * C + c]);
+            }
+            const float wv = Elem<T>::to_f32(weight[c * K + k]);
+            acc += wv * xv;
+        }
+        y_r[t * C + c] = Elem<T>::from_f32(silu_f(acc));
+    }
+
+    __syncthreads();
+
+    if (state_out_base && write_state &&
+        (write_state_mask == nullptr || write_state_mask[r] != 0) &&
+        tid == 0) {
+        for (int s = 0; s < K; ++s) {
+            const int src_t = Nr - K + s;
+            const float v = (src_t < 0)
+                ? Elem<T>::to_f32(state[(K + src_t) * C + c])
+                : Elem<T>::to_f32(x_r[src_t * C + c]);
+            state[s * C + c] = Elem<T>::from_f32(v);
+        }
+    }
+}
+
+template <class T>
+__global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ y,
+    T* __restrict__ state_out_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    int C, int K, bool write_state,
+    const u8* __restrict__ write_state_mask,
+    const int* commit_len)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int r = blockIdx.y;
+    if (c >= C) return;
+
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+
+    if (commit_len != nullptr) {
+        const int c = commit_len[r];
+        if (c < Nr) Nr = c;
+    }
+    if (Nr <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    const T* x_r = x + static_cast<long long>(t0) * C;
+    T* y_r = y + static_cast<long long>(t0) * C;
+    T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+
+    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+    float wv[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        wv[k] = (k < K) ? Elem<T>::to_f32(weight[c * K + k]) : 0.f;
+    }
+
+    for (int t = 0; t < Nr; ++t) {
+        float acc = bias_v;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= K) break;
+            const int src_t = t - (K - 1) + k;
+            float xv = 0.f;
+            if (src_t < 0) {
+                xv = Elem<T>::to_f32(state[(K + src_t) * C + c]);
+            } else {
+                xv = Elem<T>::to_f32(x_r[src_t * C + c]);
+            }
+            acc += wv[k] * xv;
+        }
+        y_r[static_cast<long long>(t) * C + c] = Elem<T>::from_f32(silu_f(acc));
+    }
+
+    if (state_out_base && write_state &&
+        (write_state_mask == nullptr || write_state_mask[r] != 0)) {
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s >= K) break;
+            const int src_t = Nr - K + s;
+            const float v = (src_t < 0)
+                ? Elem<T>::to_f32(state[(K + src_t) * C + c])
+                : Elem<T>::to_f32(x_r[src_t * C + c]);
+            state[s * C + c] = Elem<T>::from_f32(v);
+        }
+    }
+}
+
+template <class T>
+__global__ void ssm_causal_conv1d_update_batched(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ state_base,
+    const int* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    T* __restrict__ y,
+    int R, int C, int K)
+{
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R || c >= C) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    T* state = state_base + (long long)slot * slot_stride_elems;
+    const T* x_r = x + (long long)r * C;
+    T* y_r = y + (long long)r * C;
+
+    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+    const float new_x  = Elem<T>::to_f32(x_r[c]);
+
+    float acc = bias_v;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K) break;
+        float xv;
+        if (k < K - 1) {
+            xv = Elem<T>::to_f32(state[(k + 1) * C + c]);
+        } else {
+            xv = new_x;
+        }
+        const float wv = Elem<T>::to_f32(weight[c * K + k]);
+        acc += wv * xv;
+    }
+    y_r[c] = Elem<T>::from_f32(silu_f(acc));
+
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K - 1) break;
+        state[k * C + c] = state[(k + 1) * C + c];
+    }
+    state[(K - 1) * C + c] = Elem<T>::from_f32(new_x);
+}
+
+template <class T>
+__global__ void widen(
+    const T* __restrict__ x, float* __restrict__ y, usize n)
+{
+    const usize i = blockIdx.x * (usize)blockDim.x + threadIdx.x;
+    if (i < n) y[i] = Elem<T>::to_f32(x[i]);
+}
+
+template <class T>
+__global__ void narrow(
+    const float* __restrict__ x, T* __restrict__ y, usize n)
+{
+    const usize i = blockIdx.x * (usize)blockDim.x + threadIdx.x;
+    if (i < n) y[i] = Elem<T>::from_f32(x[i]);
+}
+
+template <class T>
+__global__ void repeat_interleave_heads_fp32(
+    const T* __restrict__ in, T* __restrict__ out,
+    int K_h, int V_h, int D, int repeat)
+{
+    const int n   = blockIdx.x;
+    const int h_v = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (h_v >= V_h || d >= D) return;
+    const int h_k = h_v / repeat;
+    const long long src = ((long long)n * K_h + h_k) * D + d;
+    const long long dst = ((long long)n * V_h + h_v) * D + d;
+    if (d < D) out[dst] = in[src];
+
+    for (int dd = d + blockDim.x; dd < D; dd += blockDim.x) {
+        out[((long long)n * V_h + h_v) * D + dd] =
+            in[((long long)n * K_h + h_k) * D + dd];
+    }
+}
+
+template <class T, int BLOCK>
+__global__ void l2norm_scale(
+    const T* __restrict__ x,
+    float*               __restrict__ y,
+    int hidden, float scale, float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const T* xr = x + (long long)row * hidden;
+    float*               yr = y + (long long)row * hidden;
+
+    float local = 0.f;
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float v = Elem<T>::to_f32(xr[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[tid] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(buf[0] + eps);
+
+    for (int i = tid; i < hidden; i += BLOCK) {
+        yr[i] = Elem<T>::to_f32(xr[i]) * inv * scale;
+    }
+}
+
+template <class T>
+__global__ void ssm_gdn_prep_g_beta(
+    const T* __restrict__ a,
+    const T* __restrict__ b,
+    const float* __restrict__ A_log,
+    const T* __restrict__ dt_bias,
+    float*               __restrict__ g_log_out,
+    float*               __restrict__ beta_out,
+    int N, int V_h)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= N || h >= V_h) return;
+
+    const float av  = Elem<T>::to_f32(a[(long long)t * V_h + h]);
+    const float bv  = Elem<T>::to_f32(b[(long long)t * V_h + h]);
+    const float Alh = A_log[h];
+    const float dtb = Elem<T>::to_f32(dt_bias[h]);
+
+    const float z = av + dtb;
+    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+
+    g_log_out[(long long)t * V_h + h] = -__expf(Alh) * sp;
+    beta_out[(long long)t * V_h + h]  = 1.f / (1.f + __expf(-bv));
+}
+
+template <class T, int BLOCK>
+__global__ void ssm_gdn_prep_qk_norm(
+    const T* __restrict__ qkv_post,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    int K_h, int K_d, int conv_dim,
+    float q_scale)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int K_dim = K_h * K_d;
+    const T* q_base =
+        qkv_post + (long long)n * conv_dim + (long long)h * K_d;
+    const T* k_base =
+        qkv_post + (long long)n * conv_dim + K_dim + (long long)h * K_d;
+
+    float q_sum = 0.f;
+    float k_sum = 0.f;
+    for (int i = tid; i < K_d; i += BLOCK) {
+        const float qv = Elem<T>::to_f32(q_base[i]);
+        const float kv = Elem<T>::to_f32(k_base[i]);
+        q_sum += qv * qv;
+        k_sum += kv * kv;
+    }
+
+    __shared__ float q_buf[BLOCK];
+    __shared__ float k_buf[BLOCK];
+    q_buf[tid] = q_sum;
+    k_buf[tid] = k_sum;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            q_buf[tid] += q_buf[tid + off];
+            k_buf[tid] += k_buf[tid + off];
+        }
+        __syncthreads();
+    }
+
+    const float q_inv = rsqrtf(q_buf[0] + 1e-6f) * q_scale;
+    const float k_inv = rsqrtf(k_buf[0] + 1e-6f);
+    float* q_dst = q_out + ((long long)n * K_h + h) * K_d;
+    float* k_dst = k_out + ((long long)n * K_h + h) * K_d;
+    for (int i = tid; i < K_d; i += BLOCK) {
+        q_dst[i] = Elem<T>::to_f32(q_base[i]) * q_inv;
+        k_dst[i] = Elem<T>::to_f32(k_base[i]) * k_inv;
+    }
+}
+
+template <class T, int BLOCK>
+__global__ void ssm_gdn_prep_v_g_beta(
+    const T* __restrict__ qkv_post,
+    const T* __restrict__ a,
+    const T* __restrict__ b,
+    const float* __restrict__ A_log,
+    const T* __restrict__ dt_bias,
+    float* __restrict__ v_out,
+    float* __restrict__ g_log_out,
+    float* __restrict__ beta_out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int K_dim = K_h * K_d;
+    const T* v_base =
+        qkv_post + (long long)n * conv_dim + 2 * K_dim + (long long)h * V_d;
+    float* v_dst = v_out + ((long long)n * V_h + h) * V_d;
+    for (int i = tid; i < V_d; i += BLOCK) {
+        v_dst[i] = Elem<T>::to_f32(v_base[i]);
+    }
+
+    if (tid == 0) {
+        const long long gh = (long long)n * V_h + h;
+        const float av = Elem<T>::to_f32(a[gh]);
+        const float bv = Elem<T>::to_f32(b[gh]);
+        const float z = av + Elem<T>::to_f32(dt_bias[h]);
+        const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+        g_log_out[gh] = -__expf(A_log[h]) * sp;
+        beta_out[gh] = 1.f / (1.f + __expf(-bv));
+    }
+}
+
+template <class T>
+__global__ void ssm_gdn_prep_ba_gates(
+    const T* __restrict__ ba,
+    const float* __restrict__ A_log,
+    const T* __restrict__ dt_bias,
+    float* __restrict__ gates,
+    int N, int V_h)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= N || h >= V_h) return;
+
+    const T* row = ba + (long long)t * 2 * V_h;
+    const float bv = Elem<T>::to_f32(row[h]);
+    const float av = Elem<T>::to_f32(row[V_h + h]);
+
+    const float z = av + Elem<T>::to_f32(dt_bias[h]);
+    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+
+    float* out = gates + (long long)t * 2 * V_h;
+    out[h] = -__expf(A_log[h]) * sp;
+    out[V_h + h] = 1.f / (1.f + __expf(-bv));
+}
+
+template <class T, int BLOCK>
+__global__ void ssm_gdn_prep_v_gates(
+    const T* __restrict__ qkv_post,
+    const float* __restrict__ gates,
+    float* __restrict__ v_out,
+    float* __restrict__ g_log_out,
+    float* __restrict__ beta_out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int K_dim = K_h * K_d;
+    const T* v_base =
+        qkv_post + (long long)n * conv_dim + 2 * K_dim + (long long)h * V_d;
+    float* v_dst = v_out + ((long long)n * V_h + h) * V_d;
+    for (int i = tid; i < V_d; i += BLOCK) {
+        v_dst[i] = Elem<T>::to_f32(v_base[i]);
+    }
+
+    if (tid == 0) {
+        const long long gh = (long long)n * V_h + h;
+        const float* row = gates + (long long)n * 2 * V_h;
+        g_log_out[gh] = row[h];
+        beta_out[gh] = row[V_h + h];
+    }
+}
+
+template <typename StateT>
+__device__ __forceinline__ float state_load(const StateT* p) {
+    return static_cast<float>(*p);
+}
+
+template <>
+__device__ __forceinline__ float state_load<__nv_bfloat16>(
+    const __nv_bfloat16* p) {
+    return __bfloat162float(*p);
+}
+
+template <typename StateT>
+__device__ __forceinline__ void state_store(StateT* p, float v) {
+    *p = static_cast<StateT>(v);
+}
+
+template <>
+__device__ __forceinline__ void state_store<__nv_bfloat16>(
+    __nv_bfloat16* p, float v) {
+    *p = __float2bfloat16(v);
+}
+
+template <bool KLast>
+__device__ __forceinline__ long long state_offset(
+    int k_idx, int v_idx, int K_d, int V_d) {
+    if constexpr (KLast) {
+        return (long long)v_idx * K_d + k_idx;
+    } else {
+        return (long long)k_idx * V_d + v_idx;
+    }
+}
+
+__device__ __forceinline__ float warp_sum(float x) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_down_sync(0xffffffffu, x, offset);
+    }
+    return __shfl_sync(0xffffffffu, x, 0);
+}
+
+__device__ __forceinline__ bool row_persists(
+    const u8* __restrict__ mask, int r) {
+    return mask == nullptr || mask[r] != 0;
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_step(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+
+    const long long bh = (long long)b * V_h + h;
+    const float* q_h = q_norm + bh * K_d;
+    const float* k_h = k_norm + bh * K_d;
+    const float* v_h = v      + bh * V_d;
+    const float  g_h = __expf(g_log[bh]);
+    const float  beta_h = beta[bh];
+
+    state += bh * (long long)K_d * V_d;
+    out   += bh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        float kv_mem = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off) * g_h;
+            state_store(state + off, s);
+            kv_mem += s * sk[k_idx];
+        }
+
+        const float v_t   = v_h[v_idx];
+        const float delta = (v_t - kv_mem) * beta_h;
+
+        float out_v = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off) + sk[k_idx] * delta;
+            state_store(state + off, s);
+            out_v += s * sq[k_idx];
+        }
+        out[v_idx] = out_v;
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_chunked_batched(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    for (int t = 0; t < T; ++t) {
+        const long long bh = (long long)(t0 + t) * V_h + h;
+        const float* q_h = q_norm + bh * K_d;
+        const float* k_h = k_norm + bh * K_d;
+        const float* v_h = v      + bh * V_d;
+        const float  g_h = __expf(g_log[bh]);
+        const float  beta_h = beta[bh];
+        float* out_bh = out + bh * V_d;
+
+        for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+            sq[i] = q_h[i];
+            sk[i] = k_h[i];
+        }
+        __syncthreads();
+
+        for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+            float kv_mem = 0.f;
+            for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+                const float s = state_load(state + off) * g_h;
+                state_store(state + off, s);
+                kv_mem += s * sk[k_idx];
+            }
+
+            const float v_t   = v_h[v_idx];
+            const float delta = (v_t - kv_mem) * beta_h;
+
+            float out_v = 0.f;
+            for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+                const float s = state_load(state + off) + sk[k_idx] * delta;
+                state_store(state + off, s);
+                out_v += s * sq[k_idx];
+            }
+            out_bh[v_idx] = out_v;
+        }
+
+        __syncthreads();
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_chunked_batched_cached(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d,
+    bool write_state,
+    const u8* __restrict__ write_state_mask)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    extern __shared__ float s_state[];
+    const int state_elems = K_d * V_d;
+    for (int i = threadIdx.x; i < state_elems; i += blockDim.x) {
+        s_state[i] = state_load(state + i);
+    }
+    __syncthreads();
+
+    for (int t = 0; t < T; ++t) {
+        const long long bh = (long long)(t0 + t) * V_h + h;
+        const float* q_h = q_norm + bh * K_d;
+        const float* k_h = k_norm + bh * K_d;
+        const float* v_h = v      + bh * V_d;
+        const float  g_h = __expf(g_log[bh]);
+        const float  beta_h = beta[bh];
+        float* out_bh = out + bh * V_d;
+
+        for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+            float kv_mem = 0.f;
+            for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+                const float s = s_state[off] * g_h;
+                s_state[off] = s;
+                kv_mem += s * k_h[k_idx];
+            }
+
+            const float delta = (v_h[v_idx] - kv_mem) * beta_h;
+            float out_v = 0.f;
+            for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+                const float s = s_state[off] + k_h[k_idx] * delta;
+                s_state[off] = s;
+                out_v += s * q_h[k_idx];
+            }
+            out_bh[v_idx] = out_v;
+        }
+    }
+
+    if (write_state && row_persists(write_state_mask, r)) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < state_elems; i += blockDim.x) {
+            state_store(state + i, s_state[i]);
+        }
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_chunked_batched_warp_tiled_gqa(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d,
+    bool write_state,
+    const u8* __restrict__ write_state_mask)
+{
+    constexpr int WARPS = 4;
+    constexpr int MAX_K_PER_LANE = 8;
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int v_tile = blockIdx.z * WARPS;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int v_idx = v_tile + warp;
+    if (warp >= WARPS || v_idx >= V_d) return;
+
+    const int repeat = V_h / K_h;
+    const int qk_h = h / repeat;
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    float s_vals[MAX_K_PER_LANE];
+    int k_vals[MAX_K_PER_LANE];
+    int n_k = 0;
+    for (int k_idx = lane; k_idx < K_d && n_k < MAX_K_PER_LANE; k_idx += 32) {
+        k_vals[n_k] = k_idx;
+        s_vals[n_k] = state_load(
+            state + state_offset<KLast>(k_idx, v_idx, K_d, V_d));
+        ++n_k;
+    }
+
+    for (int t = 0; t < T; ++t) {
+        const long long qk_bh = ((long long)(t0 + t) * K_h + qk_h);
+        const long long vh = (long long)(t0 + t) * V_h + h;
+        const float* q_h = q_norm_kh + qk_bh * K_d;
+        const float* k_h = k_norm_kh + qk_bh * K_d;
+        const float* v_h = v + vh * V_d;
+        const float g_h = __expf(g_log[vh]);
+        const float beta_h = beta[vh];
+
+        float kv_part = 0.f;
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                const int k_idx = k_vals[i];
+                const float s = s_vals[i] * g_h;
+                s_vals[i] = s;
+                kv_part += s * k_h[k_idx];
+            }
+        }
+        const float kv_mem = warp_sum(kv_part);
+        const float delta = (v_h[v_idx] - kv_mem) * beta_h;
+
+        float out_part = 0.f;
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                const int k_idx = k_vals[i];
+                const float s = s_vals[i] + k_h[k_idx] * delta;
+                s_vals[i] = s;
+                out_part += s * q_h[k_idx];
+            }
+        }
+        const float out_v = warp_sum(out_part);
+        if (lane == 0) {
+            out[vh * (long long)V_d + v_idx] = out_v;
+        }
+    }
+
+    if (write_state && row_persists(write_state_mask, r)) {
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                state_store(
+                    state + state_offset<KLast>(
+                        k_vals[i], v_idx, K_d, V_d),
+                    s_vals[i]);
+            }
+        }
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_chunked_batched_warp_tiled_gqa_ilp2(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d,
+    bool write_state,
+    const u8* __restrict__ write_state_mask)
+{
+    constexpr int WARPS = 4;
+    constexpr int ILP_V = 2;
+    constexpr int TILE_V = WARPS * ILP_V;
+    constexpr int MAX_K_PER_LANE = 8;
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int v0 = blockIdx.z * TILE_V + warp * ILP_V;
+    const int v1 = v0 + 1;
+    if (warp >= WARPS || v0 >= V_d) return;
+    const bool has_v1 = v1 < V_d;
+
+    const int repeat = V_h / K_h;
+    const int qk_h = h / repeat;
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    float s0[MAX_K_PER_LANE];
+    float s1[MAX_K_PER_LANE];
+    int k_vals[MAX_K_PER_LANE];
+    int n_k = 0;
+    for (int k_idx = lane; k_idx < K_d && n_k < MAX_K_PER_LANE; k_idx += 32) {
+        k_vals[n_k] = k_idx;
+        s0[n_k] = state_load(
+            state + state_offset<KLast>(k_idx, v0, K_d, V_d));
+        s1[n_k] = has_v1
+            ? state_load(state + state_offset<KLast>(k_idx, v1, K_d, V_d))
+            : 0.f;
+        ++n_k;
+    }
+
+    for (int t = 0; t < T; ++t) {
+        const long long qk_bh = ((long long)(t0 + t) * K_h + qk_h);
+        const long long vh = (long long)(t0 + t) * V_h + h;
+        const float* q_h = q_norm_kh + qk_bh * K_d;
+        const float* k_h = k_norm_kh + qk_bh * K_d;
+        const float* v_h = v + vh * V_d;
+        const float g_h = __expf(g_log[vh]);
+        const float beta_h = beta[vh];
+
+        float kv_part0 = 0.f;
+        float kv_part1 = 0.f;
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                const int k_idx = k_vals[i];
+                const float k_val = k_h[k_idx];
+                const float s_v0 = s0[i] * g_h;
+                s0[i] = s_v0;
+                kv_part0 += s_v0 * k_val;
+                if (has_v1) {
+                    const float s_v1 = s1[i] * g_h;
+                    s1[i] = s_v1;
+                    kv_part1 += s_v1 * k_val;
+                }
+            }
+        }
+        const float kv_mem0 = warp_sum(kv_part0);
+        const float kv_mem1 = has_v1 ? warp_sum(kv_part1) : 0.f;
+        const float delta0 = (v_h[v0] - kv_mem0) * beta_h;
+        const float delta1 = has_v1 ? (v_h[v1] - kv_mem1) * beta_h : 0.f;
+
+        float out_part0 = 0.f;
+        float out_part1 = 0.f;
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                const int k_idx = k_vals[i];
+                const float k_val = k_h[k_idx];
+                const float q_val = q_h[k_idx];
+                const float new_s0 = s0[i] + k_val * delta0;
+                s0[i] = new_s0;
+                out_part0 += new_s0 * q_val;
+                if (has_v1) {
+                    const float new_s1 = s1[i] + k_val * delta1;
+                    s1[i] = new_s1;
+                    out_part1 += new_s1 * q_val;
+                }
+            }
+        }
+        const float out_v0 = warp_sum(out_part0);
+        const float out_v1 = has_v1 ? warp_sum(out_part1) : 0.f;
+        if (lane == 0) {
+            out[vh * (long long)V_d + v0] = out_v0;
+            if (has_v1) out[vh * (long long)V_d + v1] = out_v1;
+        }
+    }
+
+    if (write_state && row_persists(write_state_mask, r)) {
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                state_store(
+                    state + state_offset<KLast>(k_vals[i], v0, K_d, V_d),
+                    s0[i]);
+                if (has_v1) {
+                    state_store(
+                        state + state_offset<KLast>(k_vals[i], v1, K_d, V_d),
+                        s1[i]);
+                }
+            }
+        }
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_step_batched(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*   __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const long long bh = (long long)r * V_h + h;
+    const float* q_h = q_norm + bh * K_d;
+    const float* k_h = k_norm + bh * K_d;
+    const float* v_h = v      + bh * V_d;
+    const float  g_h = __expf(g_log[bh]);
+    const float  beta_h = beta[bh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + bh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        float kv_mem = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off) * g_h;
+            state_store(state + off, s);
+            kv_mem += s * sk[k_idx];
+        }
+
+        const float v_t   = v_h[v_idx];
+        const float delta = (v_t - kv_mem) * beta_h;
+
+        float out_v = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off) + sk[k_idx] * delta;
+            state_store(state + off, s);
+            out_v += s * sq[k_idx];
+        }
+        out_bh[v_idx] = out_v;
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void ssm_gated_delta_step_batched_gqa(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int repeat = V_h / K_h;
+    const int h_k = h / repeat;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const long long qh = ((long long)r * K_h + h_k) * K_d;
+    const long long vh = (long long)r * V_h + h;
+    const float* q_h = q_norm_kh + qh;
+    const float* k_h = k_norm_kh + qh;
+    const float* v_h = v + vh * V_d;
+    const float  g_h = __expf(g_log[vh]);
+    const float  beta_h = beta[vh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + vh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        float kv_mem = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off) * g_h;
+            state_store(state + off, s);
+            kv_mem += s * sk[k_idx];
+        }
+
+        const float v_t = v_h[v_idx];
+        const float delta = (v_t - kv_mem) * beta_h;
+
+        float out_v = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off) + sk[k_idx] * delta;
+            state_store(state + off, s);
+            out_v += s * sq[k_idx];
+        }
+        out_bh[v_idx] = out_v;
+    }
+}
+
+template <typename StateT, bool KLast, int K_D_MAX>
+__global__ void ssm_gated_delta_step_batched_fused(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*   __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const long long bh = (long long)r * V_h + h;
+    const float* q_h = q_norm + bh * K_d;
+    const float* k_h = k_norm + bh * K_d;
+    const float* v_h = v      + bh * V_d;
+    const float  g_h = __expf(g_log[bh]);
+    const float  beta_h = beta[bh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + bh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    float* sm_scalars = smem + 2 * K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    float partial = 0.f;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        partial += sk[i] * sq[i];
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset);
+    }
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp_id] = partial;
+    __syncthreads();
+    if (warp_id == 0) {
+        const int num_warps = (blockDim.x + 31) >> 5;
+        float w = (threadIdx.x < num_warps) ? warp_sums[lane] : 0.f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            w += __shfl_xor_sync(0xffffffffu, w, offset);
+        }
+        if (threadIdx.x == 0) sm_scalars[0] = w;
+    }
+    __syncthreads();
+    const float sum_sk_sq = sm_scalars[0];
+
+    float s_cache[K_D_MAX];
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+
+        float sum_s_sk = 0.f;
+        float sum_s_sq = 0.f;
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off);
+            s_cache[k_idx] = s;
+            sum_s_sk += s * sk[k_idx];
+            sum_s_sq += s * sq[k_idx];
+        }
+
+        const float kv_mem = g_h * sum_s_sk;
+        const float v_t    = v_h[v_idx];
+        const float delta  = (v_t - kv_mem) * beta_h;
+
+        const float out_v  = g_h * sum_s_sq + delta * sum_sk_sq;
+        out_bh[v_idx] = out_v;
+
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s_new = s_cache[k_idx] * g_h + sk[k_idx] * delta;
+            state_store(state + off, s_new);
+        }
+    }
+}
+
+template <typename StateT, bool KLast, int K_D_MAX>
+__global__ void ssm_gated_delta_step_batched_gqa_fused(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int repeat = V_h / K_h;
+    const int h_k = h / repeat;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const long long qh = ((long long)r * K_h + h_k) * K_d;
+    const long long vh = (long long)r * V_h + h;
+    const float* q_h = q_norm_kh + qh;
+    const float* k_h = k_norm_kh + qh;
+    const float* v_h = v + vh * V_d;
+    const float  g_h = __expf(g_log[vh]);
+    const float  beta_h = beta[vh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + vh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+    float* sm_scalars = smem + 2 * K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    float partial = 0.f;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        partial += sk[i] * sq[i];
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset);
+    }
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp_id] = partial;
+    __syncthreads();
+    if (warp_id == 0) {
+        const int num_warps = (blockDim.x + 31) >> 5;
+        float w = (threadIdx.x < num_warps) ? warp_sums[lane] : 0.f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            w += __shfl_xor_sync(0xffffffffu, w, offset);
+        }
+        if (threadIdx.x == 0) sm_scalars[0] = w;
+    }
+    __syncthreads();
+    const float sum_sk_sq = sm_scalars[0];
+
+    float s_cache[K_D_MAX];
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        float sum_s_sk = 0.f;
+        float sum_s_sq = 0.f;
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off);
+            s_cache[k_idx] = s;
+            sum_s_sk += s * sk[k_idx];
+            sum_s_sq += s * sq[k_idx];
+        }
+
+        const float kv_mem = g_h * sum_s_sk;
+        const float v_t    = v_h[v_idx];
+        const float delta  = (v_t - kv_mem) * beta_h;
+        const float out_v  = g_h * sum_s_sq + delta * sum_sk_sq;
+        out_bh[v_idx] = out_v;
+
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s_new = s_cache[k_idx] * g_h + sk[k_idx] * delta;
+            state_store(state + off, s_new);
+        }
+    }
+}
+
+template <typename StateT, int BV, int BK_MAX>
+__global__ void ssm_gated_delta_step_batched_fla(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*   __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const int v_idx = vt * BV + threadIdx.x;
+    if (v_idx >= V_d) return;
+
+    const long long bh = (long long)r * V_h + h;
+    const float* q_h = q_norm + bh * K_d;
+    const float* k_h = k_norm + bh * K_d;
+    const float* v_h = v      + bh * V_d;
+    const float  g_h = __expf(g_log[bh]);
+    const float  beta_h = beta[bh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + bh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + BK_MAX;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    float bh_state[BK_MAX];
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] = state_load(state + (long long)k_idx * V_d + v_idx);
+    }
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] *= g_h;
+    }
+    float kv_mem = 0.f;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        kv_mem += bh_state[k_idx] * sk[k_idx];
+    }
+    const float v_t   = v_h[v_idx];
+    const float delta = (v_t - kv_mem) * beta_h;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] += sk[k_idx] * delta;
+    }
+    float out_v = 0.f;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        out_v += bh_state[k_idx] * sq[k_idx];
+    }
+    out_bh[v_idx] = out_v;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        state_store(state + (long long)k_idx * V_d + v_idx, bh_state[k_idx]);
+    }
+}
+
+template <typename StateT, int BV, int BK_MAX>
+__global__ void ssm_gated_delta_step_batched_gqa_fla(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*   __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d)
+{
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int repeat = V_h / K_h;
+    const int h_k = h / repeat;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const int v_idx = vt * BV + threadIdx.x;
+    if (v_idx >= V_d) return;
+
+    const long long qh = ((long long)r * K_h + h_k) * K_d;
+    const long long vh = (long long)r * V_h + h;
+    const float* q_h = q_norm_kh + qh;
+    const float* k_h = k_norm_kh + qh;
+    const float* v_h = v + vh * V_d;
+    const float  g_h = __expf(g_log[vh]);
+    const float  beta_h = beta[vh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + vh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + BK_MAX;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    float bh_state[BK_MAX];
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] = state_load(state + (long long)k_idx * V_d + v_idx);
+    }
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] *= g_h;
+    }
+    float kv_mem = 0.f;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        kv_mem += bh_state[k_idx] * sk[k_idx];
+    }
+    const float v_t   = v_h[v_idx];
+    const float delta = (v_t - kv_mem) * beta_h;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] += sk[k_idx] * delta;
+    }
+    float out_v = 0.f;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        out_v += bh_state[k_idx] * sq[k_idx];
+    }
+    out_bh[v_idx] = out_v;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        state_store(state + (long long)k_idx * V_d + v_idx, bh_state[k_idx]);
+    }
+}
+
+template <int BV>
+__global__ void ssm_gated_delta_step_batched_gqa_smem(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    __nv_bfloat16* __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d)
+{
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int v_idx = vt * BV + threadIdx.x;
+    if (v_idx >= V_d) return;
+    const int repeat = V_h / K_h;
+    const int h_k = h / repeat;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const long long qh = ((long long)r * K_h + h_k) * K_d;
+    const long long vh = (long long)r * V_h + h;
+    const float* v_h = v + vh * V_d;
+    const float g_h = __expf(g_log[vh]);
+    const float beta_h = beta[vh];
+
+    __nv_bfloat16* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + vh * V_d;
+
+    extern __shared__ __nv_bfloat16 smem_smem_step[];
+    __nv_bfloat16* s_state = smem_smem_step;
+    float* sq = (float*)(smem_smem_step + K_d * BV);
+    float* sk = sq + K_d;
+
+    const bool vec_tile =
+        (BV == V_d) && ((V_d & 7) == 0) &&
+        ((reinterpret_cast<usize>(state) & 15) == 0);
+    const int n_vec = (K_d * V_d) >> 3;
+    if (vec_tile) {
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(state);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(s_state);
+        for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    } else {
+        constexpr int kStageTile = 16;
+        __nv_bfloat16 staged[kStageTile];
+        int k = 0;
+        for (; k + kStageTile <= K_d; k += kStageTile) {
+            #pragma unroll
+            for (int u = 0; u < kStageTile; ++u) {
+                staged[u] = state[(long long)(k + u) * V_d + v_idx];
+            }
+            #pragma unroll
+            for (int u = 0; u < kStageTile; ++u) {
+                s_state[(k + u) * BV + threadIdx.x] = staged[u];
+            }
+        }
+        for (; k < K_d; ++k) {
+            s_state[k * BV + threadIdx.x] =
+                state[(long long)k * V_d + v_idx];
+        }
+    }
+    const float* q_h = q_norm_kh + qh;
+    const float* k_h = k_norm_kh + qh;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    float kv_mem = 0.f;
+    for (int k = 0; k < K_d; ++k) {
+        float s = __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h;
+        kv_mem += s * sk[k];
+    }
+    const float delta = (v_h[v_idx] - kv_mem) * beta_h;
+
+    float out_v = 0.f;
+    for (int k = 0; k < K_d; ++k) {
+        const float sg = __bfloat162float(__float2bfloat16(
+            __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h));
+        float s = sg + sk[k] * delta;
+        out_v += s * sq[k];
+
+        if (vec_tile) {
+            s_state[k * BV + threadIdx.x] = __float2bfloat16(s);
+        } else {
+            state[(long long)k * V_d + v_idx] = __float2bfloat16(s);
+        }
+    }
+    out_bh[v_idx] = out_v;
+    if (vec_tile) {
+        __syncthreads();
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(s_state);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(state);
+        for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    }
+}
+
+template <typename StateT, int BV, int BK_MAX>
+__global__ void ssm_gated_delta_chunked_batched_fla(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d,
+    bool write_state,
+    const int* __restrict__ commit_len,
+    const u8* __restrict__ write_state_mask)
+{
+
+    const int gqa_repeat = V_h / K_h;
+
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int h_k = h / gqa_repeat;
+    const int v_idx = vt * BV + threadIdx.x;
+    if (v_idx >= V_d) return;
+
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+
+    if (commit_len != nullptr) {
+        const int c = commit_len[r];
+        if (c < T) T = c;
+    }
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + BK_MAX;
+
+    __nv_bfloat162 bh_state[BK_MAX / 2];
+    #pragma unroll
+    for (int j = 0; j < BK_MAX / 2; ++j) {
+        const int k0 = 2 * j;
+        if (k0 >= K_d) break;
+        const int k1 = k0 + 1;
+        const float s0 = state_load(state + (long long)k0 * V_d + v_idx);
+        const float s1 = (k1 < K_d)
+            ? state_load(state + (long long)k1 * V_d + v_idx)
+            : 0.f;
+        bh_state[j] = __floats2bfloat162_rn(s0, s1);
+    }
+
+    const bool single_round = (commit_len != nullptr);
+
+    for (int t = 0; t < T; ++t) {
+        const long long bh = (long long)(t0 + t) * V_h + h;
+        const float  g_h = __expf(g_log[bh]);
+        const float  beta_h = beta[bh];
+
+        const long long bh_qk = (long long)(t0 + t) * K_h + h_k;
+        const float* q_h_t = q_norm + bh_qk * K_d;
+        const float* k_h_t = k_norm + bh_qk * K_d;
+        for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+            sq[i] = q_h_t[i];
+            sk[i] = k_h_t[i];
+        }
+        __syncthreads();
+
+        float kv_mem = 0.f;
+        #pragma unroll
+        for (int j = 0; j < BK_MAX / 2; ++j) {
+            const int k0 = 2 * j;
+            if (k0 >= K_d) break;
+            const int k1 = k0 + 1;
+            float2 s = __bfloat1622float2(bh_state[j]);
+            s.x *= g_h;
+            if (k1 < K_d) s.y *= g_h;
+            if (!single_round) bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
+            kv_mem += s.x * sk[k0];
+            if (k1 < K_d) kv_mem += s.y * sk[k1];
+        }
+        const float v_t   = v[bh * V_d + v_idx];
+        const float delta = (v_t - kv_mem) * beta_h;
+
+        float out_v = 0.f;
+        #pragma unroll
+        for (int j = 0; j < BK_MAX / 2; ++j) {
+            const int k0 = 2 * j;
+            if (k0 >= K_d) break;
+            const int k1 = k0 + 1;
+            float2 s = __bfloat1622float2(bh_state[j]);
+            float sx, sy;
+            if (single_round) {
+                sx = s.x * g_h + sk[k0] * delta;
+                sy = (k1 < K_d) ? (s.y * g_h + sk[k1] * delta) : s.y;
+            } else {
+
+                sx = s.x + sk[k0] * delta;
+                sy = (k1 < K_d) ? (s.y + sk[k1] * delta) : s.y;
+            }
+            bh_state[j] = __floats2bfloat162_rn(sx, sy);
+            out_v += sx * sq[k0];
+            if (k1 < K_d) out_v += sy * sq[k1];
+        }
+        out[bh * V_d + v_idx] = out_v;
+        __syncthreads();
+    }
+
+    if (!write_state || !row_persists(write_state_mask, r)) return;
+    #pragma unroll
+    for (int j = 0; j < BK_MAX / 2; ++j) {
+        const int k0 = 2 * j;
+        if (k0 >= K_d) break;
+        const int k1 = k0 + 1;
+        const float2 s = __bfloat1622float2(bh_state[j]);
+        state_store(state + (long long)k0 * V_d + v_idx, s.x);
+        if (k1 < K_d) state_store(state + (long long)k1 * V_d + v_idx, s.y);
+    }
+}
+
+template <typename StateT, int BV, int BK_MAX>
+__global__ void ssm_gated_delta_chunked_batched_gqa_fla(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d)
+{
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int v_idx = vt * BV + threadIdx.x;
+    if (v_idx >= V_d) return;
+    const int repeat = V_h / K_h;
+    const int h_k = h / repeat;
+
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + BK_MAX;
+
+    float bh_state[BK_MAX];
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        bh_state[k_idx] = state_load(state + (long long)k_idx * V_d + v_idx);
+    }
+
+    for (int t = 0; t < T; ++t) {
+        const long long qh = ((long long)(t0 + t) * K_h + h_k) * K_d;
+        const long long vh = (long long)(t0 + t) * V_h + h;
+        const float  g_h = __expf(g_log[vh]);
+        const float  beta_h = beta[vh];
+
+        const float* q_h_t = q_norm_kh + qh;
+        const float* k_h_t = k_norm_kh + qh;
+        for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+            sq[i] = q_h_t[i];
+            sk[i] = k_h_t[i];
+        }
+        __syncthreads();
+
+        float kv_mem = 0.f;
+        #pragma unroll
+        for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+            if (k_idx >= K_d) break;
+            bh_state[k_idx] *= g_h;
+            kv_mem += bh_state[k_idx] * sk[k_idx];
+        }
+        const float v_t   = v[vh * V_d + v_idx];
+        const float delta = (v_t - kv_mem) * beta_h;
+
+        float out_v = 0.f;
+        #pragma unroll
+        for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+            if (k_idx >= K_d) break;
+            bh_state[k_idx] += sk[k_idx] * delta;
+            out_v += bh_state[k_idx] * sq[k_idx];
+        }
+        out[vh * V_d + v_idx] = out_v;
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int k_idx = 0; k_idx < BK_MAX; ++k_idx) {
+        if (k_idx >= K_d) break;
+        state_store(state + (long long)k_idx * V_d + v_idx, bh_state[k_idx]);
+    }
+}
+
+__device__ __forceinline__ float sigmoidf(float x) {
+    return 1.f / (1.f + __expf(-x));
+}
+
+template <class ElemT>
+__global__ void ssm_kda_gate_beta(
+    const ElemT* __restrict__ raw_g,
+    const ElemT* __restrict__ raw_beta,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ gate_out,
+    float* __restrict__ beta_out,
+    int T, int H, int D,
+    float lower_bound)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    if (t >= T || h >= H) return;
+
+    const float a = __expf(A_log[h]);
+    const long long base = ((long long)t * H + h) * D;
+
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const float g = Elem<ElemT>::to_f32(raw_g[base + d]) + dt_bias[(long long)h * D + d];
+        float gate;
+        if (lower_bound < 0.f) {
+            gate = lower_bound * sigmoidf(a * g);
+        } else {
+
+            const float sp = (g > 20.f) ? g : __logf(1.f + __expf(g));
+            gate = -a * sp;
+        }
+        gate_out[base + d] = gate;
+    }
+
+    if (threadIdx.x == 0) {
+        beta_out[(long long)t * H + h] =
+            sigmoidf(Elem<ElemT>::to_f32(raw_beta[(long long)t * H + h]));
+    }
+}
+
+template <class ElemT, int BLOCK>
+__global__ void ssm_kda_qkv_prep(
+    const ElemT* __restrict__ mixed,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    int width, float eps)
+{
+    const int n = blockIdx.x;
+
+    const int plane = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const ElemT* src =
+        mixed + (long long)n * 3 * width + (long long)plane * width;
+    float* dst =
+        (plane == 0 ? q_out : (plane == 1 ? k_out : v_out)) +
+        (long long)n * width;
+
+    if (plane == 2) {
+        for (int i = tid; i < width; i += BLOCK) {
+            dst[i] = Elem<ElemT>::to_f32(src[i]);
+        }
+        return;
+    }
+
+    float local = 0.f;
+    for (int i = tid; i < width; i += BLOCK) {
+        const float x = Elem<ElemT>::to_f32(src[i]);
+        local += x * x;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[tid] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(buf[0] + eps);
+
+    for (int i = tid; i < width; i += BLOCK) {
+        dst[i] = Elem<ElemT>::to_f32(src[i]) * inv;
+    }
+}
+
+__global__ void ssm_kda_step_batched(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    float* __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float* __restrict__ out,
+    int H, int D)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+
+    const long long rh = (long long)r * H + h;
+    const float* q_h = q_norm + rh * D;
+    const float* k_h = k_norm + rh * D;
+    const float* v_h = v      + rh * D;
+    const float* g_h = gate   + rh * D;
+    const float beta_h = beta[rh];
+
+    float* st = state_base + (long long)slot_ids[r] * slot_stride_elems +
+                (long long)h * D * D;
+    float* out_h = out + rh * D;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + D;
+    float* sg = smem + 2 * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+        sg[i] = __expf(g_h[i]);
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+
+    for (int vi = warp; vi < D; vi += warps) {
+        float* row = st + (long long)vi * D;
+        float mem = 0.f;
+        for (int ki = lane; ki < D; ki += 32) {
+            const float sv = row[ki] * sg[ki];
+            row[ki] = sv;
+            mem += sv * sk[ki];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            mem += __shfl_down_sync(0xffffffffu, mem, off);
+        }
+        const float delta = __shfl_sync(0xffffffffu, (v_h[vi] - mem) * beta_h, 0);
+
+        float acc = 0.f;
+        for (int ki = lane; ki < D; ki += 32) {
+            const float sv = row[ki] + sk[ki] * delta;
+            row[ki] = sv;
+            acc += sv * sq[ki];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        }
+        if (lane == 0) out_h[vi] = acc;
+    }
+}
+
+__global__ void ssm_kda_chunked_batched(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    float* __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float* __restrict__ out,
+    int H, int D)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+
+    const long long begin = qo_indptr[r];
+    const long long end = qo_indptr[r + 1];
+    if (end <= begin) return;
+
+    float* st = state_base + (long long)slot_ids[r] * slot_stride_elems +
+                (long long)h * D * D;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + D;
+    float* sg = smem + 2 * D;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+
+    for (long long t = begin; t < end; ++t) {
+        const long long th = t * H + h;
+        for (int i = threadIdx.x; i < D; i += blockDim.x) {
+            sq[i] = q_norm[th * D + i];
+            sk[i] = k_norm[th * D + i];
+            sg[i] = __expf(gate[th * D + i]);
+        }
+        __syncthreads();
+
+        const float beta_h = beta[th];
+        for (int vi = warp; vi < D; vi += warps) {
+            float* row = st + (long long)vi * D;
+            float mem = 0.f;
+            for (int ki = lane; ki < D; ki += 32) {
+                const float sv = row[ki] * sg[ki];
+                row[ki] = sv;
+                mem += sv * sk[ki];
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                mem += __shfl_down_sync(0xffffffffu, mem, off);
+            }
+            const float delta =
+                __shfl_sync(0xffffffffu, (v[th * D + vi] - mem) * beta_h, 0);
+
+            float acc = 0.f;
+            for (int ki = lane; ki < D; ki += 32) {
+                const float sv = row[ki] + sk[ki] * delta;
+                row[ki] = sv;
+                acc += sv * sq[ki];
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xffffffffu, acc, off);
+            }
+            if (lane == 0) out[th * D + vi] = acc;
+        }
+
+        __syncthreads();
+    }
+}
+
+}

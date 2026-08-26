@@ -1,15 +1,21 @@
-use model_dsl::axes::{Dtype, KvDtype};
+//! The Gemma 4 forward pass over the typed IR — the old forward minus the
+//! machinery the design killed (design §10): attention plans are built once
+//! up front and shared visibly across layers (§6), kv-append geometry is a
+//! declared input fetched where it is used — the recorder declares each input
+//! once no matter how many layers ask (§7), raggedness is ambient so the
+//! masked/prefill arms lose their `query_windows` plumbing (§5), and tensor
+//! parallelism is plain control flow on `m.tp` (§9, decision #18). The
+//! logit-softcap tail and the local/global theta split transcribe verbatim.
+
 use model_dsl::{
-    Classify, Facts, Forward, Input, KvSpec, Norm, Pages, Predicate, Request, Tensor, Value,
-    kernels, merge, seam,
+    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ValueId,
+    Weight, kernels, merge, seam,
 };
 
 use super::model::{Attn, AttnBanks, AttnKind, Model};
 
-#[derive(Facts)]
-pub struct Facts {
-    pub qo_one: bool,
-    pub masked: bool,
+model_dsl::facts! {
+    pub struct Facts { qo_one, masked }
 }
 
 impl Classify for Facts {
@@ -21,15 +27,20 @@ impl Classify for Facts {
     }
 }
 
-impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
+impl ForwardHybrid for Model {
     type Facts = Facts;
 
-    fn caches(&self) -> KvSpec {
-        let mut c = KvSpec::new();
+    fn caches(&self) -> HybridSpec {
+        let mut c = HybridSpec::new();
+        // One paged space for every owned kv row — the fire lays every
+        // layer's kv pages out identically, and the kv-sharing tail reads
+        // through the same pages it would have named.
+        let kv = c.kv_space(self.kv);
         for (l, w) in self.layers.iter().enumerate() {
             if let AttnBanks::Owned { .. } = &w.attn.banks {
                 let ki = &w.attn.kind;
                 c.kv(
+                    kv,
                     format!("kv.{l}"),
                     [2, ki.kv_heads() as u64 * ki.head_dim() as u64],
                 );
@@ -40,84 +51,87 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
-        let ids = inputs.token_ids();
+        // The decode and prefill plans, built once and shared visibly by
+        // every layer (§6) — the masked arm rides the prefill plan, its
+        // queries being just as ragged, and names the mask it applies.
+        let positions = inputs.positions();
+        let plan_d = kernels::attn::plan_decode(positions.rec(), inputs.kv_space());
+        let plan_p = kernels::attn::plan_prefill(positions.rec(), inputs.kv_space());
+        let mask = kernels::mask(positions.rec(), inputs.kv_space());
+        let ids = inputs.tokens();
         let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
 
-        // THE RELAY IS A STACK OF `dim`-WIDE BLOCKS, ONE PER LAYER, and both
-        // of the two things this line used to get wrong come from reading it
-        // as one flat row.
-        //
-        // * The projection's norm is stated over ONE BLOCK — the checkpoint
-        //   ships `per_layer_projection_norm` at `[dim]` and the reference
-        //   reshapes to `[.., layers, dim]` before applying it, so the RMS is
-        //   a layer's own 256 numbers. Normalising the whole `layers * dim`
-        //   row divides every block by one figure and reads the `[dim]`
-        //   weight `layers` times past its end. `rmsnorm_per_head` IS this
-        //   reading — the point's own words, "normalise each `head_dim`-wide
-        //   slice of a row independently; the weight is one head wide" — and
-        //   `layout::select` downstream already cuts the same blocks.
-        // * The two halves are averaged in QUADRATURE, not summed: the
-        //   reference scales the sum by `2^-0.5`, which is what keeps a sum
-        //   of two unit-variance planes at unit variance. Dropping it made
-        //   every layer's relay √2 too loud.
-        //
-        // Measured against a transformers 5.15.1 forward on the cached
-        // checkpoint, which is the third party that decides.
-        // **THE TABLE IS GATHERED PER LAYER NOW, AND THE `select` MOVED RATHER
-        // THAN WENT AWAY.**
-        //
-        // This built the whole relay here — one `layout.embed` of the whole
-        // `[vocab, layers * ple_dim]` row, added to the projection, and then a
-        // `layout.select` of the RELAY inside the loop. The gather is the one
-        // thing that could not stay: `PleLayer::table` says why a 5.25 GiB bank
-        // is a bank no shader plane can bind, and the fix is one param per
-        // layer.
-        //
-        // So the projection is what survives to the loop, and the loop selects
-        // IT. Elementwise nothing changes: the same slice of the same
-        // normalised projection meets the same 256 embedded columns, scaled by
-        // the same two constants. What changes is the statement graph — one
-        // wide embed and one wide add become forty-two narrow ones — and
-        // `driver-cuda`'s banked 785 at 7.5938 is what says the arithmetic did
-        // not move with it.
         let relay = m.ple.as_ref().map(|ple| {
             let proj =
-                kernels::gemm::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
-            let n = &ple.model_norm;
+                kernels::linear::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
             (
                 ple,
-                kernels::norm::rmsnorm_per_head(&proj, &n.weight, ple.dim, n.eps),
+                kernels::elemwise::rmsnorm_per_head(
+                    &proj,
+                    &ple.model_norm,
+                    ple.dim,
+                    ple.model_norm_eps,
+                ),
             )
         });
 
         for (l, w) in inputs.layers(&m.layers) {
-            let an = &w.attn_norm;
-            let normed = kernels::norm::rmsnorm(&y, &an.weight, an.eps);
+            let normed = kernels::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let at = &w.attn;
             let d = at.kind.head_dim();
             let pages = inputs.kv(&at.kv);
 
             let q = match &at.banks {
-                AttnBanks::Shared { q_proj } => q_only(&normed, &inputs.positions(), at, q_proj),
-                AttnBanks::Owned { qkv, k_norm } => {
-                    if inputs.cuda() && K::NATIVE_BF16 && at.kind.sliding() {
+                AttnBanks::Shared { q_proj } => q_only(&normed, &positions, at, q_proj),
+                AttnBanks::Owned {
+                    qkv,
+                    k_norm,
+                    k_norm_eps,
+                } => {
+                    // The old guard also asked `K::NATIVE_BF16`; a cache row's
+                    // element layout is the model's own `kv` declaration now
+                    // (design §5), and the shipped SKUs store native bf16 kv,
+                    // so the plane is the whole question.
+                    if inputs.cuda() && at.kind.sliding() {
                         let fused = Facts::qo_one() & !Facts::masked();
                         let (fast_x, rest_x) = normed.split(&fused);
-                        let (fast_pos, rest_pos) = inputs.positions().split(&fused);
-                        let qf = kernels::cuda::qkv_fused_qknorm_rope_vnorm_write(
-                            &kernels::gemm::matmul(&fast_x, qkv),
+                        let (fast_pos, rest_pos) = positions.split(&fused);
+                        let qf = kernels::custom::qkv_fused_qknorm_rope_vnorm_write(
+                            &kernels::linear::matmul(&fast_x, qkv),
                             &at.q_norm,
+                            at.q_norm_eps,
                             k_norm,
+                            *k_norm_eps,
                             at.kind.kv_heads(),
                             d,
-                            &pages,
+                            pages,
+                            &inputs.geometry(inputs.kv_space(), GeomKind::WritePage),
+                            &inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset),
                             at.kind.theta(),
                             &fast_pos,
                         );
-                        let qr = qkv_unfused(&rest_x, &rest_pos, at, qkv, k_norm, &pages);
+                        let qr = qkv_unfused(
+                            &rest_x,
+                            &rest_pos,
+                            &inputs,
+                            at,
+                            qkv,
+                            k_norm,
+                            *k_norm_eps,
+                            pages,
+                        );
                         merge![qf, qr]
                     } else {
-                        qkv_unfused(&normed, &inputs.positions(), at, qkv, k_norm, &pages)
+                        qkv_unfused(
+                            &normed,
+                            &positions,
+                            &inputs,
+                            at,
+                            qkv,
+                            k_norm,
+                            *k_norm_eps,
+                            pages,
+                        )
                     }
                 }
             };
@@ -127,117 +141,116 @@ impl<W1: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, K, TP> {
             let win = at.kind.window();
             let [mq, dq, p] = q.split([Facts::masked(), Facts::qo_one(), Predicate::rest()]);
             let a = merge![
-                kernels::attention::masked(
-                    &kernels::query_windows(&mq),
-                    &pages,
-                    win,
-                    d,
-                    at.sm_scale
-                ),
-                kernels::attention::decode(&dq, &pages, win, d, at.sm_scale),
-                kernels::attention::prefill(
-                    &kernels::query_windows(&p),
-                    &pages,
-                    win,
-                    d,
-                    at.kind.kv_heads(),
-                    at.sm_scale
-                ),
+                kernels::attn::masked(&mq, &plan_p, &mask, pages, win, d, at.sm_scale),
+                kernels::attn::decode(&dq, &plan_d, pages, win, d, at.sm_scale),
+                kernels::attn::prefill(&p, &plan_p, pages, win, d, at.kind.kv_heads(), at.sm_scale),
             ];
             seam::at(seam::ATTN_OUT, (&a,));
-            let o = kernels::gemm::attention_landing(&a, &w.o_proj);
-            let o = kernels::dist::reduce::<TP>(o);
+            let o = kernels::linear::attention_landing(&a, &w.o_proj, l);
+            let o = if m.tp > 1 {
+                kernels::collective::all_reduce(&o)
+            } else {
+                o
+            };
 
-            let pan = &w.post_attn_norm;
-            y = kernels::norm::residual_add(&kernels::norm::rmsnorm(&o, &pan.weight, pan.eps), &y);
-            let pff = &w.pre_ffw_norm;
-            let mlp_in = kernels::norm::rmsnorm(&y, &pff.weight, pff.eps);
+            y = kernels::elemwise::residual_add(
+                &kernels::elemwise::rmsnorm(&o, &w.post_attn_norm, w.post_attn_norm_eps),
+                &y,
+            );
+            let mlp_in = kernels::elemwise::rmsnorm(&y, &w.pre_ffw_norm, w.pre_ffw_norm_eps);
 
-            let act = kernels::mlp::geglu_tanh_packed(
-                &kernels::gemm::matmul(&mlp_in, &w.gate_up),
+            let act = kernels::linear::mlp_geglu_tanh_packed(
+                &kernels::linear::matmul(&mlp_in, &w.gate_up),
                 w.inter,
             );
-            let f = kernels::gemm::matmul(&act, &w.down);
-            let f = kernels::dist::reduce::<TP>(f);
-            let pfn = &w.post_ffw_norm;
-            y = kernels::norm::residual_add(&kernels::norm::rmsnorm(&f, &pfn.weight, pfn.eps), &y);
+            let f = kernels::linear::matmul(&act, &w.down);
+            let f = if m.tp > 1 {
+                kernels::collective::all_reduce(&f)
+            } else {
+                f
+            };
+            y = kernels::elemwise::residual_add(
+                &kernels::elemwise::rmsnorm(&f, &w.post_ffw_norm, w.post_ffw_norm_eps),
+                &y,
+            );
 
             if let Some((ple, proj)) = &relay {
                 let lp = &ple.per_layer[l as usize];
                 let table =
                     kernels::layout::embed(&ids, &lp.table, m.vocab) * (ple.dim as f32).sqrt();
-                let relay =
-                    kernels::norm::residual_add(&table, &kernels::layout::select(proj, l, ple.dim))
-                        * std::f32::consts::FRAC_1_SQRT_2;
-                let gated = kernels::mlp::geglu_tanh(&kernels::gemm::matmul(&y, &lp.gate), &relay);
-                let out = kernels::gemm::matmul(&gated, &lp.proj);
-                let out = kernels::norm::rmsnorm(&out, &lp.norm.weight, lp.norm.eps);
-                // THE SCALAR RIDES THE WHOLE LAYER, NOT THE RELAY'S BRANCH.
-                // It scaled `out` alone here, and the checkpoint says
-                // otherwise: `layer_scalar` is a `[1]` buffer of its own,
-                // trained (0.06 at layer 0 to 0.89 at layer 37 on e4b, never
-                // 1.0), and the reference multiplies the layer's RESULT by
-                // it after the relay's residual lands. Scaling the branch
-                // instead leaves the residual stream un-damped and the error
-                // compounds 42 times — measured against a transformers 5.15.1
-                // forward on the cached checkpoint, which is the third party
-                // that decides.
-                y = kernels::norm::scale(&lp.scalar, &kernels::norm::residual_add(&out, &y));
+                let relay = kernels::elemwise::residual_add(
+                    &table,
+                    &kernels::layout::select(proj, l, ple.dim),
+                ) * std::f32::consts::FRAC_1_SQRT_2;
+                let gated =
+                    kernels::linear::mlp_geglu_tanh(&kernels::linear::matmul(&y, &lp.gate), &relay);
+                let out = kernels::linear::matmul(&gated, &lp.proj);
+                let out = kernels::elemwise::rmsnorm(&out, &lp.norm, lp.norm_eps);
+
+                y = kernels::elemwise::scale(
+                    &lp.scalar,
+                    &kernels::elemwise::residual_add(&out, &y),
+                );
             }
         }
 
-        let fin = &m.final_norm;
-        let x = kernels::norm::rmsnorm(&y, &fin.weight, fin.eps);
-        let logits = kernels::gemm::lm_head(&x, &m.embed);
+        let x = kernels::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
+        let logits = kernels::linear::lm_head(&x, &m.embed);
         if let Some(cap) = m.softcap {
-            kernels::attention::logit_softcap(&logits, cap)
+            kernels::attn::logit_softcap(&logits, cap)
         } else {
             logits
         }
     }
 }
 
-fn qkv_unfused<W1: Dtype>(
+fn qkv_unfused(
     x: &Value,
     pos: &Value,
-    at: &Attn<W1>,
-    qkv: &Tensor<W1>,
-    k_norm: &Norm<W1>,
-    pages: &Pages,
+    inputs: &Input<Facts>,
+    at: &Attn,
+    qkv: &Weight,
+    k_norm: &Weight,
+    k_norm_eps: f32,
+    pages: ValueId,
 ) -> Value {
+    let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
+    let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
     let d = at.kind.head_dim();
     let (q, k, v) = kernels::layout::split_qkv(
-        &kernels::gemm::matmul(x, qkv),
+        &kernels::linear::matmul(x, qkv),
         at.q_heads * d,
         at.kind.kv_heads() * d,
     );
     seam::at(seam::ATTN_QV, (&q, &v));
-    let v = kernels::norm::rmsnorm_no_scale(&v, d, at.q_norm.eps);
-    let q = kernels::norm::rmsnorm_per_head(&q, &at.q_norm.weight, d, at.q_norm.eps);
-    let k = kernels::norm::rmsnorm_per_head(&k, &k_norm.weight, d, k_norm.eps);
+    let v = kernels::elemwise::rmsnorm_no_scale(&v, d, at.q_norm_eps);
+    let q = kernels::elemwise::rmsnorm_per_head(&q, &at.q_norm, d, at.q_norm_eps);
+    let k = kernels::elemwise::rmsnorm_per_head(&k, k_norm, d, k_norm_eps);
     let (q, k) = match &at.kind {
         AttnKind::Full {
             rotary_dim, theta, ..
-        } => kernels::rope::partial(&q, &k, pos, *rotary_dim, d, *theta),
-        // NeoX pairing: gemma rotates `d` against `d + d/2`.
-        AttnKind::Sliding { theta, .. } => kernels::rope::full(&q, &k, pos, d, *theta, false),
+        } => kernels::elemwise::rope_partial(&q, &k, pos, *rotary_dim, d, *theta),
+
+        AttnKind::Sliding { theta, .. } => {
+            kernels::elemwise::rope_full(&q, &k, pos, d, *theta, false)
+        }
     };
-    kernels::attention::kv_append(&k, &v, pages);
+    kernels::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     q
 }
 
-fn q_only<W1: Dtype>(x: &Value, pos: &Value, at: &Attn<W1>, q_proj: &Tensor<W1>) -> Value {
+fn q_only(x: &Value, pos: &Value, at: &Attn, q_proj: &Weight) -> Value {
     let d = at.kind.head_dim();
-    let q = kernels::norm::rmsnorm_per_head(
-        &kernels::gemm::matmul(x, q_proj),
-        &at.q_norm.weight,
+    let q = kernels::elemwise::rmsnorm_per_head(
+        &kernels::linear::matmul(x, q_proj),
+        &at.q_norm,
         d,
-        at.q_norm.eps,
+        at.q_norm_eps,
     );
     match &at.kind {
         AttnKind::Full {
             rotary_dim, theta, ..
-        } => kernels::rope::partial_q(&q, pos, *rotary_dim, d, *theta),
-        AttnKind::Sliding { theta, .. } => kernels::rope::partial_q(&q, pos, d, d, *theta),
+        } => kernels::elemwise::rope_partial_q(&q, pos, *rotary_dim, d, *theta),
+        AttnKind::Sliding { theta, .. } => kernels::elemwise::rope_partial_q(&q, pos, d, d, *theta),
     }
 }

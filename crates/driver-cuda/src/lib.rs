@@ -1,106 +1,65 @@
-//! The CUDA execution shell, in Rust.
+//! The menlo CUDA driver's dispatch layer: the [`Run`] that resolves plan
+//! ids to device handles, and its `impl Dispatch*` set — every op family
+//! answered by destructure → resolve → call into `kernels-cuda`
+//! (design §8, decisions #13–#16).
 //!
-//! Subsystems landed here one at a time, each keeping its C++ original in
-//! `driver-cuda/csrc` as the differential oracle until the Rust side was
-//! proven byte-identical. THAT TREE IS GONE, and the tense matters: eleven of
-//! the thirteen `tests/oracle/*/run.sh` cannot run at all, because the
-//! sources they copy were deleted with it. `tests/oracle_census.rs` is the
-//! standing measurement of which, and its whole point is that a dead oracle
-//! reads as live infrastructure unless something says otherwise. The goldens
-//! those scripts once produced are still ASSERTED — they are read, not
-//! re-derived — and two oracles (`dtoa`, `gemm_service`) can still be run,
-//! neither of them here.
+//! **Lineage.** This crate took `driver-cuda`'s name when the string-plan
+//! shell it re-imagines was deleted with the rest of the old stack (design,
+//! porting order step 6); serving plumbing (bind, pools, serve) rejoins it
+//! as the fabric is rewired.
 //!
-//! It builds without CUDA: `cudarc` is pinned with `fallback-dynamic-loading`,
-//! so nothing is linked and every symbol resolves through `dlopen` on first
-//! call — the host logic compiles and tests on a machine with no CUDA.
+//! **Prepare/capture.** Graph capture policy — whether to capture at all,
+//! rows-bucketing vs graph-update, when a bucket is re-captured — stays the
+//! shell's; this crate only makes the split *executable*. The prepare-phase
+//! arms run the pure plan builders and `stage` their pageable-host uploads
+//! eagerly (#16), so nothing they do can leak into a capture; the
+//! capture-phase arms enqueue only (#15), so the same walk runs identically
+//! inside `cudaStreamBeginCapture`. Two words cross the boundary:
+//! [`FireBindings::capture`] carries the shell's policy *in* (the builders
+//! carve graph-shaped, padded schedules under it), and
+//! `PrefillPlan::graph_capturable` carries the builders' answer *out* (a
+//! schedule that would not fit fell back to an uncapturable one — the shell
+//! reads it before capturing).
+//!
+//! **The seam** — the driver side of the `MENLO-SEAM` markers in
+//! `kernels_cuda`. A `Run` binds more than the ops name, and on this
+//! plane the deepest seam is a *duality*: the IR declares kv geometry as
+//! device inputs (design §7), but the plan builders are host functions that
+//! walk that geometry's **contents** — and a device handle cannot be read
+//! host-side. So every geometry the planners consume (`kv_indptr`,
+//! `kv_len`, the qo side) is bound twice: the device tensor
+//! [`Run::tensor`] serves to launches, and the host copy the same driver
+//! kept when it wrote that tensor ([`FireBindings::indptr_host`] fire-wide,
+//! [`CachePlanning`] per cache space). The ledger of extras with no IR seat
+//! is short now — the IR seats the write descriptors, `row_valid`,
+//! `request_of_token`, and the mask bits as declared inputs — leaving:
+//!
+//! - the fire's shared **indptr**: `qo_indptr` is no longer a runtime input
+//!   (design §5) — ragged views assemble from [`FireBindings::indptr`], and
+//!   its host twin is what `plan_prefill`/`plan_mla` walk;
+//! - the **mask span table** for `attention.masked`'s op-named bits: the
+//!   plan-prefill arm binds [`FireTables::mask_indptr`] onto the plan at
+//!   build;
+//! - the dsv4 **compressor slabs** ([`PoolSlabs`]) `attention.pool_gather`
+//!   reads beside its cache;
+//! - the split-plane **mxfp4 banks**: one weight id, two device planes —
+//!   [`WeightRow::Planes`] seats what the metal shell's one-handle rows
+//!   refused, resolved through [`Run::planes`].
+//!
+//! Inside `kernels_cuda` a residue of derive-addressed writers remains
+//! (quantized kv schemes, the mla latent writer, the dsv4 store): those
+//! entries accept the op's `write_page`/`write_offset` and mark where the
+//! device text still re-derives the cells.
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
-#![deny(missing_docs)]
-#![deny(
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::dbg_macro,
-    clippy::mem_forget
-)]
-#![deny(clippy::print_stdout, clippy::print_stderr)]
+mod dispatch;
+pub mod run;
 
-// No `compile_error!` for a featureless build: nothing links `cudarc`, so no
-// segfault is reachable, and a consumer that forgets a feature is caught by an
-// unresolved `driver_cuda::serve::*` path.
-#[cfg(all(feature = "cuda-12", feature = "cuda-13"))]
-compile_error!(
-    "driver-cuda needs exactly ONE of `cuda-12` / `cuda-13`, not both. \
-     Cargo unifies features across a build graph, so this usually means two \
-     dependents each picked a different one."
-);
+pub use run::{
+    CacheGeometry, CachePlanning, CachePool, CacheTable, FireBindings, FireTables, PoolSlabs, Run,
+    SlotTable, StructSlot, WeightRow, WeightTable,
+};
 
-/// The exact `cudarc` build this shell speaks CUDA through, re-exported
-/// because the API hands out raw `CUdeviceptr`s and nothing is linked.
-#[cfg(feature = "_cuda")]
-pub use cudarc;
-
-/// Ungated, unlike its two CUDA variants: `Error` is the layout layer's
-/// return type, so gating `cudarc` here would gate all of it.
-mod error;
-
-pub mod dtype;
-pub mod tensor;
-
-/// How big, where, how many — none of it needs a card. [`pools`]'s
-/// `kv_cache` allocates the pages this shapes.
-pub mod layout;
-
-// Everything that names a CUDA symbol is gated on `_cuda` here and nowhere
-// else, so a module that forgets its own `#[cfg]` sits unreachable rather than
-// breaking a featureless build.
-
-/// The only place vendor words are correct: stream, event, heap, allocator,
-/// graph. Above it the crate uses one word per concept, shared with Metal.
-#[cfg(feature = "_cuda")]
-pub mod device;
-
-/// What [`layout`] planned, allocated: KV, recurrent, swap.
-#[cfg(feature = "_cuda")]
-pub mod pools;
-
-/// The fire's prepared state: the fa2 plan caches, the per-fire descriptors
-/// every view is cut from, and the view arena itself.
-#[cfg(feature = "_cuda")]
-pub mod bind;
-
-/// One forward pass: its scratch, the planes it stages, and its retirement.
-#[cfg(feature = "_cuda")]
-pub mod fire;
-
-// THE FIRE PATH: a `model_compiler::program::Program` per lane, built at
-// load, fired by `fire::launch`. Not "beside" anything and behind no knob —
-// R2 deleted the legacy lowering, dispatch and walk, and a checkpoint whose
-// Program will not build is REFUSED at `load_model` rather than served by a
-// second path.
-//
-// `pub(crate)` and not `pub`, unlike its neighbours: nothing outside this
-// crate reaches it, and the surface it WOULD publish (`Baked`, `bound`, the
-// staging table) is the surface `#[claims]` generates or is going to.
-// Publishing it now would be publishing a shape that is about to change.
-//
-// Gated on `_cuda` and not on `abi`, though only the `abi` shell has a
-// `Shell` to hang it off: the load, the resolve and the binding name CUDA
-// symbols and nothing else, so a `--features cuda-13` build compiles and
-// unit-tests them without the ABI door.
-#[cfg(feature = "_cuda")]
-pub(crate) mod baker;
-
-/// User programs: compile, cache, channel, run.
-#[cfg(feature = "_cuda")]
-pub mod program;
-
-/// The door. create / load / launch / transfer / close.
-#[cfg(all(feature = "_cuda", feature = "abi"))]
-pub mod serve;
-
-/// Every boot knob, parsed once.
-pub mod boot;
-
-pub use dtype::DType;
-pub use error::{Error, Result};
+/// The walk is `kernels::exec`'s, written once and generic over any
+/// `Dispatch`; re-exported so a shell driving this `Run` needs one crate in
+/// scope.
+pub use kernels::{Phases, fire, phases, walk};

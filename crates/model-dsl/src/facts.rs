@@ -1,48 +1,12 @@
-//! Fire-time facts: model-owned bits, classified per request.
+//! The fact-bit predicate algebra a model splits on. Unchanged in spirit from
+//! the old `facts.rs`: [`facts!`](crate::facts!) on a list of field names hands
+//! the model one `Predicate` constructor and one word bit per field, and
+//! `Value::split` lowers predicates to `Cond` trees on the nodes they guard.
 
 use std::ops::{BitAnd, Not};
 
-/// The per-request view `Classify` reads; the engine constructs one per
-/// admitted request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Request {
-    query_len: u32,
-    custom_mask: bool,
-}
-
-impl Request {
-    #[must_use]
-    pub fn new(query_len: u32, custom_mask: bool) -> Request {
-        Request {
-            query_len,
-            custom_mask,
-        }
-    }
-
-    #[must_use]
-    pub fn query_len(&self) -> u32 {
-        self.query_len
-    }
-
-    #[must_use]
-    pub fn has_custom_mask(&self) -> bool {
-        self.custom_mask
-    }
-}
-
-/// The declared facts: bit-ordered names and the word packing, field
-/// order; `#[derive(Facts)]` writes both.
-pub trait FactWord {
-    const NAMES: &'static [&'static str];
-    fn word(&self) -> u64;
-}
-
-pub trait Classify: FactWord {
-    fn of(r: &Request) -> Self;
-}
-
-/// A condition over the fact word, recorded as data and swept at finish;
-/// the derive's constructors are the atoms.
+/// A formula over fact bits, stated at trace time. `Rest` is the n-way
+/// split's catch-all arm and legal nowhere else.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     Fact { bit: u8, name: &'static str },
@@ -77,4 +41,61 @@ impl Not for Predicate {
     fn not(self) -> Predicate {
         Predicate::Not(Box::new(self))
     }
+}
+
+/// Declares a model's fact vocabulary. Every field is a bool, and its bit in
+/// the fact word is its position in the list:
+///
+/// ```
+/// model_dsl::facts! {
+///     pub struct Facts { qo_one, masked }
+/// }
+/// ```
+///
+/// generates the struct itself, the [`FactWord`](crate::FactWord) impl —
+/// `NAMES` in field order, `word` packing each bool into its bit — and one
+/// predicate constructor per field: `Facts::qo_one()` is the
+/// [`Predicate`](crate::Predicate) testing bit 0. A fact word is one `u64`,
+/// so a struct of more than 64 fields is a compile-time error.
+#[macro_export]
+macro_rules! facts {
+    ($vis:vis struct $name:ident { $($field:ident),+ $(,)? }) => {
+        $vis struct $name {
+            $(pub $field: bool,)+
+        }
+
+        impl $name {
+            $crate::facts!(@predicates [] $($field)+);
+        }
+
+        impl $crate::FactWord for $name {
+            const NAMES: &'static [&'static str] = &[$(stringify!($field)),+];
+
+            fn word(&self) -> u64 {
+                let mut word = 0u64;
+                for (bit, &fact) in [$(self.$field),+].iter().enumerate() {
+                    word |= (fact as u64) << bit;
+                }
+                word
+            }
+        }
+
+        const _: () = assert!(
+            <$name as $crate::FactWord>::NAMES.len() <= 64,
+            "a fact word is one u64: at most 64 fields",
+        );
+    };
+
+    // One predicate constructor, its bit the count of the fields before it.
+    (@predicates [$($seen:ident)*] $field:ident $($rest:ident)*) => {
+        #[must_use]
+        pub fn $field() -> $crate::Predicate {
+            const BIT: u8 = <[&str]>::len(&[$(stringify!($seen)),*]) as u8;
+            $crate::Predicate::fact(BIT, stringify!($field))
+        }
+
+        $crate::facts!(@predicates [$($seen)* $field] $($rest)*);
+    };
+
+    (@predicates [$($seen:ident)*]) => {};
 }

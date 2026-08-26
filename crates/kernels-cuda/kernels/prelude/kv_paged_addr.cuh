@@ -1,25 +1,9 @@
 #pragma once
 
-// Where a current-step token's K/V row lands in the paged cache.
-//
-// Used by the RoPE write-through path in rope.cu, which lands K in the cache
-// directly instead of handing it to a second kernel that reads it straight
-// back. `write_kv_kernel` in kv_paged.cu still carries its own copy of this
-// arithmetic -- it is the reference, and deliberately left untouched, since a
-// paged-addressing bug does not fail loudly: it writes correct-looking keys
-// to the wrong slot and the model quietly degrades. What keeps the two
-// honest is smallop_bench, which runs the fused path and the real
-// rope-then-write_kv pair over the same paging inputs and requires the cache
-// contents to come out bit-identical.
-
-// The fixed-width integer names, out of the prelude: NVRTC has no
-// `<cstdint>`, and this header addresses pages in `u32`.
 #include "prelude/device.cuh"
 
 namespace pie {
 
-// Linear scan to find the request index — `R` is small (≤ batch_size, which
-// is bounded by max_forward_requests, ≤ a few hundred).
 __device__ __forceinline__ int kv_find_request(
     const u32* __restrict__ qo_indptr, int R, int token_idx) {
     for (int r = 0; r < R; ++r) {
@@ -29,11 +13,10 @@ __device__ __forceinline__ int kv_find_request(
 }
 
 struct KvSlot {
-    int page;             // physical page index
-    int offset_in_page;   // row within that page
+    int page;
+    int offset_in_page;
 };
 
-// Resolve token `t` of the current step to its physical (page, offset).
 __device__ __forceinline__ KvSlot kv_slot_for_token(
     const u32* __restrict__ qo_indptr,
     const u32* __restrict__ kv_page_indices,
@@ -61,7 +44,6 @@ __device__ __forceinline__ KvSlot kv_slot_for_token(
     return s;
 }
 
-// Element `i` of the (h_kv * head_dim) row, in the cache's own layout.
 template <bool HND_LAYOUT>
 __device__ __forceinline__ long long kv_dst_index(
     const KvSlot& s, int i, int page_size, int h_kv, int d) {
@@ -76,4 +58,4 @@ __device__ __forceinline__ long long kv_dst_index(
     }
 }
 
-}  // namespace pie
+}

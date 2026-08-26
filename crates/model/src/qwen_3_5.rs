@@ -1,42 +1,33 @@
-use model_dsl::axes::{Bf16, NativeKv};
-use model_dsl::load::SfBf16;
+//! Qwen 3.5 — the first model on the menlo stack: a hybrid decoder
+//! interleaving gated-delta-net layers with full attention, dense or routed
+//! mlps by SKU. The declaration lives in [`model`], the forward pass in
+//! [`forward`]; `import.rs` (checkpoint mapping) is deferred to the loader port.
 
 pub mod forward;
-pub mod import;
 pub mod model;
 
-use import::import_hf;
 use model::Model;
-
-pub type ShippedW1 = Bf16;
-pub type ShippedKv = NativeKv;
+use model_dsl::Dtype;
 
 pub const CATALOG: &[(&str, model_dsl::TraceFn)] = model_dsl::catalog![
     (
         "qwen35-a3b-bf16-kv-bf16",
         model_dsl::trace_hybrid,
-        Model::<ShippedW1, ShippedKv>::a3b(),
+        Model::a3b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
         "qwen35-d3b-bf16-kv-bf16",
         model_dsl::trace_hybrid,
-        Model::<ShippedW1, ShippedKv>::d3b(),
+        Model::d3b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
         "qwen35-d0.8b-bf16-kv-bf16",
         model_dsl::trace_hybrid,
-        Model::<ShippedW1, ShippedKv>::d0_8b(),
+        Model::d0_8b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
         "qwen35-a3b-bf16-kv-bf16-tp2",
         model_dsl::trace_hybrid,
-        Model::<ShippedW1, ShippedKv, 2>::a3b(),
+        Model::a3b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 2)
     ),
 ];
-
-model_dsl::allow_import! {
-    import_hf::<SfBf16, ShippedW1, ShippedKv> => ("qwen35-a3b-bf16-kv-bf16", Model::<ShippedW1, ShippedKv>::a3b()),
-    import_hf::<SfBf16, ShippedW1, ShippedKv> => ("qwen35-d3b-bf16-kv-bf16", Model::<ShippedW1, ShippedKv>::d3b()),
-    import_hf::<SfBf16, ShippedW1, ShippedKv> => ("qwen35-d0.8b-bf16-kv-bf16", Model::<ShippedW1, ShippedKv>::d0_8b()),
-    import_hf::<SfBf16, ShippedW1, ShippedKv> => ("qwen35-a3b-bf16-kv-bf16-tp2", Model::<ShippedW1, ShippedKv, 2>::a3b()),
-}

@@ -1,31 +1,23 @@
-use model_dsl::axes::{Bf16, NativeKv};
-use model_dsl::load::SfBf16;
+//! GLM 5 on the menlo stack: multi-head latent attention with a sparse
+//! top-k indexer on every layer, dense early layers giving way to a routed
+//! mlp. The declaration lives in [`model`], the forward pass in [`forward`];
+//! `import.rs` (checkpoint mapping) is deferred to the loader port.
 
 pub mod forward;
-pub mod import;
 pub mod model;
 
-use import::import_hf;
 use model::Model;
-
-pub type ShippedW1 = Bf16;
-pub type ShippedW2 = Bf16;
-pub type ShippedKv = NativeKv;
+use model_dsl::Dtype;
 
 pub const CATALOG: &[(&str, model_dsl::TraceFn)] = model_dsl::catalog![
     (
         "glm5-a12b-bf16-bf16-kv-bf16",
-        model_dsl::trace,
-        Model::<ShippedW1, ShippedW2, ShippedKv>::a12b(),
+        model_dsl::trace_hybrid,
+        Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
         "glm5-a12b-bf16-bf16-kv-bf16-tp2",
-        model_dsl::trace,
-        Model::<ShippedW1, ShippedW2, ShippedKv, 2>::a12b(),
+        model_dsl::trace_hybrid,
+        Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 2)
     ),
 ];
-
-model_dsl::allow_import! {
-    import_hf::<SfBf16, ShippedW1, ShippedW2, ShippedKv> => ("glm5-a12b-bf16-bf16-kv-bf16", Model::<ShippedW1, ShippedW2, ShippedKv>::a12b()),
-    import_hf::<SfBf16, ShippedW1, ShippedW2, ShippedKv> => ("glm5-a12b-bf16-bf16-kv-bf16-tp2", Model::<ShippedW1, ShippedW2, ShippedKv, 2>::a12b()),
-}

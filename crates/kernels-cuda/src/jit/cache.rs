@@ -1,13 +1,16 @@
+//! The module cache: each `(root, instantiation, arch)` compiles at most
+//! once per process, lands on disk keyed by everything that can change the
+//! cubin, and resolves to a loaded `CUfunction` for every fire after the
+//! first.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use cudarc::driver::sys as dr;
 use cudarc::runtime::sys as rt;
 
-use cudarc::driver::sys as dr;
-
-use crate::jit::Root;
-use crate::jit::{Error, nvrtc};
+use crate::jit::{Fault, Root, nvrtc};
 
 pub struct Resolved {
     #[allow(dead_code)]
@@ -19,7 +22,7 @@ unsafe impl Send for Resolved {}
 
 unsafe impl Sync for Resolved {}
 
-type Slot = OnceLock<Result<Resolved, Error>>;
+type Slot = OnceLock<Result<Resolved, Fault>>;
 
 fn slot(key: &str) -> &'static Slot {
     static SLOTS: OnceLock<Mutex<HashMap<String, &'static Slot>>> = OnceLock::new();
@@ -36,28 +39,21 @@ fn slot(key: &str) -> &'static Slot {
     fresh
 }
 
-pub fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Error> {
+pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
     bind_context()?;
-    let arch = arch().ok_or(Error::NoDevice)?;
+    let arch = arch().ok_or(Fault::Device {
+        call: "cuDeviceGet",
+        code: -1,
+    })?;
     let key = root.key(instantiation, arch);
 
-    let started = crate::jit::warm::warming().then(std::time::Instant::now);
-    let out = slot(&key)
+    slot(&key)
         .get_or_init(|| load(root, instantiation, &key, arch))
         .as_ref()
-        .map_err(Clone::clone);
-    if let Some(started) = started {
-        crate::jit::warm::note(
-            root.name,
-            instantiation,
-            out.as_ref().err().map(ToString::to_string),
-            started.elapsed(),
-        );
-    }
-    out
+        .map_err(Clone::clone)
 }
 
-fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Error> {
+fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Fault> {
     let started = std::time::Instant::now();
     let (cubin, mangled, compiled) = match read_disk(key) {
         Some(hit) => (hit.0, hit.1, false),
@@ -71,10 +67,6 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
                 floor: root.floor,
                 wanted: std::slice::from_ref(&instantiation.to_owned()),
                 device_link: root.needs_device_runtime(),
-            })
-            .map_err(|why| Error::Compile {
-                unit: root.name,
-                why: why.to_string(),
             })?;
             if !built.log.trim().is_empty() {
                 tracing::warn!(
@@ -89,9 +81,9 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
                 .lowered
                 .into_iter()
                 .next()
-                .ok_or_else(|| Error::Compile {
+                .ok_or_else(|| Fault::Compile {
                     unit: root.name,
-                    why: format!("`{instantiation}` compiled and NVRTC named nothing for it"),
+                    log: format!("`{instantiation}` compiled and NVRTC named nothing for it"),
                 })?;
             write_disk(key, &built.cubin, &mangled);
             (built.cubin, mangled, true)
@@ -113,11 +105,11 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
     Ok(Resolved { module, function })
 }
 
-fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Error> {
+fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Fault> {
     if image.is_empty() {
-        return Err(Error::Compile {
+        return Err(Fault::Compile {
             unit: root,
-            why: "the compile produced an empty image, so there is nothing to load".into(),
+            log: "the compile produced an empty image, so there is nothing to load".into(),
         });
     }
     let mut module: dr::CUmodule = std::ptr::null_mut();
@@ -126,10 +118,9 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Error> {
     if code == dr::CUresult::CUDA_SUCCESS {
         Ok(module)
     } else {
-        Err(Error::Driver {
-            what: "cuModuleLoadData",
+        Err(Fault::Device {
+            call: "cuModuleLoadData",
             code: code as i32,
-            why: format!("{code:?}"),
         })
     }
 }
@@ -139,11 +130,11 @@ fn entry_by_name(
     module: dr::CUmodule,
     instantiation: &str,
     mangled: &str,
-) -> Result<dr::CUfunction, Error> {
+) -> Result<dr::CUfunction, Fault> {
     let Ok(c_name) = std::ffi::CString::new(mangled) else {
-        return Err(Error::Compile {
+        return Err(Fault::Compile {
             unit: root,
-            why: format!("the lowered name for `{instantiation}` contains a NUL"),
+            log: format!("the lowered name for `{instantiation}` contains a NUL"),
         });
     };
     let mut function: dr::CUfunction = std::ptr::null_mut();
@@ -151,14 +142,13 @@ fn entry_by_name(
     let code = unsafe { dr::cuModuleGetFunction(&raw mut function, module, c_name.as_ptr()) };
     match code {
         dr::CUresult::CUDA_SUCCESS => Ok(function),
-        dr::CUresult::CUDA_ERROR_NOT_FOUND => Err(Error::Compile {
+        dr::CUresult::CUDA_ERROR_NOT_FOUND => Err(Fault::Compile {
             unit: root,
-            why: format!("`{instantiation}` compiled and is not in the image"),
+            log: format!("`{instantiation}` compiled and is not in the image"),
         }),
-        other => Err(Error::Driver {
-            what: "cuModuleGetFunction",
+        other => Err(Fault::Device {
+            call: "cuModuleGetFunction",
             code: other as i32,
-            why: format!("{other:?}"),
         }),
     }
 }
@@ -223,7 +213,8 @@ fn put_str(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(&text.as_bytes()[..len as usize]);
 }
 
-pub fn bind_context() -> Result<(), Error> {
+/// Ensure this thread holds the primary context before any driver-API call.
+pub(crate) fn bind_context() -> Result<(), Fault> {
     use std::cell::Cell;
 
     thread_local! {
@@ -236,12 +227,16 @@ pub fn bind_context() -> Result<(), Error> {
 
     let code = unsafe { rt::cudaFree(std::ptr::null_mut()) };
     if code != rt::cudaError::cudaSuccess {
-        return Err(Error::NoDevice);
+        return Err(Fault::Device {
+            call: "cudaFree",
+            code: code as i32,
+        });
     }
     BOUND.with(|bound| bound.set(true));
     Ok(())
 }
 
+/// The current device's `sm_XY`, probed once.
 #[must_use]
 pub fn arch() -> Option<&'static str> {
     use dr::CUdevice_attribute as Attr;

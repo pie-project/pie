@@ -1,18 +1,21 @@
+//! The launch call itself: geometry into `CUlaunchConfig`, the cooperative
+//! attribute when a kernel grid-synchronises, and the one-time raising of
+//! the dynamic shared-memory cap past the 48KB default.
+
 use core::ffi::c_void;
 
 use cudarc::driver::sys as dr;
 
-use crate::jit::Error;
-use crate::jit::Launch;
+use crate::jit::{Fault, Launch};
 
 const DEFAULT_DYNAMIC_SMEM: u32 = 48 * 1024;
 
-pub unsafe fn issue(
+pub(crate) unsafe fn issue(
     function: dr::CUfunction,
     launch: Launch,
     slots: &mut [*mut c_void],
     stream: *mut c_void,
-) -> Result<(), Error> {
+) -> Result<(), Fault> {
     if launch.smem > DEFAULT_DYNAMIC_SMEM {
         raise_dynamic_smem_cap(function, launch.smem)?;
     }
@@ -53,23 +56,21 @@ pub unsafe fn issue(
     if code == dr::CUresult::CUDA_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Driver {
-            what: "cuLaunchKernelEx",
+        Err(Fault::Device {
+            call: "cuLaunchKernelEx",
             code: code as i32,
-            why: format!("{code:?}"),
         })
     }
 }
 
-fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Error> {
+fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Fault> {
     let mut device: dr::CUdevice = 0;
 
     let code = unsafe { dr::cuCtxGetDevice(&raw mut device) };
     if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Error::Driver {
-            what: "cuCtxGetDevice",
+        return Err(Fault::Device {
+            call: "cuCtxGetDevice",
             code: code as i32,
-            why: format!("{code:?}"),
         });
     }
     let key = (device, function.addr());
@@ -90,10 +91,9 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Er
         )
     };
     if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Error::Driver {
-            what: "cuFuncSetAttribute",
+        return Err(Fault::Device {
+            call: "cuFuncSetAttribute",
             code: code as i32,
-            why: format!("{code:?}"),
         });
     }
     match granted.iter_mut().find(|(k, _)| *k == key) {

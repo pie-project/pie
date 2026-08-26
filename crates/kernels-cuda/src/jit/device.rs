@@ -1,9 +1,16 @@
+//! The device probe and the process-global scratch slabs. Every probe runs
+//! once and is cached; the slabs grow and never shrink, because an entry may
+//! not allocate per fire (graph capture forbids it). A slab that would have
+//! to grow under a capturing stream is refused, not grown — the contract
+//! lives on [`Ctx::scratch`](crate::jit::Ctx::scratch).
+
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cudarc::runtime::sys as rt;
-use kernels::plane::Refusal;
+
+use crate::jit::Fault;
 
 struct Slab {
     ptr: *mut c_void,
@@ -17,7 +24,26 @@ fn slabs() -> &'static Mutex<HashMap<&'static str, Slab>> {
     SLABS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn take(name: &'static str, bytes: usize) -> Result<*mut c_void, Refusal> {
+/// Whether `stream` is mid-capture; `None` when the runtime will not say
+/// (the pending error is cleared). The one `cudaStreamIsCapturing` query
+/// the plane makes — the dense autotuner's guards and [`take`]'s growth
+/// refusal both read it.
+pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptureStatus> {
+    let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+    if unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) }
+        != rt::cudaError::cudaSuccess
+    {
+        let _ = unsafe { rt::cudaGetLastError() };
+        return None;
+    }
+    Some(status)
+}
+
+pub(crate) fn take(
+    stream: *mut c_void,
+    name: &'static str,
+    bytes: usize,
+) -> Result<*mut c_void, Fault> {
     if bytes == 0 {
         return Ok(core::ptr::null_mut());
     }
@@ -31,6 +57,17 @@ pub fn take(name: &'static str, bytes: usize) -> Result<*mut c_void, Refusal> {
     if slab.bytes >= bytes {
         return Ok(slab.ptr);
     }
+    // Growth is `cudaFree` + `cudaMalloc`; under capture that poisons the
+    // graph, so an un-warmed slab is a refusal, not a corruption.
+    if capture_status(stream)
+        .is_some_and(|s| s != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
+    {
+        return Err(Fault::Unwarmed {
+            name,
+            have: slab.bytes,
+            need: bytes,
+        });
+    }
     if !slab.ptr.is_null() {
         let _ = unsafe { rt::cudaFree(slab.ptr) };
         slab.ptr = core::ptr::null_mut();
@@ -40,8 +77,9 @@ pub fn take(name: &'static str, bytes: usize) -> Result<*mut c_void, Refusal> {
 
     let code = unsafe { rt::cudaMalloc(&raw mut fresh, bytes) };
     if code != rt::cudaError::cudaSuccess || fresh.is_null() {
-        return Err(Refusal::Device {
-            why: "the device scratch could not be allocated",
+        return Err(Fault::Device {
+            call: "cudaMalloc",
+            code: code as i32,
         });
     }
     slab.ptr = fresh;
@@ -49,31 +87,14 @@ pub fn take(name: &'static str, bytes: usize) -> Result<*mut c_void, Refusal> {
     Ok(fresh)
 }
 
-pub fn multiprocessors() -> Result<u32, Refusal> {
+#[must_use]
+pub(crate) fn multiprocessors() -> Option<u32> {
     static COUNT: OnceLock<Option<u32>> = OnceLock::new();
-    (*COUNT.get_or_init(|| {
-        let mut ordinal: i32 = 0;
-
-        if unsafe { rt::cudaGetDevice(&raw mut ordinal) } != rt::cudaError::cudaSuccess {
-            return None;
-        }
-        let mut count: i32 = 0;
-
-        let code = unsafe {
-            rt::cudaDeviceGetAttribute(
-                &raw mut count,
-                rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount,
-                ordinal,
-            )
-        };
-        (code == rt::cudaError::cudaSuccess && count > 0).then(|| count.unsigned_abs())
-    }))
-    .ok_or(Refusal::Device {
-        why: "the device would not say how many multiprocessors it has",
-    })
+    *COUNT.get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount))
 }
 
-pub fn compute_capability_major() -> Option<u32> {
+#[must_use]
+pub(crate) fn compute_capability_major() -> Option<u32> {
     static MAJOR: OnceLock<Option<u32>> = OnceLock::new();
     *MAJOR.get_or_init(|| {
         use cudarc::driver::sys as dr;
@@ -102,21 +123,22 @@ pub fn compute_capability_major() -> Option<u32> {
     })
 }
 
-pub fn max_shared_memory_per_sm() -> Result<u32, Refusal> {
+/// Unfired until the attn wave: its plan builders size shared-memory tiles
+/// from these two probes.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn max_shared_memory_per_sm() -> Option<u32> {
     static BYTES: OnceLock<Option<u32>> = OnceLock::new();
-    (*BYTES
-        .get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor)))
-    .ok_or(Refusal::Device {
-        why: "the device would not say its shared memory per SM",
-    })
+    *BYTES
+        .get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor))
 }
 
-pub fn max_shared_memory_per_block_optin() -> Result<u32, Refusal> {
+/// Unfired until the attn wave, as above.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
     static BYTES: OnceLock<Option<u32>> = OnceLock::new();
-    (*BYTES.get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin)))
-        .ok_or(Refusal::Device {
-            why: "the device would not say its opt-in shared memory cap",
-        })
+    *BYTES.get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin))
 }
 
 pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
@@ -138,27 +160,4 @@ fn attribute(which: rt::cudaDeviceAttr) -> Option<u32> {
 
     let code = unsafe { rt::cudaDeviceGetAttribute(&raw mut value, which, ordinal) };
     (code == rt::cudaError::cudaSuccess && value > 0).then(|| value.unsigned_abs())
-}
-
-pub unsafe fn upload(dst: *mut c_void, src: &[u8], stream: *mut c_void) -> Result<(), Refusal> {
-    if src.is_empty() {
-        return Ok(());
-    }
-
-    let code = unsafe {
-        rt::cudaMemcpyAsync(
-            dst,
-            src.as_ptr().cast(),
-            src.len(),
-            rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-            stream.cast(),
-        )
-    };
-    if code == rt::cudaError::cudaSuccess {
-        Ok(())
-    } else {
-        Err(Refusal::Device {
-            why: "the host-to-device copy failed",
-        })
-    }
 }
