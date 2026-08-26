@@ -1,0 +1,15 @@
+[package]
+name = "new-model-ir-macros"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+description = "The Operands derive: def-use edges read off an op variant's ValueId fields (`#[out]`, `#[out(alias = x)]`)."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "3.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"

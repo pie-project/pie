@@ -1,0 +1,23 @@
+[package]
+name = "new-model-ir"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The typed IR of a traced forward pass: op enums per family, the Operands def-use trait, ValueDecl (Def x Ty), Cond, the Plan container, and the post-trace validator. A leaf crate — pure data plus serde, no backend edges."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "new_model_ir"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+# The Operands derive. A proc-macro crate can export nothing but macros, so it
+# could not have been a module here; `lib.rs` re-exports the derive so
+# downstream writes `#[derive(Operands)]` against this crate alone.
+#
+# Contrast with old `model-ir`, whose manifest named every `kernels-*` plane to
+# reach their claim tables: coverage is a missing match arm now, so the only
+# edge left is the macro that reads our own field declarations.
+new-model-ir-macros = { path = "../new-model-ir-macros" }

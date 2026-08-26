@@ -1,0 +1,21 @@
+[package]
+name = "new-model-dsl"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The forward-pass authoring eDSL over the typed IR: the Recorder/Value trace machinery, per-family wrappers that compute shapes in plain Rust, weight declarations without dtype generics, and split/merge/Facts guard tracking. What a model's forward pass is WRITTEN IN; it names no backend and reaches no device."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "new_model_dsl"
+path = "src/lib.rs"
+
+[dependencies]
+# The Facts derive: one Predicate constructor and one word bit per field.
+new-model-dsl-macros = { path = "../new-model-dsl-macros" }
+# The plan this surface records onto. The ONLY substantive dependency, and
+# that is the point of the split: an authoring surface reaches the IR and
+# nothing else -- not the lowering, and not a device.
+new-model-ir = { path = "../new-model-ir" }
+serde = { version = "1.0", features = ["derive"] }

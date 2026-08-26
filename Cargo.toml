@@ -308,6 +308,22 @@ members = [
     "crates/inferlet",
     "crates/inferlet-macros",
 
+    # -- menlo: the typed-IR rewrite (.wiki/menlo/design.md) ------------------
+    # Fresh-rewrite successors of the model/kernel stack. They coexist with the
+    # crates they replace until the qwen end-to-end milestone, then the old
+    # stack is deleted in one commit and these drop the `new-` prefix.
+    "crates/new-model-ir",
+    "crates/new-model-ir-macros",
+    "crates/new-model-dsl-macros",
+    "crates/new-driver",
+    "crates/new-driver-metal",
+    "crates/new-driver-cuda",
+    "crates/new-kernels",
+    "crates/new-kernels-cuda",
+    "crates/new-kernels-metal",
+    "crates/new-model-dsl",
+    "crates/new-model",
+
     # -- Rust that lives outside crates/ on purpose -------------------------
     # The python SDK's backend: pyo3/maturin want the Rust half beside its
     # product, not in the workspace tree.
@@ -355,6 +371,17 @@ default-members = [
     "crates/tensor-dsl",
     "crates/tensor-compiler",
     "crates/inferlet-macros",
+    "crates/new-model-ir",
+    "crates/new-model-ir-macros",
+    "crates/new-model-dsl-macros",
+    "crates/new-driver",
+    "crates/new-driver-metal",
+    "crates/new-driver-cuda",
+    "crates/new-kernels",
+    "crates/new-kernels-cuda",
+    "crates/new-kernels-metal",
+    "crates/new-model-dsl",
+    "crates/new-model",
     "sdk/server/python",
     "tests/gpu",
 ]

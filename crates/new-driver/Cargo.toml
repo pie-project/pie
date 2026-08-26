@@ -1,0 +1,18 @@
+[package]
+name = "new-driver"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The backend-agnostic execution walk, written once: the prepare/capture phase split read off the IR, and program-order dispatch over any D: Dispatch. No policy — rows-bucketing, graph capture, and memoization belong to the concrete drivers."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "new_driver"
+path = "src/lib.rs"
+
+[dependencies]
+# The plan being walked: `Plan`, `Node`, `Cond`, `ValueDecl`, `Operands`.
+new-model-ir = { path = "../new-model-ir" }
+# The contract being driven: `Dispatch::exec` and the `KernelError` it answers.
+new-kernels = { path = "../new-kernels" }

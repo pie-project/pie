@@ -1,0 +1,26 @@
+[package]
+name = "new-driver-metal"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The menlo Metal driver's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling new-kernels-metal entries through dyn Encode. Merges into driver-metal when the old stack is deleted."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "new_driver_metal"
+path = "src/lib.rs"
+
+[dependencies]
+# The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
+# `ValueId` — and the 15 family enums the dispatch arms destructure.
+new-model-ir = { path = "../new-model-ir" }
+# The contract implemented: the 15 `Dispatch*` traits and `KernelError`.
+new-kernels = { path = "../new-kernels" }
+# The entries called and the handles resolved to: `Tensor`, `RaggedTensor`,
+# `KvPool`, `RecurrentPool`, the plan payloads, and the `dyn Encode` sink
+# that keeps this crate OS-portable.
+new-kernels-metal = { path = "../new-kernels-metal" }
+# The shared walk, re-exported: the prepare/capture split and program-order
+# dispatch, written once and driven over this crate's `Run`.
+new-driver = { path = "../new-driver" }
