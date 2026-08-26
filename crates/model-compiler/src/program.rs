@@ -427,6 +427,11 @@ fn bind(plan: &Plan, at: usize, lane: &crate::sweep::Lane) -> Result<Program, Re
         });
     }
 
+    // IN PLACE, WHERE THE DECLARATION ALREADY SAYS SO. Done before the spans,
+    // because `touch` reads through `root` -- so an alias installed here makes
+    // the operand's span cover the result's life without any surgery, which is
+    // the same mechanism a lane merge has always used.
+    alias_in_place(plan, &steps, &mut slots);
     let spans = spans_over(plan, &steps, &slots);
     let row_pitch = carve(&mut slots, &spans);
 
@@ -594,6 +599,122 @@ fn touch(slots: &[Slot], spans: &mut [Option<Span>], v: ValueId, at: u32) {
                 first: at,
                 last: at,
             })
+        }
+    }
+}
+
+/// Give every `InOut` statement's result the rectangle its operand already is.
+///
+/// `kernels_macros` states the rule while REFUSING a `#[shape]` on such a
+/// point: *"an `InOut` result is the rectangle its operand already is"*. The
+/// declaration has said so since it was written; nothing implemented it, so
+/// every in-place statement minted a second rectangle and the driver copied
+/// the operand into it before the kernel could write through it.
+///
+/// **What that cost, measured.** On gpt-oss-20b's decode through
+/// `driver-metal`, 240 of 819 dispatches were those copies; on gemma-4-e4b,
+/// 363 of 1541. A dispatch on that plane costs about 23 us whatever it does --
+/// three models from 0.8B to 20B land within 8% of that number -- so the
+/// copies were 5.6 ms of a 19 ms step.
+///
+/// # The operand has to DIE here
+///
+/// In place means the operand's bytes are gone. The DSL spells an in-place
+/// point as `y = f(.., &y)`, so the old value is unreachable and this is free
+/// -- but nothing in the plan FORCES that, and `kimi_k3`'s residual ledger
+/// keeps earlier values alive on purpose (`blocks.push(y.clone())`). So the
+/// condition is read off the plan rather than assumed: the operand's value id
+/// must be named by no later step, and by no `OUT` seam.
+///
+/// LAST NAMED, PER VALUE ID, NOT PER ROOT. A chain of in-place statements over
+/// one residual is the ordinary case -- `y1 = add(o, y0)`, `y2 = add(f, y1)` --
+/// and rooting first would ask whether `y0` dies at the SECOND statement, which
+/// it does not. Asking about `y1` there is the question that chains.
+fn alias_in_place(plan: &Plan, steps: &[Step], slots: &mut [Slot]) {
+    use model_ir::kernels::points::Mark;
+
+    // The last step that names each value id, and `u32::MAX` for one the `OUT`
+    // seam holds open past every step.
+    let mut last: Vec<u32> = vec![0; slots.len()];
+    for (at, step) in steps.iter().enumerate() {
+        let at = u32::try_from(at).expect("a step index inside the lane");
+        let op = &plan.ops[step.op as usize];
+        for v in op.inputs.iter().chain(op.outputs.iter()) {
+            if let Some(slot) = last.get_mut(*v as usize) {
+                *slot = (*slot).max(at);
+            }
+        }
+    }
+    for seam in plan
+        .seams
+        .iter()
+        .filter(|s| s.seam == model_ir::seam::OUT.name)
+    {
+        for &v in &seam.values {
+            if let Some(slot) = last.get_mut(v as usize) {
+                *slot = u32::MAX;
+            }
+        }
+    }
+
+    for (at, step) in steps.iter().enumerate() {
+        let at = u32::try_from(at).expect("a step index inside the lane");
+        let op = &plan.ops[step.op as usize];
+        let Some(point) = model_ir::kernels::point_of(op.kernel.as_str()) else {
+            continue;
+        };
+        // WHICH OPERAND COLUMN EACH `InOut` IS. `kernels_macros` numbers `In`
+        // and `InOut` off ONE counter -- that shared counter IS the operand
+        // list's index -- and `Point::slots` carries the marks in declaration
+        // order, so counting them back is exact rather than a convention.
+        let mut column = 0usize;
+        let mut places: Vec<usize> = Vec::new();
+        for slot in point.slots {
+            match slot.mark {
+                Mark::In => column += 1,
+                Mark::InOut => {
+                    places.push(column);
+                    column += 1;
+                }
+                _ => {}
+            }
+        }
+        if places.is_empty() {
+            continue;
+        }
+        // RESULTS ARE ALL `Out` OR ALL `InOut`, never mixed -- the macro
+        // refuses the mixture by name -- so the i-th result is the i-th
+        // `InOut`, in declaration order, and the zip is the whole mapping.
+        for (result, &place) in op.outputs.iter().zip(&places) {
+            let Some(&operand) = op.inputs.get(place) else {
+                continue;
+            };
+            let (src, dst) = (root(slots, operand) as usize, *result as usize);
+            if src == dst
+                || !matches!(slots[src], Slot::Arena { .. })
+                || !matches!(slots[dst], Slot::Arena { .. })
+                // A result WIDER than its operand cannot live in the operand's
+                // bytes. `Fire::inout` refuses the other direction outright;
+                // this declines it, and the copy stays.
+                || slots[src].bytes() != slots[dst].bytes()
+                || last.get(operand as usize).copied().unwrap_or(u32::MAX) != at
+            {
+                continue;
+            }
+            slots[dst] = Slot::Alias(root(slots, operand));
+        }
+    }
+
+    // ONE HOP, WHICH IS THE PROPERTY THE MERGE CODE ALREADY KEEPS -- "a merge
+    // of merges aliases the rectangle, not the alias". A merge built earlier
+    // in the value loop points at an ARM, and this pass can turn that arm into
+    // an alias afterwards, which would leave a two-hop chain behind it. `root`
+    // chases either way; flattening is what keeps the invariant one sentence,
+    // and `gemma_widths::a_merge_aliases_its_surviving_arm` is what says so.
+    for id in 0..slots.len() {
+        if let Slot::Alias(to) = slots[id] {
+            let through = root(slots, to);
+            slots[id] = Slot::Alias(through);
         }
     }
 }

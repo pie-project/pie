@@ -585,20 +585,63 @@ fn a_stated_scalar_reaches_the_claim_body() {
     );
 }
 
-/// AN `InOut` POINT SCHEDULES THE COPY THAT MAKES IT HONEST.
+/// AN `InOut` POINT RIDES ITS OPERAND, AND COPIES ONLY WHEN IT CANNOT.
 ///
-/// The walk mints a FRESH rectangle for every result, so a kernel that writes
-/// through an in-place handle would leave the result's column holding
-/// whatever the arena held. Two of the fixture's statements are `InOut`
-/// (`norm.residual_add`'s hidden slot and `attention.logit_softcap`'s x), so
-/// two blits are scheduled — and their `from`/`to` are disjoint, which is the
-/// property the arena's inclusive spans guarantee and the copy depends on.
+/// This asserted TWO blits, on the reading its own doc gave: *"the walk mints
+/// a FRESH rectangle for every result, so a kernel that writes through an
+/// in-place handle would leave the result's column holding whatever the arena
+/// held"*. That was true of the layout and never of the declaration --
+/// `kernels_macros` refuses a `#[shape]` on an `InOut` point with the words
+/// *"an `InOut` result is the rectangle its operand already is"* -- and
+/// `model_compiler::program::alias_in_place` closed the gap. Both of the
+/// fixture's in-place statements now ride their operand and copy nothing.
+///
+/// BOTH HALVES ARE CHECKED, because asserting only the zero would leave the
+/// copy path with no reader at all -- the failure this tree keeps finding in
+/// its own tests. The second fixture keeps `norm.residual_add`'s in-place
+/// operand alive past the statement that would ride it, which is exactly what
+/// `alias_in_place` declines, and the copy comes back.
 #[test]
-fn an_in_place_point_schedules_a_disjoint_copy() {
+fn an_in_place_point_rides_its_operand_and_copies_when_it_cannot() {
     let plan = plan();
-    let program = fireable(&plan);
-    let (_, blits) = walk(&plan, &program);
-    assert_eq!(blits, 2, "two `InOut` statements, two staged copies");
+    let (_, blits) = walk(&plan, &fireable(&plan));
+    assert_eq!(
+        blits, 0,
+        "both `InOut` statements ride the rectangle their operand already is",
+    );
+
+    let held = plan_holding_its_in_place_operand();
+    let (_, blits) = walk(&held, &fireable(&held));
+    assert_eq!(
+        blits, 1,
+        "the residual is read after the statement that would ride it, so that \
+         one is staged; `attention.logit_softcap` still rides its own",
+    );
+}
+
+/// [`plan`] with a SECOND READER of the value `norm.residual_add` writes
+/// through.
+///
+/// In place means the operand's bytes are gone, so a later reader of them is
+/// the one case aliasing must decline. The DSL cannot spell this -- an
+/// in-place builder returns a value that replaces its operand -- but a plan
+/// can hold it, and `kimi_k3`'s residual ledger holds something like it on
+/// purpose, so the refusal is worth a fixture rather than an argument.
+fn plan_holding_its_in_place_operand() -> Plan {
+    let mut plan = plan();
+    plan.values.push(ValueDef::Stmt(5));
+    plan.ops.push(Op {
+        kernel: "norm.rmsnorm_no_scale".to_string(),
+        inputs: vec![2],
+        outputs: vec![6],
+        weights: Vec::new(),
+        params: vec![HEAD_DIM, f32::to_bits(1e-6).into()],
+        cache: None,
+        layer: Some(0),
+        cond: Cond::Always,
+    });
+    plan.seams[0].values.push(6);
+    plan
 }
 
 /// A SYMBOL CALL REFUSES WITH THE STATEMENT NAMED.

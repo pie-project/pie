@@ -967,10 +967,26 @@ fn gate(row: &Banked, class: FireClass) {
     };
     let rendered = format!("{logit:.4}");
     println!("ARGMAX {id} at {rendered} over {dispatches} dispatches, {staged} staged");
-    assert!(
-        staged > 0,
-        "this tower states `InOut` points and the walk found none, which would \
-         make the staged-copy path untested rather than passing",
+    // **ZERO, AND THAT IS THE CLAIM NOW.** This asserted `staged > 0` — "this
+    // tower states `InOut` points and the walk found none, which would make
+    // the staged-copy path untested rather than passing" — and it was right
+    // until `model_compiler::program::alias_in_place` landed. An `InOut`
+    // result now IS the rectangle its operand already is, which is what the
+    // declaration always said, so there is nothing to copy: 240 dispatches
+    // went out of gpt-oss's decode and 363 out of gemma-4's.
+    //
+    // The copy path did not go away with them. It stands for the cases
+    // aliasing declines — an operand still live at its own statement, or a
+    // result wider than the operand it rides — and no catalogue row reaches
+    // one. So this asserts the ZERO: the day a tower needs a copy again, the
+    // number moves and this says so, which is the same service the old
+    // direction gave.
+    assert_eq!(
+        staged, 0,
+        "an `InOut` result is the rectangle its operand already is, so a fire \
+         that staged {staged} copies found an operand `alias_in_place` \
+         declined — which is a real case and worth reading, not a failure of \
+         this tower",
     );
     assert_eq!(
         id, row.id,

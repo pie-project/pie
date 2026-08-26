@@ -387,7 +387,18 @@ impl<'a, P: Plane> Fire<'a, P> {
                 max: to.bytes().cast_signed(),
             });
         }
-        if bytes > 0 {
+        // **A RECTANGLE IS NOT COPIED ONTO ITSELF.** When the compiler gives an
+        // in-place statement's result the slot its operand already holds --
+        // which is what `InOut` means, and what `kernels_macros` says in as
+        // many words ("an `InOut` result is the rectangle its operand already
+        // is") -- the two slices are the same region and the copy is a no-op
+        // that still costs a dispatch and the barrier in front of it.
+        //
+        // MEASURED, on gpt-oss-20b's decode: 240 of 819 dispatches were these,
+        // at ~23 us apiece, which is 5.6 ms of a 19 ms step. The guard is what
+        // lets `model_compiler::program::alias_in_place` turn that into
+        // nothing rather than into a cheaper copy.
+        if bytes > 0 && from.slice != to.slice {
             self.blits.borrow_mut().push(Blit {
                 from: from.slice,
                 to: to.slice,

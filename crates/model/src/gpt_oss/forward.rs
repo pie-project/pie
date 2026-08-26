@@ -42,9 +42,22 @@ impl<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize> Forward for Model<W1, W2
             let pages = inputs.kv(&at.kv);
 
             let x = kernels::norm::rmsnorm(&y, &w.attn_norm.weight, w.attn_norm.eps);
-            let q = kernels::norm::add_bias(&at.q_bias, &kernels::gemm::matmul(&x, &at.q_proj));
-            let k = kernels::norm::add_bias(&at.k_bias, &kernels::gemm::matmul(&x, &at.k_proj));
-            let v = kernels::norm::add_bias(&at.v_bias, &kernels::gemm::matmul(&x, &at.v_proj));
+            // ONE MATVEC AND ONE CUT, where this was three of each.
+            //
+            // The three projections read the SAME row and write three
+            // rectangles, so they were three dispatches that could not overlap
+            // — and on `driver-metal` the two small ones ran at 24% of the
+            // machine's streaming roof against 68% for `q` and 90% for the
+            // lm_head, because 2.95 MB is not enough work to fill a GPU. The
+            // packed bank makes them one 29.5 MB matvec, and
+            // `layout.split_qkv` cuts the result back along the axis
+            // `Source::Pack` joined it on. `gemma_4` has always read its
+            // attention this way.
+            let (q, k, v) = kernels::layout::split_qkv(
+                &kernels::norm::add_bias(&at.qkv_bias, &kernels::gemm::matmul(&x, &at.qkv_proj)),
+                at.q_heads * d,
+                at.kv_heads * d,
+            );
             seam::at(seam::ATTN_QV, (&q, &v));
 
             // NeoX pairing, and the YaRN block unpacked: a builder mirrors its

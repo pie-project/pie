@@ -145,38 +145,62 @@ fn every_rectangle_fits_the_pitch() {
     }
 }
 
-/// A STATEMENT NEVER READS ITS OWN RESULT'S BYTES -- the `InOut` decision,
-/// stated where it can be checked.
+/// A STATEMENT OVERLAPS ITS OWN OPERAND ONLY WHERE THE POINT DECLARED IT --
+/// the `InOut` decision, stated where it can be checked.
 ///
-/// The walk gives an `InOut` point's operand and result distinct slabs, and
-/// both executors lean on that: they stage the operand INTO the result's
-/// rectangle with a device-to-device copy before the launch
-/// (`driver-cuda/src/baker/fire.rs`'s `inout`), which is only a copy if the
-/// two do not overlap. Sharing them instead would be a claim about the
-/// kernel's indexing -- may it read a lane of its input after writing that
-/// lane of its output -- that no plan states.
+/// This asserted the stronger thing: that an operand and a result NEVER share
+/// bytes. Its reasoning was that the executors "stage the operand INTO the
+/// result's rectangle with a device-to-device copy before the launch, which is
+/// only a copy if the two do not overlap", and that sharing "would be a claim
+/// about the kernel's indexing -- may it read a lane of its input after
+/// writing that lane of its output -- **that no plan states**".
 ///
-/// Checked for every statement and not just the declared-`InOut` ones,
-/// because it is the same rule: a launch reads its operands while it writes
-/// its results.
+/// The last clause is what changed. `Mark::InOut` is that claim, and
+/// `kernels_macros` has spelled it out the whole time, in the error it raises
+/// against a `#[shape]` on such a point: *"an `InOut` result is the rectangle
+/// its operand already is"*. Nothing implemented it, so the sentence was true
+/// of the LAYOUT while being false of the declaration.
+/// `model_compiler::program::alias_in_place` implements it now.
+///
+/// So the rule keeps its teeth where they bite. A statement that overlaps an
+/// operand it did NOT declare `InOut` is still the defect this test was
+/// written for -- a launch reads its operands while it writes its results --
+/// and the declared pairing is the one exception, checked to be exactly the
+/// pairing rather than merely permitted.
 #[test]
 fn no_statement_writes_the_bytes_it_is_reading() {
     for (sku, plan, lanes) in catalogue() {
         for (at, lane) in lanes.iter().enumerate() {
             for step in &lane.steps {
                 let op = &plan.ops[step.op as usize];
-                for out in &op.outputs {
+                let declared = in_place_pairs(&plan, op);
+                for (result, out) in op.outputs.iter().enumerate() {
                     let Some((o_at, o_bytes)) = span_of(lane, *out) else {
                         continue;
                     };
-                    for input in &op.inputs {
+                    for (operand, input) in op.inputs.iter().enumerate() {
                         let Some((i_at, i_bytes)) = span_of(lane, *input) else {
                             continue;
                         };
+                        if o_at >= i_at + i_bytes || i_at >= o_at + o_bytes {
+                            continue;
+                        }
                         assert!(
-                            o_at >= i_at + i_bytes || i_at >= o_at + o_bytes,
+                            declared.contains(&(result, operand)),
                             "`{sku}` lane {at}: `{}` reads value {input} out of the bytes it \
-                             writes value {out} into",
+                             writes value {out} into, and declares no `InOut` pairing that \
+                             says it may",
+                            op.kernel
+                        );
+                        // AND IT IS THE WHOLE RECTANGLE, not a straddle. A
+                        // result that shares SOME of its operand's bytes is
+                        // neither in place nor disjoint, and no kernel is
+                        // written against that.
+                        assert_eq!(
+                            (o_at, o_bytes),
+                            (i_at, i_bytes),
+                            "`{sku}` lane {at}: `{}` rides value {input} in place and lands on \
+                             part of it",
                             op.kernel
                         );
                     }
@@ -184,6 +208,34 @@ fn no_statement_writes_the_bytes_it_is_reading() {
             }
         }
     }
+}
+
+/// `(result, operand)` for every `InOut` slot the point declares.
+///
+/// `kernels_macros` numbers `In` and `InOut` off ONE counter, and that counter
+/// IS the operand list's index; results are all `Out` or all `InOut`, never
+/// mixed, so the i-th result is the i-th `InOut`. Both facts are the ones
+/// `alias_in_place` reads, restated here on purpose -- a checker that derived
+/// them the same way twice would agree with itself.
+fn in_place_pairs(plan: &model_ir::plan::Plan, op: &model_ir::plan::Op) -> Vec<(usize, usize)> {
+    use model_ir::kernels::points::Mark;
+    let _ = plan;
+    let Some(point) = model_ir::kernels::point_of(op.kernel.as_str()) else {
+        return Vec::new();
+    };
+    let mut column = 0usize;
+    let mut places = Vec::new();
+    for slot in point.slots {
+        match slot.mark {
+            Mark::In => column += 1,
+            Mark::InOut => {
+                places.push(column);
+                column += 1;
+            }
+            _ => {}
+        }
+    }
+    places.into_iter().enumerate().collect()
 }
 
 /// Where a value's bytes are, chasing a merge to the arm that survived. A

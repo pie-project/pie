@@ -1,5 +1,5 @@
 use model_dsl::axes::{Dtype, KvDtype};
-use model_dsl::load::{Import, SfBase, copy, deinterleave};
+use model_dsl::load::{Import, SfBase, copy, deinterleave, pack};
 
 use super::model::Model;
 
@@ -37,29 +37,26 @@ pub fn import_hf<B: SfBase, W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(
             format!("layer.{l}.mlp_norm"),
             copy(format!("layer.{l}.post_attention_layernorm")),
         );
+        // PACKED, and the three checkpoint names are unchanged. `Source::Pack`
+        // concatenates along the output axis, which is the axis
+        // `layout.split_qkv` cuts back — so the fusion is a LOAD-TIME
+        // rearrangement and the forward reads one bank where it read three.
+        // `gemma_4` writes its `qkv` from the same three names.
         i.write(
-            format!("layer.{l}.q_proj"),
-            copy(format!("layer.{l}.self_attn.q_proj")),
+            format!("layer.{l}.qkv_proj"),
+            pack([
+                format!("layer.{l}.self_attn.q_proj"),
+                format!("layer.{l}.self_attn.k_proj"),
+                format!("layer.{l}.self_attn.v_proj"),
+            ]),
         );
         i.write(
-            format!("layer.{l}.q_bias"),
-            copy(format!("layer.{l}.self_attn.q_proj.bias")),
-        );
-        i.write(
-            format!("layer.{l}.k_proj"),
-            copy(format!("layer.{l}.self_attn.k_proj")),
-        );
-        i.write(
-            format!("layer.{l}.k_bias"),
-            copy(format!("layer.{l}.self_attn.k_proj.bias")),
-        );
-        i.write(
-            format!("layer.{l}.v_proj"),
-            copy(format!("layer.{l}.self_attn.v_proj")),
-        );
-        i.write(
-            format!("layer.{l}.v_bias"),
-            copy(format!("layer.{l}.self_attn.v_proj.bias")),
+            format!("layer.{l}.qkv_bias"),
+            pack([
+                format!("layer.{l}.self_attn.q_proj.bias"),
+                format!("layer.{l}.self_attn.k_proj.bias"),
+                format!("layer.{l}.self_attn.v_proj.bias"),
+            ]),
         );
         i.write(
             format!("layer.{l}.o_proj"),

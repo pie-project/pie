@@ -37,12 +37,23 @@ pub struct Attn<W1: Dtype> {
     pub head_dim: u32,
     pub sm_scale: f32,
     pub rope: Yarn,
-    pub q_proj: Tensor<W1>,
-    pub q_bias: Tensor<W1>,
-    pub k_proj: Tensor<W1>,
-    pub k_bias: Tensor<W1>,
-    pub v_proj: Tensor<W1>,
-    pub v_bias: Tensor<W1>,
+    /// `[q_width + 2 * kv_width, hidden]`, the three projections packed.
+    ///
+    /// ONE BANK AND ONE MATMUL, where this stated three of each. The
+    /// checkpoint ships `q_proj`, `k_proj` and `v_proj` separately and
+    /// `Source::Pack` concatenates them at import, which is what `gemma_4`
+    /// has always done with the same three names.
+    ///
+    /// **WHY, MEASURED.** A decode matvec's cost on `driver-metal` is not its
+    /// bytes: `k_proj` and `v_proj` are 2.95 MB each and ran at **24% of an
+    /// M1 Max's streaming roof**, where the same kernel over the 1.16 GB
+    /// lm_head reaches 90%. They are too small to fill the GPU and the barrier
+    /// in front of the next dispatch stops them borrowing the room. Packed,
+    /// one 29.5 MB matvec does the work of three.
+    pub qkv_proj: Tensor<W1>,
+    /// `[q_width + 2 * kv_width]` — the three biases packed the same way, so
+    /// one `norm.add_bias` follows one matmul.
+    pub qkv_bias: Tensor<W1>,
     pub o_proj: Tensor<W1>,
     pub o_bias: Tensor<W1>,
     pub sinks: Tensor<W1>,
@@ -204,12 +215,8 @@ fn assemble<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>(d: Dims) -> Model
                         attention_factor: d.yarn_attention_factor,
                         original_max_position: d.yarn_original_max_position,
                     },
-                    q_proj: Tensor::sym(n("q_proj"), [q_w, hidden]).columns(),
-                    q_bias: Tensor::sym(n("q_bias"), [q_w]).columns(),
-                    k_proj: Tensor::sym(n("k_proj"), [kv_w, hidden]).columns(),
-                    k_bias: Tensor::sym(n("k_bias"), [kv_w]).columns(),
-                    v_proj: Tensor::sym(n("v_proj"), [kv_w, hidden]).columns(),
-                    v_bias: Tensor::sym(n("v_bias"), [kv_w]).columns(),
+                    qkv_proj: Tensor::sym(n("qkv_proj"), [q_w + 2 * kv_w, hidden]).columns(),
+                    qkv_bias: Tensor::sym(n("qkv_bias"), [q_w + 2 * kv_w]).columns(),
                     o_proj: Tensor::sym(n("o_proj"), [hidden, q_w]).rows(),
                     o_bias: Tensor::sym(n("o_bias"), [hidden]),
                     sinks: Tensor::sym(n("attn_sinks"), [d.q_heads as u64]).columns(),

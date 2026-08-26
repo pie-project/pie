@@ -449,6 +449,48 @@ pub fn encode(
         let (a, b) = v.split_once("..")?;
         Some(a.parse::<usize>().ok()?..b.parse::<usize>().ok()?)
     });
+    // **`PIE_METAL_DROP=<substring>` PRICES A FUSION BEFORE ANYONE BUILDS ONE.**
+    // Every dispatch whose symbol contains the substring is not encoded at all,
+    // which computes the wrong answer exactly as `PIE_METAL_BARRIER_NONE` does
+    // and for the same reason: an idea about removing dispatches deserves a
+    // number a reader can reproduce.
+    //
+    // It is an UPPER BOUND and says so. Fusing `norm.add_bias` into the `gemm`
+    // in front of it removes the dispatch and keeps the arithmetic; this
+    // removes both, so what it measures is the most such a fusion could
+    // return. A bound is what decides whether to build the thing -- and this
+    // tree has now twice been wrong by an order of magnitude estimating the
+    // same kind of saving from a share of a tally.
+    // COMMA-SEPARATED, because the families interact. Dropping `add_bias` and
+    // dropping `residual_add` each remove a barrier the other might have been
+    // hiding behind, so the two savings are not additive and summing them is
+    // the same mistake this knob exists to stop.
+    let drop: Vec<String> = std::env::var("PIE_METAL_DROP")
+        .ok()
+        .into_iter()
+        .flat_map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // **BY INDEX, WHEN A SYMBOL CANNOT TELL THEM APART.** `q`, `k` and `v`
+    // compile to one `dense_gemv_t_bfloat16`, so pricing "what if k and v were
+    // not two dispatches of their own" needs the positions rather than the
+    // name. The caller works them out from `PIE_METAL_DUMP_SLOTS` and the
+    // plan; this only reads a list.
+    let drop_at: std::collections::BTreeSet<usize> = std::env::var("PIE_METAL_DROP_AT")
+        .ok()
+        .into_iter()
+        .flat_map(|v| {
+            v.split(',')
+                .filter_map(|p| p.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut dropped = 0usize;
     let dispatches = &dispatches[..dispatches.len().min(limit)];
     for (index, dispatch) in dispatches.iter().enumerate() {
         // Skipped INSIDE the loop, not by slicing: `index` is the row this
@@ -456,6 +498,18 @@ pub fn encode(
         // a window that renumbered from zero would bind the wrong operands
         // and prove nothing.
         if index < skip {
+            continue;
+        }
+        if drop
+            .iter()
+            .any(|pat| dispatch.symbol.contains(pat.as_str()))
+            || drop_at.contains(&index)
+        {
+            // NOT noted into `hazards` either: a dispatch that did not run
+            // wrote nothing, so the edges behind it are gone too -- which is
+            // the half of a fusion that removes a barrier rather than a
+            // launch, and belongs in the same bound.
+            dropped += 1;
             continue;
         }
         // `PIE_METAL_BARRIER_ALL=1` barriers after every dispatch, which is
@@ -498,6 +552,16 @@ pub fn encode(
         encode_one(encoder, table, pipelines, params, index, dispatch)?;
         hazards.note(dispatch);
     }
+    #[allow(
+        clippy::print_stderr,
+        reason = "a probe that says what it dropped is the job"
+    )]
+    if !drop.is_empty() || !drop_at.is_empty() {
+        eprintln!(
+            "PIE_DROP {dropped} of {} dispatches matched {drop:?}",
+            dispatches.len()
+        );
+    }
     if !dispatches.is_empty() {
         encoder.barrier(VISIBILITY);
         n += 1;
@@ -533,7 +597,26 @@ impl Hazards {
     /// offsets. **WAR** is a statement overwriting a slot the previous one is
     /// still reading, which the arena's reuse makes just as reachable.
     fn races(&self, dispatch: &Dispatch) -> bool {
-        self.why(dispatch).is_some()
+        match self.why(dispatch) {
+            None => false,
+            // **`PIE_METAL_BARRIER_RAW_ONLY=1` PRICES ARENA RENAMING WITHOUT
+            // BUILDING IT.** `WAW` and `WAR` are false dependencies -- they
+            // exist because the arena reuses offsets, and a wider arena that
+            // handed out a fresh slot would erase them. Dropping their
+            // barriers computes the WRONG answer, exactly as
+            // `PIE_METAL_BARRIER_NONE` does, and for the same reason: the
+            // question "what would that idea be worth" deserves a number a
+            // reader can reproduce rather than a share of a tally multiplied
+            // by a per-barrier guess.
+            //
+            // That multiplication is why this exists. The same arithmetic said
+            // the staged in-place copies were worth 5.6 ms of a 19 ms step;
+            // removing every one of them moved it 0.46 ms, because a few-KB
+            // copy is not what the average dispatch costs. A share of a tally
+            // is not a measurement.
+            Some("WAW" | "WAR") => !raw_only(),
+            Some(_) => true,
+        }
     }
 
     /// WHICH hazard fired, which is a different question from whether one did.
@@ -591,6 +674,11 @@ impl Hazards {
             merge(&mut self.writes, *slice);
         }
     }
+}
+
+/// Whether only RAW edges are ordered. See [`Hazards::races`].
+fn raw_only() -> bool {
+    std::env::var_os("PIE_METAL_BARRIER_RAW_ONLY").is_some()
 }
 
 /// Whether `slice` overlaps any range in `set`, as half-open byte intervals.
