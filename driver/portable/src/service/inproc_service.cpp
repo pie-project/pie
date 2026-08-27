@@ -32,6 +32,20 @@ std::size_t page_bytes_of(KvCachePaged& kv) {
            * ggml_type_size(kv.k(0)->type);
 }
 
+// Returns true if the backend for tensor `t` does not support partial reads
+// via ggml_backend_tensor_get at non-zero offsets. On ggml-Vulkan, such reads
+// silently return zeros or garbage, corrupting KV pages during ctx.fork().
+bool backend_needs_full_tensor_staging(ggml_tensor* t) {
+    ggml_backend_buffer_t buf = t->buffer;
+    if (!buf) return false;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (!buft) return false;
+    const char* name = ggml_backend_buft_name(buft);
+    if (!name) return false;
+    // ggml-Vulkan buffer type names contain "Vulkan" (e.g. "Vulkan0").
+    return std::string(name).find("Vulkan") != std::string::npos;
+}
+
 }  // namespace
 
 InProcService::InProcService(Executor& executor,
@@ -43,7 +57,20 @@ InProcService::InProcService(Executor& executor,
       model_(model),
       swap_pool_(swap_pool),
       adapters_(adapters),
-      verbose_(verbose) {}
+      verbose_(verbose) {
+    // Detect backends that don't support ggml_backend_tensor_get at non-zero
+    // offsets. ggml-Vulkan silently returns zeros for such reads, corrupting
+    // KV pages during ctx.fork() (CopyD2D / CopyD2H). Check layer 0's K
+    // tensor — all layers share the same backend.
+    auto& kv = executor_.kv();
+    needs_full_tensor_staging_ = (kv.n_layers() > 0)
+                                 && backend_needs_full_tensor_staging(kv.k(0));
+    if (needs_full_tensor_staging_) {
+        std::cerr << "[pie-driver-portable] Vulkan backend detected: "
+                     "using full-tensor staging for KV page copies "
+                     "(workaround for ggml-Vulkan partial-read bug, issue #418)\n";
+    }
+}
 
 void InProcService::serve_forever(pie_driver::InProcServer& server) {
     server.serve_forever(
@@ -115,15 +142,36 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                     static_cast<std::size_t>(s) * per_page;
                                 for (std::int32_t il = 0; il < kv.n_layers();
                                      ++il) {
-                                    ggml_backend_tensor_get(
-                                        kv.k(il), swap_pool_->k_slot(il, d),
-                                        off, per_page);
-                                    ggml_backend_tensor_get(
-                                        kv.v(il), swap_pool_->v_slot(il, d),
-                                        off, per_page);
+                                    if (needs_full_tensor_staging_) {
+                                        // ggml-Vulkan silently returns zeros
+                                        // for tensor reads at non-zero offsets.
+                                        // Read the entire tensor and slice out
+                                        // the page we need. (issue #418)
+                                        const std::size_t total_k = ggml_nbytes(kv.k(il));
+                                        const std::size_t total_v = ggml_nbytes(kv.v(il));
+                                        std::vector<std::uint8_t> staging(
+                                            std::max(total_k, total_v));
+                                        ggml_backend_tensor_get(
+                                            kv.k(il), staging.data(), 0, total_k);
+                                        std::memcpy(swap_pool_->k_slot(il, d),
+                                                    staging.data() + off, per_page);
+                                        ggml_backend_tensor_get(
+                                            kv.v(il), staging.data(), 0, total_v);
+                                        std::memcpy(swap_pool_->v_slot(il, d),
+                                                    staging.data() + off, per_page);
+                                    } else {
+                                        ggml_backend_tensor_get(
+                                            kv.k(il), swap_pool_->k_slot(il, d),
+                                            off, per_page);
+                                        ggml_backend_tensor_get(
+                                            kv.v(il), swap_pool_->v_slot(il, d),
+                                            off, per_page);
+                                    }
                                 }
                             } else if (req.method ==
                                        pie_driver::PIE_METHOD_COPY_H2D) {
+                                // tensor_set with non-zero offset works
+                                // correctly on all backends including Vulkan.
                                 if (!swap_pool_) {
                                     out.status = 4;
                                     ok = false;
@@ -148,6 +196,13 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                 }
                             } else if (req.method ==
                                        pie_driver::PIE_METHOD_COPY_D2D) {
+                                // Device-to-device KV page copy, used by
+                                // ctx.fork(). On ggml-Vulkan,
+                                // ggml_backend_tensor_get with a non-zero
+                                // offset silently returns zeros (issue #418).
+                                // When needs_full_tensor_staging_ is set, read
+                                // the entire tensor into a staging buffer first
+                                // and slice out the page we need.
                                 if (s >= static_cast<std::uint32_t>(total_dev) ||
                                     d >= static_cast<std::uint32_t>(total_dev)) {
                                     out.status = 3;
@@ -161,16 +216,36 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                     static_cast<std::size_t>(d) * per_page;
                                 for (std::int32_t il = 0; il < kv.n_layers();
                                      ++il) {
-                                    ggml_backend_tensor_get(
-                                        kv.k(il), tmp.data(), soff, per_page);
-                                    ggml_backend_tensor_set(
-                                        kv.k(il), tmp.data(), doff, per_page);
-                                    ggml_backend_tensor_get(
-                                        kv.v(il), tmp.data(), soff, per_page);
-                                    ggml_backend_tensor_set(
-                                        kv.v(il), tmp.data(), doff, per_page);
+                                    if (needs_full_tensor_staging_) {
+                                        const std::size_t total_k = ggml_nbytes(kv.k(il));
+                                        const std::size_t total_v = ggml_nbytes(kv.v(il));
+                                        std::vector<std::uint8_t> staging(
+                                            std::max(total_k, total_v));
+                                        ggml_backend_tensor_get(
+                                            kv.k(il), staging.data(), 0, total_k);
+                                        std::memcpy(tmp.data(),
+                                                    staging.data() + soff, per_page);
+                                        ggml_backend_tensor_set(
+                                            kv.k(il), tmp.data(), doff, per_page);
+                                        ggml_backend_tensor_get(
+                                            kv.v(il), staging.data(), 0, total_v);
+                                        std::memcpy(tmp.data(),
+                                                    staging.data() + soff, per_page);
+                                        ggml_backend_tensor_set(
+                                            kv.v(il), tmp.data(), doff, per_page);
+                                    } else {
+                                        ggml_backend_tensor_get(
+                                            kv.k(il), tmp.data(), soff, per_page);
+                                        ggml_backend_tensor_set(
+                                            kv.k(il), tmp.data(), doff, per_page);
+                                        ggml_backend_tensor_get(
+                                            kv.v(il), tmp.data(), soff, per_page);
+                                        ggml_backend_tensor_set(
+                                            kv.v(il), tmp.data(), doff, per_page);
+                                    }
                                 }
                             } else {
+                                // CopyH2H
                                 if (!swap_pool_) {
                                     out.status = 4;
                                     ok = false;
@@ -261,10 +336,6 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     out.status = 0;
                     break;
                 case pie_driver::PIE_METHOD_GENERATE_AUDIO: {
-                    // CSM native audio output (pie:core/audio-out). adapter_path
-                    // carries JSON {prompt:[u32...], max_frames, out_path}; run
-                    // the full CSM generation, write raw little-endian f32 PCM to
-                    // out_path, and return status = n_frames (or -1 on error).
                     try {
                         if (!model_.weights().csm.present) {
                             std::cerr << "[pie-driver-portable] generate_audio: "
