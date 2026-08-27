@@ -21,7 +21,7 @@ namespace pie_portable_driver {
 
 // Per-call ggml graph node budget. Sized to comfortably fit MoE + spec
 // decode batches (every layer's MoE op count is ~10-20 nodes).
-inline constexpr std::size_t GRAPH_MAX_NODES = 1ull << 19;
+inline constexpr std::size_t GRAPH_MAX_NODES = 1ull << 14;  // reduced from 1<<19 (524288) to 1<<14 (16384) — the original value requests a ~10GB scheduler buffer regardless of model size, which fails malloc on memory-constrained systems for small models like Qwen3-0.6B.
 
 // ggml's CUDA flash_attn supports head_dim ≤ 256 across all GQA ratios.
 // Gemma 4's full-attention layers use head_dim=512 — those layers fall
