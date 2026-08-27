@@ -6,7 +6,10 @@
 //! disagree off the joined axis, a `Slice` that cuts a quantization group in
 //! half, a `Reshape` that changes the element count. It is *total*: every
 //! [`Expr`] variant has a type, including [`Expr::Shard`], which reads its
-//! extent off the [`Partition`] the resolver was built with.
+//! extent off the [`Partition`] the resolver was built with. At
+//! [`Partition::WHOLE`] that extent is the whole axis and the node types as its
+//! operand, so the same expression has two readings: what this rank holds, and
+//! what the contract says — [`Resolver::infer`] and [`Resolver::infer_whole`].
 //!
 //! Specialization is the rewrite that eliminates [`Expr::Shard`], replacing each
 //! one with the concrete slice this rank reads. Lowering requires it, because
@@ -174,6 +177,28 @@ impl<'a> Resolver<'a> {
         infer(expr, &mut self.scope)
     }
 
+    /// Infer `expr`'s type as the *contract* states it, with every
+    /// [`Expr::Shard`] in it read at [`Partition::WHOLE`].
+    ///
+    /// The rank-independent answer, and the one a declaration is a claim
+    /// about: a contract is written once per model from whole shapes, with the
+    /// cuts marked as nodes, so the shape it declares is the one its
+    /// expression denotes before any partition is chosen. Asking this
+    /// resolver rather than a fresh one is what keeps `Expr::Out` resolvable:
+    /// the names an expression reads are the ones the entries before it
+    /// published, and only this resolver has them.
+    ///
+    /// Those published types are this rank's, because an earlier entry's shard
+    /// has already been resolved into the tensor the plan will hold. So this
+    /// re-reads the shards written *here* and does not re-open the ones a name
+    /// it reads was built with.
+    pub fn infer_whole(&mut self, expr: &Expr, what: &str) -> Result<TensorType, Error> {
+        let partition = std::mem::replace(&mut self.scope.partition, Partition::WHOLE);
+        let ty = self.infer(expr, what);
+        self.scope.partition = partition;
+        ty
+    }
+
     /// Rewrite `expr` for this resolver's rank, replacing every
     /// [`Expr::Shard`] with the slice that rank reads.
     ///
@@ -313,7 +338,21 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
         }
         Expr::Shard { src, axis } => {
             let ty = infer(src, scope)?;
+            // Asked first at every world size, because it is what checks that
+            // the axis exists and that the rank is inside the world — errors a
+            // one-rank partition has as much as any other.
             let (start, len) = shard_range(&ty, *axis, scope.partition, &scope.what)?;
+            if scope.partition.world <= 1 {
+                // The exemption [`denotes_its_operand`] documents, honoured
+                // where the type is stated rather than only where the node is
+                // rewritten away. At one rank a shard *is* its operand, and
+                // `infer_slice` would refuse the whole-axis band it would
+                // otherwise be handed — which would mean an unspecialized
+                // contract could not be typed at [`Partition::WHOLE`] at all,
+                // and typing it there is how a rank-independent declaration is
+                // checked.
+                return Ok(ty);
+            }
             // Routed through `infer_slice` rather than rewriting the extent
             // directly, so that a shard is checked by everything a slice is —
             // in particular the quantization-group alignment that decides
@@ -328,6 +367,10 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
 /// The one place [`Expr::Shard`] is given meaning. Both the checker and
 /// [`specialize`] come through here, so the extent one states and the slice the
 /// other emits are the same arithmetic by construction.
+///
+/// At `world <= 1` the band it returns is the whole axis, and both callers say
+/// so the same way: neither emits a slice denoting the operand. The checker
+/// still asks, because this is also where the axis and the rank are checked.
 fn shard_range(
     ty: &TensorType,
     axis: Axis,
@@ -531,8 +574,14 @@ fn narrowed(ty: &TensorType, index: usize, len: i64) -> TensorType {
 /// alone. At `world == 1` a shard *is* its operand, but refusing it there would
 /// mean a contract could not be written without knowing how many ranks would
 /// compile it — which is the property the node exists to provide.
-/// [`Resolver::specialize`] canonicalizes it away instead, before anything
-/// below the frontend sees it.
+///
+/// Both passes honour the exemption, and they have to: [`Resolver::specialize`]
+/// canonicalizes the node away, and [`infer`] types it as its operand instead of
+/// as the whole-axis band `shard_range` hands back at one rank. Only the
+/// specializer used to, which made the exemption true of the pipeline and false
+/// of the checker — and a rank-independent declaration is checked by typing the
+/// *unspecialized* expression at [`Partition::WHOLE`], which is exactly the case
+/// the checker refused.
 ///
 /// [`Expr::Cast`]: crate::contract::Expr::Cast
 /// [`Expr::Stride`]: crate::contract::Expr::Stride
@@ -1652,6 +1701,36 @@ mod tests {
         // to one compiled from a contract that never mentioned sharding.
         let expr = specialize_one(Expr::src("q_proj").shard(0), 0, 1).unwrap();
         assert_eq!(expr, Expr::src("q_proj"));
+    }
+
+    /// The same exemption, in the checker rather than the rewrite.
+    ///
+    /// `denotes_its_operand` names `Expr::Shard` as its one exception, and the
+    /// exception has to hold where a type is *stated* and not only where the
+    /// node is rewritten away: a declaration is a claim about the whole tensor,
+    /// so it is checked by typing the unspecialized expression at
+    /// `Partition::WHOLE`. Routed straight through `infer_slice`, that typing
+    /// refused every shard it met — the band at one rank covers the whole axis,
+    /// which is the one thing a `Slice` may not do.
+    #[test]
+    fn a_shard_at_one_rank_types_as_its_operand() {
+        let whole = check_one(Expr::src("q_proj").shard(0), &qwen3()).unwrap();
+        assert_eq!(whole, TensorType::raw(vec![2048, 2048], DType::BF16));
+        // Composition too: the concatenated legs are each whole, so the join is
+        // the whole fused tensor and not one rank's share of it.
+        let fused = check_one(
+            Expr::concat(
+                0,
+                vec![Expr::src("k_proj").shard(0), Expr::src("v_proj").shard(0)],
+            ),
+            &qwen3(),
+        )
+        .unwrap();
+        assert_eq!(fused, TensorType::raw(vec![2048, 2048], DType::BF16));
+        // The checks that are not about the band still run: an axis the
+        // operand does not have is an error at one rank as at any other.
+        let axis = check_one(Expr::src("q_proj").shard(4), &qwen3()).unwrap_err();
+        assert!(axis.to_string().contains("axis 4"), "{axis}");
     }
 
     #[test]

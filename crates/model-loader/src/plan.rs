@@ -842,7 +842,7 @@ impl LoadPlan {
 /// projection are the same tensor.
 ///
 /// **This crate does not emit it.** Four contract authors in `crates/model`
-/// do — `llama_3`, `qwen_3_5` and `gemma_4` each `format!` it — and the
+/// do — `llama_3`, `qwen_3` and `gemma_4` each `format!` it — and the
 /// dependency runs `model` → `model-loader`, so nothing links their spelling
 /// to this one. A constant here does not fix that; what it fixes is the
 /// smaller thing, that a **driver** asking whether a plan ties its

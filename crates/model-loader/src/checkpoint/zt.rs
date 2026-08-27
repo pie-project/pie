@@ -438,7 +438,15 @@ fn dtype_of(dtype: ZDType, ltype: Option<&str>) -> Result<DType, Error> {
 /// Layouts the loader has no scheme for are an error, not a guess — reading a
 /// quantized payload as raw bytes of its storage type is exactly the silent
 /// misinterpretation the object model exists to prevent.
-fn encoding_of(tensor: &ztensor::Tensor<'_>, part: &ztensor::Part<'_>) -> Result<Encoding, Error> {
+///
+/// Public because it is the ONE translation from a part's stored `(dtype,
+/// logical, layout)` facts to an [`Encoding`], and a model deciding whether the
+/// bytes it was handed are the ones it wants asks here rather than growing a
+/// second copy of the scheme table beside this one.
+pub fn encoding_of(
+    tensor: &ztensor::Tensor<'_>,
+    part: &ztensor::Part<'_>,
+) -> Result<Encoding, Error> {
     let layout = tensor.layout();
     let attrs = tensor.attributes();
     let dtype = dtype_of(part.dtype(), part.logical())?;

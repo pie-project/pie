@@ -80,9 +80,10 @@ impl Weight {
 
     #[must_use]
     pub fn dim(&self, i: usize) -> u64 {
-        *self.shape.get(i).unwrap_or_else(|| {
-            panic!("`{}` is {:?} and has no axis {i}", self.name, self.shape)
-        })
+        *self
+            .shape
+            .get(i)
+            .unwrap_or_else(|| panic!("`{}` is {:?} and has no axis {i}", self.name, self.shape))
     }
 
     /// The dtype activations see through this weight. Mxfp4 banks store codes
@@ -96,9 +97,17 @@ impl Weight {
             Dtype::F16 => Dtype::F16,
             Dtype::F32 => Dtype::F32,
             Dtype::Mxfp4 => Dtype::Bf16,
-            Dtype::I32 | Dtype::U32 | Dtype::U8 | Dtype::I8
-            | Dtype::Fp8E4m3 | Dtype::Fp4 | Dtype::E8m0 => {
-                panic!("`{}`: not a weight representation an author declares", self.name)
+            Dtype::I32
+            | Dtype::U32
+            | Dtype::U8
+            | Dtype::I8
+            | Dtype::Fp8E4m3
+            | Dtype::Fp4
+            | Dtype::E8m0 => {
+                panic!(
+                    "`{}`: not a weight representation an author declares",
+                    self.name
+                )
             }
         }
     }

@@ -133,7 +133,11 @@ pub fn decode_lse(
 ) -> (Value, Value) {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
-    let lse = r.fresh(tensor(q.rows(), q.width() / u64::from(head_dim), Dtype::F32));
+    let lse = r.fresh(tensor(
+        q.rows(),
+        q.width() / u64::from(head_dim),
+        Dtype::F32,
+    ));
     r.push(
         Attention::DecodeLse {
             q: q.id(),
@@ -161,7 +165,11 @@ pub fn prefill_lse(
 ) -> (Value, Value) {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
-    let lse = r.fresh(tensor(q.rows(), q.width() / u64::from(head_dim), Dtype::F32));
+    let lse = r.fresh(tensor(
+        q.rows(),
+        q.width() / u64::from(head_dim),
+        Dtype::F32,
+    ));
     r.push(
         Attention::PrefillLse {
             q: q.id(),
@@ -518,8 +526,16 @@ pub fn mla_latents_rope(
 pub fn mla_split_q_b(q_b: &Value, heads: u32, nope_dim: u32, rope_dim: u32) -> (Value, Value) {
     let r = q_b.rec();
     let heads64 = u64::from(heads);
-    let q_nope = r.fresh(tensor(q_b.rows(), heads64 * u64::from(nope_dim), q_b.dtype()));
-    let q_pe = r.fresh(tensor(q_b.rows(), heads64 * u64::from(rope_dim), q_b.dtype()));
+    let q_nope = r.fresh(tensor(
+        q_b.rows(),
+        heads64 * u64::from(nope_dim),
+        q_b.dtype(),
+    ));
+    let q_pe = r.fresh(tensor(
+        q_b.rows(),
+        heads64 * u64::from(rope_dim),
+        q_b.dtype(),
+    ));
     r.push(
         Attention::MlaSplitQB {
             q_b: q_b.id(),

@@ -3,6 +3,8 @@ pub mod read;
 pub mod write;
 pub mod zt;
 
+pub use zt::encoding_of;
+
 use crate::types::{CheckpointFormat, Encoding, FileId, TensorId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

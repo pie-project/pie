@@ -1,21 +1,15 @@
-//! The Qwen 3.5 declaration, de-genericized (design §5, decision #18): the
-//! old `Model<W1: Dtype, K: KvDtype, const TP: usize>` phantom tree is gone —
-//! `tp` is a runtime field, each weight carries its `Dtype`, and the SKU
-//! constructors take every element choice as an argument: one dims table
-//! serves every quantization of a SKU, and the catalog row that names the
-//! shipped variant is where the weight, activation and kv-cache elements are
-//! spelled. Names and the per-layer scheme are unchanged from the old crate:
-//! weights intern by name, so the checkpoint mapping carries over untouched.
-
 use model_dsl::{Dtype, Weight};
+use model_loader::contract::ModelContract;
+
+use crate::contract::{Claim, ModelError, claim, elaborate};
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
-    /// Activation element — stated, not inherited silently.
+
     pub act: Dtype,
-    /// Kv-cache element layout — drives the append kernel and row bytes.
+
     pub kv: Dtype,
     pub embed: Weight,
     pub head: Head,
@@ -367,5 +361,69 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         layers,
         final_norm: Weight::sym("final_norm", [hidden], w),
         final_norm_eps: d.norm_eps,
+    }
+}
+
+impl Model {
+    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
+        let mut claims: Vec<Claim> = vec![
+            claim(&self.embed, self.tp),
+            claim(&self.final_norm, self.tp),
+        ];
+
+        match &self.head {
+            Head::Tied => {}
+            Head::Bank(head) => claims.push(claim(head, self.tp)),
+        }
+
+        for layer in &self.layers {
+            claims.push(claim(&layer.mixer_norm, self.tp));
+            claims.push(claim(&layer.mlp_norm, self.tp));
+
+            match &layer.mixer {
+                Mixer::Attn(a) => {
+                    claims.push(claim(&a.qg_proj, self.tp));
+                    claims.push(claim(&a.k_proj, self.tp));
+                    claims.push(claim(&a.v_proj, self.tp));
+                    claims.push(claim(&a.o_proj, self.tp));
+                    claims.push(claim(&a.q_norm, self.tp));
+                    claims.push(claim(&a.k_norm, self.tp));
+                }
+                Mixer::Gdn(g) => {
+                    claims.push(claim(&g.in_qkvz, self.tp));
+                    claims.push(claim(&g.in_ba, self.tp));
+                    claims.push(claim(&g.conv, self.tp));
+                    claims.push(claim(&g.dt_bias, self.tp));
+                    claims.push(claim(&g.a_log, self.tp));
+                    claims.push(claim(&g.norm, self.tp));
+                    claims.push(claim(&g.out_proj, self.tp));
+                }
+            }
+
+            match &layer.mlp {
+                Mlp::Dense { gate_up, down, .. } => {
+                    claims.push(claim(gate_up, self.tp));
+                    claims.push(claim(down, self.tp));
+                }
+                Mlp::Routed {
+                    router,
+                    gate_up,
+                    down,
+                    shared_gate_up,
+                    shared_down,
+                    shared_gate,
+                    ..
+                } => {
+                    claims.push(claim(router, self.tp));
+                    claims.push(claim(gate_up, self.tp));
+                    claims.push(claim(down, self.tp));
+                    claims.push(claim(shared_gate_up, self.tp));
+                    claims.push(claim(shared_down, self.tp));
+                    claims.push(claim(shared_gate, self.tp));
+                }
+            }
+        }
+
+        elaborate(src, claims)
     }
 }

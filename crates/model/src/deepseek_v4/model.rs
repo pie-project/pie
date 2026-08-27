@@ -1,21 +1,13 @@
-//! The DeepSeek V4 declaration, de-genericized (design §5, decision #18): the
-//! old `Model<W1: Dtype, K: KvDtype, const TP: usize>` phantom tree is gone —
-//! `tp` is a runtime field, each weight carries its `Dtype`, and the SKU
-//! constructors take every element choice as an argument: the catalog row
-//! spells the weight, activation and kv-cache elements outright, and the model
-//! carries the latter two as fields. Names and the per-layer scheme are
-//! unchanged from the old crate: weights intern by name, so the checkpoint
-//! mapping carries over untouched.
-
 use model_dsl::{Dtype, Weight};
+use model_loader::contract::ModelContract;
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
-    /// Activation element — stated, not inherited silently.
+
     pub act: Dtype,
-    /// Kv-cache element layout — drives the append kernel and row bytes.
+
     pub kv: Dtype,
     pub hyper: Hyper,
 
@@ -182,7 +174,11 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
             let norm = |s: &str, dim: u64| Weight::sym(n(s), [dim], w);
             let mix = |s: &str| Mix {
                 scale: Weight::sym(n(&format!("{s}_scale")), [3], Dtype::F32),
-                base: Weight::sym(n(&format!("{s}_base")), [2 * mult + mult * mult], Dtype::F32),
+                base: Weight::sym(
+                    n(&format!("{s}_base")),
+                    [2 * mult + mult * mult],
+                    Dtype::F32,
+                ),
             };
             Layer {
                 attn_mix: mix("attn_mix"),
@@ -268,5 +264,54 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         layers,
         final_norm: Weight::sym("final_norm", [hidden], w),
         final_norm_eps: d.norm_eps,
+    }
+}
+
+impl Model {
+    pub fn load(
+        &self,
+        src: &ztensor::Source,
+    ) -> Result<ModelContract, crate::contract::ModelError> {
+        let tp = self.tp;
+        let stated = |w: &Weight| crate::contract::claim(w, tp);
+        let mut claims = vec![stated(&self.embed), stated(&self.final_norm)];
+
+        for layer in &self.layers {
+            claims.push(stated(&layer.attn_mix.scale));
+            claims.push(stated(&layer.attn_mix.base));
+            claims.push(stated(&layer.mlp_mix.scale));
+            claims.push(stated(&layer.mlp_mix.base));
+
+            let at = &layer.attn;
+            claims.push(stated(&at.q_down));
+            claims.push(stated(&at.q_norm));
+            claims.push(stated(&at.q_up));
+            claims.push(stated(&at.kv_down));
+            claims.push(stated(&at.kv_norm));
+            claims.push(stated(&at.o_down));
+            claims.push(stated(&at.o_up));
+            claims.push(stated(&at.sink));
+
+            match &layer.mlp {
+                Mlp::Dense { gate_up, down, .. } => {
+                    claims.push(stated(gate_up));
+                    claims.push(stated(down));
+                }
+                Mlp::Routed {
+                    router,
+                    bias,
+                    gate_up,
+                    down,
+                    ..
+                } => {
+                    claims.push(stated(router));
+                    claims.push(stated(bias));
+                    claims.push(stated(gate_up));
+                    claims.push(stated(down));
+                }
+            }
+        }
+
+        crate::contract::elaborate(src, claims)
     }
 }

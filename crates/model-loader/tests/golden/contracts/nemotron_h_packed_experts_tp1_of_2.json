@@ -62,7 +62,7 @@
       },
       "shape": [
         6,
-        2
+        4
       ],
       "encoding": {
         "Raw": "BF16"

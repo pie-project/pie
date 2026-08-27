@@ -245,14 +245,19 @@ impl Builder<'_> {
 
     /// Build one contract, leaving it to the caller to name any error.
     ///
-    /// The preamble — specialize, infer, check the declared shape, declare —
+    /// The preamble — check the declared shape, specialize, infer, declare —
     /// is shared by every node, kernel or not. It used to be written out once
     /// per arm, and four copies of four steps drift: the `Repack` arm came to
-    /// skip [`check_declared_shape`] entirely, and the kernel arms came to
-    /// report an unnamed error where the affine path reported a named one. A
-    /// node that needs a kernel differs from an affine one in how it is
+    /// skip [`Builder::check_declared_shape`] entirely, and the kernel arms
+    /// came to report an unnamed error where the affine path reported a named
+    /// one. A node that needs a kernel differs from an affine one in how it is
     /// *lowered*, not in how it is checked, so only the lowering is per-arm.
+    ///
+    /// The declaration is checked first because it is a claim about the
+    /// *contract*, which is rank-independent, and the three steps after it are
+    /// about this rank. Nothing downstream reads the type that check produced.
     fn build_tensor(&mut self, contract: &TensorContract, id: TensorId) -> Result<()> {
+        self.check_declared_shape(contract)?;
         // Sharding is resolved before lowering, for every node: below this line
         // the expression means the same thing on every rank, the factors a
         // scale reads line up with the payload, and neither `compile` nor any
@@ -266,7 +271,6 @@ impl Builder<'_> {
         // skips it demotes those rules to comments that fire only for
         // expressions nested deep enough to reach an arm that does check.
         let ty = self.resolver.infer(&expr, &contract.name)?;
-        check_declared_shape(contract, &ty)?;
         let decl = TensorDecl {
             id,
             name: contract.name.clone(),
@@ -399,6 +403,43 @@ impl Builder<'_> {
         );
         let value = self.realize(value, &realized, contract.visibility)?;
         self.values.insert(contract.name.clone(), value);
+        Ok(())
+    }
+
+    /// The declared shape is a claim about the contract, checked against it.
+    ///
+    /// The claim is the WHOLE tensor's. A contract is authored once per model
+    /// from `tp = 1` shapes, with each cut written as an [`Expr::Shard`] and
+    /// the [`Partition`] supplied when a rank compiles it, so the shape it
+    /// states cannot be this rank's band — it is stated before there is a rank.
+    /// Checking it against what the *specialized* expression yields therefore
+    /// compared a rank-independent claim to a per-rank result, and every
+    /// sharded tensor in a contract failed at `tp_size > 1` for saying exactly
+    /// what it means.
+    ///
+    /// So the claim is checked against
+    /// [`Resolver::infer_whole`](crate::contract::infer::Resolver::infer_whole),
+    /// which types the unspecialized expression with every shard read at
+    /// [`Partition::WHOLE`]. Nothing else moves: the plan is still built from
+    /// the specialized expression and still declares this rank's shape, which
+    /// is what a driver binds.
+    ///
+    /// `TensorContract::shape` is optional, so this is a no-op for a contract
+    /// that declares none — and then nothing is typed twice either. The caller
+    /// names every error this returns, once.
+    fn check_declared_shape(&mut self, contract: &TensorContract) -> Result<()> {
+        let Some(declared) = &contract.shape else {
+            return Ok(());
+        };
+        let claimed = self
+            .resolver
+            .infer_whole(&contract.expr, &contract.name)?
+            .shape;
+        if claimed != *declared {
+            return Err(Error::Contract(format!(
+                "declares shape {declared:?} but its expression yields {claimed:?}"
+            )));
+        }
         Ok(())
     }
 
@@ -1460,22 +1501,6 @@ impl ScaleLayout {
     }
 }
 
-/// The declared shape is a claim about the expression, checked against it.
-///
-/// `TensorContract::shape` is optional, so this is a no-op for a contract that
-/// declares none. The caller names every error it returns, once.
-fn check_declared_shape(contract: &TensorContract, ty: &TensorType) -> Result<()> {
-    if let Some(declared) = &contract.shape
-        && ty.shape != *declared
-    {
-        return Err(Error::Contract(format!(
-            "declares shape {declared:?} but its expression yields {:?}",
-            ty.shape
-        )));
-    }
-    Ok(())
-}
-
 /// The declared encoding is a claim about the expression, not an instruction.
 ///
 /// It was an instruction until [`Expr::Cast`] existed: a declaration whose
@@ -1484,8 +1509,10 @@ fn check_declared_shape(contract: &TensorContract, ty: &TensorType) -> Result<()
 /// depending on whether they happened to agree. Now the kernel has a name and
 /// this is only the check.
 ///
-/// Like [`check_declared_shape`], this leaves the contract unnamed: the caller
-/// names every error it returns, once.
+/// Like [`Builder::check_declared_shape`], this leaves the contract unnamed:
+/// the caller names every error it returns, once. Unlike it, this is a claim
+/// about the rank: an encoding is what it is however the tensor is cut, so
+/// there is no whole-tensor reading of it to check against instead.
 fn check_declared_encoding(contract: &TensorContract, decl: &TensorDecl) -> Result<()> {
     if contract.encoding == decl.encoding {
         return Ok(());

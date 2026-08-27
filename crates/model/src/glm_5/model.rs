@@ -1,21 +1,13 @@
-//! The GLM 5 declaration, de-genericized (design §5, decision #18): the old
-//! `Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>` phantom tree is
-//! gone — `tp` is a runtime field, each weight carries its `Dtype`, and the
-//! SKU constructors take every element choice as an argument: the catalog row
-//! spells the dense-weight, routed-expert, activation and kv-cache elements it
-//! wants, and the model keeps the last two as fields for the forward pass.
-//! Names and the per-layer scheme are unchanged from the old crate: weights
-//! intern by name, so the checkpoint mapping carries over untouched.
-
 use model_dsl::{Dtype, Weight};
+use model_loader::contract::ModelContract;
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
-    /// Activation element — stated, not inherited silently.
+
     pub act: Dtype,
-    /// Kv-cache element layout — drives the append kernel and row bytes.
+
     pub kv: Dtype,
     pub embed: Weight,
     pub head: Weight,
@@ -282,5 +274,59 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
         layers,
         final_norm: Weight::sym("final_norm", [hidden], w),
         final_norm_eps: d.norm_eps,
+    }
+}
+
+impl Model {
+    pub fn load(
+        &self,
+        src: &ztensor::Source,
+    ) -> Result<ModelContract, crate::contract::ModelError> {
+        let tp = self.tp;
+        let claim = |w: &Weight| crate::contract::claim(w, tp);
+        let mut claims = Vec::new();
+        claims.push(claim(&self.embed));
+        claims.push(claim(&self.final_norm));
+        claims.push(claim(&self.head));
+        for layer in &self.layers {
+            let attn = &layer.attn;
+            let index = &attn.indexer;
+            claims.push(claim(&layer.attn_norm));
+            claims.push(claim(&layer.mlp_norm));
+            claims.push(claim(&attn.q_a_proj));
+            claims.push(claim(&attn.q_a_norm));
+            claims.push(claim(&attn.q_b_proj));
+            claims.push(claim(&attn.kv_a_proj));
+            claims.push(claim(&attn.kv_a_norm));
+            claims.push(claim(&attn.kv_b_proj));
+            claims.push(claim(&attn.o_proj));
+            claims.push(claim(&index.q_proj));
+            claims.push(claim(&index.k_proj));
+            claims.push(claim(&index.weights_proj));
+            claims.push(claim(&index.k_norm));
+            claims.push(claim(&index.k_norm_bias));
+            match &layer.mlp {
+                Mlp::Dense { gate_up, down, .. } => {
+                    claims.push(claim(gate_up));
+                    claims.push(claim(down));
+                }
+                Mlp::Routed {
+                    router,
+                    gate_up,
+                    down,
+                    shared,
+                    ..
+                } => {
+                    claims.push(claim(router));
+                    claims.push(claim(gate_up));
+                    claims.push(claim(down));
+                    if let Some(shared) = shared {
+                        claims.push(claim(&shared.gate_up));
+                        claims.push(claim(&shared.down));
+                    }
+                }
+            }
+        }
+        crate::contract::elaborate(src, claims)
     }
 }

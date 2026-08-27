@@ -3,7 +3,7 @@ name = "model"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The model catalog of the menlo stack: each model is a declaration (weights, dims, cache spaces) plus a forward pass written in model-dsl. Qwen 3.5 is ported first, end-to-end; the others follow the same shape."
+description = "The model catalog of the menlo stack: each model is a declaration (weights, dims, cache spaces) plus a forward pass written in model-dsl, an import contract saying how a checkpoint's bytes become its weights, and a chat template saying how a turn of conversation is written and read back."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -11,9 +11,30 @@ repository = "https://github.com/pie-project/pie"
 name = "model"
 path = "src/lib.rs"
 
+# NO FEATURES. The one this crate had, `serve`, gated the one module that
+# needed an image codec; multimodal decode is gone and the gate went with it.
+# Every dependency below is one every consumer of the catalog needs.
+
 [dependencies]
 # What a forward pass is written in: Recorder/Value, the per-family kernel
 # wrappers, split/merge/Facts, and the `Weight` declaration. A model's whole
-# vocabulary comes from here — the IR names it needs (`Dtype`, `GeomKind`)
-# arrive through the dsl's re-exports, so `model-ir` is never named directly.
+# computation vocabulary comes from here — the IR names it needs (`Dtype`,
+# `Plan`, `Param`, `Shard`) arrive through the dsl's re-exports, so `model-ir`
+# is never named directly.
 model-dsl = { path = "../model-dsl" }
+# The vocabulary a family's checkpoint provenance is written in. `contract::Expr`
+# and `ModelContract` are the load contract's own algebra, and this crate is the
+# declarer that module's doc names — so a `<model>/import.rs` states where its
+# bytes come from in the language the loader checks and runs, rather than in a
+# second one beside it.
+model-loader = { path = "../model-loader" }
+# The tool arguments a family's chat template renders, and the plan `bin/trace`
+# prints.
+serde_json = "1"
+# What a chat template writes turns into and reads tokens back out of.
+tokenizer = { path = "../tokenizer" }
+# The container a built artifact is: `Model::load` is handed an open
+# `ztensor::Source` and reads the checkpoint's own stored facts out of it —
+# which tensors are there, and what each part says its elements are — before it
+# decides between an identity load, a cast, and a refusal.
+ztensor = { workspace = true }

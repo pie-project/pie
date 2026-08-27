@@ -1,12 +1,7 @@
-//! DeepSeek V4 — the MLA flagship on the menlo stack: hyper-connection
-//! residual streams around every block, attention over a shared compressed
-//! kv plane whose windowed main path merges a pooled long-range path by lse,
-//! and a sqrt-softplus-routed MoE above the first dense layer. The
-//! declaration lives in [`model`], the forward pass in [`forward`];
-//! `import.rs` (checkpoint mapping) is deferred to the loader port.
-
 pub mod forward;
+pub mod import;
 pub mod model;
+pub mod template;
 
 use model::Model;
 use model_dsl::Dtype;
@@ -22,4 +17,18 @@ pub const CATALOG: &[(&str, model_dsl::TraceFn)] = model_dsl::catalog![
         model_dsl::trace_hybrid,
         Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 2)
     ),
+];
+
+pub const IMPORTS: &[crate::ImportRow] = &[
+    ("dsv4-base-bf16-kv-bf16", |src| {
+        Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
+    ("dsv4-base-bf16-kv-bf16-tp2", |src| {
+        Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
+];
+
+pub const TEMPLATES: &[crate::template::TemplateRow] = &[
+    ("dsv4-base-bf16-kv-bf16", template::r1),
+    ("dsv4-base-bf16-kv-bf16-tp2", template::r1),
 ];

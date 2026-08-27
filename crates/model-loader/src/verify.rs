@@ -114,11 +114,22 @@ pub struct ContractView<'a> {
 /// decline to predict a shape (`TensorContract::inferred`), and inventing one
 /// here would turn the loader's own inference into the thing being verified.
 ///
+/// It is also unpinned for an expression that names an [`Expr::Shard`], and for
+/// the same reason. A declaration is the whole tensor's while a plan holds this
+/// rank's band, and what relates them is the algebra that resolved the shard —
+/// so comparing the two numbers here would report every sharded tensor in a
+/// tp > 1 plan as a violation. That claim is checked where the algebra is, by
+/// `plan::build`'s `check_declared_shape`, against the same declaration. What
+/// is left here is what a second opinion can actually hold: the tensor is
+/// present, and its encoding is what was asked for.
+///
 /// There is no `optional`. It existed for a driver that declared the tensors it
 /// would bind without authoring them, and could only guess whether a weight it
 /// named would be present; a contract does not guess, because the author read
 /// the checkpoint's tensor table before writing it. A tied-embedding checkpoint
 /// yields a contract that does not declare `lm_head.weight` at all.
+///
+/// [`Expr::Shard`]: crate::contract::Expr::Shard
 pub struct TensorDemand<'a> {
     pub name: &'a str,
     pub shape: Option<Vec<i64>>,
@@ -137,18 +148,20 @@ impl<'a> TensorDemand<'a> {
 }
 
 impl<'a> ContractView<'a> {
-    /// Read a contract as the rank that will execute it sees it.
+    /// Read a contract as the rank that will execute it sees it: every tensor
+    /// it declares, and of each declaration the part that is about the rank.
     pub fn of(contract: &'a crate::contract::ModelContract) -> Self {
         Self {
             tensors: contract
                 .tensors
                 .iter()
                 .map(|tensor| {
-                    TensorDemand::authored(
-                        tensor.name.as_str(),
-                        tensor.shape.as_deref(),
-                        &tensor.encoding,
-                    )
+                    let shape = if tensor.expr.is_sharded() {
+                        None
+                    } else {
+                        tensor.shape.as_deref()
+                    };
+                    TensorDemand::authored(tensor.name.as_str(), shape, &tensor.encoding)
                 })
                 .collect(),
         }

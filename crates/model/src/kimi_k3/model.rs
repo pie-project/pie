@@ -1,23 +1,15 @@
-//! The Kimi K3 declaration, de-genericized (design §5, decision #18): the old
-//! `Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>` phantom tree is
-//! gone — `tp` is a runtime field, each weight carries its `Dtype`, and the
-//! element choices are constructor arguments, so the catalog row spells the
-//! dense weights, the routed-expert banks, the activation and the kv-cache
-//! element at the call site and the SKU name stays a name. Only the KDA
-//! physics — the delta gate's `dt_bias` and `a_log` — stays pinned to f32
-//! here, because it is not a knob. Names and the per-layer scheme are
-//! unchanged from the old crate: weights intern by name, so the checkpoint
-//! mapping carries over untouched.
-
 use model_dsl::{Dtype, Weight};
+use model_loader::contract::ModelContract;
+
+use crate::contract::{ModelError, claim, elaborate};
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
-    /// Activation element — stated, not inherited silently.
+
     pub act: Dtype,
-    /// Kv-cache element layout — drives the append kernel and row bytes.
+
     pub kv: Dtype,
     pub embed: Weight,
     pub head: Weight,
@@ -308,8 +300,12 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
                         experts,
                     )
                     .bank([inter, inter]),
-                    down: Weight::sym(n("experts_down"), [m.experts as u64, hidden, inter], experts)
-                        .rows(),
+                    down: Weight::sym(
+                        n("experts_down"),
+                        [m.experts as u64, hidden, inter],
+                        experts,
+                    )
+                    .rows(),
                     shared: (m.shared_inter > 0).then(|| Shared {
                         gate_up: Weight::sym(n("shared_gate_up"), [2 * shared_inter, hidden], w)
                             .packed([shared_inter, shared_inter]),
@@ -361,5 +357,71 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
         layers,
         final_norm: Weight::sym("final_norm", [hidden], w),
         final_norm_eps: d.norm_eps,
+    }
+}
+
+impl Model {
+    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
+        let mut claims = Vec::new();
+        let mut state = |w: &Weight| claims.push(claim(w, self.tp));
+        state(&self.embed);
+        state(&self.final_norm);
+        state(&self.head);
+        for layer in &self.layers {
+            state(&layer.mixer_norm);
+            state(&layer.mlp_norm);
+            if let Some(res) = &layer.res_blend {
+                state(&res.norm);
+                state(&res.proj);
+            }
+            match &layer.mixer {
+                Mixer::Mla(a) => {
+                    state(&a.q_a_proj);
+                    state(&a.q_a_norm);
+                    state(&a.q_b_proj);
+                    state(&a.kv_a_proj);
+                    state(&a.kv_a_norm);
+                    state(&a.kv_b_proj);
+                    if let Some(gate) = &a.gate {
+                        state(gate);
+                    }
+                    state(&a.o_proj);
+                }
+                Mixer::Kda(k) => {
+                    state(&k.qkv);
+                    state(&k.conv);
+                    state(&k.f_a);
+                    state(&k.f_b);
+                    state(&k.b);
+                    state(&k.dt_bias);
+                    state(&k.a_log);
+                    state(&k.gate);
+                    state(&k.o_norm);
+                    state(&k.o_proj);
+                }
+            }
+            match &layer.mlp {
+                Mlp::Dense { gate_up, down, .. } => {
+                    state(gate_up);
+                    state(down);
+                }
+                Mlp::Routed {
+                    router,
+                    gate_up,
+                    down,
+                    shared,
+                    ..
+                } => {
+                    state(router);
+                    state(gate_up);
+                    state(down);
+                    if let Some(s) = shared {
+                        state(&s.gate_up);
+                        state(&s.down);
+                    }
+                }
+            }
+        }
+        elaborate(src, claims)
     }
 }

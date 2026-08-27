@@ -1,13 +1,5 @@
-//! The Qwen 3.5 forward pass over the typed IR — the old forward minus the
-//! machinery the design killed (design §10): attention plans are built once
-//! up front and shared visibly across layers (§6), kv-append geometry is a
-//! declared input fetched where it is used — the recorder declares each input
-//! once no matter how many layers ask (§7), raggedness is ambient so the
-//! prefill/chunked arms lose their `query_windows` plumbing (§5), and tensor
-//! parallelism is plain control flow on `m.tp` (§9, decision #18).
-
 use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Request, Value, kernels, merge, seam,
+    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Request, Value, merge, ops, seam,
 };
 
 use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model};
@@ -55,35 +47,34 @@ impl ForwardHybrid for Model {
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
-        // The decode and prefill plans, built once and shared visibly by
-        // every attention layer (§6).
+
         let positions = inputs.positions();
-        let plan_d = kernels::attn::plan_decode(positions.rec(), inputs.kv_space());
-        let plan_p = kernels::attn::plan_prefill(positions.rec(), inputs.kv_space());
+        let plan_d = ops::attn::plan_decode(positions.rec(), inputs.kv_space());
+        let plan_p = ops::attn::plan_prefill(positions.rec(), inputs.kv_space());
         let ids = inputs.tokens();
-        let mut y = kernels::layout::embed(&ids, &m.embed, m.vocab);
+        let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
 
         for (l, w) in inputs.layers(&m.layers) {
-            let x = kernels::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
+            let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
                 Mixer::Attn(a) => attn_mixer(&x, &inputs, &plan_d, &plan_p, a, l),
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
             };
             let o = if m.tp > 1 {
-                kernels::collective::all_reduce(&o)
+                ops::collective::all_reduce(&o)
             } else {
                 o
             };
-            y = kernels::elemwise::residual_add(&o, &y);
+            y = ops::elemwise::residual_add(&o, &y);
 
-            let x = kernels::elemwise::rmsnorm_plus_one(&y, &w.mlp_norm, w.mlp_norm_eps);
+            let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mlp_norm, w.mlp_norm_eps);
             let f = match &w.mlp {
                 Mlp::Dense {
                     gate_up,
                     down,
                     inter,
-                } => kernels::linear::matmul(
-                    &kernels::linear::mlp_swiglu(&kernels::linear::matmul(&x, gate_up), *inter),
+                } => ops::linear::matmul(
+                    &ops::linear::mlp_swiglu(&ops::linear::matmul(&x, gate_up), *inter),
                     down,
                 ),
                 Mlp::Routed {
@@ -98,45 +89,45 @@ impl ForwardHybrid for Model {
                     inter,
                     shared_inter,
                 } => {
-                    let (routes, weights) = kernels::linear::moe_topk_softmax(
-                        &kernels::linear::matmul(&x, router),
+                    let (routes, weights) = ops::linear::moe_topk_softmax(
+                        &ops::linear::matmul(&x, router),
                         *experts,
                         *top_k,
                     );
-                    let hidden = kernels::linear::mlp_swiglu(
-                        &kernels::linear::moe_matmul_select(&x, gate_up, &routes, *top_k),
+                    let hidden = ops::linear::mlp_swiglu(
+                        &ops::linear::moe_matmul_select(&x, gate_up, &routes, *top_k),
                         *inter,
                     );
-                    let routed = kernels::linear::moe_weighted_sum(
-                        &kernels::linear::moe_matmul_select(&hidden, down, &routes, *top_k),
+                    let routed = ops::linear::moe_weighted_sum(
+                        &ops::linear::moe_matmul_select(&hidden, down, &routes, *top_k),
                         &weights,
                     );
-                    let shared = kernels::linear::matmul(
-                        &kernels::linear::mlp_swiglu(
-                            &kernels::linear::matmul(&x, shared_gate_up),
+                    let shared = ops::linear::matmul(
+                        &ops::linear::mlp_swiglu(
+                            &ops::linear::matmul(&x, shared_gate_up),
                             *shared_inter,
                         ),
                         shared_down,
                     );
-                    kernels::linear::moe_sigmoid_gate_add(
+                    ops::linear::moe_sigmoid_gate_add(
                         &routed,
                         &shared,
-                        &kernels::linear::matmul(&x, shared_gate),
+                        &ops::linear::matmul(&x, shared_gate),
                     )
                 }
             };
             let f = if m.tp > 1 {
-                kernels::collective::all_reduce(&f)
+                ops::collective::all_reduce(&f)
             } else {
                 f
             };
-            y = kernels::elemwise::residual_add(&f, &y);
+            y = ops::elemwise::residual_add(&f, &y);
         }
 
-        let x = kernels::elemwise::rmsnorm_plus_one(&y, &m.final_norm, m.final_norm_eps);
+        let x = ops::elemwise::rmsnorm_plus_one(&y, &m.final_norm, m.final_norm_eps);
         match &m.head {
-            Head::Tied => kernels::linear::lm_head(&x, &m.embed),
-            Head::Bank(bank) => kernels::linear::lm_head(&x, bank),
+            Head::Tied => ops::linear::lm_head(&x, &m.embed),
+            Head::Bank(bank) => ops::linear::lm_head(&x, bank),
         }
     }
 }
@@ -154,23 +145,23 @@ fn attn_mixer(
     let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
     let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
     let d = a.head_dim;
-    let (q, gate) = kernels::layout::split_q_gate(&kernels::linear::matmul(x, &a.qg_proj), d);
-    let k = kernels::linear::matmul(x, &a.k_proj);
-    let v = kernels::linear::matmul(x, &a.v_proj);
+    let (q, gate) = ops::layout::split_q_gate(&ops::linear::matmul(x, &a.qg_proj), d);
+    let k = ops::linear::matmul(x, &a.k_proj);
+    let v = ops::linear::matmul(x, &a.v_proj);
     seam::at(seam::ATTN_QV, (&q, &v));
-    let q = kernels::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
-    let k = kernels::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
-    let (q, k) = kernels::elemwise::rope_partial(&q, &k, &positions, a.rotary_dim, d, a.theta);
-    kernels::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
+    let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
+    let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
+    let (q, k) = ops::elemwise::rope_partial(&q, &k, &positions, a.rotary_dim, d, a.theta);
+    ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, (&q,));
     let (dq, p) = q.split(&Facts::qo_one());
     let o = merge![
-        kernels::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
-        kernels::attn::prefill(&p, plan_p, pages, None, d, a.kv_heads, a.sm_scale),
+        ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
+        ops::attn::prefill(&p, plan_p, pages, None, d, a.kv_heads, a.sm_scale),
     ];
     seam::at(seam::ATTN_OUT, (&o,));
-    kernels::linear::attention_landing(
-        &kernels::elemwise::gate_sigmoid_mul(&o, &gate),
+    ops::linear::attention_landing(
+        &ops::elemwise::gate_sigmoid_mul(&o, &gate),
         &a.o_proj,
         layer,
     )
@@ -179,18 +170,18 @@ fn attn_mixer(
 fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let conv_state = inputs.state(&g.conv_state);
     let delta_state = inputs.state(&g.delta_state);
-    let qkvz = kernels::linear::matmul(x, &g.in_qkvz);
-    let ba = kernels::linear::matmul(x, &g.in_ba);
+    let qkvz = ops::linear::matmul(x, &g.in_qkvz);
+    let ba = ops::linear::matmul(x, &g.in_ba);
     seam::at(seam::RECURRENT, (&qkvz,));
     let width = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
     let one = Facts::qo_one();
     let (qkvz_d, qkvz_p) = qkvz.split(&one);
     let (ba_d, ba_p) = ba.split(&one);
     let (core_d, z_d) = {
-        let (qkv, z) = kernels::layout::split_rows(&qkvz_d, width);
-        let qkv = kernels::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);
-        let gates = kernels::attn::ssm_gdn_prep(&ba_d, &g.dt_bias, &g.a_log);
-        let core = kernels::attn::ssm_gated_delta(
+        let (qkv, z) = ops::layout::split_rows(&qkvz_d, width);
+        let qkv = ops::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);
+        let gates = ops::attn::ssm_gdn_prep(&ba_d, &g.dt_bias, &g.a_log);
+        let core = ops::attn::ssm_gated_delta(
             &qkv,
             &z,
             &gates,
@@ -203,11 +194,10 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
         (core, z)
     };
     let (core_p, z_p) = {
-        let (qkv, z) = kernels::layout::split_rows(&qkvz_p, width);
-        let qkv =
-            kernels::attn::ssm_causal_conv1d_chunked(&qkv, &g.conv, conv_state, g.conv_kernel);
-        let gates = kernels::attn::ssm_gdn_prep(&ba_p, &g.dt_bias, &g.a_log);
-        let core = kernels::attn::ssm_gated_delta_chunked(
+        let (qkv, z) = ops::layout::split_rows(&qkvz_p, width);
+        let qkv = ops::attn::ssm_causal_conv1d_chunked(&qkv, &g.conv, conv_state, g.conv_kernel);
+        let gates = ops::attn::ssm_gdn_prep(&ba_p, &g.dt_bias, &g.a_log);
+        let core = ops::attn::ssm_gated_delta_chunked(
             &qkv,
             &z,
             &gates,
@@ -222,6 +212,6 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let o = merge![core_d, core_p];
     let z = merge![z_d, z_p];
 
-    let o = kernels::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps);
-    kernels::linear::matmul(&o, &g.out_proj)
+    let o = ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps);
+    ops::linear::matmul(&o, &g.out_proj)
 }

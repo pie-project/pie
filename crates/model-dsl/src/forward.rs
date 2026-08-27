@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 
 use model_ir::{CacheRow, Dim, Dtype, GeomKind, Plan, Plane, RuntimeInput, Ty, ValueId};
 
-use crate::kernels;
+use crate::ops;
 use crate::record::{Recorder, Value};
 use crate::seam;
 
@@ -122,7 +122,12 @@ pub trait ForwardHybrid {
 /// and `finish` through the validator.
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, plane: Plane) -> Plan {
     let caches = m.caches();
-    let rec = Recorder::new(name, plane, <M::Facts as FactWord>::NAMES, caches.rows.clone());
+    let rec = Recorder::new(
+        name,
+        plane,
+        <M::Facts as FactWord>::NAMES,
+        caches.rows.clone(),
+    );
     rec.seam(seam::IN.name, &[]);
     let logits = m.forward(Input {
         rec: rec.clone(),
@@ -210,10 +215,10 @@ impl<F> Input<F> {
     /// it feeds are pure functions of visible inputs (§7). The dims state
     /// alignment, not an arena size: geometry buffers are driver-bound, and
     /// `Indices` in particular is lane-aligned ragged, viewed through the
-    /// indptr beside it. The kind→shape table lives on [`kernels::geometry`].
+    /// indptr beside it. The kind→shape table lives on [`ops::geometry`].
     #[must_use]
     pub fn geometry(&self, space: u32, kind: GeomKind) -> Value {
-        kernels::geometry(&self.rec, space, kind)
+        ops::geometry(&self.rec, space, kind)
     }
 
     /// The model's paged-kv geometry space: the FIRST space `caches()`

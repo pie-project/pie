@@ -737,10 +737,14 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         contract.name == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
             && contract.shape.as_deref() == Some(&[4, 3][..])
     }));
+    // The packed bank declares the WHOLE `[6, 4]`; the `Shard` on axis 1 is
+    // what says this rank binds `[6, 2]` of it. The two views below are cut
+    // out of what that bank published, which is already this rank's, so their
+    // declarations are the halves they slice.
     assert!(contract.tensors.iter().any(|contract| {
         contract.name
             == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
-            && contract.shape.as_deref() == Some(&[6, 2][..])
+            && contract.shape.as_deref() == Some(&[6, 4][..])
             && matches!(&contract.expr, model_loader::contract::Expr::Shard { axis, .. } if *axis == Axis(1))
     }));
     assert!(contract.tensors.iter().any(|contract| {
@@ -887,7 +891,9 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
         tensors: vec![TensorContract::new(
             "local",
             expr,
-            vec![4, 2],
+            // The whole tensor, which is what a declaration is: this rank
+            // binds `[4, 2]` and the `Shard` is what says so.
+            vec![8, 2],
             Encoding::Raw(DType::F32),
         )],
         groups: Vec::new(),
@@ -933,7 +939,10 @@ fn a_head_boundary_shard_rejects_an_indivisible_world() {
                 .transmute(TensorType::raw(vec![3, 4], DType::F32))
                 .shard(0)
                 .transmute(TensorType::raw(vec![-1, 2], DType::F32)),
-            vec![4, 2],
+            // The whole tensor's, so that what this test pins is the shard
+            // being refused and not a declaration disagreeing on the way in:
+            // the shape claim is checked first, and it is checked at one rank.
+            vec![6, 2],
             Encoding::Raw(DType::F32),
         )],
         groups: Vec::new(),
@@ -1224,7 +1233,9 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                         encoding: Encoding::Raw(DType::E8M0),
                     })
                     .shard(0),
-                vec![2, 1],
+                // Both declarations are the whole tensor's; rank 1 binds half
+                // of each, which is what the two `Shard`s say.
+                vec![4, 1],
                 Encoding::Raw(DType::E8M0),
             ),
             TensorContract::new(
@@ -1236,7 +1247,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                     })
                     .shard(0)
                     .scale_per_block(Expr::out("scales")),
-                vec![2, 32],
+                vec![4, 32],
                 Encoding::Raw(DType::BF16),
             ),
         ],

@@ -174,6 +174,10 @@ pub enum Expr {
     /// [`Partition`]. Given one, this types like anything else: its extent is
     /// [`local_range`], and the band it denotes is checked by everything a
     /// [`Expr::Slice`] is checked by, quantization-group alignment included.
+    /// At [`Partition::WHOLE`] the band is the whole axis, and the node types
+    /// as its operand rather than as a slice denoting it — which is what lets
+    /// a contract be *typed* without a rank, and is how the shape it declares
+    /// is checked.
     ///
     /// A byte offset cannot be symbolic, so
     /// [`Resolver::specialize`](crate::contract::infer::Resolver::specialize)
@@ -422,6 +426,15 @@ impl TensorType {
 /// that a driver whose model of the checkpoint is wrong fails to compile instead
 /// of silently binding a plausible-looking buffer.
 ///
+/// **The prediction is the WHOLE tensor's**, not this rank's band. A contract
+/// is authored once per model from `tp = 1` shapes and the cut enters as an
+/// [`Expr::Shard`] resolved against a [`Partition`] at compile time, so a
+/// declaration is written before there is a rank to write one for. It is
+/// checked against the type the expression has at [`Partition::WHOLE`] —
+/// `plan::build`'s `check_declared_shape` — while the plan the same pass emits
+/// declares this rank's band, which is what a driver binds. The two differ by
+/// exactly the shards the expression names.
+///
 /// A prediction may be declined. `shape: None` says "I do not claim to know",
 /// which is the honest answer for a packed quantized weight whose on-disk
 /// extents are a property of the quantizer that produced the file rather than of
@@ -434,7 +447,8 @@ pub struct TensorContract {
     pub name: String,
     /// How to build it from the checkpoint. See [`Expr`].
     pub expr: Expr,
-    /// Declared logical shape, or `None` where the contract makes no claim.
+    /// Declared logical shape of the whole tensor, or `None` where the
+    /// contract makes no claim. Rank-independent: see this type's docs.
     pub shape: Option<Vec<i64>>,
     /// Declared encoding of its elements.
     pub encoding: Encoding,
@@ -718,6 +732,40 @@ impl Expr {
             Expr::Bias { .. } => "Bias",
             Expr::SrcIndexed(_) => "SrcIndexed",
             Expr::Select { .. } => "Select",
+        }
+    }
+
+    /// Whether an [`Expr::Shard`] appears anywhere in this expression.
+    ///
+    /// The one question that decides whether a declaration's shape and the
+    /// plan's are the same number. A shard is the only node whose meaning
+    /// depends on the target, so an expression without one denotes the same
+    /// tensor at every rank and an expression with one denotes a band of what
+    /// the contract declares.
+    ///
+    /// A name read through [`Expr::Out`] is not followed: it is a published
+    /// tensor, whose own shards were resolved when it was built.
+    #[must_use]
+    pub fn is_sharded(&self) -> bool {
+        match self {
+            Expr::Shard { .. } => true,
+            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => false,
+            Expr::Slice { src, .. }
+            | Expr::Stride { src, .. }
+            | Expr::Gather { src, .. }
+            | Expr::Select { src, .. }
+            | Expr::Transmute { src, .. }
+            | Expr::Repack { src, .. }
+            | Expr::Cast { src, .. }
+            | Expr::Bias { src, .. } => src.is_sharded(),
+            Expr::Scale { src, factor } => {
+                src.is_sharded()
+                    || match factor {
+                        ScaleFactor::Uniform(_) => false,
+                        ScaleFactor::PerBlock { by } => by.is_sharded(),
+                    }
+            }
+            Expr::Concat { parts, .. } => parts.iter().any(Expr::is_sharded),
         }
     }
 

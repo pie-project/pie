@@ -5,6 +5,13 @@
 //! planner because they reason about *shape and cost*, never about which model
 //! a tensor belongs to — a rewrite that needed the model's name would be the
 //! driver's business, not the compiler's.
+//!
+//! What they return is a contract for ONE RANK. A rewrite runs with the target
+//! in hand and resolves the shards it rewrites, so the expressions it emits
+//! name concrete bands and the shapes it declares are those bands. The
+//! rank-independent contract is the *input*: a declaration there is the whole
+//! tensor's, which is what [`coalesce_direct_row_shards`] matches against, and
+//! it is the last place in the pipeline where that is so.
 
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
 use crate::contract::{Expr, ModelContract, TensorContract, local_range};
@@ -51,8 +58,10 @@ pub fn coalesce_direct_row_shards(
         let Some(raw) = metadata.tensor_by_name(name) else {
             continue;
         };
-        // Extents come off the checkpoint, because the contract's shape is
-        // already this rank's band and cannot say how wide the whole is.
+        // Extents come off the checkpoint. The contract's own shape says the
+        // same thing -- a declaration is the whole tensor's -- but only for a
+        // tensor that declares one, and the band this pass emits has to be
+        // derived either way.
         if raw.shape.len() != 2 || raw.shape[0] <= 0 || raw.shape[1] <= 0 {
             continue;
         }
@@ -69,7 +78,13 @@ pub fn coalesce_direct_row_shards(
             target.tp_rank,
             &format!("the row count of '{}'", tensor.name),
         )?;
-        if tensor.shape.as_deref() != Some(&[local_rows, raw.shape[1]][..]) {
+        // A declaration is a claim about the whole tensor, so a row shard of a
+        // whole checkpoint tensor claims that tensor's own shape. This used to
+        // ask for `[local_rows, cols]`, which was the same claim read as this
+        // rank's band; a contract that says what it means says the whole, and
+        // reading it the old way would have quietly stopped matching -- and
+        // this pass with it.
+        if tensor.shape.as_deref() != Some(&raw.shape[..]) {
             continue;
         }
         let row_bytes =

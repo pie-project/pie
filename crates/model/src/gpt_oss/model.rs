@@ -1,23 +1,13 @@
-//! The gpt-oss declaration, de-genericized (design §5, decision #18): the old
-//! `Model<W1: Dtype, W2: Dtype, K: KvDtype, const TP: usize>` phantom tree is
-//! gone — `tp` is a runtime field, each weight carries its `Dtype`, and the
-//! SKU constructors take every element choice as an argument: dense weights,
-//! routed-expert banks, activation and kv-cache element are all spelled by
-//! the caller, so a catalog row reads as the SKU it names. The mxfp4 expert
-//! banks are ordinary `Weight`s whose dtype interns a packed codes plane and
-//! an `.scales` companion behind one name (the declare surface's bank
-//! planes). Names and the per-layer scheme are unchanged from the old crate:
-//! weights intern by name, so the checkpoint mapping carries over untouched.
-
 use model_dsl::{Dtype, Weight};
+use model_loader::contract::ModelContract;
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
-    /// Activation element — stated, not inherited silently.
+
     pub act: Dtype,
-    /// Kv-cache element layout — drives the append kernel and row bytes.
+
     pub kv: Dtype,
     pub embed: Weight,
     pub head: Weight,
@@ -246,5 +236,43 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
         layers,
         final_norm: Weight::sym("final_norm", [hidden], w),
         final_norm_eps: d.norm_eps,
+    }
+}
+
+impl Model {
+    pub fn load(
+        &self,
+        src: &ztensor::Source,
+    ) -> Result<ModelContract, crate::contract::ModelError> {
+        let mut claims = vec![
+            crate::contract::claim(&self.embed, self.tp),
+            crate::contract::claim(&self.final_norm, self.tp),
+            crate::contract::claim(&self.head, self.tp),
+        ];
+
+        for layer in &self.layers {
+            let attn = &layer.attn;
+            let mlp = &layer.mlp;
+
+            claims.push(crate::contract::claim(&layer.attn_norm, self.tp));
+            claims.push(crate::contract::claim(&layer.mlp_norm, self.tp));
+            claims.push(crate::contract::claim(&attn.q_proj, self.tp));
+            claims.push(crate::contract::claim(&attn.q_bias, self.tp));
+            claims.push(crate::contract::claim(&attn.k_proj, self.tp));
+            claims.push(crate::contract::claim(&attn.k_bias, self.tp));
+            claims.push(crate::contract::claim(&attn.v_proj, self.tp));
+            claims.push(crate::contract::claim(&attn.v_bias, self.tp));
+            claims.push(crate::contract::claim(&attn.o_proj, self.tp));
+            claims.push(crate::contract::claim(&attn.o_bias, self.tp));
+            claims.push(crate::contract::claim(&attn.sinks, self.tp));
+            claims.push(crate::contract::claim(&mlp.router, self.tp));
+            claims.push(crate::contract::claim(&mlp.router_bias, self.tp));
+            claims.push(crate::contract::claim(&mlp.gate_up, self.tp));
+            claims.push(crate::contract::claim(&mlp.gate_up_bias, self.tp));
+            claims.push(crate::contract::claim(&mlp.down, self.tp));
+            claims.push(crate::contract::claim(&mlp.down_bias, self.tp));
+        }
+
+        crate::contract::elaborate(src, claims)
     }
 }

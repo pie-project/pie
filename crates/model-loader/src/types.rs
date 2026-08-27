@@ -564,6 +564,9 @@ pub enum Visibility {
 pub struct TensorDecl {
     pub id: TensorId,
     pub name: String,
+    /// What this rank holds, in elements — the band a
+    /// [`Expr::Shard`](crate::contract::Expr::Shard) cut out, not the whole
+    /// tensor the contract that asked for it declares.
     pub shape: Vec<i64>,
     pub encoding: Encoding,
     pub alignment: u32,

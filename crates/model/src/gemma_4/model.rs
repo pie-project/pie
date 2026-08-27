@@ -1,21 +1,13 @@
-//! The Gemma 4 declaration, de-genericized (design §5, decision #18): the
-//! old `Model<W1: Dtype, K: KvDtype, const TP: usize>` phantom tree is gone —
-//! `tp` is a runtime field, each weight carries its `Dtype`, and the SKU
-//! constructors take every element choice as an argument: the catalog row
-//! spells the weight, activation, and kv-cache elements at the call site, and
-//! the model keeps the latter two as fields. Names and the per-layer scheme
-//! are unchanged from the old crate: weights intern by name, so the
-//! checkpoint mapping carries over untouched.
-
 use model_dsl::{Dtype, Weight};
+use model_loader::contract::ModelContract;
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
-    /// Activation element — stated, not inherited silently.
+
     pub act: Dtype,
-    /// Kv-cache element layout — drives the append kernel and row bytes.
+
     pub kv: Dtype,
     pub softcap: Option<f32>,
     pub embed: Weight,
@@ -65,8 +57,7 @@ pub struct Attn {
     pub sm_scale: f32,
     pub q_norm: Weight,
     pub q_norm_eps: f32,
-    /// The kv space row this layer reads and writes — the sharing tail names
-    /// an earlier layer's row.
+
     pub kv: String,
     pub banks: AttnBanks,
 }
@@ -329,5 +320,53 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         layers,
         final_norm: Weight::sym("final_norm", [hidden], w),
         final_norm_eps: d.norm_eps,
+    }
+}
+
+impl Model {
+    pub fn load(
+        &self,
+        src: &ztensor::Source,
+    ) -> Result<ModelContract, crate::contract::ModelError> {
+        let mut claims = Vec::new();
+        let mut claim = |w: &Weight| claims.push(crate::contract::claim(w, self.tp));
+
+        claim(&self.embed);
+        claim(&self.final_norm);
+
+        for layer in &self.layers {
+            claim(&layer.attn_norm);
+            claim(&layer.post_attn_norm);
+            claim(&layer.pre_ffw_norm);
+            claim(&layer.post_ffw_norm);
+            claim(&layer.attn.q_norm);
+            match &layer.attn.banks {
+                AttnBanks::Owned { qkv, k_norm, .. } => {
+                    claim(k_norm);
+                    claim(qkv);
+                }
+
+                AttnBanks::Shared { q_proj } => {
+                    claim(q_proj);
+                }
+            }
+            claim(&layer.o_proj);
+            claim(&layer.gate_up);
+            claim(&layer.down);
+        }
+
+        if let Some(ple) = &self.ple {
+            claim(&ple.model_proj);
+            claim(&ple.model_norm);
+            for per in &ple.per_layer {
+                claim(&per.table);
+                claim(&per.gate);
+                claim(&per.proj);
+                claim(&per.norm);
+                claim(&per.scalar);
+            }
+        }
+
+        crate::contract::elaborate(src, claims)
     }
 }

@@ -435,7 +435,10 @@ fn a_group_composes_with_a_shard() {
             tensors: vec![TensorContract::new(
                 "w",
                 expr,
-                vec![ROWS / 2, COLS],
+                // The whole instance, because a declaration is the whole
+                // tensor's: the `Shard` says the rank takes half of it, and
+                // saying so twice is what a contract stops being able to do.
+                vec![ROWS, COLS],
                 Encoding::Raw(DType::BF16),
             )],
         }],
