@@ -124,8 +124,9 @@ impl Weight {
                     .expect("an mxfp4 bank's logical shape ends in its contracted axis");
                 assert!(
                     k % 32 == 0,
-                    "an mxfp4 bank contracts over {k}, which is not a whole number of \
-                     32-code blocks"
+                    "`{}` is an mxfp4 bank contracting over {k}, which is not a whole \
+                     number of 32-code blocks",
+                    self.name,
                 );
                 let groups = k / 32;
                 let mut codes = lead.to_vec();
@@ -139,7 +140,7 @@ impl Weight {
                         dtype: Dtype::Mxfp4,
                     },
                     BankPlane {
-                        suffix: ".scales",
+                        suffix: SCALES,
                         shape: scales,
                         dtype: Dtype::E8m0,
                     },
@@ -171,14 +172,18 @@ pub(crate) struct BankPlane {
     pub dtype: Dtype,
 }
 
-/// The per-rank extent of a head count or width that tensor parallelism cuts.
+/// What an mxfp4 bank's e8m0 scales plane is called: the bank's own name and
+/// this suffix.
+///
+/// ONE HOME FOR ONE STRING. Four places write it — the plane `planes` interns,
+/// the load contract that declares where the bytes come from, the family
+/// import that names the stored tensor, and the loader's runtime-quant encode
+/// that publishes the companion it computed — and they must agree exactly or
+/// the loader lands a plane nothing reads under a name no contract chose. So
+/// they all say it here.
+const SCALES: &str = ".scales";
+
 #[must_use]
-pub fn per_rank(what: &str, whole: u32, tp: usize) -> u32 {
-    let tp = u32::try_from(tp).expect("a world no u32 holds");
-    assert!(tp > 0, "a {tp}-way cut of `{what}`");
-    assert!(
-        whole.is_multiple_of(tp),
-        "`{what}` is {whole} and does not cut {tp} ways",
-    );
-    whole / tp
+pub fn scales_name(of: &str) -> String {
+    format!("{of}{SCALES}")
 }

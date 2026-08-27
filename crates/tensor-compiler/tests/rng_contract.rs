@@ -259,11 +259,12 @@ fn allowlists() -> Allowlists {
             STAGED_RNG_PREAMBLE,
         ],
         stride: &[
-            // The CUDA reference generator's splitmix64 increment. See this
-            // file's `shift` list for the whole argument: the fixture is an
-            // input generator for a cross-language comparison, and canonical
-            // splitmix happens to share the golden-ratio word.
-            "crates/driver-metal/tests/fixtures/cuda_reference.cu",
+            // `driver-metal/tests/fixtures/cuda_reference.cu` STOOD HERE —
+            // the CUDA reference generator's splitmix64 increment, an input
+            // generator for the cross-language comparison. It went with the
+            // old driver-metal test tree in the palo sweep, and this entry
+            // goes with it, which is what `allowlisted_paths_still_exist`
+            // is for.
             "crates/gateway/src/route.rs",
             "crates/engine/src/inferlet/linker.rs",
             // splitmix64 id generation: the canonical splitmix increment
@@ -299,9 +300,11 @@ fn allowlists() -> Allowlists {
             // The CUTLASS MoE tactic cache is the same format again
             // (`moe/flashinfer_moe.cu` was a host program too), and both
             // autotuners came to rest in the same module when the families
-            // crossed. ONE entry covers what was briefly two `driver-cuda`
-            // ones, which is the move this list is built to survive.
-            "crates/kernels-cuda/src/gemm/dense.rs",
+            // crossed. `kernels-cuda/src/gemm/dense.rs` STOOD HERE for that
+            // lineage; the menlo rewrite's autotuner (`linear/dense.rs`) no
+            // longer spells the golden-ratio word at all, so the entry goes
+            // rather than moves — the third relocation this list has named,
+            // and the first that ends in deletion.
             // SEEDS, not streams. The three below fill TEST DATA with a
             // seeded generator, and the golden-ratio word is the obvious
             // constant to seed one with -- it is in splitmix64, in boost's
@@ -310,14 +313,12 @@ fn allowlists() -> Allowlists {
             // for; the scanner cannot tell a seed from a transcription, which
             // is what this list is for.
             //
-            // The GEMM service parity pair. The seed has to be the SAME word
-            // on both sides -- a Rust harness and a C++ oracle comparing
-            // element for element -- so it cannot be shared through a helper
-            // either crate could call, and the `.cu` half cannot call the
-            // Rust one at all.
-            "crates/driver-cuda/tests/gemm_service_parity.rs",
-            "crates/driver-cuda/tests/oracle/gemm_service/oracle.cu",
-            "crates/driver-cuda/tests/oracle/gemm_service/bias_fold.cu",
+            // The GEMM service parity pair STOOD HERE — a Rust harness and a
+            // C++ oracle seeding the same word on both sides. The whole
+            // oracle tree went with the old driver-cuda in the palo sweep
+            // (its successor parities — serve_smoke, graph_replay,
+            // program_parity — seed nothing with the golden-ratio word), so
+            // all three entries go with it.
             // A fifth entry, `crates/kernels-cuda/examples/fp8_pipeline_probe.rs`,
             // held a splitmix state in an example that generated its own
             // inputs. It went with `kernels-cuda/examples/`, and this entry
@@ -348,23 +349,14 @@ fn allowlists() -> Allowlists {
         // file stopped needing the exemption" from "the file stopped
         // existing", and only one of those is progress. Nothing outside the
         // contract writes this shift today either way.
-        // **A SPLITMIX64 INPUT GENERATOR, NOT A PTIR STREAM**, which is the
-        // distinction the comment above already draws for this needle.
-        //
-        // `driver-metal/tests/fixtures/cuda_reference.cu` drives the CUDA
-        // kernels so a Metal one can be compared to what they produce, and it
-        // needs reproducible INPUTS to do it. Its generator is canonical
-        // splitmix64 — the golden-ratio increment, then the two published
-        // mixers, neither of which is a PTIR constant — and its `unit()` is the
-        // standard sixty-four-to-float reduction. There is nothing for it to
-        // include:
-        // the contract's C header was deleted with the C++ drivers, and the
-        // `.metal` one is not a thing `nvcc` reads.
-        shift: &["crates/driver-metal/tests/fixtures/cuda_reference.cu"],
-        // The same file and the same reason: the divisor is the other half of
-        // the shift's reduction, and until this list existed a file could be
-        // excused for one and not the other.
-        unit: &["crates/driver-metal/tests/fixtures/cuda_reference.cu"],
+        // `driver-metal/tests/fixtures/cuda_reference.cu` STOOD HERE too —
+        // **a splitmix64 input generator, not a PTIR stream** — driving the
+        // CUDA kernels so a Metal one could be compared against them. The
+        // fixture went with the old driver-metal test tree in the palo sweep,
+        // and both its exemptions go with it; nothing outside the contract
+        // writes the shift or the divisor today.
+        shift: &[],
+        unit: &[],
     }
 }
 

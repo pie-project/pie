@@ -670,7 +670,7 @@ pub struct CanonicalAppend {
 /// geometry must agree when present.
 pub fn canonical_hash_tokens(
     evidence: CanonicalFireEvidence,
-    request: &crate::driver::LaunchPlan,
+    request: &crate::driver::FireRequest,
     device_resolved: bool,
     page_size: u32,
 ) -> Option<CanonicalAppend> {
@@ -775,13 +775,34 @@ pub fn canonical_hash_tokens(
     // mirrored instead of the wire (the classifier parity corpus pins the
     // two resolutions together).
     if !device_resolved {
-        if evidence.tokens != request.token_ids {
+        let submitted: Vec<u32> = request
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.tokens.iter().copied())
+            .collect();
+        if evidence.tokens != submitted {
             return None;
         }
-        if let Some(positions) = &evidence.positions
-            && *positions != request.position_ids
-        {
-            return None;
+        // A LANE WITH NO POSITIONS STATES THE NATURAL RUN, which is
+        // `held .. held + rows` — so the comparison is against that run and
+        // not skipped. The flat `position_ids` could not express the
+        // distinction: empty there meant "the driver's append order", and a
+        // request whose lane holds sixteen tokens looked identical to one
+        // whose lane holds none.
+        if let Some(positions) = &evidence.positions {
+            let mut at = 0usize;
+            for lane in &request.lanes {
+                let rows = lane.tokens.len();
+                let stated: Vec<u32> = if lane.positions.is_empty() {
+                    (0..rows as u32).map(|row| lane.kv.held + row).collect()
+                } else {
+                    lane.positions.clone()
+                };
+                if positions.get(at..at + rows) != Some(stated.as_slice()) {
+                    return None;
+                }
+                at += rows;
+            }
         }
     }
     Some(CanonicalAppend {
@@ -796,6 +817,39 @@ mod tests {
 
     fn nonce() -> [u8; 32] {
         [7u8; 32]
+    }
+
+    /// One lane over every token, continuing a sequence that already holds
+    /// `held`. Replaces four hand-built `LaunchPlan` literals whose three
+    /// fields (`token_ids`, `position_ids`, `qo_indptr`) were the CSR spelling
+    /// of exactly this.
+    fn one_lane(tokens: &[u32], held: u32) -> crate::driver::FireRequest {
+        crate::driver::FireRequest::one(crate::driver::fire::lane_of(
+            0,
+            tokens.to_vec(),
+            held,
+            Vec::new(),
+        ))
+    }
+
+    /// One lane per token — the SDK's one-token-per-lane lowering, where each
+    /// lane attends its own causal prefix.
+    fn per_token_lanes(tokens: &[u32], held: u32) -> crate::driver::FireRequest {
+        crate::driver::FireRequest {
+            lanes: tokens
+                .iter()
+                .enumerate()
+                .map(|(at, &token)| {
+                    crate::driver::fire::lane_of(
+                        0,
+                        vec![token],
+                        held + at as u32,
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+            ..crate::driver::FireRequest::default()
+        }
     }
 
     use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, StageProgram};
@@ -982,12 +1036,7 @@ mod tests {
     #[test]
     fn canonical_explicit_prefill_requires_contiguous_resolved_writes() {
         let tokens = (1..=17).collect::<Vec<_>>();
-        let mut request = crate::driver::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (0..17).collect(),
-            qo_indptr: vec![0, 17],
-            ..crate::driver::LaunchPlan::default()
-        };
+        let mut request = one_lane(&tokens, 0);
         let evidence = explicit_single_lane_evidence(&tokens, 0);
         assert_eq!(
             canonical_hash_tokens(evidence, &request, false, 16),
@@ -998,7 +1047,7 @@ mod tests {
         );
 
         // Wire disagreement (host geometry differs from evidence): no hash.
-        request.position_ids[16] = 0;
+        request.lanes[0].positions = (0..17).map(|at| if at == 16 { 0 } else { at }).collect();
         let invalid = explicit_single_lane_evidence(&tokens, 0);
         assert!(canonical_hash_tokens(invalid, &request, false, 16).is_none());
     }
@@ -1009,12 +1058,7 @@ mod tests {
         // against [16, 24), not [0, 8) — the old gate's committed==0 bail is
         // exactly the prefix-cache regression (RV-1).
         let tokens = (100..108).collect::<Vec<_>>();
-        let request = crate::driver::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (16..24).collect(),
-            qo_indptr: vec![0, 8],
-            ..crate::driver::LaunchPlan::default()
-        };
+        let request = one_lane(&tokens, 16);
         let evidence = explicit_single_lane_evidence(&tokens, 16);
         assert_eq!(
             canonical_hash_tokens(evidence, &request, false, 16),
@@ -1036,12 +1080,7 @@ mod tests {
         let n = 5u32;
         let tokens: Vec<u32> = (1..=n).collect();
         let pages: Vec<u32> = (0..n).flat_map(|_| [7u32]).collect(); // lane i -> page 7
-        let request = crate::driver::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (0..n).collect(),
-            qo_indptr: (0..=n).collect(),
-            ..crate::driver::LaunchPlan::default()
-        };
+        let request = per_token_lanes(&tokens, 0);
         let evidence = CanonicalFireEvidence {
             tokens: tokens.clone(),
             kv_len: (1..=n).collect(),
@@ -1079,12 +1118,7 @@ mod tests {
     fn canonical_per_token_csr_derives_continuation_start() {
         let n = 5u32;
         let tokens: Vec<u32> = (100..100 + n).collect();
-        let request = crate::driver::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (16..16 + n).collect(),
-            qo_indptr: (0..=n).collect(),
-            ..crate::driver::LaunchPlan::default()
-        };
+        let request = per_token_lanes(&tokens, 16);
         let evidence = CanonicalFireEvidence {
             tokens: tokens.clone(),
             kv_len: (17..17 + n).collect(),
@@ -1106,12 +1140,7 @@ mod tests {
     fn in_band_skip_tokens_never_hash() {
         // -1 (0xFFFFFFFF) anywhere means this is not a plain append.
         let tokens = vec![1, u32::MAX, 3];
-        let request = crate::driver::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (0..3).collect(),
-            qo_indptr: vec![0, 3],
-            ..crate::driver::LaunchPlan::default()
-        };
+        let request = one_lane(&tokens, 0);
         let evidence = CanonicalFireEvidence {
             tokens,
             kv_len: vec![3],

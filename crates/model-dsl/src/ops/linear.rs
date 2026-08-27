@@ -31,21 +31,6 @@ pub fn lm_head(act: &Value, w: &Weight) -> Value {
     y
 }
 
-pub fn attention_landing(act: &Value, w: &Weight, layer: u32) -> Value {
-    let r = act.rec();
-    let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
-    r.push(
-        Linear::AttentionLanding {
-            act: act.id(),
-            w: r.weight(w),
-            layer,
-            y: y.id(),
-        },
-        &[act],
-    );
-    y
-}
-
 pub fn mlp_swiglu(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
@@ -243,6 +228,23 @@ pub fn moe_matmul_select_bias(
     y
 }
 
+/// The fold over a split-plane quantized bank with nothing added: the routed
+/// bias such an expert wants lands after the reduce, through `moe_bias_sum`.
+pub fn moe_matmul_select_quant(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
+    r.push(
+        Linear::MoeMatmulSelectQuant {
+            x: x.id(),
+            bank: r.weight(bank),
+            routes: routes.id(),
+            y: y.id(),
+        },
+        &[x, routes],
+    );
+    y
+}
+
 pub fn moe_weighted_sum(routed: &Value, weights: &Value) -> Value {
     let r = routed.rec();
     let y = r.fresh(tensor(Dim::Tokens, routed.width(), routed.dtype()));
@@ -253,6 +255,30 @@ pub fn moe_weighted_sum(routed: &Value, weights: &Value) -> Value {
             y: y.id(),
         },
         &[routed, weights],
+    );
+    y
+}
+
+/// Adds the routed bias mixture to an already-folded activation. The expert
+/// down-projection is rows-cut under tp, so each rank's routed matmul is a
+/// partial product and the all_reduce sums the ranks; a replicated bias folded
+/// into that matmul would be summed tp times. Routing comes from replicated
+/// inputs, so `routes` and `weights` are the same on every rank and the mixture
+/// can be said once, here, on the reduced row. At tp = 1 the value is
+/// unchanged — the routing weights sum to one — so the model text needs no
+/// branch.
+pub fn moe_bias_sum(x: &Value, bias: &Weight, routes: &Value, weights: &Value) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Linear::MoeBiasSum {
+            x: x.id(),
+            bias: r.weight(bias),
+            routes: routes.id(),
+            weights: weights.id(),
+            y: y.id(),
+        },
+        &[x, routes, weights],
     );
     y
 }

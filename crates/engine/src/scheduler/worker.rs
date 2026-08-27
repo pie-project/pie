@@ -6,9 +6,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::driver::{
-    BoundInstance, ChannelRegistrationPlan, DriverBackend, DriverId, InstanceBindingPlan,
-    PoolResizePlan, ProgramRegistration, RegisteredChannel, SchedulerLimits, StateCopyPlan,
-    SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
+    BoundInstance, ChannelJoin, ChannelRegistration, DriverBackend, DriverId,
+    InstanceBindingPlan, PoolResize, ProgramRegistration, RegisteredChannel, SchedulerLimits,
+    StateCopy, SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
@@ -251,10 +251,9 @@ static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,
-    pub(crate) request: crate::driver::LaunchPlan,
+    pub(crate) request: crate::driver::FireRequest,
     pub(crate) instance_id: u64,
     pub(crate) completion: WorkItemCompletion,
-    pub(crate) last_page_len: u32,
     /// The owning process. Process-wide suspend/terminate acts on every
     /// request with this identity.
     pub(crate) process_id: Option<ProcessId>,
@@ -263,8 +262,8 @@ pub(crate) struct PendingRequest {
     /// lane (and at k = 1 the synthesized single-slot stamp's lane).
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) prebuilt: bool,
-    pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-    pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
+    pub(crate) prelaunch_copy: Option<crate::driver::KvCopy>,
+    pub(crate) prelaunch_state_copy: Option<StateCopy>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
     /// At k = 1 the worker synthesizes a single-slot stamp at admission for
     /// every tracked fire (`lane` = `pipeline_id`, `seq` = the fire id).
@@ -289,15 +288,14 @@ impl PendingRequest {
                   same twelve fields"
     )]
     fn direct(
-        request: crate::driver::LaunchPlan,
+        request: crate::driver::FireRequest,
         instance_id: u64,
         completion: WorkItemCompletion,
-        last_page_len: u32,
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
         prebuilt: bool,
-        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-        prelaunch_state_copy: Option<StateCopyPlan>,
+        prelaunch_copy: Option<crate::driver::KvCopy>,
+        prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
         hook_program: bool,
         lora_program: bool,
@@ -308,7 +306,6 @@ impl PendingRequest {
             request,
             instance_id,
             completion,
-            last_page_len,
             process_id,
             pipeline_id,
             prebuilt,
@@ -321,12 +318,12 @@ impl PendingRequest {
     }
 
     pub(crate) fn wire_row_count(&self) -> usize {
-        self.request.qo_indptr.len().saturating_sub(1)
+        self.request.lanes.len()
     }
 
     fn requires_solo_submission(&self) -> bool {
         (self.prebuilt && self.pipeline_id.is_none())
-            || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
+            || (self.preserves_inner_rows() && self.request.tokens() == 0)
             || self.rs_batch_kind() == RsBatchKind::Solo
     }
 
@@ -343,13 +340,14 @@ impl PendingRequest {
     /// RS row cannot share with a row that has no RS binding at all, because
     /// the RS arrays are one-per-request and a partial batch does not resolve.
     fn rs_batch_kind(&self) -> RsBatchKind {
-        if self.request.rs_slot_ids.is_empty() {
+        if self.request.rs.slot_ids.is_empty() {
             return RsBatchKind::None;
         }
-        let indptr = &self.request.rs_buffer_slot_indptr;
+        let indptr = &self.request.rs.buffer_slot_indptr;
         let replays = self
             .request
-            .rs_slot_flags
+            .rs
+            .slot_flags
             .iter()
             .enumerate()
             .any(|(row, flags)| {
@@ -357,8 +355,8 @@ impl PendingRequest {
                     .get(row + 1)
                     .zip(indptr.get(row))
                     .is_some_and(|(end, begin)| end > begin);
-                span && flags & ::driver_api::RS_FLAG_FOLD != 0
-                    && flags & ::driver_api::RS_FLAG_BUFFER_WRITE == 0
+                span && flags & crate::driver::RS_FLAG_FOLD != 0
+                    && flags & crate::driver::RS_FLAG_BUFFER_WRITE == 0
             });
         if replays {
             RsBatchKind::Solo
@@ -437,8 +435,8 @@ pub(crate) struct LaunchGrouping {
 /// One token per row — the paged-decode-path shape, independent of
 /// `single_token_mode` (which a masked row clears to pick the mask-aware
 /// attention variant while still carrying exactly one token).
-fn one_token_rows(request: &crate::driver::LaunchPlan) -> bool {
-    request.qo_indptr.windows(2).all(|w| w[1] - w[0] == 1)
+fn one_token_rows(request: &crate::driver::FireRequest) -> bool {
+    request.lanes.iter().all(|lane| lane.tokens.len() == 1)
 }
 
 /// `PIE_WAVE_TRACE` — wave/enqueue observability, resolved once (this sits
@@ -471,8 +469,16 @@ pub(crate) fn wave_trace() -> bool {
 /// device-geometry wire-mask fires stay out of shared waves via the
 /// `wire_mask_on_device_geometry` clause in `accepts`, which is what
 /// keeps that test green.)
-fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
+fn has_dense_device_mask(request: &crate::driver::FireRequest) -> bool {
+    request.dense_device_mask || (request.has_user_mask && !has_wire_masks(request))
+}
+
+/// Whether this request lowered its mask to rows the host can see.
+///
+/// Was `!request.masks.is_empty()` on a flat mask vector; a mask lives on its
+/// LANE now (`Lane::mask`), so the question is whether any lane carries one.
+fn has_wire_masks(request: &crate::driver::FireRequest) -> bool {
+    request.lanes.iter().any(|lane| lane.mask.is_some())
 }
 
 impl LaunchGrouping {
@@ -517,7 +523,7 @@ impl LaunchGrouping {
         // path cannot merge it with another program.
         let masked_device_geometry = has_dense_device_mask(&request.request);
         let wire_mask_on_device_geometry = request.request.has_user_mask
-            && !request.request.masks.is_empty()
+            && has_wire_masks(&request.request)
             && request.request.device_resolved_geometry;
         if self.count != 0
             && (masked_device_geometry
@@ -674,11 +680,11 @@ enum SchedulerItem {
         response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     RegisterChannel {
-        plan: ChannelRegistrationPlan,
+        plan: ChannelRegistration,
         response: tokio::sync::oneshot::Sender<Result<RegisteredChannel>>,
     },
     RegisterChannels {
-        plans: Vec<ChannelRegistrationPlan>,
+        plans: Vec<ChannelRegistration>,
         response: tokio::sync::oneshot::Sender<Result<Vec<RegisteredChannel>>>,
     },
     BindInstance {
@@ -692,23 +698,23 @@ enum SchedulerItem {
     /// turnover control convoy (V6 iteration 25 attribution).
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
-        plans: Vec<ChannelRegistrationPlan>,
+        plans: Vec<ChannelRegistration>,
         /// Some on the program cache's first sight (the driver requires the
         /// instance's channels registered BEFORE the program — status -5
         /// otherwise — so registration must ride between channels and bind
         /// inside the one dispatch); None when the hash is already
-        /// registered, with `bind.program_id` carrying the cached id.
+        /// registered, with `bind.program_id()` carrying the cached id.
         program: Option<ProgramRegistration>,
         bind: InstanceBindingPlan,
         response:
             tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
     CopyKv {
-        plan: crate::driver::KvCopyPlan,
+        plan: crate::driver::KvCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CopyKvTracked {
-        plan: crate::driver::KvCopyPlan,
+        plan: crate::driver::KvCopy,
         completion: ControlCompletion,
     },
     // Only reached via `SchedulerHandle::copy_state`/`resize_pool`, which
@@ -717,12 +723,12 @@ enum SchedulerItem {
     // module doc for the full driver-ABI-completeness rationale.
     #[allow(dead_code)]
     CopyState {
-        plan: StateCopyPlan,
+        plan: StateCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     #[allow(dead_code)]
     ResizePool {
-        plan: PoolResizePlan,
+        plan: PoolResize,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
@@ -852,8 +858,8 @@ fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Wa
 
 #[derive(Clone)]
 enum PreLaunchCopy {
-    Kv(crate::driver::KvCopyPlan),
-    State(StateCopyPlan),
+    Kv(crate::driver::KvCopy),
+    State(StateCopy),
 }
 
 impl PreLaunchCopy {
@@ -903,7 +909,7 @@ impl PreLaunchCopy {
 /// discipline as the worker-inline call this replaces, with the backing
 /// requests kept alive in `in_flight_launches` until the frame retires
 /// (retire happens strictly after the lane's reply).
-struct LaneLaunch(crate::driver::FrameSubmission);
+struct LaneLaunch(crate::driver::FrameFire);
 unsafe impl Send for LaneLaunch {}
 
 /// Worker → lane requests, executed strictly in FIFO order.
@@ -963,7 +969,7 @@ enum LaneRequest {
     /// Drain marker: the lane replies with the driver and its channel set so
     /// the worker can run shutdown teardown with everything already quiesced.
     Shutdown {
-        response: crossbeam::channel::Sender<(Option<DriverBackend>, HashSet<u64>)>,
+        response: crossbeam::channel::Sender<(Option<DriverBackend>, ChannelJoin)>,
     },
 }
 
@@ -1085,7 +1091,7 @@ impl DriverLane {
         let (control_tx, control_rx) = crossbeam::channel::unbounded::<LaneRequest>();
         let thread = std::thread::Builder::new()
             .name(format!("pie-driver-{driver_idx}"))
-            .spawn(move || Self::run(driver, launch_rx, control_rx, reply_tx, stats))
+            .spawn(move || Self::run(driver_idx, driver, launch_rx, control_rx, reply_tx, stats))
             .expect("spawn pie-driver lane thread");
         Self {
             launch_tx,
@@ -1113,14 +1119,14 @@ impl DriverLane {
     /// Drain both queues and take the driver + channel set back for
     /// teardown. The worker only calls this with `lane_inflight == 0`, so
     /// both queues are empty and the Shutdown marker is the sole item.
-    fn shutdown(&mut self) -> (Option<DriverBackend>, HashSet<u64>) {
+    fn shutdown(&mut self) -> (Option<DriverBackend>, ChannelJoin) {
         let (response_tx, response_rx) = crossbeam::channel::bounded(1);
         let _ = self.control_tx.send(LaneRequest::Shutdown {
             response: response_tx,
         });
         let state = response_rx
             .recv()
-            .unwrap_or_else(|_| (None, HashSet::new()));
+            .unwrap_or_else(|_| (None, ChannelJoin::new()));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1182,13 +1188,28 @@ impl DriverLane {
     }
 
     fn run(
+        driver_idx: usize,
         mut driver: Option<DriverBackend>,
         launch_rx: crossbeam::channel::Receiver<LaneRequest>,
         control_rx: crossbeam::channel::Receiver<LaneRequest>,
         reply_tx: crossbeam::channel::Sender<SchedulerItem>,
         stats: Arc<SchedulerStats>,
     ) {
-        let mut channels: HashSet<u64> = HashSet::new();
+        let mut channels = ChannelJoin::new();
+        // **THIS THREAD IS THE ONE THAT DRIVES THE DEVICE.** The driver was
+        // opened and LOADED on the worker's boot thread and moved here; a
+        // shell with per-thread device state (`driver-cuda`'s `cudaSetDevice`
+        // — see `Driver::bind_thread`) has to hear about the hand-off, and
+        // this is the one instant at which it has happened and no verb has
+        // run yet. Every verb below runs on this thread and nowhere else.
+        //
+        // A refusal is not fatal HERE: it is the same refusal the first verb
+        // will answer with, and answering it there names the verb.
+        if let Some(driver) = driver.as_mut()
+            && let Err(error) = driver.bind_thread()
+        {
+            tracing::error!(driver_idx, %error, "driver lane could not bind its thread");
+        }
         while let Ok(request) = Self::next_request(&launch_rx, &control_rx) {
             let lane_began = Instant::now();
             let lane_was_control = matches!(request, LaneRequest::Control { .. });
@@ -1224,57 +1245,64 @@ impl DriverLane {
                         LaneRequest::Launch {
                             token, submission, ..
                         } => {
-                            let LaneLaunch(submission) = submission;
-                            // Folded admission (ABI v14): EXHAUSTED retries in place —
+                            let LaneLaunch(frame) = submission;
+                            // Folded admission: EXHAUSTED retries in place —
                             // the lane is FIFO, so retrying here preserves global
                             // frame order (later frames must not overtake), and the
                             // physical pool frees resolve on the driver's own
                             // completion threads, never on this lane. Bounded so a
                             // wedged pool converges to a loud failure.
+                            //
+                            // WHAT CHANGED: the two outcomes are ERROR VARIANTS
+                            // now, not `Ok` shapes. `FrameLaunchOutcome::{Exhausted,
+                            // Impossible}` are `DriverError::{Exhausted, Impossible}`
+                            // and `DriverError::is_scheduling` is the one predicate
+                            // that tells them from a fault — which is exactly how
+                            // the contract's own header says to read them. Keeping
+                            // them as errors rather than a third `Ok` shape is what
+                            // makes a caller that ignores the distinction fail
+                            // loudly instead of silently dropping a submission.
+                            //
+                            // A FRAME IS ITS STEPS, FIRED IN ORDER. `Driver::fire`
+                            // takes one `FireSubmission`; a frame's k steps were
+                            // always sequential on one device, and the loop is what
+                            // the driver's own `launch` did with `frame.steps`.
                             const EXHAUSTED_RETRY_SLEEP: Duration = Duration::from_micros(200);
                             const EXHAUSTED_RETRY_MAX: u32 = 25_000; // ~5 s
-                            let result =
-                                match driver.as_mut() {
-                                    Some(driver) => {
-                                        crate::probe_fire!(stats.fire.execute.driver_fire_us, {
-                                            let mut attempts = 0u32;
-                                            loop {
-                                                match driver.launch(&submission) {
-                                    Ok(crate::driver::FrameLaunchOutcome::Launched(completion)) => {
-                                        break Ok(completion);
-                                    }
-                                    Ok(crate::driver::FrameLaunchOutcome::Exhausted) => {
-                                        attempts += 1;
-                                        if attempts == 1 || attempts.is_multiple_of(1000) {
-                                            tracing::warn!(
-                                                attempts,
-                                                "frame admission exhausted; lane retrying"
-                                            );
-                                        }
-                                        if attempts > EXHAUSTED_RETRY_MAX {
-                                            break Err("frame admission exhausted beyond deadline"
-                                                .to_string());
-                                        }
-                                        std::thread::sleep(EXHAUSTED_RETRY_SLEEP);
-                                    }
-                                    Ok(crate::driver::FrameLaunchOutcome::Impossible) => {
-                                        break Err(
-                                            "frame exceeds the driver's physical budget ceiling"
-                                                .to_string(),
-                                        );
-                                    }
-                                    Err(err) => break Err(format!("{err:#}")),
+                            let result = match driver.as_mut() {
+                                Some(driver) => {
+                                    crate::probe_fire!(stats.fire.execute.driver_fire_us, {
+                                        Self::fire_frame(
+                                            driver,
+                                            &channels,
+                                            &frame,
+                                            EXHAUSTED_RETRY_SLEEP,
+                                            EXHAUSTED_RETRY_MAX,
+                                        )
+                                    })
                                 }
-                                            }
-                                        })
-                                    }
-                                    None => Err("driver has no backend installed".to_string()),
-                                };
+                                None => Err("driver has no backend installed".to_string()),
+                            };
+                            if let Err(reason) = &result {
+                                // EVERY CELL THE FRAME OWNS, FAILED. The driver used
+                                // to publish these itself across the ABI; it answers
+                                // a `Result` now, so the engine writes them — and a
+                                // frame that never reached the device must still
+                                // settle, or its work items park forever (the
+                                // 850-second hang `settle_control` was written for).
+                                let _ = reason;
+                                let cells: Vec<_> = frame.terminal_cells().collect();
+                                crate::driver::completion::settle(
+                                    &cells,
+                                    crate::driver::completion::TERMINAL_OUTCOME_FAILED,
+                                );
+                            }
                             let _ = reply_tx
                                 .send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
                         }
                         LaneRequest::Control { token, item } => {
-                            let commit = Self::execute_control(&mut driver, &mut channels, *item);
+                            let commit =
+                                Self::execute_control(driver_idx, &mut driver, &mut channels, *item);
                             let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
                                 token,
                                 commit,
@@ -1321,13 +1349,13 @@ impl DriverLane {
         control_rx: &crossbeam::channel::Receiver<LaneRequest>,
         reply_tx: &crossbeam::channel::Sender<SchedulerItem>,
         driver: Option<DriverBackend>,
-        channels: HashSet<u64>,
+        channels: ChannelJoin,
     ) {
         std::mem::forget(driver);
         drop(channels);
         while let Ok(request) = Self::next_request(launch_rx, control_rx) {
             if let LaneRequest::Shutdown { response } = request {
-                let _ = response.send((None, HashSet::new()));
+                let _ = response.send((None, ChannelJoin::new()));
                 return;
             }
             Owed::of(&request).answer(reply_tx, "the driver lane is down after a panic");
@@ -1339,9 +1367,97 @@ impl DriverLane {
     /// with worker-map effects returned as a [`LaneCommit`]. Failures respond
     /// directly from here (after lane-side rollback) — only effects that
     /// must be ordered with worker state travel back.
+    /// Fire one frame's steps in order, settling each step's cells.
+    ///
+    /// Answers the frame's completion, or the sentence that failed it. The
+    /// retry is per STEP because that is what the refusal is about: a step
+    /// that does not fit now may fit once an earlier one's pages are freed,
+    /// and the ones already fired are already committed.
+    fn fire_frame(
+        driver: &mut DriverBackend,
+        channels: &ChannelJoin,
+        frame: &crate::driver::FrameFire,
+        retry_sleep: Duration,
+        retry_max: u32,
+    ) -> std::result::Result<SubmissionCompletion, String> {
+        use crate::driver::completion;
+
+        for step in &frame.steps {
+            let mut attempts = 0u32;
+            loop {
+                // ── THE CHANNEL JOIN, IN (`palo B2`). Every cell the guest
+                //    put into a host ring since the last fire crosses into
+                //    the device ring the attached instance's pass reads. It
+                //    runs INSIDE the retry loop and not before it because a
+                //    fire that answered `Exhausted` did not consume anything,
+                //    and the guest may have published more in the meantime —
+                //    which is, for a blocked guest program, exactly what
+                //    unblocks the retry.
+                for attachment in &step.submission.attachments {
+                    if let Err(error) = channels.pump_in(driver.as_mut(), attachment.instance) {
+                        return Err(format!("channel publish: {error}"));
+                    }
+                }
+                match driver.fire(&step.submission) {
+                    Ok(_ticket) => {
+                        // ── AND OUT, only now. `Driver::fire` answered `Ok`,
+                        //    so every attached pass COMMITTED — a blocked or
+                        //    declined one is an error, and a fire that never
+                        //    committed has nothing to take. This is where the
+                        //    pass-atomic contract becomes visible to the
+                        //    guest: its `channel.take` sees the cells of a
+                        //    fire that finished, and never of one that did
+                        //    not.
+                        for attachment in &step.submission.attachments {
+                            if let Err(error) =
+                                channels.pump_out(driver.as_mut(), attachment.instance)
+                            {
+                                return Err(format!("channel take: {error}"));
+                            }
+                        }
+                        // THE TICKET IS THE RECEIPT AND THE SHELLS ARE
+                        // SYNCHRONOUS: the eager walk completed before `fire`
+                        // returned, so the work item is committed the moment
+                        // this arm is reached. An asynchronous shell answers
+                        // with an empty readout list and `FireTicket::id`,
+                        // and settling on that id is what the broker here is
+                        // for — the seam is named, not built, because no
+                        // shell in this workspace needs it yet.
+                        completion::settle(
+                            &step.terminal_cells,
+                            completion::TERMINAL_OUTCOME_SUCCESS,
+                        );
+                        break;
+                    }
+                    Err(error) if error.is_scheduling() => {
+                        // `Exhausted` retries; `Impossible` does not, and the
+                        // difference is a ceiling the load was baked against
+                        // against a pool that is full right now.
+                        if matches!(error, driver_api::DriverError::Impossible(_)) {
+                            return Err(format!("{error}"));
+                        }
+                        attempts += 1;
+                        if attempts == 1 || attempts.is_multiple_of(1000) {
+                            tracing::warn!(attempts, %error, "frame admission exhausted; lane retrying");
+                        }
+                        if attempts > retry_max {
+                            return Err(format!(
+                                "frame admission exhausted beyond deadline: {error}"
+                            ));
+                        }
+                        std::thread::sleep(retry_sleep);
+                    }
+                    Err(error) => return Err(format!("{error}")),
+                }
+            }
+        }
+        Ok(SubmissionCompletion::ready())
+    }
+
     fn execute_control(
+        driver_idx: usize,
         driver: &mut Option<DriverBackend>,
-        channels: &mut HashSet<u64>,
+        channels: &mut ChannelJoin,
         item: QueuedItem,
     ) -> LaneCommit {
         match item {
@@ -1372,10 +1488,10 @@ impl DriverLane {
                 let operation = plan.label();
                 match driver.as_mut() {
                     Some(driver) => {
-                        let submitted = match plan {
+                        let submitted = crate::driver::verbs::settled(match plan {
                             PreLaunchCopy::Kv(plan) => driver.copy_kv(&plan),
                             PreLaunchCopy::State(plan) => driver.copy_state(&plan),
-                        };
+                        });
                         match submitted {
                             Ok(completion) => LaneCommit::AsyncControl {
                                 result: Ok(completion),
@@ -1412,9 +1528,9 @@ impl DriverLane {
                     // the driver layer, which had to reach into
                     // `crate::pipeline` to do it -- against its own header.
                     Some(driver) => {
-                        let backend = driver.codegen_backend();
+                        let backend = crate::driver::verbs::codegen_backend(driver);
                         let plan = crate::pipeline::program::with_host_codegen(&plan, backend);
-                        driver.register_program(&plan)
+                        driver.register_program(&plan).map_err(anyhow::Error::from)
                     }
                     None => Err(anyhow!("driver has no backend installed")),
                 };
@@ -1439,17 +1555,20 @@ impl DriverLane {
                     Self::release_channel_plan_wait_slots(std::slice::from_ref(&plan));
                     tracing::warn!(
                         operation = "register_channel",
-                        channel_id = plan.channel_id,
+                        channel_id = plan.id,
                         "scheduler RPC cancelled before resource creation"
                     );
                     return LaneCommit::None;
                 }
-                let result = if channels.contains(&plan.channel_id) {
-                    Err(anyhow!("channel {} is already registered", plan.channel_id))
+                let result = if channels.contains(plan.id) {
+                    Err(anyhow!("channel {} is already registered", plan.id))
                 } else {
                     match driver.as_mut() {
-                        Some(driver) => driver.register_channel(&plan).inspect(|_channel| {
-                            channels.insert(plan.channel_id);
+                        Some(driver) => crate::driver::verbs::register_channel(
+                            driver, driver_idx, &plan,
+                        )
+                        .inspect(|channel| {
+                            channels.insert(channel.clone(), plan.host_role);
                         }),
                         None => Err(anyhow!("driver has no backend installed")),
                     }
@@ -1489,7 +1608,7 @@ impl DriverLane {
                     return LaneCommit::None;
                 }
                 let result = match driver.as_mut() {
-                    Some(driver) => Self::register_channel_set(driver, channels, &plans),
+                    Some(driver) => Self::register_channel_set(driver, driver_idx, channels, &plans),
                     None => Err(anyhow!("driver has no backend installed")),
                 };
                 match result {
@@ -1524,18 +1643,27 @@ impl DriverLane {
                     DriverLane::release_wait_slots([plan.pacing_wait_id]);
                     tracing::warn!(
                         operation = "bind_instance",
-                        requested_instance_id = plan.requested_instance_id,
+                        program_id = plan.program_id(),
                         "scheduler RPC cancelled before resource creation"
                     );
                     return LaneCommit::BindFinished { pipeline_id };
                 }
                 match driver.as_mut() {
-                    Some(driver) => match driver.bind_instance(&plan) {
-                        Ok(bound) => LaneCommit::BindInstance {
-                            pipeline_id,
-                            bound,
-                            respond: BindRespond::Bind(response),
-                        },
+                    Some(driver) => match driver.bind_instance(&plan.binding).map(|bound| crate::driver::BoundInstance::new(plan.driver_id, &bound, plan.pacing_wait_id)).map_err(anyhow::Error::from) {
+                        Ok(bound) => {
+                            // WHICH CHANNEL IS WHICH DENSE SLOT, kept for the
+                            // pump. `InstanceBinding::channels` is the
+                            // package's declaration order, which is the
+                            // numbering `publish_channel`/`take_channel`
+                            // address, and the lane is the only party that
+                            // sees both it and the driver.
+                            channels.bind(bound.instance_id, plan.binding.channels.clone());
+                            LaneCommit::BindInstance {
+                                pipeline_id,
+                                bound,
+                                respond: BindRespond::Bind(response),
+                            }
+                        }
                         Err(error) => {
                             if response.send(Err(error)).is_err() {
                                 DriverLane::release_wait_slots([plan.pacing_wait_id]);
@@ -1566,7 +1694,7 @@ impl DriverLane {
                     DriverLane::release_wait_slots([bind.pacing_wait_id]);
                     tracing::warn!(
                         operation = "register_channels_bind",
-                        requested_instance_id = bind.requested_instance_id,
+                        program_id = bind.program_id(),
                         "scheduler RPC cancelled before resource creation"
                     );
                     return LaneCommit::BindFinished { pipeline_id };
@@ -1581,7 +1709,7 @@ impl DriverLane {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 };
-                let registered = match Self::register_channel_set(driver, channels, &plans) {
+                let registered = match Self::register_channel_set(driver, driver_idx, channels, &plans) {
                     Ok(registered) => registered,
                     Err(error) => {
                         if response.send(Err(error)).is_err() {
@@ -1605,10 +1733,10 @@ impl DriverLane {
                 }
                 let program_registered = program.is_some();
                 if let Some(plan) = &program {
-                    let backend = driver.codegen_backend();
+                    let backend = crate::driver::verbs::codegen_backend(driver);
                     let plan = &crate::pipeline::program::with_host_codegen(plan, backend);
-                    match driver.register_program(plan) {
-                        Ok(program_id) => bind.program_id = program_id,
+                    match driver.register_program(plan).map_err(anyhow::Error::from) {
+                        Ok(program_id) => bind.binding.program = program_id,
                         Err(error) => {
                             Self::rollback_channel_set(
                                 driver,
@@ -1638,23 +1766,28 @@ impl DriverLane {
                     if program_registered {
                         tracing::warn!(
                             operation = "register_channels_bind",
-                            program_id = bind.program_id,
+                            program_id = bind.program_id(),
                             "scheduler RPC cancelled after program registration; retaining driver-lifetime program"
                         );
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 }
-                match driver.bind_instance(&bind) {
-                    Ok(bound) => LaneCommit::BindInstance {
-                        pipeline_id,
-                        bound,
-                        respond: BindRespond::ChannelsBind {
-                            registered,
-                            program_id: bind.program_id,
-                            program_registered,
-                            response,
-                        },
-                    },
+                match driver.bind_instance(&bind.binding).map(|bound| crate::driver::BoundInstance::new(bind.driver_id, &bound, bind.pacing_wait_id)).map_err(anyhow::Error::from) {
+                    Ok(bound) => {
+                        // As the `BindInstance` arm above: the dense channel
+                        // order the pump addresses by.
+                        channels.bind(bound.instance_id, bind.binding.channels.clone());
+                        LaneCommit::BindInstance {
+                            pipeline_id,
+                            bound,
+                            respond: BindRespond::ChannelsBind {
+                                registered,
+                                program_id: bind.program_id(),
+                                program_registered,
+                                response,
+                            },
+                        }
+                    }
                     Err(error) => {
                         Self::rollback_channel_set(
                             driver,
@@ -1672,7 +1805,7 @@ impl DriverLane {
                 }
             }
             QueuedItem::CopyKv { plan, response } => match driver.as_mut() {
-                Some(driver) => match driver.copy_kv(&plan) {
+                Some(driver) => match crate::driver::verbs::settled(driver.copy_kv(&plan)) {
                     Ok(completion) => {
                         let _ = response.send(Ok(completion.clone()));
                         LaneCommit::AsyncControl {
@@ -1695,7 +1828,7 @@ impl DriverLane {
                 }
             },
             QueuedItem::CopyKvTracked { plan, completion } => match driver.as_mut() {
-                Some(driver) => match driver.copy_kv(&plan) {
+                Some(driver) => match crate::driver::verbs::settled(driver.copy_kv(&plan)) {
                     Ok(native_completion) => LaneCommit::AsyncControl {
                         result: Ok(native_completion),
                     },
@@ -1715,7 +1848,7 @@ impl DriverLane {
                 }
             },
             QueuedItem::CopyState { plan, response } => match driver.as_mut() {
-                Some(driver) => match driver.copy_state(&plan) {
+                Some(driver) => match crate::driver::verbs::settled(driver.copy_state(&plan)) {
                     Ok(completion) => {
                         let _ = response.send(Ok(completion.clone()));
                         LaneCommit::AsyncControl {
@@ -1738,7 +1871,7 @@ impl DriverLane {
                 }
             },
             QueuedItem::ResizePool { plan, response } => match driver.as_mut() {
-                Some(driver) => match driver.resize_pool(&plan) {
+                Some(driver) => match crate::driver::verbs::settled(driver.resize_pool(&plan)) {
                     Ok(completion) => {
                         let _ = response.send(Ok(completion.clone()));
                         LaneCommit::AsyncControl {
@@ -1763,8 +1896,11 @@ impl DriverLane {
             QueuedItem::CloseInstance { id, .. } => match driver.as_mut() {
                 // The worker already gated existence/pacing/quiescence before
                 // posting; the map removal happens at commit.
-                Some(driver) => match driver.close_instance(id) {
-                    Ok(()) => LaneCommit::CloseInstance { id },
+                Some(driver) => match driver.close_instance(id).map_err(anyhow::Error::from) {
+                    Ok(()) => {
+                        channels.unbind(id);
+                        LaneCommit::CloseInstance { id }
+                    }
                     Err(err) => {
                         tracing::warn!(instance_id = id, ?err, "scheduler close_instance failed");
                         LaneCommit::None
@@ -1777,12 +1913,12 @@ impl DriverLane {
             },
             QueuedItem::CloseChannels { ids } => {
                 for id in ids {
-                    let result = if !channels.contains(&id) {
+                    let result = if !channels.contains(id) {
                         Err(anyhow!("channel {id} is unknown or stale"))
                     } else {
                         match driver.as_mut() {
-                            Some(driver) => driver.close_channel(id).map(|()| {
-                                channels.remove(&id);
+                            Some(driver) => Self::close_channel(driver, id).map(|()| {
+                                channels.remove(id);
                             }),
                             None => Err(anyhow!("driver has no backend installed")),
                         }
@@ -1796,33 +1932,57 @@ impl DriverLane {
         }
     }
 
+    /// Close one channel on the driver, tolerating the shell that has no
+    /// standalone channel to close.
+    ///
+    /// **BINDING IS REGISTRATION FOR A SHELL WHOSE RINGS ARE ITS INSTANCES'**
+    /// (`Driver::register_channel`'s own doc, and `verbs::register_channel`
+    /// tolerates the same refusal on the way in). Such a shell allocated
+    /// nothing for a bare channel id and frees nothing for it, so
+    /// `Unsupported` here means the close SUCCEEDED as far as anything the
+    /// driver owns is concerned — and treating it as a failure would leave
+    /// the engine's own ring in the lane's table forever, held alive by an
+    /// error it re-logs on every teardown.
+    fn close_channel(driver: &mut DriverBackend, id: u64) -> Result<()> {
+        match driver.close_channel(id) {
+            Ok(()) | Err(driver_api::DriverError::Unsupported { .. }) => Ok(()),
+            Err(error) => Err(anyhow::Error::from(error)),
+        }
+    }
+
     /// Register a set of channels with all-or-nothing rollback (the shared
     /// body of `RegisterChannels` and `RegisterChannelsBind`).
+    ///
     fn register_channel_set(
         driver: &mut DriverBackend,
-        channels: &mut HashSet<u64>,
-        plans: &[ChannelRegistrationPlan],
+        driver_idx: usize,
+        channels: &mut ChannelJoin,
+        plans: &[ChannelRegistration],
     ) -> Result<Vec<RegisteredChannel>> {
         let mut registered = Vec::with_capacity(plans.len());
         let mut registered_ids = Vec::with_capacity(plans.len());
         for plan in plans {
-            if channels.contains(&plan.channel_id) {
+            if channels.contains(plan.id) {
                 for channel_id in registered_ids.iter().rev() {
                     let _ = driver.close_channel(*channel_id);
-                    channels.remove(channel_id);
+                    channels.remove(*channel_id);
                 }
-                return Err(anyhow!("channel {} is already registered", plan.channel_id));
+                return Err(anyhow!("channel {} is already registered", plan.id));
             }
-            match driver.register_channel(plan) {
+            match crate::driver::verbs::register_channel(driver, driver_idx, plan) {
                 Ok(channel) => {
-                    channels.insert(plan.channel_id);
-                    registered_ids.push(plan.channel_id);
+                    // THE RING, THE ROLE AND THE ID, all three kept: the pump
+                    // that joins this host ring to the device half needs to
+                    // know where the cells are and which way they travel, and
+                    // both facts are in hand exactly here.
+                    channels.insert(channel.clone(), plan.host_role);
+                    registered_ids.push(plan.id);
                     registered.push(channel);
                 }
                 Err(cause) => {
                     for channel_id in registered_ids.iter().rev() {
                         let _ = driver.close_channel(*channel_id);
-                        channels.remove(channel_id);
+                        channels.remove(*channel_id);
                     }
                     return Err(cause);
                 }
@@ -1833,16 +1993,16 @@ impl DriverLane {
 
     fn rollback_channel_set(
         driver: &mut DriverBackend,
-        channels: &mut HashSet<u64>,
+        channels: &mut ChannelJoin,
         registered: &[RegisteredChannel],
         operation: &'static str,
         cancellation: bool,
     ) {
         for channel in registered.iter().rev() {
             let channel_id = channel.binding.channel_id;
-            match driver.close_channel(channel_id) {
+            match Self::close_channel(driver, channel_id) {
                 Ok(()) => {
-                    channels.remove(&channel_id);
+                    channels.remove(channel_id);
                 }
                 Err(error) => {
                     tracing::error!(
@@ -1863,12 +2023,16 @@ impl DriverLane {
         );
     }
 
-    fn release_channel_plan_wait_slots(plans: &[ChannelRegistrationPlan]) {
-        Self::release_wait_slots(
-            plans
-                .iter()
-                .flat_map(|plan| [plan.reader_wait_id, plan.writer_wait_id]),
-        );
+    /// **NOTHING TO RELEASE ANY MORE, AND THAT IS THE POINT.** A
+    /// registration used to CARRY its two wait slots — the engine allocated
+    /// them and handed them across so a C driver could publish into them — so
+    /// a cancelled registration had to give them back. The contract's
+    /// `RegisteredChannel` ANSWERS them, which means an unregistered channel
+    /// never allocated any. Kept as a named no-op because the cancellation
+    /// paths read as a pair with `release_registered_channel_wait_slots`,
+    /// which still has real work.
+    fn release_channel_plan_wait_slots(plans: &[ChannelRegistration]) {
+        let _ = plans;
     }
 
     fn release_registered_channel_wait_slots(registered: &[RegisteredChannel]) {
@@ -1908,11 +2072,11 @@ enum QueuedItem {
         response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     RegisterChannel {
-        plan: ChannelRegistrationPlan,
+        plan: ChannelRegistration,
         response: tokio::sync::oneshot::Sender<Result<RegisteredChannel>>,
     },
     RegisterChannels {
-        plans: Vec<ChannelRegistrationPlan>,
+        plans: Vec<ChannelRegistration>,
         response: tokio::sync::oneshot::Sender<Result<Vec<RegisteredChannel>>>,
     },
     BindInstance {
@@ -1926,31 +2090,31 @@ enum QueuedItem {
     /// turnover control convoy (V6 iteration 25 attribution).
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
-        plans: Vec<ChannelRegistrationPlan>,
+        plans: Vec<ChannelRegistration>,
         /// Some on the program cache's first sight (the driver requires the
         /// instance's channels registered BEFORE the program — status -5
         /// otherwise — so registration must ride between channels and bind
         /// inside the one dispatch); None when the hash is already
-        /// registered, with `bind.program_id` carrying the cached id.
+        /// registered, with `bind.program_id()` carrying the cached id.
         program: Option<ProgramRegistration>,
         bind: InstanceBindingPlan,
         response:
             tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
     CopyKv {
-        plan: crate::driver::KvCopyPlan,
+        plan: crate::driver::KvCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CopyKvTracked {
-        plan: crate::driver::KvCopyPlan,
+        plan: crate::driver::KvCopy,
         completion: ControlCompletion,
     },
     CopyState {
-        plan: StateCopyPlan,
+        plan: StateCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     ResizePool {
-        plan: PoolResizePlan,
+        plan: PoolResize,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
@@ -2331,7 +2495,7 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<HashMap<u64, (u64, ::driver_api::plan::LaunchPackage)>>,
+    program_ids: Mutex<HashMap<u64, (u64, ::driver_api::program::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     /// Which memory this driver's KV pages live in.
@@ -2340,7 +2504,7 @@ struct SchedulerControl {
     /// handle and no driver id, and a `KvCopyPlan` they build has to name the
     /// right memory. See `scheduler::device_domain` for what naming the wrong
     /// one cost.
-    device_domain: ::driver_api::DeviceDomain,
+    device_domain: ::driver_api::MemoryDomain,
 }
 
 #[derive(Clone)]
@@ -2350,7 +2514,7 @@ pub(crate) struct SchedulerHandle {
 
 impl SchedulerHandle {
     /// The memory this scheduler's driver keeps its KV pages in.
-    pub(crate) fn device_domain(&self) -> ::driver_api::DeviceDomain {
+    pub(crate) fn device_domain(&self) -> ::driver_api::MemoryDomain {
         self.inner.device_domain
     }
 
@@ -2417,20 +2581,18 @@ impl SchedulerHandle {
     )]
     pub fn submit_with_identity_and_copy(
         &self,
-        request: crate::driver::LaunchPlan,
+        request: crate::driver::FireRequest,
         instance_id: u64,
         completion: WorkItemCompletion,
-        last_page_len: u32,
         pipeline_id: Option<ProcessId>,
-        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-        prelaunch_state_copy: Option<StateCopyPlan>,
+        prelaunch_copy: Option<crate::driver::KvCopy>,
+        prelaunch_state_copy: Option<StateCopy>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
                 completion,
-                last_page_len,
                 pipeline_id,
                 pipeline_id,
                 false,
@@ -2445,19 +2607,17 @@ impl SchedulerHandle {
 
     pub fn submit_prebuilt_with_copy(
         &self,
-        request: crate::driver::LaunchPlan,
+        request: crate::driver::FireRequest,
         instance_id: u64,
         completion: WorkItemCompletion,
-        last_page_len: u32,
-        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-        prelaunch_state_copy: Option<StateCopyPlan>,
+        prelaunch_copy: Option<crate::driver::KvCopy>,
+        prelaunch_state_copy: Option<StateCopy>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
                 completion,
-                last_page_len,
                 None,
                 None,
                 true,
@@ -2473,14 +2633,13 @@ impl SchedulerHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn submit_prebuilt_tracked_with_copy(
         &self,
-        request: crate::driver::LaunchPlan,
+        request: crate::driver::FireRequest,
         instance_id: u64,
         completion: WorkItemCompletion,
-        last_page_len: u32,
         process_id: ProcessId,
         pipeline_id: ProcessId,
-        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-        prelaunch_state_copy: Option<StateCopyPlan>,
+        prelaunch_copy: Option<crate::driver::KvCopy>,
+        prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
         hook_program: bool,
         lora_program: bool,
@@ -2490,7 +2649,6 @@ impl SchedulerHandle {
                 request,
                 instance_id,
                 completion,
-                last_page_len,
                 Some(process_id),
                 Some(pipeline_id),
                 true,
@@ -2539,18 +2697,30 @@ impl SchedulerHandle {
         Ok(program_id)
     }
 
+    /// `driver_id` is an ARGUMENT NOW, because the ring is the engine's.
+    ///
+    /// A registration used to carry it (`ChannelRegistrationPlan::driver_id`)
+    /// so the driver could stamp it back onto the answer; the contract's
+    /// `ChannelRegistration` states only what a driver needs, and the field
+    /// that says which registry slot a channel's endpoint belongs to is the
+    /// engine's own.
     pub async fn register_channel(
         &self,
-        plan: ChannelRegistrationPlan,
+        driver_id: crate::driver::DriverId,
+        plan: ChannelRegistration,
     ) -> Result<RegisteredChannel> {
+        let _ = driver_id;
         self.request(|response| SchedulerItem::RegisterChannel { plan, response })
             .await?
     }
 
+    /// As [`SchedulerHandle::register_channel`], for a set.
     pub async fn register_channels(
         &self,
-        plans: Vec<ChannelRegistrationPlan>,
+        driver_id: crate::driver::DriverId,
+        plans: Vec<ChannelRegistration>,
     ) -> Result<Vec<RegisteredChannel>> {
+        let _ = driver_id;
         self.request(|response| SchedulerItem::RegisterChannels { plans, response })
             .await?
     }
@@ -2571,10 +2741,12 @@ impl SchedulerHandle {
     pub async fn register_channels_bind(
         &self,
         pipeline_id: Option<ProcessId>,
-        plans: Vec<ChannelRegistrationPlan>,
+        driver_id: crate::driver::DriverId,
+        plans: Vec<ChannelRegistration>,
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
     ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
+        let _ = driver_id;
         let program_hash = program.program_hash;
         let cached = {
             let program_ids = self.inner.program_ids.lock().unwrap();
@@ -2590,7 +2762,7 @@ impl SchedulerHandle {
         };
         let (program_field, cache_fill) = match cached {
             Some(program_id) => {
-                bind.program_id = program_id;
+                bind.binding.program = program_id;
                 (None, None)
             }
             None => (Some(program.clone()), Some(program.launch)),
@@ -2614,14 +2786,14 @@ impl SchedulerHandle {
         Ok((registered, bound))
     }
 
-    pub async fn copy_kv(&self, plan: crate::driver::KvCopyPlan) -> Result<SubmissionCompletion> {
+    pub async fn copy_kv(&self, plan: crate::driver::KvCopy) -> Result<SubmissionCompletion> {
         self.request(|response| SchedulerItem::CopyKv { plan, response })
             .await?
     }
 
     pub(crate) fn copy_kv_tracked(
         &self,
-        plan: crate::driver::KvCopyPlan,
+        plan: crate::driver::KvCopy,
     ) -> Result<ControlCompletion> {
         let completion = ControlCompletion::new();
         self.send(SchedulerItem::CopyKvTracked {
@@ -2646,13 +2818,13 @@ impl SchedulerHandle {
     // (not yet issued by the mock-driver fire path) and this module's own
     // unit tests — see `scheduler::dispatch`'s module doc.
     #[allow(dead_code)]
-    pub async fn copy_state(&self, plan: StateCopyPlan) -> Result<SubmissionCompletion> {
+    pub async fn copy_state(&self, plan: StateCopy) -> Result<SubmissionCompletion> {
         self.request(|response| SchedulerItem::CopyState { plan, response })
             .await?
     }
 
     #[allow(dead_code)]
-    pub async fn resize_pool(&self, plan: PoolResizePlan) -> Result<SubmissionCompletion> {
+    pub async fn resize_pool(&self, plan: PoolResize) -> Result<SubmissionCompletion> {
         self.request(|response| SchedulerItem::ResizePool { plan, response })
             .await?
     }
@@ -3343,7 +3515,7 @@ impl BatchScheduler {
                             launch.logical_fire_id,
                             launch.frame.is_some(),
                             launch.request.has_user_mask,
-                            launch.request.masks.len(),
+                            has_wire_masks(&launch.request),
                             launch.request.single_token_mode,
                             launch.pipeline_id.is_some()
                         );
@@ -3353,7 +3525,7 @@ impl BatchScheduler {
                             stamp,
                             launch.process_id,
                             launch.logical_fire_id,
-                            launch.request.token_ids.len(),
+                            launch.request.tokens(),
                             launch.wire_row_count(),
                         );
                     }
@@ -3967,7 +4139,12 @@ impl BatchScheduler {
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
         in_flight_control: &mut InFlightControls,
-        frame_policy: &mut FramePolicy,
+        // Read by the two "instance is already bound" refusals that stood in
+        // the match below and are unreachable now (see the note there): both
+        // told the frame policy their bind had completed. Kept in the
+        // signature because every caller passes it and the next refusal that
+        // needs it will be one of these.
+        _frame_policy: &mut FramePolicy,
         item: QueuedItem,
     ) {
         match &item {
@@ -4000,57 +4177,14 @@ impl BatchScheduler {
                     return;
                 }
             }
-            QueuedItem::BindInstance { plan, .. }
-                if plan.requested_instance_id != 0
-                    && instances.contains_key(&plan.requested_instance_id) =>
-            {
-                let QueuedItem::BindInstance {
-                    pipeline_id,
-                    plan,
-                    response,
-                } = item
-                else {
-                    unreachable!();
-                };
-                if response
-                    .send(Err(anyhow!(
-                        "instance {} is already bound",
-                        plan.requested_instance_id
-                    )))
-                    .is_err()
-                {
-                    DriverLane::release_wait_slots([plan.pacing_wait_id]);
-                }
-                frame_policy.on_bind_completed(pipeline_id);
-                return;
-            }
-            QueuedItem::RegisterChannelsBind { bind, .. }
-                if bind.requested_instance_id != 0
-                    && instances.contains_key(&bind.requested_instance_id) =>
-            {
-                let QueuedItem::RegisterChannelsBind {
-                    pipeline_id,
-                    plans,
-                    bind,
-                    response,
-                    ..
-                } = item
-                else {
-                    unreachable!();
-                };
-                if response
-                    .send(Err(anyhow!(
-                        "instance {} is already bound",
-                        bind.requested_instance_id
-                    )))
-                    .is_err()
-                {
-                    DriverLane::release_channel_plan_wait_slots(&plans);
-                    DriverLane::release_wait_slots([bind.pacing_wait_id]);
-                }
-                frame_policy.on_bind_completed(pipeline_id);
-                return;
-            }
+            // THE "ALREADY BOUND" GUARDS STOOD HERE, both of them, and both
+            // are unreachable now. They rejected a bind whose
+            // `requested_instance_id` was already in the instance map — a
+            // check that only meant anything while the ENGINE chose the id
+            // and handed it across for the driver to acknowledge. The driver
+            // mints it (`driver-api::program`'s note on `InstanceBinding`:
+            // "the driver mints the id; the engine keeps its own tables"), so
+            // a collision is not something a caller can ask for.
             _ => {}
         }
         *lane_token += 1;
@@ -4504,7 +4638,7 @@ impl BatchScheduler {
         let batch_size = requests.len() as u64;
         let total_tokens = requests
             .iter()
-            .map(|req| req.request.token_ids.len())
+            .map(|req| req.request.tokens())
             .sum::<usize>();
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
@@ -4890,8 +5024,8 @@ impl BatchScheduler {
         }
     }
 
-    fn shutdown_channels(driver: &mut Option<DriverBackend>, channels: &mut HashSet<u64>) {
-        let outstanding = std::mem::take(channels);
+    fn shutdown_channels(driver: &mut Option<DriverBackend>, channels: &mut ChannelJoin) {
+        let outstanding = std::mem::take(channels).into_ids();
         for channel_id in outstanding {
             if let Some(driver) = driver.as_mut()
                 && let Err(err) = driver.close_channel(channel_id)
@@ -4910,7 +5044,7 @@ impl Drop for BatchScheduler {
 
 struct TrackedInstance {
     pacing_wait_id: u64,
-    wait_slots: Arc<::driver_api::BoundWaitSlots>,
+    wait_slots: Arc<crate::driver::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
 }
@@ -4946,43 +5080,18 @@ mod tests {
         fn kind(&self) -> &'static str {
             "panicking"
         }
-        fn device_domain(&self) -> driver_api::DeviceDomain {
-            driver_api::local::PIE_MEMORY_DOMAIN_HOST_PINNED
-        }
-        fn load_model(
+
+        fn load(
             &mut self,
-            _descs: Vec<driver_api::ModelLoadDesc>,
-        ) -> Result<driver_api::DriverCapabilities> {
-            Err(anyhow!("no model"))
+            _request: driver_api::LoadRequest,
+        ) -> driver_api::Result<driver_api::Loaded> {
+            Err(driver_api::DriverError::Load("no model".into()))
         }
-        fn register_program(
+
+        fn fire(
             &mut self,
-            _plan: &driver_api::ProgramRegistration,
-        ) -> Result<driver_api::ProgramId> {
-            Err(anyhow!("no programs"))
-        }
-        fn register_channel(
-            &mut self,
-            _plan: &driver_api::ChannelRegistrationPlan,
-        ) -> Result<driver_api::RegisteredChannel> {
-            Err(anyhow!("no channels"))
-        }
-        fn bind_instance(
-            &mut self,
-            _plan: &driver_api::InstanceBindingPlan,
-        ) -> Result<driver_api::BoundInstance> {
-            Err(anyhow!("no instances"))
-        }
-        fn close_instance(&mut self, _id: u64) -> Result<()> {
-            Ok(())
-        }
-        fn close_channel(&mut self, _id: u64) -> Result<()> {
-            Ok(())
-        }
-        fn launch(
-            &mut self,
-            _frame: &crate::driver::FrameSubmission,
-        ) -> Result<crate::driver::FrameLaunchOutcome> {
+            _submission: &driver_api::FireSubmission,
+        ) -> driver_api::Result<driver_api::FireTicket> {
             panic!("the shape of an interpreter reading lane zero of an empty cell");
         }
     }
@@ -5008,7 +5117,22 @@ mod tests {
         for token in [7_u64, 8] {
             lane.post(LaneRequest::Launch {
                 token,
-                submission: LaneLaunch(crate::driver::FrameSubmission::default()),
+                // ONE STEP, because a frame is its steps and a frame with
+                // none never reaches `Driver::fire` — which is the verb this
+                // test's driver panics in. The old `FrameSubmission::default()`
+                // reached `launch` regardless, because `launch` took the whole
+                // frame.
+                submission: LaneLaunch(crate::driver::FrameFire {
+                    steps: vec![crate::driver::StepFire {
+                        submission: crate::driver::FireSubmission {
+                            lanes: vec![crate::driver::Lane::decode(0, 0, 1, 0)],
+                            attachments: Vec::new(),
+                        },
+                        terminal_cells: Vec::new(),
+                        instances: vec![0],
+                        logical_fire_ids: vec![token],
+                    }],
+                }),
                 prefill: false,
             });
         }

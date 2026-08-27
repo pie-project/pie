@@ -8,8 +8,6 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    pub act: Dtype,
-
     pub kv: Dtype,
     pub embed: Weight,
     pub head: Weight,
@@ -121,6 +119,7 @@ struct MlaDims {
 struct KdaDims {
     heads: u32,
     head_dim: u32,
+    f_rank: u32,
     conv_kernel: u32,
     norm_eps: f32,
 }
@@ -149,33 +148,15 @@ struct Dims {
     norm_eps: f32,
 }
 
-fn per_rank(d: Dims, tp: u32) -> Dims {
-    let cut = |what, whole| model_dsl::per_rank(what, whole, tp as usize);
-    Dims {
-        mla: MlaDims {
-            heads: cut("mla heads", d.mla.heads),
-            ..d.mla
-        },
-        kda: KdaDims {
-            heads: cut("kda heads", d.kda.heads),
-            ..d.kda
-        },
-        moe: MoeDims {
-            inter: cut("moe inter", d.moe.inter),
-            shared_inter: cut("shared inter", d.moe.shared_inter),
-            ..d.moe
-        },
-        dense_inter: cut("dense inter", d.dense_inter),
-        ..d
-    }
+fn closes_a_block(l: u32, every: u32) -> bool {
+    every > 0 && (l + 1).is_multiple_of(every)
 }
 
 impl Model {
-    pub fn k3(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn k3(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         assemble(
             w,
             experts,
-            act,
             kv,
             tp,
             Dims {
@@ -196,6 +177,7 @@ impl Model {
                 kda: KdaDims {
                     heads: 16,
                     head_dim: 128,
+                    f_rank: 128,
                     conv_kernel: 4,
                     norm_eps: 1e-5,
                 },
@@ -216,84 +198,105 @@ impl Model {
     }
 }
 
-fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-    let d = per_rank(d, tp);
+fn assemble(weights: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    assert!(
+        matches!(tp, 1 | 2 | 4 | 8),
+        "tp {tp} is not a world this catalog ships"
+    );
+    let mla_heads = d.mla.heads / tp;
+    let kda_heads = d.kda.heads / tp;
+    let moe_inter = d.moe.inter / tp;
+    let shared_inter = d.moe.shared_inter / tp;
+    let dense_inter = d.dense_inter / tp;
+
     let hidden = d.hidden as u64;
-    let full_at = |l: u32| d.full_attn_every > 0 && (l + 1).is_multiple_of(d.full_attn_every);
+    let full_at = |l: u32| closes_a_block(l, d.full_attn_every);
     let moe_at = |l: u32| l >= d.dense_layers;
-    let blend_at = |l: u32| d.res_block > 0 && l > 0 && l.is_multiple_of(d.res_block);
+    let blend_at = |l: u32| l > 0 && closes_a_block(l - 1, d.res_block);
 
     let a = &d.mla;
     let k = &d.kda;
     let qk_head_dim = (a.qk_nope_head_dim + a.qk_rope_head_dim) as u64;
-    let q_b_width = a.heads as u64 * qk_head_dim;
+    let q_b_width = mla_heads as u64 * qk_head_dim;
     let kv_a_width = (a.kv_lora_rank + a.qk_rope_head_dim) as u64;
-    let kv_b_width = a.heads as u64 * (a.qk_nope_head_dim + a.v_head_dim) as u64;
-    let v_width = a.heads as u64 * a.v_head_dim as u64;
-    let kda_width = k.heads as u64 * k.head_dim as u64;
+    let kv_b_width = mla_heads as u64 * (a.qk_nope_head_dim + a.v_head_dim) as u64;
+    let v_width = mla_heads as u64 * a.v_head_dim as u64;
+    let kda_width = kda_heads as u64 * k.head_dim as u64;
 
     let layers = (0..d.layers)
         .map(|l| {
             let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, width: u64| Weight::sym(n(s), [width], w);
+            let norm = |s: &str, width: u64| Weight::sym(n(s), [width], weights);
             let mixer = if full_at(l) {
                 Mixer::Mla(Mla {
-                    heads: a.heads,
+                    heads: mla_heads,
                     kv_lora_rank: a.kv_lora_rank,
                     qk_nope_head_dim: a.qk_nope_head_dim,
                     qk_rope_head_dim: a.qk_rope_head_dim,
                     v_head_dim: a.v_head_dim,
                     sm_scale: (qk_head_dim as f32).sqrt().recip(),
-                    q_a_proj: Weight::sym(n("q_a_proj"), [a.q_lora_rank as u64, hidden], w),
+                    q_a_proj: Weight::sym(n("q_a_proj"), [a.q_lora_rank as u64, hidden], weights),
                     q_a_norm: norm("q_a_norm", a.q_lora_rank as u64),
                     q_a_norm_eps: d.norm_eps,
-                    q_b_proj: Weight::sym(n("q_b_proj"), [q_b_width, a.q_lora_rank as u64], w)
-                        .columns(),
-                    kv_a_proj: Weight::sym(n("kv_a_proj"), [kv_a_width, hidden], w),
+                    q_b_proj: Weight::sym(
+                        n("q_b_proj"),
+                        [q_b_width, a.q_lora_rank as u64],
+                        weights,
+                    )
+                    .columns(),
+                    kv_a_proj: Weight::sym(n("kv_a_proj"), [kv_a_width, hidden], weights),
                     kv_a_norm: norm("kv_a_norm", a.kv_lora_rank as u64),
                     kv_a_norm_eps: d.norm_eps,
-                    kv_b_proj: Weight::sym(n("kv_b_proj"), [kv_b_width, a.kv_lora_rank as u64], w)
-                        .columns(),
+                    kv_b_proj: Weight::sym(
+                        n("kv_b_proj"),
+                        [kv_b_width, a.kv_lora_rank as u64],
+                        weights,
+                    )
+                    .columns(),
                     gate: a
                         .output_gate
-                        .then(|| Weight::sym(n("o_gate"), [v_width, hidden], w).columns()),
-                    o_proj: Weight::sym(n("o_proj"), [hidden, v_width], w).rows(),
+                        .then(|| Weight::sym(n("o_gate"), [v_width, hidden], weights).columns()),
+                    o_proj: Weight::sym(n("o_proj"), [hidden, v_width], weights).rows(),
                     kv: format!("kv.{l}"),
                 })
             } else {
                 Mixer::Kda(Kda {
-                    heads: k.heads,
+                    heads: kda_heads,
                     head_dim: k.head_dim,
                     conv_kernel: k.conv_kernel,
                     norm_eps: k.norm_eps,
-                    qkv: Weight::sym(n("kda_qkv"), [3 * kda_width, hidden], w)
+                    qkv: Weight::sym(n("kda_qkv"), [3 * kda_width, hidden], weights)
                         .packed([kda_width, kda_width, kda_width]),
-                    conv: Weight::sym(n("kda_conv"), [3 * kda_width, k.conv_kernel as u64], w)
-                        .packed([kda_width, kda_width, kda_width]),
-                    f_a: Weight::sym(n("kda_f_a"), [k.head_dim as u64, hidden], w),
-                    f_b: Weight::sym(n("kda_f_b"), [kda_width, k.head_dim as u64], w).columns(),
-                    b: Weight::sym(n("kda_b"), [k.heads as u64, hidden], w).columns(),
+                    conv: Weight::sym(
+                        n("kda_conv"),
+                        [3 * kda_width, k.conv_kernel as u64],
+                        weights,
+                    )
+                    .packed([kda_width, kda_width, kda_width]),
+                    f_a: Weight::sym(n("kda_f_a"), [k.f_rank as u64, hidden], weights),
+                    f_b: Weight::sym(n("kda_f_b"), [kda_width, k.f_rank as u64], weights).columns(),
+                    b: Weight::sym(n("kda_b"), [kda_heads as u64, hidden], weights).columns(),
                     dt_bias: Weight::sym(
                         n("kda_dt_bias"),
-                        [k.heads as u64, k.head_dim as u64],
+                        [kda_heads as u64, k.head_dim as u64],
                         Dtype::F32,
                     )
                     .columns(),
-                    a_log: Weight::sym(n("kda_a_log"), [k.heads as u64], Dtype::F32).columns(),
-                    gate: Weight::sym(n("kda_gate"), [kda_width, hidden], w).columns(),
-                    o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], w),
+                    a_log: Weight::sym(n("kda_a_log"), [kda_heads as u64], Dtype::F32).columns(),
+                    gate: Weight::sym(n("kda_gate"), [kda_width, hidden], weights).columns(),
+                    o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], weights),
                     o_norm_eps: k.norm_eps,
-                    o_proj: Weight::sym(n("kda_o_proj"), [hidden, kda_width], w).rows(),
+                    o_proj: Weight::sym(n("kda_o_proj"), [hidden, kda_width], weights).rows(),
                     conv_state: format!("conv.{l}"),
                     delta_state: format!("delta.{l}"),
                 })
             };
             let mlp = if moe_at(l) {
                 let m = &d.moe;
-                let inter = m.inter as u64;
-                let shared_inter = m.shared_inter as u64;
+                let inter = moe_inter as u64;
+                let shared_width = shared_inter as u64;
                 Mlp::Routed {
-                    router: Weight::sym(n("router"), [m.experts as u64, hidden], w),
+                    router: Weight::sym(n("router"), [m.experts as u64, hidden], weights),
                     gate_up: Weight::sym(
                         n("experts_gate_up"),
                         [m.experts as u64, 2 * inter, hidden],
@@ -306,26 +309,30 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
                         experts,
                     )
                     .rows(),
-                    shared: (m.shared_inter > 0).then(|| Shared {
-                        gate_up: Weight::sym(n("shared_gate_up"), [2 * shared_inter, hidden], w)
-                            .packed([shared_inter, shared_inter]),
-                        down: Weight::sym(n("shared_down"), [hidden, shared_inter], w).rows(),
-                        inter: m.shared_inter,
+                    shared: (shared_inter > 0).then(|| Shared {
+                        gate_up: Weight::sym(
+                            n("shared_gate_up"),
+                            [2 * shared_width, hidden],
+                            weights,
+                        )
+                        .packed([shared_width, shared_width]),
+                        down: Weight::sym(n("shared_down"), [hidden, shared_width], weights).rows(),
+                        inter: shared_inter,
                     }),
                     experts: m.experts,
                     top_k: m.top_k,
                     routed_scaling: m.routed_scaling,
-                    inter: m.inter,
+                    inter: moe_inter,
                     beta: d.situ_beta,
                     up_cap: d.situ_cap,
                 }
             } else {
-                let inter = d.dense_inter as u64;
+                let inter = dense_inter as u64;
                 Mlp::Dense {
-                    gate_up: Weight::sym(n("gate_up"), [2 * inter, hidden], w)
+                    gate_up: Weight::sym(n("gate_up"), [2 * inter, hidden], weights)
                         .packed([inter, inter]),
-                    down: Weight::sym(n("down"), [hidden, inter], w).rows(),
-                    inter: d.dense_inter,
+                    down: Weight::sym(n("down"), [hidden, inter], weights).rows(),
+                    inter: dense_inter,
                     beta: d.situ_beta,
                     up_cap: d.situ_cap,
                 }
@@ -334,7 +341,7 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
                 res_blend: blend_at(l).then(|| ResBlend {
                     norm: norm("res_norm", hidden),
                     norm_eps: d.norm_eps,
-                    proj: Weight::sym(n("res_proj"), [1, hidden], w),
+                    proj: Weight::sym(n("res_proj"), [1, hidden], weights),
                 }),
                 mixer,
                 mixer_norm: norm("mixer_norm", hidden),
@@ -350,12 +357,11 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
         hidden: d.hidden,
         vocab: d.vocab,
         tp,
-        act,
         kv,
-        embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
-        head: Weight::sym("lm_head", [d.vocab as u64, hidden], w),
+        embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
+        head: Weight::sym("lm_head", [d.vocab as u64, hidden], weights),
         layers,
-        final_norm: Weight::sym("final_norm", [hidden], w),
+        final_norm: Weight::sym("final_norm", [hidden], weights),
         final_norm_eps: d.norm_eps,
     }
 }

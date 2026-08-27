@@ -17,7 +17,20 @@ use crate::embedded_driver::DriverCapabilities;
 
 /// Per-driver bundle created before bootstrap.
 pub struct GroupDriver {
+    /// What the load can do — the device, the pools, the ceilings, the
+    /// guest-visible profile.
     pub caps: DriverCapabilities,
+    /// What the load came out as: its plan's name and the bytes it landed.
+    pub facts: driver_api::LoadFacts,
+    /// Where this worker resolved the checkpoint.
+    ///
+    /// **THE CALLER'S ANSWER, NOT THE DRIVER'S.** It was
+    /// `DriverCapabilities::snapshot_dir`, echoed back by a driver that had
+    /// just been handed it; the contract dropped it for exactly that reason
+    /// (`driver-api::caps`: "`snapshot_dir`/`model_id`/`arch_name` say where
+    /// the caller's own checkpoint came from").
+    pub snapshot_dir: PathBuf,
+    /// The device behind it.
     pub backend: ::engine::driver::DriverBackend,
 }
 
@@ -34,7 +47,7 @@ pub struct ModelDrivers {
 pub fn build(
     user: &config::Config,
     drivers: ModelDrivers,
-    metadata: model::serve::ModelMetadata,
+    metadata: ::engine::model::ModelMetadata,
 ) -> Result<::engine::bootstrap::Config> {
     if drivers.groups.is_empty() {
         anyhow::bail!(
@@ -87,13 +100,14 @@ pub fn build(
 fn build_model(
     m: &config::ModelConfig,
     drivers: ModelDrivers,
-    metadata: model::serve::ModelMetadata,
+    metadata: ::engine::model::ModelMetadata,
 ) -> Result<::engine::bootstrap::ModelConfig> {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps can differ in
     // memory-derived capacities — those flow through the per-driver entries.
     let group0_caps = drivers.groups[0].caps.clone();
-    let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
+    let snapshot_dir = drivers.groups[0].snapshot_dir.clone();
+    let drivers_facts = drivers.groups[0].facts.plan_name.clone();
     // The metadata was lifted once when the model was resolved; this only
     // decides which of the two shapes the runtime is being handed. Only the
     // tokenizer half varies -- the config is there either way.
@@ -113,29 +127,46 @@ fn build_model(
         .into_iter()
         .map(|g| {
             let backend_kind = g.backend.kind().to_string();
+            // THREE RECORDS, NOT ONE FLAT STRUCT. Every line below reads
+            // the half of `Capabilities` its own subject lives in — `pools`
+            // for capacities, `limits` for ceilings, `profile` for what a
+            // guest program may name — which is the split
+            // `driver-api::caps`'s header argues for.
             ::engine::bootstrap::DriverConfig {
-                total_pages: g.caps.total_pages as usize,
-                cpu_pages: g.caps.swap_pool_size as usize,
-                kv_copy_domain_mask: g.caps.kv_copy_domain_mask,
+                total_pages: g.caps.pools.kv_pages as usize,
+                // The host-swap pool is a DEPLOYMENT's, not a load's: the
+                // contract has no field for it because no driver reserves
+                // one on the caller's behalf.
+                cpu_pages: 0,
+                kv_copy: g.caps.kv_copy,
                 backend_kind,
-                rs_cache_required: g.caps.rs_cache_required,
-                rs_cache_slots: g.caps.rs_cache_slots as usize,
-                rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
-                elastic_page_bytes: g.caps.elastic_page_bytes,
-                elastic_budget_pages: g.caps.elastic_budget_pages,
-                has_mtp_logits: g.caps.has_mtp_logits,
-                has_mtp_drafts: g.caps.has_mtp_drafts,
-                has_value_head: g.caps.has_value_head,
-                has_kv_envelopes: g.caps.has_kv_envelopes,
-                has_attn_page_mask: g.caps.has_attn_page_mask,
-                has_attn_score: g.caps.has_attn_score,
-                has_lora: g.caps.has_lora,
-                device_geometry_port_mask: g.caps.device_geometry_port_mask,
-                resolves_geometry_per_step: g.caps.resolves_geometry_per_step,
+                rs_cache_required: g.caps.pools.state_slots != 0,
+                rs_cache_slots: g.caps.pools.state_slots as usize,
+                rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
+                elastic_page_bytes: g.caps.pools.elastic_page_bytes,
+                elastic_budget_pages: g.caps.pools.elastic_budget_pages,
+                has_mtp_logits: g.caps.profile.has_mtp_logits,
+                has_mtp_drafts: g.caps.profile.has_mtp_drafts,
+                has_value_head: g.caps.profile.has_value_head,
+                // `has_kv_envelopes` has no successor: it advertised a
+                // model-gated PTIR intrinsic the profile does not carry, and
+                // the engine's `PtirCaps` is the only reader.
+                has_kv_envelopes: false,
+                has_attn_page_mask: g.caps.profile.has_attn_page_mask,
+                has_attn_score: g.caps.profile.has_attn_score,
+                has_lora: g.caps.profile.has_lora,
+                device_geometry_port_mask: g.caps.ports,
+                // palo B-pipelined-geometry: this said whether a driver
+                // resolves a STEP's descriptor ports when the step runs
+                // rather than for the whole frame. The contract has no field
+                // for it, and no shell in this workspace interleaves the two
+                // halves — the CUDA shell stages every geometry vector from
+                // the host before the walk. False is what both of those say.
+                resolves_geometry_per_step: false,
                 limits: ::engine::driver::SchedulerLimits {
-                    max_forward_requests: g.caps.max_forward_requests as usize,
-                    max_forward_tokens: g.caps.max_forward_tokens as usize,
-                    max_page_refs: g.caps.max_page_refs as usize,
+                    max_forward_requests: g.caps.limits.max_lanes as usize,
+                    max_forward_tokens: g.caps.limits.max_tokens as usize,
+                    max_page_refs: g.caps.limits.max_page_refs as usize,
                 },
                 driver_backend: g.backend,
             }
@@ -144,8 +175,15 @@ fn build_model(
 
     Ok(::engine::bootstrap::ModelConfig {
         name: m.name.clone(),
-        model_id: group0_caps.model_id,
-        kv_page_size: group0_caps.kv_page_size as usize,
+        // The operator's answer, or the model's own name. It was
+        // `DriverCapabilities::model_id`, echoed back by a driver that was
+        // handed it.
+        // The plan's own name, as the model text declared it — which is what
+        // a `model_id` ever was: the row this checkpoint loaded as. It comes
+        // off `LoadFacts` now instead of off a driver echoing back the string
+        // the operator handed it.
+        model_id: drivers_facts,
+        kv_page_size: group0_caps.pools.kv_page_size as usize,
         tokenizer_path,
         metadata,
         drivers,

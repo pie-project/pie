@@ -22,13 +22,6 @@ impl DispatchLinear for Run<'_> {
                 self.tensor(*w),
                 self.tensor(*y),
             ),
-            Linear::AttentionLanding { act, w, layer, y } => linear::gemm::attention_landing(
-                self.ctx(),
-                self.tensor(*act),
-                self.tensor(*w),
-                *layer,
-                self.tensor(*y),
-            ),
 
             // The absorbed `mlp` family (`linear.mlp_*`), calling into
             // `kernels_metal::linear::mlp`.
@@ -182,9 +175,37 @@ impl DispatchLinear for Run<'_> {
                     self.tensor(*y),
                 )
             }
+            // The same split-plane bank as `MoeMatmulSelectBias`, with
+            // nothing added inside the fold — the routed bias of a rows-cut
+            // expert lands afterwards, through `MoeBiasSum`.
+            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
+                let (codes, scales) = self.planes(*bank);
+                linear::moe::matmul_select_quant(
+                    self.ctx(),
+                    self.tensor(*x),
+                    codes,
+                    scales,
+                    self.tensor(*routes),
+                    self.tensor(*y),
+                )
+            }
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
+                self.tensor(*weights),
+                self.tensor(*y),
+            ),
+            Linear::MoeBiasSum {
+                x,
+                bias,
+                routes,
+                weights,
+                y,
+            } => linear::moe::bias_sum(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*bias),
+                self.tensor(*routes),
                 self.tensor(*weights),
                 self.tensor(*y),
             ),

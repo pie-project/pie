@@ -15,9 +15,9 @@ path = "src/lib.rs"
 # The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
 # `StructKind` — and the 15 family enums the dispatch arms destructure.
 model-ir = { path = "../model-ir" }
-# The contract implemented — the 15 `Dispatch*` traits and `KernelError` —
-# and the shared walk re-exported: the prepare/capture split and
-# program-order dispatch, written once and driven over this crate's `Run`.
+# The contract implemented — the 15 `Dispatch*` traits and `KernelError`.
+# Contract only: the walk written over it lives in the driver substrate
+# (`driver::fire::walk`) and is driven over this crate's `Run` from there.
 kernels = { path = "../kernels" }
 # The entries called and the handles resolved to: `Tensor`, `RaggedTensor`,
 # `KvPool`, `RecurrentPool`, the four plan structs and their pure builders.
@@ -26,3 +26,74 @@ kernels = { path = "../kernels" }
 # `cudaGraphAddNode`'s arity), and this crate builds and tests everywhere —
 # a fire without a runtime answers with a typed refusal.
 kernels-cuda = { path = "../kernels-cuda" }
+
+# The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`
+# (palo design §6). The shell supplies the two traits and calls the walk; it
+# never re-implements one.
+driver = { path = "../driver" }
+# `Baked` — the artifact this shell records and replays: the region template,
+# the class table a descriptor's counts index, and the arena's static offsets.
+model-compiler = { path = "../model-compiler" }
+# The residency half: `ModelContract` (the caller's, per decision #18 — the
+# shell is handed a contract, never a model family), `plan::compile` and the
+# `Execution` that runs it against the checkpoint. No family name crosses
+# this edge; `model` is a dev-dependency of the smoke and nothing more.
+model-loader = { path = "../model-loader" }
+
+# The CUDA runtime, for the bytes this crate owns that no kernel entry
+# allocates: the arena, the weight store, the pool pages, the resident fire
+# inputs, and the stream they are all written on. `kernels-cuda` allocates
+# only its own process-global scratch, by design — see its `Ctx::scratch`.
+#
+# Optional and version-pinned the same way, for the same reason: the runtime
+# ABI is the BINARY's choice, and Cargo unifies features across the graph, so
+# a `cudarc` version selected here and a different one selected in
+# `kernels-cuda` would silently become one.
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "runtime",
+    "nvrtc",
+    "fallback-dynamic-loading",
+] }
+
+[features]
+# Nothing by default. Every item below compiles with no runtime selected and
+# every device call answers `Fault::Runtimeless` — the same property
+# `kernels-cuda` keeps, and what lets a plain workspace check carry this
+# crate's host tests on a machine with no GPU in it.
+default = []
+
+# Exactly one of these turns the runtime on, and it must name the libcudart
+# this binary will LOAD. Forwarded to `kernels-cuda`, whose manifest explains
+# why guessing is unrecoverable (`cudaGraphAddNode`'s arity differs), and
+# pinned to the same `cudarc` version here so the two cannot disagree.
+cuda-12 = ["_cuda", "kernels-cuda/cuda-12", "cudarc/cuda-12080"]
+cuda-13 = ["_cuda", "kernels-cuda/cuda-13", "cudarc/cuda-13000"]
+
+# Private: "some CUDA version was chosen".
+_cuda = ["dep:cudarc"]
+
+[dev-dependencies]
+# The smoke's catalog row and its load contract. A DEV dependency on purpose:
+# the engine traces and hands a `Plan` and a `ModelContract` across (design
+# §7, decision #18), so the shell itself must not know a model family.
+model = { path = "../model" }
+# `Plane`, and the `Facts`/`Request` pair the smoke computes each lane's word
+# with — `Classify::of`, engine-side in production.
+model-dsl = { path = "../model-dsl" }
+# The prompt in, the continuation out.
+tokenizer = { path = "../tokenizer" }
+# The checkpoint container the import contract is checked against, and the
+# projection that lets a stock safetensors snapshot BE one — the same pair
+# `model-loader` uses, and for the same reason its manifest gives: `ztensor`
+# owns the container format, `ztensor-compat` owns the foreign projections.
+ztensor = { workspace = true }
+ztensor-compat = { workspace = true }
+# The guest-program half's producer: a golden trace in, a `LaunchPackage` and
+# an emitted CUDA kernel table out. A DEV edge — `program/` is handed the two
+# by its caller and never plans anything itself (the same arrow `driver`'s own
+# manifest argues for its `plan` import).
+tensor-compiler = { path = "../tensor-compiler" }
+# The container the goldens are stored as, and the profile they bind against.
+tensor-ir = { path = "../tensor-ir" }

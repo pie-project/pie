@@ -8,6 +8,17 @@
 //! Port expectations — the struct kind a plan port takes, the cache storage a
 //! cache port names, the dtypes the old signatures pinned — live in one table
 //! (`expect`), matched per op right next to the rules that read it.
+//!
+//! [`classes`] is the second thing checked about a trace and the one thing
+//! computed from it: the 2^F class sweep and the backward demand walk that
+//! resolves every `Def::Merge`. It is a sibling rather than a rule of `check`
+//! because it answers a question the rules cannot — coverage is a property of
+//! a whole class, not of a value — and because its answer is data the compiler
+//! keeps (palo design §1).
+
+pub mod classes;
+
+pub use classes::{fact_width, resolve_classes};
 
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
@@ -335,12 +346,14 @@ fn available(
 /// `Attention::PoolLse.entries`, settled as the pool cache space rather than
 /// `PoolGather`'s tensor. Dtype rows port the pins of the old signatures
 /// (positions- and indptr-like inputs i32; gate/lse/routing-weight outputs
-/// f32) — advisory coverage, not an exhaustive typing of every port.
+/// f32; the `row_valid` padding mask u8) — advisory coverage, not an
+/// exhaustive typing of every port.
 fn expect(op: &Operation) -> &'static [(Port, Expect)] {
     use Port::{In, Out};
 
     const I32: Expect = Expect::Tensor(Dtype::I32);
     const F32: Expect = Expect::Tensor(Dtype::F32);
+    const U8: Expect = Expect::Tensor(Dtype::U8);
     const CACHE: Expect = Expect::Cache;
     const DECODE_PLAN: Expect = Expect::Struct(&[StructKind::AttnDecodePlan]);
     const PREFILL_PLAN: Expect =
@@ -386,8 +399,16 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
             Attention::IndexTopk { .. } => &[(In(2), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
+            // `row_valid` is one byte per padded row, not an index vector:
+            // `kernels/attn/pool.cuh` takes it as `const u8* __restrict__` in
+            // both boundary kernels and tests it against zero, and the C++
+            // lineage held it the same way (`DeviceBuffer<std::uint8_t>` in
+            // the dev driver's persistent inputs, memset to 1). The mask is
+            // what `model_dsl::ops::geometry` has always declared for
+            // `GeomKind::RowValid`; this row read i32 only because it was
+            // copied off the positions port beside it.
             Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => {
-                &[(In(0), I32), (In(1), I32), (Out(0), I32), (Out(1), I32)]
+                &[(In(0), I32), (In(1), U8), (Out(0), I32), (Out(1), I32)]
             }
             Attention::PoolGather { .. } => &[(In(0), I32), (In(1), I32), (In(2), CACHE)],
             Attention::PoolKvAppend { .. } => {
@@ -403,12 +424,18 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MoeTopkSqrtSoftplus { .. } => &[(Out(0), I32), (Out(1), F32)],
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
+            // The bias-free quantized twin carries no bias port, so `routes`
+            // sits back at In(2), where `MoeMatmulSelect` keeps it.
+            Linear::MoeMatmulSelectQuant { .. } => &[(In(2), I32)],
             Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
+            // The bias mixture reads both routing outputs at once, so it pins
+            // the pair the two rows above pin one each of. Its `bias` rides the
+            // activation dtype, as `MoeMatmulSelectBias`'s does.
+            Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
             // Channel mixing with nothing pinned: the gemms, their epilogues,
             // and the routed sum's gate ride the activation dtype they are given.
             Linear::Matmul { .. }
             | Linear::LmHead { .. }
-            | Linear::AttentionLanding { .. }
             | Linear::MlpSwiglu { .. }
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
@@ -473,8 +500,9 @@ impl DefKind {
     }
 }
 
-/// "v42" — the spelling every message uses for a value.
-struct V(ValueId);
+/// "v42" — the spelling every message uses for a value. `pub(crate)` so the
+/// class sweep next door spells a merge the same way this file does.
+pub(crate) struct V(pub(crate) ValueId);
 
 impl Display for V {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

@@ -91,20 +91,34 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 /// `model_legacy::ingest`'s `MODEL_TYPES` table — a hand-kept list of the HF
 /// strings the legacy contract had a naming pass for. R3 deleted the table
 /// with the contract, and there is nothing to replace it WITH, because the
-/// new catalog never asks a config what a model is. It asks the TENSORS:
-/// `model::identify` matches a snapshot's names and its `embed` depth against
-/// the import tables production is about to read, and that is the same
-/// question a driver settles at load.
+/// new catalog never asks a config what a model is. It asks the TENSORS: the
+/// identify door compiles each SKU's load contract against the checkpoint's
+/// own metadata, and that is the same question a driver settles at load.
 ///
 /// So this asks that question instead, one step earlier and against the
-/// checkpoint headers rather than a document about them. `Snapshot::at`
-/// header-parses without reading a byte of payload, so listing a cache of
-/// twenty repos costs twenty header reads.
+/// checkpoint headers rather than a document about them.
+///
+/// # And it asks it through the door serving asks it through
+///
+/// It read the snapshot itself — `model::snapshot::Snapshot::at`, a
+/// safetensors header parser lifted out of a baker harness — and handed
+/// `model::identify` a `&dyn Fn(&str) -> Option<shape>` closure over it. Both
+/// are gone (menlo M18/M19), and what replaced them is not a rename: the
+/// engine's [`identify`](engine::driver::load::identify) does not match tensor
+/// NAMES, it compiles each candidate's load contract against the checkpoint's
+/// own metadata and answers with the SKU whose params the checkpoint actually
+/// holds. A name match cannot tell a 3B Qwen from a 0.8B one — every SKU of a
+/// family spells its tensors the same way — and that is measured, in the boot
+/// smoke that came back with the wrong row.
+///
+/// Cost is unchanged: that door opens the container's index and runs the
+/// contract's arithmetic, so listing a cache of twenty repos still reads
+/// twenty headers and no payload.
 ///
 /// Returns `(true, sku)` for a checkpoint that matches a row, and
-/// `(false, why)` for one that does not — carrying `model::Unmatched`'s own
-/// account, so "no safetensors here" and "two rows match it" read
-/// differently.
+/// `(false, why)` for one that does not, carrying the refusal's own account —
+/// which now names what each candidate did wrong instead of counting how many
+/// matched.
 fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let snapshots = repo_dir.join("snapshots");
     let snapshot = match std::fs::read_dir(&snapshots) {
@@ -117,15 +131,32 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let Some(snap) = snapshot else {
         return (false, "no snapshot".to_string());
     };
-    let Some(reader) = model::snapshot::Snapshot::at(snap) else {
+    // "A snapshot with no weights in it" and "a checkpoint no SKU claims" are
+    // different operator actions, and the door below answers both with one
+    // refusal. `Snapshot::at` used to draw the line by returning `None`; this
+    // draws it by looking, which is the same read the door would do first
+    // anyway.
+    let weights = std::fs::read_dir(&snap).is_ok_and(|entries| {
+        entries.filter_map(|entry| entry.ok()).any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".safetensors") || name.ends_with(".zt")
+        })
+    });
+    if !weights {
         return (false, "no safetensors".to_string());
-    };
-    match model::identify(&|name| reader.shape_of(name)) {
+    }
+    // The plane picks an alignment and a tile budget, neither of which can
+    // change whether a tensor's SHAPE is the one a contract declares — which
+    // is the only question a listing asks — so the door's own note applies:
+    // one plane is as good as any, and this listing is a host-side answer
+    // about files, not about a device this machine has.
+    match engine::driver::load::identify(&snap, engine::driver::load::Plane::Cuda) {
         Ok(sku) => (true, sku.to_string()),
-        Err(model::Unmatched::Ambiguous { skus }) => {
-            (false, format!("matches {} SKUs", skus.len()))
-        }
-        Err(model::Unmatched::NoRow { .. }) => (false, "no SKU".to_string()),
+        // One line, because this is a table cell. The full per-candidate
+        // account is what `pie model import` prints when the load is
+        // actually attempted.
+        Err(_) => (false, "no SKU".to_string()),
     }
 }
 

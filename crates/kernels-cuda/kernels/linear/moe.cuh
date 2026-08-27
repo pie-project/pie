@@ -1219,6 +1219,33 @@ __global__ void moe_weighted_sum(
 }
 
 template <class T>
+__global__ void moe_bias_sum(
+    T* __restrict__ out,
+    const T* __restrict__ x,
+    const T* __restrict__ bias,
+    const i32* __restrict__ topk_idx,
+    const float* __restrict__ weights,
+    int top_k, int hidden)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    const long long base = static_cast<long long>(n) * top_k;
+    const long long i = static_cast<long long>(n) * hidden + h;
+    float acc = Elem<T>::to_f32(x[i]);
+    for (int k = 0; k < top_k; ++k) {
+        const long long r = base + k;
+        const int e = topk_idx[r];
+
+        if (e < 0) continue;
+        const float b = Elem<T>::to_f32(
+            bias[static_cast<long long>(e) * hidden + h]);
+        acc += weights[r] * b;
+    }
+    out[i] = Elem<T>::from_f32(acc);
+}
+
+template <class T>
 __global__ void moe_weighted_sum_add(
     T* __restrict__ out,
     const T* __restrict__ src,

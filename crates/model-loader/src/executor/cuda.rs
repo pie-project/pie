@@ -7,8 +7,9 @@
 //!
 //! The staging buffer is PINNED (two alternating slots so a copy can
 //! overlap the next fill; an oversized write bypasses staging), and
-//! `Cast`/`Scale`/`Encode` run on the device via [`kernels_cuda::quant`]
-//! when both operands are already resident, avoiding a host round trip.
+//! `Cast`/`Scale`/`Encode` run on the device via
+//! [`kernels_cuda::linear::quant`] when both operands are already resident,
+//! avoiding a host round trip.
 
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -20,10 +21,25 @@ use cudarc::runtime::sys as rt;
 // pass calls these `fn`s directly and is invisible to all of them, so
 // the gates measure the binder's surface and this is not on it.
 //
-// `scale_rows` takes a fat `Out` rather than a slot, sized by
-// `extent_2d`'s `(rows, width)` pair rather than two separate `i32`s.
-use kernels_cuda::quant;
-use kernels_cuda::{In, InOut, Out};
+// THE HANDLE VOCABULARY CHANGED UNDER THIS FILE ONCE, and the repair is
+// worth recording because nothing caught it for a release. The plane used to
+// speak `In`/`Out`/`InOut` marks carrying `{ptr, rows, width}` around a
+// `Tensor<T>` whose scalar was a type parameter; it now speaks one
+// dtype-erased [`Tensor`] with the extents folded onto the handle, and the
+// entries moved from `kernels_cuda::quant` to `kernels_cuda::linear::quant`.
+// This file was the only caller and did not follow, so `--features cuda`
+// stopped compiling while every default build stayed green — see
+// `.wiki/palo/design.md`'s step-4 note, which routed around it with host
+// transforms.
+//
+// `&`/`&mut` on a `Tensor` is INTENT, not borrow discipline
+// (`crates/kernels-cuda/src/tensor.rs` states the rule): an entry takes what it writes by `&mut`, and
+// that signature is the whole record of write intent. So `scale_rows`'s
+// in-place destination is the `&mut` operand and its per-column factors are
+// the by-value one, which is the same claim the old `InOut`/`In` pair made.
+use kernels_cuda::linear::quant;
+use kernels_cuda::{Ctx, Tensor};
+use model_ir::Dtype;
 
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, TileMapOp};
@@ -391,10 +407,33 @@ impl CudaArena {
     // are all `&mut self` methods and the arena is therefore alive at
     // each call.
 
+    /// This arena's stream as the context an entry fires on.
+    ///
+    /// Built per call rather than held as a field: a [`Ctx`] is what a
+    /// driver's `Run` mints per fire, it carries no state of its own (the jit
+    /// cache and the scratch slabs are process-global behind it), and holding
+    /// one would only restate `self.stream` in a second place that could
+    /// disagree with the first.
+    fn ctx(&self) -> Ctx {
+        // SAFETY: `stream` is live for as long as this arena is, by
+        // `CudaArena::new`'s safety contract, and this is a `&self` method.
+        unsafe { Ctx::on(self.stream.cast()) }
+    }
+
+    /// The device address `bytes` into the arena, as the integer a
+    /// [`Tensor`] carries. `Tensor::ptr` is a `u64` rather than a pointer
+    /// because the host never dereferences it.
+    fn device_ptr(&self, offset: usize) -> u64 {
+        self.at(offset) as u64
+    }
+
     /// `quant::cast_fp32_to`, at `bf16`: elementwise over a flat byte run,
-    /// addressed by element count `n` rather than the plan's 2-D shape
-    /// (a `Cast` is not indexed by rows/cols). `x::quant::elementwise`
-    /// turns `n` into `Launch::flat(n, 256)` internally.
+    /// addressed by element count rather than the plan's 2-D shape (a `Cast`
+    /// is not indexed by rows/cols). The entry reads that count off the
+    /// DESTINATION handle (`Tensor::elements`) and picks its instantiation
+    /// off the destination's dtype, so `Dtype::Bf16` here is what
+    /// `CUDA_CAST_FP32_TO_BF16`'s name has always meant and the turbofish
+    /// used to say.
     fn cast(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         self.bounds(op.src.offset, op.src.len)?;
         self.bounds(op.dst.offset, op.dst.len)?;
@@ -404,38 +443,24 @@ impl CudaArena {
         // the arena had). Refused HERE, first, so this is a load error
         // naming the plan rather than a `panic!` inside the host
         // program, which has no `Result` to put it in.
-        u32::try_from(n).map_err(|_| {
+        let width = u32::try_from(n).map_err(|_| {
             plan_disagrees("the cast covers more elements than a 32-bit launch extent states")
         })?;
-        // SAFETY: both spans are in bounds, the plan chose this row for an
-        // f32 source and a bf16 destination, and the stream is live for the
-        // launch.
-        let width = i32::try_from(n)
-            .map_err(|_| plan_disagrees("the cast covers more elements than one row can state"))?;
-        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
-        let fired = quant::cast_fp32_to::<kernels_cuda::jit::abi::bf16>(
-            &ctx,
-            // ONE ROW OF `n`: the cast is elementwise and the routine reads
-            // its extent off the destination, which is what a traced fire's
-            // binder mints for it too.
-            In {
-                ptr: self.at(op.src.offset).cast(),
-                rows: 1,
-                width,
-            },
-            Out {
-                ptr: self.at(op.dst.offset).cast(),
-                rows: 1,
-                width,
-            },
-        );
+        // ONE ROW OF `n`: the cast is elementwise, and `rows * width` is the
+        // extent the entry counts in either way.
+        let src = Tensor::new(self.device_ptr(op.src.offset), 1, width, Dtype::F32);
+        let mut dst = Tensor::new(self.device_ptr(op.dst.offset), 1, width, Dtype::Bf16);
+        let fired = quant::cast_fp32_to(&self.ctx(), src, &mut dst);
         declined(CUDA_CAST_FP32_TO_BF16, fired)
     }
 
-    /// `quant::scale_rows`, at `bf16`, the per-row multiply, in place. `rows`
-    /// picks the block (`grid.x`) and `width` is read by the kernel's
-    /// own loop over columns; both now live inside
-    /// `x::quant::route_rows`, next to the `<<<>>>` they size.
+    /// `quant::scale_rows`, at `bf16`, the per-row multiply, in place.
+    ///
+    /// `buf.rows` picks the block (`grid.x`) and `buf.width` sizes it and is
+    /// read by the kernel's own loop over columns; both live inside
+    /// `quant::route_rows`, next to the `<<<>>>` they size. The factors are
+    /// one row of `cols` — the device text indexes them `l[c]`, by COLUMN,
+    /// which is why they are a `[1, cols]` handle and not a `[rows, 1]` one.
     fn scale(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let factors = op
@@ -443,70 +468,57 @@ impl CudaArena {
             .ok_or_else(|| plan_disagrees("scale_rows reads per-group factors"))?;
         self.bounds(op.dst.offset, op.dst.len)?;
         self.bounds(factors.offset, factors.len)?;
-        // SAFETY: both spans are in bounds; the kernel writes `dst` in place,
-        // which is what the plan checked before naming this row.
-        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
-        let fired = quant::scale_rows::<kernels_cuda::jit::abi::bf16>(
-            &ctx,
-            // `InOut`: the kernel scales `dst` IN PLACE, which the comment
-            // above already says and the mark now says too.
-            InOut {
-                ptr: self.at(op.dst.offset).cast(),
-                rows: as_int(rows)?,
-                width: as_int(cols)?,
-            },
-            In {
-                ptr: self.at(factors.offset).cast_const().cast(),
-                rows: 0,
-                width: 0,
-            },
-        );
+        let l = Tensor::new(self.device_ptr(factors.offset), 1, cols, Dtype::Bf16);
+        // `&mut`: the kernel scales `dst` IN PLACE, which the plan checked
+        // before naming this row.
+        let mut buf = Tensor::new(self.device_ptr(op.dst.offset), rows, cols, Dtype::Bf16);
+        let fired = quant::scale_rows(&self.ctx(), l, &mut buf);
         declined(CUDA_SCALE_ROWS_BF16, fired)
     }
 
-    /// `quant::quantize_bf16_to_mxfp4_e2m1_per_block`: `rows` sizes the
-    /// block, `cols` is read directly by the packer. The host program
-    /// divides `cols` into 32-element groups internally -- exact, since
-    /// the plan has already refused a `cols` that is not a whole number
-    /// of them.
+    /// `quant::quantize_bf16_to_mxfp4_e2m1_per_block`: `w.rows` sizes the
+    /// grid, `w.width` is read directly by the packer. The device text
+    /// divides `cols` into 32-element groups internally -- exact, since the
+    /// plan has already refused a `cols` that is not a whole number of them.
+    ///
+    /// The two destinations are HALF-WIDTH and GROUP-WIDTH, and they are
+    /// stated rather than derived: `packed` holds two e2m1 codes per byte
+    /// (`cols / 2`), `scales` one e8m0 byte per 32-element group
+    /// (`cols / 32`). Both travel as `U8` because that is what the bank
+    /// convention on the other side reads them as (`linear::moe`
+    /// debug-asserts exactly that of an mxfp4 bank's two planes); the byte
+    /// content is what the dtype would have named anyway.
     fn encode_mxfp4(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
-        // SAFETY: every span is bounds-checked by `encode_scales`; the row
-        // takes a source, a payload, an E8M0 scale array and one extent.
-        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
-        let fired = unsafe {
-            quant::quantize_bf16_to_mxfp4_e2m1_per_block(
-                &ctx,
-                self.at(op.src.offset).cast_const().cast(),
-                self.at(op.dst.offset).cast(),
-                self.at(scales.offset).cast(),
-                as_int(rows)?,
-                as_int(cols)?,
-            )
-        };
+        let w = Tensor::new(self.device_ptr(op.src.offset), rows, cols, Dtype::Bf16);
+        let mut packed = Tensor::new(self.device_ptr(op.dst.offset), rows, cols / 2, Dtype::U8);
+        let mut scale_bytes =
+            Tensor::new(self.device_ptr(scales.offset), rows, cols / 32, Dtype::U8);
+        let fired = quant::quantize_bf16_to_mxfp4_e2m1_per_block(
+            &self.ctx(),
+            w,
+            &mut packed,
+            &mut scale_bytes,
+        );
         declined(CUDA_QUANTIZE_BF16_TO_MXFP4, fired)
     }
 
     /// `quant::quantize_bf16_to_fp8_e4m3_per_channel`: a per-row absmax
-    /// reduction, `Launch::per_row(rows, 256)` with 32 bytes of shared
-    /// memory sized to that fixed block width; `cols` stays an operand
-    /// the reduction does not otherwise need.
+    /// reduction, `Launch::per_row(rows, 256)` with 32 bytes of shared memory
+    /// sized to that fixed block width; `w.width` stays an operand the
+    /// reduction does not otherwise need.
+    ///
+    /// ONE `f32` INVERSE SCALE PER ROW, and the entry debug-asserts the
+    /// dtype: `[rows, 1]`, `Dtype::F32`.
     fn encode_fp8(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
-        // SAFETY: as above; the scales are `f32` for this row.
-        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
-        let fired = unsafe {
-            quant::quantize_bf16_to_fp8_e4m3_per_channel(
-                &ctx,
-                self.at(op.src.offset).cast_const().cast(),
-                self.at(op.dst.offset).cast(),
-                self.at(scales.offset).cast(),
-                as_int(rows)?,
-                as_int(cols)?,
-            )
-        };
+        let w = Tensor::new(self.device_ptr(op.src.offset), rows, cols, Dtype::Bf16);
+        let mut fp8 = Tensor::new(self.device_ptr(op.dst.offset), rows, cols, Dtype::Fp8E4m3);
+        let mut scale_inv = Tensor::new(self.device_ptr(scales.offset), rows, 1, Dtype::F32);
+        let fired =
+            quant::quantize_bf16_to_fp8_e4m3_per_channel(&self.ctx(), w, &mut fp8, &mut scale_inv);
         declined(CUDA_QUANTIZE_BF16_TO_FP8, fired)
     }
 
@@ -533,11 +545,6 @@ impl CudaArena {
     }
 }
 
-/// An extent as the `int` the `__global__` reads it in.
-fn as_int(extent: u32) -> Result<i32, Error> {
-    i32::try_from(extent).map_err(|_| plan_disagrees("the extent does not fit an `int`"))
-}
-
 /// The compiler named a row whose operands are not what arrived. Never
 /// a fallback: the host path would produce the right bytes, which is
 /// exactly why it must not run and hide a compiler that chose wrongly.
@@ -551,13 +558,17 @@ fn plan_disagrees(what: &str) -> Error {
 /// wrong -- the refusal is propagated and the load fails with the row
 /// named.
 ///
-/// **One narrowing, and it is real.** Of `runtime::Error`'s variants,
-/// only `Refusal::Empty` (a collapsed rectangle) arrives here as an
-/// `Err`; an unknown symbol or a unit that will not compile PANICS
-/// instead, since a host program has no `Result` to put them in and
-/// both are drift between this build and its own device text rather
-/// than a condition a load can report.
-fn declined(symbol: &str, fired: Result<(), kernels_cuda::Refusal>) -> Result<(), Error> {
+/// **NOTHING PANICS ANY MORE, and the paragraph that stood here said it
+/// did.** It read: only `KernelError::Zero` (a collapsed rectangle) arrives
+/// as an `Err`, while an unknown symbol or a unit that will not compile
+/// panics, since a host program has no `Result` to put them in. That was
+/// true of the routine layer and is not true of `Ctx::fire`, whose every
+/// failure — no carried unit by that name, an empty grid, an instantiation
+/// NVRTC refuses, a launch the runtime rejects — comes back as a
+/// [`kernels_cuda::KernelError`] attributed to the op. So every one of them
+/// reaches here, and every one of them fails the load with the row named,
+/// which is what this function always claimed to be for.
+fn declined(symbol: &str, fired: Result<(), kernels_cuda::KernelError>) -> Result<(), Error> {
     fired.map_err(|why| {
         Error::Contract(format!(
             "cuda arena: the plan named `{symbol}` and the routine declined it: {why:?}"
@@ -567,7 +578,10 @@ fn declined(symbol: &str, fired: Result<(), kernels_cuda::Refusal>) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::passes::tile::{CUDA_CAST_FP32_TO_BF16, CUDA_SCALE_ROWS_BF16};
+    use crate::plan::passes::tile::{
+        CUDA_CAST_FP32_TO_BF16, CUDA_QUANTIZE_BF16_TO_FP8, CUDA_QUANTIZE_BF16_TO_MXFP4,
+        CUDA_SCALE_ROWS_BF16,
+    };
 
     /// Every symbol the compiler may name is a PATH this build calls.
     ///
@@ -576,33 +590,52 @@ mod tests {
     /// is the other half, catching a renamed transform here instead of at
     /// load time.
     ///
-    /// THE PATH IS THE BINDING AND THE STRING IS ITS SPELLING. `dispatch`
-    /// above MATCHES these two strings and then calls the two functions by
-    /// path, so what can drift is the spelling, not the call. The macro binds
-    /// the function item — which is what makes a rename a compile error here
-    /// — and composes the string out of the same tokens, so the two cannot
-    /// disagree without this failing.
+    /// THE PATH IS THE BINDING AND THE STRING IS ITS SPELLING.
+    /// `run_tile_map` above MATCHES these strings and then calls the
+    /// functions by path, so what can drift is the spelling, not the call.
+    /// The macro binds the function item — which is what makes a rename a
+    /// compile error here — and composes the string out of the same tokens,
+    /// so the two cannot disagree without this failing.
     ///
     /// This replaced a lookup in `kernels_cuda::routine(symbol)`, the by-name
     /// registry the routine layer carried. The registry is deleted; the
     /// question it was asked survives, and the compiler answers more of it.
     ///
-    /// THE OTHER TWO ARE NOT LAUNCHES AT ALL: `quantize_bf16_to_mxfp4_*` and
-    /// `quantize_bf16_to_fp8_*` are load-time weight transforms that
-    /// `kernels-cuda` holds as plain `unsafe fn`s, and their names are
-    /// checked by the COMPILER at `encode_mxfp4`/`encode_fp8`, which is a
-    /// stronger check than this one and needs no list.
+    /// ALL FOUR ARE CHECKED NOW, where two used to be. The other two were
+    /// exempted as "not launches at all — plain `unsafe fn`s whose names the
+    /// COMPILER checks at `encode_mxfp4`/`encode_fp8`". Both halves of that
+    /// went away with the rewrite: the quantisers are ordinary safe entries
+    /// that fire through `Ctx` like the other two, and the four constants are
+    /// uniformly the LOADER's own vocabulary — the word a plan carries from
+    /// `tile` to this file's dispatch, resolved against no registry
+    /// anywhere. So they all get the same one-line binding.
+    ///
+    /// THE STRINGS SAY `quant::`, THE PATHS SAY `linear::quant::`, AND THAT
+    /// IS DELIBERATE. The entries moved namespace when the kernel plane was
+    /// re-cut; the strings did not, because one of them is written into a
+    /// checked-in plan (`tests/golden/llama_dense_cuda_runtime_fp8.json`) and
+    /// a plan's kernel word is a name this crate owns, not a Rust path it
+    /// mirrors. The macro therefore takes the path and the spelling
+    /// separately, and this test is what holds them to each other.
     #[test]
     fn every_symbol_the_plan_may_name_is_a_path_this_build_calls() {
         macro_rules! spelled {
             ($ns:ident :: $f:ident) => {{
                 // THE PATH, RESOLVED. A rename that missed the constant
                 // stops this line from compiling.
-                let _ = kernels_cuda::$ns::$f::<kernels_cuda::jit::abi::bf16>;
+                let _ = kernels_cuda::linear::$ns::$f;
                 concat!(stringify!($ns), "::", stringify!($f))
             }};
         }
         assert_eq!(CUDA_CAST_FP32_TO_BF16, spelled!(quant::cast_fp32_to));
         assert_eq!(CUDA_SCALE_ROWS_BF16, spelled!(quant::scale_rows));
+        assert_eq!(
+            CUDA_QUANTIZE_BF16_TO_MXFP4,
+            spelled!(quant::quantize_bf16_to_mxfp4_e2m1_per_block)
+        );
+        assert_eq!(
+            CUDA_QUANTIZE_BF16_TO_FP8,
+            spelled!(quant::quantize_bf16_to_fp8_e4m3_per_channel)
+        );
     }
 }

@@ -125,20 +125,27 @@ model-loader = { path = "../model-loader", default-features = false }
 # anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
 # `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.
 # The artifact's compiled metadata is lifted here and handed to the runtime
-# whole: `model::serve` owns the shape it arrives in, `tokenizer` names the
-# objects that make up a `pie.tokenizer/1`, and `model::serve::encoding` names
-# `model/config` and the `Encoding` read out of it -- so the worker lifts a
-# snapshot's own `config.json` and reads it back out of an artifact under the
-# same name `convert` writes it under.
+# whole. `tokenizer` names the objects that make up a `pie.tokenizer/1`, and
+# `engine::model::ModelMetadata` is the shape the two halves travel in -- so
+# the worker lifts a snapshot's own `config.json` and reads it back out of an
+# artifact under the same name `convert` writes it under.
 #
-# THE LEGACY CRATE IS GONE FROM THIS GRAPH. It was here for two things, and
-# neither survived inspection: the `contract` feature, whose whole use was those
-# two names above (now `model::serve::encoding`, which is the same 66 lines and
-# no load contract behind them), and `catalog::identify_artifact`, whose only
-# reachable leg was "is the row this artifact names one this build ships" --
-# `model::serve::row` answers exactly that, and `weights.rs` records the
-# measurement that the other leg never once succeeded.
-model = { path = "../model", features = ["serve"] }
+# `model` STOOD HERE and does not any more. It was here for `model::serve`, and
+# for nothing else: `ModelMetadata`, `encoding::CONFIG_OBJECT` and
+# `encoding::Encoding` were the only three names this crate ever spelled out of
+# that crate. M18 deleted the module, and the three did not land back in
+# `model` -- the first is `engine`'s (the serving fabric states the shape of
+# its own boot bundle), the second is `weights.rs`'s own const, and the third
+# had no non-test caller left, because a checkpoint's quantization is read off
+# its stored tensor encodings now rather than off what its config claims.
+# Which leaves an edge to a crate this one names nowhere.
+#
+# THE LEGACY CRATE went the same way one wave earlier, and for the record: it
+# was here for the `contract` feature, whose whole use was those names, and for
+# `catalog::identify_artifact`, whose only reachable leg was "is the row this
+# artifact names one this build ships" -- `engine::model::row` answers exactly
+# that, and `weights.rs` records the measurement that the other leg never once
+# succeeded.
 tokenizer = { path = "../tokenizer" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
@@ -150,7 +157,7 @@ client = { path = "../client" }
 tempfile = "3"
 # So `RUST_LOG=error` reaches the CUDA harness. `kernels-cuda`'s `said` puts
 # the whole of WHY a device instantiation would not fire behind
-# `tracing::error!` -- the returned `Refusal::Device { why }` is a
+# `tracing::error!` -- the returned `KernelError::Device { call, code }` is a
 # `&'static str` and cannot carry it -- so without a subscriber a real fault
 # reads as "the compile, the load or the launch refused; see the log" and
 # there is no log. Finding one such fault meant patching an `eprintln!` into

@@ -251,6 +251,89 @@ pub async fn boot_4090_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle>
     run_standalone(controller, gateway, worker).await
 }
 
+/// **THE B3 SERVING BOOT.** The standalone over the CUDA shell, serving the
+/// one dense SKU the catalog and the L40S agree about
+/// (`qwen35-d0.8b-bf16-kv-bf16`), with the ceilings stated rather than
+/// planner-derived: the arena reserves `max_tokens` rows of a vocabulary-wide
+/// logit column, so an 8192-row default is 8 GiB of arena for a test that
+/// fires eight tokens.
+///
+/// `[model] name` is the deployment's name, not the checkpoint's — the SKU is
+/// identified from the checkpoint's own tensors by `engine::driver::load`.
+pub fn serving_standalone_toml(checkpoint: &str) -> String {
+    format!(
+        "[server]\n\
+         port = 0\n\
+         \n\
+         [model]\n\
+         name = \"qwen35\"\n\
+         model = \"{checkpoint}\"\n\
+         \n\
+         [driver]\n\
+         type = \"cuda_native\"\n\
+         device = [\"cuda:0\"]\n\
+         gpu_mem_utilization = 0.85\n\
+         kv_page_size = 16\n\
+         max_forward_tokens = 512\n\
+         max_forward_requests = 8\n\
+         max_total_pages = 2048\n\
+         swap_pool_size = 0\n"
+    )
+}
+
+/// The prompt every serving gate asks, and why it is this one: the answer is a
+/// single well-known token, so a continuation that is merely fluent still
+/// fails.
+pub const SERVING_PROMPT: &str = "The capital of France is";
+
+/// What greedy decoding of [`SERVING_PROMPT`] answers with on
+/// `qwen35-d0.8b-bf16`, for the first sixteen tokens.
+///
+/// **SIXTEEN, BECAUSE THE PROMPT IS FIVE AND A KV PAGE IS SIXTEEN.** The
+/// continuation crosses a page boundary, which is the first thing a frozen
+/// page CSR gets wrong — and the sixteenth token is where it goes wrong.
+///
+/// It lives here rather than in one test because it is what the `palo B3`
+/// arms are diffed against: `text-completion` produces it with the token
+/// travelling through the host, `token-healing` produces it with the token
+/// carried on the device, and the run-ahead A/B produces it at each of two
+/// `frame_size`s. Those arms are spread over several processes because a
+/// BOOT is what they differ by (one boot per process — the driver grabs the
+/// device and `auth` panics on a second), and a constant is how several
+/// processes agree about a fact. Launches within one boot are not spread:
+/// `cuda_launch_isolation` is the gate that says so.
+pub const SERVING_GREEDY_16: &str =
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is";
+
+/// Boot the standalone the way `pie serve` does, against the HF-cache
+/// snapshot of Qwen3.5-0.8B.
+pub async fn boot_serving() -> Result<pie::StandaloneHandle> {
+    boot_serving_frame(None).await
+}
+
+/// [`boot_serving`] at a stated run-ahead width.
+///
+/// **k IS THE RUN-AHEAD DEPTH A GUEST SEES**, and it is stated here rather
+/// than left to the default because the `palo B3` A/B is exactly the two
+/// values: at `frame_size = 1` `submit_frame` short-circuits before
+/// `validate_frame` and every fire settles before the next is built, which is
+/// one host round trip per token; at `2` a frame carries two ordered slots
+/// and slot 1 consumes the channel slot 0 published, which is the chained
+/// decode. `None` keeps the engine's own default so
+/// [`boot_serving`]'s callers are unchanged.
+///
+/// It rides `[runtime]`, which `worker::config_layout::reshape` moves to
+/// `model.scheduler` — the same door `boot_4090_dispatch_depth` uses.
+pub async fn boot_serving_frame(frame_size: Option<u32>) -> Result<pie::StandaloneHandle> {
+    let checkpoint = resolve_qwen35_snapshot()?;
+    let mut toml = serving_standalone_toml(&checkpoint);
+    if let Some(k) = frame_size {
+        toml.push_str(&format!("\n[runtime]\nframe_size = {k}\n"));
+    }
+    let (controller, gateway, worker) = derive_standalone(&toml)?;
+    run_standalone(controller, gateway, worker).await
+}
+
 /// K for the MTP suites, from `PIE_MTP_DRAFT_TOKENS`. A harness parameter, not
 /// engine config: it selects which arm of a manual A/B to boot, and is handed
 /// to the driver as `mtp_num_drafts`.
@@ -373,7 +456,7 @@ pub async fn run_inferlet(
     let (wasm, manifest) = build_inferlet(name);
 
     // The gateway serves the multi-turn client WebSocket at `/v1/ws`
-    // (`gateway/src/ingress/mod.rs`), gated on the `x-pie-identity` trust-edge
+    // (`gateway/src/ingress.rs`), gated on the `x-pie-identity` trust-edge
     // header (else 401). Standalone has no edge proxy, so inject it here.
     let client = Client::connect_with_identity(&format!("ws://{listen_addr}/v1/ws"), "test-user")
         .await
@@ -399,6 +482,6 @@ pub async fn run_inferlet(
 //
 // `vulkan_standalone_toml*`, `wgpu_standalone_toml*`, `boot_vulkan*` and
 // `boot_wgpu*`, together with the fifteen gates that called them, went with
-// R3: `driver-vulkan` and `driver-wgpu` are out of the workspace until their
+// R3: the vulkan and wgpu drivers are out of the workspace until their
 // baker executors land (P5), so this crate has no feature that reaches one.
 // They come back with the drivers.

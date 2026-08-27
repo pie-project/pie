@@ -4,7 +4,7 @@ use model_loader::types::{Axis, Encoding, QuantGranularity, QuantSpec, ScaleForm
 
 const GROUP: u32 = 32;
 
-const ALIGNMENT: u32 = 256;
+pub(crate) const ALIGNMENT: u32 = 256;
 
 pub struct Claim {
     pub name: String,
@@ -40,8 +40,8 @@ impl std::fmt::Display for ModelError {
             ),
             Self::Illegible { name, detail } => write!(
                 f,
-                "`{name}`: the checkpoint states this plane in terms no reader \
-                 here can name ({detail})"
+                "`{name}`: this checkpoint is stated in terms no reader here \
+                 can name ({detail})"
             ),
             Self::Incompatible { name, stored, want } => write!(
                 f,
@@ -66,8 +66,11 @@ pub fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U8
         | Dtype::I8
         | Dtype::Fp8E4m3
-        | Dtype::E8m0
-        | Dtype::Fp4 => (crate::encoding(w.dtype), None),
+        | Dtype::E8m0 => (crate::encoding(w.dtype), None),
+        Dtype::Fp4 => panic!(
+            "`Dtype::Fp4` names a kv-page quantization scheme, not a stored \
+             weight plane; no load contract declares one"
+        ),
     };
     Claim {
         name: w.name.clone(),
@@ -81,26 +84,53 @@ pub fn claim(w: &Weight, tp: u32) -> Claim {
 pub fn elaborate(src: &ztensor::Source, claims: Vec<Claim>) -> Result<ModelContract, ModelError> {
     let mut tensors = Vec::new();
     for claim in claims {
-        let stored = stored_encoding(src, &claim.name)?;
-        let read = banded(&claim.name, claim.bands.as_ref());
-        let expr = ladder(&claim.name, read, &stored, &claim.encoding)?;
-        tensors.push(match &claim.encoding {
-            Encoding::Raw(_) => TensorContract::new(
-                claim.name.clone(),
-                expr,
-                claim.shape.clone(),
-                claim.encoding.clone(),
-            ),
-            Encoding::Quant(_) => {
-                TensorContract::inferred(claim.name.clone(), expr, claim.encoding.clone())
+        let Claim {
+            name,
+            shape,
+            bands,
+            encoding,
+            scales,
+        } = claim;
+        let stored = stored_encoding(src, &name)?;
+        let read = banded(&name, bands.as_ref());
+        let expr = ladder(&name, read, &stored, &encoding)?;
+        tensors.push(match &encoding {
+            Encoding::Raw(_) => {
+                TensorContract::new(name.clone(), expr, shape.clone(), encoding.clone())
             }
+            Encoding::Quant(_) => TensorContract::inferred(name.clone(), expr, encoding.clone()),
         });
-        let pairing = match stored {
-            Encoding::Quant(_) => claim.scales,
-            Encoding::Raw(_) => None,
-        };
-        if let Some(pairing) = pairing {
-            tensors.push(interned(&claim.name, &claim.shape, claim.bands, pairing));
+        match (&stored, scales) {
+            // The checkpoint SHIPPED both planes: the second one is bytes on
+            // disk, so the contract says where they are.
+            (Encoding::Quant(_), Some(pairing)) => {
+                tensors.push(interned(&name, &shape, bands, pairing));
+            }
+            // The checkpoint ships the weight unquantized and the model wants
+            // it quantized, so `ladder` above put an honest
+            // `Cast { to: Quant(..) }` in the expression and the LOADER
+            // encodes on the way in. It also publishes the scales plane the
+            // codes cannot be read without, under `<w>.scales` — the one name
+            // this tree binds an mxfp4 second plane by, the one
+            // `model_dsl::scales_name` writes and `Weight::planes` interns
+            // into `Plan::params`. That accord is settled in the loader
+            // (`plan::build::ScaleLayout::for_encode`'s MXFP4 arm carries the
+            // ruling and `executor::walk`'s
+            // `an_expert_bank_encodes_to_the_same_bytes_as_the_rows_it_stacks`
+            // proves the bytes and the name), which is why there is nothing
+            // to declare here: an entry of our own would be a SECOND producer
+            // for a plane that already has exactly one.
+            //
+            // THIS ARM WAS A REFUSAL — `ModelError::Incompatible`, "one
+            // quantization is not decoded into another on the way in", which
+            // is a sentence about the Quant-to-Quant case wrongly applied to
+            // this one. It made runtime quantization unreachable through
+            // `Model::load` at all, against M18's own ruling that a declared
+            // encoding the checkpoint does not hold is exactly what makes the
+            // loader cast or encode. The Quant-to-Quant refusal is unaffected:
+            // it lives in `ladder`, where it belongs.
+            (Encoding::Raw(_), Some(_)) => {}
+            (Encoding::Quant(_), None) | (Encoding::Raw(_), None) => {}
         }
     }
     Ok(ModelContract {
@@ -114,14 +144,13 @@ pub fn elaborate(src: &ztensor::Source, claims: Vec<Claim>) -> Result<ModelContr
 pub fn declare(
     src: &ztensor::Source,
     w: &Weight,
-    tp: u32,
     expr: Expr,
 ) -> Result<TensorContract, ModelError> {
     let want = crate::encoding(w.dtype);
     let stored = agreed(src, &w.name, &expr)?;
     let expr = ladder(&w.name, expr, &stored, &want)?;
     Ok(match &stored {
-        Encoding::Raw(_) => TensorContract::new(w.name.clone(), expr, whole(w, tp), want),
+        Encoding::Raw(_) => TensorContract::new(w.name.clone(), expr, extents(w), want),
         Encoding::Quant(_) => TensorContract::inferred(w.name.clone(), expr, want),
     })
 }
@@ -129,20 +158,18 @@ pub fn declare(
 pub fn copy(
     src: &ztensor::Source,
     w: &Weight,
-    tp: u32,
     from: impl Into<String>,
 ) -> Result<TensorContract, ModelError> {
-    declare(src, w, tp, Expr::src(from))
+    declare(src, w, Expr::src(from))
 }
 
 pub fn fused(
     src: &ztensor::Source,
     w: &Weight,
-    tp: u32,
     parts: impl IntoIterator<Item = String>,
 ) -> Result<TensorContract, ModelError> {
     let legs = parts.into_iter().map(Expr::src).collect();
-    declare(src, w, tp, Expr::concat(pack_axis(w), legs))
+    declare(src, w, Expr::concat(pack_axis(w), legs))
 }
 
 fn interned(
@@ -152,7 +179,7 @@ fn interned(
     pairing: Scales,
 ) -> TensorContract {
     seams_clear_the_blocked_axis(of, bands.as_ref(), pairing.channel_axis);
-    let name = format!("{of}.scales");
+    let name = model_dsl::scales_name(of);
     let declared = divided(shape, pairing.channel_axis, of);
     let want = crate::encoding(Dtype::E8m0);
     let expr = banded(&name, bands.as_ref());
@@ -166,7 +193,10 @@ fn agreed(src: &ztensor::Source, name: &str, expr: &Expr) -> Result<Encoding, Mo
         read.push((source, stored));
     }
     let Some((whose, first)) = read.first() else {
-        panic!("`{name}` is built from no checkpoint tensor at all")
+        return Err(ModelError::Illegible {
+            name: name.to_string(),
+            detail: "it is built from no checkpoint tensor at all".to_string(),
+        });
     };
     for (source, seen) in &read {
         if seen != first {
@@ -182,7 +212,7 @@ fn agreed(src: &ztensor::Source, name: &str, expr: &Expr) -> Result<Encoding, Mo
     Ok(first.clone())
 }
 
-fn stored_encoding(src: &ztensor::Source, name: &str) -> Result<Encoding, ModelError> {
+pub(crate) fn stored_encoding(src: &ztensor::Source, name: &str) -> Result<Encoding, ModelError> {
     let Some(tensor) = src.get(name) else {
         return Err(ModelError::Missing(name.to_string()));
     };
@@ -244,12 +274,15 @@ fn banded(name: &str, bands: Option<&(u32, Vec<i64>)>) -> Expr {
     }
 }
 
-fn whole(w: &Weight, tp: u32) -> Vec<i64> {
-    let mut dims: Vec<i64> = w
-        .shape
+pub(crate) fn extents(w: &Weight) -> Vec<i64> {
+    w.shape
         .iter()
         .map(|extent| i64::try_from(*extent).expect("an extent no i64 holds"))
-        .collect();
+        .collect()
+}
+
+pub(crate) fn whole(w: &Weight, tp: u32) -> Vec<i64> {
+    let mut dims = extents(w);
     match &w.shard {
         Shard::Replicated => dims,
         Shard::Cut { axis, segments } => {
@@ -272,7 +305,7 @@ fn whole(w: &Weight, tp: u32) -> Vec<i64> {
     }
 }
 
-fn divided(shape: &[i64], axis: u32, name: &str) -> Vec<i64> {
+pub(crate) fn divided(shape: &[i64], axis: u32, name: &str) -> Vec<i64> {
     let mut dims = shape.to_vec();
     let at = axis as usize;
     let extent = *dims
@@ -300,7 +333,7 @@ fn seams_clear_the_blocked_axis(name: &str, bands: Option<&(u32, Vec<i64>)>, cha
     );
 }
 
-fn scaling(w: &Weight) -> Scales {
+pub(crate) fn scaling(w: &Weight) -> Scales {
     Scales {
         of: w.name.clone(),
         granularity: QuantGranularity::PerGroup,
@@ -310,7 +343,7 @@ fn scaling(w: &Weight) -> Scales {
     }
 }
 
-fn grouped(w: &Weight) -> Encoding {
+pub(crate) fn grouped(w: &Weight) -> Encoding {
     match crate::encoding(w.dtype) {
         Encoding::Quant(spec) => Encoding::Quant(QuantSpec {
             channel_axis: Some(Axis(channel_axis(w))),
@@ -324,7 +357,7 @@ fn grouped(w: &Weight) -> Encoding {
     }
 }
 
-fn channel_axis(w: &Weight) -> u8 {
+pub(crate) fn channel_axis(w: &Weight) -> u8 {
     let last = w
         .shape
         .len()

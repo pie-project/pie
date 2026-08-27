@@ -72,7 +72,7 @@ pub fn max_touched_pages(total_tokens: i32, num_requests: i32, page_size: i32) -
     if page_size <= 0 {
         return 0;
     }
-    total_tokens.div_ceil(page_size) + num_requests
+    (total_tokens + page_size - 1) / page_size + num_requests
 }
 
 /// The `(kv_heads, head_dim)` split the pool row's strides spell for an
@@ -369,7 +369,7 @@ fn active_geometry(
 ) -> (i64, i32, Launch) {
     let page_elems = page_size * num_kv_heads * head_dim;
     let logical_n = i64::from(num_pages_in_batch) * i64::from(page_elems);
-    let blocks = logical_n.div_ceil(i64::from(BLOCK));
+    let blocks = (logical_n + i64::from(BLOCK) - 1) / i64::from(BLOCK);
     (
         logical_n,
         page_elems,

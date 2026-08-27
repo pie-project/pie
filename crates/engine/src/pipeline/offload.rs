@@ -1,34 +1,83 @@
-//! Remote executor partner registry, admission, transfer, and prefix adoption.
+//! Remote executor partners: the registry and the admission accounting, and a
+//! named hole where the transport was.
+//!
+//! # `palo B-remote`: what this module lost, and why it kept its shape
+//!
+//! Every verb that moved bytes lived on `driver_api::remote` —
+//! `ExecutorRpcClient`, `ExecutorRequest`/`ExecutorResponse`, `PushKv`,
+//! `InlineKvPayload`, `RemoteEncode`, `RemoteEmbeddings`, `RemoteMediaBlob`,
+//! `ScratchGrant`, `REMOTE_WIRE_VERSION` — and the palo contract rewrite
+//! deleted the module whole, on the ruling that remote is a property of a
+//! transport and not an encoding of a contract (design §7, decision 19). So
+//! the ~1,300 lines that framed those messages are gone: the inline KV push
+//! and its host-side region import, the encode blob server and its TCP
+//! listener, the surrogate-instance cache, the prefix-adoption planner, and
+//! `try_prefill`.
+//!
+//! What is NOT gone is everything above the wire, because none of it was
+//! about the wire:
+//!
+//! * the **registry** — which peers exist, in which role, behind which
+//!   `DriverId`;
+//! * the **admission accounting** — `max_outstanding`, the claim/release
+//!   guard, the drain notification, power-of-two-choices selection;
+//! * the **settings** and the **counters** an operator reads.
+//!
+//! A registered peer is a `DriverId` like any other, and the driver behind it
+//! is `crate::driver::backend::remote::RemoteDriver`, which answers
+//! [`DriverError::Unsupported`](driver_api::DriverError::Unsupported) to
+//! every verb with the peer named. That is the shape the rewrite asks for: a
+//! remote driver is *a `dyn Driver` whose envelope is the transport's*, and
+//! until the transport exists the engine can see the peer, refuse to use it,
+//! and say why — rather than silently dropping the request, which is what a
+//! stub that answered `Ok` would do.
+//!
+//! Each site the transport used to occupy carries a `palo B-remote:` marker
+//! naming what the future envelope has to carry there.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock, RwLock};
 
-use ::driver_api::{
-    ExecutorRequest, ExecutorResponse, InlineKvPayload, MemoryDomain, PushKv, RemoteMediaBlob,
-    RemoteMediaKind, RemoteTransferKind,
-};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow};
 
-use crate::pipeline::program::RegisteredProgram;
-use crate::store::kv::page_table::WorkingSetId;
-
+/// Which side of a disaggregated deployment a peer serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartnerRole {
+    /// It runs prefills and hands back KV.
     Prefill,
+    /// It runs a multimodal encoder and hands back embedding rows.
     Encode,
 }
 
+/// How a peer's bytes are meant to reach this node.
+///
+/// **AN ENGINE TYPE NOW, NOT A CONTRACT ONE.** It was
+/// `driver_api::RemoteTransferKind`, sitting in the contract beside the tarpc
+/// service it selected a codec for. Which wire a deployment runs on is a
+/// deployment's decision and a transport's implementation; the engine holds
+/// it because the engine is what an operator configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransferKind {
+    /// The peer's pages travel inside the reply.
+    #[default]
+    Inline,
+    /// The peer writes into this node's pool over RDMA.
+    Nixl,
+}
+
+/// One registered peer.
+///
+/// The `client: Option<ExecutorRpcClient>` field is gone with the envelope
+/// (see the module header); what is left is the identity a scheduler routes
+/// on and the accounting an admission decision reads.
 pub struct Partner {
     worker_id: u64,
     destination_worker_id: u64,
     driver_id: Option<usize>,
     role: PartnerRole,
-    transfer: RemoteTransferKind,
-    client: Option<::driver_api::ExecutorRpcClient>,
+    transfer: TransferKind,
     blob_host: RwLock<Option<IpAddr>>,
     max_outstanding: u32,
     outstanding: AtomicU32,
@@ -37,39 +86,62 @@ pub struct Partner {
 }
 
 impl Partner {
+    /// Which worker this is.
     pub fn worker_id(&self) -> u64 {
         self.worker_id
     }
 
+    /// Which worker its answers are destined for.
+    pub fn destination_worker_id(&self) -> u64 {
+        self.destination_worker_id
+    }
+
+    /// Which registry slot its driver holds.
+    ///
+    /// # Panics
+    ///
+    /// For an encode partner, which has no driver of its own.
     pub fn driver_id(&self) -> usize {
         self.driver_id
             .expect("only prefill partners have remote driver slots")
     }
 
+    /// Which side it serves.
     pub fn role(&self) -> PartnerRole {
         self.role
     }
 
-    pub fn transfer_kind(&self) -> RemoteTransferKind {
+    /// Which wire it was configured for.
+    pub fn transfer_kind(&self) -> TransferKind {
         self.transfer
     }
 
+    /// How many claims are outstanding against it.
     pub fn outstanding(&self) -> u32 {
         self.outstanding.load(Ordering::Relaxed)
     }
 
+    /// Stop selecting it.
     pub fn mark_suspect(&self) {
         self.available.store(false, Ordering::Release);
     }
 
+    /// Select it again.
     pub fn mark_available(&self) {
         self.available.store(true, Ordering::Release);
     }
 
+    /// Where its large payloads would be fetched from.
     pub fn set_blob_host(&self, host: IpAddr) {
         *self.blob_host.write().unwrap() = Some(host);
     }
 
+    /// Where its large payloads would be fetched from, if it stated one.
+    pub fn blob_host(&self) -> Option<IpAddr> {
+        *self.blob_host.read().unwrap()
+    }
+
+    /// Park until nothing is outstanding against it.
     pub async fn wait_drained(&self) {
         loop {
             if self.outstanding() == 0 {
@@ -85,114 +157,55 @@ impl Partner {
         }
     }
 
+    /// Pull this peer's KV pages into the home pool.
+    ///
+    /// # Errors
+    ///
+    /// Always, until the envelope exists.
+    ///
+    /// **`palo B-remote`**: the envelope must carry, for each direction it
+    /// serves, either the page BYTES (the old `InlineKvPayload`: a page-stride
+    /// count, the destination page ids echoed back, and one flat buffer the
+    /// caller splits per region) or an RDMA registration
+    /// ([`KvHandle`](driver_api::KvHandle) is serde and already says where a
+    /// pool's regions are). It must also answer which one it used, because
+    /// the caller's next act differs: an inline reply is imported region by
+    /// region on the host; an RDMA push is already done when the reply
+    /// arrives.
     pub async fn pull_kv(&self, src_page_ids: Vec<u32>, dst_page_ids: Vec<u32>) -> Result<()> {
-        ensure!(
-            src_page_ids.len() == dst_page_ids.len(),
-            "inline KV source/destination page counts differ"
-        );
-        ensure!(
-            matches!(
-                self.transfer,
-                RemoteTransferKind::Inline | RemoteTransferKind::Nixl
-            ),
-            "transfer {:?} is not wired yet",
-            self.transfer
-        );
-        let expected_dst_page_ids = dst_page_ids.clone();
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| anyhow!("partner has no transfer client"))?;
-        let mut context = tarpc::context::current();
-        context.deadline = Instant::now() + Duration::from_secs(24 * 60 * 60);
-        let response = client
-            .execute(
-                context,
-                ExecutorRequest::PushKv(PushKv {
-                    src_page_ids,
-                    dst_page_ids,
-                    dst_worker: self.destination_worker_id,
-                }),
-            )
-            .await
-            .map_err(|error| anyhow!("inline KV transport failed: {error}"))?
-            .map_err(|error| anyhow!("inline KV push rejected: {error}"))?;
-        match (self.transfer, response) {
-            (RemoteTransferKind::Inline, ExecutorResponse::KvPayload(payload)) => {
-                ensure!(
-                    payload.dst_page_ids == expected_dst_page_ids,
-                    "executor changed inline KV destination page ids"
-                );
-                import_inline_payload(&payload)
-            }
-            (RemoteTransferKind::Nixl, ExecutorResponse::KvPushed) => Ok(()),
-            (_, response) => Err(anyhow!(
-                "executor returned unexpected KV push response {response:?}"
-            )),
-        }
+        let _ = (src_page_ids, dst_page_ids);
+        Err(self.no_transport("pull_kv"))
     }
 
-    pub async fn encode(
-        &self,
-        mut plan: ::driver_api::LaunchPlan,
-    ) -> Result<::driver_api::RemoteEmbeddings> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| anyhow!("partner has no executor client"))?;
-        let mut context = tarpc::context::current();
-        context.deadline = Instant::now() + Duration::from_secs(300);
-        let mut blobs = Vec::new();
-        let mut blob_leases = Vec::new();
-        let threshold = SETTINGS.read().unwrap().encode_blob_threshold;
-        let payload_bytes = plan
-            .image_pixels
-            .len()
-            .checked_add(plan.audio_features.len())
-            .ok_or_else(|| anyhow!("aggregate encode media size overflow"))?;
-        if payload_bytes >= threshold {
-            let blob_host = self
-                .blob_host
-                .read()
-                .unwrap()
-                .ok_or_else(|| anyhow!("encode partner has no routed blob host"))?;
-            if !plan.image_pixels.is_empty() {
-                let (blob, lease) = publish_encode_blob(
-                    RemoteMediaKind::ImagePixels,
-                    std::mem::take(&mut plan.image_pixels),
-                    blob_host,
-                )?;
-                blobs.push(blob);
-                blob_leases.push(lease);
-            }
-            if !plan.audio_features.is_empty() {
-                let (blob, lease) = publish_encode_blob(
-                    RemoteMediaKind::AudioFeatures,
-                    std::mem::take(&mut plan.audio_features),
-                    blob_host,
-                )?;
-                blobs.push(blob);
-                blob_leases.push(lease);
-            }
-        }
-        let response = client
-            .execute(
-                context,
-                ExecutorRequest::Encode(::driver_api::RemoteEncode { plan, blobs }),
-            )
-            .await
-            .map_err(|error| anyhow!("encode transport failed: {error}"))?
-            .map_err(|error| anyhow!("encode rejected: {error}"))?;
-        let ExecutorResponse::Embeddings(embeddings) = response else {
-            return Err(anyhow!(
-                "executor returned unexpected encode response {response:?}"
-            ));
-        };
-        Ok(embeddings)
+    /// Run this peer's encoder over a media payload.
+    ///
+    /// # Errors
+    ///
+    /// Always, until the envelope exists.
+    ///
+    /// **`palo B-remote`**: [`MediaEncode`](driver_api::MediaEncode) is serde
+    /// and carries its own bytes, so the message is that type and the answer
+    /// is the same value with `output_rows` filled. What the envelope must
+    /// add is a SIZE policy — an encode is megabytes, the old code stood up a
+    /// TCP blob server above four of them, and a frame limit is the
+    /// transport's business rather than the contract's.
+    pub async fn encode(&self, plan: driver_api::MediaEncode) -> Result<driver_api::MediaEncode> {
+        let _ = plan;
+        Err(self.no_transport("encode"))
+    }
+
+    fn no_transport(&self, verb: &'static str) -> anyhow::Error {
+        COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
+        anyhow!(
+            "partner {} cannot serve `{verb}`: the remote envelope \
+             `driver_api::remote` carried was deleted by the palo contract \
+             rewrite and its successor is palo B-remote",
+            self.worker_id
+        )
     }
 
     fn try_claim(self: &Arc<Self>) -> Option<PartnerGuard> {
-        if self.transfer == RemoteTransferKind::Nixl && NIXL_QUARANTINED.load(Ordering::Acquire) {
+        if self.transfer == TransferKind::Nixl && NIXL_QUARANTINED.load(Ordering::Acquire) {
             return None;
         }
         if !self.available.load(Ordering::Acquire) {
@@ -208,8 +221,7 @@ impl Partner {
             return None;
         }
         if !self.available.load(Ordering::Acquire)
-            || (self.transfer == RemoteTransferKind::Nixl
-                && NIXL_QUARANTINED.load(Ordering::Acquire))
+            || (self.transfer == TransferKind::Nixl && NIXL_QUARANTINED.load(Ordering::Acquire))
         {
             let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
             if previous == 1 {
@@ -223,11 +235,13 @@ impl Partner {
     }
 }
 
+/// One outstanding claim against a partner, released on drop.
 pub struct PartnerGuard {
     partner: Arc<Partner>,
 }
 
 impl PartnerGuard {
+    /// The peer this claim is against.
     pub fn partner(&self) -> &Arc<Partner> {
         &self.partner
     }
@@ -248,14 +262,18 @@ type PartnerKey = (PartnerRole, u64);
 static PARTNERS: LazyLock<RwLock<HashMap<PartnerKey, Arc<Partner>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Register a peer, replacing (and suspecting) any earlier one in the same
+/// role.
+///
+/// The `client: Option<ExecutorRpcClient>` argument is gone: there is no
+/// client type to pass. Everything else is what it was.
 pub fn register_partner(
     worker_id: u64,
     destination_worker_id: u64,
     driver_id: impl Into<Option<usize>>,
     role: PartnerRole,
     max_outstanding: u32,
-    transfer: RemoteTransferKind,
-    client: Option<::driver_api::ExecutorRpcClient>,
+    transfer: TransferKind,
 ) -> Arc<Partner> {
     let partner = Arc::new(Partner {
         worker_id,
@@ -263,7 +281,6 @@ pub fn register_partner(
         driver_id: driver_id.into(),
         role,
         transfer,
-        client,
         blob_host: RwLock::new(None),
         max_outstanding: max_outstanding.max(1),
         outstanding: AtomicU32::new(0),
@@ -280,74 +297,37 @@ pub fn register_partner(
     partner
 }
 
+/// Forget a peer.
 pub fn remove_partner(worker_id: u64, role: PartnerRole) {
     if let Some(partner) = PARTNERS.write().unwrap().remove(&(role, worker_id)) {
         partner.mark_suspect();
     }
 }
 
+/// Close every surrogate instance a driver holds.
+///
+/// **`palo B-remote`**: a surrogate was a bound instance on the HOME driver
+/// standing in for a peer's context extension, cached by
+/// `(driver, program, home_instance)` — the prefix-adoption machinery. It
+/// went with `try_prefill`; nothing holds a surrogate now, so this has
+/// nothing to close. Kept as a door because the link layer calls it on
+/// teardown and a peer's driver going away must remain a stated event.
 pub fn close_driver_surrogates(driver_id: usize) {
-    let mut cache = SURROGATES.lock().unwrap();
-    let keys = cache
-        .keys()
-        .filter(|(candidate, _, _)| *candidate == driver_id)
-        .copied()
-        .collect::<Vec<_>>();
-    for key in keys {
-        if let Some(surrogate) = cache.remove(&key) {
-            let _ = crate::scheduler::close_instance(&surrogate.bound);
-        }
-    }
+    let _ = driver_id;
 }
 
+/// Note that a home instance is gone.
+///
+/// **`palo B-remote`**: as [`close_driver_surrogates`] — the home-state table
+/// this walked existed to keep surrogates alive across a peer's answer.
 pub(crate) fn close_home_instance(home_instance_id: u64) {
-    let users = {
-        let mut states = HOME_STATES.lock().unwrap();
-        let state = states.entry(home_instance_id).or_default();
-        state.closed = true;
-        state.users
-    };
-    let surrogates = {
-        let mut cache = SURROGATES.lock().unwrap();
-        let keys = cache
-            .keys()
-            .filter(|(_, _, candidate)| *candidate == home_instance_id)
-            .copied()
-            .collect::<Vec<_>>();
-        keys.into_iter()
-            .filter_map(|key| cache.remove(&key))
-            .collect::<Vec<_>>()
-    };
-    if surrogates.is_empty() {
-        if users == 0 {
-            HOME_STATES.lock().unwrap().remove(&home_instance_id);
-        }
-        return;
-    }
-    let close = move || {
-        for surrogate in surrogates {
-            while Arc::strong_count(&surrogate) != 1 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let _ = crate::scheduler::close_instance(&surrogate.bound);
-        }
-        let mut states = HOME_STATES.lock().unwrap();
-        if states
-            .get(&home_instance_id)
-            .is_some_and(|state| state.closed && state.users == 0)
-        {
-            states.remove(&home_instance_id);
-        }
-    };
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn_blocking(close);
-    } else {
-        let _ = std::thread::Builder::new()
-            .name(format!("pie-surrogate-close-{home_instance_id}"))
-            .spawn(close);
-    }
+    let _ = home_instance_id;
 }
 
+/// Claim the least-loaded of two random available peers in `role`.
+///
+/// Power of two choices, unchanged: the selection policy is about load, and
+/// load is not an encoding.
 pub fn select_partner(role: PartnerRole) -> Option<PartnerGuard> {
     let candidates = PARTNERS
         .read()
@@ -399,7 +379,6 @@ struct OffloadSettings {
     prefill_min_suffix_tokens: usize,
     encode_injection: bool,
     encode_hidden_size: u32,
-    encode_blob_threshold: usize,
 }
 
 static SETTINGS: LazyLock<RwLock<OffloadSettings>> = LazyLock::new(|| {
@@ -408,338 +387,14 @@ static SETTINGS: LazyLock<RwLock<OffloadSettings>> = LazyLock::new(|| {
         prefill_min_suffix_tokens: 0,
         encode_injection: false,
         encode_hidden_size: 0,
-        encode_blob_threshold: 4 * 1024 * 1024,
     })
 });
 static OFFLOAD_ENABLED: AtomicBool = AtomicBool::new(false);
 static ENCODE_INJECTION_ENABLED: AtomicBool = AtomicBool::new(false);
-static ENCODE_BLOB_REGISTRY: LazyLock<Mutex<EncodeBlobRegistry>> =
-    LazyLock::new(|| Mutex::new(EncodeBlobRegistry::default()));
-
-#[derive(Default)]
-struct EncodeBlobRegistry {
-    server: Option<Arc<EncodeBlobServer>>,
-    blobs: HashMap<[u8; 32], EncodeBlobEntry>,
-}
-
-struct EncodeBlobEntry {
-    bytes: Arc<Vec<u8>>,
-    leases: usize,
-}
-
-struct EncodeBlobServer {
-    port: u16,
-    host: IpAddr,
-    shutdown: Arc<AtomicBool>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-struct EncodeBlobLease {
-    hash: [u8; 32],
-}
-
-impl Drop for EncodeBlobLease {
-    fn drop(&mut self) {
-        let server = {
-            let mut registry = ENCODE_BLOB_REGISTRY.lock().unwrap();
-            let Some(entry) = registry.blobs.get_mut(&self.hash) else {
-                return;
-            };
-            entry.leases -= 1;
-            if entry.leases == 0 {
-                registry.blobs.remove(&self.hash);
-            }
-            registry
-                .blobs
-                .is_empty()
-                .then(|| registry.server.take())
-                .flatten()
-        };
-        if let Some(server) = server {
-            server.stop();
-        };
-    }
-}
-
-impl EncodeBlobServer {
-    fn start(host: IpAddr) -> Result<Arc<Self>> {
-        let listener = TcpListener::bind(SocketAddr::new(host, 0))
-            .map_err(|error| anyhow!("binding encode blob listener: {error}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| anyhow!("configuring encode blob listener: {error}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|error| anyhow!("reading encode blob listener address: {error}"))?
-            .port();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = Arc::clone(&shutdown);
-        let thread = std::thread::Builder::new()
-            .name("pie-encode-blob".to_string())
-            .spawn(move || {
-                let (connections, receiver) = std::sync::mpsc::sync_channel(16);
-                let receiver = Arc::new(Mutex::new(receiver));
-                let mut workers = Vec::with_capacity(4);
-                for index in 0..4 {
-                    let receiver = Arc::clone(&receiver);
-                    if let Ok(worker) = std::thread::Builder::new()
-                        .name(format!("pie-encode-blob-{index}"))
-                        .spawn(move || {
-                            loop {
-                                let connection = receiver.lock().unwrap().recv();
-                                match connection {
-                                    Ok(stream) => serve_encode_blob(stream),
-                                    Err(_) => break,
-                                }
-                            }
-                        })
-                    {
-                        workers.push(worker);
-                    }
-                }
-                while !thread_shutdown.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            // The listener is non-blocking so the accept loop
-                            // can poll its shutdown flag, and on macOS/BSD an
-                            // accepted socket *inherits* that flag -- Linux
-                            // does not, which is why this only ever showed up
-                            // on one platform. `serve_encode_blob` is blocking
-                            // code: without this its 8 MiB `write_all` returns
-                            // `WouldBlock` partway through a body the client
-                            // was promised by `content-length`, and the client
-                            // sees a truncated response.
-                            //
-                            // Checked rather than ignored, unlike the timeouts
-                            // below: those only sharpen a failure this one
-                            // prevents, and serving a truncated body looks to
-                            // the client like corruption rather than a refusal.
-                            if stream.set_nonblocking(false).is_err() {
-                                tracing::warn!(
-                                    "encode blob connection could not be made blocking; \
-                                     dropping it rather than truncating its body"
-                                );
-                                continue;
-                            }
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-                            if connections.try_send(stream).is_err() {
-                                tracing::warn!("encode blob connection queue is full");
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "encode blob accept failed");
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                    }
-                }
-                drop(connections);
-                for worker in workers {
-                    let _ = worker.join();
-                }
-            })
-            .map_err(|error| anyhow!("spawning encode blob listener: {error}"))?;
-        Ok(Arc::new(Self {
-            port,
-            host,
-            shutdown,
-            thread: Mutex::new(Some(thread)),
-        }))
-    }
-
-    fn stop(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.lock().unwrap().take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn publish_encode_blob(
-    kind: RemoteMediaKind,
-    bytes: Vec<u8>,
-    host: IpAddr,
-) -> Result<(RemoteMediaBlob, EncodeBlobLease)> {
-    ensure!(!bytes.is_empty(), "cannot publish an empty encode blob");
-    let size = u64::try_from(bytes.len()).map_err(|_| anyhow!("encode blob is too large"))?;
-    let hash = *blake3::hash(&bytes).as_bytes();
-    let server = {
-        let mut registry = ENCODE_BLOB_REGISTRY.lock().unwrap();
-        if let Some(server) = registry.server.as_ref() {
-            ensure!(
-                server.host == host,
-                "encode blob listener is active on {}, not routed host {host}",
-                server.host
-            );
-        } else {
-            registry.server = Some(EncodeBlobServer::start(host)?);
-        }
-        let entry = registry
-            .blobs
-            .entry(hash)
-            .or_insert_with(|| EncodeBlobEntry {
-                bytes: Arc::new(bytes),
-                leases: 0,
-            });
-        entry.leases += 1;
-        Arc::clone(registry.server.as_ref().expect("blob server is present"))
-    };
-    let authority = if server.host.is_ipv6() {
-        format!("[{}]:{}", server.host, server.port)
-    } else {
-        format!("{}:{}", server.host, server.port)
-    };
-    Ok((
-        RemoteMediaBlob {
-            kind,
-            hash,
-            size,
-            origin: format!("http://{authority}"),
-        },
-        EncodeBlobLease { hash },
-    ))
-}
-
-fn serve_encode_blob(mut stream: TcpStream) {
-    let mut request = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    while request.len() <= 8192 && !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-        let Ok(read) = stream.read(&mut chunk) else {
-            return;
-        };
-        if read == 0 {
-            return;
-        }
-        request.extend_from_slice(&chunk[..read]);
-    }
-    let request = String::from_utf8_lossy(&request);
-    let hash = request
-        .lines()
-        .next()
-        .and_then(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            (fields.next() == Some("GET"))
-                .then(|| fields.next())
-                .flatten()
-        })
-        .and_then(|path| path.strip_prefix("/encode-blob/"))
-        .and_then(parse_blob_hash);
-    let bytes = hash.and_then(|hash| {
-        ENCODE_BLOB_REGISTRY
-            .lock()
-            .unwrap()
-            .blobs
-            .get(&hash)
-            .map(|entry| Arc::clone(&entry.bytes))
-    });
-    if let Some(bytes) = bytes {
-        let header = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            bytes.len()
-        );
-        let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(&bytes);
-    } else {
-        let _ = stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
-    }
-}
-
-fn parse_blob_hash(value: &str) -> Option<[u8; 32]> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    let mut hash = [0u8; 32];
-    for (output, pair) in hash.iter_mut().zip(bytes.chunks_exact(2)) {
-        *output = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Some(hash)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-static HOME_KV_HANDLE: LazyLock<RwLock<Option<::driver_api::KvHandle>>> =
+static HOME_KV_HANDLE: LazyLock<RwLock<Option<driver_api::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
-#[cfg(feature = "_driver-cuda")]
-unsafe extern "C" {
-    fn cudaMemcpy(
-        dst: *mut std::ffi::c_void,
-        src: *const std::ffi::c_void,
-        count: usize,
-        kind: i32,
-    ) -> i32;
-    fn cudaGetDevice(device: *mut i32) -> i32;
-    fn cudaSetDevice(device: i32) -> i32;
-}
-
-#[cfg(feature = "_driver-cuda")]
-struct CudaDeviceGuard(i32);
-
-#[cfg(feature = "_driver-cuda")]
-impl CudaDeviceGuard {
-    fn select(device: u32) -> Result<Self> {
-        let mut previous = 0;
-        let status = unsafe { cudaGetDevice(&mut previous) };
-        ensure!(status == 0, "cudaGetDevice failed with status {status}");
-        if previous != device as i32 {
-            let status = unsafe { cudaSetDevice(device as i32) };
-            ensure!(status == 0, "cudaSetDevice failed with status {status}");
-        }
-        Ok(Self(previous))
-    }
-}
-
-#[cfg(feature = "_driver-cuda")]
-impl Drop for CudaDeviceGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cudaSetDevice(self.0);
-        }
-    }
-}
-
-fn copy_host_to_region(domain: MemoryDomain, dst: u64, src: &[u8]) -> Result<()> {
-    match domain {
-        MemoryDomain::HostPinned => unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
-            Ok(())
-        },
-        MemoryDomain::CudaDevice(_device) => {
-            #[cfg(feature = "_driver-cuda")]
-            {
-                let _guard = CudaDeviceGuard::select(_device)?;
-                let status = unsafe {
-                    cudaMemcpy(
-                        dst as *mut std::ffi::c_void,
-                        src.as_ptr() as *const std::ffi::c_void,
-                        src.len(),
-                        4,
-                    )
-                };
-                ensure!(status == 0, "cudaMemcpy H2D failed with status {status}");
-                Ok(())
-            }
-            #[cfg(not(feature = "_driver-cuda"))]
-            {
-                Err(anyhow!("CUDA KV import requires feature \"driver-cuda\""))
-            }
-        }
-        other => Err(anyhow!("inline KV import does not support {other:?}")),
-    }
-}
-
+/// Turn prefill offload on, and say how long a suffix has to be to qualify.
 pub fn configure(enabled: bool, prefill_min_suffix_tokens: usize) {
     let mut settings = SETTINGS.write().unwrap();
     settings.enabled = enabled;
@@ -747,6 +402,7 @@ pub fn configure(enabled: bool, prefill_min_suffix_tokens: usize) {
     OFFLOAD_ENABLED.store(enabled, Ordering::Release);
 }
 
+/// Turn encode offload on, and say how wide an embedding row is.
 pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
     let mut settings = SETTINGS.write().unwrap();
     settings.encode_injection = enabled;
@@ -754,91 +410,47 @@ pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
     ENCODE_INJECTION_ENABLED.store(enabled, Ordering::Release);
 }
 
-pub fn set_home_kv_handle(handle: ::driver_api::KvHandle) {
+/// Publish this node's own KV pool address, so a peer can be told where to
+/// write.
+///
+/// Still meaningful with no transport: [`KvHandle`](driver_api::KvHandle) is
+/// a fact about this node's pool, and it is what a future envelope's hello
+/// hands over.
+pub fn set_home_kv_handle(handle: driver_api::KvHandle) {
     *HOME_KV_HANDLE.write().unwrap() = Some(handle);
 }
 
-fn prefill_threshold(kind: RemoteTransferKind) -> Option<usize> {
-    let settings = *SETTINGS.read().unwrap();
-    if !settings.enabled {
-        return None;
-    }
-    Some(if settings.prefill_min_suffix_tokens != 0 {
-        settings.prefill_min_suffix_tokens
-    } else if kind == RemoteTransferKind::Nixl {
-        512
-    } else {
-        2048
-    })
+/// This node's own KV pool address, if a driver exported one.
+pub fn home_kv_handle() -> Option<driver_api::KvHandle> {
+    HOME_KV_HANDLE.read().unwrap().clone()
 }
 
-fn import_inline_payload(payload: &InlineKvPayload) -> Result<()> {
-    let handle = HOME_KV_HANDLE
-        .read()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| anyhow!("home KV handle is not registered"))?;
-    ensure!(!handle.regions.is_empty(), "home KV handle has no regions");
-    let page_bytes = handle.page_bytes();
-    ensure!(
-        payload.page_bytes == page_bytes,
-        "inline KV page size {} != home page size {page_bytes}",
-        payload.page_bytes
-    );
-    let expected = page_bytes
-        .checked_mul(payload.dst_page_ids.len() as u64)
-        .ok_or_else(|| anyhow!("inline KV payload size overflow"))?;
-    ensure!(
-        payload.bytes.len() as u64 == expected,
-        "inline KV payload has {} bytes, expected {expected}",
-        payload.bytes.len()
-    );
-    for (&page, page_payload) in payload
-        .dst_page_ids
-        .iter()
-        .zip(payload.bytes.chunks_exact(page_bytes as usize))
-    {
-        let mut payload_offset = 0usize;
-        for region in &handle.regions {
-            let offset = (page as u64)
-                .checked_mul(region.page_stride)
-                .ok_or_else(|| anyhow!("inline KV destination offset overflow"))?;
-            ensure!(
-                region.page_stride > 0
-                    && offset
-                        .checked_add(region.page_stride)
-                        .is_some_and(|end| end <= region.len),
-                "inline KV destination page {page} exceeds home region"
-            );
-            let end = payload_offset + region.page_stride as usize;
-            copy_host_to_region(
-                region.domain,
-                region.base + offset,
-                &page_payload[payload_offset..end],
-            )?;
-            payload_offset = end;
-        }
-        ensure!(
-            payload_offset == page_payload.len(),
-            "inline KV region strides do not cover the logical page"
-        );
-    }
-    Ok(())
-}
-
+/// What an operator reads to see where offload decisions went.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OffloadCounterSnapshot {
+    /// No peer was available in the role.
     pub no_partner: u64,
+    /// The suffix was shorter than the threshold.
     pub below_threshold: u64,
+    /// The fire was not a plain contiguous append.
     pub noncanonical: u64,
+    /// The fire touched recurrent state.
     pub recurrent_state: u64,
+    /// The fire carried a guest-supplied mask.
     pub user_mask: u64,
+    /// The fire touched a channel.
     pub channels: u64,
+    /// The fire carried media.
     pub media: u64,
+    /// The fire's shape was past a ceiling.
     pub shape: u64,
+    /// The peer refused, or could not be reached.
     pub remote_failure: u64,
+    /// The transfer failed after the peer answered.
     pub transfer_failure: u64,
+    /// A prefix was adopted from a peer.
     pub adopted: u64,
+    /// The NIXL path is quarantined after a failure.
     pub nixl_quarantined: bool,
 }
 
@@ -860,6 +472,7 @@ struct OffloadCounters {
 static COUNTERS: LazyLock<OffloadCounters> = LazyLock::new(OffloadCounters::default);
 static NIXL_QUARANTINED: AtomicBool = AtomicBool::new(false);
 
+/// Read every counter at once.
 pub fn counters() -> OffloadCounterSnapshot {
     let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
     OffloadCounterSnapshot {
@@ -878,1405 +491,91 @@ pub fn counters() -> OffloadCounterSnapshot {
     }
 }
 
-pub(crate) async fn try_encode(request: &mut ::driver_api::LaunchPlan) -> bool {
-    if !OFFLOAD_ENABLED.load(Ordering::Acquire)
-        || !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire)
-        || (request.image_pixels.is_empty() && request.audio_features.is_empty())
-    {
+/// Offer this fire's media to an encode partner, and inject the rows it
+/// answers with.
+///
+/// Answers whether anything was injected — `false` every time, for now.
+///
+/// **`palo B-remote` AND `palo B-media`, IN ONE PLACE.** Two things stand
+/// between this and working, and they are independent:
+///
+/// 1. the envelope (see [`Partner::encode`]);
+/// 2. the fire's own seat for precomputed embedding rows. The wire plan
+///    carried them inline — `embed_rows`, `embed_indptr`, `embed_shapes`,
+///    `embed_anchor_rows`, `embed_block_indptr` — and the contract does not:
+///    what a fire needs after an encode is ROWS IN THE ARENA, which is a seam
+///    the shell resolves (design §9's export ops), not a payload the
+///    submission carries. `crate::driver::Media` is where the engine holds
+///    the payload meanwhile.
+///
+/// The check that the module is even configured for it is kept, so an
+/// operator who turns encode injection on and sees nothing happen gets the
+/// refusal from the partner rather than silence from here.
+pub(crate) async fn try_encode(request: &mut crate::driver::FireRequest) -> bool {
+    if !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire) || request.media.is_empty() {
         return false;
     }
-    let settings = *SETTINGS.read().unwrap();
-    if !settings.enabled || !settings.encode_injection {
-        return false;
-    }
-    let Some(partner_guard) = select_partner(PartnerRole::Encode) else {
+    let Some(guard) = select_partner(PartnerRole::Encode) else {
         COUNTERS.no_partner.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    let partner = Arc::clone(partner_guard.partner());
-    let encode_request = request.clone();
-    let encode = tokio::spawn({
-        let partner = Arc::clone(&partner);
-        async move {
-            let _guard = partner_guard;
-            partner.encode(encode_request).await
-        }
-    });
-    let embeddings = match encode.await {
-        Ok(Ok(embeddings)) => embeddings,
-        Ok(Err(error)) => {
-            partner.mark_suspect();
-            COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%error, "encode offload failed; using local media path");
-            return false;
-        }
-        Err(error) => {
-            partner.mark_suspect();
-            COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%error, "encode offload task failed; using local media path");
-            return false;
-        }
-    };
-    let Some((embeddings, block_indptr)) =
-        canonicalize_remote_embeddings(request, embeddings, settings.encode_hidden_size)
-    else {
-        tracing::debug!("encode partner returned malformed embedding metadata");
-        return false;
-    };
-    request.embed_rows = embeddings.rows;
-    request.embed_indptr = embeddings.indptr;
-    request.embed_shapes = embeddings.shapes;
-    request.embed_dtypes = embeddings.dtypes;
-    request.embed_anchor_rows = embeddings.anchor_rows;
-    request.embed_block_indptr = block_indptr;
-    request.image_indptr.clear();
-    request.image_grids.clear();
-    request.image_anchor_positions.clear();
-    request.image_pixels.clear();
-    request.image_pixel_indptr.clear();
-    request.image_mrope_positions.clear();
-    request.image_mrope_indptr.clear();
-    request.image_patch_positions.clear();
-    request.image_anchor_rows.clear();
-    request.audio_features.clear();
-    request.audio_feature_indptr.clear();
-    request.audio_anchor_rows.clear();
-    request.audio_indptr.clear();
-    true
-}
-
-fn canonicalize_remote_embeddings(
-    request: &::driver_api::LaunchPlan,
-    embeddings: ::driver_api::RemoteEmbeddings,
-    hidden_size: u32,
-) -> Option<(::driver_api::RemoteEmbeddings, Vec<u32>)> {
-    let expected_anchors = request
-        .image_anchor_rows
-        .iter()
-        .chain(&request.audio_anchor_rows)
-        .copied()
-        .collect::<Vec<_>>();
-    let blocks = embeddings.dtypes.len();
-    let row_bytes = usize::try_from(hidden_size).ok()?.checked_mul(2)?;
-    let payload_len = u32::try_from(embeddings.rows.len()).ok()?;
-    if hidden_size == 0
-        || blocks == 0
-        || blocks != expected_anchors.len()
-        || embeddings.anchor_rows != expected_anchors
-        || embeddings.indptr.len() != blocks + 1
-        || embeddings.shapes.len() != blocks * 2
-        || embeddings.indptr.first().copied() != Some(0)
-        || embeddings.indptr.last().copied() != Some(payload_len)
-        || !embeddings
-            .indptr
-            .windows(2)
-            .all(|window| window[0] <= window[1])
-        || request.qo_indptr.len() < 2
-        || request.qo_indptr.first().copied() != Some(0)
-        || request.qo_indptr.last().copied() != u32::try_from(request.token_ids.len()).ok()
-        || !request
-            .qo_indptr
-            .windows(2)
-            .all(|window| window[0] <= window[1])
-    {
-        return None;
-    }
-
-    let mut indexed = Vec::with_capacity(blocks);
-    for block in 0..blocks {
-        let rows = embeddings.shapes[2 * block] as usize;
-        let width = embeddings.shapes[2 * block + 1];
-        let begin = embeddings.indptr[block] as usize;
-        let end = embeddings.indptr[block + 1] as usize;
-        let anchor = embeddings.anchor_rows[block] as usize;
-        let end_row = anchor.checked_add(rows)?;
-        if embeddings.dtypes[block] != 2
-            || rows == 0
-            || width != hidden_size
-            || end < begin
-            || rows.checked_mul(row_bytes)? != end - begin
-        {
-            return None;
-        }
-        let row = request
-            .qo_indptr
-            .windows(2)
-            .position(|bounds| anchor >= bounds[0] as usize && end_row <= bounds[1] as usize)?;
-        indexed.push((row, anchor, block));
-    }
-    indexed.sort_by_key(|&(row, anchor, block)| (row, anchor, block));
-
-    let mut canonical = ::driver_api::RemoteEmbeddings {
-        rows: Vec::with_capacity(embeddings.rows.len()),
-        indptr: vec![0],
-        shapes: Vec::with_capacity(embeddings.shapes.len()),
-        dtypes: Vec::with_capacity(blocks),
-        anchor_rows: Vec::with_capacity(blocks),
-    };
-    let mut counts = vec![0u32; request.qo_indptr.len() - 1];
-    for (row, _, block) in indexed {
-        let begin = embeddings.indptr[block] as usize;
-        let end = embeddings.indptr[block + 1] as usize;
-        canonical
-            .rows
-            .extend_from_slice(&embeddings.rows[begin..end]);
-        canonical
-            .indptr
-            .push(u32::try_from(canonical.rows.len()).ok()?);
-        canonical
-            .shapes
-            .extend_from_slice(&embeddings.shapes[2 * block..2 * block + 2]);
-        canonical.dtypes.push(embeddings.dtypes[block]);
-        canonical.anchor_rows.push(embeddings.anchor_rows[block]);
-        counts[row] = counts[row].checked_add(1)?;
-    }
-    let mut block_indptr: Vec<u32> = Vec::with_capacity(counts.len() + 1);
-    block_indptr.push(0);
-    for count in counts {
-        let next = block_indptr.last().copied()?.checked_add(count)?;
-        block_indptr.push(next);
-    }
-    Some((canonical, block_indptr))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OffloadAdoption {
-    pub token_count: usize,
-}
-
-type SurrogateKey = (usize, u64, u64);
-struct Surrogate {
-    bound: crate::driver::BoundInstance,
-    _channels: Vec<Arc<crate::driver::ChannelEndpoint>>,
-}
-
-static SURROGATES: LazyLock<Mutex<HashMap<SurrogateKey, Arc<Surrogate>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-#[derive(Default)]
-struct HomeState {
-    closed: bool,
-    users: usize,
-}
-
-static HOME_STATES: LazyLock<Mutex<HashMap<u64, HomeState>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_SURROGATE_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
-
-struct HomeUse {
-    instance_id: u64,
-}
-
-impl HomeUse {
-    fn acquire(instance_id: u64) -> Result<Self> {
-        let mut states = HOME_STATES.lock().unwrap();
-        let state = states.entry(instance_id).or_default();
-        ensure!(!state.closed, "home instance {instance_id} is closed");
-        state.users += 1;
-        Ok(Self { instance_id })
-    }
-}
-
-impl Drop for HomeUse {
-    fn drop(&mut self) {
-        let mut states = HOME_STATES.lock().unwrap();
-        let Some(state) = states.get_mut(&self.instance_id) else {
-            return;
-        };
-        state.users = state.users.saturating_sub(1);
-        if state.closed && state.users == 0 {
-            states.remove(&self.instance_id);
-        }
-    }
-}
-
-fn home_instance_closed(instance_id: u64) -> bool {
-    HOME_STATES
-        .lock()
-        .unwrap()
-        .get(&instance_id)
-        .is_some_and(|state| state.closed)
-}
-
-async fn surrogate(
-    driver_id: usize,
-    program: &Arc<RegisteredProgram>,
-    home_instance_id: u64,
-) -> Result<Arc<Surrogate>> {
-    let key = (driver_id, program.hash, home_instance_id);
-    ensure!(
-        !home_instance_closed(home_instance_id),
-        "home instance {home_instance_id} is closed"
-    );
-    {
-        let cache = SURROGATES.lock().unwrap();
-        if let Some(bound) = cache.get(&key) {
-            return Ok(Arc::clone(bound));
-        }
-    }
-    let program_id = crate::scheduler::register_program(
-        driver_id,
-        ::driver_api::ProgramRegistration {
-            program_hash: program.hash,
-            launch: program.launch().clone(),
-            reference_ptir: program.bytes.clone(),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let mut channel_ids = Vec::with_capacity(program.bound.container.channels.len());
-    let mut channels = Vec::with_capacity(program.bound.container.channels.len());
-    for declaration in &program.bound.container.channels {
-        let channel_id = NEXT_SURROGATE_CHANNEL_ID.fetch_add(1, Ordering::Relaxed);
-        ensure!(
-            channel_id != 0,
-            "remote surrogate channel id space exhausted"
-        );
-        let endpoint = crate::scheduler::register_channel(
-            driver_id,
-            ::driver_api::ChannelRegistrationPlan {
-                driver_id,
-                channel_id,
-                shape: declaration.shape.dims().to_vec(),
-                dtype: declaration.dtype.tag(),
-                host_role: declaration.host_role as u8,
-                seeded: declaration.seeded,
-                extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
-                capacity: declaration.capacity,
-                reader_wait_id: 0,
-                writer_wait_id: 0,
-                extern_name: Vec::new(),
-            },
-        )
-        .await?;
-        channel_ids.push(channel_id);
-        channels.push(endpoint);
-    }
-    let bound =
-        crate::scheduler::bind_instance(driver_id, None, program_id, 0, channel_ids, Vec::new())
-            .await?;
-    let surrogate = Arc::new(Surrogate {
-        bound,
-        _channels: channels,
-    });
-    let states = HOME_STATES.lock().unwrap();
-    if states
-        .get(&home_instance_id)
-        .is_some_and(|state| state.closed)
-    {
-        drop(states);
-        let _ = crate::scheduler::close_instance(&surrogate.bound);
-        return Err(anyhow!(
-            "home instance {home_instance_id} closed during bind"
-        ));
-    }
-    let mut cache = SURROGATES.lock().unwrap();
-    if let Some(existing) = cache.get(&key) {
-        let _ = crate::scheduler::close_instance(&surrogate.bound);
-        return Ok(Arc::clone(existing));
-    }
-    cache.insert(key, Arc::clone(&surrogate));
-    Ok(surrogate)
-}
-
-fn context_extension_program(
-    profile: &tensor_ir::registry::ModelProfile,
-) -> Result<Arc<RegisteredProgram>> {
-    use tensor_ir::container::{StageProgram, TraceContainer};
-    use tensor_ir::registry::Stage;
-
-    static PROGRAM: std::sync::OnceLock<Arc<RegisteredProgram>> = std::sync::OnceLock::new();
-    if let Some(program) = PROGRAM.get() {
-        return Ok(Arc::clone(program));
-    }
-    let bytes = TraceContainer {
-        names: Vec::new(),
-        externs: Vec::new(),
-        channels: Vec::new(),
-        ports: Vec::new(),
-        stages: vec![StageProgram {
-            stage: Stage::Epilogue,
-            ops: Vec::new(),
-        }],
-    }
-    .encode();
-    let program = crate::pipeline::program::register(bytes, profile)
-        .map_err(|error| anyhow!("registering context-extension program: {error}"))?;
-    let _ = PROGRAM.set(Arc::clone(&program));
-    Ok(PROGRAM.get().cloned().unwrap_or(program))
-}
-
-fn release_scratch(model_idx: usize, driver_id: usize, ws: WorkingSetId) {
-    let stores = crate::store::registry::get(model_idx, driver_id);
-    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-        let epoch = kv.current_epoch();
-        kv.release_working_set(ws, epoch);
-        kv.retire_idle();
-    });
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one prefill's whole offload context: which model/driver/working set \
-              it is leaving, the plan being rewritten, the tokens that must stay \
-              canonical, the program to run remotely, and the home instance whose \
-              lifetime the transfer is pinned to; a struct would just re-list them"
-)]
-#[allow(
-    dead_code,
-    reason = "the prefill-offload path landed in c1e148ef2 (`Implement PTIR fusion`) \
-              together with a wholesale rewrite of its only caller, and that rewrite \
-              dropped the call: on the `bravo` snapshot of the same work \
-              (6276995b9) `pipeline/fire.rs` still called \
-              `offload::try_prefill`, and no call has existed on this branch since. \
-              Kept, not deleted, because the surviving half of the same machinery \
-              (`Surrogate`/`SURROGATES`/`HOME_STATES`, drained by the exported \
-              `close_driver_surrogates` and `close_home_instance`) is still public \
-              API, so removing this root would cascade into deleting the feature. \
-              Rewiring it is a design decision, not a lint fix. NOTE: this allow \
-              also covers the chain reachable only from here \
-              (`try_prefill_owned`, `HomeUse`, `surrogate`, `prefill_threshold`, \
-              `context_extension_program`, `release_scratch`, `OffloadAdoption`), \
-              which rustc treats as live once this root is allowed"
-)]
-pub(crate) async fn try_prefill(
-    model_idx: usize,
-    home_driver_id: usize,
-    home_ws: WorkingSetId,
-    page_size: u32,
-    request: &mut ::driver_api::LaunchPlan,
-    canonical_tokens: &[u32],
-    program: &Arc<RegisteredProgram>,
-    home_instance_id: u64,
-    lifetime_guard: Option<crate::store::kv::working_set::KvFireLease>,
-) -> Option<OffloadAdoption> {
-    let task = tokio::spawn(try_prefill_owned(
-        model_idx,
-        home_driver_id,
-        home_ws,
-        page_size,
-        request.clone(),
-        canonical_tokens.to_vec(),
-        Arc::clone(program),
-        home_instance_id,
-        lifetime_guard,
-    ));
-    match task.await {
-        Ok(Some((adoption, rewritten))) => {
-            *request = rewritten;
-            Some(adoption)
-        }
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(%error, "prefill offload task failed");
-            None
-        }
-    }
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the owned twin of `try_prefill` — same whole-offload context, cloned \
-              so the work can run on its own task; the parameter list is the \
-              signature it mirrors"
-)]
-async fn try_prefill_owned(
-    model_idx: usize,
-    home_driver_id: usize,
-    home_ws: WorkingSetId,
-    page_size: u32,
-    mut request: ::driver_api::LaunchPlan,
-    canonical_tokens: Vec<u32>,
-    program: Arc<RegisteredProgram>,
-    home_instance_id: u64,
-    _lifetime_guard: Option<crate::store::kv::working_set::KvFireLease>,
-) -> Option<(OffloadAdoption, ::driver_api::LaunchPlan)> {
-    if !SETTINGS.read().unwrap().enabled {
-        return None;
-    }
-    let _home_use = match HomeUse::acquire(home_instance_id) {
-        Ok(usage) => usage,
-        Err(_) => return None,
-    };
-    let Some(partner_guard) = select_partner(PartnerRole::Prefill) else {
-        COUNTERS.no_partner.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    let partner = Arc::clone(partner_guard.partner());
-    let threshold = prefill_threshold(partner.transfer_kind()).expect("offload is enabled");
-    if canonical_tokens.len() < threshold {
-        COUNTERS.below_threshold.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if canonical_tokens != request.token_ids {
-        COUNTERS.noncanonical.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if !request.rs_slot_ids.is_empty()
-        || !request.rs_slot_flags.is_empty()
-        || !request.rs_buffer_slot_ids.is_empty()
-    {
-        COUNTERS.recurrent_state.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if request.has_user_mask || !request.masks.is_empty() {
-        COUNTERS.user_mask.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let mutates_context =
-        program.bound.container.stages.iter().any(|stage| {
-            stage.stage != tensor_ir::registry::Stage::Epilogue && !stage.ops.is_empty()
-        });
-    if mutates_context {
-        COUNTERS.channels.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if !request.image_pixels.is_empty()
-        || !request.image_grids.is_empty()
-        || !request.audio_features.is_empty()
-    {
-        COUNTERS.media.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let count = request.token_ids.len();
-    let single_lane = request.qo_indptr == [0, count as u32]
-        && request.position_ids.len() == count
-        && request
-            .sampling_indices
-            .iter()
-            .all(|&index| (index as usize) < count);
-    if !single_lane || count <= 1 || page_size == 0 {
-        COUNTERS.shape.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let first_sample = request
-        .sampling_indices
-        .iter()
-        .copied()
-        .min()
-        .map(|value| value as usize)
-        .unwrap_or(count - 1);
-    let offload_rows = (first_sample.min(count - 1) / page_size as usize) * page_size as usize;
-    if offload_rows == 0 {
-        COUNTERS.shape.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let home_stores = crate::store::registry::get(model_idx, home_driver_id);
-    let home_is_canonical =
-        crate::store::registry::with_kv_lock(&home_stores.kv, "host-other", |home| {
-            home.mapped_len(home_ws).ok() == Some(0)
-                && home.chain_state(home_ws).ok().flatten().is_none()
-        });
-    if !home_is_canonical {
-        COUNTERS.noncanonical.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-
-    let remote_program = match context_extension_program(&program.bound.profile) {
-        Ok(program) => program,
-        Err(error) => {
-            COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%error, "prefill context-extension program failed");
-            return None;
-        }
-    };
-    let surrogate = match surrogate(partner.driver_id(), &remote_program, home_instance_id).await {
-        Ok(bound) => bound,
-        Err(error) => {
-            partner.mark_suspect();
-            COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%error, "prefill offload surrogate setup failed");
-            return None;
-        }
-    };
-
-    let remote_stores = crate::store::registry::get(model_idx, partner.driver_id());
-    let scratch_ws =
-        crate::store::registry::with_kv_lock(&remote_stores.kv, "host-other", |remote| {
-            remote.create_working_set()
-        });
-    let prefix_tokens = &canonical_tokens[..offload_rows];
-    let prepared =
-        crate::store::registry::with_kv_lock(&remote_stores.kv, "host-other", |remote| {
-            crate::pipeline::fire::kv::prepare(
-                remote,
-                scratch_ws,
-                0,
-                prefix_tokens,
-                page_size,
-                Some(prefix_tokens),
-            )
-        });
-    let (projection, copies, translation, txn) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            release_scratch(model_idx, partner.driver_id(), scratch_ws);
-            COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%error, "prefill offload scratch preparation failed");
-            return None;
-        }
-    };
-    if !copies.0.is_empty() || !copies.1.is_empty() {
-        crate::store::registry::with_kv_lock(&remote_stores.kv, "host-other", |remote| {
-            crate::pipeline::fire::kv::abandon(remote, txn);
-        });
-        release_scratch(model_idx, partner.driver_id(), scratch_ws);
-        COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-
-    let mut remote_request = request.clone();
-    remote_request.token_ids.truncate(offload_rows);
-    remote_request.position_ids.truncate(offload_rows);
-    remote_request.qo_indptr = vec![0, offload_rows as u32];
-    // Explicit single-arity wire pages: the scratch working set's pages in
-    // slot order, resolved through `kv_translation` on the remote driver.
-    remote_request.kv_page_indices = (0..projection.physical_page_ids.len() as u32).collect();
-    remote_request.kv_page_indptr.clear();
-    remote_request.kv_last_page_lens.clear();
-    remote_request.kv_len.clear();
-    remote_request.kv_len_device.clear();
-    remote_request.kv_translation = translation;
-    remote_request.sampling_indices.clear();
-    remote_request.sampling_indptr = vec![0, 0];
-    remote_request.context_ids.clear();
-    remote_request.masks.clear();
-    remote_request.mask_indptr = vec![0, 0];
-    remote_request.single_token_mode = false;
-    remote_request.has_user_mask = false;
-    remote_request.channel_expected_head.clear();
-    remote_request.channel_expected_tail.clear();
-
-    let completion = surrogate.bound.reserve_completion();
-    let submit = crate::scheduler::submit_async(
-        remote_request,
-        partner.driver_id(),
-        surrogate.bound.instance_id,
-        projection.last_page_len,
-        None,
-        completion.clone(),
-    );
-    if let Err(error) = submit {
-        crate::store::registry::with_kv_lock(&remote_stores.kv, "host-other", |remote| {
-            crate::pipeline::fire::kv::abandon(remote, txn);
-        });
-        release_scratch(model_idx, partner.driver_id(), scratch_ws);
-        partner.mark_suspect();
-        COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(%error, "prefill offload submit failed");
-        return None;
-    }
-    let remote_success = completion.await.is_ok();
-    crate::store::registry::with_kv_lock(&remote_stores.kv, "host-other", |remote| {
-        if let Err(error) = crate::pipeline::fire::kv::finalize(remote, txn, remote_success) {
-            tracing::debug!(%error, "prefill offload scratch finalize failed");
-        }
-    });
-    if !remote_success {
-        release_scratch(model_idx, partner.driver_id(), scratch_ws);
-        partner.mark_suspect();
-        COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-
-    let destination_pages =
-        crate::store::registry::with_kv_lock(&home_stores.kv, "host-other", |home| {
-            home.reserve_device_pages(projection.physical_page_ids.len())
-        });
-    let Some(destination_pages) = destination_pages else {
-        release_scratch(model_idx, partner.driver_id(), scratch_ws);
-        COUNTERS.transfer_failure.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    let destination_ids = destination_pages
-        .iter()
-        .map(|page| page.0)
-        .collect::<Vec<_>>();
-    if let Err(error) = partner
-        .pull_kv(projection.physical_page_ids.clone(), destination_ids)
+    if let Err(error) = guard
+        .partner()
+        .encode(driver_api::MediaEncode::default())
         .await
     {
-        if partner.transfer_kind() == RemoteTransferKind::Inline {
-            crate::store::registry::with_kv_lock(&home_stores.kv, "host-other", |home| {
-                home.release_device_reservation(destination_pages);
-            });
-            release_scratch(model_idx, partner.driver_id(), scratch_ws);
-        } else {
-            NIXL_QUARANTINED.store(true, Ordering::Release);
-            tracing::warn!(
-                partner = partner.worker_id(),
-                "quarantining source and destination KV pages and disabling NIXL offload until restart"
-            );
-        }
-        partner.mark_suspect();
-        COUNTERS.transfer_failure.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(%error, "prefill offload transfer failed");
-        return None;
+        tracing::warn!(%error, "encode offload declined");
     }
-    let adopted = crate::store::registry::with_kv_lock(&home_stores.kv, "host-other", |home| {
-        home.adopt_offloaded_prefix(home_ws, prefix_tokens, destination_pages, page_size)
-    });
-    release_scratch(model_idx, partner.driver_id(), scratch_ws);
-    if let Err(error) = adopted {
-        COUNTERS.transfer_failure.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(%error, "prefill offload adoption failed");
-        return None;
-    }
+    false
+}
 
-    request.token_ids.drain(..offload_rows);
-    request.position_ids.drain(..offload_rows);
-    request.qo_indptr = vec![0, (count - offload_rows) as u32];
-    for index in &mut request.sampling_indices {
-        *index -= offload_rows as u32;
+/// Forget every peer. Test support, and the shutdown path.
+pub fn clear_partners() {
+    let partners: Vec<Arc<Partner>> = PARTNERS.write().unwrap().drain().map(|(_, p)| p).collect();
+    for partner in partners {
+        partner.mark_suspect();
     }
-    COUNTERS.adopted.fetch_add(1, Ordering::Relaxed);
-    Some((
-        OffloadAdoption {
-            token_count: offload_rows,
-        },
-        request,
-    ))
 }
 
 #[cfg(test)]
-pub(crate) fn clear_partners() {
-    let partners = std::mem::take(&mut *PARTNERS.write().unwrap());
-    for partner in partners.into_values() {
-        partner.mark_suspect();
-    }
-    SURROGATES.lock().unwrap().clear();
-    HOME_STATES.lock().unwrap().clear();
-    NIXL_QUARANTINED.store(false, Ordering::Release);
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "`TEST_LOCK` is a test-harness serializer, not a runtime lock: these \
-              tests mutate process-global partner state (`clear_partners`, \
-              `register_partner`, the encode-blob registry), so libtest's threads \
-              have to take turns. It is acquired ONLY on the first line of a test \
-              body and never by anything those bodies spawn, so no task on any of \
-              these runtimes can ever contend for it while a test is suspended at \
-              an await, and it cannot deadlock — including in the four \
-              `flavor = \"multi_thread\"` cases. Holding it across the awaits IS \
-              the serialization; dropping it early would let the next test stomp \
-              the globals mid-await"
-)]
 mod tests {
     use super::*;
-    use ::driver_api::{
-        DriverCapabilities, ExecutorResponse, ExecutorRpc, KvDtype, KvHandle, KvLayout,
-        KvLayoutKind, KvRegion, PIE_TERMINAL_OUTCOME_SUCCESS, RemoteBindResponse,
-        RemoteChannelBinding, RemoteError, RemoteTerminal, ScratchGrant, TerminalCellState,
-    };
-    use futures::StreamExt;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicU64;
-    use tarpc::server::{BaseChannel, Channel};
-    use tensor_ir::container::{StageProgram, TraceContainer};
-    use tensor_ir::registry::{ModelProfile, Stage};
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn selection_respects_cap_and_releases_on_drop() {
-        let _lock = TEST_LOCK.lock().unwrap();
+    fn a_claim_is_released_when_its_guard_drops() {
         clear_partners();
-        let partner = register_partner(
-            1,
-            2,
-            4,
-            PartnerRole::Prefill,
-            1,
-            RemoteTransferKind::Inline,
-            None,
-        );
-        let guard = select_partner(PartnerRole::Prefill).unwrap();
-        assert_eq!(guard.partner().driver_id(), 4);
+        let partner = register_partner(1, 2, 7usize, PartnerRole::Prefill, 2, TransferKind::Inline);
+        let first = select_partner(PartnerRole::Prefill).expect("a peer is available");
         assert_eq!(partner.outstanding(), 1);
-        assert!(select_partner(PartnerRole::Prefill).is_none());
-        drop(guard);
-        assert!(select_partner(PartnerRole::Prefill).is_some());
-        clear_partners();
-    }
-
-    #[test]
-    fn suspect_partner_is_not_selected() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        let partner = register_partner(
-            1,
-            2,
-            4,
-            PartnerRole::Prefill,
-            2,
-            RemoteTransferKind::Inline,
-            None,
-        );
-        partner.mark_suspect();
-        assert!(select_partner(PartnerRole::Prefill).is_none());
-        clear_partners();
-    }
-
-    #[test]
-    fn uncertain_nixl_failure_disables_further_nixl_offload() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        register_partner(
-            2,
-            3,
-            5,
-            PartnerRole::Prefill,
-            2,
-            RemoteTransferKind::Nixl,
-            None,
-        );
-        NIXL_QUARANTINED.store(true, Ordering::Release);
-        assert!(select_partner(PartnerRole::Prefill).is_none());
-        clear_partners();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn partner_drain_waits_for_active_guard() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        let partner = register_partner(
-            3,
-            4,
-            5,
-            PartnerRole::Prefill,
-            1,
-            RemoteTransferKind::Inline,
-            None,
-        );
-        let guard = select_partner(PartnerRole::Prefill).unwrap();
-        partner.mark_suspect();
+        let second = select_partner(PartnerRole::Prefill).expect("two claims fit");
+        assert_eq!(partner.outstanding(), 2);
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), partner.wait_drained())
-                .await
-                .is_err()
+            select_partner(PartnerRole::Prefill).is_none(),
+            "a third claim is past max_outstanding"
         );
-        drop(guard);
-        tokio::time::timeout(Duration::from_secs(1), partner.wait_drained())
+        drop(second);
+        drop(first);
+        assert_eq!(partner.outstanding(), 0);
+        clear_partners();
+    }
+
+    #[tokio::test]
+    async fn every_transfer_verb_refuses_by_name_rather_than_answering_ok() {
+        clear_partners();
+        let partner = register_partner(3, 4, 0usize, PartnerRole::Prefill, 1, TransferKind::Inline);
+        let error = partner
+            .pull_kv(vec![0], vec![1])
             .await
-            .unwrap();
-        clear_partners();
-    }
-
-    #[test]
-    fn closed_home_state_is_removed_after_users_drain() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        let usage = HomeUse::acquire(404).unwrap();
-        close_home_instance(404);
-        assert!(home_instance_closed(404));
-        drop(usage);
-        assert!(!HOME_STATES.lock().unwrap().contains_key(&404));
-        clear_partners();
-    }
-
-    #[derive(Clone)]
-    struct StubExecutor {
-        next_instance: Arc<AtomicU64>,
-        page_bytes: u64,
-        fail_launch: bool,
-        fail_push: bool,
-        encode_delay_ms: u64,
-    }
-
-    impl ExecutorRpc for StubExecutor {
-        async fn execute(
-            self,
-            _: tarpc::context::Context,
-            request: ExecutorRequest,
-        ) -> std::result::Result<ExecutorResponse, RemoteError> {
-            Ok(match request {
-                ExecutorRequest::LoadedModel => ExecutorResponse::LoadedModel(true),
-                ExecutorRequest::RegisterProgram(_) => ExecutorResponse::ProgramRegistered(1),
-                ExecutorRequest::RegisterChannel(channel) => {
-                    ExecutorResponse::ChannelRegistered(RemoteChannelBinding {
-                        local_channel_id: channel.local_channel_id,
-                        executor_channel_id: channel.local_channel_id,
-                    })
-                }
-                ExecutorRequest::BindInstance(binding) => {
-                    ExecutorResponse::InstanceBound(RemoteBindResponse {
-                        local_instance_id: binding.local_instance_id,
-                        executor_instance_id: self.next_instance.fetch_add(1, Ordering::Relaxed),
-                        geometry_class: binding.geometry_class,
-                    })
-                }
-                ExecutorRequest::Launch(launch) => {
-                    if self.fail_launch {
-                        return Err(RemoteError::new(
-                            ::driver_api::RemoteErrorKind::Driver,
-                            "injected launch failure",
-                        ));
-                    }
-                    ExecutorResponse::Terminal(RemoteTerminal {
-                        per_request: (0..launch.terminal_count)
-                            .map(|_| TerminalCellState {
-                                outcome: PIE_TERMINAL_OUTCOME_SUCCESS,
-                                reserved0: 0,
-                            })
-                            .collect(),
-                    })
-                }
-                ExecutorRequest::CopyKv(_) => ExecutorResponse::Terminal(RemoteTerminal {
-                    per_request: vec![TerminalCellState {
-                        outcome: PIE_TERMINAL_OUTCOME_SUCCESS,
-                        reserved0: 0,
-                    }],
-                }),
-                ExecutorRequest::Encode(encode) => {
-                    if self.encode_delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(self.encode_delay_ms)).await;
-                    }
-                    if encode.plan.embed_rows.is_empty() {
-                        let rows = encode.plan.token_ids.len().max(1);
-                        let mut bytes = Vec::with_capacity(rows * 2);
-                        for token in encode
-                            .plan
-                            .token_ids
-                            .iter()
-                            .copied()
-                            .chain(std::iter::repeat_n(0, rows - encode.plan.token_ids.len()))
-                        {
-                            bytes.extend_from_slice(&(token as u16).to_le_bytes());
-                        }
-                        ExecutorResponse::Embeddings(::driver_api::RemoteEmbeddings {
-                            rows: bytes,
-                            indptr: vec![0, (rows * 2) as u32],
-                            shapes: vec![rows as u32, 1],
-                            dtypes: vec![2],
-                            anchor_rows: vec![0],
-                        })
-                    } else {
-                        ExecutorResponse::Embeddings(::driver_api::RemoteEmbeddings {
-                            rows: encode.plan.embed_rows,
-                            indptr: encode.plan.embed_indptr,
-                            shapes: encode.plan.embed_shapes,
-                            dtypes: encode.plan.embed_dtypes,
-                            anchor_rows: encode.plan.embed_anchor_rows,
-                        })
-                    }
-                }
-                ExecutorRequest::PushKv(push) => ExecutorResponse::KvPayload(InlineKvPayload {
-                    dst_page_ids: if self.fail_push {
-                        return Err(RemoteError::new(
-                            ::driver_api::RemoteErrorKind::Driver,
-                            "injected transfer failure",
-                        ));
-                    } else {
-                        push.dst_page_ids
-                    },
-                    page_bytes: self.page_bytes,
-                    bytes: vec![0; push.src_page_ids.len() * self.page_bytes as usize],
-                }),
-                ExecutorRequest::CloseInstance(_) | ExecutorRequest::CloseChannel(_) => {
-                    ExecutorResponse::Closed
-                }
-                ExecutorRequest::Hello(_) => unreachable!("test registers the paired client"),
-            })
-        }
-    }
-
-    fn test_caps() -> DriverCapabilities {
-        DriverCapabilities {
-            // These fixtures fire host-geometry steps, so the per-step
-            // interleave this names is not what they exercise.
-            resolves_geometry_per_step: false,
-            has_lora: false,
-            model_site_summary: Default::default(),
-            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
-            total_pages: 8,
-            kv_page_size: 16,
-            swap_pool_size: 0,
-            kv_copy_domain_mask: ::driver_api::KV_COPY_DEVICE_TO_DEVICE,
-            rs_cache_required: false,
-            rs_cache_slots: 0,
-            rs_cache_slot_bytes: 0,
-            elastic_page_bytes: 0,
-            elastic_budget_pages: 0,
-            has_mtp_logits: true,
-            has_mtp_drafts: true,
-            has_value_head: true,
-            has_attn_score: false,
-            has_attn_page_mask: false,
-            has_kv_envelopes: false,
-            device_geometry_port_mask: 0,
-            max_forward_tokens: 128,
-            max_forward_requests: 8,
-            max_page_refs: 128,
-            arch_name: "dummy".to_string(),
-            model_id: String::new(),
-            vocab_size: 32,
-            max_model_len: 128,
-            activation_dtype: "f32".to_string(),
-            hidden_size: 1,
-            supports_media_encode: false,
-            snapshot_dir: String::new(),
-            kv_handle: None,
-            codegen_backend: String::new(),
-        }
-    }
-
-    fn empty_registered_program() -> Arc<RegisteredProgram> {
-        let bytes = TraceContainer {
-            names: Vec::new(),
-            externs: Vec::new(),
-            channels: Vec::new(),
-            ports: Vec::new(),
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops: Vec::new(),
-            }],
-        }
-        .encode();
-        let mut profile = ModelProfile::dummy();
-        profile.page_size = 16;
-        let mut registry =
-            crate::pipeline::program::Registry::new(std::num::NonZeroUsize::new(4).unwrap());
-        registry.register(bytes, &profile).unwrap()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remote_prefill_transfers_adopts_and_trims() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        configure(true, 1);
-
-        let layout = KvLayout {
-            num_layers: 1,
-            num_kv_heads: 1,
-            head_dim: 1,
-            page_size: 16,
-            dtype: KvDtype::I8,
-            kind: KvLayoutKind::FusedLatent,
-            storage_format: "test-i8".to_string(),
-            region_page_bytes: Vec::new(),
-        };
-        let page_bytes = layout.page_bytes();
-        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-        let server_task = tokio::spawn(
-            BaseChannel::with_defaults(server_transport)
-                .execute(
-                    StubExecutor {
-                        next_instance: Arc::new(AtomicU64::new(1)),
-                        page_bytes,
-                        fail_launch: false,
-                        fail_push: false,
-                        encode_delay_ms: 0,
-                    }
-                    .serve(),
-                )
-                .for_each_concurrent(None, |request| async move {
-                    tokio::spawn(request);
-                }),
-        );
-        let new_client = ::driver_api::ExecutorRpcClient::new(
-            tarpc::client::Config::default(),
-            client_transport,
-        );
-        let client = new_client.client;
-        tokio::spawn(new_client.dispatch);
-        let remote = crate::driver::RemoteDriver::new(
-            client.clone(),
-            tokio::runtime::Handle::current(),
-            test_caps(),
-            ScratchGrant {
-                base_page: 0,
-                num_pages: 8,
-            },
-        );
-        let remote_driver_id = crate::driver::register_driver_backend(
-            crate::driver::DriverSpec {
-                resolves_geometry_per_step: false,
-                // Overwritten by `register_driver_backend` from the
-                // backend itself; see `DriverSpec::device_domain`.
-                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
-                num_kv_pages: 8,
-                limits: crate::driver::SchedulerLimits {
-                    max_forward_requests: 8,
-                    max_forward_tokens: 128,
-                    max_page_refs: 128,
-                },
-                device_geometry_port_mask: 0,
-            },
-            Box::new(remote),
-        );
-        let capacities = vec![8; remote_driver_id + 1];
-        let model_idx =
-            crate::store::registry::register_model(16, &capacities, &vec![0; capacities.len()]);
-        crate::scheduler::spawn_driver(remote_driver_id, 16, 5).unwrap();
-
-        let mut home_bytes = vec![0u8; page_bytes as usize * 8].into_boxed_slice();
-        set_home_kv_handle(KvHandle {
-            regions: vec![KvRegion {
-                base: home_bytes.as_mut_ptr() as u64,
-                len: home_bytes.len() as u64,
-                page_stride: page_bytes,
-                domain: MemoryDomain::HostPinned,
-            }],
-            layout: layout.clone(),
-        });
-        register_partner(
-            99,
-            42,
-            remote_driver_id,
-            PartnerRole::Prefill,
-            4,
-            RemoteTransferKind::Inline,
-            Some(client),
-        );
-
-        let home_ws = {
-            let stores = crate::store::registry::get(model_idx, 0);
-
-            stores.kv.lock().create_working_set()
-        };
-        let program = empty_registered_program();
-        let tokens = (0..33).collect::<Vec<u32>>();
-        let mut request = ::driver_api::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (0..33).collect(),
-            qo_indptr: vec![0, 33],
-            sampling_indices: vec![32],
-            sampling_indptr: vec![0, 1],
-            ..Default::default()
-        };
-        let adopted = try_prefill(
-            model_idx,
-            0,
-            home_ws,
-            16,
-            &mut request,
-            &tokens,
-            &program,
-            7,
-            None,
-        )
-        .await
-        .expect("offload adopted");
-        assert_eq!(adopted.token_count, 32);
-        assert_eq!(request.token_ids, vec![32]);
-        assert_eq!(request.position_ids, vec![32]);
-        assert_eq!(request.sampling_indices, vec![0]);
-        assert_eq!(
-            crate::store::registry::get(model_idx, 0)
-                .kv
-                .lock()
-                .committed_token_len(home_ws, 16)
-                .unwrap(),
-            32
-        );
-
-        remove_partner(99, PartnerRole::Prefill);
-        crate::scheduler::stop_driver(remote_driver_id).unwrap();
-        crate::driver::unregister_driver(remote_driver_id).unwrap();
-        configure(false, 0);
-        clear_partners();
-        server_task.abort();
-        drop(home_bytes);
-    }
-
-    async fn assert_failure_falls_back(fail_launch: bool, fail_push: bool) {
-        clear_partners();
-        configure(true, 1);
-        let layout = KvLayout {
-            num_layers: 1,
-            num_kv_heads: 1,
-            head_dim: 1,
-            page_size: 16,
-            dtype: KvDtype::I8,
-            kind: KvLayoutKind::FusedLatent,
-            storage_format: "test-i8".to_string(),
-            region_page_bytes: Vec::new(),
-        };
-        let page_bytes = layout.page_bytes();
-        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-        let server_task = tokio::spawn(
-            BaseChannel::with_defaults(server_transport)
-                .execute(
-                    StubExecutor {
-                        next_instance: Arc::new(AtomicU64::new(1)),
-                        page_bytes,
-                        fail_launch,
-                        fail_push,
-                        encode_delay_ms: 0,
-                    }
-                    .serve(),
-                )
-                .for_each_concurrent(None, |request| async move {
-                    tokio::spawn(request);
-                }),
-        );
-        let new_client = ::driver_api::ExecutorRpcClient::new(
-            tarpc::client::Config::default(),
-            client_transport,
-        );
-        let client = new_client.client;
-        tokio::spawn(new_client.dispatch);
-        let remote = crate::driver::RemoteDriver::new(
-            client.clone(),
-            tokio::runtime::Handle::current(),
-            test_caps(),
-            ScratchGrant {
-                base_page: 0,
-                num_pages: 8,
-            },
-        );
-        let remote_driver_id = crate::driver::register_driver_backend(
-            crate::driver::DriverSpec {
-                resolves_geometry_per_step: false,
-                // Overwritten by `register_driver_backend` from the
-                // backend itself; see `DriverSpec::device_domain`.
-                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
-                num_kv_pages: 8,
-                limits: crate::driver::SchedulerLimits {
-                    max_forward_requests: 8,
-                    max_forward_tokens: 128,
-                    max_page_refs: 128,
-                },
-                device_geometry_port_mask: 0,
-            },
-            Box::new(remote),
-        );
-        let capacities = vec![8; remote_driver_id + 1];
-        let model_idx =
-            crate::store::registry::register_model(16, &capacities, &vec![0; capacities.len()]);
-        crate::scheduler::spawn_driver(remote_driver_id, 16, 5).unwrap();
-        let mut home_bytes = vec![0u8; page_bytes as usize * 8].into_boxed_slice();
-        set_home_kv_handle(KvHandle {
-            regions: vec![KvRegion {
-                base: home_bytes.as_mut_ptr() as u64,
-                len: home_bytes.len() as u64,
-                page_stride: page_bytes,
-                domain: MemoryDomain::HostPinned,
-            }],
-            layout,
-        });
-        register_partner(
-            100 + u64::from(fail_push),
-            42,
-            remote_driver_id,
-            PartnerRole::Prefill,
-            4,
-            RemoteTransferKind::Inline,
-            Some(client),
-        );
-        let home_stores = crate::store::registry::get(model_idx, 0);
-        let home_ws = home_stores.kv.lock().create_working_set();
-        let program = empty_registered_program();
-        let tokens = (0..33).collect::<Vec<u32>>();
-        let original = ::driver_api::LaunchPlan {
-            token_ids: tokens.clone(),
-            position_ids: (0..33).collect(),
-            qo_indptr: vec![0, 33],
-            sampling_indices: vec![32],
-            sampling_indptr: vec![0, 1],
-            ..Default::default()
-        };
-        let mut request = original.clone();
+            .expect_err("there is no transport");
         assert!(
-            try_prefill(
-                model_idx,
-                0,
-                home_ws,
-                16,
-                &mut request,
-                &tokens,
-                &program,
-                8,
-                None,
-            )
+            format!("{error}").contains("palo B-remote"),
+            "the refusal names the wave that owes the envelope: {error}"
+        );
+        let error = partner
+            .encode(driver_api::MediaEncode::default())
             .await
-            .is_none()
-        );
-        assert_eq!(request, original, "fallback must keep the full local plan");
-        let home = home_stores.kv.lock();
-        assert_eq!(home.mapped_len(home_ws).unwrap(), 0);
-        assert_eq!(home.available_pages(), 8);
-        drop(home);
-
-        remove_partner(100 + u64::from(fail_push), PartnerRole::Prefill);
-        crate::scheduler::stop_driver(remote_driver_id).unwrap();
-        crate::driver::unregister_driver(remote_driver_id).unwrap();
-        configure(false, 0);
+            .expect_err("there is no transport");
+        assert!(format!("{error}").contains("palo B-remote"), "{error}");
         clear_partners();
-        server_task.abort();
-        drop(home_bytes);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn launch_and_transfer_failures_preserve_local_fallback() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        assert_failure_falls_back(true, false).await;
-        assert_failure_falls_back(false, true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn encode_partner_rewrites_media_to_embedding_rows() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        configure(true, 1);
-        configure_encode_injection(true, 1);
-        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-        let server_task = tokio::spawn(
-            BaseChannel::with_defaults(server_transport)
-                .execute(
-                    StubExecutor {
-                        next_instance: Arc::new(AtomicU64::new(1)),
-                        page_bytes: 16,
-                        fail_launch: false,
-                        fail_push: false,
-                        encode_delay_ms: 0,
-                    }
-                    .serve(),
-                )
-                .for_each_concurrent(None, |request| async move {
-                    tokio::spawn(request);
-                }),
-        );
-        let new_client = ::driver_api::ExecutorRpcClient::new(
-            tarpc::client::Config::default(),
-            client_transport,
-        );
-        let client = new_client.client;
-        tokio::spawn(new_client.dispatch);
-        register_partner(
-            200,
-            42,
-            99,
-            PartnerRole::Encode,
-            4,
-            RemoteTransferKind::Inline,
-            Some(client),
-        );
-        let mut plan = ::driver_api::LaunchPlan {
-            token_ids: vec![7, 8],
-            qo_indptr: vec![0, 2],
-            image_pixels: vec![1, 2, 3, 4],
-            image_anchor_rows: vec![0],
-            ..Default::default()
-        };
-        assert!(try_encode(&mut plan).await);
-        assert!(plan.image_pixels.is_empty());
-        assert_eq!(plan.embed_shapes, vec![2, 1]);
-        assert_eq!(plan.embed_dtypes, vec![2]);
-        assert_eq!(plan.embed_anchor_rows, vec![0]);
-        assert_eq!(plan.embed_rows.len(), 4);
-
-        remove_partner(200, PartnerRole::Encode);
-        configure_encode_injection(false, 0);
-        configure(false, 0);
-        clear_partners();
-        server_task.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_encode_keeps_partner_admission_until_rpc_retires() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        clear_partners();
-        configure(true, 1);
-        configure_encode_injection(true, 1);
-        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-        let server_task = tokio::spawn(
-            BaseChannel::with_defaults(server_transport)
-                .execute(
-                    StubExecutor {
-                        next_instance: Arc::new(AtomicU64::new(1)),
-                        page_bytes: 16,
-                        fail_launch: false,
-                        fail_push: false,
-                        encode_delay_ms: 200,
-                    }
-                    .serve(),
-                )
-                .for_each_concurrent(None, |request| async move {
-                    tokio::spawn(request);
-                }),
-        );
-        let new_client = ::driver_api::ExecutorRpcClient::new(
-            tarpc::client::Config::default(),
-            client_transport,
-        );
-        let client = new_client.client;
-        tokio::spawn(new_client.dispatch);
-        let partner = register_partner(
-            201,
-            42,
-            99,
-            PartnerRole::Encode,
-            1,
-            RemoteTransferKind::Inline,
-            Some(client),
-        );
-        let encode = tokio::spawn(async move {
-            let mut plan = ::driver_api::LaunchPlan {
-                token_ids: vec![7, 8],
-                qo_indptr: vec![0, 2],
-                image_pixels: vec![1, 2, 3, 4],
-                image_anchor_rows: vec![0],
-                ..Default::default()
-            };
-            try_encode(&mut plan).await
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while partner.outstanding() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("encode never acquired partner admission");
-        encode.abort();
-        let _ = encode.await;
-        assert_eq!(
-            partner.outstanding(),
-            1,
-            "caller cancellation released admission before the RPC retired"
-        );
-        tokio::time::timeout(Duration::from_secs(1), partner.wait_drained())
-            .await
-            .expect("owned encode task did not release admission");
-
-        remove_partner(201, PartnerRole::Encode);
-        configure_encode_injection(false, 0);
-        configure(false, 0);
-        clear_partners();
-        server_task.abort();
-    }
-
-    #[test]
-    fn remote_embeddings_require_exact_media_attribution_and_reorder_by_row() {
-        let request = ::driver_api::LaunchPlan {
-            token_ids: vec![1, 2, 3, 4],
-            qo_indptr: vec![0, 2, 4],
-            image_anchor_rows: vec![2],
-            audio_anchor_rows: vec![0],
-            ..Default::default()
-        };
-        let embeddings = ::driver_api::RemoteEmbeddings {
-            rows: vec![2, 0, 1, 0],
-            indptr: vec![0, 2, 4],
-            shapes: vec![1, 1, 1, 1],
-            dtypes: vec![2, 2],
-            anchor_rows: vec![2, 0],
-        };
-        let (canonical, block_indptr) =
-            canonicalize_remote_embeddings(&request, embeddings, 1).unwrap();
-        assert_eq!(canonical.anchor_rows, vec![0, 2]);
-        assert_eq!(canonical.rows, vec![1, 0, 2, 0]);
-        assert_eq!(block_indptr, vec![0, 1, 2]);
-
-        let missing = ::driver_api::RemoteEmbeddings {
-            rows: vec![2, 0],
-            indptr: vec![0, 2],
-            shapes: vec![1, 1],
-            dtypes: vec![2],
-            anchor_rows: vec![2],
-        };
-        assert!(canonicalize_remote_embeddings(&request, missing, 1).is_none());
-        assert!(parse_blob_hash(&"é".repeat(32)).is_none());
     }
 }

@@ -15,11 +15,11 @@ fn main() {
     let rows = model::catalog();
     let row = rows
         .iter()
-        .find(|(name, _)| *name == sku)
+        .find(|(name, ..)| *name == sku)
         .unwrap_or_else(|| {
-            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let names: Vec<&str> = rows.iter().map(|(n, ..)| *n).collect();
             panic!("`{sku}` is not a catalog row; rows: {names:#?}")
         });
-    let plan = row.1(plane);
+    let plan = row.2(plane);
     println!("{}", serde_json::to_string_pretty(&plan).unwrap());
 }

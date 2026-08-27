@@ -5,7 +5,7 @@
 //! per-stage grouped plans. Until this file existed it had exactly one caller
 //! in the tested workspace — `cuda_golden::emit_driver_test_kernel_fixtures`,
 //! which writes the encoded package into a gitignored fixtures directory and
-//! asserts nothing about its contents. So `PIE_STAGE_GROUPED_VALID`,
+//! asserts nothing about its contents. So `StageNeeds::grouped_valid`,
 //! `plan.error`, `flags`, `mtp_rows` and `channel_rules` were all unpinned:
 //! a mutation testing this discovered that declaring `add` grouped-unsupported
 //! — which silently costs every elementwise stage its grouped path — passed
@@ -18,12 +18,7 @@
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use driver_api::plan::LaunchStagePlan;
-use driver_api::{
-    PIE_STAGE_GROUPED_VALID, PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL,
-    PIE_STAGE_REQUIRES_LAYER, PIE_STAGE_REQUIRES_LORA, PIE_STAGE_REQUIRES_MTP_ROWS,
-    PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY,
-};
+use driver_api::program::LaunchStagePlan;
 use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -67,15 +62,6 @@ fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     (out, refused)
 }
 
-/// Every bit `lower_stage_plan` is allowed to set.
-const DECLARED_FLAGS: u32 = PIE_STAGE_GROUPED_VALID
-    | PIE_STAGE_REQUIRES_QUERY
-    | PIE_STAGE_REQUIRES_LAYER
-    | PIE_STAGE_REQUIRES_ATTN_SCORE
-    | PIE_STAGE_REQUIRES_MTP_ROWS
-    | PIE_STAGE_REQUIRES_KERNEL_CALL
-    | PIE_STAGE_REQUIRES_PAGE_MASK
-    | PIE_STAGE_REQUIRES_LORA;
 
 #[test]
 fn every_plan_the_driver_receives_is_well_formed() {
@@ -120,27 +106,23 @@ fn every_plan_the_driver_receives_is_well_formed() {
             // may happen without the other, or the driver sees a plan it will
             // run with a diagnosis attached, or refuse with none.
             assert_eq!(
-                plan.flags & PIE_STAGE_GROUPED_VALID != 0,
+                plan.needs.grouped_valid,
                 plan.error.is_empty(),
                 "{id}: grouped-valid = {}, error = {:?}",
-                plan.flags & PIE_STAGE_GROUPED_VALID != 0,
+                plan.needs.grouped_valid,
                 plan.error
             );
-            assert_eq!(
-                plan.flags & !DECLARED_FLAGS,
-                0,
-                "{id}: flags {:#010x} carry a bit no PIE_STAGE_* constant declares",
-                plan.flags
-            );
+            // The "no undeclared bit" assertion that stood here is gone with
+            // the bitmask: `StageNeeds` is eight named booleans, so a bit no
+            // constant declares is not a value it can hold.
 
             // Every lowered op is an op, and every index the driver will
             // dereference is in range of the table it indexes.
             for op in &plan.ops {
-                let tag = u8::try_from(op.code).expect("an op code is a wire tag");
                 assert!(
-                    tensor_ir::op::spec(tag).is_some(),
-                    "{id}: lowered op code {:#06x} is not in OP_TABLE",
-                    op.code
+                    tensor_ir::op::spec(op.tag).is_some(),
+                    "{id}: lowered op tag {:#04x} is not in OP_TABLE",
+                    op.tag
                 );
             }
             assert_eq!(
@@ -165,7 +147,7 @@ fn every_plan_the_driver_receives_is_well_formed() {
                     "{id}: an unbound channel slot reached the driver"
                 );
             }
-            if plan.flags & PIE_STAGE_REQUIRES_MTP_ROWS != 0 {
+            if plan.needs.mtp_rows {
                 assert!(
                     plan.mtp_rows > 0,
                     "{id}: asks the driver for MTP rows and then names zero of them"
@@ -193,7 +175,7 @@ fn the_grouped_path_accepts_the_same_stages_it_always_has() {
     let mut refused: Vec<String> = Vec::new();
     for (name, stage_plans) in &packages {
         for (index, plan) in stage_plans.iter().enumerate() {
-            if plan.flags & PIE_STAGE_GROUPED_VALID != 0 {
+            if plan.needs.grouped_valid {
                 valid += 1;
             } else {
                 refused.push(format!("{name}#{index}: {}", plan.error));
@@ -223,7 +205,7 @@ const EXPECTED_GROUPED_VALID: usize = 18;
 
 /// A prologue `lora` sink raises its own stage flag, and only its own.
 ///
-/// The sink-flag derivation used to set `PIE_STAGE_REQUIRES_PAGE_MASK` for
+/// The sink-flag derivation used to set `StageNeeds::page_mask` for
 /// every `sink_call`; now that two first-party sinks exist it dispatches on
 /// the resolved name, and this is what notices if that dispatch regresses in
 /// either direction — a lora stage flagged as a page mask would have the
@@ -263,14 +245,12 @@ fn the_lora_sink_raises_its_own_stage_flag() {
     let stages = compile_bound(&bound);
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
     let plan = &package.plans[0];
-    assert_ne!(
-        plan.flags & PIE_STAGE_REQUIRES_LORA,
-        0,
+    assert!(
+        plan.needs.lora,
         "a stage writing the lora sink must tell the driver so"
     );
-    assert_eq!(
-        plan.flags & PIE_STAGE_REQUIRES_PAGE_MASK,
-        0,
+    assert!(
+        !plan.needs.page_mask,
         "a lora stage is not a page-mask stage"
     );
 
@@ -280,14 +260,14 @@ fn the_lora_sink_raises_its_own_stage_flag() {
     let (mut page_mask_plans, mut lora_plans) = (0usize, 0usize);
     for (name, stage_plans) in &packages() {
         for plan in stage_plans {
-            if plan.flags & PIE_STAGE_REQUIRES_PAGE_MASK != 0 {
+            if plan.needs.page_mask {
                 page_mask_plans += 1;
                 assert!(
                     plan.names.iter().any(|n| n == "attn_page_mask"),
                     "{name}: a page-mask flag with no attn_page_mask in the name table"
                 );
             }
-            if plan.flags & PIE_STAGE_REQUIRES_LORA != 0 {
+            if plan.needs.lora {
                 lora_plans += 1;
                 assert!(
                     plan.names.iter().any(|n| n == "lora"),

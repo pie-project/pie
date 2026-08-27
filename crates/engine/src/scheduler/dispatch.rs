@@ -20,13 +20,15 @@
 
 use std::sync::Arc;
 
-use ::driver_api::{KvMoveCell, PIE_MEMORY_DOMAIN_HOST_PINNED, PoolRange, StateCopyRange};
+use ::driver_api::transfer::{KvMove, MemoryDomain, PageRange, Pool, StateMove};
 use anyhow::Result;
+use tensor_ir::registry::GeometryClass;
+
+use ::driver_api::program::BindExtents;
 
 use crate::driver::{
-    BoundInstance, ChannelEndpoint, ChannelRegistrationPlan, ChannelValue, DriverId,
-    InstanceBindingPlan, InstanceId, KvCopyPlan, PoolResizePlan, ProgramId, ProgramRegistration,
-    StateCopyPlan, SubmissionCompletion,
+    BoundInstance, ChannelEndpoint, ChannelRegistration, ChannelValue, DriverId, InstanceBindingPlan,
+    InstanceId, KvCopy, PoolResize, ProgramId, ProgramRegistration, StateCopy, SubmissionCompletion,
 };
 
 use super::{ProcessId, scheduler_handle};
@@ -40,14 +42,10 @@ pub(crate) async fn register_program(
 
 pub(crate) async fn register_channel(
     driver_idx: DriverId,
-    mut plan: ChannelRegistrationPlan,
+    plan: ChannelRegistration,
 ) -> Result<Arc<ChannelEndpoint>> {
-    let table = waker::WakerTable::global();
-    plan.driver_id = driver_idx;
-    plan.reader_wait_id = table.alloc();
-    plan.writer_wait_id = table.alloc();
     let handle = scheduler_handle(driver_idx)?;
-    let result = handle.register_channel(plan.clone()).await;
+    let result = handle.register_channel(driver_idx, plan.clone()).await;
     match result {
         Ok(channel) => {
             // Installs the close-notification callback (`ChannelEndpoint`
@@ -59,30 +57,25 @@ pub(crate) async fn register_channel(
                 Arc::new(move |channel_id| closer_handle.close_channel(channel_id));
             Ok(Arc::new(ChannelEndpoint::new(channel).with_closer(closer)))
         }
-        Err(error) => {
-            for wait_id in [plan.reader_wait_id, plan.writer_wait_id] {
-                table.free(wait_id);
-            }
-            Err(error)
-        }
+        // THE WAIT SLOTS ARE THE REGISTRATION'S ANSWER NOW, not its
+        // argument: the engine used to allocate them and hand them across so
+        // a C driver could publish into them, and the contract's
+        // `RegisteredChannel` answers them instead. So there is nothing to
+        // free on a failed registration here — whoever allocated them frees
+        // them, and that is the scheduler that made the ring.
+        Err(error) => Err(error),
     }
 }
 
 pub(crate) async fn register_channels(
     driver_idx: DriverId,
-    mut plans: Vec<ChannelRegistrationPlan>,
+    plans: Vec<ChannelRegistration>,
 ) -> Result<Vec<Arc<ChannelEndpoint>>> {
     if plans.is_empty() {
         return Ok(Vec::new());
     }
     let handle = scheduler_handle(driver_idx)?;
-    let table = waker::WakerTable::global();
-    for plan in &mut plans {
-        plan.driver_id = driver_idx;
-        plan.reader_wait_id = table.alloc();
-        plan.writer_wait_id = table.alloc();
-    }
-    match handle.register_channels(plans.clone()).await {
+    match handle.register_channels(driver_idx, plans.clone()).await {
         Ok(channels) => {
             let closer_handle = handle.clone();
             let closer: crate::driver::ChannelCloser =
@@ -94,15 +87,62 @@ pub(crate) async fn register_channels(
                 })
                 .collect())
         }
-        Err(error) => {
-            for plan in plans {
-                for wait_id in [plan.reader_wait_id, plan.writer_wait_id] {
-                    table.free(wait_id);
-                }
-            }
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
+}
+
+/// The seeds, renumbered from the engine's ids into the contract's.
+///
+/// **THE TWO PLANES NUMBER A CHANNEL DIFFERENTLY, AND THIS IS THE ONE PLACE
+/// THAT KNOWS BOTH.** The engine's channel plane addresses a channel by its
+/// GLOBAL id — [`ChannelValue::channel`](crate::driver::ChannelValue), the id
+/// a `ChannelRegistration` was minted with — and the contract's
+/// [`ChannelSeed`](driver_api::ChannelSeed) addresses it by its index in the
+/// package's DECLARATION order, the same numbering
+/// [`Driver::publish_channel`](driver_api::Driver::publish_channel) uses and
+/// the numbering an instance's rings are carved in.
+///
+/// Both sites below used to spell the conversion `u32::try_from(global_id)`,
+/// which is not a conversion at all: it is the identity, and the two
+/// numberings are not the same one. A global id is minted when the GUEST
+/// constructs a channel; declaration order is the order the TRACE holds them
+/// in (`Traced::channel_order`), which the builder derives from how the ports
+/// and stages use them. They coincide by accident or not at all — the first
+/// PTIR inferlet through this door seeded a five-token `toks` cell into a
+/// two-lane `rng` ring, which is where the CUDA shell caught it
+/// ("a i32 wire cell of 2 lane(s) is 8 bytes and 20 were offered").
+///
+/// `binding.channels` IS the declaration order (the contract says so on the
+/// field), so the position of a seed's id in it is the seed's number.
+///
+/// # Errors
+///
+/// A seed for a channel this binding does not carry: the caller staged a
+/// value for a ring that is not there, and planting it anywhere else is worse
+/// than refusing.
+fn seeds_in_declaration_order(
+    channel_ids: &[u64],
+    seed_values: Vec<ChannelValue>,
+) -> Result<Vec<::driver_api::channel::ChannelSeed>> {
+    seed_values
+        .into_iter()
+        .map(|value| {
+            let at = channel_ids
+                .iter()
+                .position(|id| *id == value.channel)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "a seed names channel {} and this instance binds {:?}",
+                        value.channel,
+                        channel_ids
+                    )
+                })?;
+            Ok(::driver_api::channel::ChannelSeed {
+                channel: u32::try_from(at).unwrap_or(u32::MAX),
+                bytes: value.bytes,
+            })
+        })
+        .collect()
 }
 
 /// Register `plans` and bind the instance in ONE scheduler control —
@@ -112,49 +152,54 @@ pub(crate) async fn register_channels(
     clippy::too_many_arguments,
     reason = "one combined register-channels-and-bind request: the driver and pipeline \
               it is for, the channel plans and their ids, the program to register, the \
-              instance id asked for, the seed values to plant, and the geometry class \
-              the bind is classified as. The whole point of this call is that all of \
-              it crosses to the scheduler as ONE item, so the argument list is the \
-              item"
+              instance id asked for, the seed values to plant, the geometry class \
+              the bind is classified as, and the extents its stage buffers are \
+              carved at. The whole point of this call is that all of it crosses to \
+              the scheduler as ONE item, so the argument list is the item"
 )]
 pub(crate) async fn register_channels_bind_classified(
     driver_idx: DriverId,
     pipeline_id: Option<ProcessId>,
-    mut plans: Vec<crate::driver::ChannelRegistrationPlan>,
+    plans: Vec<ChannelRegistration>,
     program: ProgramRegistration,
     requested_instance_id: InstanceId,
     channel_ids: Vec<u64>,
     seed_values: Vec<ChannelValue>,
-    geometry_class: ::driver_api::GeometryClass,
+    geometry_class: GeometryClass,
+    extents: BindExtents,
 ) -> Result<(
     Vec<Arc<ChannelEndpoint>>,
     BoundInstance,
     super::worker::SchedulerHandle,
 )> {
+    // `requested_instance_id` NO LONGER TRAVELS. The contract's
+    // `InstanceBinding` carries what a driver needs and nothing the engine
+    // wanted back unchanged; the driver mints the id and the engine keeps its
+    // own tables (`driver-api::program`'s note). The argument survives because
+    // callers still name the instance they staged channels for.
+    let _ = requested_instance_id;
     let handle = scheduler_handle(driver_idx)?;
     let table = waker::WakerTable::global();
-    for plan in &mut plans {
-        plan.driver_id = driver_idx;
-        plan.reader_wait_id = table.alloc();
-        plan.writer_wait_id = table.alloc();
-    }
     let pacing_wait_id = table.alloc();
-    let wait_ids: Vec<u64> = plans
-        .iter()
-        .flat_map(|plan| [plan.reader_wait_id, plan.writer_wait_id])
-        .chain([pacing_wait_id])
-        .collect();
-    let bind = InstanceBindingPlan {
-        driver_id: driver_idx,
-        program_id: 0,
-        requested_instance_id,
-        pacing_wait_id,
-        channel_ids,
-        seed_values,
-        geometry_class,
+    let wait_ids: Vec<u64> = vec![pacing_wait_id];
+    let seeds = match seeds_in_declaration_order(&channel_ids, seed_values) {
+        Ok(seeds) => seeds,
+        Err(error) => {
+            table.free(pacing_wait_id);
+            return Err(error);
+        }
     };
+    let bind = InstanceBindingPlan::new(
+        driver_idx,
+        pacing_wait_id,
+        0,
+        channel_ids,
+        seeds,
+        geometry_class,
+        extents,
+    );
     match handle
-        .register_channels_bind(pipeline_id, plans, program, bind)
+        .register_channels_bind(pipeline_id, driver_idx, plans, program, bind)
         .await
     {
         Ok((channels, bound)) => {
@@ -193,11 +238,18 @@ pub(crate) async fn bind_instance(
         requested_instance_id,
         channel_ids,
         seed_values,
-        ::driver_api::GeometryClass::Host,
+        GeometryClass::Host,
+        BindExtents::default(),
     )
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one bind, said by the parties that know its parts: the driver and \
+              pipeline it is for, the program, the instance, the channels, the \
+              seeds, the geometry class and the extents"
+)]
 pub(crate) async fn bind_instance_classified(
     driver_idx: DriverId,
     pipeline_id: Option<ProcessId>,
@@ -205,22 +257,32 @@ pub(crate) async fn bind_instance_classified(
     requested_instance_id: InstanceId,
     channel_ids: Vec<u64>,
     seed_values: Vec<ChannelValue>,
-    geometry_class: ::driver_api::GeometryClass,
+    geometry_class: GeometryClass,
+    extents: BindExtents,
 ) -> Result<BoundInstance> {
+    // See `register_channels_bind_classified`: the driver mints the id.
+    let _ = requested_instance_id;
     let table = waker::WakerTable::global();
     let pacing_wait_id = table.alloc();
+    let seeds = match seeds_in_declaration_order(&channel_ids, seed_values) {
+        Ok(seeds) => seeds,
+        Err(error) => {
+            table.free(pacing_wait_id);
+            return Err(error);
+        }
+    };
     let bind = scheduler_handle(driver_idx)?
         .bind_instance(
             pipeline_id,
-            InstanceBindingPlan {
-                driver_id: driver_idx,
-                program_id,
-                requested_instance_id,
+            InstanceBindingPlan::new(
+                driver_idx,
                 pacing_wait_id,
+                program_id,
                 channel_ids,
-                seed_values,
+                seeds,
                 geometry_class,
-            },
+                extents,
+            ),
         )
         .await;
     if bind.is_err() {
@@ -245,14 +307,12 @@ pub(crate) async fn copy_d2h(
     cpu_pages: &[u32],
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
-        .copy_kv(KvCopyPlan {
-            src_domain: super::device_domain(driver_idx),
-            src_device_ordinal: 0,
-            dst_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
-            dst_device_ordinal: 0,
+        .copy_kv(KvCopy {
+            src: super::device_domain(driver_idx),
+            dst: MemoryDomain::HostPinned,
             src_page_ids: gpu_phys_ids.to_vec(),
             dst_page_ids: cpu_pages.to_vec(),
-            cells: Vec::new(),
+            moves: Vec::new(),
         })
         .await
 }
@@ -262,14 +322,12 @@ pub(crate) fn copy_d2h_tracked(
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
 ) -> Result<super::ControlCompletion> {
-    scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopyPlan {
-        src_domain: super::device_domain(driver_idx),
-        src_device_ordinal: 0,
-        dst_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
-        dst_device_ordinal: 0,
+    scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopy {
+        src: super::device_domain(driver_idx),
+        dst: MemoryDomain::HostPinned,
         src_page_ids: gpu_phys_ids.to_vec(),
         dst_page_ids: cpu_pages.to_vec(),
-        cells: Vec::new(),
+        moves: Vec::new(),
     })
 }
 
@@ -279,14 +337,12 @@ pub(crate) async fn copy_h2d(
     cpu_pages: &[u32],
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
-        .copy_kv(KvCopyPlan {
-            src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
-            src_device_ordinal: 0,
-            dst_domain: super::device_domain(driver_idx),
-            dst_device_ordinal: 0,
+        .copy_kv(KvCopy {
+            src: MemoryDomain::HostPinned,
+            dst: super::device_domain(driver_idx),
             src_page_ids: cpu_pages.to_vec(),
             dst_page_ids: gpu_phys_ids.to_vec(),
-            cells: Vec::new(),
+            moves: Vec::new(),
         })
         .await
 }
@@ -296,14 +352,12 @@ pub(crate) fn copy_h2d_tracked(
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
 ) -> Result<super::ControlCompletion> {
-    scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopyPlan {
-        src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
-        src_device_ordinal: 0,
-        dst_domain: super::device_domain(driver_idx),
-        dst_device_ordinal: 0,
+    scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopy {
+        src: MemoryDomain::HostPinned,
+        dst: super::device_domain(driver_idx),
         src_page_ids: cpu_pages.to_vec(),
         dst_page_ids: gpu_phys_ids.to_vec(),
-        cells: Vec::new(),
+        moves: Vec::new(),
     })
 }
 
@@ -313,14 +367,12 @@ pub(crate) async fn copy_d2d(
     dst_phys_ids: &[u32],
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
-        .copy_kv(KvCopyPlan {
-            src_domain: super::device_domain(driver_idx),
-            src_device_ordinal: 0,
-            dst_domain: super::device_domain(driver_idx),
-            dst_device_ordinal: 0,
+        .copy_kv(KvCopy {
+            src: super::device_domain(driver_idx),
+            dst: super::device_domain(driver_idx),
             src_page_ids: src_phys_ids.to_vec(),
             dst_page_ids: dst_phys_ids.to_vec(),
-            cells: Vec::new(),
+            moves: Vec::new(),
         })
         .await
 }
@@ -331,31 +383,27 @@ pub(crate) async fn copy_h2h(
     dst_slots: &[u32],
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
-        .copy_kv(KvCopyPlan {
-            src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
-            src_device_ordinal: 0,
-            dst_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
-            dst_device_ordinal: 0,
+        .copy_kv(KvCopy {
+            src: MemoryDomain::HostPinned,
+            dst: MemoryDomain::HostPinned,
             src_page_ids: src_slots.to_vec(),
             dst_page_ids: dst_slots.to_vec(),
-            cells: Vec::new(),
+            moves: Vec::new(),
         })
         .await
 }
 
 pub(crate) async fn copy_kv_cells(
     driver_idx: DriverId,
-    cells: Vec<KvMoveCell>,
+    cells: Vec<KvMove>,
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
-        .copy_kv(KvCopyPlan {
-            src_domain: super::device_domain(driver_idx),
-            src_device_ordinal: 0,
-            dst_domain: super::device_domain(driver_idx),
-            dst_device_ordinal: 0,
+        .copy_kv(KvCopy {
+            src: super::device_domain(driver_idx),
+            dst: super::device_domain(driver_idx),
             src_page_ids: Vec::new(),
             dst_page_ids: Vec::new(),
-            cells,
+            moves: cells,
         })
         .await
 }
@@ -368,7 +416,7 @@ pub(crate) async fn copy_rs_d2d(
     let slot_ranges = src_slots
         .iter()
         .zip(dst_slots.iter())
-        .map(|(&src_slot_id, &dst_slot_id)| StateCopyRange {
+        .map(|(&src_slot_id, &dst_slot_id)| StateMove {
             src_slot_id,
             dst_slot_id,
             src_token_offset: 0,
@@ -377,20 +425,20 @@ pub(crate) async fn copy_rs_d2d(
         })
         .collect();
     scheduler_handle(driver_idx)?
-        .copy_state(StateCopyPlan { slot_ranges })
+        .copy_state(StateCopy { moves: slot_ranges })
         .await
 }
 
 pub(crate) async fn resize_pool(
     driver_idx: DriverId,
-    pool_id: u64,
+    pool: Pool,
     target_pages: u64,
-    map_ranges: Vec<PoolRange>,
-    unmap_ranges: Vec<PoolRange>,
+    map_ranges: Vec<PageRange>,
+    unmap_ranges: Vec<PageRange>,
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
-        .resize_pool(PoolResizePlan {
-            pool_id,
+        .resize_pool(PoolResize {
+            pool,
             target_pages,
             map_ranges,
             unmap_ranges,

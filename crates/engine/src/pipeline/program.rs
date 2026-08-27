@@ -21,23 +21,25 @@
 //! The registry probes ([`Registry::lookup`]/[`Registry::len`], the free
 //! [`lookup`]) are `#[cfg(test)]`: production carries the
 //! `Arc<RegisteredProgram>` that [`register`] returns rather than probing by
-//! hash. [`Pricing`] is the one thing computed on the
-//! production path with no production consumer yet — thrust-2 capacity
-//! accounting is unwired — so it carries an annotated `allow` instead of a
-//! blanket module-level one.
+//! hash. [`Pricing::rows`] is read at bind (`palo B2`): it is the readout row
+//! count the driver carves an instance's stage buffers at. Its other two
+//! fields are still waiting on thrust-2 capacity accounting.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use ::driver_api::plan::{DirectArgmax, RegionAnalysis};
+use ::driver_api::program::{DirectArgmax, RegionAnalysis};
 use lru::LruCache;
 use tensor_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
 use tensor_compiler::plan::CompiledStage;
 use tensor_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use tensor_ir::container_hash;
-use tensor_ir::op::Op;
+use tensor_compiler::codegen::cuda::region_analysis::{
+    REGION_GENERATED_VALID, REGION_SECOND_PARTY_SUPPORTED,
+};
+use tensor_ir::op::{IntrinsicId, Op};
 use tensor_ir::registry::{ModelProfile, Port};
 use tensor_ir::validate::{BoundTrace, ValidateError, bind};
 
@@ -78,7 +80,7 @@ pub struct RegisteredProgram {
     pub channel_accesses: Vec<(bool, bool)>,
     /// This program in the shape a driver executes it, built on first use.
     /// See [`Self::launch`].
-    launch: std::sync::OnceLock<::driver_api::plan::LaunchPackage>,
+    launch: std::sync::OnceLock<::driver_api::program::LaunchPackage>,
     /// Static geometry-derivability taint, and the per-pass shadow fold
     /// schedule derived from it. Both are functions of `bound` alone, and a
     /// program is registered once but instantiated many times — at a cohort
@@ -87,10 +89,12 @@ pub struct RegisteredProgram {
     /// critical path.
     geometry_taint: std::sync::OnceLock<tensor_compiler::eval::pareval::GeometryTaint>,
     shadow_plan: std::sync::OnceLock<Arc<crate::pipeline::fire::shadow::ShadowPlan>>,
-    /// Registration-time pricing. Computed by [`price`] on every register,
-    /// but nothing consumes it yet (thrust-2 capacity accounting is
-    /// unwired) — the `allow` marks that gap rather than hiding it.
-    #[allow(dead_code)]
+    /// Registration-time pricing. [`Pricing::rows`] is read at bind — it is
+    /// the readout row count an instance's stage buffers are carved at
+    /// (`driver_api::BindExtents::sampled_rows`), and the same number
+    /// registration already derived is the one the bind states rather than a
+    /// second derivation of it. The other two feed thrust-2 capacity
+    /// accounting, which is still unwired.
     pub pricing: Pricing,
 }
 
@@ -108,7 +112,7 @@ impl RegisteredProgram {
     /// This is what replaced the container bytes and the PTIB sidecar. A driver
     /// receives typed records instead of PTIR, so it has no wire format to parse and no
     /// plan to re-derive (`ptir-refactor.md` §2.3).
-    pub fn launch(&self) -> &::driver_api::plan::LaunchPackage {
+    pub fn launch(&self) -> &::driver_api::program::LaunchPackage {
         self.launch.get_or_init(|| {
             tensor_compiler::codegen::launch::build(&self.bound, &self.compiled_stages)
         })
@@ -146,15 +150,28 @@ impl RegisteredProgram {
             .map(|region| RegionAnalysis {
                 stage_index: region.stage_index,
                 region_index: region.region_index,
-                flags: region.flags,
+                // TWO NAMED BOOLEANS, out of two bits of a `u32` the emitter
+                // and the driver each had a `REGION_*` constant for. The
+                // contract's `program` module purified every such tag; this is
+                // the one place the emitter's numbering is read.
+                second_party_supported: region.flags & REGION_SECOND_PARTY_SUPPORTED != 0,
+                generated_valid: region.flags & REGION_GENERATED_VALID != 0,
                 direct_argmax: region
                     .direct_argmax
                     .into_iter()
-                    .map(|record| DirectArgmax {
-                        node: record.node,
-                        source_value: record.source_value,
-                        intrinsic: record.intrinsic,
-                        requires_single_row: record.requires_single_row,
+                    .filter_map(|record| {
+                        Some(DirectArgmax {
+                            node: record.node,
+                            source_value: record.source_value,
+                            // A `u16` in the emitter's record, and PTIR's own
+                            // enum in the contract. An id no intrinsic claims
+                            // is dropped rather than shipped: the fast path it
+                            // describes is an optimisation, and a driver that
+                            // took an unnameable intrinsic would read a buffer
+                            // by a number nobody bound.
+                            intrinsic: IntrinsicId::from_u16(record.intrinsic)?,
+                            requires_single_row: record.requires_single_row != 0,
+                        })
                     })
                     .collect(),
                 skipped: region.skipped,

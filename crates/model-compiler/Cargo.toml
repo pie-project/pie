@@ -1,0 +1,40 @@
+[package]
+name = "model-compiler"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Bakes a traced Plan once: class resolution, region coalescing and the arena carve, into the backend-neutral Baked artifact a driver records and replays. Pure functions — no device, no I/O."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# No `build.rs`. The rewrite's fingerprinted the TRACER, and the tracer is
+# `model-dsl` + `model-ir`; this crate consumes plans and does not decide what
+# one is, so hashing its own sources produced a number that moved for changes
+# the fingerprint was not about.
+
+[lib]
+name = "model_compiler"
+path = "src/lib.rs"
+
+[dependencies]
+# THE ONLY DEPENDENCY, and the whole architecture is in that fact: baking
+# reads an IR and writes offsets, masks and byte counts, so it needs the
+# vocabulary and nothing else — no authoring surface, no kernel table, no
+# device. `resolve_classes` lives over there rather than here for the same
+# reason it is a dependency at all (decision #7): the model test suite calls
+# the same walk at authoring time, and a second implementation on this side
+# would be a second answer to "does this merge cover its classes".
+model-ir = { path = "../model-ir" }
+
+[dev-dependencies]
+# THE REAL CATALOG, and nothing smaller. `tests/every_sku_carves_an_arena.rs`
+# traces the shipping row and bakes what comes out of it; a fixture plan would
+# pin the carve against this crate's own idea of a plan, which is the one thing
+# it cannot check itself.
+#
+# A DEV EDGE ONLY, and it does not cycle: `model` reads `model-dsl` and
+# `model-ir` and knows nothing of baking. Nothing in `[dependencies]` above
+# names either, so the cycle a reader worries about — model -> compiler ->
+# model — has no first edge to close.
+model = { path = "../model" }
+model-dsl = { path = "../model-dsl" }

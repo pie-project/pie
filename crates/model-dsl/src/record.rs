@@ -33,12 +33,11 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub(crate) fn new(name: &str, plane: Plane, facts: &[&str], caches: Vec<CacheRow>) -> Recorder {
+    pub(crate) fn new(name: &str, plane: Plane, caches: Vec<CacheRow>) -> Recorder {
         Recorder {
             inner: Rc::new(RefCell::new(Plan {
                 name: name.to_string(),
                 plane,
-                facts: facts.iter().map(|f| (*f).to_string()).collect(),
                 params: Vec::new(),
                 caches,
                 values: Vec::new(),
@@ -343,7 +342,7 @@ impl Value {
     /// slot aliasing and nothing ever dispatches it.
     #[must_use]
     pub fn merge(arms: Vec<Value>) -> Value {
-        assert!(arms.len() >= 2, "merge! wants at least two arms");
+        assert!(arms.len() >= 2, "a merge wants at least two arms");
         let rec = arms[0].rec.clone();
         // Arms must agree on ty; the validator's MergeArmTy rule names the
         // odd one out, so the first arm's ty stands for the merge here.
@@ -469,7 +468,7 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
 
 fn cond_of(p: &Predicate) -> Cond {
     match p {
-        Predicate::Fact { bit, .. } => Cond::Fact(*bit),
+        Predicate::Fact { bit } => Cond::Fact(*bit),
         Predicate::Not(a) => Cond::not(cond_of(a)),
         Predicate::And(a, b) => Cond::and(cond_of(a), cond_of(b)),
         Predicate::Rest => panic!("Predicate::rest() belongs only in an n-way split"),
@@ -485,11 +484,4 @@ fn meet(a: Cond, b: Cond) -> Cond {
         (Cond::Always, x) | (x, Cond::Always) => x,
         (a, _) => a,
     }
-}
-
-#[macro_export]
-macro_rules! merge {
-    ($($arm:expr),+ $(,)?) => {
-        $crate::Value::merge(vec![$($arm),+])
-    };
 }

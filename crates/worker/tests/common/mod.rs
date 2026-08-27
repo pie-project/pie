@@ -132,7 +132,7 @@ pub fn cuda_toml() -> String {
 /// interesting CUDA failures are not the ones this harness asserts on. A
 /// device instantiation that will not compile or load is reported by
 /// `kernels-cuda::jit::ctx::said` through `tracing::error!` and NOWHERE else
-/// -- the `Refusal::Device { why }` it returns holds a `&'static str` and so
+/// -- the `KernelError::Device { call, code }` it returns holds a `&'static str` and so
 /// cannot carry the driver's sentence -- so the engine's message stops at
 /// "the compile, the load or the launch refused; see the log". Without a
 /// subscriber there is no log, and a `CUDA_ERROR_ILLEGAL_ADDRESS` in one

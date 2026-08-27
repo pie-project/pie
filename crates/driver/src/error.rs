@@ -1,31 +1,48 @@
-//! The one thing this layer can fail at.
-//!
-//! No device, heap or compiler diagnostic is reachable from here. What IS
-//! reachable is a launch program that does not make sense -- an op the table
-//! does not name, a stage graph closing over a value no stage produces, a
-//! channel whose declared shape and dtype disagree with the cell it is bound
-//! to -- so the one variant blames the *text*. The shells re-export their own
-//! error and convert: `driver-metal` and `driver-cuda` each carry a `Program`
-//! variant, so a `?` on one of this crate's results lands in the shell's type
-//! without a match.
-
 use std::fmt;
 
-/// This layer's result alias.
+use kernels::KernelError;
+
+use crate::fire::Fault;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// What the PTIR channel plane can fail at.
-///
-/// One variant, deliberately: a second would have to name something other
-/// than the program. NOT `#[non_exhaustive]` -- a shell's `From` impl should
-/// be a TOTAL match that breaks loudly when a variant is added.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A launch program the interpreter cannot run.
     Program {
-        /// What could not be made sense of.
         message: String,
     },
+
+    /// A fire the artifact cannot describe, or a template the walk cannot
+    /// execute (`fire::Fault`).
+    ///
+    /// THE MODEL PLANE'S HALF OF THIS ENUM, and it is one variant rather than
+    /// six because the vocabulary belongs to `fire`: what a lane word is, what
+    /// a window is, what a bucket is. The error type is the crate's door;
+    /// `Fault` is the sentence behind it.
+    Fire(Fault),
+
+    /// What a backend answered at dispatch.
+    ///
+    /// **NEVER ABOUT THE PLAN.** `KernelError` is the kernels crate's
+    /// contract: no implementation for this op, none for this dtype, or a
+    /// launch that would not enqueue. Shape and dtype mismatches are the
+    /// trace-time validator's business and never appear here — which is why
+    /// this is a distinct variant from `Fire` rather than folded into it, even
+    /// though both surface from the same `fire::walk` call. One means the
+    /// device cannot do it; the other means the batch was not describable.
+    Kernel(KernelError),
+}
+
+impl From<Fault> for Error {
+    fn from(fault: Fault) -> Error {
+        Error::Fire(fault)
+    }
+}
+
+impl From<KernelError> for Error {
+    fn from(error: KernelError) -> Error {
+        Error::Kernel(error)
+    }
 }
 
 impl fmt::Display for Error {
@@ -34,6 +51,8 @@ impl fmt::Display for Error {
             Self::Program { message } => {
                 write!(f, "launch program cannot be interpreted: {message}")
             }
+            Self::Fire(fault) => write!(f, "this fire cannot be walked: {fault}"),
+            Self::Kernel(error) => write!(f, "the backend refused a dispatch: {error}"),
         }
     }
 }

@@ -23,13 +23,6 @@ impl DispatchLinear for Run<'_> {
                 self.tensor(*w),
                 &mut self.tensor(*y),
             ),
-            Linear::AttentionLanding { act, w, layer, y } => linear::gemm::attention_landing(
-                self.ctx(),
-                self.tensor(*act),
-                self.tensor(*w),
-                *layer,
-                &mut self.tensor(*y),
-            ),
             // ---- mlp ----
             Linear::MlpSwiglu {
                 packed,
@@ -180,9 +173,37 @@ impl DispatchLinear for Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            // The same two-plane bank as the biased twin above, with nothing
+            // added inside the fold: the down leg's routed bias lands after
+            // the reduce, through `MoeBiasSum`.
+            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
+                let (codes, scales) = self.planes(*bank);
+                linear::moe::matmul_select_quant(
+                    self.ctx(),
+                    self.tensor(*x),
+                    codes,
+                    scales,
+                    self.tensor(*routes),
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
+                self.tensor(*weights),
+                &mut self.tensor(*y),
+            ),
+            Linear::MoeBiasSum {
+                x,
+                bias,
+                routes,
+                weights,
+                y,
+            } => linear::moe::bias_sum(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*bias),
+                self.tensor(*routes),
                 self.tensor(*weights),
                 &mut self.tensor(*y),
             ),

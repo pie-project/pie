@@ -35,7 +35,9 @@
 use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
-use driver_api::{DeviceDomain, Driver};
+use driver_api::transfer::MemoryDomain;
+use driver_api::Driver;
+use tensor_ir::registry::PortMask;
 
 /// One execution device, behind the contract.
 ///
@@ -57,7 +59,12 @@ pub struct SchedulerLimits {
 pub struct DriverSpec {
     pub num_kv_pages: usize,
     pub limits: SchedulerLimits,
-    pub device_geometry_port_mask: u32,
+    /// Which descriptor ports this driver resolves on the device.
+    ///
+    /// Was a private thirteen-bit `u32` numbering that disagreed with the
+    /// port registry's own; it is `tensor_ir::registry`'s mask now
+    /// (decision 19), so the two cannot drift.
+    pub device_geometry_port_mask: PortMask,
     /// Does this driver resolve a step's descriptor ports when the step RUNS,
     /// rather than for the whole frame before any of it runs?
     ///
@@ -87,7 +94,7 @@ pub struct DriverSpec {
     /// memory, and a driver that checks the domain -- which is the only
     /// defence against a copy between two unrelated pools -- refuses every
     /// prefix-cache hit and every swap.
-    pub device_domain: DeviceDomain,
+    pub device_domain: MemoryDomain,
 }
 
 impl DriverSpec {
@@ -123,18 +130,42 @@ pub mod open {
     /// No device, or a boot config this driver refuses.
     #[cfg(feature = "_driver-cuda")]
     pub fn cuda(config_bytes: &[u8]) -> Result<DriverBackend> {
-        Ok(Box::new(super::cuda::CudaDriver::create(config_bytes)?))
+        Ok(Box::new(super::cuda::open(config_bytes)?))
     }
 
     /// Open one CUDA device per rank, as one driver.
     ///
+    /// **`palo B-tp`: ONE RANK, AND IT REFUSES THE REST BY NAME.** The group
+    /// this replaced was a leader shell and N follower shells behind one
+    /// `Driver`, fanning a `Vec<ModelLoadDesc>` across a thread scope and
+    /// cross-checking that the ranks agreed about the model. None of that
+    /// shape survives: a rank is not a load
+    /// ([`LoadRequest`](driver_api::LoadRequest) is one plan, `Shard::Cut` is
+    /// in the plan), the shell states tp=1 in `weights.rs` — `StorageTarget::
+    /// for_backend(Cuda, 0, 1)` — and no collective ever fires in v1
+    /// (`serve.rs`'s "what v1 does not do"). A multi-rank launch is refused
+    /// here rather than opened and served wrong.
+    ///
+    /// What the successor needs: a rank index and a width reaching
+    /// `StorageTarget`, a `Driver` that owns N shells and drives their
+    /// streams in lockstep, and NCCL ordering — decision 5, "collectives
+    /// never elided; descriptor rank-replicated".
+    ///
     /// # Errors
     ///
-    /// Any rank's device failed to open.
+    /// An empty rank list, more than one rank, or a device that failed to
+    /// open.
     #[cfg(feature = "_driver-cuda")]
     pub fn cuda_group(config_blobs: Vec<Vec<u8>>) -> Result<(DriverBackend, usize)> {
-        let (driver, ranks) = super::cuda::CudaDriver::create_group(config_blobs)?;
-        Ok((Box::new(driver), ranks))
+        match config_blobs.len() {
+            0 => Err(super::anyhow!("a cuda group requires at least one rank")),
+            1 => Ok((cuda(&config_blobs[0])?, 1)),
+            ranks => Err(super::anyhow!(
+                "this build serves one cuda rank and was asked for {ranks}: \
+                 tensor parallelism is palo B-tp, and a group opened as a \
+                 single rank would load every shard onto one device"
+            )),
+        }
     }
 
     /// Open the default Metal 4 device.
@@ -148,51 +179,45 @@ pub mod open {
     }
 }
 
-/// Settle a control-plane submission a HOST-SIDE seam has already finished.
-///
-/// A seam whose memory is coherent — where `copy_kv` is a `memmove` — has
-/// nobody to hand the completion target to, so it publishes the terminal cell
-/// and notifies the broker itself. `cuda` and `remote` never use this and must
-/// not: they are asynchronous, so each hands the whole target to whatever
-/// finishes the work.
-///
-/// BOTH HALVES, IN THAT ORDER. The 850-second hang this exists to prevent came
-/// from a seam that minted a `control_completion` and dropped the target: it
-/// parked a real `pie run`, with the scheduler's watchdog naming it exactly —
-/// `in_flight_control: KV copy pipeline Some(..) settled=false`. Publishing
-/// without notifying trips the engine's own check on the way out.
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-pub(crate) fn settle_control(
-    broker: &driver_api::CompletionBroker,
-) -> driver_api::SubmissionCompletion {
-    let (raw, completion) = broker.control_completion(1);
-    if !raw.terminal_cell.is_null() {
-        // SAFETY: the broker owns this cell for the life of the completion it
-        // was minted with, and `publish` is a release store into an
-        // `AtomicU32` the engine only ever reads.
-        unsafe {
-            (*raw.terminal_cell).publish(driver_api::PIE_TERMINAL_OUTCOME_SUCCESS);
-        }
-    }
-    broker.notify(completion.wait_id(), raw.target_epoch);
-    completion
-}
+// `settle_control` STOOD HERE. A seam whose memory is coherent — where
+// `copy_kv` is a `memmove` — had nobody to hand a completion target to, so it
+// published the terminal cell and notified the broker itself, and the comment
+// on it recorded an 850-second hang from a seam that did one and not the
+// other. Both halves are `crate::driver::verbs::settled` now, for every seam
+// at once: the contract's control verbs answer `Result<()>` and the work is
+// done when they return, so the completion the engine hands its waiters is
+// one that is already settled. There is no half of it left to forget.
 
 #[cfg(feature = "_driver-cuda")]
 mod cuda;
-// TARGET-GATED as well as feature-gated, unlike the seams that stood beside it:
-// `driver-metal` is Apple-only at the crate level, so the feature alone is not
-// a build that links. Vulkan is a loader and wgpu is pure Rust; neither needed
-// this, and both are still out at P5.
+// TARGET-GATED as well as feature-gated, and the reason has moved. It used to
+// be that `driver-metal` was Apple-only at the crate level, so the feature
+// alone was not a build that links. That crate names no Metal API any more —
+// it is the dispatch layer, and it builds and tests on any OS — and the seam
+// behind this gate has no shell to be Apple about either, so the module
+// itself is portable and the test beside it passes on Linux with the target
+// clause lifted. The gate stays because `worker`'s `DriverOptions::Metal`
+// arm and its whole option struct are Apple-gated: ungating the door alone
+// would open one nothing on this platform can reach. It comes off with the
+// shell (`palo B-metal`), when there is something on the other side.
 #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 mod metal;
 mod remote;
 
-#[cfg(feature = "_driver-cuda")]
-pub use cuda::CudaDriver;
+// `pub use cuda::CudaDriver` STOOD HERE. There is no such type: the `Driver`
+// impl is `driver_cuda::Cuda`, in the crate that owns the device, and this
+// module's CUDA arm is a boot-config reader that answers one
+// (`backend::cuda::open`). Re-exporting the shell's own type through here
+// would be this crate claiming a driver it does not implement.
 #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 pub use metal::MetalDriver;
 pub use remote::{RemoteDisconnectHandle, RemoteDriver};
+
+// One function DOES come through, and it is not a driver: `palo B3`'s
+// envelope counter, which is the only observable of a negative (the token
+// that did not travel to the host). See `cuda::envelopes_resolved`.
+#[cfg(feature = "_driver-cuda")]
+pub use cuda::envelopes_resolved;
 
 struct DriverRegistration {
     spec: DriverSpec,
@@ -220,7 +245,13 @@ fn registry() -> &'static RwLock<Vec<Option<DriverRegistration>>> {
 pub fn register_driver_backend(mut spec: DriverSpec, backend: DriverBackend) -> usize {
     let mut drivers = registry().write().unwrap();
     let id = drivers.len();
-    spec.device_domain = backend.device_domain();
+    // The BACKEND states it, still — but through `device_facts`, which is
+    // where a driver says what machine it is. A driver with no device of its
+    // own (the remote seam) answers `None`, and host-pinned is the honest
+    // reading of "these pages are not on a device of mine".
+    spec.device_domain = backend
+        .device_facts()
+        .map_or(MemoryDomain::HostPinned, |facts| facts.domain);
     drivers.push(Some(DriverRegistration {
         spec,
         backend: Some(backend),

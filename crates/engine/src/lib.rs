@@ -19,19 +19,22 @@ extern crate driver_cuda as _;
 pub mod bootstrap;
 pub mod driver;
 pub mod inferlet;
-/// The served model: the global cache the runtime binds once at bootstrap.
+/// The served model: the global cache the runtime binds once at bootstrap,
+/// and the serving table it is built from.
 ///
 /// Moved here from `model`, which defines itself as backend-blind family
 /// knowledge — and a process-global `OnceLock` holding whatever this engine
-/// booted is neither a family fact nor knowledge. `::model::serve::ModelMetadata`
-/// stayed behind: what an artifact carries is a fact about models.
+/// booted is neither a family fact nor knowledge. `ModelMetadata` and the
+/// `(layers, vocab, arch)` rows FOLLOWED IT at M18, which deleted
+/// `model::serve` outright: what an artifact carries and what a fleet calls a
+/// model are facts about serving, and this is the serving fabric.
 pub mod model;
 pub(crate) mod pipeline;
 pub mod offload {
     pub use crate::pipeline::offload::{
-        OffloadCounterSnapshot, Partner, PartnerGuard, PartnerRole, close_driver_surrogates,
-        configure, configure_encode_injection, counters, register_partner, remove_partner,
-        select_partner, set_home_kv_handle,
+        OffloadCounterSnapshot, Partner, PartnerGuard, PartnerRole, TransferKind, clear_partners,
+        close_driver_surrogates, configure, configure_encode_injection, counters, home_kv_handle,
+        register_partner, remove_partner, select_partner, set_home_kv_handle,
     };
 
     pub fn register_remote_store(

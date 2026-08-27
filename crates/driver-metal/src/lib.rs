@@ -10,9 +10,9 @@
 //!
 //! **Portability.** No Metal API is named here. The `Run` encodes through
 //! [`kernels_metal::Ctx`] (`dyn Encode`), which the real shell
-//! implements against its command buffers — so this crate, like the old
-//! walk, builds and tests on any OS; only the shell behind the sink is
-//! macOS-bound.
+//! implements against its command buffers — so this crate, like the walk
+//! that drives it (`driver::fire::walk`), builds and tests on any OS; only
+//! the shell behind the sink is macOS-bound.
 //!
 //! **The seam** — the driver side of the `MENLO-SEAM` markers in
 //! `kernels_metal::attn`. The ledger is shorter than it was: the appenders'
@@ -39,8 +39,3 @@ pub use run::{
     CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, Run, SlotTable, StructSlot,
     WeightRow, WeightTable,
 };
-
-/// The walk is `kernels::exec`'s, written once and generic over any
-/// `Dispatch`; re-exported so a shell driving this `Run` needs one crate in
-/// scope.
-pub use kernels::{Phases, fire, phases, walk};

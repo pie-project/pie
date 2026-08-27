@@ -109,18 +109,52 @@ waker = { path = "../waker" }
 tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
 # What this engine needs to know about the model it serves that is NOT its
-# forward pass: the chat template a turn is written with, the `(layers, vocab)`
-# a sampler and the PTIR lowering are sized from, host-side multimodal decode,
-# and the shape an artifact's metadata arrives in. All of it is `model::serve`.
+# forward pass. It used to be the whole of `model::serve`, a module this crate
+# and `worker` were the only consumers of. M18 deleted it, on the ruling that
+# `model` says what a model family IS, backend-blind, and a serving process's
+# questions are not family questions. Two of the four came back through doors
+# `model` still keeps, and they are all this edge carries now:
 #
-# It used to be `model-legacy`, and the reason was one module: a scheduler site
-# table that traced a real legacy declaration to find a fire's divergence sites.
-# That table had no producer, no carrier and no consumer (see
-# `src/scheduler/fire_plan.rs`), and it walked a traced form the baker path does
-# not produce — so R1 deleted it, and with it this crate's last need for a
-# declaration. Everything left is serving knowledge, and it moved to this crate
-# rather than being ported, file for file.
-model = { path = "../model", features = ["serve"] }
+#   * the chat template a turn is written with -- `model::template::template_of`,
+#     keyed by the same SKU the driver reports having loaded;
+#   * the decoders that read the generated tokens back as chat, reasoning and
+#     tool events -- `model::template`, re-exported from `chat_template`.
+#
+# The other two RE-HOMED HERE, because a serving fabric is what asks them:
+# `(layers, vocab, arch)` per SKU and the shape an artifact's metadata arrives
+# in are `src/model.rs`, and host-side media decode is
+# `src/inferlet/host/media/multimodal.rs`.
+model = { path = "../model" }
+# THE ENGINE TRACES, AND THE ENGINE STATES THE LOAD CONTRACT (palo design §7,
+# decision 18). `model` above supplies the catalog and the per-SKU import; the
+# three edges below are what it takes to USE them at the boundary:
+#
+#   * `model-loader` names `ModelContract`, the value `model::import_of`
+#     builds and `driver_api`'s `LoadRequest` deliberately has no seat for —
+#     the contract's dependency floor is `model-ir`/`tensor-ir`/serde/thiserror,
+#     and a loader type in it would put the whole checkpoint plane in the graph
+#     of everyone who reads a `KvHandle`. So the shell takes it through a
+#     function pointer this crate installs (`driver::load`).
+#   * `ztensor` + `ztensor-compat` open the checkpoint the import is checked
+#     against — the same pair `model-loader` itself takes, for the reason its
+#     manifest gives: `ztensor` owns the container format, `ztensor-compat`
+#     owns the foreign projections (a stock safetensors snapshot is one).
+#
+# `default-features = false` on the loader drops its testkit (oracle, contract
+# fixture builder, CPU executor); nothing here reaches them.
+model-loader = { path = "../model-loader", default-features = false }
+ztensor = { workspace = true }
+ztensor-compat = { workspace = true }
+# Host-side media decode for the model-agnostic multimodal API
+# (`inferlet::host::media::multimodal`). It rode `model`'s `serve` feature
+# while that module lived over there -- a flag whose whole purpose was to keep
+# twenty image crates out of a driver's link. The module is here now, where
+# every build decodes media, so the dependency is plain.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+] }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
@@ -140,7 +174,7 @@ lru = "0.18.1"
 ipnet = "2"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-driver-metal = { path = "../driver-metal", optional = true, features = ["metal-4"] }
+driver-metal = { path = "../driver-metal", optional = true }
 
 [features]
 default = []
@@ -166,7 +200,14 @@ default = []
 # shape and the same underscore as `driver-cuda`'s own `_cuda`: every
 # `#[cfg]` in this crate is written against it, so the modules do not have to
 # name a version they do not care about.
-_driver-cuda = ["dep:driver-cuda", "driver-cuda/abi"]
+_driver-cuda = ["dep:driver-cuda"]
+# THE FORWARDS ARE BACK, and this is what they are for. `driver-cuda` builds
+# with no runtime selected and every device call answers `Fault::Runtimeless`
+# — deliberately, so its host tests run on a laptop — so a binary that names
+# `driver-cuda-13` here and nothing over there LINKS a shell that cannot bind
+# a device. They were dropped in the palo step-4 wave as dead refs, which they
+# were while nothing in this crate constructed a shell; `backend::cuda::open`
+# constructs one now.
 driver-cuda-12 = ["_driver-cuda", "driver-cuda/cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "driver-cuda/cuda-13"]
 # The Metal shell. APPLE-ONLY at the crate level, so unlike the CUDA features
@@ -199,6 +240,21 @@ tempfile = "3"
 # parser has no business in a shipped binary. Dev-dependencies are not built
 # for `cargo build`, which is exactly the line we want here.
 wasmtime = { version = "47", default-features = false, features = ["wat"] }
+# THE HOST HALF OF THE GUEST-PROGRAM PLANE, for the `palo B2` gate and for
+# nothing else. `driver::program` is a complete interpreter of the same launch
+# package the CUDA shell executes — same ops, same channel semantics, same
+# pass-atomic commit — and `tests/cuda_program_epilogue.rs` diffs the two over
+# a real model fire's logits. It is the golden, so it has to be the SHARED
+# crate's interpreter and not a second one written beside the test.
+driver = { path = "../driver" }
+# `model-dsl` STOOD HERE, for the boot smoke and for nothing else: `Lane::word`
+# is the one genuinely new submission field, the catalog shipped
+# `(sku, tp, TraceFn)` and no `ClassifyFn`, and the only way to state a word
+# was to name a family's own `Facts` — which a test could do and the fire path
+# could not (`palo B-word`). The catalog has the column now. Both the fire path
+# and the smoke reach it through `model`, which re-exports the `Request` a
+# `ClassifyFn` takes, so nothing here authors a forward pass and nothing here
+# needs the authoring eDSL.
 # `criterion` and `mimalloc` STOOD HERE, for benchmarks: this crate has no
 # `benches/` directory and no `[[bench]]`, and neither name appears in a line
 # of its source. The mimalloc line carried the one fact worth keeping — a

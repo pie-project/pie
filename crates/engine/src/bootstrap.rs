@@ -10,7 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::driver;
 use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
 use crate::inferlet::{linker, process, program, python};
-use crate::model;
+use crate::model::{self, ModelMetadata};
 use crate::server;
 use crate::telemetry;
 
@@ -159,7 +159,7 @@ pub struct ModelConfig {
     /// facts come from, for a `.zt` and for a snapshot alike. The runtime used
     /// to probe `config.json` itself when this was absent — two hand-written
     /// key walks that had to agree with the driver's parser by coincidence.
-    pub metadata: ::model::serve::ModelMetadata,
+    pub metadata: ModelMetadata,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
@@ -167,7 +167,12 @@ pub struct ModelConfig {
 pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
-    pub kv_copy_domain_mask: u32,
+    /// Which `copy_kv` directions this driver serves.
+    ///
+    /// Was `kv_copy_domain_mask: u32` over four `KV_COPY_*` bit constants;
+    /// four named booleans is what four bits with four names are, and a
+    /// caller reads the one it is about (`driver-api::caps`).
+    pub kv_copy: ::driver_api::caps::KvCopyDomains,
     pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
@@ -181,7 +186,9 @@ pub struct DriverConfig {
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
-    pub device_geometry_port_mask: u32,
+    /// Which descriptor ports it resolves on the device, in the port
+    /// registry's own numbering (decision 19).
+    pub device_geometry_port_mask: tensor_ir::registry::PortMask,
     /// See [`crate::driver::DriverSpec::resolves_geometry_per_step`].
     pub resolves_geometry_per_step: bool,
     pub limits: crate::driver::SchedulerLimits,
@@ -426,11 +433,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // Whether driver 0 (the contention-managed pool; working sets are
     // hardwired to (0, 0) until the per-driver core lands) can physically
     // move KV bytes to/from host swap — arms the suspend rung.
-    let kv_swap_required =
-        ::driver_api::KV_COPY_DEVICE_TO_HOST | ::driver_api::KV_COPY_HOST_TO_DEVICE;
     let kv_swap_capable = driver_configs
         .first()
-        .is_some_and(|d| d.kv_copy_domain_mask & kv_swap_required == kv_swap_required);
+        .is_some_and(|d| d.kv_copy.device_to_host && d.kv_copy.host_to_device);
     let driver_count = driver_configs.len();
     let drivers: Vec<usize> = driver_configs
         .into_iter()
@@ -439,7 +444,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 driver::DriverSpec {
                     // Overwritten by `register_driver_backend` from the
                     // backend itself; see `DriverSpec::device_domain`.
-                    device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
+                    device_domain: ::driver_api::MemoryDomain::HostPinned,
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
@@ -629,7 +634,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             |kv| kv.committed_high_water_pages().max(1),
                         );
                         let capacity = capacities[ordinal] as u32;
-                        let unmap_ranges = vec![::driver_api::PoolRange {
+                        let unmap_ranges = vec![::driver_api::PageRange {
                             page_index: u64::from(target),
                             page_count: u64::from(capacity - target),
                         }];
@@ -641,7 +646,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                         }
                         if let Ok(completion) = crate::scheduler::resize_pool(
                             driver_id,
-                            ::driver_api::PIE_ELASTIC_POOL_KV,
+                            ::driver_api::Pool::Kv,
                             u64::from(target),
                             Vec::new(),
                             unmap_ranges,
@@ -662,7 +667,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                                 if applied[ordinal][1] != Some(state_pages)
                                     && let Ok(state) = crate::scheduler::resize_pool(
                                         driver_id,
-                                        ::driver_api::PIE_ELASTIC_POOL_STATE,
+                                        ::driver_api::Pool::State,
                                         state_pages,
                                         Vec::new(),
                                         Vec::new(),
@@ -679,7 +684,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             if applied[ordinal][2] != Some(0)
                                 && let Ok(workspace) = crate::scheduler::resize_pool(
                                     driver_id,
-                                    ::driver_api::PIE_ELASTIC_POOL_WORKSPACE,
+                                    ::driver_api::Pool::Workspace,
                                     0,
                                     Vec::new(),
                                     Vec::new(),

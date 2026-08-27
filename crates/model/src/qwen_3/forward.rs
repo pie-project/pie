@@ -1,18 +1,29 @@
 use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Request, Value, merge, ops, seam,
+    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ops, seam,
 };
 
 use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model};
 
-model_dsl::facts! {
-    pub struct Facts { qo_one }
+pub struct Facts {
+    pub qo_one: bool,
+}
+
+impl Facts {
+    #[must_use]
+    pub fn qo_one() -> Predicate {
+        Predicate::fact(0)
+    }
 }
 
 impl Classify for Facts {
-    fn of(r: &Request) -> Self {
-        Self {
+    fn of(r: &Request) -> Facts {
+        Facts {
             qo_one: r.query_len() == 1,
         }
+    }
+
+    fn word(&self) -> u64 {
+        u64::from(self.qo_one)
     }
 }
 
@@ -22,21 +33,17 @@ impl ForwardHybrid for Model {
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
-        for (l, w) in self.layers.iter().enumerate() {
+        for w in &self.layers {
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    c.kv(
-                        kv,
-                        format!("kv.{l}"),
-                        [2, a.kv_heads as u64 * a.head_dim as u64],
-                    );
+                    c.kv(kv, a.kv.clone(), [2, a.kv_heads as u64 * a.head_dim as u64]);
                 }
 
                 Mixer::Gdn(g) => {
-                    let conv_ch = (2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim) as u64;
-                    c.state(format!("conv.{l}"), [g.conv_kernel as u64, conv_ch]);
+                    let conv_ch = u64::from(Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim));
+                    c.state(g.conv_state.clone(), [g.conv_kernel as u64, conv_ch]);
                     c.state(
-                        format!("delta.{l}"),
+                        g.delta_state.clone(),
                         [g.v_heads as u64, g.k_dim as u64, g.v_dim as u64],
                     );
                 }
@@ -48,16 +55,15 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        let positions = inputs.positions();
-        let plan_d = ops::attn::plan_decode(positions.rec(), inputs.kv_space());
-        let plan_p = ops::attn::plan_prefill(positions.rec(), inputs.kv_space());
+        let plan_d = inputs.plan_decode();
+        let plan_p = inputs.plan_prefill();
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
 
-        for (l, w) in inputs.layers(&m.layers) {
+        for (_, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
-                Mixer::Attn(a) => attn_mixer(&x, &inputs, &plan_d, &plan_p, a, l),
+                Mixer::Attn(a) => attn_mixer(&x, &inputs, &plan_d, &plan_p, a),
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
             };
             let o = if m.tp > 1 {
@@ -132,14 +138,7 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn attn_mixer(
-    x: &Value,
-    inputs: &Input<Facts>,
-    plan_d: &Value,
-    plan_p: &Value,
-    a: &Attn,
-    layer: u32,
-) -> Value {
+fn attn_mixer(x: &Value, inputs: &Input<Facts>, plan_d: &Value, plan_p: &Value, a: &Attn) -> Value {
     let pages = inputs.kv(&a.kv);
     let positions = inputs.positions();
     let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
@@ -148,23 +147,19 @@ fn attn_mixer(
     let (q, gate) = ops::layout::split_q_gate(&ops::linear::matmul(x, &a.qg_proj), d);
     let k = ops::linear::matmul(x, &a.k_proj);
     let v = ops::linear::matmul(x, &a.v_proj);
-    seam::at(seam::ATTN_QV, (&q, &v));
+    seam::at(seam::ATTN_QV, &[&q, &v]);
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
     let (q, k) = ops::elemwise::rope_partial(&q, &k, &positions, a.rotary_dim, d, a.theta);
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
-    seam::at(seam::ATTN_Q, (&q,));
+    seam::at(seam::ATTN_Q, &[&q]);
     let (dq, p) = q.split(&Facts::qo_one());
-    let o = merge![
+    let o = Value::merge(vec![
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, a.kv_heads, a.sm_scale),
-    ];
-    seam::at(seam::ATTN_OUT, (&o,));
-    ops::linear::attention_landing(
-        &ops::elemwise::gate_sigmoid_mul(&o, &gate),
-        &a.o_proj,
-        layer,
-    )
+    ]);
+    seam::at(seam::ATTN_OUT, &[&o]);
+    ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
 fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
@@ -172,8 +167,8 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let delta_state = inputs.state(&g.delta_state);
     let qkvz = ops::linear::matmul(x, &g.in_qkvz);
     let ba = ops::linear::matmul(x, &g.in_ba);
-    seam::at(seam::RECURRENT, (&qkvz,));
-    let width = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
+    seam::at(seam::RECURRENT, &[&qkvz]);
+    let width = Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim);
     let one = Facts::qo_one();
     let (qkvz_d, qkvz_p) = qkvz.split(&one);
     let (ba_d, ba_p) = ba.split(&one);
@@ -209,8 +204,8 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
         );
         (core, z)
     };
-    let o = merge![core_d, core_p];
-    let z = merge![z_d, z_p];
+    let o = Value::merge(vec![core_d, core_p]);
+    let z = Value::merge(vec![z_d, z_p]);
 
     let o = ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps);
     ops::linear::matmul(&o, &g.out_proj)

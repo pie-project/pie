@@ -1,0 +1,21 @@
+[package]
+name = "chat-template"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "How a turn of conversation is written into tokens and read back out of them: the Instruct surface, the chat/reasoning/tool decoders, and the named prompt formats (ChatML, Harmony, Gemma, DeepSeek, Kimi) the catalog's models are configurations of."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "chat_template"
+path = "src/lib.rs"
+
+[dependencies]
+# The vocabulary a template spells its markers in, and the streaming decoder
+# every reader here reads through. A template is nothing but a tokenizer plus
+# an opinion about where the turns are.
+tokenizer = { path = "../tokenizer" }
+# Tool schemas arrive as JSON strings and tool calls leave as JSON strings;
+# rendering the first and parsing the second is all this is for.
+serde_json = "1"

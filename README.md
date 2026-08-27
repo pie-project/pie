@@ -48,15 +48,30 @@ Then configure and run:
 
 ```bash
 pie config init
-pie model import Qwen/Qwen3-0.6B
+pie model import Qwen/Qwen3.5-0.8B
 pie serve
 ```
+
+The model has to be one this build ships a forward for — a checkpoint is
+matched against the catalog's import contracts at load and refused by name when
+none fits. `pie model list` prints the SKU beside every snapshot it can see, and
+`Qwen/Qwen3.5-0.8B` is the smallest one; it is also what `pie config init`
+writes into `[model] model`.
 
 `pie serve` boots the engine and holds the terminal. From another shell, submit an
 inferlet to it with the Python client (`pip install pie-client`):
 
 ```bash
 pie-client submit text-completion -- --prompt "The capital of France is"
+```
+
+`pie run` is the same round trip without a server: it boots a one-shot engine,
+runs one inferlet, prints what it produced, and exits — which is what to reach
+for when iterating on a local build.
+
+```bash
+pie run --path ./target/wasm32-wasip2/debug/text_completion.wasm \
+        --manifest ./Pie.toml -- --prompt "The capital of France is"
 ```
 
 ### Backends

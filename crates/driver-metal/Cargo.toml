@@ -15,9 +15,9 @@ path = "src/lib.rs"
 # The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
 # `ValueId` — and the six family enums the dispatch arms destructure.
 model-ir = { path = "../model-ir" }
-# The contract implemented — the six `Dispatch*` traits and `KernelError` —
-# and the shared walk re-exported: the prepare/capture split and
-# program-order dispatch, written once and driven over this crate's `Run`.
+# The contract implemented — the six `Dispatch*` traits and `KernelError`.
+# Contract only: the walk written over it lives in the driver substrate
+# (`driver::fire::walk`) and is driven over this crate's `Run` from there.
 kernels = { path = "../kernels" }
 # The entries called and the handles resolved to: `Tensor`, `RaggedTensor`,
 # `KvPool`, `RecurrentPool`, the plan payloads, and the `dyn Encode` sink

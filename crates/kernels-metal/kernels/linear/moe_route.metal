@@ -425,6 +425,31 @@ constant constexpr uint kMaxExperts = 1024;
   out[size_t(row) * size_t(width) + size_t(c)] = static_cast<bfloat>(acc);
 }
 
+[[kernel]] void expert_bias_combine(
+    const device bfloat* x             [[buffer(0)]],
+    const device bfloat* bias          [[buffer(1)]],
+    const device int* expert_ids       [[buffer(2)]],
+    const device float* expert_weights [[buffer(3)]],
+    device bfloat* out                 [[buffer(4)]],
+    const constant uint& width             [[buffer(5)]],
+    const constant uint& experts_per_token [[buffer(6)]],
+    uint2 gid                          [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= width) return;
+  const uint row = gid.y;
+  const uint k = experts_per_token;
+  const size_t at = size_t(row) * size_t(width) + size_t(c);
+  const size_t base = size_t(row) * size_t(k);
+  float acc = float(x[at]);
+  for (uint e = 0; e < k; ++e) {
+    const int expert = expert_ids[base + size_t(e)];
+    if (expert < 0) continue;
+    acc += expert_weights[base + size_t(e)] *
+           float(bias[size_t(uint(expert)) * size_t(width) + size_t(c)]);
+  }
+  out[at] = static_cast<bfloat>(acc);
+}
+
 [[kernel]] void combine_sorted(
     const device bfloat* y              [[buffer(0)]],
     const device bfloat* expert_weights [[buffer(1)]],

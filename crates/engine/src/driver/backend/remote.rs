@@ -1,37 +1,80 @@
-use std::collections::HashMap;
+//! The remote seam — a driver that is not here yet, and says so.
+//!
+//! # `palo B-remote`: the envelope died with `driver_api::remote`
+//!
+//! What stood here was a 539-line tarpc client: `ExecutorRpcClient`,
+//! `ExecutorRequest`/`ExecutorResponse`, `RemoteLaunch`, `RemoteBindInstance`,
+//! `RemoteRegisterChannel`, `RemoteChannelValue`, `ScratchGrant`,
+//! `TerminalCellState`, `RemoteError`/`RemoteErrorKind`,
+//! `REMOTE_WIRE_VERSION` — every one of them a type in `driver-api::remote`,
+//! and every one of them deleted by the palo contract rewrite. The rewrite's
+//! ruling (design §7, decision 19) is one sentence:
+//!
+//! > Remote is a property, not an encoding: every noun serde, trait
+//! > object-safe; wire versioning is the transport's concern, not the
+//! > contract's.
+//!
+//! So a remote driver is **a type in the transport that implements
+//! [`Driver`] and whose method bodies happen to be round trips**. Designing
+//! that envelope is not this wave, and neither is guessing at it: a stub that
+//! answered `Ok(())` to `fire` would be an engine that drops every offloaded
+//! request silently, which is the one failure mode this file exists to
+//! prevent.
+//!
+//! # What the future envelope has to carry
+//!
+//! Recorded here rather than in a commit message, because the next wave reads
+//! this file first. Each verb's marker below names its own half; the shared
+//! frame is:
+//!
+//! * **identity and admission** — which `Plan` the peer loaded, which
+//!   [`Capabilities`](driver_api::Capabilities) it answered, and the scratch
+//!   grant (base page + count) the caller may address inside its pool. The
+//!   old `ScratchGrant` + `HelloRequest`/`HelloResponse` pair.
+//! * **a wire version, on the TRANSPORT** — `REMOTE_WIRE_VERSION` was a
+//!   `driver-api` constant checked at hello; it belongs where the bytes are.
+//! * **liveness** — the disconnect notification that closes every outstanding
+//!   completion at once. That half is NOT dead and is kept below, because it
+//!   is engine bookkeeping (the broker) rather than an encoding.
+//! * **an asynchronous ticket** — [`FireTicket`](driver_api::FireTicket) is
+//!   answered with an empty `readouts` by a driver that answers before the
+//!   device is done, and `FireTicket::id` is what the engine-side broker
+//!   correlates the later completion on. A remote driver is the first one
+//!   that needs that path; the shells in this workspace are synchronous.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
-use ::driver_api::{
-    ExecutorRequest, ExecutorResponse, ExecutorRpcClient, RemoteBindInstance, RemoteChannelValue,
-    RemoteError, RemoteErrorKind, RemoteLaunch, RemoteRegisterChannel, ScratchGrant,
-    TerminalCellState,
-};
-use anyhow::{Context, Result, anyhow, ensure};
+use driver_api::channel::{ChannelRegistration, RegisteredChannel};
+use driver_api::error::{DriverError, Result};
+use driver_api::fire::{FireSubmission, FireTicket, MediaEncode};
+use driver_api::load::{LoadRequest, Loaded};
+use driver_api::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use driver_api::transfer::{KvCopy, PoolResize, StateCopy};
+use driver_api::{ChannelId, Driver};
 
-use ::driver_api::{
-    BoundInstance, ChannelRegistrationPlan, CompletionBroker, Driver, FrameLaunchOutcome,
-    FrameSubmission, InstanceBindingPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan,
-    ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
-};
+use crate::driver::CompletionBroker;
 
-const RPC_DEADLINE: Duration = Duration::from_secs(300);
-
+/// A registered peer whose transport has not been built.
+///
+/// It is a real registry entry — the engine's KV store, scheduler lane and
+/// partner tables all key on a `DriverId`, and a peer that could not be
+/// registered at all would be a peer the offload planner cannot even see to
+/// refuse. Every verb answers [`DriverError::Unsupported`].
 pub struct RemoteDriver {
-    client: ExecutorRpcClient,
-    runtime: tokio::runtime::Handle,
+    /// Who this was meant to reach, for the refusal's message.
+    peer: String,
     broker: CompletionBroker,
     connected: Arc<AtomicBool>,
     disconnected: Arc<tokio::sync::Notify>,
-    capabilities: ::driver_api::DriverCapabilities,
-    grant: ScratchGrant,
-    programs: HashMap<u64, u64>,
-    channels: HashMap<u64, u64>,
-    instances: HashMap<u64, u64>,
-    next_local_instance: u64,
 }
 
+/// The half of the old remote driver that survives: closing every outstanding
+/// completion when the peer goes away.
+///
+/// This is engine bookkeeping, not an encoding — it is the broker's
+/// `close_all` behind a handle the link layer can hold — so it is kept
+/// whole.
 #[derive(Clone)]
 pub struct RemoteDisconnectHandle {
     broker: CompletionBroker,
@@ -40,6 +83,7 @@ pub struct RemoteDisconnectHandle {
 }
 
 impl RemoteDisconnectHandle {
+    /// Fail every completion this peer's driver still owes.
     pub fn disconnect(&self, message: impl Into<String>) {
         if self.connected.swap(false, Ordering::AcqRel) {
             self.broker.close_all(message);
@@ -47,41 +91,37 @@ impl RemoteDisconnectHandle {
         }
     }
 
+    /// Whether the peer is still believed to be there.
+    #[must_use]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
     }
 }
 
 impl RemoteDriver {
-    pub fn new(
-        client: ExecutorRpcClient,
-        runtime: tokio::runtime::Handle,
-        capabilities: ::driver_api::DriverCapabilities,
-        grant: ScratchGrant,
-    ) -> Self {
-        Self {
-            client,
-            runtime,
+    /// A driver for `peer`, with no transport behind it.
+    ///
+    /// `new` used to take `(client, runtime, capabilities, grant)` — the four
+    /// pieces of the dead envelope. It takes the peer's name, because that is
+    /// the only one of the four that survives into every possible successor.
+    #[must_use]
+    pub fn new(peer: impl Into<String>) -> RemoteDriver {
+        RemoteDriver {
+            peer: peer.into(),
             broker: CompletionBroker::new(),
             connected: Arc::new(AtomicBool::new(true)),
             disconnected: Arc::new(tokio::sync::Notify::new()),
-            capabilities,
-            grant,
-            programs: HashMap::new(),
-            channels: HashMap::new(),
-            instances: HashMap::new(),
-            next_local_instance: 1,
         }
     }
 
-    pub fn capabilities(&self) -> &::driver_api::DriverCapabilities {
-        &self.capabilities
+    /// Which peer this addresses.
+    #[must_use]
+    pub fn peer(&self) -> &str {
+        &self.peer
     }
 
-    pub fn grant(&self) -> ScratchGrant {
-        self.grant
-    }
-
+    /// The handle that fails this peer's outstanding work.
+    #[must_use]
     pub fn disconnect_handle(&self) -> RemoteDisconnectHandle {
         RemoteDisconnectHandle {
             broker: self.broker.clone(),
@@ -90,173 +130,15 @@ impl RemoteDriver {
         }
     }
 
-    fn ensure_connected(&self) -> Result<()> {
-        ensure!(
-            self.connected.load(Ordering::Acquire),
-            "remote driver is disconnected"
+    /// The refusal every verb answers, with the peer named.
+    fn refuse(&self, verb: &'static str) -> DriverError {
+        tracing::warn!(
+            peer = %self.peer,
+            verb,
+            "the remote driver has no transport: palo B-remote redesigns the \
+             envelope `driver_api::remote` carried"
         );
-        Ok(())
-    }
-
-    fn context() -> tarpc::context::Context {
-        let mut context = tarpc::context::current();
-        context.deadline = Instant::now() + RPC_DEADLINE;
-        context
-    }
-
-    fn execute_blocking(
-        &self,
-        request: ExecutorRequest,
-    ) -> Result<Result<ExecutorResponse, RemoteError>> {
-        self.ensure_connected()?;
-        let client = self.client.clone();
-        let connected = Arc::clone(&self.connected);
-        let disconnected = Arc::clone(&self.disconnected);
-        let result = self.runtime.block_on(async move {
-            let notification = disconnected.notified();
-            tokio::pin!(notification);
-            notification.as_mut().enable();
-            if !connected.load(Ordering::Acquire) {
-                return Err(anyhow!("remote driver disconnected"));
-            }
-            tokio::select! {
-                response = client.execute(Self::context(), request) => {
-                    response.map_err(|error| anyhow!("executor transport failed: {error}"))
-                }
-                _ = &mut notification => Err(anyhow!("remote driver disconnected")),
-            }
-        });
-        match result {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                self.disconnect(&format!("executor transport lost: {error}"));
-                Err(error)
-            }
-        }
-    }
-
-    fn response(
-        &self,
-        request: ExecutorRequest,
-        expected: &'static str,
-    ) -> Result<ExecutorResponse> {
-        match self.execute_blocking(request)? {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                if error.kind == RemoteErrorKind::Disconnected {
-                    self.disconnect(&error.to_string());
-                }
-                Err(anyhow!("executor rejected {expected}: {error}"))
-            }
-        }
-    }
-
-    fn next_local_instance_id(&mut self, requested: u64) -> Result<u64> {
-        if requested != 0 {
-            ensure!(
-                !self.instances.contains_key(&requested),
-                "remote local instance {requested} is already bound"
-            );
-            return Ok(requested);
-        }
-        loop {
-            let candidate = self.next_local_instance;
-            self.next_local_instance = self
-                .next_local_instance
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("remote local instance id space exhausted"))?;
-            if !self.instances.contains_key(&candidate) {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    fn translate_instances(&self, local: &[u64]) -> Result<Vec<u64>> {
-        local
-            .iter()
-            .map(|id| {
-                self.instances
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| anyhow!("remote local instance {id} is not bound"))
-            })
-            .collect()
-    }
-
-    fn publish_terminal(pointers: &[usize], states: &[TerminalCellState]) -> Result<()> {
-        ensure!(
-            pointers.len() == states.len(),
-            "executor returned {} terminal cells for {} local cells",
-            states.len(),
-            pointers.len()
-        );
-        for (&address, state) in pointers.iter().zip(states) {
-            ensure!(address != 0, "local terminal cell pointer is null");
-            let cell = address as *mut ::driver_api::TerminalCell;
-            // The dereference stays unsafe -- the executor hands back an
-            // address -- but the publication no longer re-derives an atomic
-            // view of a non-atomic field: `outcome` IS the atomic.
-            unsafe {
-                (*cell).reserved0 = state.reserved0;
-                (*cell).publish(state.outcome);
-            }
-        }
-        Ok(())
-    }
-
-    fn spawn_launch_rpc(
-        &self,
-        request: ExecutorRequest,
-        terminal_pointers: Vec<usize>,
-        completion: SubmissionCompletion,
-    ) {
-        let client = self.client.clone();
-        let broker = self.broker.clone();
-        let connected = Arc::clone(&self.connected);
-        let disconnected = Arc::clone(&self.disconnected);
-        let wait_id = completion.wait_id();
-        let target_epoch = completion.target_epoch();
-        let task_completion = completion.clone();
-        self.runtime.spawn(async move {
-            let notification = disconnected.notified();
-            tokio::pin!(notification);
-            notification.as_mut().enable();
-            if !connected.load(Ordering::Acquire) {
-                task_completion.close("remote driver disconnected");
-                return;
-            }
-            let response = tokio::select! {
-                response = client.execute(Self::context(), request) => Some(response),
-                _ = &mut notification => None,
-            };
-            let settled = match response {
-                None => Err(anyhow!("remote driver disconnected")),
-                Some(Ok(Ok(ExecutorResponse::Terminal(remote)))) => {
-                    Self::publish_terminal(&terminal_pointers, &remote.per_request)
-                }
-                Some(Ok(Ok(other))) => Err(anyhow!(
-                    "executor returned unexpected launch response {other:?}"
-                )),
-                Some(Ok(Err(error))) => {
-                    if error.kind == RemoteErrorKind::Disconnected {
-                        connected.store(false, Ordering::Release);
-                        broker.close_all(error.to_string());
-                        disconnected.notify_waiters();
-                    }
-                    Err(anyhow!("executor rejected launch: {error}"))
-                }
-                Some(Err(error)) => {
-                    connected.store(false, Ordering::Release);
-                    broker.close_all(format!("executor transport lost: {error}"));
-                    disconnected.notify_waiters();
-                    Err(anyhow!("executor launch transport failed: {error}"))
-                }
-            };
-            match settled {
-                Ok(()) => broker.notify(wait_id, target_epoch),
-                Err(error) => task_completion.close(error.to_string()),
-            }
-        });
+        DriverError::unsupported("remote", verb)
     }
 }
 
@@ -265,275 +147,100 @@ impl Driver for RemoteDriver {
         "remote"
     }
 
-    fn device_domain(&self) -> ::driver_api::DeviceDomain {
-        ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE
+    // palo B-remote: `device_facts` was answered out of the peer's
+    // `HelloResponse`. The envelope must carry a `DeviceFacts` — backend name,
+    // memory domain WITH the peer's ordinal, sm count, alignment — because the
+    // engine stamps a `KvCopy`'s domains from it and a wrong domain is a copy
+    // between two unrelated pools.
+
+    fn load(&mut self, request: LoadRequest) -> Result<Loaded> {
+        // palo B-remote: the plan crosses here, and it is the one noun the
+        // rewrite made cheap — `model_ir::Plan` is serde. What the envelope
+        // adds is the CHECKPOINT question: a `Checkpoint::Path` is a path in
+        // the PEER's filesystem, and a caller that means its own has to say
+        // so.
+        let _ = request;
+        Err(self.refuse("load"))
     }
 
-    /// The one backend this means anything for.
-    ///
-    /// `&str` and not `impl Into<String>`: a generic parameter would make
-    /// `Driver` non-dyn-safe, and the registry holds `Box<dyn Driver>`. The
-    /// four in-process backends take the trait's default, which does nothing
-    /// -- they have no connection to drop.
+    fn fire(&mut self, submission: &FireSubmission) -> Result<FireTicket> {
+        // palo B-remote: the whole submission is serde, so the envelope is a
+        // framed `FireSubmission` and a `FireTicket` back. The two things it
+        // must add: (a) the ticket may arrive EMPTY and be completed later,
+        // which is the asynchronous path no shell here exercises; (b) the
+        // scheduling refusals — `Exhausted`/`Impossible` — have to survive the
+        // round trip as themselves, because the lane loop retries one and
+        // drops the other.
+        let _ = submission;
+        Err(self.refuse("fire"))
+    }
+
+    fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
+        // palo B-remote: ids are MINTED BY THE PEER, so the envelope needs the
+        // local↔remote id maps the old `RemoteDriver` kept in three
+        // `HashMap<u64, u64>`s.
+        let _ = registration;
+        Err(self.refuse("register_program"))
+    }
+
+    fn register_channel(&mut self, registration: &ChannelRegistration) -> Result<RegisteredChannel> {
+        // palo B-remote: the ring is the PEER's and the wait slots are the
+        // caller's, which is what the old `RemoteChannelBinding` was trying to
+        // say by shipping addresses. See `crate::driver::channel` on where the
+        // host ring lives now.
+        let _ = registration;
+        Err(self.refuse("register_channel"))
+    }
+
+    fn bind_instance(&mut self, binding: &InstanceBinding) -> Result<BoundInstance> {
+        let _ = binding;
+        Err(self.refuse("bind_instance"))
+    }
+
+    fn close_instance(&mut self, id: InstanceId) -> Result<()> {
+        let _ = id;
+        Err(self.refuse("close_instance"))
+    }
+
+    fn close_channel(&mut self, id: ChannelId) -> Result<()> {
+        let _ = id;
+        Err(self.refuse("close_channel"))
+    }
+
+    fn copy_kv(&mut self, copy: &KvCopy) -> Result<()> {
+        // palo B-remote: this is the verb the offload plane is actually about
+        // — pushing pages into a peer's scratch grant. The envelope must carry
+        // either the bytes (the old `InlineKvPayload`/`PushKv`) or an RDMA
+        // handle (`KvHandle` + the peer's registration), and which of the two
+        // is a deployment's choice, not the contract's.
+        let _ = copy;
+        Err(self.refuse("copy_kv"))
+    }
+
+    fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
+        let _ = copy;
+        Err(self.refuse("copy_state"))
+    }
+
+    fn resize_pool(&mut self, resize: &PoolResize) -> Result<()> {
+        let _ = resize;
+        Err(self.refuse("resize_pool"))
+    }
+
+    fn encode(&mut self, plan: &mut MediaEncode) -> Result<()> {
+        // palo B-remote: the old envelope had a whole media plane here
+        // (`RemoteMediaBlob`, `RemoteMediaKind`, a blob-fetch budget per
+        // client). `MediaEncode` is serde and carries its own bytes, so the
+        // envelope's remaining question is the SIZE ceiling — an encode is
+        // megabytes and a frame limit is the transport's.
+        let _ = plan;
+        Err(self.refuse("encode"))
+    }
+
     fn disconnect(&self, message: &str) {
-        self.disconnect_handle().disconnect(message);
-    }
-
-    fn load_model(
-        &mut self,
-        _descs: Vec<::driver_api::ModelLoadDesc>,
-    ) -> Result<::driver_api::DriverCapabilities> {
-        self.ensure_connected()?;
-        Ok(self.capabilities.clone())
-    }
-
-    fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
-        if let Some(&program_id) = self.programs.get(&desc.program_hash) {
-            return Ok(program_id);
+        if self.connected.swap(false, Ordering::AcqRel) {
+            self.broker.close_all(message.to_string());
+            self.disconnected.notify_waiters();
         }
-        let response = self.response(
-            ExecutorRequest::RegisterProgram(desc.clone()),
-            "register_program",
-        )?;
-        let ExecutorResponse::ProgramRegistered(program_id) = response else {
-            return Err(anyhow!(
-                "executor returned unexpected register_program response {response:?}"
-            ));
-        };
-        self.programs.insert(desc.program_hash, program_id);
-        Ok(program_id)
-    }
-
-    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
-        if self.channels.contains_key(&desc.channel_id) {
-            return Err(anyhow!(
-                "remote local channel {} is already registered",
-                desc.channel_id
-            ));
-        }
-        let response = self.response(
-            ExecutorRequest::RegisterChannel(RemoteRegisterChannel {
-                local_channel_id: desc.channel_id,
-                shape: desc.shape.clone(),
-                dtype: desc.dtype,
-                host_role: desc.host_role,
-                seeded: desc.seeded,
-                extern_dir: desc.extern_dir,
-                capacity: desc.capacity,
-                extern_name: desc.extern_name.clone(),
-            }),
-            "register_channel",
-        )?;
-        let ExecutorResponse::ChannelRegistered(binding) = response else {
-            return Err(anyhow!(
-                "executor returned unexpected register_channel response {response:?}"
-            ));
-        };
-        ensure!(
-            binding.local_channel_id == desc.channel_id,
-            "executor channel correlation mismatch"
-        );
-        self.channels
-            .insert(desc.channel_id, binding.executor_channel_id);
-        let native = ::driver_api::ChannelBinding {
-            channel_id: desc.channel_id,
-            ..Default::default()
-        };
-        Ok(RegisteredChannel {
-            driver_id: desc.driver_id,
-            binding: native,
-            reader_wait_id: desc.reader_wait_id,
-            writer_wait_id: desc.writer_wait_id,
-        })
-    }
-
-    fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
-        self.ensure_connected()?;
-        let local_instance_id = self.next_local_instance_id(desc.requested_instance_id)?;
-        let remote_channel_ids = desc
-            .channel_ids
-            .iter()
-            .map(|channel| {
-                self.channels
-                    .get(channel)
-                    .copied()
-                    .ok_or_else(|| anyhow!("remote local channel {channel} is not registered"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let remote_seed_values = desc
-            .seed_values
-            .iter()
-            .map(|value| {
-                Ok(RemoteChannelValue {
-                    channel_id: self.channels.get(&value.channel).copied().ok_or_else(|| {
-                        anyhow!("remote seed channel {} is not registered", value.channel)
-                    })?,
-                    bytes: value.bytes.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let response = self.response(
-            ExecutorRequest::BindInstance(RemoteBindInstance {
-                local_instance_id,
-                program_id: desc.program_id,
-                channel_ids: remote_channel_ids,
-                seed_values: remote_seed_values,
-                geometry_class: desc.geometry_class,
-            }),
-            "bind_instance",
-        )?;
-        let ExecutorResponse::InstanceBound(binding) = response else {
-            return Err(anyhow!(
-                "executor returned unexpected bind_instance response {response:?}"
-            ));
-        };
-        ensure!(
-            binding.local_instance_id == local_instance_id,
-            "executor bind correlation mismatch: {} != {}",
-            binding.local_instance_id,
-            local_instance_id
-        );
-        ensure!(
-            binding.executor_instance_id != 0,
-            "executor returned zero instance id"
-        );
-        ensure!(
-            binding.geometry_class == desc.geometry_class,
-            "executor acknowledged geometry class {:?}, expected {:?}",
-            binding.geometry_class,
-            desc.geometry_class
-        );
-        self.instances
-            .insert(local_instance_id, binding.executor_instance_id);
-        Ok(BoundInstance::new(
-            desc.driver_id,
-            desc.program_id,
-            ::driver_api::InstanceBinding {
-                instance_id: local_instance_id,
-                geometry_class: binding.geometry_class as u32,
-                reserved0: 0,
-            },
-            desc.pacing_wait_id,
-        ))
-    }
-
-    /// Edge adapter (single scheduler path, ABI v14): decompose the sealed
-    /// frame into one `RemoteLaunch` per step — the executor serializes
-    /// launches that share instances, exactly like today's run-ahead waves —
-    /// and fold the per-step RPC completions into the frame's single
-    /// completion. Each step ships the frame-union page translation (a
-    /// superset of the step's frontier; write bounds still guard writes).
-    fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
-        self.ensure_connected()?;
-        let mut step_completions = Vec::with_capacity(frame.steps.len());
-        for step in &frame.steps {
-            let step_instance_ids: Vec<u64> = step
-                .roster_rows
-                .iter()
-                .map(|&row| {
-                    frame
-                        .instance_ids
-                        .get(row as usize)
-                        .copied()
-                        .ok_or_else(|| anyhow!("step roster row {row} exceeds the frame roster"))
-                })
-                .collect::<Result<_>>()?;
-            let remote_instances = self.translate_instances(&step_instance_ids)?;
-            let terminal_count = u32::try_from(step.terminal_cells.len())
-                .context("remote launch terminal count exceeds u32")?;
-            ensure!(
-                step.terminal_cells.iter().all(|cell| !cell.is_null()),
-                "remote launch contains a null terminal cell"
-            );
-            let request = ExecutorRequest::Launch(RemoteLaunch {
-                plan: step.plan.clone(),
-                instance_ids: remote_instances,
-                terminal_count,
-                kv_translation: frame.kv_translation.clone(),
-                kv_translation_indptr: frame.kv_translation_indptr.clone(),
-                program_row_indptr: step.program_row_indptr.clone(),
-                logical_fire_ids: step.logical_fire_ids.clone(),
-                channel_expected_head: step.channel_expected_head.clone(),
-                channel_expected_tail: step.channel_expected_tail.clone(),
-                channel_ticket_indptr: step.channel_ticket_indptr.clone(),
-            });
-            let completion = self.broker.launch_completion(1).1;
-            self.spawn_launch_rpc(
-                request,
-                step.terminal_cells
-                    .iter()
-                    .map(|cell| *cell as usize)
-                    .collect(),
-                completion.clone(),
-            );
-            step_completions.push(completion);
-        }
-        Ok(FrameLaunchOutcome::Launched(SubmissionCompletion::all(
-            step_completions,
-        )))
-    }
-
-    fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
-        Err(anyhow!(
-            "nested media encode through a remote driver is unsupported"
-        ))
-    }
-
-    fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
-        self.ensure_connected()?;
-        let (raw, completion) = self.broker.control_completion(1);
-        self.spawn_launch_rpc(
-            ExecutorRequest::CopyKv(desc.clone()),
-            vec![raw.terminal_cell as usize],
-            completion.clone(),
-        );
-        Ok(completion)
-    }
-
-    fn copy_state(&mut self, _desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
-        Err(anyhow!(
-            "remote driver does not support recurrent-state copies"
-        ))
-    }
-
-    fn resize_pool(&mut self, _desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
-        Err(anyhow!(
-            "remote executor pools are fixed for the lease lifetime"
-        ))
-    }
-
-    fn close_instance(&mut self, local_id: u64) -> Result<()> {
-        let remote_id = *self
-            .instances
-            .get(&local_id)
-            .ok_or_else(|| anyhow!("remote local instance {local_id} is not bound"))?;
-        let response =
-            self.response(ExecutorRequest::CloseInstance(remote_id), "close_instance")?;
-        ensure!(
-            matches!(response, ExecutorResponse::Closed),
-            "executor returned unexpected close_instance response {response:?}"
-        );
-        self.instances.remove(&local_id);
-        Ok(())
-    }
-
-    fn close_channel(&mut self, local_id: u64) -> Result<()> {
-        let remote_id = *self
-            .channels
-            .get(&local_id)
-            .ok_or_else(|| anyhow!("remote local channel {local_id} is not registered"))?;
-        let response = self.response(ExecutorRequest::CloseChannel(remote_id), "close_channel")?;
-        ensure!(
-            matches!(response, ExecutorResponse::Closed),
-            "executor returned unexpected close_channel response {response:?}"
-        );
-        self.channels.remove(&local_id);
-        Ok(())
-    }
-}
-
-impl Drop for RemoteDriver {
-    fn drop(&mut self) {
-        self.disconnect("remote driver dropped");
     }
 }

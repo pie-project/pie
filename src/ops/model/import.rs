@@ -49,15 +49,18 @@ use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::{CheckpointFormat, Encoding, TensorDecl, Visibility};
 use model_loader::verify::ContractView;
 
-// The artifact's on-disk names come from whoever owns them: the loader owns
-// the metadata namespace and the provenance attributes,
-// `model::serve::encoding` owns the object the checkpoint's own config lands
-// in. A literal here would be a
-// second definition of something a reader elsewhere has to match exactly, and
-// a mismatch does not fail — the read just finds nothing.
-use model::serve::encoding::CONFIG_OBJECT;
 use model_loader::checkpoint::Attributes;
 use model_loader::checkpoint::meta::{SOURCE_ENCODING_KEY, SOURCE_KEY, VERSION_KEY, meta_name};
+// The artifact's on-disk names come from whoever owns them: the loader owns
+// the metadata namespace and the provenance attributes, and the object the
+// checkpoint's own config lands in belongs to the party that reads it back.
+// That was `model::serve::encoding`, beside a parser for the document; M18
+// deleted the module and the parser did not come with it — the loader reads a
+// checkpoint's quantization off its STORED encodings now — so the name lives
+// with its remaining readers, in `worker::weights`. A literal here would be a
+// second definition of something a reader elsewhere has to match exactly, and
+// a mismatch does not fail — the read just finds nothing.
+use worker::weights::CONFIG_OBJECT;
 
 /// Parses a human-written byte size: `16GiB`, `5GB`, `512MiB`, `1000000`.
 ///
@@ -1281,13 +1284,16 @@ fn tied_head_sources(metadata: &CheckpointMetadata) -> Vec<String> {
 ///
 /// What is left for a config to say is the part the tensors cannot: the
 /// declared quantization, because a group size is not an extent of anything.
-/// [`model::serve::encoding::Encoding`] reads exactly that, from the
-/// checkpoint's own words, so the honest thing to carry is the checkpoint's
-/// own words.
+/// `model::serve::encoding::Encoding` read exactly that, from the checkpoint's
+/// own words, and M18 deleted it along with the module — a checkpoint's
+/// quantization comes off its STORED tensor encodings now, which is a stronger
+/// answer to the same question. The honest thing to carry is still the
+/// checkpoint's own words.
 ///
 /// It is also why this can no longer fail on content. A config this command
 /// does not understand is not this command's problem — nothing here reads it,
-/// and `Encoding` refuses what it cannot parse at the point that needs it.
+/// and the loader refuses an encoding it cannot parse at the point that needs
+/// it.
 /// Only unreadable bytes or invalid JSON are errors, and JSON is checked so
 /// that an artifact never carries an object no reader can open.
 ///

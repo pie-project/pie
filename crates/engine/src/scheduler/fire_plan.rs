@@ -314,7 +314,7 @@ pub(crate) struct MemberFacts {
     /// it puts a pooled device-geometry member in its own suffix run instead
     /// of scattering it through the wire members -- which is what lets the
     /// sub-batch table say which class each run is.
-    pub(crate) geometry_class: u32,
+    pub(crate) geometry_class: tensor_ir::registry::GeometryClass,
     /// Arrival position within the step group; the stable-order tiebreak.
     pub(crate) arrival: usize,
 }
@@ -552,9 +552,9 @@ mod tests {
             max_layers: None,
             multi_token: false,
             geometry_class: if device_resolved_geometry {
-                ::driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+                tensor_ir::registry::GeometryClass::DecodeEnvelope
             } else {
-                ::driver_api::PIE_GEOMETRY_CLASS_HOST
+                tensor_ir::registry::GeometryClass::Host
             },
             arrival,
         }
@@ -568,7 +568,7 @@ mod tests {
             truncated: false,
             max_layers: None,
             multi_token: false,
-            geometry_class: ::driver_api::PIE_GEOMETRY_CLASS_HOST,
+            geometry_class: tensor_ir::registry::GeometryClass::Host,
             arrival,
         }
     }

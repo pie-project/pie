@@ -1482,7 +1482,7 @@ impl Walk<'_, '_> {
             dst,
             dst_scales,
             factors,
-            shape: self.buffer_shape_2d(dst_buffer),
+            shape: self.buffer_rectangle(dst_buffer),
         }))
     }
 
@@ -1495,15 +1495,16 @@ impl Walk<'_, '_> {
         })
     }
 
-    /// A buffer's declared shape, when it is 2-D.
+    /// A buffer's declared shape as the rectangle a transform walks.
     ///
     /// The same source `host::encode_bytes` reads — the buffer's own type, not
-    /// an extent's dims — so a backing and the host path launch over one
-    /// number rather than two that can disagree.
-    fn buffer_shape_2d(&self, id: BufferId) -> Option<(u32, u32)> {
-        let &[rows, cols] = self.plan.buffer(id).ok()?.ty.shape.as_slice() else {
-            return None;
-        };
+    /// an extent's dims — and folded by the same rule
+    /// ([`crate::types::rectangle`]), so a backing and the host path launch
+    /// over one number rather than two that can disagree. It answered `None`
+    /// for any rank but 2, which sent a rank-3 bank's transform to a device
+    /// backing with no extent at all.
+    fn buffer_rectangle(&self, id: BufferId) -> Option<(u32, u32)> {
+        let (rows, cols) = crate::types::rectangle(&self.plan.buffer(id).ok()?.ty.shape)?;
         Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
     }
 
@@ -1628,9 +1629,13 @@ impl Walk<'_, '_> {
             )));
         };
         let shape = self.buffer_shape(*weight)?.to_vec();
-        let [rows, cols] = shape[..] else {
+        // Folded, for the reason `encode_bytes` states: the affine pass reads
+        // groups of `group` consecutive elements out of a row-major buffer, so
+        // a leading axis is rows and nothing else.
+        let Some((rows, cols)) = crate::types::rectangle(&shape) else {
             return Err(invalid(format!(
-                "encoding to {scheme:?} walks [rows, cols] tiles, not {shape:?}"
+                "encoding to {scheme:?} scales a [rows, cols] rectangle, not \
+                 {shape:?}"
             )));
         };
         let group = i64::from(scheme.default_group_size());
@@ -1903,13 +1908,27 @@ impl Walk<'_, '_> {
             return Err(invalid("host Encode expects weight and scale outputs"));
         };
         let shape = self.buffer_shape(payload)?.to_vec();
-        let &[rows, cols] = shape.as_slice() else {
+        // THE RECTANGLE, FOLDED. `[experts, rows, cols]` is `[experts * rows,
+        // cols]` in the same bytes in the same order, and every line below
+        // indexes `row * cols + c`, so the fold is the layout rather than a
+        // reinterpretation of it -- see `types::rectangle`, which is where the
+        // rule is stated once. This read `&[rows, cols]` and refused any other
+        // rank, which is what stopped an expert bank being quantized at load
+        // time.
+        let Some((rows, cols)) = crate::types::rectangle(&shape) else {
             return Err(invalid(format!(
-                "host Encode expects a 2-D weight, got shape {shape:?}"
+                "host Encode scales a [rows, cols] rectangle, and {shape:?} has \
+                 no axis left over to hold one scale per row"
             )));
         };
         let (rows, cols) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
         let scale_shape = self.buffer_shape(scales)?.to_vec();
+        // What the plan's `ScaleLayout` built: the payload's leading axes,
+        // then the scheme's own last axis. Compared whole rather than folded,
+        // because a scales plane the driver BINDS is bound at its declared
+        // rank and a fold here would accept a plan that published the wrong
+        // one.
+        let lead = &shape[..shape.len() - 1];
 
         let dtype = if let Some(source) = source {
             self.source_dtype(source.tensor_id)?
@@ -1949,9 +1968,10 @@ impl Walk<'_, '_> {
                     )));
                 }
                 let groups = cols / 32;
-                if scale_shape.as_slice() != [rows as i64, groups as i64] {
+                let want = crate::types::grouped_shape(lead, groups as i64);
+                if scale_shape != want {
                     return Err(invalid(format!(
-                        "host MXFP4 Encode scale must be [{rows}, {groups}], got {scale_shape:?}"
+                        "host MXFP4 Encode scale must be {want:?}, got {scale_shape:?}"
                     )));
                 }
                 let mut packed = vec![0u8; rows * cols / 2];
@@ -1977,9 +1997,9 @@ impl Walk<'_, '_> {
                 (packed, scale_out)
             }
             QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => {
-                if scale_shape.as_slice() != [rows as i64] {
+                if scale_shape != lead {
                     return Err(invalid(format!(
-                        "host per-channel Encode scale must be [{rows}], got {scale_shape:?}"
+                        "host per-channel Encode scale must be {lead:?}, got {scale_shape:?}"
                     )));
                 }
                 let int8 = scheme == QuantScheme::Int8Symmetric;
@@ -2716,7 +2736,118 @@ mod tests {
         let mut expected = expected_row0.to_vec();
         expected.extend(std::iter::repeat_n(0x77u8, 16));
         assert_eq!(storage.tensors["w"], expected);
-        assert_eq!(storage.tensors["w_scale"], vec![127, 128]);
+        assert_eq!(storage.tensors["w.scales"], vec![127, 128]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The same bytes, declared as an expert bank: rank 3 is rank 2, folded.
+    ///
+    /// This is the differential the rank-3 encode is worth having. The file is
+    /// byte-identical to the test above and so is the answer; only the
+    /// DECLARATION changes, from `[2, 32]` to `[2, 1, 32]`. A dense tensor is
+    /// row-major, so the two describe the same bytes in the same order, and
+    /// every quantizer in the tree indexes `row * cols + c` — which is why
+    /// folding the leading axes (`types::rectangle`) is reading the layout
+    /// rather than reinterpreting it.
+    ///
+    /// The scales plane does NOT fold: it comes back `[2, 1, 1]`, the payload's
+    /// leading axes with one entry per 32-column block, because that is the
+    /// rank a driver binds it at and the shape `model_dsl`'s `Weight::planes`
+    /// interns for it.
+    ///
+    /// Before this, `ScaleLayout::for_encode` refused any rank but 2 and kimi's
+    /// mxfp4 expert banks over a bf16 checkpoint could not be compiled at all
+    /// (menlo M18's open item).
+    #[test]
+    fn an_expert_bank_encodes_to_the_same_bytes_as_the_rows_it_stacks() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract};
+        use crate::plan::CONVERT_TILE_MAP_MASK;
+        use crate::types::{Axis, QuantScheme, QuantSpec};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_bank_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        #[rustfmt::skip]
+        let row0: [f32; 32] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.2, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0,
+            0.4, 0.6, 1.1, 1.6, 2.2, 3.2, 4.5, 5.5,
+        ];
+        let mut data = Vec::new();
+        for value in row0 {
+            data.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes());
+        }
+        for _ in 0..32 {
+            data.extend_from_slice(&bf16::from_f32(12.0).to_bits().to_le_bytes());
+        }
+        let header = r#"{"raw":{"dtype":"BF16","shape":[2,1,32],"data_offsets":[0,128]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&data);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "raw".to_string(),
+                file_id: FileId(0),
+                file_offset: data_offset,
+                span_bytes: 128,
+                shape: vec![2, 1, 32],
+                encoding: Encoding::Raw(DType::BF16),
+            }],
+        };
+        let spec = QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(Axis(2)),
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "experts",
+                Expr::src("raw").cast(Encoding::Quant(spec.clone())),
+                vec![2, 1, 32],
+                Encoding::Quant(spec),
+            )],
+            groups: Vec::new(),
+        };
+        let target = StorageTarget {
+            tile_map_mask: CONVERT_TILE_MAP_MASK,
+            ..StorageTarget::default()
+        };
+
+        let plan = crate::plan::compile(&metadata, &contract, target).unwrap();
+        // The plane the driver binds, at the rank it binds it.
+        let scales = plan
+            .tensors
+            .iter()
+            .find(|decl| decl.name == "experts.scales")
+            .expect("the encode publishes its scales under the name the plan binds");
+        assert_eq!(scales.shape, vec![2, 1, 1]);
+
+        let storage = Execution::new(&plan, &dir).run().unwrap();
+        #[rustfmt::skip]
+        let expected_row0: [u8; 16] = [
+            0x10, 0x32, 0x54, 0x76, 0x90, 0xBA, 0xDC, 0xFE,
+            0x10, 0x32, 0x54, 0x76, 0x11, 0x32, 0x54, 0x76,
+        ];
+        let mut expected = expected_row0.to_vec();
+        expected.extend(std::iter::repeat_n(0x77u8, 16));
+        assert_eq!(storage.tensors["experts"], expected);
+        assert_eq!(storage.tensors["experts.scales"], vec![127, 128]);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3129,7 +3260,7 @@ mod tests {
         );
         let storage = Execution::new(&plan, &dir).run().unwrap();
         assert_eq!(storage.tensors["q"], vec![0x66u8; 64 * 32]);
-        assert_eq!(storage.tensors["q_scale"], vec![126u8; 64 * 2]);
+        assert_eq!(storage.tensors["q.scales"], vec![126u8; 64 * 2]);
         std::fs::remove_dir_all(dir).ok();
     }
 

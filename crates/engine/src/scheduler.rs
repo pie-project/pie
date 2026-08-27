@@ -33,7 +33,25 @@ pub(crate) mod fire_plan;
 pub(crate) mod frame;
 pub(crate) mod probe;
 pub(crate) mod stats;
-pub(crate) mod wire;
+// `wire` STOOD HERE, and its whole reason was the CSR merge. It was 716
+// lines: `new_batched_forward_request_with_capacity` (a `LaunchPlan` with
+// thirty pre-seeded indptrs), `append_request_with_options` (eleven
+// simultaneous CSR merges per member), `append_multi_row_request`, and a
+// `TrimPlan` that dropped whole all-masked KV pages out of the merged page
+// list before it was written.
+//
+// A batch is a concatenation of lanes now (`crate::driver::fire`'s header),
+// so the merge is `extend` and lives in `batch.rs` in nine lines. The one
+// piece with a claim of its own is the page trim, and it is deliberately not
+// carried over: it was an optimisation ON THE MERGED FORM — it re-derived
+// each lane's `kv_len` from the EMITTED page count so the two agreed — and
+// the same optimisation on lanes is an edit to `Lane::kv.pages` and
+// `Lane::kv.held`, which is a different function and still unwritten
+// (`palo B-mask`: the axis reaches the shell now — `Lane::mask` stages and
+// binds — but dropping an all-masked PAGE out of a lane's table is a second
+// thing, and it has to agree with the mask's own `total`). `grammar::brle`'s
+// `droppable_page_bits` and `write_skipping` — the two primitives it was
+// built from, with their own tests — are untouched and waiting.
 pub mod worker;
 
 pub use frame::FrameStamp;
@@ -472,7 +490,7 @@ pub async fn spawn(
 fn rs_state_copy_plan(
     src_slots: Vec<u32>,
     dst_slots: Vec<u32>,
-) -> Result<Option<crate::driver::StateCopyPlan>> {
+) -> Result<Option<crate::driver::StateCopy>> {
     if src_slots.len() != dst_slots.len() {
         return Err(anyhow!(
             "recurrent-state copy source/destination lengths differ: {} != {}",
@@ -486,7 +504,7 @@ fn rs_state_copy_plan(
     let slot_ranges = src_slots
         .into_iter()
         .zip(dst_slots)
-        .map(|(src_slot_id, dst_slot_id)| ::driver_api::StateCopyRange {
+        .map(|(src_slot_id, dst_slot_id)| ::driver_api::StateMove {
             src_slot_id,
             dst_slot_id,
             src_token_offset: 0,
@@ -494,14 +512,13 @@ fn rs_state_copy_plan(
             token_count: 0,
         })
         .collect();
-    Ok(Some(crate::driver::StateCopyPlan { slot_ranges }))
+    Ok(Some(crate::driver::StateCopy { moves: slot_ranges }))
 }
 
 pub fn submit_async(
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     driver_idx: usize,
     instance_id: u64,
-    last_page_len: u32,
     pipeline_id: Option<ProcessId>,
     completion: crate::driver::WorkItemCompletion,
 ) -> Result<()> {
@@ -509,7 +526,6 @@ pub fn submit_async(
         request,
         driver_idx,
         instance_id,
-        last_page_len,
         pipeline_id,
         completion,
         Vec::new(),
@@ -539,8 +555,8 @@ pub fn submit_async(
 /// rather than accepted as one of its own. The call sites cannot return an
 /// error from inside a struct literal, and the id they hold has already been
 /// used to reach a scheduler handle on the next line.
-pub(crate) fn device_domain(driver_idx: usize) -> ::driver_api::DeviceDomain {
-    crate::driver::get_spec(driver_idx).map_or(::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED, |s| {
+pub(crate) fn device_domain(driver_idx: usize) -> ::driver_api::MemoryDomain {
+    crate::driver::get_spec(driver_idx).map_or(::driver_api::MemoryDomain::HostPinned, |s| {
         s.device_domain
     })
 }
@@ -553,29 +569,25 @@ pub(crate) fn nudge(driver_idx: usize) {
 
 #[allow(clippy::too_many_arguments)]
 pub fn submit_async_with_kv_copy(
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     driver_idx: usize,
     instance_id: u64,
-    last_page_len: u32,
     pipeline_id: Option<ProcessId>,
     completion: crate::driver::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: device_domain(driver_idx),
-        src_device_ordinal: 0,
-        dst_domain: device_domain(driver_idx),
-        dst_device_ordinal: 0,
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopy {
+        src: device_domain(driver_idx),
+        dst: device_domain(driver_idx),
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
-        cells: Vec::new(),
+        moves: Vec::new(),
     });
     scheduler_handle(driver_idx)?.submit_with_identity_and_copy(
         request,
         instance_id,
         completion,
-        last_page_len,
         pipeline_id,
         prelaunch_copy,
         None,
@@ -583,17 +595,15 @@ pub fn submit_async_with_kv_copy(
 }
 
 pub fn submit_prebuilt_async(
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     driver_idx: usize,
     instance_id: u64,
-    last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
 ) -> Result<()> {
     submit_prebuilt_async_with_kv_copy(
         request,
         driver_idx,
         instance_id,
-        last_page_len,
         completion,
         Vec::new(),
         Vec::new(),
@@ -602,28 +612,24 @@ pub fn submit_prebuilt_async(
 
 #[allow(clippy::too_many_arguments)]
 pub fn submit_prebuilt_async_with_kv_copy(
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     driver_idx: usize,
     instance_id: u64,
-    last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: device_domain(driver_idx),
-        src_device_ordinal: 0,
-        dst_domain: device_domain(driver_idx),
-        dst_device_ordinal: 0,
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopy {
+        src: device_domain(driver_idx),
+        dst: device_domain(driver_idx),
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
-        cells: Vec::new(),
+        moves: Vec::new(),
     });
     scheduler_handle(driver_idx)?.submit_prebuilt_with_copy(
         request,
         instance_id,
         completion,
-        last_page_len,
         prelaunch_copy,
         None,
     )
@@ -631,30 +637,26 @@ pub fn submit_prebuilt_async_with_kv_copy(
 
 #[allow(clippy::too_many_arguments)]
 pub fn submit_prebuilt_async_with_kv_and_rs_copy(
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     driver_idx: usize,
     instance_id: u64,
-    last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
     rs_copy_src: Vec<u32>,
     rs_copy_dst: Vec<u32>,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: device_domain(driver_idx),
-        src_device_ordinal: 0,
-        dst_domain: device_domain(driver_idx),
-        dst_device_ordinal: 0,
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopy {
+        src: device_domain(driver_idx),
+        dst: device_domain(driver_idx),
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
-        cells: Vec::new(),
+        moves: Vec::new(),
     });
     scheduler_handle(driver_idx)?.submit_prebuilt_with_copy(
         request,
         instance_id,
         completion,
-        last_page_len,
         prelaunch_copy,
         rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
     )
@@ -662,11 +664,10 @@ pub fn submit_prebuilt_async_with_kv_and_rs_copy(
 
 #[allow(clippy::too_many_arguments)]
 pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     driver_idx: usize,
     instance_id: u64,
     pipeline_id: ProcessId,
-    last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
@@ -679,7 +680,6 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         instance_id,
         pipeline_id,
         pipeline_id,
-        last_page_len,
         completion,
         copy_src,
         copy_dst,
@@ -694,11 +694,10 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     handle: &worker::SchedulerHandle,
-    request: crate::driver::LaunchPlan,
+    request: crate::driver::FireRequest,
     instance_id: u64,
     process_id: ProcessId,
     pipeline_id: ProcessId,
-    last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
@@ -708,23 +707,20 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     hook_program: bool,
     lora_program: bool,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopy {
         // The HANDLE's, because this path is given a scheduler rather than a
         // driver id -- and it is the same answer, recorded when that
         // scheduler was built.
-        src_domain: handle.device_domain(),
-        src_device_ordinal: 0,
-        dst_domain: handle.device_domain(),
-        dst_device_ordinal: 0,
+        src: handle.device_domain(),
+        dst: handle.device_domain(),
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
-        cells: Vec::new(),
+        moves: Vec::new(),
     });
     handle.submit_prebuilt_tracked_with_copy(
         request,
         instance_id,
         completion,
-        last_page_len,
         process_id,
         pipeline_id,
         prelaunch_copy,
@@ -762,9 +758,9 @@ mod tests {
     #[test]
     fn an_unregistered_driver_names_no_devices_memory() {
         let domain = super::device_domain(usize::MAX);
-        assert_eq!(domain, ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED);
-        assert_ne!(domain, ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE);
-        assert_ne!(domain, ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE);
-        assert_ne!(domain, ::driver_api::PIE_MEMORY_DOMAIN_METAL_PRIVATE);
+        assert_eq!(domain, ::driver_api::MemoryDomain::HostPinned);
+        assert_ne!(domain, ::driver_api::MemoryDomain::CudaDevice(0));
+        assert_ne!(domain, ::driver_api::MemoryDomain::VulkanDevice(0));
+        assert_ne!(domain, ::driver_api::MemoryDomain::MetalPrivate);
     }
 }

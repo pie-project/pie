@@ -24,9 +24,11 @@ use serde::{Deserialize, Serialize};
 // consumers can still reach them as `controller_api::{WorkerId, …}`.
 pub use ids::{GatewayId, NodeId, WorkerId};
 
-// `DriverCapabilities` is owned by `driver` (`capabilities.rs`);
-// `WorkerInfo.capability` carries it.
-use driver_api::capabilities::DriverCapabilities;
+// The driver contract owns the capability record (`driver_api::caps`);
+// `WorkerInfo.capability` carries it. It was `DriverCapabilities`, a 30-field
+// flat struct mixing device, load and model facts; `Capabilities` is the same
+// answer with those three separated.
+use driver_api::caps::Capabilities;
 
 // ──────────────────────────── role / health ───────────────────────────
 
@@ -99,7 +101,7 @@ pub struct WorkerInfo {
     pub addr: String,
     /// What the worker's driver can do (page geometry, forward limits, arch,
     /// …) — the existing driver-handshake capability descriptor.
-    pub capability: DriverCapabilities,
+    pub capability: Capabilities,
 }
 
 /// Static identity a gateway declares when it joins.

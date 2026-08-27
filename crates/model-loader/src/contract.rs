@@ -471,8 +471,19 @@ pub struct TensorContract {
 /// silently reinterpreted as one it never belonged to.
 ///
 /// Only for scales the *checkpoint* shipped. When the loader quantizes a tensor
-/// it creates the scale tensor itself and states the pairing from there, with no
-/// name involved at all.
+/// it creates the scale tensor itself and states the PAIRING from there with no
+/// name involved at all — a [`QuantAttachment`](crate::plan::QuantAttachment)
+/// names two tensor ids, which is the whole point of stating it rather than
+/// matching suffixes.
+///
+/// **The pairing has no name; the tensor does, and it is not free either.** An
+/// encoded scales plane is bound by a driver out of the same table as a
+/// shipped one, by name, so `plan::build`'s `ScaleLayout` publishes it under
+/// the spelling the model plane binds — `<w>.scales` for MXFP4. That is the
+/// accord recorded as open against kimi's runtime-quantized expert banks, and
+/// it is settled in `ScaleLayout::for_encode`, where the comment on the MXFP4
+/// arm carries the ruling. A contract does not declare that entry and must
+/// not: the encode instruction is its one producer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scales {
     /// Declared name of the tensor these scales belong to.
@@ -946,7 +957,10 @@ impl Expr {
         found
     }
 
-    fn visit<'a>(&'a self, seen: &mut impl FnMut(&'a Expr)) {
+    /// Hand every node of this expression, self first and then each operand in
+    /// traversal order, to `seen` — the one place the shape of the grammar is
+    /// written out for a *read*.
+    pub fn visit<'a>(&'a self, seen: &mut impl FnMut(&'a Expr)) {
         seen(self);
         match self {
             Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => {}

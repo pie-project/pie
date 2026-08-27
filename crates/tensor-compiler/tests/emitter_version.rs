@@ -104,7 +104,7 @@ fn fingerprint(backend: Backend) -> u64 {
         .collect();
     let mut bytes = Vec::new();
     for kernel in emit_program(backend, &stages, &corpus_bound()) {
-        bytes.extend_from_slice(&kernel.kind.to_le_bytes());
+        bytes.extend_from_slice(&(kernel.kind as u32).to_le_bytes());
         bytes.extend_from_slice(&kernel.stage_index.to_le_bytes());
         bytes.extend_from_slice(&kernel.region_index.to_le_bytes());
         for text in [&kernel.entry_name, &kernel.source, &kernel.error] {

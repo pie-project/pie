@@ -37,26 +37,36 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 /// toolchain.
 ///
 /// What keeps them honest is the other side: with `feature = "cuda"` on,
-/// `executor::cuda` calls exactly these as the typed `x::quant` host programs
-/// they are, so a symbol that stopped existing fails that build rather than
-/// becoming a plan nothing can run.
+/// `executor::cuda` calls exactly these as the typed
+/// `kernels_cuda::linear::quant` entries they are, so a symbol that stopped
+/// existing fails that build rather than becoming a plan nothing can run.
 ///
-/// THE FOUR ARE NOT ALL THE SAME KIND OF NAME. The first two are `kernels-
-/// cuda` ROUTINES and a test resolves each against `kernels_cuda::routine`.
-/// The two quantisers are not routines and must not be looked for there: no
-/// trace states a load-time weight transform, so they are plain `unsafe fn`s
-/// and these strings are the LOADER's own vocabulary — the word a plan
-/// carries from `tile` to `executor::cuda`'s dispatch, and nothing wider.
+/// ALL FOUR ARE THE SAME KIND OF NAME, and the paragraph that split them is
+/// gone with the thing it described. It said the first two were `kernels-
+/// cuda` ROUTINES resolved against `kernels_cuda::routine`, and the two
+/// quantisers were plain `unsafe fn`s that must not be looked for there.
+/// There is no by-name registry any more and no `unsafe fn` either: every
+/// entry fires through a `Ctx`, and none of these strings resolves against
+/// anything outside this crate. They are uniformly the LOADER's own
+/// vocabulary — the word a plan carries from `tile` to `executor::cuda`'s
+/// dispatch, and nothing wider.
 ///
-/// THE FIRST TWO CARRY NO DTYPE, and the constants' own names do. That is
-/// not a mismatch: both routines are GENERIC (`cast_fp32_to<T>`,
-/// `scale_rows<T>`), so the registry symbol is the generic one and the
-/// instantiation is chosen where the routine is called, which for this
-/// loader is `bf16` and always has been. The constant is named for the
-/// instantiation the loader pins; the string is named for the row it must
-/// resolve against. They were both spelled `..._bf16` while the routines
-/// were monomorphic, and the string is what had to change when they stopped
-/// being.
+/// THE STRINGS CARRY NO DTYPE, and the constants' own names do. That is not
+/// a mismatch: the entries are dtype-DISPATCHED (`cast_fp32_to` and
+/// `scale_rows` stamp their instantiation off the handle's `Dtype`), so the
+/// word is the general one and the instantiation is chosen where the entry
+/// is called, which for this loader is `bf16` and always has been. The
+/// constant is named for the instantiation the loader pins; the string is
+/// named for the row a plan carries. They were both spelled `..._bf16` while
+/// the entries were monomorphic, and the string is what had to change when
+/// they stopped being.
+///
+/// AND THE STRINGS DO NOT TRACK THE RUST NAMESPACE. The entries live at
+/// `kernels_cuda::linear::quant` now; these words still say `quant::`,
+/// because one of them is written into a checked-in golden plan and a plan's
+/// kernel word is a name this crate owns rather than a path it mirrors.
+/// `executor::cuda`'s test binds each path beside each string and is where
+/// the two are held together.
 ///
 /// The typed call and the string are two halves of one claim, and only
 /// together: the call is checked by the compiler and does not know what this
@@ -122,7 +132,8 @@ pub const METAL_TILE_MAP_MASK: u32 =
 /// The transforms a Vulkan plan may carry.
 ///
 /// The same three Metal's does, and for the same reason rather than by
-/// imitation: `driver-vulkan` implements neither
+/// imitation: the Vulkan shell (out of the workspace since R3, its target
+/// kept against its return) implements neither
 /// [`ArenaBacking::runs_named_kernels`] nor `run_tile_map` either, so every
 /// transform in a Vulkan plan runs on the host, and this is the compile-time
 /// question of which a plan may CONTAIN.
@@ -236,7 +247,7 @@ mod mask_tests {
     /// It matters because `Unknown` is the arm a missing backend falls into,
     /// and its mask does NOT admit `TILE_MAP_ENCODE` -- a quantised
     /// checkpoint compiled against it produces a plan that carries no encode
-    /// instruction, which loads and is wrong. `driver-vulkan` asked for
+    /// instruction, which loads and is wrong. The Vulkan shell asked for
     /// Metal's target for exactly this reason before it had one of its own,
     /// with a note saying so; this is that note as a check.
     #[test]
@@ -809,16 +820,21 @@ fn source_dtype(
         .map(|decl| encoding_dtype(&decl.ty.encoding))
 }
 
-/// The declared 2-D shape behind a buffer.
+/// The declared rectangle behind a buffer.
 ///
 /// MXFP4 outputs are allocated flat (`u8[bytes]`), so the buffer's own size
 /// says nothing about rows and columns; the logical shape lives on the buffer's
 /// declared type. Same recovery `encode_tile_map` did in C++.
+///
+/// Read through [`crate::types::rectangle`], which folds a rank-3 bank's
+/// leading axes into the row count the way the kernels index it. This matched
+/// `[rows, cols]` alone, so an expert bank produced no shape, no kernel row
+/// was named for it, and it ran on the host whatever the device could do —
+/// the same failure `.wiki/fix/loader.md` §3.2 records for the dtype lookup
+/// above.
 fn logical_shape(plan: &LoadPlan, buffer: BufferId) -> Option<(u64, u64)> {
-    match plan.buffer(buffer).ok()?.ty.shape.as_slice() {
-        [rows, cols] => Some((u64::try_from(*rows).ok()?, u64::try_from(*cols).ok()?)),
-        _ => None,
-    }
+    let (rows, cols) = crate::types::rectangle(&plan.buffer(buffer).ok()?.ty.shape)?;
+    Some((u64::try_from(rows).ok()?, u64::try_from(cols).ok()?))
 }
 
 #[cfg(test)]

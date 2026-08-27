@@ -21,7 +21,7 @@
 //!
 //! [`PageLease`] is the PURE bookkeeping half (grant / reclaim / free-list),
 //! unit-tested here; the working-set page allocation + the host-put wiring live
-//! in `pipeline/fire/mod.rs` (they need the arena / ws, which need a device).
+//! in `pipeline/fire.rs` (they need the arena / ws, which need a device).
 //! [`detect_device_geometry`] + [`DevGeo`] are the paired bind-time detector
 //! and per-pass lease bundle.
 //!

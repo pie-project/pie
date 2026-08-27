@@ -587,6 +587,50 @@ impl TensorDecl {
     }
 }
 
+/// A declared shape read as the `[rows, cols]` rectangle every encode kernel
+/// walks: the LAST axis is the contracted one, and every axis before it folds
+/// into the row count.
+///
+/// **The fold is not a convenience, it is the layout.** A dense tensor is
+/// row-major, so `[experts, rows, cols]` and `[experts * rows, cols]` are the
+/// same bytes in the same order, and a kernel that indexes `row * cols + c` —
+/// which is every quantizer in the tree, on both the host and the device — has
+/// already been walking the folded rectangle for every rank it was ever
+/// handed. What was rank-2-only was the ARITHMETIC ABOVE it: `for_encode`
+/// destructured `[rows, cols]` and refused anything else, so a contract that
+/// stacked experts and then asked for runtime quantization got a refusal
+/// naming a restriction the kernels did not have.
+///
+/// Rank 0 and rank 1 are `None` rather than folded. A rank-1 tensor has no
+/// axis left over to hold a per-row scale, so the caller's question ("what
+/// rectangle do I scale") has no answer for it, and inventing `rows = 1` would
+/// turn a shapeless declaration into a plausible one-row weight.
+#[must_use]
+pub fn rectangle(shape: &[i64]) -> Option<(i64, i64)> {
+    let (&cols, lead) = shape.split_last()?;
+    if lead.is_empty() {
+        return None;
+    }
+    let rows = lead
+        .iter()
+        .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))?;
+    Some((rows, cols))
+}
+
+/// A block-scaled scales shape: the payload's leading axes, then one entry
+/// per group along the contracted axis.
+///
+/// Its own function because two sides state it and they must not drift: the
+/// plan compiler BUILDS it (`plan::build::ScaleLayout::for_encode`) and the
+/// host executor CHECKS the buffer it was handed against it before it writes
+/// a byte.
+#[must_use]
+pub fn grouped_shape(lead: &[i64], groups: i64) -> Vec<i64> {
+    let mut shape = lead.to_vec();
+    shape.push(groups);
+    shape
+}
+
 pub fn tensor_nbytes(shape: &[i64], element_bytes: u64) -> Option<u64> {
     tensor_elements(shape)?.checked_mul(element_bytes)
 }

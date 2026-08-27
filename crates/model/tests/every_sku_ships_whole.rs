@@ -8,7 +8,7 @@ use model_dsl::Plane;
 #[test]
 fn every_sku_names_a_checkpoint_it_can_be_built_from() {
     let mut faults = Vec::new();
-    let catalog: BTreeSet<&str> = model::catalog().into_iter().map(|(sku, _)| sku).collect();
+    let catalog: BTreeSet<&str> = model::catalog().into_iter().map(|(sku, ..)| sku).collect();
 
     let mut rows: BTreeMap<&str, usize> = BTreeMap::new();
     for (sku, _) in model::imports() {
@@ -41,7 +41,7 @@ fn every_sku_names_a_checkpoint_it_can_be_built_from() {
 #[test]
 fn every_sku_names_exactly_one_chat_template() {
     let mut faults = Vec::new();
-    let catalog: BTreeSet<&str> = model::catalog().into_iter().map(|(sku, _)| sku).collect();
+    let catalog: BTreeSet<&str> = model::catalog().into_iter().map(|(sku, ..)| sku).collect();
 
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for (sku, _) in model::template::templates() {
@@ -72,18 +72,48 @@ fn every_sku_names_exactly_one_chat_template() {
 }
 
 #[test]
+fn a_sku_name_states_the_world_its_row_ships() {
+    let mut faults = Vec::new();
+
+    for (sku, tp, ..) in model::catalog() {
+        let named = match sku.rsplit_once("-tp") {
+            Some((_, ranks)) => ranks.parse::<u32>().unwrap_or_else(|why| {
+                panic!("`{sku}` ends in a world of `{ranks}` ranks, which is no number: {why}")
+            }),
+            None => 1,
+        };
+        if named != tp {
+            faults.push(format!(
+                "`{sku}` names a world of {named} rank(s) and its catalog row \
+                 ships tp {tp}; the name a runtime selects by and the world it \
+                 gets are the same fact"
+            ));
+        }
+    }
+
+    assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
+}
+
+#[test]
 fn planes_do_not_move_a_param() {
-    for (sku, trace) in model::catalog() {
-        let cuda = trace(Plane::Cuda);
-        let metal = trace(Plane::Metal);
-        assert_eq!(
-            cuda.params, metal.params,
-            "`{sku}` declares different weights per plane; an artifact can no longer be one file"
-        );
-        assert_eq!(
-            cuda.caches, metal.caches,
-            "`{sku}` declares different caches per plane"
-        );
+    let planes = [Plane::Cuda, Plane::Metal, Plane::Wgpu, Plane::Vulkan];
+
+    for (sku, _, trace, _) in model::catalog() {
+        let first = trace(planes[0]);
+        for plane in &planes[1..] {
+            let other = trace(*plane);
+            assert_eq!(
+                first.params, other.params,
+                "`{sku}` declares different weights on {plane:?} than on {:?}; \
+                 an artifact can no longer be one file",
+                planes[0],
+            );
+            assert_eq!(
+                first.caches, other.caches,
+                "`{sku}` declares different caches on {plane:?} than on {:?}",
+                planes[0],
+            );
+        }
     }
 }
 
@@ -107,12 +137,13 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
                  tensor no model reads, so its import table never asked the \
                  file what it holds"
             )),
-            Err(ModelError::Missing(_)) => {}
-            Err(why @ (ModelError::Illegible { .. } | ModelError::Incompatible { .. })) => {
+            Err(ModelError::Missing(_) | ModelError::Illegible { .. }) => {}
+            Err(why @ ModelError::Incompatible { .. }) => {
                 faults.push(format!(
                     "`{sku}` refuses a checkpoint that holds nothing it reads \
-                     with `{why}`, and the refusal a missing tensor earns \
-                     names the tensor it looked for"
+                     with `{why}`, and a file that states none of its planes \
+                     is missing them, not storing them in another \
+                     representation"
                 ));
             }
         }

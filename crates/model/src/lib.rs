@@ -11,7 +11,24 @@ use model_dsl::Dtype;
 use model_loader::contract::ModelContract;
 use model_loader::types::{DType, Encoding, QuantScheme, QuantSpec};
 
-pub type Row = (&'static str, model_dsl::TraceFn);
+/// The vocabulary a caller needs to USE the catalog's fourth column, through
+/// the same door the column comes out of. A party that holds a [`ClassifyFn`]
+/// has to build the [`Request`] it takes, and making it name `model_dsl` for
+/// that would put the authoring eDSL in the dependency graph of everyone who
+/// wants a lane's word — the engine's fire path, which authors nothing.
+pub use model_dsl::{ClassifyFn, Request};
+
+/// One shipping SKU: its name, the tensor-parallel width it was traced for,
+/// its trace, and how it sorts a request into the fact word a lane carries.
+///
+/// THE FOURTH COLUMN IS WHAT LETS A LANE STATE ITS CLASS. Nothing outside a
+/// family's own module can say which bit `qo_one` is — a plan's
+/// `Cond::Fact(bit)` numbers its bits and stops there — so before this column
+/// existed the engine's fire path submitted every lane as word 0, the
+/// all-false class, and a decode lane composed as a prefill one. `catalog!`
+/// closes each family's `Classify::of(..).word()` into a plain pointer here,
+/// and the bit numbering stays private.
+pub type Row = (&'static str, u32, model_dsl::TraceFn, model_dsl::ClassifyFn);
 
 pub type ImportRow = (
     &'static str,
@@ -48,8 +65,21 @@ pub fn imports() -> Vec<ImportRow> {
 pub fn trace_of(sku: &str) -> Option<model_dsl::TraceFn> {
     catalog()
         .into_iter()
-        .find(|(n, _)| *n == sku)
-        .map(|(_, f)| f)
+        .find(|(n, ..)| *n == sku)
+        .map(|(_, _, trace, _)| trace)
+}
+
+/// How `sku` sorts a request into the fact word its lanes carry.
+///
+/// Keyed by the same string as [`trace_of`], off the same rows, because a
+/// build that classified a lane for one model and traced another would compose
+/// a fire out of windows the plan does not have.
+#[must_use]
+pub fn classify_of(sku: &str) -> Option<model_dsl::ClassifyFn> {
+    catalog()
+        .into_iter()
+        .find(|(n, ..)| *n == sku)
+        .map(|(_, _, _, classify)| classify)
 }
 
 #[must_use]
@@ -89,9 +119,10 @@ pub(crate) fn encoding(dtype: Dtype) -> Encoding {
 
 pub fn identify(src: &ztensor::Source) -> Result<&'static str, Unmatched> {
     let mut misses: Vec<(&'static str, String)> = Vec::new();
+    let rows = catalog();
 
     for (sku, import) in imports() {
-        if is_one_rank_of_a_world(sku) {
+        if rows.iter().any(|row| row.0 == sku && row.1 > 1) {
             continue;
         }
         match import(src) {
@@ -100,27 +131,6 @@ pub fn identify(src: &ztensor::Source) -> Result<&'static str, Unmatched> {
         }
     }
     Err(Unmatched { misses })
-}
-
-fn is_one_rank_of_a_world(sku: &str) -> bool {
-    use model_dsl::{Collective, Operation};
-
-    trace_of(sku).is_some_and(|trace| {
-        trace(model_dsl::Plane::Cuda)
-            .nodes
-            .iter()
-            .any(|node| match &node.op {
-                Operation::Collective(Collective::AllReduce { .. }) => true,
-                Operation::Collective(
-                    Collective::AllGather { .. } | Collective::ReduceScatter { .. },
-                ) => false,
-                Operation::Attention(_)
-                | Operation::Linear(_)
-                | Operation::Elementwise(_)
-                | Operation::Layout(_)
-                | Operation::CustomCuda(_) => false,
-            })
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

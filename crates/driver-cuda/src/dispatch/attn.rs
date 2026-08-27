@@ -58,11 +58,14 @@ impl DispatchAttention for Run<'_> {
             // shared indptr has a host twin too, and the mask span table
             // (the op-named mask bits' per-request bounds, which no op
             // names) binds onto the plan here, for `attention.masked` to
-            // find. Which builder runs is the trace's declaration: the
-            // plan value's `StructKind` says fa2 or sm90, and the arm
-            // follows it. `causal: true` is `attention.prefill`'s reading;
-            // `attention.masked` replaces the causal bound with its mask
-            // and never consults the flag.
+            // find. It is taken at THIS NODE's window (`Run::mask_indptr`),
+            // because the table is indexed by the schedule's own request
+            // number; the byte offsets inside it stay absolute, because the
+            // slab they address is handed over whole. Which builder runs is
+            // the trace's declaration: the plan value's `StructKind` says
+            // fa2 or sm90, and the arm follows it. `causal: true` is
+            // `attention.prefill`'s reading; `attention.masked` replaces the
+            // causal bound with its mask and never consults the flag.
             Attention::PlanPrefill {
                 kv_indptr,
                 kv_indices: _,
@@ -73,18 +76,19 @@ impl DispatchAttention for Run<'_> {
                 let built = {
                     let fire = self.bindings();
                     let seat = self.planning(*kv_indptr);
+                    let spans = self.mask_indptr();
                     match self.declared(*plan) {
                         StructKind::AttnPrefillPlan => {
                             let built = plan::plan_prefill(
-                                &fire.indptr_host,
+                                self.qo_indptr_host(),
                                 &seat.kv_indptr,
                                 &seat.kv_len,
-                                fire.total_tokens(),
+                                self.total_tokens(),
                                 seat.shape,
                                 seat.window,
                                 true,
                                 fire.capture,
-                                fire.tables.mask_indptr,
+                                spans,
                                 &fire.device,
                                 seat.prefill_grant(),
                             )?;
@@ -93,10 +97,10 @@ impl DispatchAttention for Run<'_> {
                         }
                         StructKind::AttnPrefillPlanSm90 => {
                             let built = plan::plan_prefill_sm90(
-                                &fire.indptr_host,
+                                self.qo_indptr_host(),
                                 &seat.kv_indptr,
                                 &seat.kv_len,
-                                fire.total_tokens(),
+                                self.total_tokens(),
                                 seat.shape,
                                 true,
                                 fire.capture,
@@ -127,7 +131,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
@@ -150,7 +154,7 @@ impl DispatchAttention for Run<'_> {
                     self.ctx(),
                     self.ragged(*q),
                     sm90,
-                    self.pool(*cache),
+                    &self.pool(*cache),
                     *window,
                     *head_dim,
                     *kv_heads,
@@ -161,7 +165,7 @@ impl DispatchAttention for Run<'_> {
                     self.ctx(),
                     self.ragged(*q),
                     self.prefill_plan(*plan),
-                    self.pool(*cache),
+                    &self.pool(*cache),
                     *window,
                     *head_dim,
                     *kv_heads,
@@ -186,7 +190,7 @@ impl DispatchAttention for Run<'_> {
                 self.ragged(*q),
                 self.prefill_plan(*plan),
                 self.tensor(*mask),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
@@ -205,7 +209,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
@@ -226,7 +230,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *window,
                 *head_dim,
                 *kv_heads,
@@ -284,7 +288,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.ragged(*k),
                 self.tensor(*v),
-                self.pool(*cache),
+                &self.pool(*cache),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
@@ -296,7 +300,7 @@ impl DispatchAttention for Run<'_> {
             } => attn::kv_append_shared(
                 self.ctx(),
                 self.ragged(*plane),
-                self.pool(*cache),
+                &self.pool(*cache),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
@@ -318,13 +322,13 @@ impl DispatchAttention for Run<'_> {
                     let fire = self.bindings();
                     let seat = self.planning(*kv_indptr);
                     plan::plan_mla(
-                        &fire.indptr_host,
+                        self.qo_indptr_host(),
                         &seat.kv_indptr,
                         &seat.kv_len,
                         seat.shape.num_requests,
                         seat.shape.num_q_heads,
                         seat.shape.head_dim,
-                        fire.multi_token(),
+                        self.multi_token(),
                         &fire.device,
                         seat.mla_grant(),
                     )?
@@ -436,7 +440,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.ragged(*kv_c),
                 self.tensor(*k_pe),
-                self.pool(*cache),
+                &self.pool(*cache),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
@@ -454,7 +458,7 @@ impl DispatchAttention for Run<'_> {
                 self.ragged(*q),
                 self.mla_plan(*plan),
                 self.tensor(*q_pe),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
@@ -474,7 +478,7 @@ impl DispatchAttention for Run<'_> {
                 self.ragged(*q),
                 self.mla_plan(*plan),
                 self.tensor(*q_pe),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
@@ -496,7 +500,7 @@ impl DispatchAttention for Run<'_> {
                 self.mla_plan(*plan),
                 self.tensor(*q_pe),
                 self.tensor(*selection),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
@@ -518,7 +522,7 @@ impl DispatchAttention for Run<'_> {
                 self.mla_plan(*plan),
                 self.tensor(*q_pe),
                 self.tensor(*selection),
-                self.pool(*cache),
+                &self.pool(*cache),
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
@@ -535,7 +539,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *conv_width,
                 &mut self.tensor(*y),
             ),
@@ -549,7 +553,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *conv_width,
                 &mut self.tensor(*y),
             ),
@@ -580,7 +584,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*qkv),
                 self.tensor(*z),
                 self.tensor(*gates),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
@@ -602,7 +606,7 @@ impl DispatchAttention for Run<'_> {
                 self.ragged(*qkv),
                 self.tensor(*z),
                 self.tensor(*gates),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
@@ -627,7 +631,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*b),
                 self.tensor(*dt_bias),
                 self.tensor(*a_log),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *heads,
                 *head_dim,
                 *norm_eps,
@@ -651,7 +655,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*b),
                 self.tensor(*dt_bias),
                 self.tensor(*a_log),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *heads,
                 *head_dim,
                 *norm_eps,
@@ -706,7 +710,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.ragged(*q),
                 self.tensor(*weights),
-                self.pool(*keys),
+                &self.pool(*keys),
                 *heads,
                 *head_dim,
                 *top_k,
@@ -722,7 +726,7 @@ impl DispatchAttention for Run<'_> {
             } => index::kv_append(
                 self.ctx(),
                 self.ragged(*k),
-                self.pool(*keys),
+                &self.pool(*keys),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
@@ -771,7 +775,7 @@ impl DispatchAttention for Run<'_> {
                     self.ctx(),
                     self.tensor(*boundary_pos),
                     self.tensor(*boundary_req),
-                    self.pool(*pages),
+                    &self.pool(*pages),
                     *head_dim,
                     *ratio,
                     slabs.state_kv,
@@ -795,7 +799,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*entries),
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
-                self.pool(*into),
+                &self.pool(*into),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
@@ -817,7 +821,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*q),
                 self.tensor(*positions),
                 self.tensor(*request_of_token),
-                self.pool(*entries),
+                &self.pool(*entries),
                 *ratio,
                 *heads,
                 *head_dim,

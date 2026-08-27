@@ -14,10 +14,12 @@
 //! multimodal wire marshaling; kept rather than deleted.
 #![allow(dead_code)]
 
+pub mod multimodal;
+
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use ::model::serve::multimodal::{self, Processor, VisionArch};
 use anyhow::Result;
+use multimodal::{Processor, VisionArch};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 

@@ -1,29 +1,41 @@
-//! Batch assembly: capacity accounting + the dense-batch accumulator.
+//! Batch assembly: capacity accounting, and the lanes a step is made of.
+//!
+//! # What the merge stopped being
+//!
+//! `build_batch_request` used to run eleven simultaneous CSR merges through
+//! `scheduler::wire` — tokens, positions, page lists, mask rows, sampler
+//! indices, recurrent slots, three multimodal side channels — so that a
+//! driver could walk them back into per-request form. A batch is a
+//! concatenation of lanes now (`crate::driver::fire`'s header), and the
+//! merge is `extend`.
+//!
+//! What survived, because none of it was about the wire form: the admission
+//! shape gate, the per-request capacity accounting, the grouping rules that
+//! decide which fires may share a step, and the fire planner's seriation.
 
-use std::collections::HashMap;
-
-use ::driver_api::TerminalCell;
+use crate::driver::completion::TerminalCell;
+use crate::driver::{FrameFire, SchedulerLimits, StepFire};
 
 use super::fire_plan;
 use super::stats::SchedulerStats;
-use super::wire;
 use super::worker::PendingRequest;
-use crate::driver::{FrameSubmission, LaunchPlan, SchedulerLimits, StepSubmission};
 
-/// One step's assembled wire request: the per-batch merge of its member
-/// fires, before roster resolution. Field names mirror the old per-wave
-/// submission so the merge logic and its tests carry over unchanged.
+/// One step's assembled lanes, before the frame is sealed.
 pub(crate) struct StepBuild {
-    pub(crate) plan: LaunchPlan,
+    /// The lanes, in member order.
+    pub(crate) lanes: Vec<crate::driver::Lane>,
+    /// Which bound instance each MEMBER belongs to.
     pub(crate) instance_ids: Vec<u64>,
+    /// Whether each MEMBER's instance runs a pass at the fire's boundary —
+    /// [`FireRequest::boundary_program`](crate::driver::FireRequest).
+    pub(crate) boundary_programs: Vec<bool>,
+    /// Which lane each member's rows start at — the attribution the region
+    /// tables used to carry.
+    pub(crate) member_lane_indptr: Vec<u32>,
+    /// One cell per member.
     pub(crate) terminal_cells: Vec<*mut TerminalCell>,
-    pub(crate) kv_translation: Vec<u32>,
-    pub(crate) kv_translation_indptr: Vec<u32>,
-    pub(crate) program_row_indptr: Vec<u32>,
+    /// One id per member.
     pub(crate) logical_fire_ids: Vec<u64>,
-    pub(crate) channel_expected_head: Vec<u64>,
-    pub(crate) channel_expected_tail: Vec<u64>,
-    pub(crate) channel_ticket_indptr: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -34,19 +46,16 @@ pub(crate) struct RequestCapacityUsage {
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
-    let input_tokens = req.request.token_ids.len();
     let forward_requests = req
         .wire_row_count()
-        .max(req.request.rs_slot_ids.len())
+        .max(req.request.rs.slot_ids.len())
         .max(1);
-    let forward_tokens = input_tokens;
-    let page_refs = req.request.kv_page_indices.len();
     let _ = page_size;
 
     RequestCapacityUsage {
         forward_requests,
-        forward_tokens,
-        page_refs,
+        forward_tokens: req.request.tokens(),
+        page_refs: req.request.pages().count(),
     }
 }
 
@@ -82,202 +91,93 @@ impl AdmissionLimits {
                 usage.page_refs, self.limits.max_page_refs
             ));
         }
-        // Malformed shapes reject the FIRE at admission; batch build treats
-        // them as invariants (a panic there would take down the scheduler
-        // thread — RV-20).
-        if req.request.kv_write_lower_bounds.len() > 1
-            || req.request.kv_write_upper_bounds.len() > 1
-            || req.request.kv_write_lower_bounds.len() != req.request.kv_write_upper_bounds.len()
-        {
-            return Some("per-fire KV containment bounds must be empty or scalar".to_string());
-        }
-        let rows = req.request.qo_indptr.len().saturating_sub(1);
-        if rows > 1 && !req.request.masks.is_empty() && req.request.mask_indptr.len() != rows + 1 {
-            return Some(format!(
-                "multi-row fire carries {} masks without a row CSR \
-                 ({} mask boundaries for {} rows)",
-                req.request.masks.len(),
-                req.request.mask_indptr.len(),
-                rows
-            ));
-        }
+        // THE TWO MALFORMED-SHAPE CHECKS THAT STOOD HERE ARE UNREPRESENTABLE
+        // NOW, which is the whole reason they were checks. "per-fire KV
+        // containment bounds must be empty or scalar" guarded two parallel
+        // `Vec<u64>`s that had to be the same length and at most one entry —
+        // it is `Option<(u64, u64)>` (`FireRequest::kv_write_bounds`). "a
+        // multi-row fire carries masks without a row CSR" guarded a flat
+        // `masks` vector against a `mask_indptr` that cut it per lane — a
+        // mask lives on its lane (`Lane::mask`), so a mask row that belongs
+        // to no lane cannot be built. Both refusals are gone with the shapes
+        // that could fail them.
         None
     }
 }
 
+/// Assemble one step's lanes out of its member requests.
+///
+/// **THIS IS A CONCATENATION.** Every member contributes its own lanes, in
+/// order, and the step's lanes are those lanes. The prebuilt/multi-row
+/// special case the merge needed — flattening a multi-lane request through
+/// the CSR merge would collapse its inner rows to one while incorrectly
+/// retaining its recurrent-state slots — cannot arise, because nothing is
+/// flattened.
 pub(crate) fn build_batch_request(
     requests: &[Box<PendingRequest>],
     page_size: u32,
     stats: &SchedulerStats,
 ) -> StepBuild {
-    if requests.len() == 1 && (requests[0].prebuilt || requests[0].preserves_inner_rows()) {
-        // Keep the logical-fire payload intact across attempts. RETRY builds a
-        // fresh native launch from this same immutable request. Ordinary
-        // multi-row programs take this path too: flattening them through
-        // `wire::append_request` would collapse their inner CSR to one row
-        // while incorrectly retaining B recurrent-state slots.
-        let req = &requests[0];
-        let mut plan = req.request.clone();
-        let kv_translation = std::mem::take(&mut plan.kv_translation);
-        plan.required_kv_pages = plan.required_kv_pages.max(
-            kv_translation
-                .iter()
-                .copied()
-                .max()
-                .map_or(0, |page| page.saturating_add(1)),
-        );
-        let channel_expected_head = plan.channel_expected_head.clone();
-        let channel_expected_tail = plan.channel_expected_tail.clone();
-        let channel_ticket_len = channel_expected_head.len() as u32;
-        let rows = plan.qo_indptr.len().saturating_sub(1) as u32;
-        return StepBuild {
-            kv_translation_indptr: vec![0, kv_translation.len() as u32],
-            kv_translation,
-            program_row_indptr: vec![0, rows],
-            plan,
-            instance_ids: vec![req.instance_id],
-            terminal_cells: vec![req.completion.terminal_cell_ptr()],
-            logical_fire_ids: vec![req.logical_fire_id],
-            channel_expected_head,
-            channel_expected_tail,
-            channel_ticket_indptr: vec![0, channel_ticket_len],
-        };
-    }
-    let elide_decode_masks = requests.iter().all(|req| {
-        req.request.single_token_mode
-            && !req.request.has_user_mask
-            && req.request.token_ids.len() <= 1
-    });
-    let use_kv_write_bounds = requests.iter().any(|req| {
-        !req.request.kv_write_lower_bounds.is_empty()
-            || !req.request.kv_write_upper_bounds.is_empty()
-    });
+    let _ = page_size;
     crate::probe_fire!(stats.fire.execute.batch_build_us, {
-        let mut batch_req = wire::new_batched_forward_request_with_capacity(requests.len());
+        let mut lanes = Vec::with_capacity(requests.len());
         let mut instance_ids = Vec::with_capacity(requests.len());
+        let mut boundary_programs = Vec::with_capacity(requests.len());
         let mut terminal_cells = Vec::with_capacity(requests.len());
-        let mut kv_translation = Vec::new();
-        let mut kv_translation_indptr = Vec::with_capacity(requests.len() + 1);
-        kv_translation_indptr.push(0);
         let mut logical_fire_ids = Vec::with_capacity(requests.len());
-        let mut channel_expected_head = Vec::new();
-        let mut channel_expected_tail = Vec::new();
-        let mut channel_ticket_indptr = Vec::with_capacity(requests.len() + 1);
-        channel_ticket_indptr.push(0);
-        let mut program_row_indptr = Vec::with_capacity(requests.len() + 1);
-        program_row_indptr.push(0);
+        let mut member_lane_indptr = Vec::with_capacity(requests.len() + 1);
+        member_lane_indptr.push(0);
         for req in requests {
+            boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
             logical_fire_ids.push(req.logical_fire_id);
-            wire::append_request_with_options(
-                &mut batch_req,
-                &req.request,
-                req.last_page_len,
-                page_size,
-                elide_decode_masks,
-            );
-            if use_kv_write_bounds {
-                match (
-                    req.request.kv_write_lower_bounds.as_slice(),
-                    req.request.kv_write_upper_bounds.as_slice(),
-                ) {
-                    ([], []) => {
-                        batch_req.kv_write_lower_bounds.push(0);
-                        batch_req.kv_write_upper_bounds.push(u64::MAX);
-                    }
-                    ([lower], [upper]) => {
-                        batch_req.kv_write_lower_bounds.push(*lower);
-                        batch_req.kv_write_upper_bounds.push(*upper);
-                    }
-                    _ => panic!("per-fire KV containment bounds must be empty or scalar"),
-                }
-            }
-            kv_translation.extend(req.request.kv_translation.iter().copied());
-            kv_translation_indptr.push(kv_translation.len() as u32);
-            channel_expected_head.extend(req.request.channel_expected_head.iter().copied());
-            channel_expected_tail.extend(req.request.channel_expected_tail.iter().copied());
-            channel_ticket_indptr.push(channel_expected_head.len() as u32);
-            program_row_indptr.push(
-                program_row_indptr.last().copied().unwrap_or(0)
-                    + req.wire_row_count().max(1) as u32,
-            );
+            lanes.extend(req.request.lanes.iter().cloned());
+            member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
         }
         StepBuild {
-            plan: batch_req,
+            lanes,
             instance_ids,
+            boundary_programs,
+            member_lane_indptr,
             terminal_cells,
-            kv_translation,
-            kv_translation_indptr,
-            program_row_indptr,
             logical_fire_ids,
-            channel_expected_head,
-            channel_expected_tail,
-            channel_ticket_indptr,
         }
     })
 }
 
-/// tart rung ③ (re-ported onto the 0.3 scheduler): the region table —
-/// the seriation's output stated ONCE; the driver derives every planned
-/// split from it (region_plans.hpp). Maximal runs of members sharing an
-/// axis signature (PIE_REGION_SIG_*) and a depth operand k; boundaries
-/// in WIRE rows through the attribution CSR. Declined (empty) when the
-/// attribution is absent or any member owns zero wire rows.
-fn planned_region_table(
-    ordered: &[Box<PendingRequest>],
-    row_indptr: &[u32],
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    if row_indptr.len() != ordered.len() + 1 || row_indptr.windows(2).any(|w| w[1] <= w[0]) {
-        return (Vec::new(), Vec::new(), Vec::new());
-    }
-    let mut indptr: Vec<u32> = vec![row_indptr[0]];
-    let mut sigs: Vec<u32> = Vec::new();
-    let mut ks: Vec<u32> = Vec::new();
-    for (member, req) in ordered.iter().enumerate() {
-        let sig = (u32::from(req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1))
-            * ::driver_api::PIE_REGION_SIG_MULTI_TOKEN)
-            | (u32::from(req.hook_program) * ::driver_api::PIE_REGION_SIG_HOOK)
-            | (u32::from(req.request.has_user_mask) * ::driver_api::PIE_REGION_SIG_MASK)
-            | (u32::from(req.request.max_layers.is_some())
-                * ::driver_api::PIE_REGION_SIG_TRUNCATED)
-            | (u32::from(req.lora_program) * ::driver_api::PIE_REGION_SIG_LORA)
-            | (u32::from(req.hook_program && req.request.hook_page_mask)
-                * ::driver_api::PIE_REGION_SIG_HOOK_PAGE_MASK);
-        let k = req
-            .request
-            .max_layers
-            .unwrap_or(::driver_api::PIE_MAX_LAYERS_FULL);
-        let end = row_indptr[member + 1];
-        if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
-            *indptr.last_mut().expect("indptr starts nonempty") = end;
-        } else {
-            sigs.push(sig);
-            ks.push(k);
-            indptr.push(end);
-        }
-    }
-    (indptr, sigs, ks)
-}
-
-/// Assemble one sealed frame's submission (ABI v14) from its waves' picked
-/// requests, in slot order. Returns the submission plus the flattened
-/// requests in POST order (step order, member order within a step) — the
-/// retirement set.
+/// Assemble one sealed frame's fires from its waves' picked requests, in slot
+/// order. Returns the frame plus the flattened requests in POST order (step
+/// order, member order within a step) — the retirement set.
 ///
 /// Step formation preserves the old per-wave batch semantics exactly: within
-/// a wave, requests group under [`LaunchGrouping`]'s compatibility rules
-/// (instance/pipeline dedup, geometry-class homogeneity, mask/solo
-/// exclusions, structural budgets); each group becomes one STEP with a
-/// single geometry-homogeneous sub-batch, so every step's wire payload is
-/// byte-identical to the wave batch it replaces.
+/// a wave, requests group under [`LaunchGrouping`](super::worker::LaunchGrouping)'s
+/// compatibility rules (instance/pipeline dedup, geometry-class homogeneity,
+/// mask/solo exclusions, structural budgets); each group becomes one step.
 ///
-/// Frame tables:
-/// - the roster is first-appearance order across steps;
-/// - each roster lane's translation segment comes from its LAST fire in the
-///   frame (the latest overlay — prepared write targets accumulate);
-/// - `required_kv_pages` is the frame-union high-water over every member
-///   (declared high-water and page-id-derived floors).
+/// # What the frame stopped carrying
+///
+/// * **the roster** (`instance_ids` + `roster_rows`) — a per-frame table of
+///   bound instances that the step tables indexed. `StepFire::instances` is
+///   the same association said per lane, and the members that run a pass at
+///   the fire's boundary become [`Attachment`](driver_api::fire::Attachment)s
+///   of the submission itself.
+/// * **`kv_translation` / `kv_translation_indptr`** — a per-roster-lane page
+///   rewrite, gathered from each lane's LAST fire in the frame. It is
+///   [`KvDelta::translation`](driver_api::KvDelta), on the lane it is about.
+/// * **`required_kv_pages`** — the frame-union page high-water, so a driver
+///   could refuse before it started. A driver makes that check for itself and
+///   answers [`Exhausted`](driver_api::DriverError::Exhausted) with the two
+///   numbers in it.
+/// * **`sub_batch_indptr` / `sub_batch_class`** — the runs of equal geometry
+///   class, which the fire planner's own sort key already produced and this
+///   table described a second time.
+/// * **the region table** (`region_row_indptr`/`region_sig`/`region_k`) —
+///   tart's seriation output, stated for a driver that derived its planned
+///   splits from it. The palo shell derives every window from the lanes'
+///   words (`driver::fire::compose`), which is the same decision made from
+///   the same facts one layer down; the six `PIE_REGION_SIG_*` bits it was
+///   encoded in are gone with `driver-api::plan`.
 #[allow(
     clippy::vec_box,
     reason = "measured: `PendingRequest` is 1408 bytes. This vec is not a store but a \
@@ -291,7 +191,7 @@ pub(crate) fn build_frame_submission(
     limits: SchedulerLimits,
     page_size: u32,
     stats: &SchedulerStats,
-) -> (FrameSubmission, Vec<Box<PendingRequest>>) {
+) -> (FrameFire, Vec<Box<PendingRequest>>) {
     let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
     for wave in waves {
         if wave.is_empty() {
@@ -323,26 +223,16 @@ pub(crate) fn build_frame_submission(
         }
     }
 
-    let mut roster: Vec<u64> = Vec::new();
-    let mut roster_index: HashMap<u64, u32> = HashMap::new();
-    let mut lane_translation: Vec<Vec<u32>> = Vec::new();
-    let mut required_kv_pages = 0u32;
-    let mut steps: Vec<StepSubmission> = Vec::new();
+    let mut steps: Vec<StepFire> = Vec::new();
     let mut flattened: Vec<Box<PendingRequest>> = Vec::new();
 
     for group in step_groups {
-        // Ordered sub-batches: wire (Host-class) members first, the
-        // device-resolved envelope suffix last — the driver's offset
-        // fixed-decode compose requires the envelope lanes to be a
-        // contiguous program suffix. Stable sort keeps arrival order
-        // within each class.
-        let group = group;
-        // tart (0.3 re-port step 1): the fire planner's seriation — the
-        // key's PRIMARY term is device_resolved_geometry, so the
-        // envelope-suffix invariant this sort used to provide is
-        // preserved, and the mask/hook/depth windows the driver's
-        // planned splits need become contiguous. Stable, arrival-order
-        // within equal keys, exactly the pre-merge behavior.
+        // tart (0.3 re-port step 1): the fire planner's seriation. It still
+        // decides the SUBMISSION order — which is a real decision about
+        // which members share a window's rows — and it no longer has to
+        // produce a table describing itself, because the shell seriates the
+        // lanes it is given by class (`driver::fire::compose`) and the
+        // engine's order is what it seriates within.
         let facts: Vec<fire_plan::MemberFacts> = group
             .iter()
             .enumerate()
@@ -352,8 +242,8 @@ pub(crate) fn build_frame_submission(
                 custom_mask: req.request.has_user_mask,
                 truncated: req.request.max_layers.is_some(),
                 max_layers: req.request.max_layers,
-                multi_token: req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1),
-                geometry_class: req.request.geometry_class,
+                multi_token: req.request.lanes.iter().any(|lane| lane.tokens.len() > 1),
+                geometry_class: req.request.geometry,
                 arrival,
             })
             .collect();
@@ -364,122 +254,72 @@ pub(crate) fn build_frame_submission(
             .iter()
             .map(|&index| slots[index].take().expect("member_order is a permutation"))
             .collect();
-        // One sub-batch per RUN of equal class. The planner's sort key has
-        // the class as its primary term, so the runs are exactly the classes
-        // and the table below is a description of the order rather than a
-        // second opinion about it.
-        //
-        // This used to count a wire prefix and call everything after it
-        // `DecodeEnvelope`, which is the same partition while there are two
-        // classes and the wrong one as soon as there are three: a pooled
-        // device-geometry member states its pages in a channel and picks a
-        // SUBSET of them in-graph, and the envelope's contract is that pages
-        // are DERIVED from positions. Naming it `DecodeEnvelope` would hand
-        // `quest-attention` the pages its own graph did not choose.
-        let mut sub_batch_indptr: Vec<u32> = vec![0];
-        let mut sub_batch_class: Vec<u32> = Vec::new();
-        for (index, req) in group.iter().enumerate() {
-            let class = req.request.geometry_class;
-            if sub_batch_class.last() == Some(&class) {
-                *sub_batch_indptr.last_mut().expect("a run has a boundary") = (index + 1) as u32;
-            } else {
-                sub_batch_class.push(class);
-                sub_batch_indptr.push((index + 1) as u32);
-            }
-        }
+
         let build = build_batch_request(&group, page_size, stats);
-        let mut roster_rows: Vec<u32> = Vec::with_capacity(build.instance_ids.len());
-        for (member_index, (member, req)) in build.instance_ids.iter().zip(&group).enumerate() {
-            let row = *roster_index.entry(*member).or_insert_with(|| {
-                roster.push(*member);
-                lane_translation.push(Vec::new());
-                (roster.len() - 1) as u32
-            });
-            roster_rows.push(row);
-            let segment = &build.kv_translation[build.kv_translation_indptr[member_index] as usize
-                ..build.kv_translation_indptr[member_index + 1] as usize];
-            if !segment.is_empty() {
-                lane_translation[row as usize] = segment.to_vec();
-            }
-            // Declared high-water + WIRE page maxima only (v13 semantics):
-            // translation ids are physical placements, not demand — folding
-            // them in demanded a full-arena commit and broke long-context
-            // shapes that oversubscribe KV through the reclaim layer.
-            required_kv_pages = required_kv_pages.max(req.request.required_kv_pages).max(
-                req.request
-                    .kv_page_indices
-                    .iter()
-                    .copied()
-                    .max()
-                    .map_or(0, |page| page.saturating_add(1)),
-            );
-        }
-        required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
-        let (region_row_indptr, region_sig, region_k) =
-            planned_region_table(&group, &build.program_row_indptr);
-        // Engine-side region observability: the driver's [band-gate] trace
-        // skips masked/multi-token frames before printing sigs, so batteries
-        // that need per-step region truth (the AC-5 census) read this line.
         if super::worker::wave_trace() {
-            let sigs: Vec<String> = region_sig
-                .iter()
-                .zip(&region_k)
-                .map(|(sig, k)| format!("{sig}:{k}"))
-                .collect();
             eprintln!(
-                "[step-regions] rows={} regions={}",
+                "[step-lanes] members={} lanes={}",
                 group.len(),
-                sigs.join(",")
+                build.lanes.len()
             );
         }
-        steps.push(StepSubmission {
-            plan: build.plan,
-            roster_rows,
-            sub_batch_indptr,
-            sub_batch_class,
+        // ONE INSTANCE ID PER LANE, not per member: a member with several
+        // lanes is one bound instance firing several row groups.
+        let mut instances = Vec::with_capacity(build.lanes.len());
+        for (member, &instance) in build.instance_ids.iter().enumerate() {
+            let span = build.member_lane_indptr[member + 1] - build.member_lane_indptr[member];
+            instances.extend(std::iter::repeat_n(instance, span as usize));
+        }
+        // THE ATTACHMENTS (`palo B2`, design §9). One per MEMBER and not per
+        // lane, because a program's stages are one pass with one readiness
+        // gate and one commit: a member that fires three row groups is still
+        // one bound instance running one pass, and naming it three times
+        // would commit its channels three times. The lane it names is the
+        // member's FIRST — the row group whose readout row an epilogue's
+        // `logits` intrinsic is pointed at.
+        //
+        // `Boundary::Epilogue` and never `Prologue`, because a guest pass at
+        // a model fire is decode logic over the fire's own logits, and before
+        // the graph there is no readout to point at. A member whose request
+        // did not say it runs a pass at the boundary contributes nothing, so
+        // a prebuilt rider's submission is byte-identical to what it was.
+        let mut attachments = Vec::new();
+        for (member, &instance) in build.instance_ids.iter().enumerate() {
+            if !build.boundary_programs[member] {
+                continue;
+            }
+            attachments.push(crate::driver::Attachment {
+                lane: build.member_lane_indptr[member],
+                instance,
+                at: crate::driver::Boundary::Epilogue,
+            });
+        }
+        steps.push(StepFire {
+            submission: crate::driver::FireSubmission {
+                lanes: build.lanes,
+                attachments,
+            },
             terminal_cells: build.terminal_cells,
-            program_row_indptr: build.program_row_indptr,
+            instances,
             logical_fire_ids: build.logical_fire_ids,
-            channel_expected_head: build.channel_expected_head,
-            channel_expected_tail: build.channel_expected_tail,
-            channel_ticket_indptr: build.channel_ticket_indptr,
-            region_row_indptr,
-            region_sig,
-            region_k,
         });
         flattened.extend(group);
     }
 
-    let mut kv_translation: Vec<u32> = Vec::new();
-    let mut kv_translation_indptr: Vec<u32> = Vec::with_capacity(roster.len() + 1);
-    kv_translation_indptr.push(0);
-    for segment in &lane_translation {
-        kv_translation.extend(segment.iter().copied());
-        kv_translation_indptr.push(kv_translation.len() as u32);
-    }
-    (
-        FrameSubmission {
-            instance_ids: roster,
-            kv_translation,
-            kv_translation_indptr,
-            required_kv_pages,
-            steps,
-        },
-        flattened,
-    )
+    (FrameFire { steps }, flattened)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{LaunchPlan, WorkItemCompletion};
+    use crate::driver::{FireRequest, WorkItemCompletion};
+    use tensor_ir::registry::GeometryClass;
 
-    fn pending(request: LaunchPlan, instance_id: u64, prebuilt: bool) -> Box<PendingRequest> {
+    fn pending(request: FireRequest, instance_id: u64, prebuilt: bool) -> Box<PendingRequest> {
         Box::new(PendingRequest {
             hook_program: false,
             lora_program: false,
             logical_fire_id: 1,
-            last_page_len: 1,
             request,
             instance_id,
             completion: WorkItemCompletion::new(instance_id, 0),
@@ -492,353 +332,193 @@ mod tests {
         })
     }
 
-    fn wire_decode(token: u32, page: u32) -> LaunchPlan {
-        LaunchPlan {
-            token_ids: vec![token],
-            position_ids: vec![0],
-            kv_page_indices: vec![page],
-            kv_page_indptr: vec![0, 1],
-            kv_last_page_lens: vec![1],
-            qo_indptr: vec![0, 1],
-            sampling_indices: vec![0],
-            sampling_indptr: vec![0, 1],
-            mask_indptr: vec![0, 0],
-            single_token_mode: true,
-            ..LaunchPlan::default()
+    /// One decode lane: one token, one page, last-row readout.
+    fn decode(token: u32, page: u32) -> FireRequest {
+        let mut request = FireRequest::one(crate::driver::fire::lane_of(0, vec![token], 0, vec![page]));
+        request.single_token_mode = true;
+        request
+    }
+
+    fn limits() -> SchedulerLimits {
+        SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
         }
     }
 
+    /// Every member's lanes stand where the attribution says they do.
+    ///
+    /// This is `batched_fires_attribute_one_row_each`, kept: what it was
+    /// really about is that a step can say which member each of its rows
+    /// belongs to, which is what the region tables and the retirement set
+    /// both read. It used to be checked through `program_row_indptr` against
+    /// a merged `qo_indptr`; it is checked through `member_lane_indptr`
+    /// against the lanes now, and a member that contributes no lane still
+    /// holds its boundary.
     #[test]
-    fn batched_fires_attribute_one_row_each() {
-        // Two wire decodes around a device-geometry placeholder: every fire
-        // owns exactly one wire request row; the placeholder's row is empty
-        // of tokens/sampling but still holds its boundary.
-        let dg = LaunchPlan {
-            kv_translation: vec![7, 8],
-            ..LaunchPlan::default()
-        };
+    fn every_member_owns_a_span_of_the_steps_lanes() {
+        let placeholder = FireRequest::default();
         let requests = vec![
-            pending(wire_decode(11, 3), 1, false),
-            pending(dg, 2, true),
-            pending(wire_decode(22, 4), 3, false),
+            pending(decode(11, 3), 1, false),
+            pending(placeholder, 2, true),
+            pending(decode(22, 4), 3, false),
         ];
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-        assert_eq!(sub.program_row_indptr, vec![0, 1, 2, 3]);
-        assert_eq!(
-            sub.plan.qo_indptr,
-            vec![0, 1, 1, 2],
-            "placeholder row is empty"
-        );
-        assert_eq!(sub.plan.sampling_indptr, vec![0, 1, 1, 2]);
-        assert_eq!(sub.kv_translation, vec![7, 8]);
-        assert_eq!(sub.kv_translation_indptr, vec![0, 0, 2, 2]);
+        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        assert_eq!(step.member_lane_indptr, vec![0, 1, 1, 2]);
+        assert_eq!(step.instance_ids, vec![1, 2, 3]);
+        assert_eq!(step.lanes.len(), 2, "the placeholder contributes no lane");
+        assert_eq!(step.lanes[0].tokens, vec![11]);
+        assert_eq!(step.lanes[1].tokens, vec![22]);
     }
 
-    #[test]
-    fn batch_preserves_largest_required_kv_high_water() {
-        let mut first = wire_decode(11, 3);
-        first.kv_translation = vec![3, 16];
-        let mut second = wire_decode(22, 4);
-        second.kv_translation = vec![8, 28];
-        let requests = [pending(first, 1, false), pending(second, 2, false)];
-
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-
-        assert_eq!(sub.plan.required_kv_pages, 29);
-    }
-
-    #[test]
-    fn prebuilt_solo_owns_all_wire_rows() {
-        // A prebuilt wire plan with two lanes: its single program owns both
-        // rows. A device-geometry prebuilt (empty qo) owns zero rows.
-        let mut two_lane = wire_decode(11, 3);
-        two_lane.token_ids = vec![11, 22];
-        two_lane.position_ids = vec![0, 0];
-        two_lane.qo_indptr = vec![0, 1, 2];
-        two_lane.rs_slot_ids = vec![31, 32];
-        two_lane.rs_slot_flags = vec![0, crate::driver::RS_FLAG_RESET];
-        let solo = [pending(two_lane, 1, true)];
-        let sub = build_batch_request(&solo, 16, &SchedulerStats::default());
-        assert_eq!(sub.program_row_indptr, vec![0, 2]);
-        assert_eq!(sub.plan.qo_indptr, vec![0, 1, 2]);
-        assert_eq!(sub.plan.rs_slot_ids, vec![31, 32]);
-
-        let dg = LaunchPlan::default();
-        let solo_dg = [pending(dg, 2, true)];
-        let sub = build_batch_request(&solo_dg, 16, &SchedulerStats::default());
-        assert_eq!(sub.program_row_indptr, vec![0, 0]);
-    }
-
-    #[test]
-    fn ordinary_multi_row_submission_remains_intact() {
-        let mut two_lane = wire_decode(11, 3);
-        two_lane.token_ids = vec![11, 22];
-        two_lane.position_ids = vec![0, 0];
-        two_lane.qo_indptr = vec![0, 1, 2];
-        two_lane.kv_page_indices = vec![3, 4];
-        two_lane.kv_page_indptr = vec![0, 1, 2];
-        two_lane.kv_last_page_lens = vec![1, 1];
-        two_lane.sampling_indices = vec![0, 0];
-        two_lane.sampling_indptr = vec![0, 1, 2];
-        two_lane.mask_indptr = vec![0, 0, 0];
-        two_lane.rs_slot_ids = vec![17, 23];
-        two_lane.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
-        let expected = two_lane.clone();
-
-        let ordinary = [pending(two_lane, 9, false)];
-        let sub = build_batch_request(&ordinary, 16, &SchedulerStats::default());
-
-        assert_eq!(sub.instance_ids, vec![9]);
-        assert_eq!(sub.program_row_indptr, vec![0, 2]);
-        assert_eq!(sub.plan.qo_indptr, expected.qo_indptr);
-        assert_eq!(sub.plan.kv_page_indptr, expected.kv_page_indptr);
-        assert_eq!(sub.plan.sampling_indptr, expected.sampling_indptr);
-        assert_eq!(sub.plan.rs_slot_ids, vec![17, 23]);
-        assert_eq!(
-            sub.plan.rs_slot_flags,
-            vec![crate::driver::RS_FLAG_RESET, 0]
-        );
-    }
-
-    /// Multi-row masks without a row CSR reject the FIRE at admission —
-    /// the batch build treats the shape as an invariant, and a panic there
-    /// would take down the scheduler thread (RV-20).
-    #[test]
-    fn multi_row_masks_without_a_row_csr_reject_at_admission() {
-        let accumulator = AdmissionLimits::new(
-            SchedulerLimits {
-                max_forward_requests: 64,
-                max_forward_tokens: 64,
-                max_page_refs: 64,
-            },
-            16,
-        );
-        let mut two_lane = wire_decode(11, 3);
-        two_lane.token_ids = vec![11, 22];
-        two_lane.position_ids = vec![0, 0];
-        two_lane.qo_indptr = vec![0, 1, 2];
-        two_lane.kv_page_indices = vec![3, 4];
-        two_lane.kv_page_indptr = vec![0, 1, 2];
-        two_lane.kv_last_page_lens = vec![1, 1];
-        two_lane.sampling_indices = vec![0, 0];
-        two_lane.sampling_indptr = vec![0, 1, 2];
-        two_lane.masks = vec![::driver_api::EncodedMask::new(vec![1], 1)];
-        two_lane.mask_indptr = vec![0, 1];
-
-        let message = accumulator
-            .single_request_limit_error(&pending(two_lane.clone(), 9, false))
-            .expect("multi-row masks without a row CSR must reject the fire");
-        assert!(message.contains("without a row CSR"), "{message}");
-
-        // The same fire with a row CSR is admitted.
-        two_lane.mask_indptr = vec![0, 1, 1];
-        assert_eq!(
-            accumulator.single_request_limit_error(&pending(two_lane, 9, false)),
-            None
-        );
-    }
-
-    #[test]
-    fn multi_row_submission_cobatches_without_collapsing_csrs() {
-        let mut two_lane = wire_decode(11, 3);
-        two_lane.token_ids = vec![11, 22];
-        two_lane.position_ids = vec![0, 0];
-        two_lane.qo_indptr = vec![0, 1, 2];
-        two_lane.kv_page_indices = vec![3, 4];
-        two_lane.kv_page_indptr = vec![0, 1, 2];
-        two_lane.kv_last_page_lens = vec![1, 1];
-        two_lane.sampling_indices = vec![0, 0];
-        two_lane.sampling_indptr = vec![0, 1, 2];
-        two_lane.mask_indptr = vec![0, 0, 0];
-        two_lane.rs_slot_ids = vec![17, 23];
-        two_lane.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
-
-        let requests = [
-            pending(two_lane, 9, false),
-            pending(wire_decode(33, 5), 10, false),
-        ];
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-
-        assert_eq!(sub.program_row_indptr, vec![0, 2, 3]);
-        assert_eq!(sub.plan.qo_indptr, vec![0, 1, 2, 3]);
-        assert_eq!(sub.plan.kv_page_indptr, vec![0, 1, 2, 3]);
-        assert_eq!(sub.plan.sampling_indptr, vec![0, 1, 2, 3]);
-        assert_eq!(sub.plan.sampling_indices, vec![0, 0, 0]);
-        assert_eq!(sub.plan.rs_slot_ids, vec![17, 23]);
-        assert_eq!(sub.plan.image_indptr, vec![0, 0, 0, 0]);
-        assert_eq!(sub.plan.audio_indptr, vec![0, 0, 0, 0]);
-        assert_eq!(sub.plan.embed_block_indptr, vec![0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn device_resolved_multitoken_geometry_skips_placeholder_mask_trim() {
-        let mut request = wire_decode(11, 3);
-        request.token_ids = vec![11, 0, 0, 0];
-        request.position_ids = vec![0; 4];
-        request.qo_indptr = vec![0, 4];
-        request.kv_page_indices = vec![3, 4, 5];
-        request.kv_page_indptr = vec![0, 3];
-        request.kv_last_page_lens = vec![6];
-        request.sampling_indices = vec![0, 1, 2, 3];
-        request.sampling_indptr = vec![0, 4];
-        request.single_token_mode = false;
-        request.device_resolved_geometry = true;
-
-        let requests = [pending(request, 12, false)];
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-        assert_eq!(sub.plan.kv_page_indices, vec![3, 4, 5]);
-        assert!(sub.plan.masks.is_empty());
-    }
-
-    #[test]
-    fn host_custom_mask_cobatches_with_causal_fire() {
-        let mut custom = wire_decode(11, 3);
-        custom.has_user_mask = true;
-        custom.single_token_mode = false;
-        custom.masks = vec![::driver_api::EncodedMask::new(vec![1], 1)];
-        custom.mask_indptr = vec![0, 1];
-        let requests = [
-            pending(custom, 20, false),
-            pending(wire_decode(22, 4), 21, false),
-        ];
-
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-        assert_eq!(sub.instance_ids, vec![20, 21]);
-        assert_eq!(sub.plan.mask_indptr, vec![0, 1, 2]);
-        assert_eq!(sub.plan.masks.len(), 2);
-        assert_eq!(sub.plan.masks[0].runs, vec![1], "explicit custom row");
-        assert_eq!(
-            sub.plan.masks[1].runs,
-            vec![0, 1],
-            "causal peer receives the synthesized compatible row"
-        );
-        assert!(sub.plan.has_user_mask);
-        assert!(!sub.plan.single_token_mode);
-    }
-
-    /// A pooled device-geometry member is stamped as its OWN class.
+    /// A multi-lane member keeps every one of its lanes.
     ///
-    /// # The bug this pins
-    ///
-    /// The stamp used to be derived: count a prefix of members whose
-    /// `device_resolved_geometry` was false, call that `Host`, call the rest
-    /// `DecodeEnvelope`. A pooled device-geometry fire has
-    /// `decode_envelope == None` by construction -- `host/forward.rs` guards
-    /// the pooled route on exactly that -- so the bool was false for the fires
-    /// the class was written for, and they went out as class 0. The driver
-    /// then read geometry out of the wire plan, which such a fire leaves
-    /// empty, and refused with `no page span in a CSR of 0 entries`.
+    /// This is `prebuilt_solo_owns_all_wire_rows` and
+    /// `ordinary_multi_row_submission_remains_intact` together — they were
+    /// two readings of the same claim, that the merge must not collapse a
+    /// member's inner rows to one. Nothing is merged, so the claim is that
+    /// the lanes arrive verbatim.
     #[test]
-    fn a_pooled_device_geometry_member_is_stamped_its_own_class() {
-        let mut plan = wire_decode(11, 3);
-        plan.geometry_class = ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY;
-        // Such a fire states its pages in a channel, not in the plan.
-        plan.kv_page_indices.clear();
-        plan.kv_page_indptr.clear();
-        plan.kv_last_page_lens.clear();
+    fn a_multi_lane_member_arrives_lane_for_lane() {
+        let mut two = FireRequest {
+            lanes: vec![
+                crate::driver::fire::lane_of(0, vec![11], 0, vec![3]),
+                crate::driver::fire::lane_of(1, vec![22], 0, vec![4]),
+            ],
+            ..FireRequest::default()
+        };
+        two.rs.slot_ids = vec![31, 32];
+        two.rs.slot_flags = vec![0, crate::driver::RS_FLAG_RESET];
+        let expected = two.lanes.clone();
 
-        let (frame, _) = build_frame_submission(
-            vec![vec![pending(plan, 12, false)]],
-            SchedulerLimits {
-                max_forward_requests: 8,
-                max_forward_tokens: 64,
-                max_page_refs: 64,
-            },
-            16,
-            &SchedulerStats::default(),
-        );
+        let step = build_batch_request(&[pending(two, 1, true)], 16, &SchedulerStats::default());
+        assert_eq!(step.member_lane_indptr, vec![0, 2]);
+        assert_eq!(step.lanes, expected);
+    }
+
+    /// Two members co-batch by concatenation, in member order.
+    #[test]
+    fn members_cobatch_by_concatenation() {
+        let two = FireRequest {
+            lanes: vec![
+                crate::driver::fire::lane_of(0, vec![11], 0, vec![3]),
+                crate::driver::fire::lane_of(1, vec![22], 0, vec![4]),
+            ],
+            ..FireRequest::default()
+        };
+        let requests = [pending(two, 9, false), pending(decode(33, 5), 10, false)];
+        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+
+        assert_eq!(step.member_lane_indptr, vec![0, 2, 3]);
         assert_eq!(
-            frame.steps[0].sub_batch_class,
-            vec![::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY],
-            "the class the fire was classified as is the class on the wire"
+            step.lanes
+                .iter()
+                .map(|lane| lane.tokens.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![11], vec![22], vec![33]]
         );
     }
 
-    /// Classes partition into RUNS, and the planner's sort makes the runs
-    /// contiguous, so a mixed step names both.
+    /// A lane's mask is the lane's, and a peer with none gets none.
+    ///
+    /// This is `host_mask_on_device_geometry_is_not_elided_as_dense`, kept
+    /// for the half that survives: a host-lowered mask reaches the
+    /// submission. What it can no longer be is *elided* or *synthesized* —
+    /// the merge used to push a causal row for every unmasked peer so that
+    /// the flat `masks` vector stayed parallel to the rows, and a lane that
+    /// carries no mask now simply carries none.
     #[test]
-    fn a_mixed_step_names_a_sub_batch_per_class() {
-        let host = wire_decode(11, 3);
-        let mut pooled = wire_decode(11, 3);
-        pooled.geometry_class = ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY;
-        pooled.kv_page_indices.clear();
-        pooled.kv_page_indptr.clear();
-        pooled.kv_last_page_lens.clear();
+    fn a_masked_lane_carries_its_own_mask_and_a_peer_carries_none() {
+        let mut masked = decode(11, 3);
+        masked.has_user_mask = true;
+        masked.single_token_mode = false;
+        masked.device_resolved_geometry = true;
+        masked.lanes[0].mask = Some(crate::driver::Mask::new(vec![0, 1], 1));
 
-        let (frame, _) = build_frame_submission(
-            vec![vec![pending(pooled, 13, false), pending(host, 12, false)]],
-            SchedulerLimits {
-                max_forward_requests: 8,
-                max_forward_tokens: 64,
-                max_page_refs: 64,
-            },
+        let requests = [pending(masked, 20, false), pending(decode(22, 4), 21, false)];
+        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        assert_eq!(
+            step.lanes[0].mask,
+            Some(crate::driver::Mask::new(vec![0, 1], 1))
+        );
+        assert_eq!(step.lanes[1].mask, None, "an unmasked peer stays unmasked");
+    }
+
+    /// A pooled device-geometry member seriates into the step's SUFFIX.
+    ///
+    /// This is `a_pooled_device_geometry_member_is_stamped_its_own_class`
+    /// and `a_mixed_step_names_a_sub_batch_per_class`, kept as the claim
+    /// that outlived the tables they checked. `sub_batch_class` was the
+    /// planner's own sort key written down a second time for the driver;
+    /// what it was ever protecting is that a device-resolved member is a
+    /// contiguous suffix and never interleaved with the host members, and
+    /// that is a property of the ORDER, which is still the engine's.
+    #[test]
+    fn a_device_geometry_member_seriates_into_the_suffix() {
+        let mut pooled = decode(11, 3);
+        pooled.geometry = GeometryClass::DeviceGeometry;
+        // Such a fire states its pages in a channel, not in the submission.
+        pooled.lanes[0].kv.pages.clear();
+
+        let (frame, flattened) = build_frame_submission(
+            vec![vec![pending(pooled, 13, false), pending(decode(22, 4), 12, false)]],
+            limits(),
             16,
             &SchedulerStats::default(),
         );
         let step = &frame.steps[0];
+        assert_eq!(step.submission.lanes.len(), 2);
         assert_eq!(
-            step.sub_batch_class,
-            vec![
-                ::driver_api::PIE_GEOMETRY_CLASS_HOST,
-                ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY
-            ],
+            flattened
+                .iter()
+                .map(|req| req.request.geometry)
+                .collect::<Vec<_>>(),
+            vec![GeometryClass::Host, GeometryClass::DeviceGeometry],
             "host first, device-resolved as the suffix run"
         );
-        assert_eq!(step.sub_batch_indptr, vec![0, 1, 2]);
+        assert_eq!(step.instances, vec![12, 13]);
     }
 
+    /// A frame's steps carry one terminal cell per member, and no two steps
+    /// share one.
     #[test]
-    fn host_mask_on_device_geometry_is_not_elided_as_dense() {
-        let mut request = wire_decode(11, 3);
-        request.device_resolved_geometry = true;
-        request.has_user_mask = true;
-        request.single_token_mode = false;
-        request.masks = vec![::driver_api::EncodedMask::new(vec![0, 1], 1)];
-        request.mask_indptr = vec![0, 1];
-
-        let requests = [pending(request, 12, false)];
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-        assert_eq!(sub.plan.masks.len(), 1);
-        assert_eq!(sub.plan.mask_indptr, vec![0, 1]);
-        assert!(sub.plan.has_user_mask);
+    fn a_frames_cells_are_one_per_member_and_never_shared() {
+        let (frame, flattened) = build_frame_submission(
+            vec![
+                vec![pending(decode(11, 3), 1, false)],
+                vec![pending(decode(22, 4), 2, false)],
+            ],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        let cells: Vec<_> = frame.terminal_cells().collect();
+        assert_eq!(cells.len(), flattened.len());
+        assert_eq!(
+            cells.iter().collect::<std::collections::HashSet<_>>().len(),
+            cells.len(),
+            "no cell is owned by two members"
+        );
     }
 
-    #[test]
-    fn deferred_multi_row_geometry_cobatches_as_zero_kv_spans() {
-        let mut plan = wire_decode(11, 3);
-        plan.token_ids = vec![11, u32::MAX];
-        plan.position_ids = vec![0, 0];
-        plan.qo_indptr = vec![0, 1, 2];
-        plan.kv_page_indices.clear();
-        plan.kv_page_indptr.clear();
-        plan.kv_last_page_lens.clear();
-        plan.sampling_indices = vec![0, 0];
-        plan.sampling_indptr = vec![0, 1, 2];
-        plan.mask_indptr = vec![0, 0, 0];
-        plan.device_resolved_geometry = true;
-        plan.kv_write_lower_bounds = vec![7];
-        plan.kv_write_upper_bounds = vec![15];
-        let requests = [pending(plan.clone(), 20, false), pending(plan, 21, false)];
-
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-        assert_eq!(sub.program_row_indptr, vec![0, 2, 4]);
-        assert_eq!(sub.plan.kv_page_indices, Vec::<u32>::new());
-        assert_eq!(sub.plan.kv_page_indptr, vec![0, 0, 0, 0, 0]);
-        assert_eq!(sub.plan.kv_last_page_lens, vec![0, 0, 0, 0]);
-        assert_eq!(sub.plan.kv_write_lower_bounds, vec![7, 7]);
-        assert_eq!(sub.plan.kv_write_upper_bounds, vec![15, 15]);
-    }
-
-    #[test]
-    fn mixed_batches_fill_unbounded_containment_entries() {
-        let plain = wire_decode(11, 3);
-        let mut bounded = wire_decode(22, 4);
-        bounded.kv_write_lower_bounds = vec![7];
-        bounded.kv_write_upper_bounds = vec![9];
-        let requests = [pending(plain, 20, false), pending(bounded, 21, false)];
-
-        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
-        assert_eq!(sub.plan.kv_write_lower_bounds, vec![0, 7]);
-        assert_eq!(sub.plan.kv_write_upper_bounds, vec![u64::MAX, 9]);
-    }
+    // FIVE TESTS STOOD HERE AND ARE GONE WITH THE SHAPES THEY PINNED:
+    //
+    // * `batch_preserves_largest_required_kv_high_water` — `required_kv_pages`
+    //   was a frame-union high-water the engine computed so a driver could
+    //   refuse early; a driver answers `DriverError::Exhausted` with the two
+    //   numbers itself.
+    // * `multi_row_masks_without_a_row_csr_reject_at_admission` — a flat
+    //   `masks` vector out of step with the `mask_indptr` cutting it is
+    //   unrepresentable: a mask lives on its lane.
+    // * `device_resolved_multitoken_geometry_skips_placeholder_mask_trim` —
+    //   the page trim went with `scheduler::wire` (see the note at its
+    //   `mod` line).
+    // * `deferred_multi_row_geometry_cobatches_as_zero_kv_spans` — every
+    //   assertion in it was about `kv_page_indptr`/`kv_last_page_lens`
+    //   staying parallel across a merge that no longer happens.
+    // * `mixed_batches_fill_unbounded_containment_entries` — the merge had
+    //   to push `(0, u64::MAX)` for every member with no bounds so the two
+    //   parallel `Vec<u64>`s stayed full length; the bounds are
+    //   `Option<(u64, u64)>` per request.
 }

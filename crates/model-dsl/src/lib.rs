@@ -1,8 +1,9 @@
 //! The forward-pass authoring eDSL over the typed IR (design §4, §10). Model
 //! texts call the per-family wrappers in [`ops`], which compute shapes in
-//! plain Rust and push typed op variants onto a recorded [`Plan`]; `split` /
-//! [`merge!`] / [`facts!`] carry the guard tracking over from the old surface
-//! unchanged. This crate names no backend and reaches no device.
+//! plain Rust and push typed op variants onto a recorded [`Plan`]; `split`,
+//! `Value::merge` and the [`Predicate`] algebra carry the guard tracking over
+//! from the old surface unchanged. This crate names no backend and reaches no
+//! device.
 //!
 //! WHERE A WEIGHT'S BYTES COME FROM IS NOT SAID HERE. It was, in a `load`
 //! module of production tables with a source algebra of their own, and that
@@ -34,26 +35,68 @@ pub use forward::*;
 /// EVERY NAME ON IT IS ASKED FOR BY SOMEBODY, and the list narrows when that
 /// stops being true. `Attention`, `CacheRow`, `Def`, `Linear`, `Plan` and
 /// `ValueId` are what `model::deployment` reads a traced plan with;
-/// `Collective` and `Operation` are how `model::identify` tells one rank of a
-/// world from a whole model; `Dtype` is what a catalog row and a load contract
+/// `Dtype` is what a catalog row and a load contract
 /// are written in; `GeomKind` is what a forward pass asks the runtime for;
 /// `Plane` is what a trace is taken at; `Param` and `Shard` are the plan's
 /// demand column and the axis a rank cut runs along, which
 /// `model/tests/every_param_has_one_producer.rs` holds against the contract
 /// that fills it.
+///
+/// `Operands` is how a tool asks a node what it reads and writes without
+/// matching every op variant itself. `resolve_classes` is the newest name on
+/// the list and the one a model text feels most directly: the class sweep
+/// every merge a forward pass writes has to survive (palo design §1). The IR
+/// owns it because the compiler's accept pass runs the same walk, and it
+/// arrives here for the reason everything else does —
+/// `model/tests/every_class_resolves_every_merge.rs` reads traced plans with
+/// these two, and reading a plan goes through this door.
 pub use model_ir::{
-    Attention, CacheRow, Collective, Def, Dtype, GeomKind, Linear, Operation, Param, Plan, Plane,
-    Shard, ValueId,
+    Attention, CacheRow, Def, Dtype, GeomKind, Linear, Operands, Operation, Param, Plan, Plane,
+    Shard, ValueId, resolve_classes,
 };
 pub use record::{Recorder, SplitSpec, Value};
 
 /// What the catalog registers per model: trace me for this plane.
 pub type TraceFn = fn(Plane) -> Plan;
 
+/// What the catalog registers per model: sort this request into my facts and
+/// pack them into the one `u64` a lane carries.
+///
+/// MONOMORPHIC ON PURPOSE. `Classify` is a trait over a family's own `Facts`
+/// struct, and the party that needs a word — the engine's fire path — holds
+/// a SKU string and nothing else: it cannot name `qwen_3::forward::Facts`,
+/// and a plan cannot tell it either, because `Cond::Fact(bit)` numbers its
+/// bits and a bit is a position and nothing else (see [`Predicate`]). The
+/// column is what closes that: one pointer per row, wrapping the family's own
+/// `Classify::of(r).word()`, so which bit `qo_one` is stays the model's own
+/// business and the word still travels.
+pub type ClassifyFn = fn(&Request) -> u64;
+
+/// The catalog rows of one family: `(sku, tp, trace, model)` each, closing the
+/// model expression into a [`TraceFn`] and a [`ClassifyFn`].
+///
+/// TP IS A COLUMN BECAUSE IT IS A FACT ABOUT THE ROW. It was reachable only by
+/// reading the model expression's arguments — or, worse, by tracing the whole
+/// forward pass and looking for an `AllReduce`, which is how `model::identify`
+/// used to tell one rank of a world from a whole model. A name is a name; the
+/// world size a row was built for is a number, and it belongs beside the name
+/// that promises it.
+///
+/// THE CLASSIFY COLUMN IS THE SAME ARGUMENT ONE STEP FURTHER IN. A lane's word
+/// is what the driver composes a fire from, and computing it means calling
+/// `<M::Facts as Classify>::of` — a call only a party that can NAME the
+/// family's `Facts` can write. The catalog is where the family's type is last
+/// visible, so it is where the call is closed over; everywhere downstream
+/// holds a SKU string and a [`ClassifyFn`].
 #[macro_export]
 macro_rules! catalog {
-    ($( ($name:literal, $trace:path, $m:expr $(,)?) ),+ $(,)?) => {
-        &[ $( ($name, (|plane| $trace($name, &$m, plane)) as _) ),+ ]
+    ($( ($name:literal, $tp:literal, $trace:path, $m:expr $(,)?) ),+ $(,)?) => {
+        &[ $( (
+            $name,
+            $tp,
+            (|plane| $trace($name, &$m, plane)) as _,
+            (|request: &$crate::Request| $crate::word_of(|| $m, request)) as _,
+        ) ),+ ]
     };
 }
 
@@ -81,24 +124,13 @@ pub mod seam {
 
     pub const OUT: Def = Def { name: "out" };
 
-    pub trait Sees {
-        fn values(&self) -> Vec<&Value>;
-    }
-
-    impl Sees for (&Value,) {
-        fn values(&self) -> Vec<&Value> {
-            vec![self.0]
-        }
-    }
-
-    impl Sees for (&Value, &Value) {
-        fn values(&self) -> Vec<&Value> {
-            vec![self.0, self.1]
-        }
-    }
-
-    pub fn at<S: Sees>(def: Def, sees: S) {
-        let values = sees.values();
-        values[0].rec().seam(def.name, &values);
+    /// Plant a seam on the values it names. The first one carries the recorder
+    /// — every value of one trace carries the same one — so the slice must not
+    /// be empty; a seam over nothing has nothing to say.
+    pub fn at(def: Def, values: &[&Value]) {
+        let first = values
+            .first()
+            .unwrap_or_else(|| panic!("seam `{}` names no value", def.name));
+        first.rec().seam(def.name, values);
     }
 }

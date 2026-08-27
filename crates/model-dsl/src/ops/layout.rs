@@ -5,7 +5,7 @@ use super::*;
 
 pub fn embed(ids: &Value, table: &Weight, vocab: u32) -> Value {
     let r = ids.rec();
-    let y = r.fresh(tensor(Dim::Tokens, table.dim(1), table.dtype()));
+    let y = r.fresh(tensor(Dim::Tokens, table.dim(1), table.compute_dtype()));
     r.push(
         Layout::Embed {
             ids: ids.id(),

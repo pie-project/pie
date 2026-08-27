@@ -576,13 +576,17 @@ pub fn mla_absorb_q(
     q_latent
 }
 
+/// The trailing pair reads `nope_dim, v_head_dim`, the same order
+/// [`mla_absorb_q`] takes it in: the two calls sit a dozen lines apart in every
+/// MLA text, take the same four numbers, and used to take the last two the
+/// other way round — which no call site can see and no type can catch.
 pub fn mla_absorb_out(
     latent: &Value,
     kv_b: &Weight,
     heads: u32,
     kv_lora_rank: u32,
-    v_head_dim: u32,
     nope_dim: u32,
+    v_head_dim: u32,
 ) -> Value {
     let r = latent.rec();
     let width = u64::from(heads) * u64::from(v_head_dim);

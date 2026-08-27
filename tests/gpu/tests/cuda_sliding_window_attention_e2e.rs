@@ -38,8 +38,9 @@
 //! value
 //! ```
 //!
-//! That sentence is about the symptom. The claim behind it is one line in
-//! `crates/driver-cuda/src/serve/load.rs`, beside `device_geometry_port_mask`:
+//! That sentence is about the symptom. The claim behind it lived beside the
+//! old shell's `device_geometry_port_mask` and survives as
+//! `PortMask::DEVICE_GEOMETRY` in `crates/tensor-ir/src/registry.rs`:
 //!
 //! > Exactly the three ports `fire::envelope::compose` reads -- `EmbedTokens |
 //! > Positions | KvLen`; the rest a decode derives from the positions.

@@ -44,8 +44,12 @@ members = [
     #
     # `-abi` was the other suffix, for the repr(C) FFI contract, and no crate
     # carries it any more: every driver on the far side is Rust, so the
-    # marshalling shapes went and `driver-api` is owned Rust types with one
-    # `#[repr(C)]` survivor that earns it. See `driver-api/src/local.rs`.
+    # marshalling shapes went. `driver-api` kept the shape of one for a while
+    # after the C++ left -- an `i32` status ladder, an ABI version on an
+    # in-process call, `u8` tag constants re-spelling `tensor-ir`'s vocabulary
+    # -- and the palo rewrite (design §7) deleted the last of it. It is owned
+    # Rust types over `model-ir` and `tensor-ir` now, with no `#[repr(C)]` left
+    # in it at all.
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
@@ -95,8 +99,12 @@ members = [
     "crates/model-ir",
     # The authoring surface: Recorder/Value, wrappers that own their shapes.
     "crates/model-dsl",
+    # Bakes a Plan once (palo design §2): classes, regions, the arena carve.
+    "crates/model-compiler",
     # The model catalog: six forwards on the new surface, SKU names verbatim.
     "crates/model",
+    # The prompt formats: ChatML/Harmony/Gemma/DeepSeek/Kimi, both directions.
+    "crates/chat-template",
     # The dispatch contract (15 traits, aggregate exec) and the shared walk.
     "crates/kernels",
     # Pure CUDA kernel definitions: jit machinery, owned attention plans,
@@ -144,6 +152,8 @@ default-members = [
     "crates/model",
     "crates/model-ir",
     "crates/model-dsl",
+    # Pure, deviceless and fast to check — a workspace sweep should carry it.
+    "crates/model-compiler",
     "crates/model-loader",
     "crates/kernels",
     "crates/kernels-cuda",
@@ -256,19 +266,15 @@ tokenizer = { path = "crates/tokenizer" }
 # the same websocket path a deployment is reached by, because measuring an
 # in-process shortcut would measure something nobody runs.
 client = { path = "crates/client" }
-# THE CATALOG, and after R3 there is one. This line read `model-legacy` and
-# carried `features = ["contract"]`, because `pie model build` authored that
-# crate's load contract and `pie model import` applied its per-family ingest
-# pass. Both are deleted (see `src/ops/model.rs`), and what is left needs
-# three things from this crate. `pie model import` needs
-# `serve::encoding::CONFIG_OBJECT`, the object name the checkpoint's own
-# `config.json` is carried into an artifact under -- a literal here would be a
-# second definition of something a reader elsewhere has to match exactly, and
-# a mismatch does not fail, the read just finds nothing. `pie model list`
-# needs `snapshot::Snapshot` and `identify`, because "can pie serve this?" is
-# now a question about a checkpoint's tensor names and not about a table of HF
-# `model_type` strings. None of the three is behind the `serve` feature.
-model = { path = "crates/model" }
+# `model` STOOD HERE, and after R3 it was the catalog: `pie model import` took
+# `serve::encoding::CONFIG_OBJECT` off it, and `pie model list` took
+# `snapshot::Snapshot` and `identify` to answer "can pie serve this?". M18/M19
+# deleted all three names, and their replacements are not in that crate. The
+# object name lives with its readers in `worker::weights`; the identity
+# question is `engine::driver::load::identify`, which compiles each SKU's load
+# contract against the checkpoint rather than matching tensor names — a name
+# match cannot tell a 3B Qwen from a 0.8B one, which is measured. This package
+# links `worker` and `engine` already, so the edge went with the names.
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.

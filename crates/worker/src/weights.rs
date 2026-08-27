@@ -23,7 +23,18 @@
 
 use std::path::{Path, PathBuf};
 
+use ::engine::model::ModelMetadata;
 use anyhow::{Result, anyhow, bail};
+
+/// The artifact object the checkpoint's own `config.json` is written under.
+///
+/// It was `model::serve::encoding::CONFIG_OBJECT`, beside an `Encoding` that
+/// parsed the document. M18 deleted that module, and the parser did not come
+/// with it: the loader reads a checkpoint's quantization off its STORED
+/// tensor encodings now, not off what its config claims, so the one reader
+/// this name had is gone. The NAME still has two — the writer below in this
+/// file's tests, and the reader in [`Model::metadata`] — and both are here.
+pub const CONFIG_OBJECT: &str = "model/config";
 
 /// What the worker was pointed at.
 ///
@@ -54,17 +65,19 @@ impl Model {
     /// what lets everything downstream read one document instead of keeping a
     /// second path that parses the files beside a snapshot.
     ///
-    /// One reader is left, and it wants three fields:
-    /// [`Encoding::from_config_json`](model::serve::encoding::Encoding::from_config_json)
-    /// asks what quantization the checkpoint declares. Everything else the
-    /// old `pie.model/1` document carried is a catalog row's now.
+    /// It is carried and not parsed. The last in-tree reader of the config's
+    /// own fields was `model::serve::encoding::Encoding`, which asked what
+    /// quantization the checkpoint declared; M18 deleted it, because the
+    /// loader reads that off the stored tensor encodings instead of believing
+    /// the document. Everything else the old `pie.model/1` document carried
+    /// is a catalog row's.
     ///
     /// The tokenizer half stays optional, and all-or-nothing: half the
     /// tokenizer compiled and half probed from files is the skew the artifact
     /// removes, so a partial one is treated as absent and the files win.
-    pub fn metadata(&self) -> Result<model::serve::ModelMetadata> {
+    pub fn metadata(&self) -> Result<ModelMetadata> {
         let Model::Artifact(path) = self else {
-            return Ok(model::serve::ModelMetadata {
+            return Ok(ModelMetadata {
                 tokenizer: None,
                 config: lift_snapshot_config(self.path())?,
             });
@@ -74,19 +87,16 @@ impl Model {
         let checkpoint = model_loader::checkpoint::read::parse_checkpoint_metadata(path)
             .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
-        let config = model_loader::checkpoint::read::read_meta(
-            &checkpoint,
-            model::serve::encoding::CONFIG_OBJECT,
-        )?
-        .ok_or_else(|| {
-            anyhow!(
-                "artifact {} carries no {}; it was written when an artifact \
-                 carried a resolved `pie.model/1` document instead of the \
-                 checkpoint's own config. Re-import it with `pie model import`",
-                path.display(),
-                model::serve::encoding::CONFIG_OBJECT,
-            )
-        })?;
+        let config = model_loader::checkpoint::read::read_meta(&checkpoint, CONFIG_OBJECT)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "artifact {} carries no {}; it was written when an artifact \
+                     carried a resolved `pie.model/1` document instead of the \
+                     checkpoint's own config. Re-import it with `pie model import`",
+                    path.display(),
+                    CONFIG_OBJECT,
+                )
+            })?;
 
         let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
         for name in tokenizer::canonical::OBJECTS {
@@ -96,7 +106,7 @@ impl Model {
             };
             tokenizer.push((name.to_string(), bytes));
         }
-        Ok(model::serve::ModelMetadata {
+        Ok(ModelMetadata {
             tokenizer: (!tokenizer.is_empty()).then_some(tokenizer),
             config,
         })
@@ -120,9 +130,11 @@ impl Model {
 /// The three that remain are the declared quantization — method, bits,
 /// group size — and they are the only ones a row cannot state, because
 /// they are properties of the FILES and Qwen3-8B ships as four
-/// different sets of them. [`model::serve::encoding::Encoding::from_config_json`]
-/// reads exactly those three, so what has to cross is the config
-/// itself.
+/// different sets of them. Nothing in the tree reads them out of this
+/// document any more — the loader takes a checkpoint's encodings off the
+/// tensors themselves — but the config still crosses whole, because
+/// carrying the checkpoint's own bytes is cheaper than deciding, here, which
+/// of its fields a future reader will want.
 ///
 /// Verbatim also removes a class of failure the normalizer had by
 /// construction: it was a second reader of a document the checkpoint
@@ -357,9 +369,7 @@ mod tests {
             .unwrap();
         let mut writer = CheckpointWriter::create(&path, &Default::default()).unwrap();
         // Ascending names: `model/…` sorts before `tokenizer/…`.
-        writer
-            .add_meta(model::serve::encoding::CONFIG_OBJECT, config)
-            .unwrap();
+        writer.add_meta(CONFIG_OBJECT, config).unwrap();
         for (name, bytes) in canonical.objects() {
             if !whole_tokenizer && name == tokenizer::canonical::MERGE_TABLE {
                 continue;
@@ -474,11 +484,14 @@ mod tests {
         assert_eq!(doc["num_hidden_layers"], 2);
         assert_eq!(doc["vocab_size"], 32);
         assert_eq!(doc["model_type"], "llama");
-        // THE ONE FIELD A READER STILL WANTS. Absent here, which is not a
-        // defect: most checkpoints declare no quantization, and an absent
-        // block is an unquantized checkpoint rather than a missing answer.
+        // THE QUANTIZATION BLOCK, absent here, which is not a defect: most
+        // checkpoints declare none, and an absent block is an unquantized
+        // checkpoint rather than a missing answer. This used to run it
+        // through `model::serve::encoding::Encoding`; that parser is deleted
+        // and had no non-test caller, so what is left to assert is that the
+        // block is not there and nothing invented one.
         assert!(
-            model::serve::encoding::Encoding::from_config_value(&doc).is_none(),
+            doc.get("quantization_config").is_none() && doc.get("quantization").is_none(),
             "an unquantized snapshot declares nothing"
         );
 

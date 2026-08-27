@@ -43,12 +43,14 @@ testkit = []
 # device answer is checked against.
 #
 # WHO TURNS THIS ON, MEASURED: exactly one target in the tree, and it is a
-# test. `cargo test -p driver-cuda --features cuda-13,abi --test
-# gpu_load_transforms` is the only build that reaches `executor::cuda`, plus
-# this crate's own `tests/gpu_transform_parity.rs` under `--features cuda-13`.
-# No `src/` path in any driver constructs a `CudaArena`: `driver-cuda` names
-# this crate twice, for a `From<Error>` impl and for `CUDA_TILE_MAP_MASK`, and
-# neither reaches the arena.
+# test — this crate's own `tests/gpu_transform_parity.rs`, under
+# `--features cuda-13`. (`driver-cuda`'s `gpu_load_transforms` stood here too
+# and is gone with the shell rewrite; nothing replaced it.) No `src/` path in
+# any driver constructs a `CudaArena`: `driver-cuda` names this crate for a
+# `From<Error>` impl and for `CUDA_TILE_MAP_MASK`, and neither reaches the
+# arena — its `crates/driver-cuda/src/weights.rs` hands the executor a
+# `Vec<u8>`, so every transform
+# it runs is host-side.
 #
 # The code stays anyway, and the reason is not sentiment. It is the ONLY
 # device-side answer to a load transform in this tree, and the gated test is
@@ -68,7 +70,7 @@ testkit = []
 # `api`, which is NVRTC at run time and a text file at build time, so
 # `--features cuda-13` needs a driver and no toolkit. Nothing in this crate's
 # graph builds an archive any more.
-cuda = ["dep:kernels-cuda", "dep:cudarc"]
+cuda = ["dep:kernels-cuda", "dep:cudarc", "dep:model-ir"]
 
 # WHICH CUDA RUNTIME, and now there are TWO crates voting rather than one.
 # This crate still names no version of its own — `driver-cuda` offers
@@ -90,24 +92,34 @@ cuda-13 = ["cuda", "cudarc/cuda-13000", "kernels-cuda/cuda-13"]
 
 [dependencies]
 half = "2"
-# The four rows this crate fires at load time, as generated typed functions —
-# `api::quant_cast_fp32_to_bf16` and its three siblings — plus the `Dims`,
-# `Stream` and `Error` their signatures are written in.
+# The four rows this crate fires at load time, as the typed entries
+# `linear::quant::cast_fp32_to` and its three siblings — plus the `Ctx`,
+# `Tensor` and `KernelError` their signatures are written in.
 #
 # kernels-cuda was here and is not — the ahead-of-time archive crate of that
 # name, deleted at `85c6c674b`. It carried the `pie_k_*` declarations, which
 # are `extern "C"` symbols defined by that archive; the archive is what dragged
 # nvcc into every build of this crate that wanted
-# device transforms. The typed entry points come from the SAME ROWS through
-# `kernels-cuda`'s `emit::emit_rust_api`, which is the replacement for
-# the generator that emitted the C shim — so a row that changes its operands
-# still changes this call site or fails to compile, which was the only
-# property the shim was worth having for.
+# device transforms. The typed entry points are the SAME ROWS, hand-written
+# now in `kernels-cuda/src/linear/quant.rs` rather than emitted — so a row
+# that changes its operands still changes this call site or fails to compile,
+# which was the only property the shim was worth having for. (It has changed
+# them once already: the `In`/`Out`/`InOut` marks and their `Dims` folded into
+# one dtype-erased `Tensor` handle, and this crate's call sites did not follow
+# until they were repaired against it.)
 #
 # `default-features = false` is the table alone; `cuda-12`/`cuda-13` above
 # add the runtime that compiles and fires. Nothing links: NVRTC turns the
 # device text carried in the binary into a cubin at run time.
 kernels-cuda = { path = "../kernels-cuda", default-features = false, optional = true }
+# `Dtype` ONLY, and only under `cuda`. `kernels-cuda`'s handle vocabulary is
+# written in the IR's dtype -- `Tensor { ptr, rows, width, dtype }` -- so the
+# one file in this crate that speaks to that plane has to spell it. It is a
+# name, not a graph: `kernels-cuda` already carries model-ir in, and this crate
+# has no other use for the IR (its own `types::DType` is the checkpoint's
+# vocabulary and stays the one this compiler reasons in). Optional, so the
+# toolkit-free default build's dependency set is unchanged.
+model-ir = { path = "../model-ir", optional = true }
 # Runtime only: the arena needs `cudaMemcpyAsync`, `cudaMemsetAsync`,
 # `cudaHostAlloc` and an event. No `driver`, no cublas, no nvrtc — a loader
 # that reached for those would be doing something other than loading.

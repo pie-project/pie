@@ -710,8 +710,11 @@ __global__ void mxfp4_moe_down_decode(
     }
 }
 
+// The routed matmul over an mxfp4 bank. `bias` is optional: a bank-cut leg
+// hands its per-expert row and the add lands inside the fold, a rows-cut one
+// hands nullptr and lets the routed bias mixture be stated after the reduce.
 template <class T, int kRowsT>
-__global__ void moe_matmul_select_bias_mxfp4(
+__global__ void moe_matmul_select_mxfp4(
     const T* __restrict__ act,
     const i32* __restrict__ routes,
     const u8* __restrict__ codes,

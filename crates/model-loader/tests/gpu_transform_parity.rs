@@ -9,13 +9,21 @@
 //!
 //! # Why bytes and not a build
 //!
-//! Cutting over from the archive crate's `kernels_cuda::ffi::pie_k_*` to
-//! `kernels_cuda::api::*` moved two extents out of every argument list
-//! and a stream out of a third — a launch that compiles is therefore no
-//! evidence at all, because the rectangle the JIT derives from [`Dims`] is
-//! precisely the thing the C symbols used to be handed and no longer are. A
-//! `rows` supplied where the rule wanted a group count still compiles, still
-//! launches, and writes a fraction of the tensor.
+//! Cutting over from the archive crate's `kernels_cuda::ffi::pie_k_*` to the
+//! typed entries moved two extents out of every argument list and a stream
+//! out of a third — a launch that compiles is therefore no evidence at all,
+//! because the rectangle the JIT derives from the handle is precisely the
+//! thing the C symbols used to be handed and no longer are. A `rows` supplied
+//! where the rule wanted a group count still compiles, still launches, and
+//! writes a fraction of the tensor.
+//!
+//! THAT HAZARD CAME DUE. The extents moved a second time — off the
+//! `In`/`Out`/`InOut` marks and onto one dtype-erased
+//! `kernels_cuda::Tensor` — and `executor::cuda` did not follow, so the
+//! `cuda` feature stopped compiling and a shell wave routed around it with
+//! host transforms (`.wiki/palo/design.md`, step-4 notes). Repairing the call
+//! sites was a build fix; THIS is what says the repair chose the right
+//! rectangles, and it is the only thing that can.
 //!
 //! `.wiki/fix/loader.md` records what a wrong answer on this path costs: a
 //! host `Cast` that pivoted every element through `f64` ran at 0.25 GiB/s and
@@ -683,9 +691,10 @@ fn the_unreachable_scale_row_agrees_with_the_host_when_fired_by_hand() {
 ///
 /// A zero-row extent is the cheapest way to reach it and the one the archive's
 /// own launchers guarded with `if (rows == 0 || cols == 0) return;` — the
-/// The claim body's geometry helper answers `Refusal::Empty` for exactly that, and
-/// this asserts the answer travels all the way out rather than becoming a
-/// silent `Ok(false)` that would send the transform to the host.
+/// entry's `nonzero` prologue answers a `KernelError::Backend` naming the
+/// collapsed axis for exactly that, and this asserts the answer travels all
+/// the way out rather than becoming a silent `Ok(false)` that would send the
+/// transform to the host.
 #[test]
 fn a_launch_the_jit_refuses_fails_the_load() {
     if !device_or_skip("the refused-launch case") {

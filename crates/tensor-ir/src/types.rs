@@ -39,6 +39,7 @@ macro_rules! declare_dtypes {
     ($($variant:ident = $wire:literal, $name:literal, $class:ident;)*) => {
         /// Element type of a value. Tag bytes are stable wire constants.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         #[repr(u8)]
         pub enum DType {
             $(
@@ -306,6 +307,7 @@ impl ValueType {
 /// variant carries the value id of its (host-supplied, de-hardwired) threshold,
 /// so the program bytecode is threshold-invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Predicate {
     /// top-k: keep the top `k` — a value id (a `U32` scalar, or a per-row
     /// `[rows]` `U32` vector for a matrix input).
@@ -343,6 +345,7 @@ impl Predicate {
 
 /// Distribution sampled by the noise op. Tag bytes are stable wire constants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum RngKind {
     /// Draws in `(0, 1)`, exclusive at both ends.

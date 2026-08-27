@@ -35,7 +35,7 @@ impl DispatchCustomCuda for Run<'_> {
                 *q_norm_eps,
                 self.tensor(*k_norm_weight),
                 *k_norm_eps,
-                self.pool(*cache),
+                &self.pool(*cache),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
                 *kv_heads,

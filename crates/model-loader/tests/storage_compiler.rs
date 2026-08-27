@@ -2102,9 +2102,13 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
     // Both halves name real entries, which is the part the name matching could
     // get wrong without anything noticing.
     assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    // `.scales`, THE ONE SPELLING. It was `_scale`, which nothing in this tree
+    // ever looked for: a driver binds an encoded plane out of the same table
+    // as a shipped one, by name, and the name the model plane binds is
+    // `<w>.scales`. See `ScaleLayout::for_encode`'s MXFP4 arm for the ruling.
     assert_eq!(
         program.tensors[attach.scale_tensor.0 as usize].name,
-        "runtime.w_scale"
+        "runtime.w.scales"
     );
 }
 
@@ -2383,12 +2387,43 @@ fn encode_to(
     compile_load_plan(&metadata, &contract, scale_target())
 }
 
-/// The encode kernels walk `[rows, cols]` tiles, so a rank-3 output has no
-/// scale layout at all -- not a different one.
+/// A rank-3 expert bank encodes, and its scales keep its leading axis.
+///
+/// THIS TEST ASSERTED THE OPPOSITE. It said "the encode kernels walk `[rows,
+/// cols]` tiles, so a rank-3 output has no scale layout at all -- not a
+/// different one", and pinned the refusal. The kernels do walk `[rows, cols]`
+/// tiles; they also walk them row-major, indexing `row * cols + c`, so
+/// `[experts, rows, cols]` is the same rectangle with the leading axes folded
+/// (`types::rectangle`). What was rank-2-only was the arithmetic above them,
+/// and what it cost is a family: kimi's mxfp4 expert banks over a bf16
+/// checkpoint could not be compiled at all.
+///
+/// The scales keep the payload's axes rather than the fold, because the plane
+/// a driver BINDS is bound at its declared rank -- `[experts, rows, cols/32]`
+/// is what `model_dsl`'s `Weight::planes` interns for it.
+#[test]
+fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {
+    let plan = encode_to("runtime.w", &[2, 64, 64], QuantScheme::Mxfp4E2M1E8M0).unwrap();
+    assert_eq!(plan.attachments.len(), 1, "{:#?}", plan.attachments);
+    let attach = plan.attachments[0];
+    let scales = &plan.tensors[attach.scale_tensor.0 as usize];
+    assert_eq!(scales.name, "runtime.w.scales");
+    assert_eq!(scales.shape, vec![2, 64, 2]);
+    // The blocked axis is the last one, at whatever rank the bank has.
+    assert_eq!(attach.channel_axis, 2);
+    assert_eq!(attach.group_size, 32);
+}
+
+/// A rank-1 declaration still has no scale layout, and that is not the same
+/// refusal wearing a different rank.
+///
+/// A vector has no axis left over to hold one scale per row, so there is
+/// nothing for `for_encode` to shape the plane like. Refused here rather than
+/// folded into a plausible one-row weight.
 #[test]
 fn an_encode_that_cannot_place_its_scales_is_refused() {
-    let err = encode_to("runtime.w", &[2, 64, 64], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
-    assert!(err.to_string().contains("rank-3"), "{err}");
+    let err = encode_to("runtime.w", &[64], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
+    assert!(err.to_string().contains("rank-1"), "{err}");
     assert!(err.to_string().contains("runtime.w"), "{err}");
 }
 

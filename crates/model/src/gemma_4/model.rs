@@ -6,8 +6,6 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    pub act: Dtype,
-
     pub kv: Dtype,
     pub softcap: Option<f32>,
     pub embed: Weight,
@@ -131,29 +129,17 @@ struct Dims {
     sm_scale: f32,
     intermediate: u32,
     vocab: u32,
-    shared_tail: u32,
-    ple_dim: u32,
+    shared_tail: Option<u32>,
+    ple_dim: Option<u32>,
     softcap: Option<f32>,
     window: u32,
     norm_eps: f32,
 }
 
-fn per_rank(d: Dims, tp: u32) -> Dims {
-    let cut = |what, whole| model_dsl::per_rank(what, whole, tp as usize);
-    Dims {
-        q_heads: cut("q_heads", d.q_heads),
-        kv_heads: cut("kv_heads", d.kv_heads),
-        global_kv_heads: cut("global_kv_heads", d.global_kv_heads),
-        intermediate: cut("intermediate", d.intermediate),
-        ..d
-    }
-}
-
 impl Model {
-    pub fn e4b(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn e4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         assemble(
             w,
-            act,
             kv,
             tp,
             Dims {
@@ -171,8 +157,8 @@ impl Model {
                 sm_scale: 1.0,
                 intermediate: 10_240,
                 vocab: 262_144,
-                shared_tail: 18,
-                ple_dim: 256,
+                shared_tail: Some(18),
+                ple_dim: Some(256),
                 softcap: Some(30.0),
                 window: 512,
                 norm_eps: 1e-6,
@@ -180,10 +166,9 @@ impl Model {
         )
     }
 
-    pub fn b31(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b31(w: Dtype, kv: Dtype, tp: u32) -> Model {
         assemble(
             w,
-            act,
             kv,
             tp,
             Dims {
@@ -201,8 +186,8 @@ impl Model {
                 sm_scale: 1.0,
                 intermediate: 21_504,
                 vocab: 262_144,
-                shared_tail: 0,
-                ple_dim: 0,
+                shared_tail: None,
+                ple_dim: None,
                 softcap: Some(30.0),
                 window: 512,
                 norm_eps: 1e-6,
@@ -211,29 +196,49 @@ impl Model {
     }
 }
 
-fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-    let d = per_rank(d, tp);
+fn assemble(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    assert!(
+        matches!(tp, 1 | 2 | 4 | 8),
+        "tp {tp} is not a world this catalog ships"
+    );
+    let q_heads = d.q_heads / tp;
+    let kv_heads = d.kv_heads / tp;
+    let global_kv_heads = d.global_kv_heads / tp;
+    let intermediate = d.intermediate / tp;
+
     let hidden = d.hidden as u64;
     let full_at = |l: u32| l % d.full_every == d.full_every - 1;
-    let shared_at = |l: u32| l >= d.layers - d.shared_tail;
+    let shared_at = |l: u32| d.shared_tail.is_some_and(|tail| l >= d.layers - tail);
     let source = |l: u32| {
         (0..l)
             .rev()
             .find(|&s| !shared_at(s) && full_at(s) == full_at(l))
-            .unwrap_or(l)
+    };
+    let owner = |l: u32| match d.shared_tail {
+        None => l,
+        Some(tail) if l < d.layers - tail => l,
+        Some(tail) => source(l).unwrap_or_else(|| {
+            panic!(
+                "layer {l} borrows its kv cache and none of the {} layers \
+                 before the shared tail is of its kind (full_every {}, \
+                 shared_tail {tail})",
+                d.layers - tail,
+                d.full_every,
+            )
+        }),
     };
     let kind = |l: u32| {
         if full_at(l) {
             AttnKind::Full {
                 head_dim: d.global_head_dim,
-                kv_heads: d.global_kv_heads,
+                kv_heads: global_kv_heads,
                 rotary_dim: d.global_rotary_dim,
                 theta: d.theta_global,
             }
         } else {
             AttnKind::Sliding {
                 head_dim: d.head_dim,
-                kv_heads: d.kv_heads,
+                kv_heads,
                 window: d.window,
                 theta: d.theta_local,
             }
@@ -246,16 +251,16 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
             let norm = |s: &str, len: u64| Weight::sym(n(s), [len], w);
             let ki = kind(l);
             let hd = ki.head_dim() as u64;
-            let q_w = d.q_heads as u64 * hd;
+            let q_w = q_heads as u64 * hd;
             let kv_w = ki.kv_heads() as u64 * hd;
-            let iw = d.intermediate as u64;
+            let iw = intermediate as u64;
             Layer {
                 attn: Attn {
-                    q_heads: d.q_heads,
+                    q_heads,
                     sm_scale: d.sm_scale,
                     q_norm: norm("q_norm", hd),
                     q_norm_eps: d.norm_eps,
-                    kv: format!("kv.{}", if shared_at(l) { source(l) } else { l }),
+                    kv: format!("kv.{}", owner(l)),
                     banks: if shared_at(l) {
                         AttnBanks::Shared {
                             q_proj: Weight::sym(n("q_proj"), [q_w, hidden], w).columns(),
@@ -280,7 +285,7 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
                 post_ffw_norm: norm("post_ffw_norm", hidden),
                 post_ffw_norm_eps: d.norm_eps,
                 gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
-                inter: d.intermediate,
+                inter: intermediate,
                 down: Weight::sym(n("down"), [hidden, iw], w).rows(),
             }
         })
@@ -290,14 +295,13 @@ fn assemble(w: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         hidden: d.hidden,
         vocab: d.vocab,
         tp,
-        act,
         kv,
         softcap: d.softcap,
         embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
-        ple: (d.ple_dim > 0).then(|| {
-            let ple = d.ple_dim as u64;
+        ple: d.ple_dim.map(|dim| {
+            let ple = dim as u64;
             Ple {
-                dim: d.ple_dim,
+                dim,
                 model_proj: Weight::sym("ple.model_proj", [d.layers as u64 * ple, hidden], w),
                 model_norm: Weight::sym("ple.model_norm", [ple], w),
                 model_norm_eps: d.norm_eps,

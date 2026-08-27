@@ -1,0 +1,12 @@
+[package]
+name = "text-completion"
+version = "0.1.0"
+description = "Greedy text completion, host-driven — the serving door's end-to-end fixture"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to continue"}
+max_tokens = {type = "int", optional = true, description = "Tokens to generate (default: 8)"}

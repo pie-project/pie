@@ -24,25 +24,16 @@ use crate::plan::{
     CompiledStage, Dimension, LibraryOp, NodeIndex, Region, RegionKind, RegionPartition,
     SymbolicExtent, SymbolicType, stage_identity,
 };
-use driver_api::local::{
-    PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE, PIE_CHANNEL_SEEDED, PIE_EXTENT_STATIC,
-    PIE_LIBRARY_MATMUL, PIE_LIBRARY_NUCLEUS_SAMPLE, PIE_LIBRARY_SCAN, PIE_LIBRARY_SECOND_PARTY,
-    PIE_LIBRARY_SORT, PIE_LIBRARY_TOP_K, PIE_NO_CHANNEL, PIE_READINESS_NEEDS_EMPTY,
-    PIE_READINESS_NEEDS_FULL, PIE_READINESS_UNTOUCHED, PIE_REGION_GENERATED, PIE_REGION_LIBRARY,
-    PIE_STAGE_GROUPED_VALID, PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL,
-    PIE_STAGE_REQUIRES_LAYER, PIE_STAGE_REQUIRES_LORA, PIE_STAGE_REQUIRES_MTP_ROWS,
-    PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY, PIE_VALUE_CHANNEL_READ,
-    PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_CONST, PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT,
-};
-use driver_api::plan::{
-    LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchPort,
-    LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue,
+use driver_api::program::{
+    Axis, ExtentRole, LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue,
+    LaunchPort, LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue, LibraryOp as
+    LaunchLibraryOp, RegionKind as LaunchRegionKind, StageNeeds, ValueSource,
 };
 use tensor_ir::DType;
-use tensor_ir::container::{ExternDir, HostRole, PortSource};
-use tensor_ir::op::{intrinsic_tags, tags};
-use tensor_ir::types::ValueType;
-use tensor_ir::validate::{BoundTrace, Direction};
+use tensor_ir::container::{ChanDType, PortSource};
+use tensor_ir::op::{IntrinsicId, intrinsic_tags, tags};
+use tensor_ir::types::{RngKind, ValueType};
+use tensor_ir::validate::BoundTrace;
 
 use crate::codegen::op_view::OpView;
 
@@ -77,7 +68,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                 .copied()
                 .unwrap_or(ValueType::scalar(DType::F32));
             value.id = base + local;
-            value.dtype = value_type.dtype as u8;
+            value.dtype = value_type.dtype;
             value.shape = value_type.shape.dims().to_vec();
             values.push(value);
         };
@@ -89,9 +80,9 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                         local,
                         LaunchValue {
                             source: if view.tag == tags::CHAN_TAKE {
-                                PIE_VALUE_CHANNEL_TAKE
+                                ValueSource::ChannelTake
                             } else {
-                                PIE_VALUE_CHANNEL_READ
+                                ValueSource::ChannelRead
                             },
                             channel: view.chan as u32,
                             ..LaunchValue::default()
@@ -103,7 +94,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     push(
                         local,
                         LaunchValue {
-                            source: PIE_VALUE_CONST,
+                            source: ValueSource::Const,
                             literal_bits: view.lit_bits,
                             ..LaunchValue::default()
                         },
@@ -114,8 +105,8 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     push(
                         local,
                         LaunchValue {
-                            source: PIE_VALUE_INTRINSIC,
-                            intrinsic: view.intr as u8,
+                            source: ValueSource::Intrinsic,
+                            intrinsic: IntrinsicId::from_u16(view.intr),
                             ..LaunchValue::default()
                         },
                     );
@@ -127,7 +118,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                         push(
                             local + result,
                             LaunchValue {
-                                source: PIE_VALUE_OP_RESULT,
+                                source: ValueSource::OpResult,
                                 ..LaunchValue::default()
                             },
                         );
@@ -148,16 +139,6 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
         .iter()
         .enumerate()
         .map(|(index, decl)| {
-            let mut flags = 0u8;
-            if decl.seeded {
-                flags |= PIE_CHANNEL_SEEDED;
-            }
-            if decl.host_role != HostRole::None {
-                flags |= PIE_CHANNEL_HOST_VISIBLE;
-            }
-            if decl.host_role == HostRole::Reader {
-                flags |= PIE_CHANNEL_HOST_READER;
-            }
             let extern_decl = bound
                 .container
                 .externs
@@ -170,22 +151,17 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
                 .readiness
                 .iter()
                 .find(|entry| entry.chan as usize == index)
-                .map_or(PIE_READINESS_UNTOUCHED, |entry| match entry.dir {
-                    Direction::NeedsFull => PIE_READINESS_NEEDS_FULL,
-                    Direction::NeedsEmpty => PIE_READINESS_NEEDS_EMPTY,
-                });
+                .map(|entry| entry.dir);
             LaunchChannel {
                 id: index as u32,
                 capacity: decl.capacity,
                 // The program-side element type, with a late-bound activation
                 // dtype already materialized — the driver allocates cells from
                 // this and never sees `ACT`.
-                dtype: bound.channel_types[index].dtype as u8,
-                flags,
-                extern_dir: extern_decl.map_or(-1, |entry| match entry.dir {
-                    ExternDir::Import => 0,
-                    ExternDir::Export => 1,
-                }),
+                dtype: ChanDType::Concrete(bound.channel_types[index].dtype),
+                seeded: decl.seeded,
+                host_role: decl.host_role,
+                extern_dir: extern_decl.map(|entry| entry.dir),
                 readiness,
                 shape: decl.shape.dims().to_vec(),
                 extern_name: extern_decl
@@ -204,7 +180,7 @@ fn lower_ports(bound: &BoundTrace) -> Vec<LaunchPort> {
         .iter()
         .map(|binding| match binding.source {
             PortSource::Channel(chan) => LaunchPort {
-                port: binding.port as u8,
+                port: binding.port,
                 is_const: false,
                 channel: chan,
                 ..LaunchPort::default()
@@ -214,9 +190,9 @@ fn lower_ports(bound: &BoundTrace) -> Vec<LaunchPort> {
                 ref shape,
                 ref data,
             } => LaunchPort {
-                port: binding.port as u8,
+                port: binding.port,
                 is_const: true,
-                const_dtype: dtype as u8,
+                const_dtype: dtype,
                 const_shape: shape.dims().to_vec(),
                 const_data: data.clone(),
                 ..LaunchPort::default()
@@ -243,7 +219,7 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
         };
 
         let mut stage = LaunchStage {
-            kind: program.stage as u8,
+            stage: program.stage,
             ..LaunchStage::default()
         };
         let mut local = 0u32;
@@ -266,20 +242,24 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
                 _ => {
                     let value_type = result_type(local);
                     stage.ops.push(LaunchOp {
-                        code: view.tag as u16,
+                        tag: view.tag,
                         result_count: view.results as u16,
                         result_id: global(local),
-                        intrinsic: view.intr,
-                        lit_dtype: view.lit_dtype,
-                        dtype: value_type.dtype as u8,
+                        // A stage body carries no `intrinsic_val` op — those
+                        // became `LaunchValue`s above — so there is no
+                        // intrinsic to name here. The field this replaced said
+                        // `0`, which is `IntrinsicId::Logits`.
+                        intrinsic: None,
+                        lit_dtype: dtype(view.lit_dtype),
+                        dtype: value_type.dtype,
                         pred_tag: view.pred_tag,
-                        rng_kind: view.kind,
+                        rng_kind: rng(view.kind),
                         lit_bits: view.lit_bits,
                         // Every predicate tag carries a value id, so it is
                         // remapped like any other operand rather than left as
                         // an immediate.
                         pred_payload: global(view.pred_payload),
-                        channel: PIE_NO_CHANNEL,
+                        channel: None,
                         name_index: u32::from(view.name_idx),
                         imm: view.imm,
                         imm2: view.imm2,
@@ -312,7 +292,7 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
     LaunchStagePlan {
         signature_hash: stage.signature.hash,
         identity: stage_identity(stage),
-        flags: grouped.flags,
+        needs: grouped.needs,
         mtp_rows: grouped.mtp_rows,
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
@@ -335,21 +315,22 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
 /// plan's own value table, which is what the emitted kernels bind against.
 fn lower_plan_op(view: &OpView) -> LaunchOp {
     LaunchOp {
-        code: view.tag as u16,
+        tag: view.tag,
         result_count: view.results as u16,
         result_id: 0,
-        intrinsic: view.intr,
-        lit_dtype: view.lit_dtype,
-        dtype: view.dtype,
+        // `intr` is set by the `intrinsic_val` arm of the wire projection and
+        // by nothing else, so asking the tag is what makes `None` mean "no
+        // intrinsic" rather than "intrinsic zero".
+        intrinsic: (view.tag == tags::INTRINSIC_VAL)
+            .then(|| IntrinsicId::from_u16(view.intr))
+            .flatten(),
+        lit_dtype: dtype(view.lit_dtype),
+        dtype: dtype(view.dtype),
         pred_tag: view.pred_tag,
-        rng_kind: view.kind,
+        rng_kind: rng(view.kind),
         lit_bits: view.lit_bits,
         pred_payload: view.pred_payload,
-        channel: if view.chan < 0 {
-            PIE_NO_CHANNEL
-        } else {
-            view.chan as u32
-        },
+        channel: u32::try_from(view.chan).ok(),
         name_index: u32::from(view.name_idx),
         imm: view.imm,
         imm2: view.imm2,
@@ -360,24 +341,52 @@ fn lower_plan_op(view: &OpView) -> LaunchOp {
 }
 
 fn lower_plan_value(value_type: &SymbolicType) -> LaunchPlanValue {
-    let mut extents = Vec::with_capacity(value_type.dims.len());
-    let mut dims = Vec::with_capacity(value_type.dims.len());
-    for dimension in &value_type.dims {
-        match *dimension {
-            Dimension::Static(extent) => {
-                extents.push(PIE_EXTENT_STATIC);
-                dims.push(extent);
-            }
-            Dimension::Symbolic(extent) => {
-                extents.push(extent as u8);
-                dims.push(0);
-            }
-        }
-    }
     LaunchPlanValue {
-        dtype: value_type.dtype as u8,
-        extents,
-        dims,
+        dtype: value_type.dtype,
+        axes: value_type.dims.iter().copied().map(axis).collect(),
+    }
+}
+
+/// One planned dimension, as the contract spells it.
+///
+/// The two enums are the same enum: `Dimension::Static`/`Symbolic` and
+/// `Axis::Static`/`Symbolic`, over extent tags that agree entry for entry
+/// (`extent_role` is where that is written down). They stay two types because
+/// `driver-api` may not depend on this crate — the contract sits UNDER the
+/// compiler — and this function is the whole of the mapping.
+fn axis(dimension: Dimension) -> Axis {
+    match dimension {
+        Dimension::Static(extent) => Axis::Static(extent),
+        Dimension::Symbolic(extent) => Axis::Symbolic(extent_role(extent)),
+    }
+}
+
+/// The contract's name for one of this crate's symbolic extents.
+fn extent_role(extent: SymbolicExtent) -> ExtentRole {
+    match extent {
+        SymbolicExtent::KvLen => ExtentRole::KvLen,
+        SymbolicExtent::PageCount => ExtentRole::PageCount,
+        SymbolicExtent::RowCount => ExtentRole::RowCount,
+        SymbolicExtent::TokenCount => ExtentRole::TokenCount,
+        SymbolicExtent::SampledRows => ExtentRole::SampledRows,
+        SymbolicExtent::QueryLen => ExtentRole::QueryLen,
+        SymbolicExtent::KeyLen => ExtentRole::KeyLen,
+    }
+}
+
+/// The element type a wire byte names. `F32` for a byte no dtype claims — the
+/// same fallback the `as u8` round trip this replaced had, made explicit.
+fn dtype(byte: u8) -> DType {
+    DType::from_wire(byte).unwrap_or(DType::F32)
+}
+
+/// The distribution a wire byte names. Uniform is tag 0, which is what every
+/// non-`rng` op carries.
+fn rng(byte: u8) -> RngKind {
+    if byte == RngKind::Gumbel as u8 {
+        RngKind::Gumbel
+    } else {
+        RngKind::Uniform
     }
 }
 
@@ -386,13 +395,11 @@ fn lower_partition(partition: &RegionPartition) -> Vec<LaunchRegion> {
 }
 
 fn lower_region(region: &Region) -> LaunchRegion {
-    let (kind, library) = match region.kind {
-        RegionKind::Generated => (PIE_REGION_GENERATED, 0),
-        RegionKind::Library(op) => (PIE_REGION_LIBRARY, library_tag(op)),
-    };
     LaunchRegion {
-        kind,
-        library,
+        kind: match region.kind {
+            RegionKind::Generated => LaunchRegionKind::Generated,
+            RegionKind::Library(op) => LaunchRegionKind::Library(library_tag(op)),
+        },
         schedule: region.schedule as u8,
         // `LaunchRegion` is the driver ABI, which has one integer space;
         // the node tags stop here.
@@ -410,17 +417,17 @@ fn lower_region(region: &Region) -> LaunchRegion {
     }
 }
 
-fn library_tag(op: LibraryOp) -> u8 {
-    // Named, not `op as u8`: the wire value is an ABI a driver reads, and a
-    // discriminant is an ABI only by accident. Reordering the enum used to be
-    // a silent wire break.
+fn library_tag(op: LibraryOp) -> LaunchLibraryOp {
+    // Named, not `op as u8`: the two enums are declared in two crates and the
+    // wire numbering is the contract's, so reordering either one has to be a
+    // compile error here rather than a silent wire break.
     match op {
-        LibraryOp::NucleusSample => PIE_LIBRARY_NUCLEUS_SAMPLE,
-        LibraryOp::TopK => PIE_LIBRARY_TOP_K,
-        LibraryOp::Sort => PIE_LIBRARY_SORT,
-        LibraryOp::Scan => PIE_LIBRARY_SCAN,
-        LibraryOp::MatMul => PIE_LIBRARY_MATMUL,
-        LibraryOp::SecondParty => PIE_LIBRARY_SECOND_PARTY,
+        LibraryOp::NucleusSample => LaunchLibraryOp::NucleusSample,
+        LibraryOp::TopK => LaunchLibraryOp::TopK,
+        LibraryOp::Sort => LaunchLibraryOp::Sort,
+        LibraryOp::Scan => LaunchLibraryOp::Scan,
+        LibraryOp::MatMul => LaunchLibraryOp::Matmul,
+        LibraryOp::SecondParty => LaunchLibraryOp::SecondParty,
     }
 }
 
@@ -432,9 +439,9 @@ fn library_tag(op: LibraryOp) -> u8 {
 /// once here rather than in each driver's launch path.
 #[derive(Default)]
 struct GroupedPlan {
-    flags: u32,
+    needs: StageNeeds,
     mtp_rows: u32,
-    used_extents: Vec<u8>,
+    used_extents: Vec<ExtentRole>,
     channel_rules: Vec<LaunchChannelRule>,
     error: String,
 }
@@ -447,22 +454,23 @@ impl GroupedPlan {
         channel_count: usize,
     ) -> Self {
         let mut plan = GroupedPlan {
-            flags: PIE_STAGE_GROUPED_VALID,
+            needs: StageNeeds {
+                grouped_valid: true,
+                ..StageNeeds::default()
+            },
             ..GroupedPlan::default()
         };
-        let mut seen = vec![false; SymbolicExtent::ALL.len()];
+        // No bounds check on the tag any more: `SymbolicExtent` is an enum, so
+        // "unsupported runtime extent" is not a state a `Dimension` can be in.
+        let mut seen = [false; SymbolicExtent::ALL.len()];
         for value_type in value_types {
             for dimension in &value_type.dims {
                 let Dimension::Symbolic(extent) = *dimension else {
                     continue;
                 };
-                let extent = extent as u8;
-                if usize::from(extent) >= seen.len() {
-                    return plan.invalid("stage uses unsupported runtime extents");
-                }
                 if !seen[extent as usize] {
                     seen[extent as usize] = true;
-                    plan.used_extents.push(extent);
+                    plan.used_extents.push(extent_role(extent));
                 }
             }
         }
@@ -481,7 +489,8 @@ impl GroupedPlan {
             // describes the op rather than rejecting it. `requires_query` is
             // set because the kernel consumes the lane's post-rope query row.
             if op.tag == tags::KERNEL_CALL {
-                plan.flags |= PIE_STAGE_REQUIRES_QUERY | PIE_STAGE_REQUIRES_KERNEL_CALL;
+                plan.needs.query = true;
+                plan.needs.kernel_call = true;
                 continue;
             }
             // Sinks are grouped-walkable but only fused-executable.
@@ -490,9 +499,9 @@ impl GroupedPlan {
             // the page mask.
             if op.tag == tags::SINK_CALL {
                 if names.get(op.name_idx as usize).map(String::as_str) == Some("lora") {
-                    plan.flags |= PIE_STAGE_REQUIRES_LORA;
+                    plan.needs.lora = true;
                 } else {
-                    plan.flags |= PIE_STAGE_REQUIRES_PAGE_MASK;
+                    plan.needs.page_mask = true;
                 }
             }
             if !grouped_supported_tag(op.tag) {
@@ -500,21 +509,21 @@ impl GroupedPlan {
             }
             if op.tag == tags::INTRINSIC_VAL {
                 match op.intr {
-                    intrinsic_tags::QUERY => plan.flags |= PIE_STAGE_REQUIRES_QUERY,
-                    intrinsic_tags::LAYER => plan.flags |= PIE_STAGE_REQUIRES_LAYER,
-                    intrinsic_tags::ATTN_SCORE => plan.flags |= PIE_STAGE_REQUIRES_ATTN_SCORE,
+                    intrinsic_tags::QUERY => plan.needs.query = true,
+                    intrinsic_tags::LAYER => plan.needs.layer = true,
+                    intrinsic_tags::ATTN_SCORE => plan.needs.attn_score = true,
                     intrinsic_tags::MTP_LOGITS => {
                         let value = value_bases[node] as usize;
                         let rows = match value_types.get(value).map(|ty| ty.dims.as_slice()) {
                             Some([Dimension::Static(rows), _]) => *rows,
                             _ => return plan.invalid("MtpLogits has no static draft-row layout"),
                         };
-                        if plan.flags & PIE_STAGE_REQUIRES_MTP_ROWS != 0 && plan.mtp_rows != rows {
+                        if plan.needs.mtp_rows && plan.mtp_rows != rows {
                             return plan.invalid(
                                 "MtpLogits stages declare incompatible draft-row layouts",
                             );
                         }
-                        plan.flags |= PIE_STAGE_REQUIRES_MTP_ROWS;
+                        plan.needs.mtp_rows = true;
                         plan.mtp_rows = rows;
                     }
                     intrinsic_tags::LOGITS => {}
@@ -541,11 +550,11 @@ impl GroupedPlan {
         plan
     }
 
-    /// The stage cannot take the grouped path. The flags derived so far still
-    /// describe it — the fused path reads them — so only the validity bit and
+    /// The stage cannot take the grouped path. What was derived so far still
+    /// describes it — the fused path reads it — so only the validity flag and
     /// the reason change.
     fn invalid(mut self, reason: &str) -> Self {
-        self.flags &= !PIE_STAGE_GROUPED_VALID;
+        self.needs.grouped_valid = false;
         self.error = reason.to_string();
         self
     }

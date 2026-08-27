@@ -41,15 +41,33 @@ impl Request {
     }
 }
 
-/// The bit-word side of a Facts struct; [`facts!`](crate::facts!) writes it.
-pub trait FactWord {
-    const NAMES: &'static [&'static str];
+/// How a model sorts a request into its facts, and how it packs them into the
+/// one `u64` the fire carries.
+///
+/// EACH FAMILY WRITES ITS OWN, BY HAND. There was a `facts!` macro here that
+/// generated the struct, the bit constants, the predicate constructors and the
+/// packing from a list of field names — six lines of model text expanded from
+/// one, and the one thing a reader wanted to know (which bit is `masked`?) was
+/// the one thing it did not say. A `Facts` struct is four visible lines per
+/// fact; written out, the bit a predicate tests and the bit `word` sets are
+/// the same literal on the page.
+pub trait Classify: Sized {
+    fn of(r: &Request) -> Self;
     fn word(&self) -> u64;
 }
 
-/// How a model sorts a request into its facts.
-pub trait Classify: FactWord {
-    fn of(r: &Request) -> Self;
+/// The body of a catalog row's [`ClassifyFn`](crate::ClassifyFn) column,
+/// monomorphized on the family the row was written for.
+///
+/// THE MODEL EXPRESSION IS A THUNK AND IS NEVER CALLED. All this needs off it
+/// is the TYPE — `M::Facts` — and a lane's word is computed on the fire path,
+/// once per lane per fire, so building a `Model` to read an associated type
+/// off it would put a weight-table walk under every decode token. The
+/// `catalog!` macro hands `|| Model::a3b(..)` in, inference reads `M` from the
+/// closure's return type, and the closure is dropped.
+#[must_use]
+pub fn word_of<M: ForwardHybrid>(_model: impl FnOnce() -> M, r: &Request) -> u64 {
+    <M::Facts as Classify>::of(r).word()
 }
 
 /// A declared kv geometry space: the group of kv rows one page table serves,
@@ -122,12 +140,7 @@ pub trait ForwardHybrid {
 /// and `finish` through the validator.
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, plane: Plane) -> Plan {
     let caches = m.caches();
-    let rec = Recorder::new(
-        name,
-        plane,
-        <M::Facts as FactWord>::NAMES,
-        caches.rows.clone(),
-    );
+    let rec = Recorder::new(name, plane, caches.rows.clone());
     rec.seam(seam::IN.name, &[]);
     let logits = m.forward(Input {
         rec: rec.clone(),
@@ -221,6 +234,37 @@ impl<F> Input<F> {
         ops::geometry(&self.rec, space, kind)
     }
 
+    /// The decode plan over the model's paged-kv space.
+    ///
+    /// THE FOUR CONSTRUCTORS BELOW EXIST BECAUSE THE RECORDER IS NOT THE
+    /// AUTHOR'S TO NAME. Every forward pass wanted `ops::attn::plan_decode`
+    /// against its own trace, and the only handle on the recorder a model
+    /// could reach was `positions.rec()` — so every model asked for the
+    /// positions input it did not want, purely to borrow the recorder off it.
+    /// The wrappers stay `pub` for a text that plans against a second space;
+    /// these four are the first space, which is what every shipped model
+    /// means.
+    #[must_use]
+    pub fn plan_decode(&self) -> Value {
+        ops::attn::plan_decode(&self.rec, self.kv_space())
+    }
+
+    #[must_use]
+    pub fn plan_prefill(&self) -> Value {
+        ops::attn::plan_prefill(&self.rec, self.kv_space())
+    }
+
+    #[must_use]
+    pub fn mla_plan(&self) -> Value {
+        ops::attn::mla_plan(&self.rec, self.kv_space())
+    }
+
+    /// The custom attention mask over the model's paged-kv space.
+    #[must_use]
+    pub fn mask(&self) -> Value {
+        ops::mask(&self.rec, self.kv_space())
+    }
+
     /// The model's paged-kv geometry space: the FIRST space `caches()`
     /// declared. Every shipped model declares exactly one paged-kv group —
     /// per-layer pool and index spaces come after it and are reached by row
@@ -274,7 +318,7 @@ impl<F> Input<F> {
         self.rec.cache(name)
     }
 
-    pub fn layers<'a, T>(&'a self, ws: &'a [T]) -> Layers<'a, T> {
+    pub fn walk_layers<'a, T>(&'a self, ws: &'a [T]) -> Layers<'a, T> {
         Layers {
             rec: &self.rec,
             ws: ws.iter(),

@@ -16,6 +16,10 @@ use model_loader::checkpoint::write::CheckpointWriter;
 use model_loader::types::{DType, Encoding, TensorDecl, TensorId, Visibility};
 use tokenizer::Tokenizer;
 use tokenizer::canonical::CanonicalTokenizer;
+// The object the checkpoint's own `config.json` is carried under, from the
+// party that reads it back — see the note beside `pie model import`'s copy of
+// this import.
+use worker::weights::CONFIG_OBJECT;
 
 /// Pulls every `__meta__/tokenizer/*` object out of an artifact and rebuilds
 /// the tokenizer — the read path a served artifact runs.
@@ -154,15 +158,12 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
     };
 
     let objects = parse_metadata(std::path::Path::new(&artifact)).unwrap();
-    let raw = objects
-        .get(model::serve::encoding::CONFIG_OBJECT)
-        .unwrap_or_else(|| {
-            panic!(
-                "the artifact carries no {}; it was written before the config was \
-                 carried verbatim, or from a source that had none",
-                model::serve::encoding::CONFIG_OBJECT
-            )
-        });
+    let raw = objects.get(CONFIG_OBJECT).unwrap_or_else(|| {
+        panic!(
+            "the artifact carries no {CONFIG_OBJECT}; it was written before the \
+             config was carried verbatim, or from a source that had none"
+        )
+    });
 
     // Valid JSON, because an artifact must never carry an object no reader can
     // open — `pie model import` checks this at write time and this is the
@@ -174,11 +175,17 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
         "a config.json that is not an object cannot be a config"
     );
 
-    // And it says something `Encoding` can read, which is the only reason it
-    // is carried at all.
-    let text = std::str::from_utf8(raw).expect("the carried config is not UTF-8");
-    let encoding =
-        model::serve::encoding::Encoding::from_config_json(text).expect("Encoding cannot read it");
+    // UTF-8, because a config nobody can read as text is not a config. It used
+    // to be parsed here too — `model::serve::encoding::Encoding` read the
+    // declared quantization out of it, and that was said to be "the only
+    // reason it is carried at all". M18 deleted the parser and did not replace
+    // it: a checkpoint's quantization comes off its STORED tensor encodings
+    // now, which is what the file says rather than what its config claims. So
+    // there is no reader left to hold this document to, and asserting against
+    // one would be asserting against a party that no longer exists. What
+    // remains is what `pie model import` promises: valid JSON, an object, and
+    // byte-identical to the source.
+    std::str::from_utf8(raw).expect("the carried config is not UTF-8");
 
     if let Ok(source) = std::env::var("PIE_TEST_CONFIG") {
         let want = std::fs::read(&source).expect("cannot read PIE_TEST_CONFIG");
@@ -190,12 +197,7 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
         );
     }
 
-    eprintln!(
-        "{artifact}: carries {} ({} bytes, quant method {:?})",
-        model::serve::encoding::CONFIG_OBJECT,
-        raw.len(),
-        encoding.method
-    );
+    eprintln!("{artifact}: carries {CONFIG_OBJECT} ({} bytes)", raw.len());
 }
 
 /// The same read path against an artifact `pie model import` actually wrote,

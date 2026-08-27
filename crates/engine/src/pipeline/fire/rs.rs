@@ -238,19 +238,32 @@ impl PreparedRs {
         empty_prepared()
     }
 
-    /// Thread this lowering into a launch plan.
-    pub fn apply_to(&self, request: &mut crate::driver::LaunchPlan) {
-        request.rs_slot_ids = self.slot_ids.clone();
-        request.rs_slot_flags = self.slot_flags.clone();
-        request.rs_fold_lens = self.fold_lens.clone();
-        request.rs_buffer_slot_ids = self.buffer_slot_ids.clone();
-        request.rs_buffer_slot_indptr = self.buffer_slot_indptr.clone();
-        request.rs_buffer_read_slot_ids = self.buffer_read_slot_ids.clone();
-        request.rs_buffer_read_indptr = self.buffer_read_indptr.clone();
-        request.rs_buffer_read_lens = self.buffer_read_lens.clone();
-        request.rs_buffer_heads = self.buffer_heads.clone();
-        request.rs_translation = self.translation.clone();
-        request.rs_translation_indptr = self.translation_indptr.clone();
+    /// Thread this lowering into a fire request.
+    ///
+    /// **`palo B-rs`: IT STOPS AT THE REQUEST.** Every field below used to be
+    /// a parallel arm of `LaunchPlan` and travelled to the driver; the palo
+    /// contract has no recurrent-state field at all, because a recurrent slot
+    /// is a `CacheRow::State` seat in the plan and `Lane::slot` is the
+    /// sequence's seat in both pools. What has no seat yet is the per-fire
+    /// VERB — reset, fold this many positions, write this buffer — and the
+    /// design puts that on a model-declared axis (§8) rather than on the
+    /// submission. So the engine still computes it (its own store is built on
+    /// it, and `copy_state` moves what it names) and `crate::driver::RsPlan`
+    /// is where it stands.
+    pub fn apply_to(&self, request: &mut crate::driver::FireRequest) {
+        request.rs = crate::driver::RsPlan {
+            slot_ids: self.slot_ids.clone(),
+            slot_flags: self.slot_flags.clone(),
+            fold_lens: self.fold_lens.clone(),
+            buffer_slot_ids: self.buffer_slot_ids.clone(),
+            buffer_slot_indptr: self.buffer_slot_indptr.clone(),
+            buffer_read_slot_ids: self.buffer_read_slot_ids.clone(),
+            buffer_read_indptr: self.buffer_read_indptr.clone(),
+            buffer_read_lens: self.buffer_read_lens.clone(),
+            buffer_heads: self.buffer_heads.clone(),
+            translation: self.translation.clone(),
+            translation_indptr: self.translation_indptr.clone(),
+        };
     }
 }
 

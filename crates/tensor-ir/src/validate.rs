@@ -41,6 +41,7 @@ use crate::types::{DType, Shape, ValueType};
 /// predicate): `take`/`read` need **full**; a leading `put` needs **empty**
 /// (back-pressure).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Direction {
     /// The channel must hold a value: the first op consumes one.
     NeedsFull,

@@ -20,6 +20,12 @@
 
 /// Declare a `#[repr(u8)]` enum with frozen wire tags.
 ///
+/// The macro is exported, so it expands in the caller's crate and must not
+/// name a Cargo feature: `tensor-compiler` declares two enums this way and has
+/// no features. An enum that needs a conditional derive (this crate's `Port`
+/// and `Stage` under `serde`) writes it as a leading attribute, which the
+/// macro forwards.
+///
 /// ```ignore
 /// declare_tagged_enum! {
 ///     /// What this enum is.

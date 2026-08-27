@@ -34,6 +34,7 @@ members = [
     "sampling-primitives",
     "sliding-window-attention",
     "tail-free-sampling",
+    "text-completion",
     "text-completion-bench",
     "token-healing",
     "top-a-sampling",

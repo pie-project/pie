@@ -172,8 +172,9 @@ pub enum StructSlot {
 
 /// One fire's dispatch state: the encode sink, the resolution tables, the
 /// fire bindings, and the plan payloads this fire builds. The shell
-/// constructs one per fire and drives `kernels::walk` over it — prepare
-/// phase first, so every plan payload exists before its consumers encode.
+/// constructs one per fire and drives the substrate's walk
+/// (`driver::fire::walk`) over it — prepare phase first, so every plan
+/// payload exists before its consumers encode.
 pub struct Run<'c> {
     /// The encode sink — the real shell behind `dyn Encode`. Everything this
     /// crate does to the device goes through it; nothing here names Metal.
@@ -222,7 +223,7 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The fire's fact word, for the shell to hand `kernels::walk`.
+    /// The fire's fact word, for the shell to hand the walk.
     #[must_use]
     pub fn facts(&self) -> u64 {
         self.fire.facts

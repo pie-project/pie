@@ -28,6 +28,7 @@ use crate::{PTIR_MAGIC, PTIR_VERSION, PTIR_VERSION_EXTERN};
 /// model-intrinsic activation type (`ACT`, wire tag 4). `ACT` resolves to the
 /// backend's quantized float at bind; in-program it materializes as F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ChanDType {
     /// A scalar type fixed by the trace.
     Concrete(DType),
@@ -71,6 +72,7 @@ impl ChanDType {
 /// SPSC: `Writer` forbids any stage put; `Reader` forbids any stage
 /// take/read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum HostRole {
     /// Both endpoints are inside the pass; the host never touches it.
@@ -143,6 +145,7 @@ pub struct PortBinding {
 /// Direction of an extern channel — whose endpoint THIS trace holds.
 /// (wire-version 2: this is what lets an SPSC pair span two pipelines.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum ExternDir {
     /// This trace CONSUMES: the other instance is the producer (e.g. the

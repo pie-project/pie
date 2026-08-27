@@ -10,6 +10,7 @@ use super::op::IntrinsicId;
 use crate::types::DType;
 
 crate::declare_tagged_enum! {
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     /// Attachment stage of a traced program. Wire tags stable.
     /// Boundary stages run once per pass; the anatomical taps run once per layer.
     pub enum Stage {
@@ -87,6 +88,7 @@ impl Phase {
 }
 
 crate::declare_tagged_enum! {
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     /// Descriptor ports: the forward's ragged-tensor families.
     /// Consumption discipline is fixed per port: the token family **takes**
     /// (a token is spent by the pass that embeds it), geometry and masks **read**
@@ -171,11 +173,175 @@ impl Port {
     }
 }
 
+/// A SET of descriptor ports, as one word.
+///
+/// **THE PORTS CAME HOME** (palo design §7, decision 19). This set used to be
+/// spelled `PIE_DEVICE_PORT_*` in `driver-api`: thirteen `u32` bit constants
+/// in a second, private numbering that agreed with [`Port`]'s wire tags
+/// nowhere — `PIE_DEVICE_PORT_PAGES` was bit 1 while [`Port::Pages`] is tag 3,
+/// and `EmbedIndptr` and `Readout` had no bit at all. Two numberings for one
+/// registry is a translation table somebody has to keep, and the only way to
+/// find out it drifted is a fire that binds the wrong buffer.
+///
+/// So the set is built from the tags themselves: bit `p as u8` is port `p`.
+/// There is one numbering, it is the container's, and a port added to [`Port`]
+/// gets a bit for free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PortMask(u32);
+
+impl PortMask {
+    /// The empty set.
+    pub const NONE: PortMask = PortMask(0);
+
+    /// The three ports a **decode envelope** resolves: the token ids, their
+    /// positions, and each request's readable KV extent. The narrow contract —
+    /// a device that serves this and no more can run a decode step, because a
+    /// decode step's geometry is one row per request and the page table is the
+    /// host's.
+    pub const DECODE_ENVELOPE: PortMask = PortMask::of(&[
+        Port::EmbedTokens,
+        Port::Positions,
+        Port::KvLen,
+    ]);
+
+    /// The seven ports a **device-resolved geometry** resolves: the decode
+    /// envelope plus the page table, the row split, and the adapter routing.
+    /// A device that serves this set derives the whole fire geometry itself
+    /// and the host stages nothing per fire but the descriptor.
+    pub const DEVICE_GEOMETRY: PortMask = PortMask::of(&[
+        Port::EmbedTokens,
+        Port::Positions,
+        Port::KvLen,
+        Port::Pages,
+        Port::PageIndptr,
+        Port::WSlot,
+        Port::WOff,
+    ]);
+
+    /// The recurrent-state buffered-slot family (tags 10-14) — RESERVED, in
+    /// the same sense [`Port`]'s own doc comments mean it.
+    pub const RS_BUFFER: PortMask = PortMask::of(&[
+        Port::RsBufferPages,
+        Port::RsBufferIndptr,
+        Port::RsBufferLen,
+        Port::RsWSlot,
+        Port::RsWOff,
+    ]);
+
+    /// The set holding exactly the listed ports.
+    pub const fn of(ports: &[Port]) -> PortMask {
+        let mut bits = 0u32;
+        let mut index = 0;
+        while index < ports.len() {
+            bits |= 1u32 << (ports[index] as u8);
+            index += 1;
+        }
+        PortMask(bits)
+    }
+
+    /// The set this raw word denotes. Bit `p as u8` is port `p`.
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> PortMask {
+        PortMask(bits)
+    }
+
+    /// This set as a raw word.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Is `port` in the set?
+    #[must_use]
+    pub const fn contains(self, port: Port) -> bool {
+        self.0 & (1u32 << (port as u8)) != 0
+    }
+
+    /// Is every port of `other` in this set?
+    #[must_use]
+    pub const fn covers(self, other: PortMask) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The set with `port` added.
+    #[must_use]
+    pub const fn with(self, port: Port) -> PortMask {
+        PortMask(self.0 | (1u32 << (port as u8)))
+    }
+
+    /// The union of two sets.
+    #[must_use]
+    pub const fn union(self, other: PortMask) -> PortMask {
+        PortMask(self.0 | other.0)
+    }
+
+    /// Is the set empty?
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Every port in the set, in wire-tag order.
+    pub fn iter(self) -> impl Iterator<Item = Port> {
+        Port::ALL.iter().copied().filter(move |&p| self.contains(p))
+    }
+}
+
+/// How much of a fire's geometry the device resolves for itself.
+///
+/// Three points on one axis — how far the descriptor ports reach — and it came
+/// home with them (decision 19). It was `driver-api`'s `GeometryClass` beside
+/// a `PIE_GEOMETRY_CLASS_*` triple of `u32`s that a `const` assertion held in
+/// step with it; here the classes ARE the port sets they name, and
+/// [`GeometryClass::ports`] is the one place the correspondence is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GeometryClass {
+    /// The host resolves everything and the device binds no descriptor port.
+    #[default]
+    Host,
+    /// The device resolves a decode step's envelope
+    /// ([`PortMask::DECODE_ENVELOPE`]) and the host still owns the page table.
+    DecodeEnvelope,
+    /// The device resolves the whole fire geometry
+    /// ([`PortMask::DEVICE_GEOMETRY`]).
+    DeviceGeometry,
+}
+
+impl GeometryClass {
+    /// The ports this class requires a device to serve.
+    #[must_use]
+    pub const fn ports(self) -> PortMask {
+        match self {
+            GeometryClass::Host => PortMask::NONE,
+            GeometryClass::DecodeEnvelope => PortMask::DECODE_ENVELOPE,
+            GeometryClass::DeviceGeometry => PortMask::DEVICE_GEOMETRY,
+        }
+    }
+
+    /// The most demanding class `served` can carry, widest first.
+    ///
+    /// Total: [`GeometryClass::Host`] asks for nothing, so it is always an
+    /// answer.
+    #[must_use]
+    pub fn admitted_by(served: PortMask) -> GeometryClass {
+        if served.covers(PortMask::DEVICE_GEOMETRY) {
+            GeometryClass::DeviceGeometry
+        } else if served.covers(PortMask::DECODE_ENVELOPE) {
+            GeometryClass::DecodeEnvelope
+        } else {
+            GeometryClass::Host
+        }
+    }
+}
+
 /// Where a configuration sink's effect is consumed — drives the T11
 /// stage-precedence check: a sink call is legal only at a stage strictly
 /// preceding its consumption point (pass-wide ⇒ prologue only;
 /// attention-scoped ⇒ prologue (all layers) or `on_attn_proj` (that layer)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SinkScope {
     /// Consumed by the whole forward (e.g. `lora`, `minference_sparse`).
     PassWide,
@@ -230,6 +396,7 @@ pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
 /// is a register read in disguise, and a trace containing one cannot be
 /// replayed, cached by hash, or batched with an identical trace.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct KernelInfo {
     /// The name a [`KernelCall`](crate::op::Op::KernelCall) or
     /// [`SinkCall`](crate::op::Op::SinkCall) resolves to.
@@ -244,7 +411,8 @@ pub struct KernelInfo {
 
 /// Everything bind needs from the model/backend: the trace-known constants,
 /// the model-gated intrinsics, and the second-party registry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModelProfile {
     /// Token-vocabulary size; the trailing extent of a logits row.
     pub vocab: u32,

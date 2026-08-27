@@ -1,19 +1,25 @@
 //! Decode-worker lifecycle for controller-assigned executor partners.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Result, anyhow};
 use controller_api::{NeighborPeer, Role};
-use driver_api::{
-    ExecutorRequest, ExecutorResponse, HelloRequest, ModelIdentity, REMOTE_WIRE_VERSION,
-};
 use ids::WorkerId;
+
+use crate::executor::ModelIdentity;
 
 use crate::executor;
 
-const PARTNER_RPC_DEADLINE: Duration = Duration::from_secs(10);
-
+// `palo B-remote`: every field below is read by the dial path, which refuses
+// at its first line until the envelope exists (see `PartnerLinkManager::dial`
+// and `crate::executor`'s header). They are kept because they are what the
+// handshake states, and deleting them would make the next wave rediscover
+// which numbers a partner link needs.
+#[allow(
+    dead_code,
+    reason = "read by the dial handshake, which is palo B-remote"
+)]
 pub(crate) struct PartnerBootstrap {
     pub full_identity: ModelIdentity,
     pub encode_identity: ModelIdentity,
@@ -36,13 +42,15 @@ struct ClientNixl {
 struct PartnerLink {
     peer: NeighborPeer,
     driver_id: Option<usize>,
-    client: driver_api::ExecutorRpcClient,
     disconnect: Option<::engine::driver::RemoteDisconnectHandle>,
     role: ::engine::offload::PartnerRole,
     partner: std::sync::Arc<::engine::offload::Partner>,
 }
 
 pub(crate) struct PartnerLinkManager {
+    /// This worker's own id, which the handshake's client nonce is.
+    /// See the note on [`PartnerBootstrap`].
+    #[allow(dead_code, reason = "read by the dial handshake, which is palo B-remote")]
     worker_id: WorkerId,
     config: PartnerBootstrap,
     links: HashMap<WorkerId, PartnerLink>,
@@ -132,14 +140,11 @@ impl PartnerLinkManager {
         {
             return false;
         }
-        let mut context = tarpc::context::current();
-        context.deadline = Instant::now() + PARTNER_RPC_DEADLINE;
-        let healthy = matches!(
-            link.client
-                .execute(context, ExecutorRequest::LoadedModel)
-                .await,
-            Ok(Ok(ExecutorResponse::LoadedModel(true)))
-        );
+        // palo B-remote: the liveness probe was one `LoadedModel` round trip.
+        // The envelope must carry a cheap "are you still serving the model
+        // you said you were" question, because a peer that answered a fire
+        // wrongly is worse than one that answered nothing.
+        let healthy = false;
         if healthy
             && link
                 .disconnect
@@ -152,6 +157,32 @@ impl PartnerLinkManager {
         false
     }
 
+    /// Dial a controller-assigned executor partner.
+    ///
+    /// # `palo B-remote`
+    ///
+    /// What stood here was the whole client handshake: a tarpc connect, a
+    /// `HelloRequest` carrying this worker's `REMOTE_WIRE_VERSION`, model
+    /// identity, `KvLayout` and (under NIXL) its own registered KV handle; a
+    /// `HelloResponse` whose scratch grant was range-checked against the
+    /// peer's advertised pool; then `register_remote_store`,
+    /// `register_driver_backend` with a `RemoteDriver` over the client, and
+    /// `spawn_driver`. Every noun in it lived in `driver_api::remote`.
+    ///
+    /// It refuses at the top rather than part way through, because a
+    /// half-dialled partner is a registered `DriverId` with no transport
+    /// behind it, and the offload planner would then select it.
+    ///
+    /// The envelope's own requirements are listed in `crate::executor`'s
+    /// header. What THIS half additionally needs: the grant's page range must
+    /// be validated against the peer's pool before any page id is minted
+    /// against it (`grant.end_page() <= capabilities.total_pages`, and a
+    /// ceiling on `grant.num_pages`), because those ids go straight into a
+    /// `KvCopy` this worker builds.
+    ///
+    /// # Errors
+    ///
+    /// Always, until the envelope exists.
     async fn dial(&self, peer: NeighborPeer) -> Result<PartnerLink> {
         let role = match peer.role {
             Role::Prefill => ::engine::offload::PartnerRole::Prefill,
@@ -162,160 +193,13 @@ impl PartnerLinkManager {
             ::engine::offload::PartnerRole::Prefill => self.config.full_identity.clone(),
             ::engine::offload::PartnerRole::Encode => self.config.encode_identity.clone(),
         };
-        let (client, local_ip) = executor::connect_with_local_ip(&peer.addr).await?;
-        let peer_conn = {
-            #[cfg(feature = "nixl")]
-            {
-                self.nixl.as_ref().map(|nixl| driver_api::RemotePeerConn {
-                    kind: driver_api::RemoteTransferKind::Nixl,
-                    handle: Some(self.config.home_kv_handle.clone()),
-                    metadata: nixl.metadata.clone(),
-                })
-            }
-            #[cfg(not(feature = "nixl"))]
-            {
-                None
-            }
-        };
-        let mut context = tarpc::context::current();
-        context.deadline = Instant::now() + PARTNER_RPC_DEADLINE;
-        let response = client
-            .execute(
-                context,
-                ExecutorRequest::Hello(HelloRequest {
-                    wire_version: REMOTE_WIRE_VERSION,
-                    client_nonce: self.worker_id.0,
-                    model: identity.clone(),
-                    kv_layout: self.config.kv_layout.clone(),
-                    peer_conn,
-                }),
-            )
-            .await
-            .context("executor Hello transport")?
-            .map_err(|error| anyhow!("executor Hello rejected: {error}"))?;
-        let ExecutorResponse::Hello(hello) = response else {
-            return Err(anyhow!("executor returned unexpected Hello response"));
-        };
-        ensure!(hello.wire_version == REMOTE_WIRE_VERSION, "wire mismatch");
-        ensure!(hello.model == identity, "model identity mismatch");
-        if role == ::engine::offload::PartnerRole::Encode {
-            ensure!(
-                hello.capabilities.supports_media_encode,
-                "encode partner does not advertise media encoding"
-            );
-            ensure!(
-                hello.grant.num_pages == 0 && hello.peer_conn.handle.is_none(),
-                "encode partner unexpectedly exposed a KV grant"
-            );
-            let partner = ::engine::offload::register_partner(
-                peer.id.0,
-                self.worker_id.0,
-                None::<usize>,
-                role,
-                self.config.max_outstanding,
-                driver_api::RemoteTransferKind::Inline,
-                Some(client.clone()),
-            );
-            partner.set_blob_host(local_ip);
-            return Ok(PartnerLink {
-                peer,
-                driver_id: None,
-                client,
-                disconnect: None,
-                role,
-                partner,
-            });
-        }
-        ensure!(
-            hello.kv_layout.compatible_with(&self.config.kv_layout),
-            "KV layout mismatch"
-        );
-        let grant_end = hello
-            .grant
-            .end_page()
-            .context("executor scratch grant overflows page id space")?;
-        ensure!(
-            hello.grant.num_pages > 0,
-            "executor returned an empty scratch grant"
-        );
-        ensure!(
-            grant_end <= hello.capabilities.total_pages,
-            "executor scratch grant exceeds its advertised pool"
-        );
-        ensure!(
-            hello.grant.num_pages <= 1_048_576,
-            "executor scratch grant is unreasonably large"
-        );
-        if self.config.transfer == crate::config::OffloadTransfer::Nixl {
-            ensure!(
-                hello.peer_conn.kind == driver_api::RemoteTransferKind::Nixl,
-                "executor did not accept required NIXL transfer"
-            );
-        }
-
-        let remote = ::engine::driver::RemoteDriver::new(
-            client.clone(),
-            tokio::runtime::Handle::current(),
-            hello.capabilities.clone(),
-            hello.grant,
-        );
-        let disconnect = remote.disconnect_handle();
-        let driver_id = ::engine::driver::register_driver_backend(
-            ::engine::driver::DriverSpec {
-                // Overwritten by `register_driver_backend` from the
-                // backend itself; see `DriverSpec::device_domain`.
-                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
-                num_kv_pages: hello.grant.num_pages as usize,
-                limits: ::engine::driver::SchedulerLimits {
-                    max_forward_requests: hello.capabilities.max_forward_requests as usize,
-                    max_forward_tokens: hello.capabilities.max_forward_tokens as usize,
-                    max_page_refs: hello.capabilities.max_page_refs as usize,
-                },
-                device_geometry_port_mask: hello.capabilities.device_geometry_port_mask,
-                resolves_geometry_per_step: hello.capabilities.resolves_geometry_per_step,
-            },
-            Box::new(remote),
-        );
-
-        if let Err(error) = ::engine::offload::register_remote_store(
-            self.config.model_idx,
-            driver_id,
-            self.config.page_size,
-            hello.grant.base_page,
-            hello.grant.num_pages as usize,
-        ) {
-            disconnect.disconnect("remote store registration failed");
-            let _ = ::engine::driver::unregister_driver(driver_id);
-            return Err(error).context("registering remote scratch store");
-        }
-
-        if let Err(error) = ::engine::scheduler::spawn_driver(
-            driver_id,
-            self.config.page_size,
-            self.config.request_timeout_secs,
-        ) {
-            disconnect.disconnect("remote scheduler registration failed");
-            let _ = ::engine::offload::unregister_remote_store(self.config.model_idx, driver_id);
-            let _ = ::engine::driver::unregister_driver(driver_id);
-            return Err(error).context("spawning remote scheduler");
-        }
-        let partner = ::engine::offload::register_partner(
-            peer.id.0,
-            self.worker_id.0,
-            driver_id,
-            role,
-            self.config.max_outstanding,
-            hello.peer_conn.kind,
-            Some(client.clone()),
-        );
-        Ok(PartnerLink {
-            peer,
-            driver_id: Some(driver_id),
-            client,
-            disconnect: Some(disconnect),
-            role,
-            partner,
-        })
+        let _ = (identity, &self.config.kv_layout, self.config.transfer);
+        executor::connect_with_local_ip(&peer.addr).await?;
+        Err(anyhow!(
+            "executor partner {} at {} cannot be dialled: palo B-remote",
+            peer.id,
+            peer.addr
+        ))
     }
 
     async fn teardown(&mut self, worker_id: WorkerId, reason: &str) {

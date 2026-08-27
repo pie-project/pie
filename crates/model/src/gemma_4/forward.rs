@@ -1,20 +1,35 @@
 use model_dsl::{
     Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ValueId,
-    Weight, merge, ops, seam,
+    Weight, ops, seam,
 };
 
 use super::model::{Attn, AttnBanks, AttnKind, Model};
 
-model_dsl::facts! {
-    pub struct Facts { qo_one, masked }
+pub struct Facts {
+    pub qo_one: bool,
+    pub masked: bool,
+}
+
+impl Facts {
+    pub fn qo_one() -> Predicate {
+        Predicate::fact(0)
+    }
+
+    pub fn masked() -> Predicate {
+        Predicate::fact(1)
+    }
 }
 
 impl Classify for Facts {
-    fn of(r: &Request) -> Self {
-        Self {
+    fn of(r: &Request) -> Facts {
+        Facts {
             qo_one: r.query_len() == 1,
             masked: r.has_custom_mask(),
         }
+    }
+
+    fn word(&self) -> u64 {
+        self.qo_one as u64 | (self.masked as u64) << 1
     }
 }
 
@@ -25,12 +40,12 @@ impl ForwardHybrid for Model {
         let mut c = HybridSpec::new();
 
         let kv = c.kv_space(self.kv);
-        for (l, w) in self.layers.iter().enumerate() {
+        for w in &self.layers {
             if let AttnBanks::Owned { .. } = &w.attn.banks {
                 let ki = &w.attn.kind;
                 c.kv(
                     kv,
-                    format!("kv.{l}"),
+                    w.attn.kv.clone(),
                     [2, ki.kv_heads() as u64 * ki.head_dim() as u64],
                 );
             }
@@ -42,11 +57,14 @@ impl ForwardHybrid for Model {
         let m = self;
 
         let positions = inputs.positions();
-        let plan_d = ops::attn::plan_decode(positions.rec(), inputs.kv_space());
-        let plan_p = ops::attn::plan_prefill(positions.rec(), inputs.kv_space());
-        let mask = ops::mask(positions.rec(), inputs.kv_space());
+        let plan_d = inputs.plan_decode();
+        let plan_p = inputs.plan_prefill();
+        let mask = inputs.mask();
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
+
+        let qo_one = Facts::qo_one();
+        let fused = qo_one.clone() & !Facts::masked();
 
         let relay = m.ple.as_ref().map(|ple| {
             let proj = ops::linear::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
@@ -61,7 +79,7 @@ impl ForwardHybrid for Model {
             )
         });
 
-        for (l, w) in inputs.layers(&m.layers) {
+        for (l, w) in inputs.walk_layers(&m.layers) {
             let normed = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let at = &w.attn;
             let d = at.kind.head_dim();
@@ -75,7 +93,6 @@ impl ForwardHybrid for Model {
                     k_norm_eps,
                 } => {
                     if inputs.cuda() && at.kind.sliding() {
-                        let fused = Facts::qo_one() & !Facts::masked();
                         let (fast_x, rest_x) = normed.split(&fused);
                         let (fast_pos, rest_pos) = positions.split(&fused);
                         let qf = ops::custom::qkv_fused_qknorm_rope_vnorm_write(
@@ -102,7 +119,7 @@ impl ForwardHybrid for Model {
                             *k_norm_eps,
                             pages,
                         );
-                        merge![qf, qr]
+                        Value::merge(vec![qf, qr])
                     } else {
                         qkv_unfused(
                             &normed,
@@ -118,17 +135,17 @@ impl ForwardHybrid for Model {
                 }
             };
 
-            seam::at(seam::ATTN_Q, (&q,));
+            seam::at(seam::ATTN_Q, &[&q]);
 
             let win = at.kind.window();
-            let [mq, dq, p] = q.split([Facts::masked(), Facts::qo_one(), Predicate::rest()]);
-            let a = merge![
+            let [mq, dq, p] = q.split([Facts::masked(), qo_one.clone(), Predicate::rest()]);
+            let a = Value::merge(vec![
                 ops::attn::masked(&mq, &plan_p, &mask, pages, win, d, at.sm_scale),
                 ops::attn::decode(&dq, &plan_d, pages, win, d, at.sm_scale),
                 ops::attn::prefill(&p, &plan_p, pages, win, d, at.kind.kv_heads(), at.sm_scale),
-            ];
-            seam::at(seam::ATTN_OUT, (&a,));
-            let o = ops::linear::attention_landing(&a, &w.o_proj, l);
+            ]);
+            seam::at(seam::ATTN_OUT, &[&a]);
+            let o = ops::linear::matmul(&a, &w.o_proj);
             let o = if m.tp > 1 {
                 ops::collective::all_reduce(&o)
             } else {
@@ -198,7 +215,6 @@ fn qkv_unfused(
         at.q_heads * d,
         at.kind.kv_heads() * d,
     );
-    seam::at(seam::ATTN_QV, (&q, &v));
     let v = ops::elemwise::rmsnorm_no_scale(&v, d, at.q_norm_eps);
     let q = ops::elemwise::rmsnorm_per_head(&q, &at.q_norm, d, at.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head(&k, k_norm, d, k_norm_eps);

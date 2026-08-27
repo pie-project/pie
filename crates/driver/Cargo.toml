@@ -67,3 +67,39 @@ tensor-ir = { path = "../tensor-ir" }
 # the emitted artifact, not an import; importing it is what this line does
 # today and it is strictly better than the copy, but it is not where it lands.
 tensor-compiler = { path = "../tensor-compiler" }
+
+# THE ARTIFACT THE FIRE WALKS, and the arrow points this way on purpose.
+# `compile(plan, budgets, profile) -> Baked` is pure and knows nothing about a
+# driver; `driver::fire::walk` iterates what it produced. Every shell then
+# holds the two together — the `Plan` for its nodes, the `Baked` for the
+# regions over them — which is the arrangement `model_compiler::baked`'s own
+# docs describe, and the reason `walk` takes both.
+model-compiler = { path = "../model-compiler" }
+
+# The vocabulary both ends of that walk are written in: `Plan`, `Node`,
+# `ClassSet`, `Operation`. It arrives through model-compiler's public types
+# anyway -- a `Region::mask` IS a `model_ir::ClassSet` -- so naming it directly
+# is what lets this crate spell the types it is already handed, rather than
+# reaching for them one re-export deep.
+model-ir = { path = "../model-ir" }
+
+# The dispatch contract, and ONLY the contract: six `Dispatch*` traits, the
+# aggregate `exec`, and `KernelError`. The one walk written over that contract
+# used to live inside `kernels` and could not stay there -- it needs `Baked`,
+# and a contract crate that knew what a compiler is would invert the layering
+# every backend depends on (palo decisions #11 and #12). So the walk moved here
+# and the dependency runs this way: driver knows kernels, kernels knows nothing.
+kernels = { path = "../kernels" }
+
+[dev-dependencies]
+# THE REAL CATALOG, for the same reason `model-compiler` takes it: every unit
+# test in `src/fire/` builds its plan by hand, which checks this crate against
+# this crate's own idea of what a fire looks like. The catalog adds the one
+# thing a fixture cannot -- six model texts somebody else wrote, four planes,
+# sixty layers of nested split and merge -- and `tests/every_sku_walks_its_
+# classes.rs` walks all of them with a mock `Dispatch` and no GPU in the room.
+#
+# A DEV EDGE ONLY, AND IT DOES NOT CYCLE: `model` reads `model-dsl`,
+# `model-loader` and `tokenizer`, and none of the three names this crate.
+model = { path = "../model" }
+model-dsl = { path = "../model-dsl" }

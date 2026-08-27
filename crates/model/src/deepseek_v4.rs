@@ -6,14 +6,16 @@ pub mod template;
 use model::Model;
 use model_dsl::Dtype;
 
-pub const CATALOG: &[(&str, model_dsl::TraceFn)] = model_dsl::catalog![
+pub const CATALOG: &[crate::Row] = model_dsl::catalog![
     (
         "dsv4-base-bf16-kv-bf16",
+        1,
         model_dsl::trace_hybrid,
         Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
         "dsv4-base-bf16-kv-bf16-tp2",
+        2,
         model_dsl::trace_hybrid,
         Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 2)
     ),

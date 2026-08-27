@@ -32,7 +32,7 @@ use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
 use tensor_ir::container::{HostRole, PortSource, TraceContainer};
-use tensor_ir::registry::Port;
+use tensor_ir::registry::{GeometryClass, Port, PortMask};
 use tensor_ir::types::DType;
 
 use super::pie;
@@ -745,17 +745,19 @@ impl ProcessCtx {
                 matches!(binding.port, tensor_ir::registry::Port::AttnMask)
                     && matches!(binding.source, tensor_ir::container::PortSource::Channel(_))
             });
-            let devgeo_capable = device_port_mask & ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
-                == ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
-                && (!needs_mask_port
-                    || device_port_mask & ::driver_api::PIE_DEVICE_PORT_ATTN_MASK != 0);
+            // THE PORTS WENT HOME (decision 19): `PIE_DEVICE_GEOMETRY_PORTS`
+            // and its twelve siblings were a private bit numbering in
+            // `driver-api` that disagreed with the registry's, and nothing
+            // checked the two. `covers` is the registry's own subset test.
+            let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
+                && (!needs_mask_port || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
             let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
                 &prog.bound.container,
             ) {
                 Some(_) if !devgeo_capable => {
                     tracing::info!(
                         "device-geometry program on a driver without device geometry ports \
-                         (mask {device_port_mask:#x}): falling back to host-evaluated \
+                         (mask {device_port_mask:?}): falling back to host-evaluated \
                          serialized execution"
                     );
                     None
@@ -813,12 +815,12 @@ impl ProcessCtx {
                     Ok(Some(envelope)) => {
                         let required =
                             crate::pipeline::fire::geometry::envelope_required_ports(&envelope);
-                        if device_port_mask & required == required {
+                        if device_port_mask.covers(required) {
                             Some(envelope)
                         } else {
                             tracing::info!(
                                 "decode envelope on a driver without device geometry ports \
-                                 (mask {device_port_mask:#x}, needs {required:#x}): falling \
+                                 (mask {device_port_mask:?}, needs {required:?}): falling \
                                  back to host-evaluated serialized execution"
                             );
                             None
@@ -882,11 +884,11 @@ impl ProcessCtx {
                 None => None,
             };
             let geometry_class = if devgeo.is_some() {
-                ::driver_api::GeometryClass::DeviceGeometry
+                GeometryClass::DeviceGeometry
             } else if decode_envelope.is_some() {
-                ::driver_api::GeometryClass::DecodeEnvelope
+                GeometryClass::DecodeEnvelope
             } else {
-                ::driver_api::GeometryClass::Host
+                GeometryClass::Host
             };
             let rs_reps = rs_working_sets.iter().map(Resource::rep).collect();
 
@@ -914,26 +916,27 @@ impl ProcessCtx {
                 }
                 let extern_binding = extern_bindings[dense].as_ref();
                 missing_dense.push(dense);
-                registration_plans.push(crate::driver::ChannelRegistrationPlan {
-                    driver_id: 0,
-                    channel_id: cell.lock().unwrap().global_id,
+                // THE TAGS ARE PTIR'S OWN NOW. `dtype: u8`, `host_role: u8`
+                // and `extern_dir: u8` were three tag bytes re-spelling
+                // `tensor_ir::container`'s enums in a second numbering
+                // (`PIE_CHANNEL_DTYPE_*`, `PIE_CHANNEL_HOST_ROLE_*`,
+                // `PIE_CHANNEL_EXTERN_*`), with nothing checking the two
+                // agreed — and `driver-api::program`'s header records the
+                // place the disagreement was visible. A declaration names the
+                // enums, so the re-spelling has nowhere left to drift.
+                //
+                // `driver_id`/`reader_wait_id`/`writer_wait_id` are gone from
+                // the argument: the first is the caller's routing (the
+                // scheduler dispatch facade already holds it) and the other
+                // two are what a registration ANSWERS.
+                registration_plans.push(crate::driver::ChannelRegistration {
+                    id: cell.lock().unwrap().global_id,
                     shape: decls[dense].shape.dims().to_vec(),
-                    dtype: decls[dense].dtype.tag(),
-                    host_role: decls[dense].host_role as u8,
+                    dtype: decls[dense].dtype,
+                    host_role: decls[dense].host_role,
                     seeded: decls[dense].seeded,
-                    extern_dir: extern_binding
-                        .map(|(_, dir)| match dir {
-                            tensor_ir::container::ExternDir::Import => {
-                                ::driver_api::PIE_CHANNEL_EXTERN_IMPORT
-                            }
-                            tensor_ir::container::ExternDir::Export => {
-                                ::driver_api::PIE_CHANNEL_EXTERN_EXPORT
-                            }
-                        })
-                        .unwrap_or(::driver_api::PIE_CHANNEL_EXTERN_NONE),
+                    extern_dir: extern_binding.map(|(_, dir)| *dir),
                     capacity: decls[dense].capacity,
-                    reader_wait_id: 0,
-                    writer_wait_id: 0,
                     extern_name: extern_binding
                         .map(|(name, _)| name.as_bytes().to_vec())
                         .unwrap_or_default(),
@@ -953,6 +956,7 @@ impl ProcessCtx {
                 reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
+            let pricing_rows = prog.pricing.rows;
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
             for (dense, cell) in cells.iter().enumerate() {
@@ -1003,6 +1007,22 @@ impl ProcessCtx {
                     channel_ids.clone(),
                     seed_values,
                     geometry_class,
+                    // THE EXTENTS THE DRIVER CARVES THIS INSTANCE'S STAGE
+                    // BUFFERS AT (Build log 15). `sampled_rows` is the one a
+                    // model fire's epilogue resolves against — how many
+                    // readout rows the program reads — and it is exactly what
+                    // registration already priced the program on
+                    // (`Pricing::rows`, read off the `embed` indptr lanes and
+                    // otherwise one), so it is read from there rather than
+                    // guessed a second time. Every other role stays at one:
+                    // no shell in this workspace makes another role symbolic
+                    // in a fire-time quantity — a decode-envelope pass resolves
+                    // its token on the device (`palo B3`) but its stage
+                    // buffers are still carved at one row apiece.
+                    ::driver_api::BindExtents {
+                        sampled_rows: pricing_rows.max(1),
+                        ..::driver_api::BindExtents::default()
+                    },
                 )
                 .await
                 {
@@ -1136,10 +1156,7 @@ impl ProcessCtx {
             let qo_indptr = if let Some(devgeo) = pass.devgeo.as_ref() {
                 vec![0; devgeo.b + 1]
             } else if has_recurrent_state {
-                match pass
-                    .instance
-                    .fire_geometry(crate::pipeline::program::model_profile().page_size)
-                {
+                match pass.instance.fire_geometry() {
                     Ok(geometry) => geometry.qo_indptr,
                     Err(error) => {
                         return Ok(Err(format!(

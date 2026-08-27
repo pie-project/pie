@@ -85,9 +85,27 @@ telemetry = false
 
 "#;
 
+// THE DEFAULT NAMES A MODEL THIS BUILD CAN ACTUALLY SERVE.
+//
+// It was `Qwen/Qwen3-0.6B` and nothing here ships a trace for it: the catalog
+// (`model::catalog`) is qwen35 / gemma4 / gptoss / glm5 / kimik3 / dsv4, and
+// the palo rewrite made the SKU the load's own identity — a checkpoint is
+// matched against every import contract in the build and refused by name when
+// none fits. So `pie config init && pie serve` answered
+//
+//     "/root/.pie/models/Qwen--Qwen3-0.6B.zt" matches no SKU this build ships
+//
+// with ten candidate refusals under it, out of the box, on a machine where
+// everything worked. A generated default that cannot boot is worse than no
+// default: the operator's first move is to debug a file they did not write.
+//
+// `Qwen/Qwen3.5-0.8B` is the smallest catalog row (`qwen35-d0.8b-bf16-kv-bf16`,
+// 1.6 GiB) and is what every gate from `driver-cuda/tests/serve_smoke` up to
+// `tests/gpu/tests/cuda_serve_round_trip` is pinned against. `pie model list`
+// prints the SKU beside each snapshot, which is the door for choosing another.
 const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
-model = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3.5-0.8B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 "#;
 

@@ -6,8 +6,6 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    pub act: Dtype,
-
     pub kv: Dtype,
     pub embed: Weight,
     pub head: Weight,
@@ -85,22 +83,11 @@ struct Dims {
     norm_eps: f32,
 }
 
-fn per_rank(d: Dims, tp: u32) -> Dims {
-    let cut = |what, whole| model_dsl::per_rank(what, whole, tp as usize);
-    Dims {
-        q_heads: cut("q_heads", d.q_heads),
-        kv_heads: cut("kv_heads", d.kv_heads),
-        inter: cut("inter", d.inter),
-        ..d
-    }
-}
-
 impl Model {
-    pub fn b20(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b20(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         assemble(
             w,
             experts,
-            act,
             kv,
             tp,
             Dims {
@@ -127,11 +114,10 @@ impl Model {
         )
     }
 
-    pub fn b120(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b120(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         assemble(
             w,
             experts,
-            act,
             kv,
             tp,
             Dims {
@@ -159,25 +145,32 @@ impl Model {
     }
 }
 
-fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-    let d = per_rank(d, tp);
+fn assemble(weights: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    assert!(
+        matches!(tp, 1 | 2 | 4 | 8),
+        "tp {tp} is not a world this catalog ships"
+    );
+    let q_heads = d.q_heads / tp;
+    let kv_heads = d.kv_heads / tp;
+    let inter = d.inter / tp;
+
     let hidden = d.hidden as u64;
     let hd = d.head_dim as u64;
-    let q_w = d.q_heads as u64 * hd;
-    let kv_w = d.kv_heads as u64 * hd;
+    let q_w = q_heads as u64 * hd;
+    let kv_w = kv_heads as u64 * hd;
     let n_experts = d.experts as u64;
-    let inter = d.inter as u64;
-    let sliding_at = |l: u32| l.is_multiple_of(2);
+    let inter_w = inter as u64;
+    let sliding_window_on = |l: u32| l.is_multiple_of(2);
 
     let layers = (0..d.layers)
         .map(|l| {
             let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, cols: u64| Weight::sym(n(s), [cols], w);
+            let norm = |s: &str, cols: u64| Weight::sym(n(s), [cols], weights);
             Layer {
                 attn: Attn {
-                    window: sliding_at(l).then_some(d.window),
-                    q_heads: d.q_heads,
-                    kv_heads: d.kv_heads,
+                    window: sliding_window_on(l).then_some(d.window),
+                    q_heads,
+                    kv_heads,
                     head_dim: d.head_dim,
                     sm_scale: (d.head_dim as f32).sqrt().recip(),
                     theta: d.theta,
@@ -186,15 +179,15 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
                     beta_slow: d.yarn_beta_slow,
                     attention_factor: d.yarn_attention_factor,
                     original_max_position: d.yarn_original_max_position,
-                    q_proj: Weight::sym(n("q_proj"), [q_w, hidden], w).columns(),
-                    q_bias: Weight::sym(n("q_bias"), [q_w], w).columns(),
-                    k_proj: Weight::sym(n("k_proj"), [kv_w, hidden], w).columns(),
-                    k_bias: Weight::sym(n("k_bias"), [kv_w], w).columns(),
-                    v_proj: Weight::sym(n("v_proj"), [kv_w, hidden], w).columns(),
-                    v_bias: Weight::sym(n("v_bias"), [kv_w], w).columns(),
-                    o_proj: Weight::sym(n("o_proj"), [hidden, q_w], w).rows(),
-                    o_bias: Weight::sym(n("o_bias"), [hidden], w),
-                    sinks: Weight::sym(n("attn_sinks"), [d.q_heads as u64], w).columns(),
+                    q_proj: Weight::sym(n("q_proj"), [q_w, hidden], weights).columns(),
+                    q_bias: Weight::sym(n("q_bias"), [q_w], weights).columns(),
+                    k_proj: Weight::sym(n("k_proj"), [kv_w, hidden], weights).columns(),
+                    k_bias: Weight::sym(n("k_bias"), [kv_w], weights).columns(),
+                    v_proj: Weight::sym(n("v_proj"), [kv_w, hidden], weights).columns(),
+                    v_bias: Weight::sym(n("v_bias"), [kv_w], weights).columns(),
+                    o_proj: Weight::sym(n("o_proj"), [hidden, q_w], weights).rows(),
+                    o_bias: Weight::sym(n("o_bias"), [hidden], weights),
+                    sinks: Weight::sym(n("attn_sinks"), [q_heads as u64], weights).columns(),
                     kv: format!("kv.{l}"),
                 },
                 attn_norm: norm("attn_norm", hidden),
@@ -204,22 +197,26 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
                 mlp: Moe {
                     experts: d.experts,
                     top_k: d.top_k,
-                    inter: d.inter,
+                    inter,
                     swiglu_limit: d.swiglu_limit,
                     swiglu_alpha: d.swiglu_alpha,
-                    router: Weight::sym(n("router"), [n_experts, hidden], w),
-                    router_bias: Weight::sym(n("router_bias"), [n_experts], w),
+                    router: Weight::sym(n("router"), [n_experts, hidden], weights),
+                    router_bias: Weight::sym(n("router_bias"), [n_experts], weights),
                     gate_up: Weight::sym(
                         n("expert_gate_up_bank"),
-                        [n_experts, 2 * inter, hidden],
+                        [n_experts, 2 * inter_w, hidden],
                         experts,
                     )
-                    .bank([inter, inter]),
-                    gate_up_bias: Weight::sym(n("expert_gate_up_bias"), [n_experts, 2 * inter], w)
-                        .bank([inter, inter]),
-                    down: Weight::sym(n("expert_down_bank"), [n_experts, hidden, inter], experts)
+                    .bank([inter_w, inter_w]),
+                    gate_up_bias: Weight::sym(
+                        n("expert_gate_up_bias"),
+                        [n_experts, 2 * inter_w],
+                        weights,
+                    )
+                    .bank([inter_w, inter_w]),
+                    down: Weight::sym(n("expert_down_bank"), [n_experts, hidden, inter_w], experts)
                         .rows(),
-                    down_bias: Weight::sym(n("expert_down_bias"), [n_experts, hidden], w),
+                    down_bias: Weight::sym(n("expert_down_bias"), [n_experts, hidden], weights),
                 },
             }
         })
@@ -229,12 +226,11 @@ fn assemble(w: Dtype, experts: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -
         hidden: d.hidden,
         vocab: d.vocab,
         tp,
-        act,
         kv,
-        embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
-        head: Weight::sym("lm_head", [d.vocab as u64, hidden], w),
+        embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
+        head: Weight::sym("lm_head", [d.vocab as u64, hidden], weights),
         layers,
-        final_norm: Weight::sym("final_norm", [hidden], w),
+        final_norm: Weight::sym("final_norm", [hidden], weights),
         final_norm_eps: d.norm_eps,
     }
 }

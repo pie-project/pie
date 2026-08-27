@@ -22,19 +22,20 @@ use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
 use tensor_ir::op::tags;
 use tensor_ir::validate::BoundTrace;
 
-/// Kind discriminants. Re-exported from the driver ABI rather than restated:
-/// [`EmittedKernel::kind`] is handed straight to the driver, so a second
-/// spelling of these numbers here would be a second thing to keep right.
-pub use driver_api::local::{
-    PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
-    PIE_KERNEL_SINGLETON,
-};
+/// Which kernel family an emission is for. Re-exported from the contract
+/// rather than restated: [`EmittedKernel::kind`] is handed straight to the
+/// driver, so a second spelling here would be a second thing to keep right.
+///
+/// It was five `PIE_KERNEL_*` `u32` constants; the contract types them now, so
+/// the five arms below are a `match` the compiler checks instead of five
+/// integers it does not.
+pub use driver_api::program::KernelKind;
 
 /// One emitted kernel, or the reason it could not be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmittedKernel {
-    /// The `PIE_KERNEL_*` discriminant naming which kernel family this is.
-    pub kind: u32,
+    /// Which kernel family this is.
+    pub kind: KernelKind,
     /// The stage this kernel was emitted for.
     pub stage_index: u32,
     /// The region within that stage this kernel was emitted for.
@@ -51,7 +52,7 @@ pub struct EmittedKernel {
 
 impl EmittedKernel {
     fn new(
-        kind: u32,
+        kind: KernelKind,
         stage_index: usize,
         region_index: usize,
         entry_name: String,
@@ -172,7 +173,7 @@ fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emit
         let entry = format!("ptir_fused_{signature}_r{region_index}");
         let emitted = crate::codegen::cuda::emit_fused_region(&entry, stage, region);
         out.push(EmittedKernel::new(
-            PIE_KERNEL_FUSED,
+            KernelKind::Fused,
             stage_index,
             region_index,
             entry,
@@ -191,7 +192,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
                 let entry = format!("ptir_m1_{signature}_r{region_index}");
                 let source = crate::codegen::metal::emit_singleton_region(&entry, meta.op.tag);
                 out.push(EmittedKernel::new(
-                    PIE_KERNEL_SINGLETON,
+                    KernelKind::Singleton,
                     stage_index,
                     region_index,
                     entry,
@@ -203,7 +204,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             // The whole stage is unrepresentable on the singleton path; say so
             // once rather than per region.
             out.push(EmittedKernel::new(
-                PIE_KERNEL_SINGLETON,
+                KernelKind::Singleton,
                 stage_index,
                 0,
                 String::new(),
@@ -228,7 +229,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             })
         };
         out.push(EmittedKernel::new(
-            PIE_KERNEL_FUSED,
+            KernelKind::Fused,
             stage_index,
             region_index,
             entry,
@@ -243,7 +244,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         let entry = format!("ptir_m3s_{signature}_r{region_index}");
         let emitted = crate::codegen::metal::emit_grouped_fused_region(&entry, stage, region);
         out.push(EmittedKernel::new(
-            PIE_KERNEL_GROUPED,
+            KernelKind::Grouped,
             stage_index,
             region_index,
             entry,
@@ -262,7 +263,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             _ => crate::codegen::metal::emit_grouped_fused_region(&entry, stage, region),
         };
         out.push(EmittedKernel::new(
-            PIE_KERNEL_GROUPED,
+            KernelKind::Grouped,
             stage_index,
             stage.singleton.regions.len() + region_index,
             entry,
@@ -279,7 +280,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     let ready = format!("ptir_m3_generic_ready_v{version}");
     let source = crate::codegen::metal::emit_grouped_readiness(&ready);
     out.push(EmittedKernel::new(
-        PIE_KERNEL_READINESS,
+        KernelKind::Readiness,
         stage_index,
         0,
         ready,
@@ -288,7 +289,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     let commit = format!("ptir_m3_generic_commit_v{version}");
     let source = crate::codegen::metal::emit_grouped_commit(&commit);
     out.push(EmittedKernel::new(
-        PIE_KERNEL_COMMIT,
+        KernelKind::Commit,
         stage_index,
         0,
         commit,
@@ -308,7 +309,7 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     let ready = format!("ptir_m1_{signature}_ready");
     let source = crate::codegen::metal::emit_readiness(&ready, &effects);
     out.push(EmittedKernel::new(
-        PIE_KERNEL_READINESS,
+        KernelKind::Readiness,
         0,
         1,
         ready,
@@ -316,7 +317,7 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     ));
     let commit = format!("ptir_m1_{signature}_commit");
     let source = crate::codegen::metal::emit_commit(&commit, &effects);
-    out.push(EmittedKernel::new(PIE_KERNEL_COMMIT, 0, 1, commit, source));
+    out.push(EmittedKernel::new(KernelKind::Commit, 0, 1, commit, source));
 }
 
 /// Which library kernel a grouped region should use, reproducing the driver's

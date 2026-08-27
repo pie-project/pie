@@ -73,8 +73,6 @@ pub struct Node {
 pub struct Plan {
     pub name: String,
     pub plane: Plane,
-    /// Fact names; `Cond::Fact(bit)` indexes this list.
-    pub facts: Vec<String>,
     pub params: Vec<Param>,
     pub caches: Vec<CacheRow>,
     pub values: Vec<ValueDecl>,

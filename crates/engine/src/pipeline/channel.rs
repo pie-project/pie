@@ -45,10 +45,24 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::driver::ChannelEndpoint;
-use ::driver_api::ChannelBinding;
+// THE RING IS THE ENGINE'S NOW. `ChannelBinding` was
+// `driver_api::local::ChannelBinding` — a driver's private ring layout,
+// published into the contract so a C caller could poke it — and the palo
+// rewrite deleted it. Every word of arithmetic below is unchanged; what
+// changed is that the bytes it reads belong to a `HostRing` this engine
+// allocated (`crate::driver::channel`, whose header argues it) rather than to
+// a driver's device memory.
+use crate::driver::{ChannelBinding, ChannelEndpoint};
 use tensor_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use tensor_ir::types::DType;
+
+/// The ticket a channel endpoint that neither consumes nor publishes states.
+///
+/// Was `driver_api::plan::CHANNEL_TICKET_NONE`, and it moved for the reason
+/// every sentinel in the rewrite moved: it is the engine's own bookkeeping —
+/// the run-ahead cursor a fire reserves and rolls back — and the contract has
+/// no field carrying it (see `crate::driver::fire::ChannelTicket`).
+pub const TICKET_NONE: u64 = u64::MAX;
 
 /// Process-wide monotonic source of GLOBAL channel identities (0 reserved as a
 /// null sentinel). Minted when the guest constructs a `channel` resource; a
@@ -359,28 +373,28 @@ impl ChannelCell {
             self.device_reserved_head += 1;
             expected
         } else {
-            ::driver_api::CHANNEL_TICKET_NONE
+            TICKET_NONE
         };
         let expected_tail = if publish {
             let expected = self.device_reserved_tail;
             self.device_reserved_tail += 1;
             expected
         } else {
-            ::driver_api::CHANNEL_TICKET_NONE
+            TICKET_NONE
         };
         (expected_head, expected_tail)
     }
 
     pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) -> bool {
         let mut complete = true;
-        if expected_tail != ::driver_api::CHANNEL_TICKET_NONE {
+        if expected_tail != TICKET_NONE {
             if self.device_reserved_tail == expected_tail + 1 {
                 self.device_reserved_tail = expected_tail;
             } else {
                 complete = false;
             }
         }
-        if expected_head != ::driver_api::CHANNEL_TICKET_NONE {
+        if expected_head != TICKET_NONE {
             if self.device_reserved_head == expected_head + 1 {
                 self.device_reserved_head = expected_head;
             } else {
@@ -807,9 +821,59 @@ impl ChannelCell {
             .ok_or(ChannelError::MissingSeed)
     }
 
+    /// The seed has landed in the DRIVER. Drop the host copy and record, in
+    /// this cell's own ring, that the cell it accounts for has already
+    /// crossed.
+    ///
+    /// # The seed is not in the host ring, and the ring has to know
+    ///
+    /// A seed rides [`InstanceBinding::seeds`](driver_api::InstanceBinding)
+    /// straight into the shell's ring — it never travels through the host
+    /// ring the engine owns, so both of that ring's words are still zero when
+    /// the bind returns. [`ChannelCell::bind`] meanwhile charges
+    /// `writer_tail` with it, because from the guest's side one cell HAS been
+    /// put. Those two facts contradict each other at the guest's NEXT put:
+    /// [`write_writer_ring`](Self::write_writer_ring) asks
+    /// `writer_tail - head >= capacity`, reads `1 - 0` against the default
+    /// capacity of one, and answers [`Full`](ChannelError::Full) — for ever,
+    /// because the only thing that moves `head` is
+    /// [`ChannelJoin::pump_in`](crate::driver::ChannelJoin::pump_in) draining
+    /// a ring that has nothing in it. A guest whose put is refused stages no
+    /// cell, its next fire finds a consuming port with nothing to consume,
+    /// and the whole lane parks: 0% on the GPU, nothing in any log.
+    ///
+    /// `cuda_seeded_channel_cursors` is the gate for exactly this, and the
+    /// fix it names — "publish the seed into the mirror as well as the ring"
+    /// — was inside the C++ driver's `ensure_sessions` and did not survive
+    /// the rewrite. The engine owns the host ring now, so it is the engine's
+    /// to say: sequence 0 was produced AND delivered, `head == tail ==
+    /// writer_tail`, and the guest's next put takes sequence 1.
     pub fn commit_seed(&mut self) {
         let _ = self.staged.pop_front();
         self.seed_taken = true;
+        if self.role != Some(HostRole::Writer) {
+            return;
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        let binding = endpoint.registered().binding;
+        // Only when the ring is untouched: a second instance attaching the
+        // same cell must not rewind cursors that fires have moved.
+        if load_word(binding.word_base, binding.tail_word_index as usize) == 0
+            && load_word(binding.word_base, binding.head_word_index as usize) == 0
+        {
+            store_word(
+                binding.word_base,
+                binding.tail_word_index as usize,
+                self.writer_tail,
+            );
+            store_word(
+                binding.word_base,
+                binding.head_word_index as usize,
+                self.writer_tail,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1390,54 +1454,74 @@ mod tests {
         );
     }
 
-    /// Builds a Writer ring the test owns (mirror + words), attached via the
-    /// direct-write path so `put` lands wire bytes in shared memory.
+    /// Builds a Writer ring, attached via the direct-write path so `put`
+    /// lands wire bytes in it.
+    ///
+    /// **THE RING IS ALLOCATED THE WAY PRODUCTION ALLOCATES IT.** The fixture
+    /// used to `Box::leak` a mirror and a word block and hand the addresses
+    /// to a hand-built `ChannelBinding` — which is what a DRIVER filled in,
+    /// across an ABI. The engine owns the ring now
+    /// (`crate::driver::channel`), so the test builds a
+    /// `RegisteredChannel` and reads the same bytes back through its binding:
+    /// the arithmetic under test is unchanged, and the fixture is no longer
+    /// an imitation of a caller that does not exist.
+    ///
+    /// Leaked because the slices below point into it and the tests hold them
+    /// for their whole body.
     fn writer_ring(
         capacity: u32,
         cell_bytes: usize,
-    ) -> (ChannelCell, &'static [u8], &'static [AtomicU64]) {
+    ) -> (
+        ChannelCell,
+        &'static [u8],
+        &'static [AtomicU64],
+        &'static crate::driver::RegisteredChannel,
+    ) {
         let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
         declaration.capacity = capacity;
         let mut writer = ChannelCell::new(vec![8], DType::Bool, capacity);
         writer.matches_decl(&declaration).unwrap();
         writer.bind(&declaration);
-        let cap1 = capacity as usize + 1;
-        let mirror = Box::leak(vec![0u8; cell_bytes * cap1].into_boxed_slice());
-        let words = Box::leak(
-            (0..4)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        (writer, mirror, words)
+        let table = waker::WakerTable::global();
+        let registered: &'static crate::driver::RegisteredChannel =
+            Box::leak(Box::new(crate::driver::RegisteredChannel::new(
+                usize::MAX,
+                writer.global_id,
+                cell_bytes as u32,
+                capacity,
+                table.alloc(),
+                table.alloc(),
+            )));
+        let binding = registered.binding;
+        // SAFETY: `registered` is leaked, so the ring it owns outlives every
+        // borrow below; the two spans are exactly what the binding describes.
+        let (mirror, words) = unsafe {
+            (
+                std::slice::from_raw_parts(
+                    binding.mirror_base as *const u8,
+                    binding.mirror_bytes as usize,
+                ),
+                std::slice::from_raw_parts(binding.word_base as *const AtomicU64, 4),
+            )
+        };
+        (writer, mirror, words, registered)
     }
 
-    fn attach_writer(
-        writer: &mut ChannelCell,
-        mirror: &[u8],
-        words: &[AtomicU64],
-        cell_bytes: u32,
-        capacity: u32,
-    ) {
-        let table = waker::WakerTable::global();
-        let endpoint = ChannelEndpoint::new(crate::driver::RegisteredChannel {
-            driver_id: usize::MAX,
-            binding: ChannelBinding {
-                channel_id: writer.global_id,
-                mirror_base: mirror.as_ptr() as u64,
-                word_base: words.as_ptr() as u64,
-                mirror_bytes: mirror.len() as u64,
-                word_bytes: std::mem::size_of_val(words) as u64,
-                cell_bytes,
-                capacity,
-                head_word_index: 0,
-                tail_word_index: 1,
-                poison_word_index: 2,
-                closed_word_index: 3,
-            },
-            reader_wait_id: table.alloc(),
-            writer_wait_id: table.alloc(),
-        });
+    /// Write one byte of a ring's mirror, the way the device half would.
+    ///
+    /// The fixtures below start from a ring that already holds a committed
+    /// cell; they used to state that by leaking a `Vec<u8>` with the byte in
+    /// it. The ring is allocated zeroed now, so the byte is poked in.
+    fn poke_cell(mirror: &[u8], at: usize, value: u8) {
+        // SAFETY: the ring is leaked, the tests drive it from one thread,
+        // and `at` is inside the mirror the binding describes.
+        unsafe {
+            *mirror.as_ptr().add(at).cast_mut() = value;
+        }
+    }
+
+    fn attach_writer(writer: &mut ChannelCell, registered: &crate::driver::RegisteredChannel) {
+        let endpoint = ChannelEndpoint::new(registered.clone());
         writer.attach_endpoint(Arc::new(endpoint)).unwrap();
     }
 
@@ -1446,8 +1530,8 @@ mod tests {
         // Plan §4.2: with an endpoint attached, `put` is a shared-memory
         // write — wire bytes at `tail % cap1`, then the release-published
         // tail word. No staging, no launch-descriptor involvement.
-        let (mut writer, mirror, words) = writer_ring(2, 1);
-        attach_writer(&mut writer, mirror, words, 1, 2);
+        let (mut writer, mirror, words, registered) = writer_ring(2, 1);
+        attach_writer(&mut writer, registered);
         writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 → 5
         assert_eq!(words[1].load(Ordering::Acquire), 1, "tail word published");
         assert_eq!(mirror[0], 5, "wire bytes written to the pinned ring");
@@ -1468,25 +1552,58 @@ mod tests {
         assert_eq!(mirror[2], 3, "sequence 2 lands at slot 2 of cap1=3");
     }
 
+    /// A SEEDED host-writer's SECOND put has to fit.
+    ///
+    /// The seed rides the bind into the driver's ring and never touches this
+    /// one, so both control words are zero when the bind returns — while
+    /// [`ChannelCell::bind`] has charged `writer_tail` with it. Left
+    /// unreconciled the guest's next put reads `writer_tail(1) - head(0) >=
+    /// capacity(1)` and answers [`Full`](ChannelError::Full) for ever, which
+    /// is a lane that parks with no error anywhere.
+    /// [`ChannelCell::commit_seed`] is where the two are reconciled.
+    #[test]
+    fn a_seeded_writers_second_put_is_not_full_for_ever() {
+        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
+        declaration.capacity = 1;
+        let (mut writer, mirror, words, registered) = writer_ring(1, 1);
+        // The seed, as the guest staged it before the bind.
+        writer.bind(&declaration);
+        writer.staged.push_back(vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        attach_writer(&mut writer, registered);
+        assert_eq!(
+            words[1].load(Ordering::Acquire),
+            0,
+            "the seed is not in this ring; it rode the bind"
+        );
+
+        writer.commit_seed();
+        assert_eq!(
+            (
+                words[0].load(Ordering::Acquire),
+                words[1].load(Ordering::Acquire)
+            ),
+            (1, 1),
+            "sequence 0 was produced AND delivered"
+        );
+
+        writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 -> 5
+        assert_eq!(words[1].load(Ordering::Acquire), 2);
+        assert_eq!(mirror[1], 5, "sequence 1 lands at slot 1 of cap1=2");
+    }
+
     #[test]
     fn writer_set_replaces_only_committed_front_and_rejects_in_flight_use() {
         let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
         declaration.capacity = 2;
-        let mut writer = ChannelCell::new(vec![8], DType::Bool, 2);
+        let (mut writer, mirror, words, registered) = writer_ring(2, 1);
         writer.bind(&declaration);
         writer.seed_taken = true;
         writer.writer_tail = 1;
-        let mirror = Box::leak(vec![1u8, 0, 0].into_boxed_slice());
-        let words = Box::leak(
-            vec![
-                AtomicU64::new(0),
-                AtomicU64::new(1),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ]
-            .into_boxed_slice(),
-        );
-        attach_writer(&mut writer, mirror, words, 1, 2);
+        // The ring already holds one committed cell: byte 1 at slot 0, tail
+        // at 1.
+        poke_cell(mirror, 0, 1);
+        words[1].store(1, Ordering::Release);
+        attach_writer(&mut writer, registered);
         let second = vec![0, 1, 0, 0, 0, 0, 0, 0];
         writer.put(second).unwrap();
 
@@ -1504,7 +1621,7 @@ mod tests {
 
         assert_eq!(
             writer.reserve_device_ticket(true, false),
-            (0, ::driver_api::CHANNEL_TICKET_NONE)
+            (0, TICKET_NONE)
         );
         assert_eq!(writer.set(vec![1; 8]).unwrap_err(), ChannelError::InFlight);
         assert_eq!(mirror[0], 8, "an in-flight front is never overwritten");
@@ -1515,16 +1632,9 @@ mod tests {
     fn cold_rebind_resynchronizes_device_tickets_from_the_live_ring() {
         let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
         declaration.capacity = 2;
-        let mut writer = ChannelCell::new(vec![8], DType::Bool, 2);
+        let (mut writer, _mirror, words, registered) = writer_ring(2, 1);
         writer.attach(11, &declaration, None).unwrap();
-        let mirror = Box::leak(vec![0u8; 3].into_boxed_slice());
-        let words = Box::leak(
-            (0..4)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        attach_writer(&mut writer, mirror, words, 1, 2);
+        attach_writer(&mut writer, registered);
 
         words[0].store(3, Ordering::Release);
         words[1].store(5, Ordering::Release);
@@ -1542,12 +1652,12 @@ mod tests {
     fn writer_staging_flushes_into_the_ring_at_attach() {
         // Pre-endpoint puts stage host-side; attaching the endpoint flushes
         // them FIFO into the ring (plan §4.2 pre-endpoint staging).
-        let (mut writer, mirror, words) = writer_ring(2, 1);
+        let (mut writer, mirror, words, registered) = writer_ring(2, 1);
         writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // 5
         writer.put(vec![0, 1, 0, 0, 0, 0, 0, 1]).unwrap(); // 130
         assert_eq!(writer.staged_len(), 2);
         assert_eq!(words[1].load(Ordering::Acquire), 0, "nothing published yet");
-        attach_writer(&mut writer, mirror, words, 1, 2);
+        attach_writer(&mut writer, registered);
         assert_eq!(writer.staged_len(), 0, "staging drained");
         assert_eq!(words[1].load(Ordering::Acquire), 2, "both cells published");
         assert_eq!(&mirror[..2], &[5, 130]);
@@ -1555,8 +1665,8 @@ mod tests {
 
     #[test]
     fn writer_put_surfaces_poison_and_close() {
-        let (mut writer, mirror, words) = writer_ring(2, 1);
-        attach_writer(&mut writer, mirror, words, 1, 2);
+        let (mut writer, _mirror, words, registered) = writer_ring(2, 1);
+        attach_writer(&mut writer, registered);
         words[2].store(9, Ordering::Release);
         assert!(matches!(
             writer.put(vec![0; 8]).unwrap_err(),

@@ -359,19 +359,19 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
 struct LoadedModelDrivers {
     model: String,
     caps: DriverCapabilities,
-    full_identity: driver_api::ModelIdentity,
-    encode_identity: driver_api::ModelIdentity,
+    full_identity: crate::executor::ModelIdentity,
+    encode_identity: crate::executor::ModelIdentity,
     kv_handle: Option<driver_api::KvHandle>,
     drivers: ModelDrivers,
     /// The model's compiled metadata, read once while resolving it. Present
     /// for either input form: an artifact carries the config, a snapshot's
     /// `config.json` is normalized into one.
-    metadata: model::serve::ModelMetadata,
+    metadata: ::engine::model::ModelMetadata,
 }
 
 struct LoadedPartnerMetadata {
-    full_identity: driver_api::ModelIdentity,
-    encode_identity: driver_api::ModelIdentity,
+    full_identity: crate::executor::ModelIdentity,
+    encode_identity: crate::executor::ModelIdentity,
     kv_handle: Option<driver_api::KvHandle>,
     page_size: u32,
     supports_media_encode: bool,
@@ -380,30 +380,37 @@ struct LoadedPartnerMetadata {
 
 /// THE DRIVER'S SELF-REPORT, DELIBERATELY, WHERE `register` READS THE ROW.
 ///
-/// `arch_name`, `vocab_size` and `max_model_len` are all stated on
-/// `model::serve::ROWS`, and the engine's own `register` reads them there —
-/// but this is not a statement of what the model IS. It is the token two
-/// workers compare before they trade KV pages, and what has to agree is what
-/// the two DRIVERS loaded, not what the two catalogs say. Substituting the
-/// row would fold in a table both binaries already share, which discriminates
-/// nothing, and would make the one divergence worth catching — a driver
-/// reporting a width its row does not state — invisible. `activation_dtype`
-/// and `hidden_size` in the same hash have no row column at all, which is the
-/// same fact from the other side: this is the driver's answer, whole.
+/// `arch_name` and `vocab_size` are stated on `engine::model::ROWS`, and the
+/// engine's own `register` reads them there — but this is not a statement of
+/// what the model IS. It is the token two workers compare before they trade
+/// KV pages, and what has to agree is what the two DRIVERS loaded, not what
+/// the two catalogs say. Substituting the row would fold in a table both
+/// binaries already share, which discriminates nothing, and would make the one
+/// divergence worth catching — a driver reporting a width its row does not
+/// state — invisible. `max_model_len`, `activation_dtype` and `hidden_size` in
+/// the same hash have no row column at all, which is the same fact from the
+/// other side: this is the driver's answer, whole.
 fn model_identity(
     user_cfg: &config::Config,
     caps: &DriverCapabilities,
     artifact_digest: &[u8; 32],
-    component: driver_api::ModelComponent,
-) -> Result<driver_api::ModelIdentity> {
+    component: crate::executor::ModelComponent,
+) -> Result<crate::executor::ModelIdentity> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(user_cfg.model.name.as_bytes());
     hasher.update(artifact_digest);
-    hasher.update(caps.arch_name.as_bytes());
-    hasher.update(&caps.vocab_size.to_le_bytes());
-    hasher.update(&caps.max_model_len.to_le_bytes());
-    hasher.update(caps.activation_dtype.as_bytes());
-    hasher.update(&caps.hidden_size.to_le_bytes());
+    // THE DRIVER'S ANSWER, WHOLE — still, and read out of the three records
+    // that replaced the flat struct. `arch_name` and `hidden_size` are gone
+    // from it: the first says which catalog row the CALLER resolved (so it
+    // discriminated nothing two peers did not already share), and the second
+    // has no seat in `ModelProfile`. What is left is what the two drivers
+    // actually loaded.
+    hasher.update(caps.device.backend.as_bytes());
+    hasher.update(&caps.profile.vocab.to_le_bytes());
+    hasher.update(&caps.profile.num_layers.to_le_bytes());
+    hasher.update(&caps.limits.max_context.to_le_bytes());
+    hasher.update(caps.profile.activation.name().as_bytes());
+    hasher.update(&caps.pools.kv_page_size.to_le_bytes());
     hasher.update(format!("{:?}", user_cfg.model.driver.kind).as_bytes());
     hasher.update(user_cfg.model.driver.activation_dtype.as_bytes());
     match user_cfg.model.driver.kind {
@@ -424,7 +431,7 @@ fn model_identity(
         // cached layout.
         config::DriverKind::Metal | config::DriverKind::Vulkan | config::DriverKind::Wgpu => {}
     }
-    Ok(driver_api::ModelIdentity {
+    Ok(crate::executor::ModelIdentity {
         hash: *hasher.finalize().as_bytes(),
         component,
     })
@@ -515,7 +522,7 @@ fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
 
 fn load_model_drivers(
     user_cfg: &config::Config,
-    component: driver_api::ModelComponent,
+    component: crate::executor::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
     // Process housekeeping, once per boot and before anything writes under
     // `$PIE_HOME/standalone/<pid>`: reclaim the directories left by launches
@@ -645,13 +652,13 @@ fn load_model_drivers(
             user_cfg,
             &caps,
             &artifact_digest,
-            driver_api::ModelComponent::Full,
+            crate::executor::ModelComponent::Full,
         )?,
         encode_identity: model_identity(
             user_cfg,
             &caps,
             &artifact_digest,
-            driver_api::ModelComponent::Encode,
+            crate::executor::ModelComponent::Encode,
         )?,
         caps,
         kv_handle,
@@ -675,7 +682,17 @@ async fn boot_engine(
         kv_handle,
         drivers,
         metadata,
-    } = load_model_drivers(user_cfg, driver_api::ModelComponent::Full)?;
+    } = load_model_drivers(user_cfg, crate::executor::ModelComponent::Full)?;
+    // The checkpoint's own `config.json`, read for the one number the driver
+    // no longer answers. A checkpoint that does not state it means an encode
+    // partner cannot be sized, which `configure_encode_injection` reads as
+    // "off" — the honest answer, and the same one a driver that reported
+    // zero gave.
+    let metadata_hidden_size: u32 = serde_json::from_slice::<serde_json::Value>(&metadata.config)
+        .ok()
+        .and_then(|config| config.get("hidden_size")?.as_u64())
+        .and_then(|size| u32::try_from(size).ok())
+        .unwrap_or(0);
 
     let boot_cfg = translate::build(user_cfg, drivers, metadata)
         .context("translating to bootstrap::Config")?;
@@ -683,9 +700,13 @@ async fn boot_engine(
     let boot = ::engine::bootstrap::bootstrap(boot_cfg)
         .await
         .map_err(|e| anyhow!("::engine::bootstrap::bootstrap: {e}"))?;
-    let page_size = caps.kv_page_size;
-    let supports_media_encode = caps.supports_media_encode;
-    let hidden_size = caps.hidden_size;
+    let page_size = caps.pools.kv_page_size;
+    let supports_media_encode = caps.media_encode;
+    // OFF THE MODEL'S OWN METADATA, not off the driver. `hidden_size` was a
+    // `DriverCapabilities` field and `ModelProfile` has no seat for it; the
+    // checkpoint's config carries it, and this crate lifted that config a
+    // moment ago.
+    let hidden_size = metadata_hidden_size;
     Ok((
         model,
         caps,
@@ -716,9 +737,9 @@ async fn boot_executor(
         .controller_addr()
         .context("executor boot requires a controller")?;
     let component = if role == Role::Encode {
-        driver_api::ModelComponent::Encode
+        crate::executor::ModelComponent::Encode
     } else {
-        driver_api::ModelComponent::Full
+        crate::executor::ModelComponent::Full
     };
     let loaded = load_model_drivers(user_cfg, component)?;
     let model_identity = if role == Role::Encode {
@@ -1046,7 +1067,7 @@ fn create_driver_group(
     snapshot_dir: &Path,
     config: &[u8],
     tp_degree: usize,
-    component: driver_api::ModelComponent,
+    component: crate::executor::ModelComponent,
 ) -> Result<GroupDriver> {
     #[cfg(feature = "_driver-cuda")]
     {

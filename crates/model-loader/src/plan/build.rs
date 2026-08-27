@@ -1389,6 +1389,13 @@ struct ScaleLayout {
     scale_form: ScaleForm,
 }
 
+/// An axis index as the `u32` a [`QuantAttachment`] states it in. Saturating
+/// rather than fallible: the index comes from a shape this compiler already
+/// walked, and no shape in this tree has 4 billion axes.
+fn axis(at: usize) -> u32 {
+    u32::try_from(at).unwrap_or(u32::MAX)
+}
+
 /// Where a generated metadata tensor's name is rooted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetaNaming {
@@ -1418,35 +1425,83 @@ impl MetaNaming {
 impl ScaleLayout {
     /// What encoding `shape` into `scheme` publishes, or why it cannot.
     ///
-    /// Every encode kernel in the tree is two-dimensional -- it walks `[rows,
-    /// cols]` tiles -- so the rank restriction is not a simplification, it is
-    /// the kernel's actual domain. A rank-3 declaration is refused here instead
-    /// of silently producing a scale-less weight, which is what a contract that
-    /// stacks experts and then asks for runtime quantization used to get.
+    /// **RANK-3 IS NOT A NEW KERNEL, IT IS THE OLD ONE READ CORRECTLY.** This
+    /// used to destructure `[rows, cols]` and refuse everything else, on the
+    /// stated grounds that "every encode kernel in the tree is
+    /// two-dimensional". The kernels are indeed two-dimensional; they are also
+    /// row-major, and they index `row * cols + c`. So an expert bank declared
+    /// `[experts, rows, cols]` is already the rectangle they walk — see
+    /// [`crate::types::rectangle`], which is the one place that fold is
+    /// spelled — and the refusal was arithmetic here, not a limit there. What
+    /// it cost is recorded: a contract that stacks experts and then asks for
+    /// runtime quantization (kimi's mxfp4 banks over a bf16 checkpoint) could
+    /// not be compiled at all.
+    ///
+    /// The scales keep the payload's LEADING AXES and replace its last one, so
+    /// a `[experts, rows, cols]` bank publishes `[experts, rows, cols / 32]` —
+    /// the same shape `model_dsl`'s `Weight::planes` interns for the plane the
+    /// driver will bind, one axis per axis rather than a flattened count. At
+    /// rank 2 every line below is exactly what it was.
     fn for_encode(scheme: QuantScheme, shape: &[i64]) -> Result<Self> {
-        let [rows, cols] = shape else {
+        let Some((_rows, cols)) = crate::types::rectangle(shape) else {
             return Err(Error::Contract(format!(
-                "encoding to {scheme:?} writes [rows, cols] tiles, so it cannot \
-                 produce scales for the rank-{} shape {shape:?}",
+                "encoding to {scheme:?} scales a [rows, cols] rectangle, so it \
+                 cannot produce scales for the rank-{} shape {shape:?}",
                 shape.len()
             )));
         };
+        let cols = &cols;
+        // The payload's axes minus its contracted one: what a scales shape is
+        // built on, in the declaration's own rank.
+        let lead = &shape[..shape.len() - 1];
         match scheme {
             QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => Ok(Self {
                 suffix: "_scale_inv",
                 zero_point_suffix: None,
                 naming: MetaNaming::Extend,
-                // `[rows]` of F32, one per output channel.
-                shape: vec![*rows],
+                // One F32 per output channel: the payload's leading axes,
+                // whole -- `[rows]` at rank 2, `[experts, rows]` at rank 3.
+                shape: lead.to_vec(),
                 encoding: Encoding::Raw(DType::F32),
                 granularity: QuantGranularity::PerChannel,
                 group_size: 0,
-                channel_axis: 0,
+                // The last axis a channel is counted along, which is the one
+                // just inside the contracted axis. `0` at rank 2, as before.
+                channel_axis: axis(lead.len() - 1),
                 scale_form: ScaleForm::F32Factors,
             }),
             // E8M0 block scale: one uint8 per 32-element block along K. The
-            // encode-tile kernel writes a row-major `[rows, cols/32]` byte
+            // encode-tile kernel writes a row-major `[.., cols/32]` byte
             // tensor, and the MXFP4 kernels want those bytes as they are.
+            //
+            // **THE NAME IS `.scales`, AND IT IS AN ACCORD, NOT A PREFERENCE.**
+            // It was `_scale`, which is a name nothing in this tree looks for.
+            // An mxfp4 bank's second plane has exactly one spelling here:
+            // `model_dsl`'s `SCALES`, interned by `Weight::planes` into
+            // `Plan::params` as `<w>.scales`, written by every family import
+            // that names a stored scales tensor, and looked up by name in the
+            // driver's residency sink (`driver-cuda/src/weights.rs` indexes
+            // `plan.params` by name and refuses a param the load never
+            // published). A weight this loader ENCODES lands beside a weight
+            // the checkpoint shipped, in the same table, under the same rule —
+            // so publishing the encoder's plane under a fourth spelling
+            // produced a tensor correct in every respect except findable, and
+            // that is precisely the failure mode `MetaNaming`'s own doc
+            // warns about two screens below.
+            //
+            // This is the seam the `.scales`-vs-`_scale` accord was recorded
+            // as open on, and it is closed HERE rather than in the contract
+            // for the reason [`Scales`](crate::contract::Scales) states: the
+            // loader creates this tensor, so the loader names it, and the
+            // pairing a driver reads is the `QuantAttachment`'s tensor id and
+            // never a suffix match. "Every param has one producer" stays TRUE
+            // rather than exempted — the producer of `<w>.scales` is the
+            // encode instruction that also produces `<w>`, and it now
+            // publishes under the name the plan binds.
+            //
+            // `MetaNaming::Extend` and not `ReplaceWeight`: this tree's
+            // canonical names (`layer.7.experts_down`) do not end in
+            // `.weight`, and MLX's convention below is the one that does.
             QuantScheme::Mxfp4E2M1E8M0 => {
                 if cols % 32 != 0 {
                     return Err(Error::Contract(format!(
@@ -1455,14 +1510,14 @@ impl ScaleLayout {
                     )));
                 }
                 Ok(Self {
-                    suffix: "_scale",
+                    suffix: ".scales",
                     zero_point_suffix: None,
                     naming: MetaNaming::Extend,
-                    shape: vec![*rows, cols / 32],
+                    shape: crate::types::grouped_shape(lead, cols / 32),
                     encoding: Encoding::Raw(DType::U8),
                     granularity: QuantGranularity::PerGroup,
                     group_size: 32,
-                    channel_axis: 1,
+                    channel_axis: axis(lead.len()),
                     scale_form: ScaleForm::RawE8M0,
                 })
             }
@@ -1485,11 +1540,11 @@ impl ScaleLayout {
                     suffix: ".scales",
                     zero_point_suffix: Some(".biases"),
                     naming: MetaNaming::ReplaceWeight,
-                    shape: vec![*rows, cols / 64],
+                    shape: crate::types::grouped_shape(lead, cols / 64),
                     encoding: Encoding::Raw(DType::BF16),
                     granularity: QuantGranularity::PerGroup,
                     group_size: 64,
-                    channel_axis: 1,
+                    channel_axis: axis(lead.len()),
                     scale_form: ScaleForm::Bf16AffineFactors,
                 })
             }

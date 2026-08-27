@@ -432,32 +432,85 @@ pub fn remove_launch_state() {
     }
 }
 
-// `DriverCapabilities` is owned by `driver` (single source of truth
-// for the driver ↔ runtime interface). Re-exported here so existing call
-// sites in pie-worker keep working through the
-// `embedded_driver::DriverCapabilities` path.
-pub use driver_api::DriverCapabilities;
-
-/// Build the model-load request the driver will compile from.
+/// What a load answered about itself.
 ///
-/// The runtime states *what* it wants loaded — the checkpoint, the quantization
-/// it would prefer, the MoE lowering, the component scope — and nothing about
-/// the device. The driver measures the device and calls the loader itself
-/// (`loader/architecture.md` §3).
-fn model_load_desc(
+/// A rename, not an alias with a new spelling behind it: the 30-field
+/// `DriverCapabilities` mixed three subjects (the device, the load, and the
+/// MODEL) and the contract's [`Capabilities`](driver_api::Capabilities)
+/// separates them — `device`, `pools`, `limits`, and a
+/// `ModelProfile` carried whole rather than rebuilt from eight booleans
+/// (`driver-api::caps`'s header). Three of the old fields have no successor
+/// because they were never the driver's to answer: `snapshot_dir`,
+/// `model_id` and `arch_name` say where the CALLER's checkpoint came from,
+/// and the caller is this crate. They are on
+/// [`GroupDriver`](crate::translate::GroupDriver) now.
+pub use driver_api::Capabilities as DriverCapabilities;
+
+/// The ceilings a load is baked against, out of what the operator stated.
+///
+/// **THIS IS WHERE `ModelLoadDesc` WENT.** Its four fields said nothing this
+/// does not: `snapshot_dir` is [`Checkpoint::Path`](driver_api::Checkpoint),
+/// `component` is which `Plan` you hand over, and `runtime_quant`/`mxfp4_moe`
+/// were a quantization word and a MoE lowering name that a backend
+/// string-matched — the plan's params carry their own dtypes, and which
+/// kernel answers an op is the dispatch arm's decision (design §6). What is
+/// left is arithmetic about the pools, and it is the operator's.
+///
+/// `slots` is derived rather than stated because the two knobs an operator
+/// has are a page count and a context length, and the shell's paging hands
+/// each seated sequence one block of `max_context / page_size` pages: how
+/// many sequences fit is that division, not a third knob to keep in step.
+#[cfg(any(feature = "_driver-cuda", test))]
+fn cuda_budgets(opts: &CudaNativeDriverOptions) -> driver_api::Budgets {
+    let page_size = opts.kv_page_size.unwrap_or(16).max(1);
+    // No CUDA knob states a context ceiling — `max_model_len` is the Metal
+    // options' — so this is the contract's own default, stated once here
+    // rather than guessed twice.
+    let max_context = driver_api::Budgets::default().max_context;
+    let pages_per_slot = max_context.div_ceil(page_size).max(1);
+    driver_api::Budgets {
+        max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
+        max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
+        // v1 pads nothing: a fire's shape IS its graph key (`driver-cuda`'s
+        // `record.rs` argues the mechanism, and what padding would take).
+        buckets: Vec::new(),
+        // palo B-adapters: design §8's banks are a budget, and no shell
+        // reserves one yet.
+        max_adapters: 0,
+        page_size,
+        max_context,
+        slots: opts
+            .max_total_pages
+            .map_or(256, |pages| (pages / pages_per_slot).max(1)),
+    }
+}
+
+/// Hand a driver its model: trace the plan engine-side, state the ceilings,
+/// and land the checkpoint.
+///
+/// The tracing is the ENGINE's (design §7, decision 18) and reaching it
+/// through `engine::driver::load` is what keeps `model` out of this crate's
+/// dependency graph — the note on the manifest's deleted `model` edge is the
+/// same ruling from the other side.
+fn land(
+    backend: &mut ::engine::driver::DriverBackend,
     snapshot_dir: &Path,
-    runtime_quant: &str,
-    mxfp4_moe: &str,
-    component: driver_api::ModelComponent,
-) -> Result<driver_api::ModelLoadDesc> {
-    let mxfp4_moe = driver_api::Mxfp4MoeRequest::parse(mxfp4_moe)
-        .ok_or_else(|| anyhow!("unknown mxfp4_moe policy '{mxfp4_moe}'"))?;
-    Ok(driver_api::ModelLoadDesc {
-        snapshot_dir: snapshot_dir.to_path_buf(),
-        runtime_quant: runtime_quant.to_string(),
-        mxfp4_moe,
-        component,
-    })
+    budgets: driver_api::Budgets,
+    plane: driver_api::model_ir::Plane,
+    component: crate::executor::ModelComponent,
+) -> Result<driver_api::Loaded> {
+    if component != crate::executor::ModelComponent::Full {
+        // palo B-component: an encoder is a traced plan like any other, and
+        // the catalog ships no encoder trace. Refused by name rather than
+        // loaded as the full model, which is what the old
+        // `ModelComponent::Encode` did — it staged the whole 48 GiB
+        // checkpoint and died in `cudaMalloc`.
+        return Err(anyhow!(
+            "this build loads only the full model; {component:?} needs a traced              plan the catalog does not ship"
+        ));
+    }
+    let request = ::engine::driver::load::request(snapshot_dir, plane, budgets, -1)?;
+    backend.load(request).map_err(anyhow::Error::from)
 }
 
 /// Write the cuda driver's bootstrap TOML. Schema mirrors
@@ -699,7 +752,7 @@ pub(crate) fn create_driver_backend_group(
     config: &[u8],
     group_id: usize,
     tp_launches: &[TpLaunch],
-    component: driver_api::ModelComponent,
+    component: crate::executor::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -755,32 +808,31 @@ pub(crate) fn create_driver_backend_group(
             "cuda group opened {opened} ranks for {ranks} rank configs"
         ));
     }
-    // Each rank's config is identical: the per-rank facts (rank index, TP
-    // width, device capability) reach the loader through the driver's own
-    // bootstrap TOML, not through the request.
-    let descs = rank_options
-        .iter()
-        .map(|options| {
-            // Irrefutable in a CUDA-only build, for the reason the loop
-            // above gives; here the `else` is a second reading of that
-            // loop's check rather than a check of its own.
-            #[allow(
-                irrefutable_let_patterns,
-                reason = "`DriverOptions` has one variant in a CUDA-only build"
-            )]
-            let DriverOptions::CudaNative(opts) = options else {
-                unreachable!("validated cuda options above");
-            };
-            model_load_desc(
-                snapshot_dir,
-                &opts.runtime_quant,
-                &opts.mxfp4_moe,
-                component,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let caps = backend.load_model(descs)?;
-    Ok(crate::translate::GroupDriver { caps, backend })
+    // ONE LOAD, NOT ONE PER RANK. `load_model` took a `Vec<ModelLoadDesc>`,
+    // one descriptor per rank, and cross-checked that they agreed about the
+    // model; a rank is not a load (`LoadRequest` is one plan, `Shard::Cut` is
+    // in the plan), and `open::cuda_group` refuses a multi-rank launch by
+    // name until `palo B-tp` builds one.
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "`DriverOptions` has one variant in a CUDA-only build"
+    )]
+    let DriverOptions::CudaNative(opts) = &rank_options[0] else {
+        unreachable!("validated cuda options above");
+    };
+    let loaded = land(
+        &mut backend,
+        snapshot_dir,
+        cuda_budgets(opts),
+        driver_api::model_ir::Plane::Cuda,
+        component,
+    )?;
+    Ok(crate::translate::GroupDriver {
+        caps: loaded.caps,
+        facts: loaded.facts,
+        snapshot_dir: snapshot_dir.to_path_buf(),
+        backend,
+    })
 }
 
 #[cfg_attr(
@@ -798,7 +850,7 @@ pub(crate) fn create_driver_backend(
     config: &[u8],
     group_id: usize,
     tp: Option<&TpLaunch>,
-    component: driver_api::ModelComponent,
+    component: crate::executor::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     // Each is used only inside a `#[cfg(feature = "driver-…")]` arm below.
     let _ = (group_id, tp, config);
@@ -809,8 +861,11 @@ pub(crate) fn create_driver_backend(
     // work from. That build reaches no device, which is the truth since the
     // interpreter backend was deleted: there is no ungated flavor left to
     // fall back to.
-    let (mut backend, runtime_quant, mxfp4_moe): (::engine::driver::DriverBackend, &str, &str) =
-        match options {
+    let (mut backend, budgets, plane): (
+        ::engine::driver::DriverBackend,
+        driver_api::Budgets,
+        driver_api::model_ir::Plane,
+    ) = match options {
             #[cfg(not(any(
                 feature = "_driver-cuda",
                 all(feature = "driver-metal", target_vendor = "apple")
@@ -849,8 +904,8 @@ pub(crate) fn create_driver_backend(
                 let backend = ::engine::driver::backend::open::cuda(&boot_doc)?;
                 (
                     backend,
-                    opts.runtime_quant.as_str(),
-                    opts.mxfp4_moe.as_str(),
+                    cuda_budgets(opts),
+                    driver_api::model_ir::Plane::Cuda,
                 )
             }
             // METAL, BACK AT P5, AND IT HANDS OVER THE DOCUMENT — the same
@@ -876,7 +931,21 @@ pub(crate) fn create_driver_backend(
                     format!("read the driver boot config just written to {toml_path:?}")
                 })?;
                 let backend = ::engine::driver::backend::open::metal(&boot_doc)?;
-                (backend, "", "")
+                (
+                    backend,
+                    driver_api::Budgets {
+                        max_lanes: opts.max_forward_requests.max(1),
+                        max_tokens: opts.max_forward_tokens.max(1),
+                        buckets: Vec::new(),
+                        max_adapters: 0,
+                        page_size: opts.kv_page_size.max(1),
+                        max_context: opts
+                            .max_model_len
+                            .unwrap_or_else(|| driver_api::Budgets::default().max_context),
+                        slots: opts.total_pages.max(1),
+                    },
+                    driver_api::model_ir::Plane::Metal,
+                )
             }
         };
     // Uniform across backends now that the load is a request rather than a
@@ -889,15 +958,48 @@ pub(crate) fn create_driver_backend(
             reason = "`DriverOptions` has no variants in this build"
         )
     )]
-    let desc = model_load_desc(snapshot_dir, runtime_quant, mxfp4_moe, component)?;
-    let caps = backend.load_model(vec![desc])?;
+    let loaded = land(&mut backend, snapshot_dir, budgets, plane, component)?;
 
-    Ok(crate::translate::GroupDriver { caps, backend })
+    Ok(crate::translate::GroupDriver {
+        caps: loaded.caps,
+        facts: loaded.facts,
+        snapshot_dir: snapshot_dir.to_path_buf(),
+        backend,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pool arithmetic an operator's two knobs come out as.
+    ///
+    /// `slots` is the one number nobody states: a page cap and a context
+    /// length determine it, and stating it separately would be a third knob
+    /// to keep in step with the other two.
+    #[test]
+    fn the_pool_budget_derives_its_seat_count_from_the_page_cap() {
+        let mut opts = CudaNativeDriverOptions {
+            kv_page_size: Some(16),
+            max_total_pages: Some(1024),
+            ..Default::default()
+        };
+        let budgets = cuda_budgets(&opts);
+        assert_eq!(budgets.page_size, 16);
+        // 4096 tokens of context is 256 pages a slot; 1024 pages seats four.
+        assert_eq!(budgets.max_context, 4096);
+        assert_eq!(budgets.slots, 4);
+
+        // No cap stated: the contract's own default seat count, not a
+        // division by nothing.
+        opts.max_total_pages = None;
+        assert_eq!(cuda_budgets(&opts).slots, 256);
+
+        // A cap smaller than one slot's block still seats one — a pool that
+        // seats nothing is a load that cannot fire.
+        opts.max_total_pages = Some(1);
+        assert_eq!(cuda_budgets(&opts).slots, 1);
+    }
 
     /// A stand-in checkpoint config for the tests that are about something
     /// else. The writers move the bytes without reading them, so the smallest
@@ -907,289 +1009,24 @@ mod tests {
     /// it arrives).
     const CONFIG: &[u8] = br#"{}"#;
 
-    #[test]
-    fn caps_json_round_trips() {
-        let json = format!(
-            r#"{{
-            "abi_version": {},
-            "total_pages": 1024,
-            "kv_page_size": 32,
-            "swap_pool_size": 0,
-            "max_forward_tokens": 4096,
-            "max_forward_requests": 512,
-            "max_page_refs": 262144,
-            "arch_name": "qwen3",
-            "vocab_size": 151936,
-            "max_model_len": 4096,
-            "activation_dtype": "bfloat16",
-            "snapshot_dir": "/tmp/snap"
-        }}"#,
-            driver_api::PIE_DRIVER_ABI_VERSION
-        );
-        let caps: DriverCapabilities = serde_json::from_str(&json).unwrap();
-        assert_eq!(caps.abi_version, driver_api::PIE_DRIVER_ABI_VERSION);
-        assert_eq!(caps.total_pages, 1024);
-        assert_eq!(caps.arch_name, "qwen3");
-        assert_eq!(caps.snapshot_dir, "/tmp/snap");
-        assert_eq!(caps.max_forward_tokens, 4096);
-        assert_eq!(caps.max_page_refs, 262144);
-    }
+    // `caps_json_round_trips` STOOD HERE. It deserialized a
+    // `DriverCapabilities` from a JSON document with an `abi_version` in it
+    // and asserted the round trip — a test about a 30-field flat struct with
+    // `#[serde(default)]` on two thirds of it, four of whose fields
+    // (`abi_version`, `arch_name`, `snapshot_dir`, and the flat
+    // `max_forward_*`) have no successor at all. `Capabilities` is four typed
+    // records and `serde`'s derive is what round-trips it; there is nothing
+    // left here that a hand-written document would check.
 
-    /// WHAT `ModelComponent::Encode` SHOULD DO -- not what it does.
-    ///
-    /// This test has never run. It is `#[cfg(feature = "_driver-cuda")]` and
-    /// no `cargo test` in CI enables a worker driver feature, so it was never
-    /// even COMPILED there; running it by hand for the first time found three
-    /// separate defects stacked behind one another:
-    ///
-    /// 1. it passed `&[]` as the boot config, which `write_config_beside`
-    ///    wrote to an EMPTY file and named anyway -> status -3;
-    /// 2. the worker handed `open::cuda` the PATH to the generated boot TOML
-    ///    where the driver parses the DOCUMENT, so every key in it read as
-    ///    absent (fixed in `create_driver_backend`);
-    /// 3. and `driver-cuda` has no reader for `desc.component` at all, so
-    ///    `Encode` staged the WHOLE 48.1 GiB checkpoint and died on
-    ///    `cudaMalloc`.
-    ///
-    /// (3) is now an explicit refusal
-    /// (`driver-cuda/tests/serve.rs::load_model_refuses_a_component_scope_it_
-    /// does_not_implement`), so this test cannot pass until the scope is
-    /// implemented -- which is the honest state. It is kept because it is the
-    /// only written statement of what the encode path is supposed to answer,
-    /// and it should fail loudly on the day the scope lands rather than be
-    /// rewritten from memory then.
-    #[cfg(feature = "_driver-cuda")]
-    #[tokio::test]
-    #[ignore = "awaits component-scoped loading in driver-cuda; see the note on \
-                this test"]
-    async fn gemma4_encode_component_loads_and_encodes() {
-        let snapshot = std::env::var_os("PIE_TEST_GEMMA4_SNAPSHOT")
-            .map(PathBuf::from)
-            .expect("set PIE_TEST_GEMMA4_SNAPSHOT");
-        let options = DriverOptions::CudaNative(CudaNativeDriverOptions {
-            device: "cuda:0".to_string(),
-            gpu_mem_utilization: 0.5,
-            verbose: true,
-            ..Default::default()
-        });
-        let boot_config = std::fs::read(snapshot.join("config.json"))
-            .expect("the snapshot carries its own config.json");
-        let mut group = create_driver_backend(
-            &options,
-            &snapshot,
-            // A test snapshot, not an artifact: no EMBEDDED config, so the
-            // bytes here have to be the checkpoint's own `config.json`.
-            // `write_config_beside` writes them to `model.config.json` next
-            // to the generated driver TOML and names that path in
-            // `[model] config`.
-            //
-            // This was `&[]`, which wrote an EMPTY file and named it anyway,
-            // and the driver answered `load_model: no embedded model/config
-            // and no [model] config in the boot TOML` -> status -3, on the
-            // first line that touches it. Nothing caught that because
-            // nothing has ever run this test: it is
-            // `#[cfg(feature = "_driver-cuda")]`, and no `cargo test` in CI
-            // enables a worker driver feature -- `--lib` takes the default
-            // (no driver) and the other step is `--no-default-features`. So
-            // it was never even COMPILED there, let alone run.
-            &boot_config,
-            0,
-            None,
-            driver_api::ModelComponent::Encode,
-        )
-        .unwrap();
-        assert!(group.caps.supports_media_encode);
-        assert_eq!(group.caps.total_pages, 0);
-        assert!(group.backend.export_kv_handle().is_none());
-
-        let patch_count = 9usize;
-        let pixel_bytes = patch_count * 3 * 16 * 16 * std::mem::size_of::<f32>();
-        let hidden_size = group.caps.hidden_size;
-        let make_encode = || {
-            let mut patch_positions = Vec::with_capacity(patch_count * 2);
-            for y in 0..3 {
-                for x in 0..3 {
-                    patch_positions.extend([x, y]);
-                }
-            }
-            driver_api::MediaEncodePlan {
-                image_grids: vec![1, 3, 3],
-                image_pixels: vec![0; pixel_bytes],
-                image_pixel_indptr: vec![0, pixel_bytes as u32],
-                image_patch_positions: patch_positions,
-                image_anchor_rows: vec![0],
-                audio_features: Vec::new(),
-                audio_feature_indptr: Vec::new(),
-                audio_anchor_rows: Vec::new(),
-                output_rows: vec![0; hidden_size as usize * 2],
-                output_row_indptr: vec![0; 2],
-            }
-        };
-        let audio_frames = 16usize;
-        let audio_rows = 4usize;
-        let make_audio = || driver_api::MediaEncodePlan {
-            image_grids: Vec::new(),
-            image_pixels: Vec::new(),
-            image_pixel_indptr: Vec::new(),
-            image_patch_positions: Vec::new(),
-            image_anchor_rows: Vec::new(),
-            audio_features: vec![0; audio_frames * 128 * std::mem::size_of::<f32>()],
-            audio_feature_indptr: vec![0, (audio_frames * 128 * std::mem::size_of::<f32>()) as u32],
-            audio_anchor_rows: vec![0],
-            output_rows: vec![0; audio_rows * hidden_size as usize * 2],
-            output_row_indptr: vec![0; 2],
-        };
-        let mut encode = make_encode();
-        let completion = group.backend.encode(&mut encode).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
-            .await
-            .expect("encode completion timed out")
-            .unwrap();
-        assert_eq!(encode.output_row_indptr, vec![0, 1]);
-        assert!(encode.output_rows.iter().any(|byte| *byte != 0));
-        let tower_rows = encode.output_rows;
-        let mut audio = make_audio();
-        let completion = group.backend.encode(&mut audio).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
-            .await
-            .expect("audio encode completion timed out")
-            .unwrap();
-        assert_eq!(audio.output_row_indptr, vec![0, audio_rows as u32]);
-        assert!(audio.output_rows.iter().any(|byte| *byte != 0));
-        let tower_audio_rows = audio.output_rows;
-
-        let model = driver_api::ModelIdentity {
-            hash: [9; 32],
-            component: driver_api::ModelComponent::Encode,
-        };
-        let layout = driver_api::KvLayout {
-            num_layers: 0,
-            num_kv_heads: 0,
-            head_dim: 0,
-            page_size: 0,
-            dtype: driver_api::KvDtype::Bf16,
-            kind: driver_api::KvLayoutKind::KvSeparate,
-            storage_format: String::new(),
-            region_page_bytes: Vec::new(),
-        };
-        let server = crate::executor::ExecutorServer::bind(
-            "127.0.0.1:0",
-            crate::translate::ModelDrivers {
-                groups: vec![group],
-            },
-            model.clone(),
-            1,
-        )
-        .await
-        .unwrap();
-        let client = crate::executor::connect_with_local_ip(server.endpoint())
-            .await
-            .unwrap()
-            .0;
-        let hello = client
-            .execute(
-                tarpc::context::current(),
-                driver_api::ExecutorRequest::Hello(driver_api::HelloRequest {
-                    wire_version: driver_api::REMOTE_WIRE_VERSION,
-                    client_nonce: 1,
-                    model,
-                    kv_layout: layout,
-                    peer_conn: None,
-                }),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let driver_api::ExecutorResponse::Hello(hello) = hello else {
-            panic!("executor Hello response");
-        };
-        assert_eq!(hello.grant.num_pages, 0);
-
-        let image = make_encode();
-        let response = client
-            .execute(
-                tarpc::context::current(),
-                driver_api::ExecutorRequest::Encode(driver_api::RemoteEncode {
-                    plan: driver_api::LaunchPlan {
-                        token_ids: vec![0],
-                        qo_indptr: vec![0, 1],
-                        image_grids: image.image_grids,
-                        image_pixels: image.image_pixels,
-                        image_pixel_indptr: image.image_pixel_indptr,
-                        image_patch_positions: image.image_patch_positions,
-                        image_anchor_rows: image.image_anchor_rows,
-                        ..Default::default()
-                    },
-                    blobs: Vec::new(),
-                }),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let driver_api::ExecutorResponse::Embeddings(image) = response else {
-            panic!("executor image response");
-        };
-        assert_eq!(image.rows, tower_rows);
-
-        let audio = make_audio();
-        let response = client
-            .execute(
-                tarpc::context::current(),
-                driver_api::ExecutorRequest::Encode(driver_api::RemoteEncode {
-                    plan: driver_api::LaunchPlan {
-                        token_ids: vec![0; audio_rows],
-                        qo_indptr: vec![0, audio_rows as u32],
-                        audio_features: audio.audio_features,
-                        audio_feature_indptr: audio.audio_feature_indptr,
-                        audio_anchor_rows: audio.audio_anchor_rows,
-                        ..Default::default()
-                    },
-                    blobs: Vec::new(),
-                }),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let driver_api::ExecutorResponse::Embeddings(audio) = response else {
-            panic!("executor audio response");
-        };
-        assert_eq!(audio.rows, tower_audio_rows);
-        server.shutdown().await;
-
-        let full_options = DriverOptions::CudaNative(CudaNativeDriverOptions {
-            device: "cuda:0".to_string(),
-            gpu_mem_utilization: 1.0,
-            memory_profile: CudaMemoryProfile::Latency,
-            max_total_pages: Some(1),
-            ..Default::default()
-        });
-        let mut full = create_driver_backend(
-            &full_options,
-            &snapshot,
-            &[],
-            1,
-            None,
-            driver_api::ModelComponent::Full,
-        )
-        .unwrap();
-        assert!(full.caps.supports_media_encode);
-        let mut inline = make_encode();
-        let completion = full.backend.encode(&mut inline).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
-            .await
-            .expect("full-model encode completion timed out")
-            .unwrap();
-        assert_eq!(inline.output_row_indptr, vec![0, 1]);
-        assert_eq!(inline.output_rows, tower_rows);
-        let mut inline_audio = make_audio();
-        let completion = full.backend.encode(&mut inline_audio).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
-            .await
-            .expect("full-model audio encode completion timed out")
-            .unwrap();
-        assert_eq!(inline_audio.output_row_indptr, vec![0, audio_rows as u32]);
-        assert_eq!(inline_audio.output_rows, tower_audio_rows);
-    }
+    // `gemma4_encode_component_loads_and_encodes` STOOD HERE, `#[ignore]`d
+    // and by its own header never once run. It was written against four
+    // things the palo contract rewrite deleted outright — `ModelComponent`
+    // on a load request, `MediaEncodePlan` with a completion to await, the
+    // executor server it stood one up through, and `KvDtype` — and the thing
+    // it was waiting for (component-scoped loading) is now a different
+    // question entirely: an encoder is a traced `Plan`, and the catalog ships
+    // none. `embedded_driver::land` refuses a non-`Full` component by name,
+    // which is the statement this test was keeping alive.
 
     /// What a driver may be handed: an artifact, or a snapshot directory.
     ///

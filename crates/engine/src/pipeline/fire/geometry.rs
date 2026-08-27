@@ -15,7 +15,7 @@
 use grammar::brle::RunMask;
 use tensor_ir::container::{PortSource, TraceContainer};
 use tensor_ir::op::Op;
-use tensor_ir::registry::Port;
+use tensor_ir::registry::{Port, PortMask};
 use tensor_ir::types::DType;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +35,27 @@ pub struct DecodeEnvelope {
     pub device_positions: bool,
 }
 
+/// The classifier's own SHAPE derivation, and the only thing that reads it is
+/// the classifier's tests.
+///
+/// **PRODUCTION TAKES THE SPLIT, NOT THE TEMPLATE** (`palo B3`). This is the
+/// all-placeholder geometry a driver would want if it resolved the WHOLE
+/// envelope from page segments of its own -- the shape
+/// `fire::envelope::compose` filled one generation back. No shell in this
+/// workspace owns such a segment: the ENGINE allocates this working set's
+/// physical pages, so a submission stating none would leave the driver
+/// deriving a block formula for a pool it does not allocate from. The fire
+/// path folds every port the shadow can and leaves the driver exactly the
+/// device-decided ones ([`map_geometry_evaluated_with`]).
+///
+/// It stays because the classifier's derived CSRs -- the token indptr it
+/// accepts from a channel, the sampling rows a const `Readout` names, the
+/// per-lane distribution of a multi-lane readout -- are assertions about
+/// THIS derivation, and re-deriving them inside the test would be asserting
+/// against a copy. Marked `#[cfg(test)]` for the same reason
+/// [`classify_decode_envelope`] is: an item nothing in production reaches is
+/// an item that says so.
+#[cfg(test)]
 impl DecodeEnvelope {
     pub fn template(&self, container: &TraceContainer) -> Result<ReqGeometry, GeometryError> {
         let token_count = self.token_count;
@@ -411,11 +432,15 @@ pub fn classify_decode_envelope_why(
 
 /// The device geometry ports executing `envelope` as the DecodeEnvelope
 /// class demands of a driver.
-pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> u32 {
-    let mut required =
-        ::driver_api::PIE_DEVICE_PORT_EMBED_TOKENS | ::driver_api::PIE_DEVICE_PORT_KV_LEN;
+pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> PortMask {
+    // THE PORTS WENT HOME (palo design §7, decision 19). These were
+    // `PIE_DEVICE_PORT_*`, thirteen bits in a private `driver-api` numbering
+    // that disagreed with the registry's own and had nothing checking the
+    // two agreed. They are `tensor_ir::registry::Port` now, and the mask is
+    // the registry's.
+    let mut required = PortMask::of(&[Port::EmbedTokens, Port::KvLen]);
     if envelope.device_positions {
-        required |= ::driver_api::PIE_DEVICE_PORT_POSITIONS;
+        required = required.with(Port::Positions);
     }
     // No `PIE_DEVICE_PORT_ATTN_MASK` clause: the classifier declines a
     // channel-bound mask outright, so no envelope reaches here carrying one.
@@ -426,6 +451,7 @@ pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> u32 {
     required
 }
 
+#[cfg(test)]
 fn const_port(container: &TraceContainer, port: Port) -> Option<&[u8]> {
     container.ports.iter().find_map(|binding| {
         if binding.port != port {
@@ -451,8 +477,16 @@ pub struct ReqGeometry {
     pub kv_page_indices: Vec<u32>,
     /// Per-lane page CSR from the required `page_indptr` channel.
     pub kv_page_indptr: Vec<u32>,
-    /// Valid tokens in each lane's last KV page (derived from `kv_len`).
-    pub kv_last_page_lens: Vec<u32>,
+    /// Each lane's readable KV extent AFTER this fire's append — the
+    /// `kv_len` port, verbatim.
+    ///
+    /// Was `kv_last_page_lens`, which is this number modulo the page size and
+    /// was derived here only because the wire form asked for it. The
+    /// contract's [`KvDelta::held`](driver_api::KvDelta) is the extent BEFORE
+    /// the append, which is this minus the lane's rows — so keeping the
+    /// undivided number is what lets the lowering state `held` without
+    /// knowing a page size.
+    pub kv_len: Vec<u32>,
     /// Read-out positions (from `readout`, else the last token of each lane).
     pub sampling_indices: Vec<u32>,
     /// Per-lane read-out CSR.
@@ -483,19 +517,98 @@ pub enum GeometryError {
 }
 
 impl ReqGeometry {
-    /// Write this geometry into a [`LaunchPlan`]'s forward-geometry fields
-    /// (the host-known prefill for a PTIR fire). One-to-one with the request's
-    /// `token_ids`/`position_ids`/`qo_indptr`/`kv_page_*`/`kv_last_page_lens`/
-    /// `sampling_*` — leaves every other field (samplers, masks, carrier) intact.
-    pub fn apply_to(&self, req: &mut crate::driver::LaunchPlan) {
-        req.token_ids = self.token_ids.clone();
-        req.position_ids = self.position_ids.clone();
-        req.qo_indptr = self.qo_indptr.clone();
-        req.kv_page_indices = self.kv_page_indices.clone();
-        req.kv_page_indptr = self.kv_page_indptr.clone();
-        req.kv_last_page_lens = self.kv_last_page_lens.clone();
-        req.sampling_indices = self.sampling_indices.clone();
-        req.sampling_indptr = self.sampling_indptr.clone();
+    /// This geometry as the lanes a fire submits.
+    ///
+    /// **THE CSRs BECOME LANES HERE, AND THIS IS THE WHOLE OF IT.** Six
+    /// parallel arms — `token_ids`/`qo_indptr`, `kv_page_indices`/
+    /// `kv_page_indptr`, `sampling_indices`/`sampling_indptr` — were the
+    /// engine flattening its per-lane state so a driver could walk it back
+    /// into per-lane form (`driver_api::fire`'s header). The contract's
+    /// [`Lane`] IS the per-lane form, so the flattening ends at this
+    /// function and there is nothing on the far side to undo it.
+    ///
+    /// A lane that names no page keeps an empty page list, which is the
+    /// contract's way of saying the SHELL owns this slot's page table.
+    #[must_use]
+    pub fn lanes(&self) -> Vec<crate::driver::Lane> {
+        let cut = |values: &[u32], indptr: &[u32], lane: usize| -> Vec<u32> {
+            let (Some(&start), Some(&end)) = (indptr.get(lane), indptr.get(lane + 1)) else {
+                return Vec::new();
+            };
+            values
+                .get(start as usize..end as usize)
+                .unwrap_or_default()
+                .to_vec()
+        };
+        let count = self.qo_indptr.len().saturating_sub(1);
+        (0..count)
+            .map(|lane| {
+                let tokens = cut(&self.token_ids, &self.qo_indptr, lane);
+                let positions = cut(&self.position_ids, &self.qo_indptr, lane);
+                let pages = cut(&self.kv_page_indices, &self.kv_page_indptr, lane);
+                let rows = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+                // The extent the port states is AFTER the append; `held` is
+                // before it. A lane that states less than it writes is a
+                // geometry the port got wrong, and saturating leaves it at
+                // zero rather than wrapping to four billion.
+                let held = self
+                    .kv_len
+                    .get(lane)
+                    .copied()
+                    .unwrap_or(rows)
+                    .saturating_sub(rows);
+                let readout = cut(&self.sampling_indices, &self.sampling_indptr, lane);
+                crate::driver::Lane {
+                    // The engine keeps the page table, so a lane's SLOT is
+                    // its working set — see `crate::driver::fire`. A PTIR
+                    // fire's geometry ports carry no slot of their own, and
+                    // the caller stamps it.
+                    slot: 0,
+                    // `Lane::word` is stamped by
+                    // `crate::pipeline::fire::stamp_lane_words`, not here.
+                    // The word is the per-lane fact bits the model's own
+                    // `Classify::of(&Request)` produces, and one of those
+                    // facts is whether the lane carries a custom mask — which
+                    // a lane does not have until `FireAttnMask::apply_to` has
+                    // cut the fire's mask onto it, further down the path.
+                    // A word stated here would be stated before its inputs
+                    // are. Zero is the all-false word and it does not survive
+                    // this request's submission.
+                    word: 0,
+                    tokens,
+                    // Empty means the natural run `held .. held + rows`,
+                    // which is what the port states in every case but the
+                    // ones that are the point of stating it.
+                    positions: if positions
+                        .iter()
+                        .enumerate()
+                        .all(|(at, &position)| position == held + at as u32)
+                    {
+                        Vec::new()
+                    } else {
+                        positions
+                    },
+                    kv: crate::driver::KvDelta {
+                        held,
+                        pages,
+                        translation: Vec::new(),
+                    },
+                    mask: None,
+                    adapter: None,
+                    readout: match readout.as_slice() {
+                        [] => crate::driver::Readout::None,
+                        [only] if *only + 1 == rows => crate::driver::Readout::Last,
+                        rows => crate::driver::Readout::Rows(rows.to_vec()),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Write this geometry into a request's lanes, leaving everything else
+    /// (the recurrent half, the mask, the tickets) intact.
+    pub fn apply_to(&self, req: &mut crate::driver::FireRequest) {
+        req.lanes = self.lanes();
     }
 }
 
@@ -511,19 +624,55 @@ impl ReqGeometry {
 pub(crate) enum FireAttnMask {
     Omitted,
     Host {
-        masks: Vec<::driver_api::EncodedMask>,
+        masks: Vec<crate::driver::Mask>,
         mask_indptr: Vec<u32>,
     },
     Device,
 }
 
 impl FireAttnMask {
-    pub(crate) fn apply_to(self, request: &mut crate::driver::LaunchPlan) {
+    /// Cut this fire's mask onto its lanes.
+    ///
+    /// # Errors
+    ///
+    /// A lane whose mask CSR spans more than one query row. `Lane::mask` is
+    /// ONE mask over the lane's readable extent and the driver re-applies the
+    /// causal bound per row from it ([`driver_cuda::mask`]'s expansion), so a
+    /// mask of the ordinary shape — a restriction of the extent, intersected
+    /// with causality — round-trips exactly. What does not is a genuinely
+    /// two-dimensional mask whose rows are not nested: no per-lane mask can
+    /// carry it, and the row this used to pick silently was row ZERO, which
+    /// is every later row truncated to the first one's causal bound. Refused
+    /// by name instead (`palo B-mask`: the shape, not the axis).
+    pub(crate) fn apply_to(
+        self,
+        request: &mut crate::driver::FireRequest,
+    ) -> Result<(), String> {
         match self {
             FireAttnMask::Omitted => {}
             FireAttnMask::Host { masks, mask_indptr } => {
-                request.masks = masks;
-                request.mask_indptr = mask_indptr;
+                // ONE MASK PER LANE, ON THE LANE. The wire form carried a
+                // flat `masks` vector and a `mask_indptr` cutting it per lane,
+                // and a driver's first act was to cut it back. A lane holds
+                // its own (`Lane::mask`), so a mask row that belongs to no
+                // lane cannot be submitted.
+                for (lane, request_lane) in request.lanes.iter_mut().enumerate() {
+                    let (Some(&start), Some(&end)) =
+                        (mask_indptr.get(lane), mask_indptr.get(lane + 1))
+                    else {
+                        continue;
+                    };
+                    if end > start + 1 {
+                        return Err(format!(
+                            "lane {lane}'s attention mask spans {} query rows and a \
+                             lane carries one mask over its readable extent; a \
+                             multi-query mask whose rows are not one restriction \
+                             under the causal bound has no per-lane form",
+                            end - start
+                        ));
+                    }
+                    request_lane.mask = masks.get(start as usize).cloned().filter(|_| end > start);
+                }
                 request.has_user_mask = true;
                 // A decode-shaped custom mask still needs the mask-aware
                 // prefill attention path.
@@ -540,6 +689,7 @@ impl FireAttnMask {
                 request.has_user_mask = true;
             }
         }
+        Ok(())
     }
 }
 
@@ -601,7 +751,7 @@ pub(crate) fn lower_attn_mask_evaluated(
         .chunks_exact(stride)
         .map(|row| {
             let mask = RunMask::from_slice(row);
-            ::driver_api::EncodedMask::new(mask.buffer, mask.total_size)
+            crate::driver::Mask::new(mask.buffer, mask.total_size)
         })
         .collect();
     Ok(FireAttnMask::Host {
@@ -680,17 +830,41 @@ fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
 
 /// Map a pass's descriptor ports to forward geometry by **evaluating** the
 /// geometry prologue over host-known channel values (`tensor_compiler::eval::pareval`) —
-/// the general form of [`map_geometry`], which reads only directly-present
+/// the general form of `map_geometry`, which reads only directly-present
 /// values and is its degenerate case. Returns the geometry plus every port's
 /// evaluated value (the canonical-KV gate verifies evidence against these).
 ///
 /// A rank-2 `Pages` envelope (`[lanes, P]`, the SDK lowering) is compacted to
 /// the wire CSR by each lane's live page count from `PageIndptr`, mirroring
 /// the driver's descriptor resolution; rank-1 pages pass through flat.
-pub fn map_geometry_evaluated(
+/// Which ports the DRIVER will resolve, left unfolded instead of refused.
+///
+/// **THE CLASS IS A SPLIT, NOT A SWITCH** (`palo B3`). A decode-envelope pass
+/// differs from a host-class one in exactly one value: the sampled token,
+/// which the shadow commits UNKNOWN because the device decided it. Everything
+/// else its epilogue carries — the position, the readable extent, the write
+/// slot and offset, the page CSR — is pure arithmetic over the KV length, and
+/// the shadow folds every bit of it. Refusing the whole geometry because one
+/// port is device-decided would throw away the page table the engine owns and
+/// the driver cannot know, which is what
+/// an all-placeholder geometry would do; a driver that
+/// resolved the WHOLE envelope (its own page segments, the rewrite's
+/// `fire::envelope::compose`) wants that, and one that resolves only the
+/// device-decided values wants this.
+///
+/// So `device_resolved` names the ports whose blocker is not an error here:
+/// each is left as a placeholder of the right LENGTH, because the length is
+/// the token CSR's and the CSR is derivable in every trace this class admits.
+/// A port outside the set is refused exactly as before — the loud failure on
+/// the first value nobody can know is the whole reason this path is honest.
+///
+/// # Errors
+///
+/// [`EvaluatedGeometryError`], minus the ports in `device_resolved`.
+pub fn map_geometry_evaluated_with(
     bound: &tensor_ir::validate::BoundTrace,
     known: &mut dyn FnMut(u32) -> Option<tensor_compiler::eval::interp::Value>,
-    page_size: u32,
+    device_resolved: PortMask,
 ) -> Result<(ReqGeometry, PortEvaluations), EvaluatedGeometryError> {
     use tensor_compiler::eval::interp::Value;
 
@@ -725,9 +899,26 @@ pub fn map_geometry_evaluated(
         }
     };
 
+    // THE CSR FIRST, BECAUSE IT IS WHAT SIZES A PLACEHOLDER. A device-resolved
+    // token port carries no value the host can fold, but it carries a COUNT
+    // the host must state: the composition places rows, carves arena
+    // rectangles and counts pages from it, and the driver's own resolution
+    // refuses a port whose length disagrees.
+    let qo_indptr = required_u32(Port::EmbedIndptr)?;
+    let spanned_rows = qo_indptr.last().copied().unwrap_or(0) as usize;
+    let token_ids = match required_u32(Port::EmbedTokens) {
+        Ok(ids) => ids,
+        Err(EvaluatedGeometryError::NotDerivable { port, blocker })
+            if device_resolved.contains(Port::EmbedTokens) =>
+        {
+            let _ = (port, blocker);
+            vec![0; spanned_rows]
+        }
+        Err(error) => return Err(error),
+    };
     let mut g = ReqGeometry {
-        token_ids: required_u32(Port::EmbedTokens)?,
-        qo_indptr: required_u32(Port::EmbedIndptr)?,
+        token_ids,
+        qo_indptr,
         ..ReqGeometry::default()
     };
 
@@ -821,10 +1012,7 @@ pub fn map_geometry_evaluated(
             ),
         });
     }
-    g.kv_last_page_lens = kv_len
-        .iter()
-        .map(|&len| last_page_len(len, page_size))
-        .collect();
+    g.kv_len = kv_len.clone();
 
     let evaluated = ports
         .into_iter()
@@ -888,11 +1076,10 @@ pub(crate) fn compact_page_envelope(
 /// descriptor port must resolve to a host-known value here; the
 /// device-geometry path does not come through this function — the driver
 /// resolves its ports in-graph and the host maps the RESULT through
-/// [`map_geometry_evaluated`].
+/// [`map_geometry_evaluated_with`].
 pub fn map_geometry(
     container: &TraceContainer,
     values: ChannelValues<'_>,
-    page_size: u32,
 ) -> Result<ReqGeometry, GeometryError> {
     let mut g = ReqGeometry::default();
 
@@ -959,23 +1146,18 @@ pub fn map_geometry(
         }
         (None, _) => return Err(GeometryError::BadCsr { port: Port::Pages }),
     }
-    g.kv_last_page_lens = kv_len
-        .iter()
-        .map(|&len| last_page_len(len, page_size))
-        .collect();
+    g.kv_len = kv_len.clone();
 
     Ok(g)
 }
 
-/// Valid tokens in the last KV page for a physical span `len` (§5.1): a full
-/// span ends the page exactly (`page_size`), else the remainder; `0` for empty.
-fn last_page_len(len: u32, page_size: u32) -> u32 {
-    if len == 0 || page_size == 0 {
-        0
-    } else {
-        ((len - 1) % page_size) + 1
-    }
-}
+// `last_page_len` STOOD HERE, and the page size went with it. Both existed
+// to turn a lane's readable extent into the wire's
+// `kv_last_page_lens` — the extent modulo the page size — which is a fact
+// about a PAGE TABLE and not about the lane. `KvDelta` states the extent
+// (`held`, before the append) and the pages, and whoever owns the page table
+// does the division: the shell when the list is empty, the engine's own KV
+// store when it is not.
 
 /// Resolve a port's value: its const payload, or the current value of the
 /// channel it binds. `None` if the container has no such port; a port bound
@@ -1122,7 +1304,7 @@ mod tests {
             Some(0u32.to_le_bytes().to_vec()),
             Some(4u32.to_le_bytes().to_vec()),
         ];
-        let g = map_geometry(&c, &values, 16).unwrap();
+        let g = map_geometry(&c, &values).unwrap();
 
         assert_eq!(g.token_ids, vec![42]);
         assert_eq!(g.qo_indptr, vec![0, 1], "one lane, one token");
@@ -1138,9 +1320,9 @@ mod tests {
         );
         assert_eq!(g.sampling_indptr, vec![0, 1]);
         assert_eq!(
-            g.kv_last_page_lens,
+            g.kv_len,
             vec![5],
-            "len 5 in a 16-page → last page holds 5"
+            "the lane's readable extent after the append is 5"
         );
         assert_eq!(g.kv_page_indices, vec![0]);
         assert_eq!(g.kv_page_indptr, vec![0, 1]);
@@ -1341,7 +1523,7 @@ mod tests {
             Some(u32_bytes(&[10, 11, 12, 20, 21, 22])), // 2 pages [B,P] flat
             Some(u32_bytes(&[20, 33])),   // 3 klen (physical spans)
         ];
-        let g = map_geometry(&c, &values, 16).unwrap();
+        let g = map_geometry(&c, &values).unwrap();
 
         assert_eq!(g.token_ids, vec![100, 200]);
         assert_eq!(g.qo_indptr, vec![0, 1, 2], "one token per lane");
@@ -1354,15 +1536,16 @@ mod tests {
         assert_eq!(g.sampling_indptr, vec![0, 1, 2]);
         assert_eq!(g.kv_page_indices, vec![10, 11, 12, 20, 21, 22]);
         assert_eq!(g.kv_page_indptr, vec![0, 3, 6]);
-        // len 20 in 16-page → last page holds 4; len 33 → 1.
-        assert_eq!(g.kv_last_page_lens, vec![4, 1]);
+        // The extents the `kv_len` port stated, undivided: the page size is
+        // whoever-owns-the-page-table's business now.
+        assert_eq!(g.kv_len, vec![20, 33]);
     }
 
     #[test]
     fn missing_channel_value_errors() {
         let c = section3_container();
         let values: Vec<Option<Vec<u8>>> = vec![None, Some(5u32.to_le_bytes().to_vec())];
-        let e = map_geometry(&c, &values, 16).unwrap_err();
+        let e = map_geometry(&c, &values).unwrap_err();
         assert_eq!(
             e,
             GeometryError::MissingChannelValue {
@@ -1374,25 +1557,21 @@ mod tests {
 
     /// A device-geometry container's ports are unfilled at host fire time;
     /// the strict map refuses to invent them (the driver resolves them
-    /// in-graph and the host maps the result through `map_geometry_evaluated`).
+    /// in-graph and the host maps the result through `map_geometry_evaluated_with`).
     #[test]
     fn unfilled_device_ports_are_rejected() {
         let c = beam_container(2, 3);
         let values: Vec<Option<Vec<u8>>> = vec![None, None, None, None];
         assert!(
-            map_geometry(&c, &values, 16).is_err(),
+            map_geometry(&c, &values).is_err(),
             "strict gate errors on device-resolved ports"
         );
     }
 
-    #[test]
-    fn last_page_len_boundaries() {
-        assert_eq!(last_page_len(0, 16), 0);
-        assert_eq!(last_page_len(1, 16), 1);
-        assert_eq!(last_page_len(16, 16), 16, "a full page ends exactly");
-        assert_eq!(last_page_len(17, 16), 1);
-        assert_eq!(last_page_len(32, 16), 16);
-    }
+    // `last_page_len_boundaries` STOOD HERE. It pinned the wire form's
+    // "valid tokens in the last KV page" arithmetic, and the geometry
+    // carries the undivided extent now — see `ReqGeometry::kv_len`. The
+    // division belongs to whoever owns the page table.
 
     fn mask_container() -> TraceContainer {
         let mut container = section3_container();
@@ -1407,7 +1586,7 @@ mod tests {
         container
     }
 
-    fn expand_mask(mask: &::driver_api::EncodedMask) -> Vec<bool> {
+    fn expand_mask(mask: &crate::driver::Mask) -> Vec<bool> {
         let mut values = Vec::new();
         for (run, &len) in mask.runs.iter().enumerate() {
             values.extend(std::iter::repeat_n(run % 2 == 1, len as usize));
@@ -1419,14 +1598,14 @@ mod tests {
     fn omitted_attention_mask_stays_mask_free() {
         let lowered = lower_attn_mask_evaluated(&section3_container(), &[0, 1], &[]).unwrap();
         assert_eq!(lowered, FireAttnMask::Omitted);
-        let mut plan = crate::driver::LaunchPlan {
+        let mut plan = crate::driver::FireRequest {
+            lanes: vec![crate::driver::Lane::default()],
             single_token_mode: true,
             ..Default::default()
         };
-        lowered.apply_to(&mut plan);
+        lowered.apply_to(&mut plan).expect("a one-row-per-lane mask lowers");
         assert!(!plan.has_user_mask);
-        assert!(plan.masks.is_empty());
-        assert!(plan.mask_indptr.is_empty());
+        assert!(plan.lanes.iter().all(|lane| lane.mask.is_none()));
         assert!(plan.single_token_mode);
     }
 
@@ -1438,21 +1617,25 @@ mod tests {
             Ok(tensor_compiler::eval::interp::Value::Bool(dense.clone())),
         )];
         let lowered = lower_attn_mask_evaluated(&mask_container(), &[0, 1, 2], &evaluated).unwrap();
-        let FireAttnMask::Host { masks, mask_indptr } = &lowered else {
+        let FireAttnMask::Host { masks, mask_indptr } = lowered.clone() else {
             panic!("host-known mask must use wire lowering");
         };
-        assert_eq!(mask_indptr, &[0, 1, 2]);
+        assert_eq!(mask_indptr, vec![0, 1, 2]);
         assert_eq!(masks.len(), 2);
         assert_eq!(expand_mask(&masks[0]), dense[..4]);
         assert_eq!(expand_mask(&masks[1]), dense[4..]);
 
-        let mut plan = crate::driver::LaunchPlan {
+        // TWO LANES, ONE MASK EACH. The wire form put both rows in a flat
+        // vector and cut it with `mask_indptr`; a lane holds its own.
+        let mut plan = crate::driver::FireRequest {
+            lanes: vec![crate::driver::Lane::default(), crate::driver::Lane::default()],
             single_token_mode: true,
             ..Default::default()
         };
-        lowered.apply_to(&mut plan);
+        lowered.apply_to(&mut plan).expect("a one-row-per-lane mask lowers");
         assert!(plan.has_user_mask);
-        assert_eq!(plan.mask_indptr, vec![0, 1, 2]);
+        assert_eq!(plan.lanes[0].mask.as_ref(), Some(&masks[0]));
+        assert_eq!(plan.lanes[1].mask.as_ref(), Some(&masks[1]));
         assert!(
             !plan.single_token_mode,
             "decode-shaped custom masks require the prefill fallback"
@@ -1476,9 +1659,15 @@ mod tests {
             lower_attn_mask_evaluated(&container, &[0, 1, 2], &device).unwrap(),
             FireAttnMask::Device
         );
-        let mut plan = crate::driver::LaunchPlan::default();
+        let mut plan = crate::driver::FireRequest {
+            lanes: vec![crate::driver::Lane::default()],
+            ..Default::default()
+        };
         FireAttnMask::Device.apply_to(&mut plan);
         assert!(plan.has_user_mask);
-        assert!(plan.masks.is_empty(), "dense device path has no wire rows");
+        assert!(
+            plan.lanes.iter().all(|lane| lane.mask.is_none()),
+            "dense device path puts no mask on a lane"
+        );
     }
 }

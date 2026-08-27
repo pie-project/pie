@@ -111,7 +111,6 @@ impl Instance {
     /// run-ahead resolution rather than a pure host prefill.
     pub fn fire_geometry(
         &self,
-        page_size: u32,
     ) -> Result<
         crate::pipeline::fire::geometry::ReqGeometry,
         crate::pipeline::fire::geometry::GeometryError,
@@ -119,7 +118,6 @@ impl Instance {
         crate::pipeline::fire::geometry::map_geometry(
             &self.program.bound.container,
             &self.channel_values(),
-            page_size,
         )
     }
 }
@@ -872,17 +870,21 @@ mod tests {
         .unwrap();
         let inst = instantiate(prog.hash, vec![seed(0, 42)]).unwrap();
 
-        let g = inst.fire_geometry(16).unwrap();
+        let g = inst.fire_geometry().unwrap();
         assert_eq!(g.token_ids, vec![42], "the seeded token embeds");
         assert_eq!(g.qo_indptr, vec![0, 1], "one lane, one token");
         assert_eq!(g.position_ids, vec![0]);
         assert_eq!(g.sampling_indices, vec![0], "read out the only token");
 
-        let mut req = crate::driver::LaunchPlan::default();
+        // AND THE SAME GEOMETRY AS A LANE. The CSRs are one lane's worth, so
+        // the lowering is one lane: its token, its natural positions (empty,
+        // because they ARE the natural run), and a last-row readout.
+        let mut req = crate::driver::FireRequest::default();
         g.apply_to(&mut req);
-        assert_eq!(req.token_ids, vec![42]);
-        assert_eq!(req.qo_indptr, vec![0, 1]);
-        assert_eq!(req.sampling_indices, vec![0]);
+        assert_eq!(req.lanes.len(), 1);
+        assert_eq!(req.lanes[0].tokens, vec![42]);
+        assert_eq!(req.lanes[0].positions, Vec::<u32>::new());
+        assert_eq!(req.lanes[0].readout, crate::driver::Readout::Last);
     }
 
     /// P2/P3 exit gate: register → instantiate → run on echo's reference

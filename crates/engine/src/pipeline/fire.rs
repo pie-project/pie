@@ -84,6 +84,8 @@ use wasmtime::component::Resource;
 
 pub use context::FireContext;
 
+use tensor_ir::registry::{GeometryClass, Port, PortMask};
+
 use crate::pipeline::Pipeline;
 use crate::pipeline::channel::{BoundCells, Channel, ChannelError};
 use crate::pipeline::instance::ForwardPass;
@@ -713,7 +715,7 @@ fn rs_plan_for(
 /// reaches the driver and is still refused, loudly: asking for logits that
 /// cannot exist is a guest bug worth reporting, not one worth papering over.
 fn suppress_defaulted_readout_for_fold(
-    req: &mut crate::driver::LaunchPlan,
+    req: &mut crate::driver::FireRequest,
     readout_defaulted: bool,
     plan: &rs::RsPlan,
 ) {
@@ -721,8 +723,14 @@ fn suppress_defaulted_readout_for_fold(
     if !replays_buffer || !readout_defaulted {
         return;
     }
-    req.sampling_indices.clear();
-    req.sampling_indptr = vec![0; req.sampling_indptr.len()];
+    // `Readout::None` is the contract's way of saying "this lane runs for its
+    // cache writes alone", which is exactly what a buffered fold does. The
+    // wire form had to say it by clearing an index vector and zeroing a CSR,
+    // and could not tell that apart from a lane whose readout was empty for
+    // some other reason.
+    for lane in &mut req.lanes {
+        lane.readout = crate::driver::Readout::None;
+    }
 }
 
 fn rs_slot_demand(
@@ -1032,6 +1040,49 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
+/// **THE LANE WORD, STAMPED ONCE THE LANE IS FINISHED** (`palo B-word`).
+///
+/// A lane's word is its fact bits, and `driver::fire::compose` turns it into
+/// a class and therefore into the row WINDOW every guarded node runs over
+/// (palo design §0, decision 18). Both lane-construction sites left it at
+/// zero — the all-false class — so every decode lane went out composed as a
+/// prefill one; the engine could not do better while `model::catalog()` shipped
+/// three columns, because a plan's `Cond::Fact(bit)` numbers its bits and no
+/// reader outside a family's own module can say which one `qo_one` is. The
+/// catalog carries a `ClassifyFn` now and `crate::model::Model::word` calls
+/// it; nothing here reads a bit.
+///
+/// **WHY HERE AND NOT IN `ReqGeometry::lanes`.** A lane's word depends on its
+/// mask, and a lane does not have its mask until the fire's mask has lowered:
+/// `FireAttnMask::apply_to` is what cuts the mask CSR onto the lanes. So the
+/// two facts the engine states — how many rows a lane has, and whether it
+/// carries a mask of its own — are only both true at one point in each path,
+/// and that is where this is called.
+///
+/// `fire_wide_mask` is the device-resident case, which has no `Lane::mask` to
+/// read: the driver's descriptor resolver reads the `AttnMask` channel cell on
+/// every fire, so the mask is on the FIRE and covers every lane in it. A model
+/// that splits on `masked` (gemma) would otherwise run those rows through the
+/// arm for lanes that have no mask.
+///
+/// **AND IT IS THE COLLAPSE §0 WARNS ABOUT, STATED RATHER THAN HIDDEN.** One
+/// dense mask in one channel cell, shared by every lane of the pass, is a
+/// per-fire reading of a per-LANE axis — the engine cannot do better here
+/// because the device value it is reading has no per-lane state to cut
+/// (`geometry::detect_pooled_device_geometry`'s ruling). What it must not do
+/// is let that reading reach a masked arm with nothing behind it: the word
+/// says `masked` and no `Lane::mask` follows, so the driver would send the
+/// arm at a slab the fire never staged. The CUDA shell refuses exactly that
+/// pairing by name — `Fault::MaskWord`, asked per lane against the class the
+/// word resolved to — so the narrowing costs a refusal and never an answer.
+fn stamp_lane_words(req: &mut crate::driver::FireRequest, fire_wide_mask: bool) {
+    let model = crate::model::model();
+    for lane in &mut req.lanes {
+        let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+        lane.word = model.word(rows, lane.mask.is_some() || fire_wide_mask);
+    }
+}
+
 /// Poison every host-reader cell of a pass with the failed fire's error —
 /// under run-ahead this IS the error channel (`take`/`read` surface it).
 fn poison_readers(cells: &BoundCells, reason: &str) {
@@ -1071,9 +1122,24 @@ impl TicketReservation {
         }
     }
 
-    fn apply_to(&self, request: &mut crate::driver::LaunchPlan) {
-        request.channel_expected_head.clone_from(&self.heads);
-        request.channel_expected_tail.clone_from(&self.tails);
+    /// **IT STOPS AT THE REQUEST, AND THAT IS WHERE IT BELONGS.** The heads
+    /// and tails were `channel_expected_head`/`channel_expected_tail` on the
+    /// wire plan, a per-fire assertion — shipped across the boundary — that a
+    /// guest program's rings stood where the engine thought. The driver gates
+    /// its own cursors before it launches anything now
+    /// (`driver_cuda::program::Plane::ready`, reached through the fire's
+    /// [`Attachment`](driver_api::fire::Attachment)s), so a shipped claim has
+    /// nothing left to add. What the reservation and the LIFO rollback below
+    /// are for is the OTHER question — how many cells a frame of k fires
+    /// could need before any of them settles — and that is engine
+    /// bookkeeping, unchanged.
+    fn apply_to(&self, request: &mut crate::driver::FireRequest) {
+        request.tickets = self
+            .heads
+            .iter()
+            .zip(&self.tails)
+            .map(|(&head, &tail)| crate::driver::ChannelTicket { head, tail })
+            .collect();
     }
 
     fn commit(mut self) {
@@ -1202,40 +1268,41 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: forward-pass failed by an earlier fire: {e}"
                 )));
             }
-            let (geometry, attn_mask) = if let Some(envelope) = &p.decode_envelope {
-                let geometry = match envelope.template(&p.instance.program.bound.container) {
-                    Ok(template) => template,
-                    Err(error) => {
-                        return Ok(Err(format!("pipeline: fire geometry: {error:?}")));
-                    }
-                };
-                let bound = &p.instance.program.bound;
-                let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
-                let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-                let attn_mask =
-                    match geometry::evaluate_attn_mask(bound, &mut known, &geometry.qo_indptr) {
-                        Ok(mask) => mask,
-                        Err(error) => {
-                            return Ok(Err(format!("pipeline: fire attention mask: {error}")));
-                        }
-                    };
-                (geometry, attn_mask)
+            // WHICH PORTS THE DRIVER WILL RESOLVE, AND NOTHING ELSE (`palo
+            // B3`). A decode-envelope pass carries exactly one value the host
+            // cannot fold — the sampled token, which the shadow commits
+            // unknown — and the CUDA shell reads it off the ring the previous
+            // epilogue wrote. Everything else the pass's epilogue carries is
+            // arithmetic over the KV length, and folding it here is what
+            // gives the fire a page table: the ENGINE owns this working set's
+            // physical pages, so a submission that stated none would leave
+            // the driver deriving a block formula for a pool it does not
+            // allocate from.
+            //
+            // An all-placeholder geometry is the other reading — a driver
+            // that resolves the WHOLE envelope from its own page segments,
+            // which is what `fire::envelope::compose` did one generation back
+            // — and no shell in this workspace owns a page segment to resolve
+            // one from. `DecodeEnvelope::template` was that reading written
+            // down, and it is deleted rather than kept as an unreachable
+            // alternative.
+            let device_resolved = if p.decode_envelope.is_some() {
+                PortMask::of(&[Port::EmbedTokens])
             } else {
+                PortMask::NONE
+            };
+            let (geometry, attn_mask) = {
                 let bound = &p.instance.program.bound;
                 let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
                 let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-                match geometry::map_geometry_evaluated(
-                    bound,
-                    &mut known,
-                    crate::pipeline::program::model_profile().page_size,
-                ) {
+                match geometry::map_geometry_evaluated_with(bound, &mut known, device_resolved) {
                     Ok((geometry, evaluated)) => {
                         // In-band -1 skips are the DEVICE-resolved contract
                         // (rank compaction happens in the compose kernels); a
                         // host-wire fire would embed the sentinel as a real
                         // token. Loud rejection, never silent execution
                         // (RV-12).
-                        if geometry.token_ids.contains(&u32::MAX) {
+                        if device_resolved.is_empty() && geometry.token_ids.contains(&u32::MAX) {
                             return Ok(Err(
                                 "pipeline: fire geometry: in-band -1 skip tokens require a \
                                  device-resolved geometry class; this fire resolved on the \
@@ -1278,9 +1345,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.dense_mask,
             )
         };
-        let mut req = crate::driver::LaunchPlan::default();
+        let mut req = crate::driver::FireRequest::default();
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
+        // A BOUND PASS *IS* A GUEST PROGRAM AT THE FIRE'S BOUNDARY (`palo
+        // B2`, design §9). Every fire that comes through here fires a
+        // `BoundForwardPass` — an instance whose channels the driver carved
+        // and whose stages it compiled — so the fire carries an attachment
+        // for it and the driver runs its pass after the forward, with this
+        // lane's logits row bound as the `logits` intrinsic. The requests
+        // that do NOT come through here (a prebuilt rider, a geometry
+        // lowering under test) leave the flag false and submit exactly the
+        // fire they always did.
+        req.boundary_program = true;
         req.device_resolved_geometry = decode_envelope.is_some();
         // The same fact as the line above, said as a CLASS rather than a bool,
         // because there are three ways to read a fire's geometry and a bool
@@ -1291,10 +1368,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // The bool is deliberately left alone. Every existing consumer
         // (`worker::has_device_geometry`, `wire.rs`'s `deferred_geometry`, the
         // co-batching rules) keeps the behaviour it was measured with.
-        req.geometry_class = if decode_envelope.is_some() {
-            ::driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+        req.geometry = if decode_envelope.is_some() {
+            GeometryClass::DecodeEnvelope
         } else {
-            ::driver_api::PIE_GEOMETRY_CLASS_HOST
+            GeometryClass::Host
         };
         // Carried to the batcher, which keeps such a fire out of shared
         // waves — see `scheduler::worker::has_dense_device_mask`. The
@@ -1304,8 +1381,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // co-batch those), so only genuinely device-resident masks keep
         // the dense-device solo.
         req.dense_device_mask = dense_mask;
-        req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
-            && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
+        req.single_token_mode = req.lanes.iter().all(|lane| lane.tokens.len() == 1);
         // tart (0.3 re-port step 2): the pass's layer truncation rides
         // every fire; the scheduler's region table carries it to the
         // driver as per-region k.
@@ -1313,7 +1389,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let p = ctx.resources().get(&fwd)?;
             p.max_layers
         };
-        attn_mask.apply_to(&mut req);
+        // The mask is on the FIRE when it stays device-resident, and there is
+        // no `Lane::mask` to read it back off — so the class is read here,
+        // before `apply_to` consumes it, and handed to the word stamp.
+        let fire_wide_mask = matches!(attn_mask, geometry::FireAttnMask::Device);
+        if let Err(error) = attn_mask.apply_to(&mut req) {
+            return Ok(Err(format!("pipeline: fire attention mask: {error}")));
+        }
+        // THE LANES ARE FINISHED, so their words can be stated: rows from the
+        // geometry above, mask from the lowering just now (`palo B-word`).
+        stamp_lane_words(&mut req, fire_wide_mask);
         crate::pipeline::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the
@@ -1352,18 +1437,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
             ));
         }
         if decode_envelope.is_none()
-            && let Some(&page) = req
-                .kv_page_indices
-                .iter()
-                .find(|&&page| !readable_pages.contains(&u64::from(page)))
+            && let Some(page) = req
+                .pages()
+                .find(|&page| !readable_pages.contains(&u64::from(page)))
         {
             return Ok(Err(format!(
                 "pipeline: KV read page {page} escapes the readable declaration"
             )));
         }
         let page_size = u64::from(ws.page_size);
-        req.kv_write_lower_bounds = vec![writable_pages.start * page_size];
-        req.kv_write_upper_bounds = vec![writable_pages.end * page_size];
+        req.kv_write_bounds = Some((
+            writable_pages.start * page_size,
+            writable_pages.end * page_size,
+        ));
         let model = ws.model;
         let driver = ws.driver;
         let pid = ctx.process_id();
@@ -1386,7 +1472,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
-        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr) {
+        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr()) {
             Ok(plan) => plan,
             Err(error) => {
                 return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
@@ -1463,7 +1549,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 model,
                 driver,
                 &rs_reps,
-                &req.qo_indptr,
+                &req.qo_indptr(),
                 &pipeline_scope,
                 &rs_plan,
                 &mut grant,
@@ -1491,7 +1577,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         req.kv_translation_version = translation_version;
         req.kv_translation = translation.as_ref().to_vec();
-        let last_page_len = req.kv_last_page_lens.last().copied().unwrap_or(0);
         let completion = ctx
             .resources()
             .get_mut(&fwd)?
@@ -1518,7 +1603,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             instance_id,
             pid,
             quorum_pipeline_id,
-            last_page_len,
             completion.clone(),
             copy_src,
             copy_dst,
@@ -2061,7 +2145,7 @@ pub async fn copy_into_inner<C: FireContext>(
         .zip(kv_move_src_pages.into_iter().zip(src_tok_idx))
         .map(
             |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| {
-                ::driver_api::KvMoveCell {
+                crate::driver::KvMove {
                     dst_page_id,
                     dst_token_offset,
                     src_page_id,
@@ -2453,7 +2537,7 @@ fn reclaim_pending_device_grant<C: FireContext>(ctx: &mut C, fwd: &Resource<Forw
 /// neither replays the epilogue arithmetic nor projects per-lane KV. The
 /// runtime leases `B` fresh physical pages, delivers them to the program as a
 /// host-put on the `fresh` channel, submits the fire prebuilt (the host wire
-/// geometry stays empty — `geometry::map_geometry_evaluated` maps what the
+/// geometry stays empty — `geometry::map_geometry_evaluated_with` maps what the
 /// driver resolved), and fires it RUN-AHEAD onto the pipeline FIFO (unlike
 /// the deleted synchronous host-replay beam branch).
 /// The per-fire arena/write txns ride the `PendingFire`; `finalize_op`
@@ -2617,7 +2701,12 @@ async fn fire_device_geometry<C: FireContext>(
     // awaits in this build; nothing physical is held. Phase C: prepare from
     // it; on stale demand recompute both figures and re-acquire, bounded.
     let mut attempts = 0;
-    let (ws_guard, pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
+    // `pages` WAS READ ONLY BY THE WIRE FORM'S `last_page_len`: a
+    // device-geometry fire leases pages and the DEVICE picks which of them a
+    // token lands in, so the host's `kv_last_page_lens` for it was a guess
+    // dressed as a fact (`if pages.is_empty() { 0 } else { page_size }`).
+    // `KvDelta` has no seat for a guess.
+    let (ws_guard, _pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
         let kv_demand =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
                 kv::prepare_explicit_demand(store, ws.id, &write_indexes)
@@ -2814,11 +2903,29 @@ async fn fire_device_geometry<C: FireContext>(
         }
     };
 
-    let mut req = crate::driver::LaunchPlan {
-        qo_indptr: resolved_qo_indptr,
+    // A DEVICE-GEOMETRY FIRE STATES ITS ROW SPLIT AND NOTHING ELSE. The wire
+    // plan carried `qo_indptr` — a CSR whose only content here was "this many
+    // lanes, one row each" — because the driver read the geometry out of a
+    // channel the device wrote and the CSR was the only shape the host still
+    // had to state. Lanes say it directly: one lane per entry, and its tokens
+    // are the ones the device will resolve.
+    let mut req = crate::driver::FireRequest {
+        // As the host-geometry path above: this fire is a bound pass, so its
+        // guest program runs at the boundary.
+        boundary_program: true,
+        // `Lane::word` is left at its default here and stamped below, once
+        // the mask has lowered — see `stamp_lane_words`, which is the one
+        // place either path states a word.
+        lanes: resolved_qo_indptr
+            .windows(2)
+            .map(|span| crate::driver::Lane {
+                tokens: vec![0; (span[1] - span[0]) as usize],
+                ..crate::driver::Lane::default()
+            })
+            .collect(),
         kv_translation,
         kv_translation_version,
-        ..crate::driver::LaunchPlan::default()
+        ..crate::driver::FireRequest::default()
     };
     // The declared writable span is this pass's containment promise, and the
     // host has to state it even though the device picks the exact cells: the
@@ -2829,11 +2936,19 @@ async fn fire_device_geometry<C: FireContext>(
     // device-carried decode fail with `descriptor channel N not ready`.
     if let Some(span) = &writable_span {
         let page_size = u64::from(page_size);
-        req.kv_write_lower_bounds = vec![span.start * page_size];
-        req.kv_write_upper_bounds = vec![span.end * page_size];
+        req.kv_write_bounds = Some((span.start * page_size, span.end * page_size));
     }
     rs_prepared.apply_to(&mut req);
-    attn_mask.apply_to(&mut req);
+    let fire_wide_mask = matches!(attn_mask, geometry::FireAttnMask::Device);
+    if let Err(error) = attn_mask.apply_to(&mut req) {
+        reclaim_pending_device_grant(ctx, &fwd);
+        let reason = format!("pipeline: device-geometry attention mask: {error}");
+        record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+        return Ok(Err(reason));
+    }
+    // The same stamp as the wire path, for the same reason and at the same
+    // point: rows from the lanes above, mask from the lowering just now.
+    stamp_lane_words(&mut req, fire_wide_mask);
     // Same carry as the wire path: the AttnMask channel binding is the
     // program's, so a device-geometry fire of a mask-binding pass must be
     // scheduled SOLO too. Omitting it here is what let the run-ahead
@@ -2866,11 +2981,10 @@ async fn fire_device_geometry<C: FireContext>(
         .as_ref()
         .is_some_and(|devgeo| devgeo.pooled)
     {
-        req.geometry_class = ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY;
+        req.geometry = GeometryClass::DeviceGeometry;
     }
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
-    let last_page_len = if pages.is_empty() { 0 } else { page_size };
 
     let (hook_program, lora_program) = {
         let p = ctx.resources().get(&fwd)?;
@@ -2887,7 +3001,6 @@ async fn fire_device_geometry<C: FireContext>(
         instance_id,
         pid,
         quorum_pipeline_id,
-        last_page_len,
         completion.clone(),
         copy_src,
         copy_dst,

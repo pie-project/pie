@@ -336,56 +336,57 @@ pub fn matmul_select(
     )
 }
 
-/// Grouped matmul over an mxfp4 bank, with a per-expert bias — the one
-/// quantized bank form this plane stamps. `codes` are the e2m1 nibbles,
-/// `scales` the shared e8m0 exponents, 32 codes to one scale byte.
+/// The mxfp4 selects' shared launch — the one quantized bank form this plane
+/// stamps. `codes` are the e2m1 nibbles, `scales` the shared e8m0 exponents,
+/// 32 codes to one scale byte. The per-expert bias is what the two entries
+/// differ in, so it arrives optional and the kernel's own bias seat carries
+/// the absence.
 #[allow(clippy::too_many_arguments)]
-pub fn matmul_select_bias(
+fn matmul_select_mxfp4(
     ctx: &Ctx,
+    op: &'static str,
     x: Tensor,
     codes: Tensor,
     scales: Tensor,
-    bias: Tensor,
+    bias: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "linear.moe_matmul_select_bias";
-
     const MXFP4_BLOCK: u32 = 32;
 
     const ROWS_PER_WARP: u32 = 4;
 
     const DECODE_BLOCK: u32 = 128;
 
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(codes.dtype, Dtype::U8, "an mxfp4 bank's codes are u8");
     debug_assert_eq!(scales.dtype, Dtype::U8, "an mxfp4 bank's scales are u8");
-    debug_assert_eq!(
-        bias.dtype, x.dtype,
+    debug_assert!(
+        bias.is_none_or(|bias| bias.dtype == x.dtype),
         "the expert bias rides the activation's dtype"
     );
-    let fan = selected(OP, x, routes, y)?;
+    let fan = selected(op, x, routes, y)?;
     if x.width == 0 || x.width % MXFP4_BLOCK != 0 {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "K is {}, not a whole number of {MXFP4_BLOCK}-code mxfp4 blocks",
                 x.width
             ),
         ));
     }
-    let k = stated(OP, x.width)?;
-    let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     // Each warp decodes `ROWS_PER_WARP` bank rows; a block tiles that many
     // warps' worth of the output width.
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             "linear/quant.cuh",
             symbol(&format!(
-                "::pie::linear::moe_matmul_select_bias_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
+                "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
             )),
         )
         .apply(Launch::grid(
@@ -397,13 +398,46 @@ pub fn matmul_select_bias(
             routes.arg(),
             codes.arg(),
             scales.arg(),
-            bias.arg(),
+            bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
             y.arg(),
             act_div.arg(),
             n.arg(),
             k.arg(),
         ],
     )
+}
+
+/// Grouped matmul over an mxfp4 bank, with a per-expert bias — the gate/up
+/// leg, whose bank and bias are cut the same way, so the add belongs inside
+/// the fold.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_select_bias(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    bias: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), KernelError> {
+    const OP: &str = "linear.moe_matmul_select_bias";
+    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y)
+}
+
+/// Grouped matmul over an mxfp4 bank with nothing added — the down leg,
+/// whose bank is rows-cut, so a replicated bias folded in here would be
+/// summed once per rank by the all_reduce that follows. Its routed bias is
+/// stated after the reduce instead, by [`bias_sum`].
+pub fn matmul_select_quant(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), KernelError> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y)
 }
 
 /// Folds the `top_k` routed rows back to one row per token, weighted.
@@ -445,6 +479,66 @@ pub fn weighted_sum(
         &[
             y.arg(),
             routed.arg(),
+            weights.arg(),
+            stated(OP, top_k)?.arg(),
+            stated(OP, y.width)?.arg(),
+        ],
+    )
+}
+
+/// The routed bias mixture, stated once on an activation that already holds
+/// the fold: `y[t] = x[t] + sum_k weights[t, k] * bias[routes[t, k]]`.
+///
+/// It is its own fire because the expert down-projection is rows-cut under
+/// tp: each rank's routed matmul is a *partial* product and the all_reduce
+/// sums the ranks, so a replicated bias folded into that matmul would land
+/// once per rank. Routing is computed from replicated inputs, so `routes`
+/// and `weights` are the same on every rank and the mixture can be stated
+/// after the reduce, on the reduced activation. At tp = 1 the value is
+/// identical (the weights sum to one), so the statement has one path and no
+/// tp branch.
+pub fn bias_sum(
+    ctx: &Ctx,
+    x: Tensor,
+    bias: Tensor,
+    routes: Tensor,
+    weights: Tensor,
+    y: &mut Tensor,
+) -> Result<(), KernelError> {
+    const OP: &str = "linear.moe_bias_sum";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 routes");
+    debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
+    debug_assert_eq!(
+        bias.dtype, x.dtype,
+        "the expert bias rides the activation's dtype"
+    );
+    debug_assert!(
+        x.rows == y.rows && x.width == y.width,
+        "the bias lands on the activation's own rectangle"
+    );
+    debug_assert_eq!(
+        bias.width, y.width,
+        "an expert's bias row is the width it is added to"
+    );
+    debug_assert_eq!(
+        routes.rows, y.rows,
+        "the route plane is one row per token row"
+    );
+    debug_assert!(
+        weights.rows == y.rows && weights.width == routes.width,
+        "the weight plane is one weight per route"
+    );
+    let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_bias_sum<{t}>")))
+            .apply(elementwise_rows(OP, y.rows, y.width)?),
+        &[
+            y.arg(),
+            x.arg(),
+            bias.arg(),
+            routes.arg(),
             weights.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),

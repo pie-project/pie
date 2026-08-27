@@ -75,7 +75,7 @@
 //! invitation is gone from the message -- that measurement is what removed it.
 //!
 //! How much stands behind the bit, for whoever picks this up: envelope
-//! MAINTENANCE is real, in `kernels-cuda/src/attn/mod.rs`, where the write-KV
+//! MAINTENANCE is real, in `kernels-cuda/src/attn.rs`, where the write-KV
 //! kernels call `envelope_merge_written` and `envelope_update_appended` gated
 //! on the `KvHasEnvelopes` ask. There is a hole -- `write_kv_explicit_bf16_
 //! devwin` asserts `!has_envelopes` with "envelope maintenance not yet"

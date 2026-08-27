@@ -55,6 +55,7 @@ macro_rules! declare_intrinsics {
         /// `u16` constants — see [`crate::registry`] for scope and gating
         /// rules.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         #[repr(u16)]
         pub enum IntrinsicId {
             $($(#[$doc])* $variant = $id,)*

@@ -445,6 +445,7 @@ instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU4, bfloat
 instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU4, bfloat16, bfloat, 64, 4)
 
 instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
+instantiate_gptoss_qmv(mxfp4_qmv_routed, qmv_routed, Mxfp4, bfloat16, bfloat, 32, 4)
 
 instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU8, bfloat16, bfloat, 64, 8)
 

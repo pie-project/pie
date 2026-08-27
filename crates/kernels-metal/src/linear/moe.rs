@@ -351,6 +351,55 @@ pub fn matmul_select_bias(
     )
 }
 
+/// Grouped matmul over an mxfp4 bank with nothing added — the bias-free twin
+/// of [`matmul_select_bias`], for the rows-cut expert down-projection, whose
+/// routed bias lands after the reduce through [`bias_sum`] instead. The
+/// driver resolves the bank weight to its `(codes, scales)` planes before
+/// calling, exactly as the biased entry's does.
+pub fn matmul_select_quant(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), KernelError> {
+    const OP: &str = "moe.matmul_select_quant";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mxfp4_qmv_routed_bfloat16_gs_32_b_4" });
+    debug_assert_eq!(codes.dtype, Dtype::U8, "an mxfp4 bank's codes are u8");
+    debug_assert_eq!(scales.dtype, Dtype::U8, "an mxfp4 bank's scales are u8");
+    let fan = selected(OP, x, routes, y)?;
+    if x.width % MXFP4_BLOCK != 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "K is {}, not a whole number of {MXFP4_BLOCK}-code mxfp4 blocks",
+                x.width
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
+            routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
+            QMV_GROUP,
+        )),
+        &[
+            codes.arg(),
+            scales.arg(),
+            ctx.absent()?, // the affine biases seat; mxfp4 carries none
+            x.arg(),
+            y.arg_mut(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, y.width)?.arg(),
+            ctx.absent()?, // the expert bias seat; this entry is the one that adds none
+            routes.arg(),
+            stated(OP, fan.x_slot_stride)?.arg(),
+            stated(OP, fan.x_row_stride)?.arg(),
+            stated(OP, fan.top_k)?.arg(),
+        ],
+    )
+}
+
 /// Folds the `top_k` routed rows back to one row per token, weighted.
 pub fn weighted_sum(
     ctx: &Ctx<'_>,
@@ -385,6 +434,65 @@ pub fn weighted_sum(
         Fire::at("linear/moe_route.metal", entry).apply(grid),
         &[
             routed.arg(),
+            weights.arg(),
+            y.arg_mut(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, top_k)?.arg(),
+        ],
+    )
+}
+
+/// The routed bias mixture, said once on an already-folded activation:
+/// `y[t] = x[t] + Σ_k weights[t, k] · bias[routes[t, k]]`.
+///
+/// It is its own entry rather than a seat inside the routed matmul because
+/// the expert down-projection is rows-cut under tp: each rank's routed
+/// matmul is a PARTIAL product, and the all_reduce that follows sums the
+/// ranks — a replicated bias folded in there would be summed tp times. The
+/// routing is computed from replicated inputs, so `routes` and `weights` are
+/// identical on every rank and the mixture can be stated after the reduce,
+/// where it lands exactly once. At tp = 1 the weights sum to one, so the
+/// value is the same and the model text keeps a single path.
+pub fn bias_sum(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bias: Tensor,
+    routes: Tensor,
+    weights: Tensor,
+    y: Tensor,
+) -> Result<(), KernelError> {
+    const OP: &str = "moe.bias_sum";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "expert_bias_combine" });
+    debug_assert_eq!(
+        bias.dtype, x.dtype,
+        "the expert bias rides the activation's dtype"
+    );
+    debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 routes");
+    debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
+    debug_assert!(
+        x.rows == y.rows && x.width == y.width,
+        "the token rectangle, which adding a bias does not change"
+    );
+    debug_assert_eq!(
+        bias.width, y.width,
+        "the bias bank is one row per expert, the activation's width"
+    );
+    debug_assert!(
+        routes.rows == y.rows && weights.rows == y.rows,
+        "a routed plane lands one row per token row"
+    );
+    debug_assert_eq!(
+        routes.width, weights.width,
+        "the weight plane is one weight per route"
+    );
+    let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
+    let grid = route_rows(OP, y.width, y.rows)?;
+    ctx.fire(
+        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        &[
+            x.arg(),
+            bias.arg(),
+            routes.arg(),
             weights.arg(),
             y.arg_mut(),
             stated(OP, y.width)?.arg(),

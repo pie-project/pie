@@ -5,15 +5,23 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use ::model::serve::instruct::{ToolDecoder, ToolEvent};
+use ::model::template::{ToolDecoder, ToolEvent};
 use anyhow::Result;
 use grammar::matcher::GrammarMatcher;
+use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 /// Tool-use decoder resource — wraps a model-specific ToolDecoder trait object.
+///
+/// A decoder answers a batch with every call that batch completed, and a batch
+/// can complete more than one. The WIT `feed` hands back a single event, so
+/// the surplus queues here and drains on the following calls; an idle batch
+/// answers with `ToolEvent::None`, which is the WIT's `start` because the
+/// variant has no idle arm and `start` is what an idle feed has always said.
 pub struct Decoder {
     inner: Box<dyn ToolDecoder>,
+    pending: VecDeque<ToolEvent>,
 }
 
 impl std::fmt::Debug for Decoder {
@@ -72,7 +80,10 @@ impl pie::inferlet::tools::Host for ProcessCtx {
 impl pie::inferlet::tools::HostDecoder for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<Decoder>> {
         let inner = crate::model::model().instruct().tool_decoder();
-        let decoder = Decoder { inner };
+        let decoder = Decoder {
+            inner,
+            pending: VecDeque::new(),
+        };
         Ok(self.ctx().table.push(decoder)?)
     }
 
@@ -82,9 +93,11 @@ impl pie::inferlet::tools::HostDecoder for ProcessCtx {
         tokens: Vec<u32>,
     ) -> Result<Result<pie::inferlet::tools::Event, pie::inferlet::types::Error>> {
         let decoder = self.ctx().table.get_mut(&this)?;
-        let event = decoder.inner.feed(&tokens);
+        let events = decoder.inner.feed(&tokens);
+        decoder.pending.extend(events);
+        let event = decoder.pending.pop_front().unwrap_or(ToolEvent::None);
         Ok(Ok(match event {
-            ToolEvent::Start => pie::inferlet::tools::Event::Start,
+            ToolEvent::None | ToolEvent::Start => pie::inferlet::tools::Event::Start,
             ToolEvent::Call(name, args) => {
                 pie::inferlet::tools::Event::Call(pie::inferlet::tools::ToolCall {
                     name,
@@ -97,6 +110,7 @@ impl pie::inferlet::tools::HostDecoder for ProcessCtx {
     async fn reset(&mut self, this: Resource<Decoder>) -> Result<()> {
         let decoder = self.ctx().table.get_mut(&this)?;
         decoder.inner.reset();
+        decoder.pending.clear();
         Ok(())
     }
 

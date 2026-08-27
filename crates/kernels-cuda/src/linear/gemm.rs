@@ -20,22 +20,6 @@ pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), 
     act_x_wt(ctx, "linear.lm_head", act, w, y)
 }
 
-/// The o-proj landing after attention.
-///
-// MENLO-SEAM: `layer` names the o-proj slice on planes that stack them;
-// this plane's weights arrive pre-sliced, so it is stated and unused — as
-// before.
-pub fn attention_landing(
-    ctx: &Ctx,
-    act: Tensor,
-    w: Tensor,
-    layer: u32,
-    y: &mut Tensor,
-) -> Result<(), KernelError> {
-    let _ = layer;
-    act_x_wt(ctx, "linear.attention_landing", act, w, y)
-}
-
 /// `y = act x w^T`. An empty projection (any extent zero) is a silent no-op,
 /// as before — a conditioned batch may legitimately land nothing, and a
 /// refusal here would kill the whole fire under graph capture.

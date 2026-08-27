@@ -52,7 +52,11 @@ pub use engines::nixl::NixlEngine;
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 
-pub use driver_api::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+// `KvDtype` is gone: a cache row's element type is the model's, and
+// `driver-api` names `model_ir::Dtype` for it now (palo decision 18). The
+// re-export follows, so `transport::Dtype` is what `transport::KvDtype` was.
+pub use driver_api::{KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+pub use driver_api::model_ir::Dtype;
 
 #[cfg(test)]
 mod tests {
@@ -65,7 +69,7 @@ mod tests {
             num_kv_heads: 4,
             head_dim: 64,
             page_size: 16,
-            dtype: KvDtype::Bf16,
+            dtype: Dtype::Bf16,
             kind: KvLayoutKind::KvSeparate,
             storage_format: "test-bf16".to_string(),
             region_page_bytes: Vec::new(),

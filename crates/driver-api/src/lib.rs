@@ -1,79 +1,117 @@
-//! The runtime ↔ driver contract — what the two sides say to each other, and
-//! what a driver promises.
+//! The engine↔driver contract: what a driver *is*, in types.
 //!
-//! Both drivers are Rust and both are called directly, so there is no ABI
-//! here and no longer a crate named for one.
+//! ```text
+//! driver.rs    trait Driver — load, register_program, register_channel,
+//!              bind_instance, close_*, fire, copy_kv, copy_state,
+//!              resize_pool, encode
+//! error.rs     DriverError                       ← the PIE_STATUS_* graveyard
+//! load.rs      LoadRequest { plan, checkpoint, budgets } -> Loaded { facts, caps }
+//! fire.rs      FireSubmission { lanes: Vec<Lane { word, tokens, kv, … }> }
+//!              -> FireTicket                     ← Lane::word is the new field
+//! program.rs   the LaunchPackage lineage, purified
+//! channel.rs   the typed channel declaration
+//! transfer.rs  KvHandle / KvLayout / the three movement verbs' arguments
+//! caps.rs      DeviceFacts, Capabilities
+//! ```
 //!
-//! It is `driver-api` rather than `driver` because it is not driver-common:
-//! nine crates depend on it and five of them are not drivers at all
-//! (`engine`, `transport`, `controller-api`, `worker`, `tensor-compiler`).
-//! A crate both sides speak is a CONTRACT; the substrate only drivers use is
-//! `driver`, which is what that name is now for.
+//! # What this crate was
 //!
-//! [`Driver`] is the contract itself: fourteen verbs one execution device
-//! answers. Three things had to move here for the trait to be statable, and
-//! each was already contract rather than engine:
+//! A C header's ghost. There is no C on either side of this boundary any more
+//! — every driver in the workspace is Rust, linked into the same process, and
+//! called through a `&mut dyn Driver` — but the crate kept the shape of one
+//! for years after the C++ went:
 //!
-//! - [`completion`] — a driver MINTS a completion (its `launch` returns one),
-//!   so the broker that mints them is vocabulary, not scheduler internals.
-//! - [`instance`] — the bind plan and the handle a driver answers with.
-//! - [`channel`] — the seed value a bind carries and the registration a
-//!   driver answers. The `ChannelEndpoint` an application holds stayed in
-//!   `engine`: no verb here takes one.
+//! * an `i32` status ladder (`PIE_STATUS_OK` … `PIE_STATUS_IMPOSSIBLE`), so a
+//!   caller needed a table to read a failure and a second, unrelated string to
+//!   learn what it was about;
+//! * `PIE_DRIVER_ABI_VERSION: u32 = 25`, stamped into every capability record
+//!   and checked on every load — an ABI version on a call between two crates
+//!   Cargo compiles together;
+//! * `type DeviceDomain = u32` with seven `PIE_MEMORY_DOMAIN_*` constants and
+//!   a `pie_memory_domain_is_valid` predicate, sitting three files away from
+//!   `enum MemoryDomain`, which is the same axis and cannot be invalid;
+//! * forty-odd `u8` tag constants re-spelling `tensor-ir`'s own vocabulary
+//!   (dtypes, host roles, extern directions, readiness, stages, ports) with
+//!   nothing checking that the two numberings agreed;
+//! * thirteen `PIE_DEVICE_PORT_*` bits in a private numbering that disagreed
+//!   with the port registry's;
+//! * and an 807-line completion broker — a waker table, a recycling pool of
+//!   `#[repr(C)]` atomic terminal cells, per-work-item leases — living inside
+//!   the description of what a driver is.
 //!
-//! The rest of the vocabulary:
+//! # What it is now
 //!
-//! - [`local`]: the five records a driver answers with, and the constants
-//!   both sides name.
-//! - [`capabilities`]: what a driver answers at create and load time.
-//! - [`transfer`]: the KV transfer vocabulary shared with cross-node transport.
-//! - [`plan`]: owned verb plans shared by local and remote backends.
-//! - [`submission`]: the sealed frame a `launch` takes.
-//! - [`remote`]: the versioned worker-to-executor protocol.
+//! The verb set survived; the encoding did not. The five decisions the rewrite
+//! executed (palo design §7, decisions 18–20):
+//!
+//! 1. **`model-ir` is a dependency.** The engine traces, `Plan` crosses at
+//!    load, `Baked` never crosses, and `model_ir::Dtype` is *the* dtype — the
+//!    `KvDtype` that spelled five of its variants a second time is gone.
+//! 2. **The completion broker went to the engine.** Run-ahead is a scheduling
+//!    policy, and this crate keeps only the receipt
+//!    ([`fire::FireTicket`]).
+//! 3. **The ports went to `tensor-ir`.** `PIE_DEVICE_PORT_*` and
+//!    `GeometryClass` live in `tensor_ir::registry` beside the `Port` enum
+//!    they were a second numbering of. This crate names them; it does not
+//!    re-export them.
+//! 4. **Every noun is serde and the trait is object-safe.** There is no wire
+//!    version here: remote is a property of a transport, not an encoding of a
+//!    contract.
+//! 5. **The dead `LaunchPlan`-era types are gone**, and the ones with living
+//!    consumers got typed successors.
+//!
+//! # The dependency floor
+//!
+//! `model-ir`, `tensor-ir`, `serde`, `thiserror`. All four are leaves. What
+//! this crate no longer drags into the graph of everyone who reads a
+//! `KvHandle`: `tarpc` (and tokio, and its wasm/windows platform closure),
+//! `waker` (and `loom`, and a C compiler), `anyhow`, `crossbeam-queue`. Both
+//! of the crate's Cargo features existed to hold those back, and both are
+//! gone with them.
 
-pub mod capabilities;
+#![deny(missing_docs)]
+#![deny(
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro,
+    clippy::mem_forget
+)]
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![forbid(unsafe_code)]
+
+// Re-exported so a consumer that only reads a `KvLayout` does not have to
+// declare a `model-ir` dependency of its own to name the dtype inside it, and
+// so `tensor_ir::registry`'s port vocabulary is reachable from the contract
+// without this crate re-exporting the ports themselves (decision 19).
+pub use model_ir;
+pub use tensor_ir;
+
+pub mod caps;
 pub mod channel;
-// The runtime half. See the `runtime` feature: the device crates want the
-// plain data below and nothing here, and one of them proves it.
-#[cfg(feature = "runtime")]
-pub mod completion;
-#[cfg(feature = "runtime")]
 pub mod driver;
-pub mod geometry;
-#[cfg(feature = "runtime")]
-pub mod instance;
-pub mod local;
-pub mod plan;
-pub mod remote;
-pub mod submission;
+pub mod error;
+pub mod fire;
+pub mod load;
+pub mod program;
 pub mod transfer;
 
-pub use capabilities::{
-    DeviceFacts, DriverCapabilities, ExpertSiteSummary, KV_COPY_DEVICE_TO_DEVICE,
-    KV_COPY_DEVICE_TO_HOST, KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelFacts,
-    ModelLoadDesc, ModelSiteSummary, Mxfp4MoeRequest,
+pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, RegisteredChannel};
+pub use driver::Driver;
+pub use error::{DriverError, Result};
+pub use fire::{
+    Attachment, Boundary, FireId, FireSubmission, FireTicket, KvDelta, Lane, LaneReadout, Mask,
+    MediaEncode, Readout,
 };
-pub use channel::{ChannelValue, RegisteredChannel};
-#[cfg(feature = "runtime")]
-pub use completion::{CompletionBroker, CompletionLease, SubmissionCompletion, WorkItemCompletion};
-#[cfg(feature = "runtime")]
-pub use driver::{Driver, FrameLaunchOutcome, Unsupported};
-pub use geometry::{
-    GeometryClass, PIE_DECODE_ENVELOPE_PORTS, PIE_DEVICE_GEOMETRY_PORTS, PIE_DEVICE_PORT_ATTN_MASK,
-    PIE_DEVICE_PORT_EMBED_TOKENS, PIE_DEVICE_PORT_KV_LEN, PIE_DEVICE_PORT_PAGE_INDPTR,
-    PIE_DEVICE_PORT_PAGES, PIE_DEVICE_PORT_POSITIONS, PIE_DEVICE_PORT_RS_BUFFER_INDPTR,
-    PIE_DEVICE_PORT_RS_BUFFER_LEN, PIE_DEVICE_PORT_RS_BUFFER_PAGES, PIE_DEVICE_PORT_RS_W_OFF,
-    PIE_DEVICE_PORT_RS_W_SLOT, PIE_DEVICE_PORT_W_OFF, PIE_DEVICE_PORT_W_SLOT,
-    PIE_DEVICE_RS_BUFFER_PORTS,
+pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
+pub use program::{
+    Axis, BindExtents, BoundInstance, DirectArgmax, EmittedKernel, ExtentRole, InstanceBinding,
+    InstanceId,
+    KernelKind, LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue,
+    LaunchPort, LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue, LibraryOp,
+    ProgramId, ProgramRegistration, RegionAnalysis, RegionKind, StageNeeds, ValueSource,
 };
-#[cfg(feature = "runtime")]
-pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceId, ProgramId};
-pub use local::*;
-pub use plan::{
-    CHANNEL_TICKET_NONE, ChannelRegistrationPlan, EmittedKernel, EncodedMask, KvCopyPlan,
-    LaunchPlan, MaskWords, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
-    RS_FLAG_BUFFER_WRITE, RS_FLAG_FOLD, RS_FLAG_FOLD_LEN_DEVICE, RS_FLAG_RESET, StateCopyPlan,
+pub use transfer::{
+    KvCopy, KvExport, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, PageRange,
+    Pool, PoolResize, StateCopy, StateMove,
 };
-pub use remote::*;
-pub use submission::{FrameSubmission, StepSubmission};
-pub use transfer::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};

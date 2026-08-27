@@ -313,7 +313,7 @@ pub fn packed_causal_kv_end(
     }
     let init = i64::from(kv_len) - i64::from(qo_len);
     let walked = (i64::from(qo_tile_idx) + 1) * i64::from(cluster_tile_q);
-    let end = init + walked.div_ceil(i64::from(group_size));
+    let end = init + (walked + i64::from(group_size) - 1) / i64::from(group_size);
     // Clamped into [0, kv_len], so the u32 round trip is exact.
     end.clamp(0, i64::from(kv_len)) as u32
 }

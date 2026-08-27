@@ -16,6 +16,12 @@ path = "src/lib.rs"
 # Every dependency below is one every consumer of the catalog needs.
 
 [dependencies]
+# What a turn of conversation is written in and read back out of: the
+# `Instruct` surface, the three stream decoders, and the named prompt formats
+# themselves. This crate keeps only the table that says which SKU speaks which
+# — the formats stopped being per-family files when two of them turned out to
+# be the same three hundred lines.
+chat-template = { path = "../chat-template" }
 # What a forward pass is written in: Recorder/Value, the per-family kernel
 # wrappers, split/merge/Facts, and the `Weight` declaration. A model's whole
 # computation vocabulary comes from here — the IR names it needs (`Dtype`,

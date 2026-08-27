@@ -33,19 +33,6 @@ pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), K
     act_x_wt(ctx, "gemm.lm_head", act, w, y)
 }
 
-/// `layer` names the o-proj slice on planes that stack them; this plane's
-/// weights arrive pre-sliced, so it is stated and unused — as before.
-pub fn attention_landing(
-    ctx: &Ctx<'_>,
-    act: Tensor,
-    w: Tensor,
-    layer: u32,
-    y: Tensor,
-) -> Result<(), KernelError> {
-    let _ = layer;
-    act_x_wt(ctx, "gemm.attention_landing", act, w, y)
-}
-
 /// `y = act x w^T`. Skinny fires (fewer than [`TILE_M`] rows — the decode
 /// path) take the simdgroup gemv; everything else takes the 32x32 tile.
 pub fn act_x_wt(
