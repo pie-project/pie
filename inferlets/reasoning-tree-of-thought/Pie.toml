@@ -1,0 +1,19 @@
+[package]
+name = "reasoning-tree-of-thought"
+version = "0.1.0"
+description = "Tree-of-Thought inferlet for reasoning benchmarks"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", description = "Math word problem to solve"}
+num_candidates = {type = "int", optional = true, description = "Initial candidate count (default: 4)"}
+beam_width = {type = "int", optional = true, description = "Number of candidates to refine (default: 2)"}
+max_tokens = {type = "int", optional = true, description = "Maximum answer tokens per generation (default: 256)"}
+score_tokens = {type = "int", optional = true, description = "Maximum tokens per model-scoring call (default: 16)"}
+temperature = {type = "float", optional = true, description = "Candidate sampling temperature (default: 0.7)"}
+top_p = {type = "float", optional = true, description = "Candidate top-p value (default: 0.95)"}
+thinking = {type = "bool", optional = true, description = "Allow model thinking blocks (default: false)"}

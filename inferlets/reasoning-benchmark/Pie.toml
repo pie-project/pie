@@ -1,0 +1,20 @@
+[package]
+name = "reasoning-benchmark"
+version = "0.1.0"
+description = "Unified Direct, Best-of-N, Tree-of-Thought, and Graph-of-Thought benchmark inferlet"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+pattern = {type = "string", optional = true, description = "direct | best_of_n | tree_of_thought | graph_of_thought"}
+question = {type = "string", description = "Math word problem to solve"}
+num_candidates = {type = "int", optional = true, description = "Candidate count for branching patterns (default: 4)"}
+beam_width = {type = "int", optional = true, description = "Number of candidates refined by tree_of_thought (default: 2)"}
+max_tokens = {type = "int", optional = true, description = "Maximum answer tokens per generation (default: 256)"}
+score_tokens = {type = "int", optional = true, description = "Maximum tokens per model-scoring call (default: 16)"}
+temperature = {type = "float", optional = true, description = "Candidate sampling temperature (default: 0.7)"}
+top_p = {type = "float", optional = true, description = "Candidate top-p value (default: 0.95)"}
+thinking = {type = "bool", optional = true, description = "Allow model thinking blocks (default: false)"}

@@ -14,6 +14,7 @@ from test_skeleton_of_thought import test_skeleton_of_thought
 from test_tree_of_thought import test_tree_of_thought
 from test_graph_of_thought import test_graph_of_thought
 from test_recursion_of_thought import test_recursion_of_thought
+from test_reasoning_benchmark import test_reasoning_benchmark
 from test_agent_react import test_agent_react
 from test_agent_codeact import test_agent_codeact
 from test_image_fetch import test_image_fetch
@@ -50,6 +51,7 @@ ALL_TESTS = [
     test_tree_of_thought,
     test_graph_of_thought,
     test_recursion_of_thought,
+    test_reasoning_benchmark,
     test_best_of_n,
     test_knowledge_graph,
     test_agent_react,
