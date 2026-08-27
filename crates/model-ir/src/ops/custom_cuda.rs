@@ -4,8 +4,8 @@ use crate::operands::Operands;
 use crate::value::ValueId;
 
 /// The deliberate backend escape hatch: fusions in cuda's vocabulary, refused by
-/// every other plane; `CustomMetal`/`CustomVulkan` join only when those planes
-/// grow fusions. Pure data like every family — only the dispatch impl is gated.
+/// every other platform; `CustomMetal`/`CustomVulkan` join only when those
+/// platforms grow fusions. Pure data like every family — only the dispatch impl is gated.
 /// Emitting one is a model-source decision, under the standing rule that each
 /// has a canonical unfused equivalent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

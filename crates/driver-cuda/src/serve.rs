@@ -75,6 +75,15 @@
 //! the idiom `Toggles::from_env` already set on this plane: read once, at
 //! load, never on the fire path.
 //!
+//! **`PIE_CUDA_STREAMS=off|0|<n>` is P6's cap, and it is read into the
+//! COMPILER rather than into a flag here.** `off` bakes an artifact with no
+//! fork group, no event point and stream 0 on every region — byte for byte
+//! what this shell recorded before P6 existed — rather than a shell that
+//! declines to use a graph it baked, which is the only arrangement in which
+//! the streams-off arm of a measurement is an arm. A number sets how many
+//! side streams the compiler may hand out; unset leaves the profile's own
+//! figure (2).
+//!
 //! # What v1 does not do
 //!
 //! tp=1, so no collective ever fires, and no bucket padding — a fire's shape
@@ -96,25 +105,149 @@ use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
-use driver::driver_api::fire::{Boundary, Mask};
+use driver::driver_api::fire::{Boundary, LayerScores, Mask};
 
 use crate::program::launch::INTRINSIC_STORAGE_RAW_BF16;
 use crate::program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
 use crate::record::{self, Graphs as GraphCache};
-use crate::run::{CacheGeometry, CachePlanning, FireBindings, FireTables, Run};
-use crate::store::kv::{self, Paging, Seat, SpaceFacts};
+use crate::run::{CacheGeometry, CachePlanning, FireBindings, FireTables, Run, ScheduleSeat};
+use crate::store::kv::{self, Paging, Seat};
 use crate::store::Pools;
-use crate::weights::Weights;
-use crate::window::{Cursor, Windows};
+use crate::weights::{AdapterPlane, Weights};
+use crate::window::{Cursor, Lanes, Windows};
 
-/// The name `model_dsl::seam::OUT` states — the one seam whose value a reader
-/// touches after the graph has run.
+/// The names `model_dsl::seam` states for the values a reader touches after
+/// the graph has run — `out`, `mtp`, `attn.scores`, in that order.
 ///
-/// A literal, because this crate does not depend on the authoring surface;
-/// the compiler's arena carries the same literal for the same reason and says
-/// so. The coupling is one string, and a plan that lost it would fail
-/// [`Shell::load`] with a sentence rather than reading somebody else's bytes.
-const OUT_SEAM: &str = "out";
+/// **READ FROM THE COMPILER, NOT SPELLED AGAIN** (palo C3b). This crate does
+/// not depend on the authoring surface, and until this wave it kept its own
+/// copy of the literal `"out"` with a comment in each place saying the other
+/// one existed. `model_compiler::arena` is what gives these values their
+/// delivery tail, so it is the honest place for the list to live: a shell
+/// reading a name the carve does not pin would be reading bytes the carve was
+/// free to give away.
+const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
+const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
+const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
+
+/// One declared export, resolved against this load's plan and bake.
+///
+/// **A VALUE AND THE CLASSES THAT FILL IT, AND BOTH HALVES ARE USED.** The
+/// value is what the fire's carve turns into a rectangle; the class set is
+/// what a lane's word is checked against, because an export is written by an
+/// ARM and an arm runs over a window. `Shell::masked` and `Shell::corrected`
+/// are the same reading taken from the op vocabulary; this one is taken from
+/// the seam, because a draft head's attention and a trunk layer's attention
+/// are the same `Attention::Prefill` variant and only the export tells them
+/// apart.
+#[derive(Debug, Clone)]
+pub struct Export {
+    /// The exported value, as the plan's `Seam` row names it.
+    pub value: ValueId,
+    /// Which transformer layer it came from, for a per-layer export.
+    pub layer: u32,
+    /// The classes whose window runs the node that writes it.
+    pub classes: model_ir::ClassSet,
+}
+
+/// This load's declared exports (design §9), resolved once at boot.
+#[derive(Debug, Clone)]
+struct Exports {
+    /// The trunk's logits. Required: a plan with no `out` seam computes
+    /// nothing a reader can take.
+    out: ValueId,
+    /// The draft head's logits over the draft window, for a SKU whose model
+    /// text declares one (palo C3).
+    mtp: Option<Export>,
+    /// The attention's per-query mass, one entry per attention layer that
+    /// exports it, in the plan's own order (palo C4).
+    scores: Vec<Export>,
+    /// The union of every capture column's classes — the set a capturing
+    /// lane's word must land in, and empty for an artifact with no capture
+    /// arm at all.
+    capturing: model_ir::ClassSet,
+}
+
+impl Exports {
+    /// Resolve the export seams against a plan and the bake that placed them.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Unbound`] for a plan with no `out` seam.
+    fn of(plan: &Plan, baked: &Baked) -> Result<Exports> {
+        let out = plan
+            .seams
+            .iter()
+            .find(|seam| seam.seam == OUT_SEAM)
+            .and_then(|seam| seam.values.first().copied())
+            .ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "no `{OUT_SEAM}` seam, so a fire would compute nothing a reader can take"
+                ),
+            })?;
+        let named = |name: &str| -> Vec<Export> {
+            plan.seams
+                .iter()
+                .filter(|seam| seam.seam == name)
+                .flat_map(|seam| {
+                    let layer = seam.layer.unwrap_or(0);
+                    seam.values
+                        .iter()
+                        .map(move |value| (layer, *value))
+                })
+                .map(|(layer, value)| Export {
+                    value,
+                    layer,
+                    classes: writer_classes(plan, baked, value),
+                })
+                .collect()
+        };
+        let scores = named(SCORES_SEAM);
+        let mut capturing = model_ir::ClassSet::default();
+        for export in &scores {
+            for class in export.classes.iter() {
+                capturing.insert(class);
+            }
+        }
+        Ok(Exports {
+            out,
+            mtp: named(MTP_SEAM).into_iter().next(),
+            scores,
+            capturing,
+        })
+    }
+}
+
+/// The classes whose window runs the node that writes `value`.
+///
+/// **THE NODE, NOT THE OP NAME.** An export is told apart from the trunk by
+/// WHAT IT IS, not by which kernel wrote it: the draft head's readout and the
+/// trunk's are both `linear.lm_head`, and the capture arm's output and a
+/// pooled attention's are both `[rows, heads]` F32. Asking which regions hold
+/// the writing node is the one reading that cannot be fooled by a model text
+/// reusing an op.
+fn writer_classes(plan: &Plan, baked: &Baked, value: ValueId) -> model_ir::ClassSet {
+    use model_ir::Operands;
+    let mut outputs: Vec<ValueId> = Vec::new();
+    let mut writers: Vec<u32> = Vec::new();
+    for (at, node) in plan.nodes.iter().enumerate() {
+        outputs.clear();
+        node.op.outputs(&mut outputs);
+        if outputs.contains(&value) {
+            writers.push(u32::try_from(at).unwrap_or(u32::MAX));
+        }
+    }
+    let mut classes = model_ir::ClassSet::default();
+    for region in baked.template() {
+        if !region.nodes.clone().any(|node| writers.contains(&node)) {
+            continue;
+        }
+        for class in region.mask.iter() {
+            classes.insert(class);
+        }
+    }
+    classes
+}
 
 /// How much of a fire this shell records.
 ///
@@ -162,6 +295,23 @@ impl Graphs {
             Some("on" | "1" | "graph") => Graphs::On,
             _ => stated,
         }
+    }
+}
+
+/// **P6's CAP, OFF THE ENVIRONMENT.** `PIE_CUDA_STREAMS=off|0` bakes an
+/// artifact with no fork group at all; a number sets how many side streams the
+/// compiler may hand out; anything else leaves the profile's own figure alone.
+///
+/// Read ONCE, at load, like `PIE_CUDA_GRAPHS` and `Toggles::from_env` beside
+/// it. And read into the COMPILER's input rather than into a shell flag,
+/// because the off arm has to be the artifact P6 never ran on — not a shell
+/// that declines to use one it baked. See `model_compiler::stream`.
+#[must_use]
+fn streams_from_env(stated: u32) -> u32 {
+    match std::env::var("PIE_CUDA_STREAMS").ok().as_deref() {
+        Some("off" | "0" | "none") => 0,
+        Some(text) => text.parse().unwrap_or(stated),
+        None => stated,
     }
 }
 
@@ -245,6 +395,39 @@ pub struct Seated<'a> {
     /// sequences are seats submits neither. [`crate::mask`] is what turns it
     /// into the bits `attention.masked` reads.
     pub mask: Option<&'a Mask>,
+    /// Which adapter bank this lane's rows route to (design §8), or `None`
+    /// for the base model.
+    ///
+    /// **A REGISTERED ID, NOT A SET OF WEIGHTS.** `Shell::register_adapter`
+    /// put the bytes in the bank once; a fire says only which row of it each
+    /// lane wants, and every correction site in the plan reads that one id.
+    /// So swapping an adapter is an integer in a submission, which is the
+    /// whole of decision 17's "no recapture": the graph key is this fire's
+    /// composition, and a bank's CONTENTS are not in it.
+    ///
+    /// Beside `mask` for the same reason `mask` is not on [`Lane`], and with
+    /// the same standing check: the word the caller stamped has to agree with
+    /// it, because the word is what puts the lane's rows inside the
+    /// correction's window or outside it (`Fault::AdapterWord`).
+    pub adapter: Option<u32>,
+    /// Run the model's draft head over this lane's rows (design §8, palo C3).
+    ///
+    /// **A BOOLEAN BESIDE TWO PAYLOADS, AND THE DIFFERENCE IS THE AXIS.** A
+    /// mask is bits the caller holds and an adapter is a row of a bank; a
+    /// draft is neither — the head reads the lane's own hidden and the lane's
+    /// own tokens over the lane's own rows, and there is nothing for the
+    /// submission to carry but the intent. The standing check is unchanged:
+    /// the word the caller stamped has to agree with this
+    /// (`Fault::DraftWord`), because the word is what puts the lane's rows
+    /// inside the head's window or outside it.
+    pub drafts: bool,
+    /// Keep this lane's per-query attention mass (design §9, palo C4).
+    ///
+    /// [`Seated::drafts`]'s twin, down to the refusal
+    /// (`Fault::ScoreWord`). What comes back is
+    /// [`Shell::fire_captured`]'s `scores`, one entry per exported attention
+    /// layer.
+    pub captures_scores: bool,
 }
 
 impl<'a> Seated<'a> {
@@ -257,6 +440,9 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             mask: None,
+            adapter: None,
+            drafts: false,
+            captures_scores: false,
         }
     }
 
@@ -265,6 +451,33 @@ impl<'a> Seated<'a> {
     pub fn masked(lane: Lane<'a>, mask: &'a Mask) -> Seated<'a> {
         Seated {
             mask: Some(mask),
+            ..Seated::of(lane)
+        }
+    }
+
+    /// The same lane, corrected by adapter `id` (design §8).
+    #[must_use]
+    pub fn adapted(lane: Lane<'a>, id: u32) -> Seated<'a> {
+        Seated {
+            adapter: Some(id),
+            ..Seated::of(lane)
+        }
+    }
+
+    /// The same lane, with the model's draft head run over its rows (palo C3).
+    #[must_use]
+    pub fn drafting(lane: Lane<'a>) -> Seated<'a> {
+        Seated {
+            drafts: true,
+            ..Seated::of(lane)
+        }
+    }
+
+    /// The same lane, with its attention's per-query mass kept (palo C4).
+    #[must_use]
+    pub fn capturing(lane: Lane<'a>) -> Seated<'a> {
+        Seated {
+            captures_scores: true,
             ..Seated::of(lane)
         }
     }
@@ -298,15 +511,32 @@ pub struct Shell {
     arena: Arena,
     pools: Pools,
     inputs: Inputs,
-    spaces: Vec<Option<SpaceFacts>>,
+    /// What the plan restates about its own caches: per cache ROW (the bytes
+    /// one page holds) and per PLAN VALUE (the reading one schedule carves).
+    facts: kv::Facts,
+    /// How many kv geometry spaces the plan declares — the page-id spaces,
+    /// which is all a space is.
+    spaces: usize,
     /// The classes whose window runs an `attention.masked` arm — read once
     /// off the bake, because a mask is only ever read by a lane the WORD put
     /// in one of them. Empty for an artifact that declares no masked arm at
     /// all, and then a mask has nowhere to go.
     masked: model_ir::ClassSet,
+    /// The classes whose window runs a `linear.lora_correct` arm — the
+    /// adapter axis's twin of [`masked`](Shell::masked), read off the bake
+    /// for the same reason and checked against a submission the same way.
+    ///
+    /// **THIS IS WHAT MAKES THE ZERO-ADAPTER FIRE FREE, AND WHAT MAKES A
+    /// MISMATCH A REFUSAL.** A lane's word decides which class it lands in,
+    /// and the class decides whether its rows fall inside the correction's
+    /// window. Empty for an artifact that declares no correction at all, and
+    /// then an adapter has nowhere to go.
+    corrected: model_ir::ClassSet,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
-    out: ValueId,
+    /// This load's declared exports (design §9): the trunk's readout, the
+    /// draft readout when the model text states one, and the capture columns.
+    exports: Exports,
     graphs: Graphs,
     cache: GraphCache,
     /// The guest-program plane (design §9). Empty until something registers a
@@ -325,20 +555,42 @@ impl Shell {
     /// residency, [`Fault::Unbound`] for a plan naming a seat this shell does
     /// not bind.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        let device = Context::bind(boot.ordinal)?;
+        let mut device = Context::bind(boot.ordinal)?;
 
         // Costs are input (design §6's `layout/` lineage row): the shell
         // measured the device once at bind, and hands the numbers to a
         // compiler that could equally have been run on a laptop.
-        let profile = boot.profile.unwrap_or(DeviceProfile {
+        let mut profile = boot.profile.unwrap_or(DeviceProfile {
             sms: device.device().num_sm,
             ..DeviceProfile::default()
         });
+        // **P6's OFF ARM IS FIRST CLASS AND THIS IS WHERE IT LIVES.**
+        // `PIE_CUDA_STREAMS` is read once, at load, in the idiom
+        // `PIE_CUDA_GRAPHS` and `Toggles::from_env` already set on this plane;
+        // what it sets is the compiler's own cap, so `off` does not disable a
+        // shell feature — it bakes an artifact with no fork group, no event
+        // point and stream 0 on every region, which is the artifact this
+        // compiler produced before P6 existed. A measurement whose off arm is
+        // a different artifact is a measurement of two things.
+        profile.side_streams = streams_from_env(profile.side_streams);
+        // And the one device fact a pure compiler cannot derive: which
+        // entries claim a workspace no second launch may be inside. See
+        // [`crate::EXCLUSIVE`] — the profile's own doc argues why it is data
+        // and not knowledge.
+        profile.exclusive = crate::EXCLUSIVE.iter().map(|op| (*op).to_string()).collect();
         let baked = compile(&boot.plan, &boot.budgets, &profile)?;
+        // The streams and the events the artifact asked for, opened once,
+        // here: a `cudaStreamCreate` on the fire path would be host work
+        // between two launches, and inside a capture it is what
+        // `Graph::capture`'s thread-local mode refuses by name.
+        device.open_lanes(baked.forks.streams.saturating_sub(1), baked.forks.events)?;
 
-        // Heads and head widths are on the ops, not on `CacheRow::Kv`, so
-        // they are read off the plan rather than off a config beside it.
-        let spaces = kv::probe(&boot.plan)?;
+        // Heads, head widths and windows are on the ops, not on
+        // `CacheRow::Kv`, so they are read off the plan rather than off a
+        // config beside it — per cache ROW for the bytes a page holds, per
+        // PLAN VALUE for the reading a schedule is carved at
+        // (`kv::SpaceFacts`, and build log 20's first blocker).
+        let facts = kv::probe(&boot.plan)?;
         // The window argument's bake-time half, asked once: no attention
         // schedule may be carved over more classes than the arm consuming it
         // runs in. A per-fire check would be the same answer at a worse
@@ -371,28 +623,52 @@ impl Shell {
                 }
             }
         }
+        // The same reading for the adapter axis, and the same three
+        // consequences: an artifact with no correction op has nowhere for an
+        // adapter id to go (`Fault::Adapterless`), a lane whose word puts it
+        // outside the correction's window may not carry one and a lane whose
+        // word puts it inside must (`Fault::AdapterWord`), and a fire in whose
+        // composition NO class of this set has rows never stages the routes
+        // vector, never binds the seat, and never launches the arm.
+        let mut corrected = model_ir::ClassSet::default();
+        for region in baked.template() {
+            let runs_correction = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.plan.nodes.get(node as usize).map(|node| &node.op),
+                    Some(model_ir::Operation::Linear(model_ir::Linear::LoraCorrect { .. }))
+                )
+            });
+            if runs_correction {
+                for class in region.mask.iter() {
+                    corrected.insert(class);
+                }
+            }
+        }
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
 
         let weights = Weights::resident(&boot.plan, boot.contract, boot.checkpoint)?;
         let arena = Arena::reserve(&baked.arena)?;
-        let pools = Pools::reserve(&boot.plan, paging, &spaces)?;
+        let pools = Pools::reserve(&boot.plan, paging, &facts)?;
+        let spaces = boot
+            .plan
+            .caches
+            .iter()
+            .filter_map(|row| match row {
+                model_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
+                model_ir::CacheRow::State { .. } => None,
+            })
+            .max()
+            .unwrap_or(0);
         let inputs = Inputs::reserve(
             &boot.budgets,
             paging,
-            &spaces,
+            spaces,
+            &facts,
             baked.classes.classes.len(),
             device.device().num_sm,
         )?;
 
-        let out = boot
-            .plan
-            .seams
-            .iter()
-            .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-            .ok_or_else(|| Fault::Unbound {
-                what: format!("no `{OUT_SEAM}` seam, so a fire would compute nothing a reader can take"),
-            })?;
+        let exports = Exports::of(&boot.plan, &baked)?;
 
         Ok(Shell {
             device,
@@ -403,14 +679,44 @@ impl Shell {
             arena,
             pools,
             inputs,
+            facts,
             spaces,
             masked,
+            corrected,
             held: vec![0; boot.slots as usize],
-            out,
+            exports,
             graphs: Graphs::from_env(boot.graphs),
             cache: GraphCache::new(),
             programs: ProgramPlane::default(),
         })
+    }
+
+    /// Write one adapter's planes into this load's banks (design §8).
+    ///
+    /// **REGISTERING IS A POOL WRITE AND A TABLE ROW — NOT A RECAPTURE**
+    /// (decision 17). The graph key is a fire's COMPOSITION (`record::Key`),
+    /// and a bank's contents are not in it; the bank's addresses were reserved
+    /// at load and do not move. So the thirty-second adapter costs what the
+    /// first did — a copy — and every graph this shell has recorded stays
+    /// valid, which is the property
+    /// `adapter_banks::registering_another_adapter_captures_nothing` asserts by
+    /// counting.
+    ///
+    /// [`Weights::banks`] is what a caller sizes its planes against.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Adapter`] for a bank this plan does not declare, an id past
+    /// the declared capacity, or a plane that is not one slot's bytes;
+    /// [`Fault::Device`] for the copy.
+    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
+        self.weights.register_adapter(id, planes)
+    }
+
+    /// The banks this load declared: name, capacity, bytes per adapter slot.
+    #[must_use]
+    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
+        self.weights.banks()
     }
 
     /// Open a slot for a fresh sequence.
@@ -499,7 +805,36 @@ impl Shell {
     ///
     /// [`Fault::Unbound`] for an out value whose width is symbolic.
     pub fn out_width(&self) -> Result<u64> {
-        kv::width_of(&self.plan, self.out)
+        kv::width_of(&self.plan, self.exports.out)
+    }
+
+    /// Does this load's model text declare a draft head (design §8's MTP
+    /// row, palo C3)?
+    ///
+    /// What `driver_cuda::api::profile` answers `ModelProfile::has_mtp_logits`
+    /// with, and therefore what decides whether a guest program may declare
+    /// `IntrinsicId::MtpLogits` at all. A bind-time contract has to be true at
+    /// the FIRST fire, and it is true exactly when the plan states the export
+    /// this shell binds the intrinsic at.
+    #[must_use]
+    pub fn drafts(&self) -> bool {
+        self.exports.mtp.is_some()
+    }
+
+    /// Does this load's model text declare a capture arm (design §9, palo C4)?
+    ///
+    /// Empty means a `Lane::captures_scores` has nowhere to go, and the fire
+    /// says so by name rather than answering with an uncaptured continuation.
+    #[must_use]
+    pub fn captures_scores(&self) -> bool {
+        !self.exports.scores.is_empty()
+    }
+
+    /// The attention layers this load exports a capture column for, in the
+    /// plan's own order.
+    #[must_use]
+    pub fn score_layers(&self) -> Vec<u32> {
+        self.exports.scores.iter().map(|e| e.layer).collect()
     }
 
     /// Which mode it is firing in.
@@ -527,6 +862,26 @@ impl Shell {
     #[must_use]
     pub fn graph_stats(&self) -> record::Stats {
         self.cache.stats()
+    }
+
+    /// **WHAT P6 BAKED FOR THIS LOAD, AND WHAT THIS SHELL OPENED FOR IT**:
+    /// `(streams, events, forked regions, side streams open)`.
+    ///
+    /// The one observable of a fork from outside. A recorded graph does not
+    /// carry its event points as NODES — stream capture turns a
+    /// `cudaEventRecord` and the `cudaStreamWaitEvent` behind it into an edge
+    /// between the launches on either side, which is exactly what one wants
+    /// and exactly what makes `cudaGraphGetNodes` unable to tell a forked
+    /// graph from a sequential one. So a measurement that wants to say its two
+    /// arms are two different artifacts asks here.
+    #[must_use]
+    pub fn forks(&self) -> (u32, u32, usize, usize) {
+        (
+            self.baked.forks.streams,
+            self.baked.forks.events,
+            self.baked.regions.iter().filter(|r| r.stream != 0).count(),
+            self.device.lanes(),
+        )
     }
 
     // ── The guest-program plane (design §9) ──
@@ -710,6 +1065,36 @@ impl Shell {
         lanes: &[Seated<'_>],
         attachments: &[Attached],
     ) -> Result<Vec<Vec<f32>>> {
+        self.fire_captured(lanes, attachments, &mut Vec::new())
+    }
+
+    /// The same fire, with the capture columns read back (design §9, palo C4).
+    ///
+    /// `scores` is filled with one entry per SUBMITTED lane, in submission
+    /// order: empty for a lane that captured nothing, and one
+    /// [`LayerScores`] per exported attention layer for a lane that did. It is
+    /// an out-parameter rather than a second return value because a fire that
+    /// captures nothing must not pay a `Vec` per lane to say so, and because
+    /// every existing caller of [`Shell::fire_attached`] means exactly "and
+    /// nobody captured".
+    ///
+    /// **THE READ IS THE SAME READ THE LOGITS TAKE.** The capture column is an
+    /// arena rectangle the carve holds open past the last node, and this
+    /// copies the capturing lane's rows out of it where they lie. No pool, no
+    /// second buffer, no verb of its own — the argument for that choice is on
+    /// [`LaneReadout::scores`](driver::driver_api::fire::LaneReadout::scores).
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::fire_attached`], plus [`Fault::Scoreless`] for a lane that
+    /// asked to capture against an artifact with no capture arm, and
+    /// [`Fault::ScoreWord`] for a lane whose word and whose ask disagree.
+    pub fn fire_captured(
+        &mut self,
+        lanes: &[Seated<'_>],
+        attachments: &[Attached],
+        scores: &mut Vec<Vec<LayerScores>>,
+    ) -> Result<Vec<Vec<f32>>> {
         let Shell {
             device,
             plan,
@@ -719,10 +1104,12 @@ impl Shell {
             arena,
             pools,
             inputs,
+            facts,
             spaces,
             masked,
+            corrected,
             held,
-            out,
+            exports,
             graphs,
             cache,
             // NAMED, NOT `..`: the guest-program plane is touched at the
@@ -834,6 +1221,18 @@ impl Shell {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
+        // THE ADAPTER AXIS, IN FIRE ROW ORDER. One entry per token ROW —
+        // `linear.lora_correct` reads `routes[row]` beside `x[row]`, so this
+        // is the shape `tokens` and `positions` have and not the shape
+        // `slot_ids` has. Stays empty for a fire no lane routed, and an empty
+        // vector is what makes the whole axis cost that fire nothing:
+        // `Inputs::write` stages no bytes, `FireBindings` binds no seat, and
+        // the correction's window has no rows for the walk to dispatch.
+        let mut adapter_routes: Vec<i32> = Vec::new();
+        let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
+        if any_adapter {
+            adapter_routes.reserve(rows as usize);
+        }
         for row in composition.lanes() {
             let seated = &lanes[row.source as usize];
             let lane = &seated.lane;
@@ -916,6 +1315,74 @@ impl Shell {
                 rows: row.rows,
             });
             slot_ids.push(lane.slot as i32);
+            // THE ADAPTER AND THE WORD, CHECKED AGAINST EACH OTHER, ONCE —
+            // the mask's rule above, restated for the axis beside it, and it
+            // is the same two wrong answers that look right. A lane that
+            // named an adapter and landed in a class outside the correction's
+            // window gets the BASE MODEL and nobody is told; a lane whose
+            // word put it inside the window and named none would have its
+            // rows read a routes vector nothing wrote. Both are refused
+            // before anything launches.
+            let runs_correction = corrected.contains(row.class as usize);
+            if seated.adapter.is_some() && corrected.is_empty() {
+                return Err(Fault::Adapterless { lane: row.source });
+            }
+            if seated.adapter.is_some() != runs_correction {
+                return Err(Fault::AdapterWord {
+                    lane: row.source,
+                    word: lane.word,
+                    runs_correction,
+                });
+            }
+            // THE TWO EXPORT AXES, CHECKED THE SAME WAY, AND THE ARGUMENT
+            // CHANGES IN ONE PLACE (palo C3b/C4b). The mask and the adapter
+            // are PAYLOADS, so their second wrong answer is "staged and never
+            // read". These carry no payload — a draft head reads the lane's
+            // own hidden, a capture arm the lane's own query — so the second
+            // wrong answer is "computed and nobody told": a lane whose word
+            // put it inside the export's window and that asked for nothing
+            // has a column written for it that no reader collects, and a lane
+            // that asked and landed outside gets no column and is handed an
+            // empty readout with no way to tell that from a fire that
+            // captured zeros. Both are refused before anything launches.
+            let runs_draft_arm = exports
+                .mtp
+                .as_ref()
+                .is_some_and(|mtp| mtp.classes.contains(row.class as usize));
+            if seated.drafts && exports.mtp.is_none() {
+                return Err(Fault::Draftless { lane: row.source });
+            }
+            if seated.drafts != runs_draft_arm {
+                return Err(Fault::DraftWord {
+                    lane: row.source,
+                    word: lane.word,
+                    runs_draft_arm,
+                });
+            }
+            let runs_capture_arm = exports.capturing.contains(row.class as usize);
+            if seated.captures_scores && exports.scores.is_empty() {
+                return Err(Fault::Scoreless { lane: row.source });
+            }
+            if seated.captures_scores != runs_capture_arm {
+                return Err(Fault::ScoreWord {
+                    lane: row.source,
+                    word: lane.word,
+                    runs_capture_arm,
+                });
+            }
+            if any_adapter {
+                // `-1` is the base model, and it is what an unrouted lane
+                // contributes to a fire some OTHER lane routed: the projection
+                // half writes its waist row zero and the combine returns before
+                // it reads the bank, so those rows are bit-identical to the
+                // fire they would have had alone. Reachable only when the
+                // artifact's correction window covers a class that carries no
+                // adapter, which the check above forbids — so today every entry
+                // this branch writes is a real id, and the sentinel is the
+                // kernel's own floor rather than a path.
+                let id = seated.adapter.map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
+                adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
+            }
 
             // WHERE THE TOKEN COMES FROM IS THE WHOLE OF `palo B3`. A
             // host-class lane's ids are in the submission, because the engine
@@ -954,8 +1421,7 @@ impl Shell {
         //    nothing above it.
         let indptr_host = kv::indptr(&seats);
         let paging = pools.paging();
-        let geometries = spaces
-            .iter()
+        let geometries = (0..*spaces)
             .map(|_| kv::geometry_with(&paging, &seats, &tables))
             .collect::<Result<Vec<_>>>()?;
         let pages = geometries
@@ -991,6 +1457,7 @@ impl Shell {
                 slot_ids: &slot_ids,
                 spaces: &geometries,
                 mask: staged.as_ref(),
+                adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
             },
         )?;
         windows.bind(handles.windows);
@@ -1006,10 +1473,9 @@ impl Shell {
         //    host functions that walk its CONTENTS, so the same vector is
         //    bound twice — once as a handle for the launches, once as a
         //    `Vec<i32>` for `plan_decode`/`plan_prefill`.
-        let mut geometry = Vec::with_capacity(spaces.len());
-        for (space, facts) in spaces.iter().enumerate() {
+        let mut geometry = Vec::with_capacity(*spaces);
+        for (space, host) in geometries.iter().enumerate() {
             let seat = handles.spaces[space];
-            let host = &geometries[space];
             geometry.push(CacheGeometry {
                 indptr: Some(seat.indptr),
                 indices: Some(seat.indices),
@@ -1027,31 +1493,44 @@ impl Shell {
                 // the same extents — the day two spaces hold different
                 // readable extents, this reads `staged` per space.
                 mask: handles.mask,
-                planning: facts.map(|facts| CachePlanning {
+                planning: Some(CachePlanning {
                     kv_indptr: host.indptr.clone(),
                     kv_len: host.kv_len.clone(),
-                    // The FIRE's lanes; `Run::planning` narrows this to the
-                    // asking node's window, which is the count a schedule is
-                    // actually carved at.
-                    shape: Shape {
-                        num_requests: lane_count,
-                        num_q_heads: facts.q_heads,
-                        num_kv_heads: facts.kv_heads,
-                        head_dim: facts.head_dim,
-                        page_size: paging.page_size,
-                        hnd_layout: false,
-                    },
-                    window: facts.window,
-                    decode_workspace: Some(inputs.decode_grant()),
-                    prefill_workspace: Some(inputs.prefill_grant()),
-                    // No SKU this shell serves declares a latent space; a
-                    // plan op that fired over one would panic naming the
-                    // grant it never got, which is the honest answer to a
-                    // binding hole.
-                    mla_workspace: None,
                 }),
             });
         }
+
+        // 7b. The schedule seats. One per PLAN VALUE, because a schedule is
+        //    carved for ONE reading — head width, query heads, window — and a
+        //    family may carve two out of one page-id space (gemma's sliding
+        //    beside its global). The FIRE's lanes go in; `Run::planning`
+        //    narrows `num_requests` to the asking node's window, which is the
+        //    count a schedule is actually built at.
+        let schedules: Vec<Option<ScheduleSeat>> = facts
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(at, seat)| {
+                let seat = (*seat)?;
+                Some(ScheduleSeat {
+                    shape: Shape {
+                        num_requests: lane_count,
+                        num_q_heads: seat.reading.q_heads,
+                        num_kv_heads: seat.reading.kv_heads,
+                        head_dim: seat.reading.head_dim,
+                        page_size: paging.page_size,
+                        hnd_layout: false,
+                    },
+                    window: seat.reading.window,
+                    workspace: inputs.grant(at as u32).unwrap_or_else(|| {
+                        panic!(
+                            "plan value {at} carries a reading but no grant; \
+                             `Inputs::reserve` carves one per probed plan"
+                        )
+                    }),
+                })
+            })
+            .collect();
 
         // 8. The walk. The prepare regions build and stage the attention
         //    schedules — one per window, so a mixed fire builds both — and
@@ -1062,7 +1541,9 @@ impl Shell {
         let bindings = FireBindings {
             tokens: handles.tokens,
             positions: handles.positions,
+            adapter_routes: handles.adapter_routes,
             geometry,
+            schedules,
             tables: FireTables {
                 // Fire-wide going in and window-sliced coming out
                 // (`Run::mask_indptr`): the plan-building arm takes its own
@@ -1084,6 +1565,19 @@ impl Shell {
         // window to resolve in. They cannot be one object — `walk` takes two
         // `&mut` — and this is the smallest thing that stands between them.
         let region = Cell::new(0u32);
+        // P6's twin of it: which STREAM the walk is on. Written by the same
+        // cursor at the same instant, read by the same `Run` — one more `u32`
+        // between the sink and the dispatch, and nothing else changes about
+        // either.
+        let stream = Cell::new(0u32);
+        let side_ctx = device.side_ctx();
+        let side_streams = device.side_streams();
+        let forked = (!side_ctx.is_empty()).then(|| Lanes {
+            side: &side_streams,
+            main: device.stream(),
+            events: device.events(),
+            at: &stream,
+        });
         let mut run = Run::new(
             device.ctx(),
             &plan.values,
@@ -1093,7 +1587,8 @@ impl Shell {
             bindings,
             &windows,
             &region,
-        );
+        )
+        .across(&side_ctx, &stream);
         // TWO MODES, ONE WALK (design §6, decision #11). Off and Shaped run
         // it whole; On splits it at the phase boundary — prepare on the open
         // stream, then the capture regions either replayed from this shape's
@@ -1107,6 +1602,7 @@ impl Shell {
                     baked,
                     descriptor: &descriptor,
                     stream: device.stream(),
+                    lanes: forked,
                     key: record::Key::of(composition.classes()),
                 },
                 &mut run,
@@ -1128,6 +1624,7 @@ impl Shell {
         //    design (decision #15).
         device.synchronize()?;
 
+        let out = exports.out;
         let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!("value {}, the out seam, which the carve gave no rectangle", out.0),
         })?;
@@ -1144,15 +1641,85 @@ impl Shell {
         // below indexes and what an epilogue's `logits` intrinsic is offset
         // by, and computing it twice is how the two would come to disagree.
         let mut last_row = vec![0u32; lanes.len()];
+        // And which rows it OWNS, first and count — the draft readout is
+        // indexed by the first (`driver::program`'s `mtp_draft_row`) and the
+        // capture readout copies the whole run, so both come off the same
+        // reading of the same composition.
+        let mut first_row = vec![0u32; lanes.len()];
+        let mut lane_rows = vec![0u32; lanes.len()];
         let mut raw = vec![0u8; width * 2];
         for row in composition.lanes() {
             let last = row.row_offset + row.rows - 1;
             last_row[row.source as usize] = last;
+            first_row[row.source as usize] = row.row_offset;
+            lane_rows[row.source as usize] = row.rows;
             arena.read(logits.ptr + u64::from(last) * width as u64 * 2, &mut raw)?;
             taken[row.source as usize] = raw
                 .chunks_exact(2)
                 .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
                 .collect();
+        }
+
+        // ── THE CAPTURE COLUMNS (design §9, palo C4b). One rectangle per
+        //    exported attention layer, each `[fire rows, heads]` F32, and a
+        //    capturing lane's mass is its own row run of every one of them.
+        //
+        //    **READ HERE, WHERE THE LOGITS ARE READ, AND FOR THE SAME REASON.**
+        //    The carve holds an export open past the last node so that nothing
+        //    is carved on top of it; what makes that pin worth having is a
+        //    reader that comes for the bytes, and this is it. A lane that
+        //    captured nothing costs this block one `is_empty` — the loop does
+        //    not run — which is the same "zero rows, no launch" the arm itself
+        //    is priced at.
+        scores.clear();
+        scores.resize(lanes.len(), Vec::new());
+        if lanes.iter().any(|seated| seated.captures_scores) {
+            let mut mass: Vec<u8> = Vec::new();
+            for (index, seated) in lanes.iter().enumerate() {
+                if !seated.captures_scores {
+                    continue;
+                }
+                let rows = lane_rows[index];
+                let first = first_row[index];
+                let mut layers = Vec::with_capacity(exports.scores.len());
+                for export in &exports.scores {
+                    let column =
+                        slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
+                            what: format!(
+                                "value {}, an `{SCORES_SEAM}` export, which the carve gave                                  no rectangle",
+                                export.value.0
+                            ),
+                        })?;
+                    if column.dtype != Dtype::F32 {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "an `{SCORES_SEAM}` export landed as {:?}; the kernel's                                  log-sum-exp is F32 and this shell reads back no other",
+                                column.dtype
+                            ),
+                        });
+                    }
+                    let heads = column.width;
+                    let bytes = rows as usize * heads as usize * 4;
+                    mass.clear();
+                    mass.resize(bytes, 0);
+                    arena.read(
+                        column.ptr + u64::from(first) * u64::from(heads) * 4,
+                        &mut mass,
+                    )?;
+                    layers.push(LayerScores {
+                        layer: export.layer,
+                        rows,
+                        heads,
+                        lse: mass
+                            .chunks_exact(4)
+                            .map(|word| {
+                                f32::from_le_bytes([word[0], word[1], word[2], word[3]])
+                            })
+                            .collect(),
+                    });
+                }
+                scores[index] = layers;
+            }
         }
 
         // ── The epilogue. The readout is back, so the intrinsic has
@@ -1165,7 +1732,39 @@ impl Shell {
         //    exactly the f32 the caller is handed — bit for bit, which is
         //    what makes a parity diff against the host interpreter mean
         //    anything.
+        //    **AND THE DRAFT COLUMN IS BOUND BESIDE IT** (palo C3b). The MTP
+        //    export is a rectangle of its own — `mtp` and `out` are two
+        //    values and the carve is what keeps them two, which is what
+        //    `the_draft_readout_outlives_the_trunk_readout` asserts — so
+        //    `IntrinsicId::MtpLogits` takes that rectangle's base rather than
+        //    an offset into the trunk's, and `mtp_draft_row` is the first row
+        //    of this lane's draft window off the composition's own lane
+        //    table. Bound only when the plan declares the export, which is
+        //    exactly when `ModelProfile::has_mtp_logits` let the program
+        //    declare the intrinsic in the first place; a shell that bound it
+        //    otherwise would hand the guest the trunk's logits under the
+        //    draft's name.
         let vocab = u32::try_from(width).unwrap_or(u32::MAX);
+        let draft = match &exports.mtp {
+            Some(export) => {
+                let column = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, the `{MTP_SEAM}` export, which the carve gave no rectangle",
+                        export.value.0
+                    ),
+                })?;
+                if column.dtype != Dtype::Bf16 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "an `{MTP_SEAM}` export landed as {:?}, which this shell cannot                              point an intrinsic at",
+                            column.dtype
+                        ),
+                    });
+                }
+                Some(column)
+            }
+            None => None,
+        };
         for attached in attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             programs.bind_intrinsic(
                 device,
@@ -1177,6 +1776,18 @@ impl Shell {
                 vocab,
                 last_row[attached.lane as usize],
             )?;
+            if let Some(column) = draft {
+                programs.bind_intrinsic(
+                    device,
+                    attached.instance,
+                    driver::tensor_ir::op::IntrinsicId::MtpLogits,
+                    column.ptr,
+                    INTRINSIC_STORAGE_RAW_BF16,
+                    column.width,
+                    column.width,
+                    first_row[attached.lane as usize],
+                )?;
+            }
             let fired = programs.fire(device, attached.instance)?;
             committed_or(fired, attached, "epilogue")?;
         }

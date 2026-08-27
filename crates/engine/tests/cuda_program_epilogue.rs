@@ -5,9 +5,9 @@
 //! `driver-cuda/tests/program_parity.rs` proves the guest-program plane
 //! computes the right thing: both halves of `driver::program` — the host
 //! interpreter and the CUDA one — run the same golden traces over the same
-//! inputs and must agree byte for byte. What it drives is a [`Plane`] with a
-//! hand-staged f32 buffer standing in for a readout, because at P7 there was
-//! no model fire to take one from.
+//! inputs and must agree byte for byte. What it drives is a
+//! [`driver_cuda::program::Plane`] with a hand-staged f32 buffer standing in
+//! for a readout, because at P7 there was no model fire to take one from.
 //!
 //! This test is that parity **through the serving stack**:
 //!
@@ -64,7 +64,7 @@ use driver::{
     adopt_launch_package_with, concrete_dtype, encode_wire, host_put, host_take,
     make_host_instance, step, wire_cell_bytes,
 };
-use driver_api::model_ir::Plane;
+use driver_api::model_ir::Platform;
 use driver_api::{
     Attachment, BindExtents, Boundary, Budgets, DriverError, FireSubmission, InstanceBinding, Lane,
     Readout,
@@ -415,7 +415,7 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
         max_context: 512,
         slots: 4,
     };
-    let request = engine::driver::load::request(&checkpoint, Plane::Cuda, budgets.clone(), 0)
+    let request = engine::driver::load::request(&checkpoint, Platform::Cuda, budgets.clone(), 0)
         .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(request.plan.name, SKU);
     let loaded = driver.load(request).expect("the checkpoint lands");
@@ -572,6 +572,7 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
                 logits: Some(&readout.values),
                 rows: 1,
                 vocab,
+                mtp_logits: None,
                 mtp_draft_row: None,
             },
         );

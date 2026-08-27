@@ -1,5 +1,5 @@
-//! `Linear`: the gemm anchor, the mlp activations, and the moe router,
-//! bank, and combine arms.
+//! `Linear`: the gemm anchor, the mlp activations, the moe router, bank and
+//! combine arms, and the LoRA correction over a routed adapter bank.
 
 use kernels::{DispatchLinear, KernelError};
 use kernels_cuda::linear;
@@ -206,6 +206,34 @@ impl DispatchLinear for Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
                 &mut self.tensor(*y),
+            ),
+            // ---- the correction class (design §8) ----
+            //
+            // `y` and `y_out` are ONE arena column — the compiler folded the
+            // in-place pair — so the arm resolves `y_out` and writes through
+            // it, which is the same address `y` names. Resolving `y` here
+            // instead would be right today and wrong the first time a pass
+            // stops aliasing; the output seat is the one the walk owns.
+            //
+            // Both banks resolve through `Run::tensor` like any other weight,
+            // because that is exactly what they are: `Def::Weight` rows whose
+            // bytes came from `register_adapter` instead of the checkpoint
+            // (`ParamSource::Registered`), and the runtime index rides in
+            // `routes` inside the op — the MoE precedent, followed.
+            Linear::LoraCorrect {
+                x,
+                bank_a,
+                bank_b,
+                routes,
+                y: _,
+                y_out,
+            } => linear::lora::correct(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*bank_a),
+                self.tensor(*bank_b),
+                self.tensor(*routes),
+                &mut self.tensor(*y_out),
             ),
             Linear::MoeSigmoidGateAdd {
                 routed,

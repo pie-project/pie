@@ -2,14 +2,46 @@
 //! recurrences, MLA, the DSA index, and the pooled plane.
 
 use super::*;
+use crate::forward::Input;
 
-/// Builds the decode plan from kv space `space`'s declared geometry —
-/// once per forward, shared visibly by every layer's `decode` (§6).
-pub fn plan_decode(r: &Recorder, space: u32) -> Value {
-    let kv_indptr = geometry(r, space, GeomKind::Indptr);
-    let kv_indices = geometry(r, space, GeomKind::Indices);
-    let last_page_len = geometry(r, space, GeomKind::LastPageLen);
-    let kv_len = geometry(r, space, GeomKind::KvLen);
+/// Builds the decode plan off `inputs`' geometry and the reading it is carved
+/// for — once per (reading × class) at the top of `forward`, shared visibly by
+/// every layer's `decode` (§6).
+///
+/// **A SCHEDULE IS A CARVING FOR ONE CLASS, AND ITS GUARD IS THE ARM IT WAS
+/// BUILT OFF.** The four geometry vectors come off `inputs`, so they carry
+/// whatever class that arm carries, and `Recorder::push` meets their conds
+/// into the plan node's guard. Build it off `inputs` whole and it is the
+/// whole fire's; build it off `inputs.split(..)`'s decode arm and it is the
+/// decode class's, and a query from another arm that reaches for it is
+/// refused by `push` at the line that mixed them. The old
+/// `(r: &Recorder, space: u32)` shape could not say any of that: every plan
+/// was unguarded, and which class it belonged to had to be inferred backwards
+/// from who read it (`model/tests/no_schedule_straddles_its_readers.rs`).
+/// Now the text says it.
+///
+/// **AND IT IS CARVED FOR ONE READING**, which `q_heads`, `kv_heads`,
+/// `head_dim` and `window` state outright — the shell no longer probes it off
+/// the launches that consume the plan. There is no interning and no dedup:
+/// the text builds one plan per (reading × class) at the top of `forward` and
+/// every layer READS it, and that hoisting IS the statement of reuse — two
+/// layers share a schedule because the text says so, not because a cache
+/// noticed their numbers matched. So the numbers stated here are facts about
+/// the MODEL, held once on `Model` rather than on each layer's attention
+/// struct; a family whose layers read at two readings names those readings and
+/// hoists one plan for each.
+pub fn plan_decode<F>(
+    inputs: &Input<F>,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    window: Option<u32>,
+) -> Value {
+    let kv_indptr = inputs.kv_indptr();
+    let kv_indices = inputs.kv_indices();
+    let last_page_len = inputs.last_page_len();
+    let kv_len = inputs.kv_len();
+    let r = kv_indptr.rec();
     let plan = r.fresh(Ty::Struct(StructKind::AttnDecodePlan));
     r.push(
         Attention::PlanDecode {
@@ -17,6 +49,10 @@ pub fn plan_decode(r: &Recorder, space: u32) -> Value {
             kv_indices: kv_indices.id(),
             last_page_len: last_page_len.id(),
             kv_len: kv_len.id(),
+            q_heads,
+            kv_heads,
+            head_dim,
+            window,
             plan: plan.id(),
         },
         &[&kv_indptr, &kv_indices, &last_page_len, &kv_len],
@@ -24,12 +60,21 @@ pub fn plan_decode(r: &Recorder, space: u32) -> Value {
     plan
 }
 
-/// Builds the prefill plan from kv space `space`'s declared geometry.
-pub fn plan_prefill(r: &Recorder, space: u32) -> Value {
-    let kv_indptr = geometry(r, space, GeomKind::Indptr);
-    let kv_indices = geometry(r, space, GeomKind::Indices);
-    let last_page_len = geometry(r, space, GeomKind::LastPageLen);
-    let kv_len = geometry(r, space, GeomKind::KvLen);
+/// Builds the prefill plan off `inputs`' geometry and its reading. Like
+/// [`plan_decode`], the plan's guard is the arm it was built off, and its
+/// reading is stated here rather than inferred from its readers.
+pub fn plan_prefill<F>(
+    inputs: &Input<F>,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    window: Option<u32>,
+) -> Value {
+    let kv_indptr = inputs.kv_indptr();
+    let kv_indices = inputs.kv_indices();
+    let last_page_len = inputs.last_page_len();
+    let kv_len = inputs.kv_len();
+    let r = kv_indptr.rec();
     let plan = r.fresh(Ty::Struct(StructKind::AttnPrefillPlan));
     r.push(
         Attention::PlanPrefill {
@@ -37,6 +82,10 @@ pub fn plan_prefill(r: &Recorder, space: u32) -> Value {
             kv_indices: kv_indices.id(),
             last_page_len: last_page_len.id(),
             kv_len: kv_len.id(),
+            q_heads,
+            kv_heads,
+            head_dim,
+            window,
             plan: plan.id(),
         },
         &[&kv_indptr, &kv_indices, &last_page_len, &kv_len],
@@ -447,13 +496,22 @@ pub fn ssm_kda_chunked(
     y
 }
 
-/// Builds the one MLA plan — shared by decode and prefill — from kv
-/// space `space`'s declared geometry.
-pub fn mla_plan(r: &Recorder, space: u32) -> Value {
-    let kv_indptr = geometry(r, space, GeomKind::Indptr);
-    let kv_indices = geometry(r, space, GeomKind::Indices);
-    let last_page_len = geometry(r, space, GeomKind::LastPageLen);
-    let kv_len = geometry(r, space, GeomKind::KvLen);
+/// Builds the one MLA plan — one shape serving both decode and prefill — off
+/// `inputs`' geometry and its reading. Like [`plan_decode`], the plan's guard
+/// is the arm it was built off, so an MLA text that wants one per class calls
+/// this once per arm.
+///
+/// `heads` and `kv_lora_rank` are the absorbed reading: the latent launches
+/// size their output at `heads × kv_lora_rank`, and each of them restates that
+/// pair. Same discipline as [`plan_decode`] — no interning, one hoisted plan
+/// per (reading × class) that every layer reads, so the pair is a fact about
+/// the `Model` and lives there once.
+pub fn mla_plan<F>(inputs: &Input<F>, heads: u32, kv_lora_rank: u32) -> Value {
+    let kv_indptr = inputs.kv_indptr();
+    let kv_indices = inputs.kv_indices();
+    let last_page_len = inputs.last_page_len();
+    let kv_len = inputs.kv_len();
+    let r = kv_indptr.rec();
     let plan = r.fresh(Ty::Struct(StructKind::MlaPlan));
     r.push(
         Attention::MlaPlan {
@@ -461,6 +519,8 @@ pub fn mla_plan(r: &Recorder, space: u32) -> Value {
             kv_indices: kv_indices.id(),
             last_page_len: last_page_len.id(),
             kv_len: kv_len.id(),
+            heads,
+            kv_lora_rank,
             plan: plan.id(),
         },
         &[&kv_indptr, &kv_indices, &last_page_len, &kv_len],

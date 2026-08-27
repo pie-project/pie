@@ -27,11 +27,15 @@ impl DispatchAttention for Run<'_> {
                 kv_indices: _,
                 last_page_len: _,
                 kv_len: _,
+                q_heads: _,
+                kv_heads: _,
+                head_dim: _,
+                window: _,
                 plan,
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr);
+                    let seat = self.planning(*kv_indptr, *plan);
                     let max_grid = fa2::decode_max_grid_size(
                         seat.shape.head_dim,
                         seat.shape.num_q_heads,
@@ -47,7 +51,7 @@ impl DispatchAttention for Run<'_> {
                         max_grid,
                         fire.toggles,
                         &fire.device,
-                        seat.decode_grant(),
+                        seat.workspace,
                     )?
                 };
                 built.stage(self.ctx())?;
@@ -71,11 +75,15 @@ impl DispatchAttention for Run<'_> {
                 kv_indices: _,
                 last_page_len: _,
                 kv_len: _,
+                q_heads: _,
+                kv_heads: _,
+                head_dim: _,
+                window: _,
                 plan,
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr);
+                    let seat = self.planning(*kv_indptr, *plan);
                     let spans = self.mask_indptr();
                     match self.declared(*plan) {
                         StructKind::AttnPrefillPlan => {
@@ -90,7 +98,7 @@ impl DispatchAttention for Run<'_> {
                                 fire.capture,
                                 spans,
                                 &fire.device,
-                                seat.prefill_grant(),
+                                seat.workspace,
                             )?;
                             built.stage(self.ctx())?;
                             StructSlot::Prefill(built)
@@ -105,7 +113,7 @@ impl DispatchAttention for Run<'_> {
                                 true,
                                 fire.capture,
                                 &fire.device,
-                                seat.prefill_grant(),
+                                seat.workspace,
                             )?;
                             built.stage(self.ctx())?;
                             StructSlot::PrefillSm90(built)
@@ -310,17 +318,22 @@ impl DispatchAttention for Run<'_> {
             // host copies on the planning twin. The builder's `causal` word
             // is derived from the fire's own boundaries: multi-token lanes
             // attend causally within themselves, single-token (decode)
-            // lanes have nothing to order.
+            // lanes have nothing to order. The op's own `heads` and
+            // `kv_lora_rank` ride in on the seat — `store::kv::probe` seats
+            // them as `num_q_heads` and `head_dim`, and `head_dim` is what
+            // `plan_mla` sizes its partial-output buffer at (`head_dim_o`).
             Attention::MlaPlan {
                 kv_indptr,
                 kv_indices: _,
                 last_page_len: _,
                 kv_len: _,
+                heads: _,
+                kv_lora_rank: _,
                 plan,
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr);
+                    let seat = self.planning(*kv_indptr, *plan);
                     plan::plan_mla(
                         self.qo_indptr_host(),
                         &seat.kv_indptr,
@@ -330,7 +343,7 @@ impl DispatchAttention for Run<'_> {
                         seat.shape.head_dim,
                         self.multi_token(),
                         &fire.device,
-                        seat.mla_grant(),
+                        seat.workspace,
                     )?
                 };
                 built.stage(self.ctx())?;

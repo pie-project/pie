@@ -79,7 +79,7 @@ _cuda = ["dep:cudarc"]
 # the engine traces and hands a `Plan` and a `ModelContract` across (design
 # §7, decision #18), so the shell itself must not know a model family.
 model = { path = "../model" }
-# `Plane`, and the `Facts`/`Request` pair the smoke computes each lane's word
+# `Platform`, and the `Facts`/`Request` pair the smoke computes each lane's word
 # with — `Classify::of`, engine-side in production.
 model-dsl = { path = "../model-dsl" }
 # The prompt in, the continuation out.

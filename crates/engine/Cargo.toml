@@ -210,11 +210,13 @@ _driver-cuda = ["dep:driver-cuda"]
 # constructs one now.
 driver-cuda-12 = ["_driver-cuda", "driver-cuda/cuda-12"]
 driver-cuda-13 = ["_driver-cuda", "driver-cuda/cuda-13"]
-# The Metal shell. APPLE-ONLY at the crate level, so unlike the CUDA features
-# above, the flag alone is not a build that links -- every `#[cfg]` reading it
-# pairs it with `target_vendor = "apple"`. There is no ABI to choose and so no
-# version in the name: Metal 4 is the one the driver's device half is gated on
-# (`driver-metal/metal-4`) and the one it states.
+# The Metal shell. There is no ABI to choose and so no version in the name:
+# `driver-metal` is TARGET-gated rather than feature-gated (Metal is the
+# platform, not a choice a machine makes), so the crate builds and host-tests
+# everywhere and its device half exists on Apple targets only. The flag alone
+# is therefore not a build that links a device, which is why every `#[cfg]`
+# reading it pairs it with `target_vendor = "apple"`, and why the dependency
+# is declared twice below -- once portably, once in the Apple target table.
 driver-metal = ["dep:driver-metal"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different

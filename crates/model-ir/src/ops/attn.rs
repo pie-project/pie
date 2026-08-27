@@ -6,26 +6,38 @@ use crate::value::ValueId;
 /// Ops where tokens interact, or where a sequence cache — kv pages, ssm
 /// recurrent state, the indexer's key cache, the compressor's pooled entries —
 /// is touched. Plans are explicit ops: the `Plan*` variants define `Struct`
-/// values from declared geometry inputs, and every variant that walks a cache
-/// takes the plan it was built from — `cache` is the pool pointer, nothing
+/// values from declared geometry inputs and from the reading they are carved
+/// for, and every variant that walks a cache takes the plan it was built from
+/// — `cache` is the pool pointer, nothing
 /// more. The append ops carry their write addressing
 /// (`write_page`/`write_offset`) the same way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Attention {
     /// Defines `Struct(AttnDecodePlan)`. Host work; runs in the prepare phase.
+    /// A schedule is carved for ONE reading, stated here; every launch that
+    /// reads it restates its share and the shell refuses a disagreement.
     PlanDecode {
         kv_indptr: ValueId,
         kv_indices: ValueId,
         last_page_len: ValueId,
         kv_len: ValueId,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        window: Option<u32>,
         plan: ValueId,
     },
-    /// Defines `Struct(AttnPrefillPlan)`.
+    /// Defines `Struct(AttnPrefillPlan)`. Carries the same reading
+    /// [`Attention::PlanDecode`] does, on the same terms.
     PlanPrefill {
         kv_indptr: ValueId,
         kv_indices: ValueId,
         last_page_len: ValueId,
         kv_len: ValueId,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        window: Option<u32>,
         plan: ValueId,
     },
     Decode {
@@ -122,12 +134,17 @@ pub enum Attention {
     // above: one `MlaPlan` op defines the struct, the four cache-walking
     // variants take it, and `MlaKvAppend` carries its write addressing. The
     // absorb/split variants are pure math and take nothing but tensors.
-    /// Defines `Struct(MlaPlan)`, shared by decode and prefill.
+    /// Defines `Struct(MlaPlan)`, shared by decode and prefill. `heads` and
+    /// `kv_lora_rank` are the absorbed reading: the latent kernels size their
+    /// output at `heads × kv_lora_rank`, which is what `MlaDecode`/`MlaPrefill`
+    /// restate.
     MlaPlan {
         kv_indptr: ValueId,
         kv_indices: ValueId,
         last_page_len: ValueId,
         kv_len: ValueId,
+        heads: u32,
+        kv_lora_rank: u32,
         plan: ValueId,
     },
     /// Splits `kv_a` into the rmsnormed compressed latent and the rope plane.

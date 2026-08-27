@@ -10,6 +10,7 @@
 //!              -> FireTicket                     ← Lane::word is the new field
 //! program.rs   the LaunchPackage lineage, purified
 //! channel.rs   the typed channel declaration
+//! adapter.rs   AdapterRegistration — the correction class's residency verb
 //! transfer.rs  KvHandle / KvLayout / the three movement verbs' arguments
 //! caps.rs      DeviceFacts, Capabilities
 //! ```
@@ -86,6 +87,7 @@
 pub use model_ir;
 pub use tensor_ir;
 
+pub mod adapter;
 pub mod caps;
 pub mod channel;
 pub mod driver;
@@ -95,13 +97,14 @@ pub mod load;
 pub mod program;
 pub mod transfer;
 
+pub use adapter::{AdapterPlane, AdapterRegistration};
 pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
 pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, RegisteredChannel};
 pub use driver::Driver;
 pub use error::{DriverError, Result};
 pub use fire::{
-    Attachment, Boundary, FireId, FireSubmission, FireTicket, KvDelta, Lane, LaneReadout, Mask,
-    MediaEncode, Readout,
+    Attachment, Boundary, FireId, FireSubmission, FireTicket, KvDelta, Lane, LaneReadout,
+    LayerScores, Mask, MediaEncode, Readout,
 };
 pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 pub use program::{

@@ -168,14 +168,23 @@ pub mod open {
         }
     }
 
-    /// Open the default Metal 4 device.
+    /// Open the system's default Metal device.
+    ///
+    /// **THERE IS NO DEVICE KEY TO READ**, where the CUDA door reads
+    /// `[model] device`: Metal selects with `MTLCreateSystemDefaultDevice`
+    /// and a Mac has one GPU. The boot document is still handed over,
+    /// because the seam reads what it is about and a document that says
+    /// nothing about this driver is the ordinary case rather than an error.
     ///
     /// # Errors
     ///
-    /// No Metal 4 device, or a device whose queue could not be created.
+    /// A boot document that is not TOML. Binding the device happens at
+    /// [`Driver::load`](driver_api::Driver::load), not here — `Shell::load`
+    /// is one call that binds, bakes and lands, and there is nothing to bind
+    /// before a plan says what to bake.
     #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
     pub fn metal(config_bytes: &[u8]) -> Result<DriverBackend> {
-        Ok(Box::new(super::metal::MetalDriver::create(config_bytes)?))
+        Ok(Box::new(super::metal::open(config_bytes)?))
     }
 }
 
@@ -190,16 +199,13 @@ pub mod open {
 
 #[cfg(feature = "_driver-cuda")]
 mod cuda;
-// TARGET-GATED as well as feature-gated, and the reason has moved. It used to
-// be that `driver-metal` was Apple-only at the crate level, so the feature
-// alone was not a build that links. That crate names no Metal API any more —
-// it is the dispatch layer, and it builds and tests on any OS — and the seam
-// behind this gate has no shell to be Apple about either, so the module
-// itself is portable and the test beside it passes on Linux with the target
-// clause lifted. The gate stays because `worker`'s `DriverOptions::Metal`
-// arm and its whole option struct are Apple-gated: ungating the door alone
-// would open one nothing on this platform can reach. It comes off with the
-// shell (`palo B-metal`), when there is something on the other side.
+// TARGET-GATED as well as feature-gated, and now for the plainest reason
+// there is: there is a shell behind this door and it binds an `MTLDevice`.
+// `driver-metal` itself still builds and host-tests on any OS — its device
+// half is `cfg(target_vendor = "apple")` and its refusing twin answers
+// `Fault::Deviceless` elsewhere — but a `Driver` impl that cannot bind
+// anything is not one this registry should hand a scheduler, and `worker`'s
+// `DriverOptions::Metal` arm is Apple-gated on the same reading.
 #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 mod metal;
 mod remote;
@@ -209,8 +215,12 @@ mod remote;
 // module's CUDA arm is a boot-config reader that answers one
 // (`backend::cuda::open`). Re-exporting the shell's own type through here
 // would be this crate claiming a driver it does not implement.
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-pub use metal::MetalDriver;
+// `pub use metal::MetalDriver` STOOD HERE, and it is gone for the reason the
+// CUDA line above it never existed: the `Driver` impl is `driver_metal::Metal`,
+// in the crate that owns the device, and this module's metal arm is a
+// boot-config reader that answers one (`backend::metal::open`). What stood
+// here was a REFUSING driver this crate defined itself, back when there was
+// no shell to open — every verb `DriverError::Unsupported`. There is a shell.
 pub use remote::{RemoteDisconnectHandle, RemoteDriver};
 
 // One function DOES come through, and it is not a driver: `palo B3`'s

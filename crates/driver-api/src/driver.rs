@@ -34,6 +34,7 @@
 //! thing for a driver to do, and it is cheaper to write it once here than in
 //! every shell that does not serve it.
 
+use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use crate::error::{DriverError, Result};
@@ -228,6 +229,35 @@ pub trait Driver: Send + Sync {
     fn take_channel(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>> {
         let _ = (instance, channel);
         Err(self.unsupported("take_channel"))
+    }
+
+    // ── adapter banks ───────────────────────────────────────────────────
+
+    /// Write one adapter's planes into this load's device banks (design §8).
+    ///
+    /// **ADDITIVE, DEFAULTED, AND A RESIDENCY VERB** — the same shape
+    /// [`Driver::publish_channel`] and [`Driver::bind_thread`] joined by. It
+    /// is not one of `copy_kv`'s kin: those move state the driver already
+    /// holds between places it already owns, and this lands host bytes into
+    /// device residency under a name the plan declared, which is what
+    /// [`Driver::load`] does. [`crate::adapter`] argues both halves.
+    ///
+    /// **NO RECAPTURE, AND THAT IS THE WHOLE OF DECISION 17.** A driver's
+    /// graph key is a fire's composition; a bank's CONTENTS are not in it, and
+    /// its addresses were reserved at load from a capacity the model text
+    /// declared. So a deployment adds its two-hundredth adapter without
+    /// re-recording anything, and a lane selects one with an integer in a
+    /// submission ([`Lane::adapter`](crate::fire::Lane::adapter)).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Load`] for a bank this plan does not declare, an id past
+    /// the declared capacity, or a plane that is not one slot's bytes;
+    /// [`DriverError::Device`] for the residency;
+    /// [`DriverError::Unsupported`] from a shell whose loads seat no bank.
+    fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {
+        let _ = registration;
+        Err(self.unsupported("register_adapter"))
     }
 
     // ── the fire path ───────────────────────────────────────────────────

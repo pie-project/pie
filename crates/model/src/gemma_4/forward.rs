@@ -1,9 +1,9 @@
 use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ValueId,
+    Classify, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Request, Value, ValueId,
     Weight, ops, seam,
 };
 
-use super::model::{Attn, AttnBanks, AttnKind, Model};
+use super::model::{Attn, AttnBanks, Model, Reading};
 
 pub struct Facts {
     pub qo_one: bool,
@@ -42,12 +42,12 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             if let AttnBanks::Owned { .. } = &w.attn.banks {
-                let ki = &w.attn.kind;
-                c.kv(
-                    kv,
-                    w.attn.kv.clone(),
-                    [2, ki.kv_heads() as u64 * ki.head_dim() as u64],
-                );
+                let (head_dim, kv_heads) = match w.attn.reading {
+                    Reading::Sliding => (self.sliding.head_dim, self.sliding.kv_heads),
+                    Reading::Global => (self.global.head_dim, self.global.kv_heads),
+                };
+                let plane = kv_heads as u64 * head_dim as u64;
+                c.kv(kv, w.attn.kv.clone(), [plane, plane]);
             }
         }
         c
@@ -57,14 +57,82 @@ impl ForwardHybrid for Model {
         let m = self;
 
         let positions = inputs.positions();
-        let plan_d = inputs.plan_decode();
-        let plan_p = inputs.plan_prefill();
+        let qo_one = Facts::qo_one();
+        let fused = qo_one.clone() & !Facts::masked();
+
+        // SIX SCHEDULES, AND EVERY ONE OF THEM IS A DIFFERENT CARVING.
+        //
+        // A gemma layer is one of two READINGS of the one sequence — sliding
+        // layers are 2 kv heads of 256 under a 512-wide window, global layers
+        // 2 heads of 512 with none — and an attention schedule is carved for
+        // exactly one of those: the head width picks the CTA tile, the window
+        // sizes the kv chunking, and the kernel recomputes both from the same
+        // numbers when it merges the partials. So the reading axis is the
+        // literal pair below, whose two lines differ by the reading's numbers
+        // — the ones each plan op now states — and the layer indexes it.
+        //
+        // The class axis is the split. One `plan_prefill` read by both the
+        // prefill arm (the rest class) and the masked arm (its own) would be
+        // carved over both windows, and each arm would then hand it its own
+        // rebased boundaries, which end before the schedule's work items do —
+        // the shell refuses that by name at load (`Fault::Straddled`). So each
+        // plan is built off ONE class's arm of `inputs` and carries that class
+        // as its guard. The layer loop cuts `q` with the SAME `classes` array,
+        // so the arms carry structurally equal conds and the recorder refuses
+        // a reader from another arm at the line that mixes them.
+        let classes = [Facts::masked(), qo_one.clone(), Predicate::rest()];
+        let [input_m, input_d, input_p] = inputs.split(classes.clone());
+        let plan_m = [
+            ops::attn::plan_prefill(
+                &input_m,
+                m.q_heads,
+                m.sliding.kv_heads,
+                m.sliding.head_dim,
+                Some(m.sliding.window),
+            ),
+            ops::attn::plan_prefill(
+                &input_m,
+                m.q_heads,
+                m.global.kv_heads,
+                m.global.head_dim,
+                None,
+            ),
+        ];
+        let plan_d = [
+            ops::attn::plan_decode(
+                &input_d,
+                m.q_heads,
+                m.sliding.kv_heads,
+                m.sliding.head_dim,
+                Some(m.sliding.window),
+            ),
+            ops::attn::plan_decode(
+                &input_d,
+                m.q_heads,
+                m.global.kv_heads,
+                m.global.head_dim,
+                None,
+            ),
+        ];
+        let plan_p = [
+            ops::attn::plan_prefill(
+                &input_p,
+                m.q_heads,
+                m.sliding.kv_heads,
+                m.sliding.head_dim,
+                Some(m.sliding.window),
+            ),
+            ops::attn::plan_prefill(
+                &input_p,
+                m.q_heads,
+                m.global.kv_heads,
+                m.global.head_dim,
+                None,
+            ),
+        ];
         let mask = inputs.mask();
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
-
-        let qo_one = Facts::qo_one();
-        let fused = qo_one.clone() & !Facts::masked();
 
         let relay = m.ple.as_ref().map(|ple| {
             let proj = ops::linear::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
@@ -82,17 +150,26 @@ impl ForwardHybrid for Model {
         for (l, w) in inputs.walk_layers(&m.layers) {
             let normed = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let at = &w.attn;
-            let d = at.kind.head_dim();
+            // Every number this layer's attention is carved for comes off its
+            // reading, once: the head width, the kv heads, and the window.
+            let (d, kv_heads, win) = match at.reading {
+                Reading::Sliding => (
+                    m.sliding.head_dim,
+                    m.sliding.kv_heads,
+                    Some(m.sliding.window),
+                ),
+                Reading::Global => (m.global.head_dim, m.global.kv_heads, None),
+            };
             let pages = inputs.kv(&at.kv);
 
             let q = match &at.banks {
-                AttnBanks::Shared { q_proj } => q_only(&normed, &positions, at, q_proj),
+                AttnBanks::Shared { q_proj } => q_only(&normed, &positions, m, at, d, q_proj),
                 AttnBanks::Owned {
                     qkv,
                     k_norm,
                     k_norm_eps,
                 } => {
-                    if inputs.cuda() && at.kind.sliding() {
+                    if model_dsl::platform() == Platform::Cuda && at.reading == Reading::Sliding {
                         let (fast_x, rest_x) = normed.split(&fused);
                         let (fast_pos, rest_pos) = positions.split(&fused);
                         let qf = ops::custom::qkv_fused_qknorm_rope_vnorm_write(
@@ -101,19 +178,22 @@ impl ForwardHybrid for Model {
                             at.q_norm_eps,
                             k_norm,
                             *k_norm_eps,
-                            at.kind.kv_heads(),
+                            kv_heads,
                             d,
                             pages,
-                            &inputs.geometry(inputs.kv_space(), GeomKind::WritePage),
-                            &inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset),
-                            at.kind.theta(),
+                            &inputs.write_page(&at.kv),
+                            &inputs.write_offset(&at.kv),
+                            m.sliding.theta,
                             &fast_pos,
                         );
                         let qr = qkv_unfused(
                             &rest_x,
                             &rest_pos,
                             &inputs,
+                            m,
                             at,
+                            d,
+                            kv_heads,
                             qkv,
                             k_norm,
                             *k_norm_eps,
@@ -125,7 +205,10 @@ impl ForwardHybrid for Model {
                             &normed,
                             &positions,
                             &inputs,
+                            m,
                             at,
+                            d,
+                            kv_heads,
                             qkv,
                             k_norm,
                             *k_norm_eps,
@@ -137,12 +220,34 @@ impl ForwardHybrid for Model {
 
             seam::at(seam::ATTN_Q, &[&q]);
 
-            let win = at.kind.window();
-            let [mq, dq, p] = q.split([Facts::masked(), qo_one.clone(), Predicate::rest()]);
+            let [mq, dq, p] = q.split(classes.clone());
             let a = Value::merge(vec![
-                ops::attn::masked(&mq, &plan_p, &mask, pages, win, d, at.sm_scale),
-                ops::attn::decode(&dq, &plan_d, pages, win, d, at.sm_scale),
-                ops::attn::prefill(&p, &plan_p, pages, win, d, at.kind.kv_heads(), at.sm_scale),
+                ops::attn::masked(
+                    &mq,
+                    &plan_m[at.reading as usize],
+                    &mask,
+                    pages,
+                    win,
+                    d,
+                    at.sm_scale,
+                ),
+                ops::attn::decode(
+                    &dq,
+                    &plan_d[at.reading as usize],
+                    pages,
+                    win,
+                    d,
+                    at.sm_scale,
+                ),
+                ops::attn::prefill(
+                    &p,
+                    &plan_p[at.reading as usize],
+                    pages,
+                    win,
+                    d,
+                    kv_heads,
+                    at.sm_scale,
+                ),
             ]);
             seam::at(seam::ATTN_OUT, &[&a]);
             let o = ops::linear::matmul(&a, &w.o_proj);
@@ -201,46 +306,44 @@ fn qkv_unfused(
     x: &Value,
     pos: &Value,
     inputs: &Input<Facts>,
+    m: &Model,
     at: &Attn,
+    d: u32,
+    kv_heads: u32,
     qkv: &Weight,
     k_norm: &Weight,
     k_norm_eps: f32,
     pages: ValueId,
 ) -> Value {
-    let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
-    let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
-    let d = at.kind.head_dim();
-    let (q, k, v) = ops::layout::split_qkv(
-        &ops::linear::matmul(x, qkv),
-        at.q_heads * d,
-        at.kind.kv_heads() * d,
-    );
+    let write_page = inputs.write_page(&at.kv);
+    let write_offset = inputs.write_offset(&at.kv);
+    let (q, k, v) =
+        ops::layout::split_qkv(&ops::linear::matmul(x, qkv), m.q_heads * d, kv_heads * d);
     let v = ops::elemwise::rmsnorm_no_scale(&v, d, at.q_norm_eps);
     let q = ops::elemwise::rmsnorm_per_head(&q, &at.q_norm, d, at.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head(&k, k_norm, d, k_norm_eps);
-    let (q, k) = match &at.kind {
-        AttnKind::Full {
-            rotary_dim, theta, ..
-        } => ops::elemwise::rope_partial(&q, &k, pos, *rotary_dim, d, *theta),
+    let (q, k) = match at.reading {
+        Reading::Global => {
+            ops::elemwise::rope_partial(&q, &k, pos, m.global.rotary_dim, d, m.global.theta)
+        }
 
-        AttnKind::Sliding { theta, .. } => ops::elemwise::rope_full(&q, &k, pos, d, *theta, false),
+        Reading::Sliding => ops::elemwise::rope_full(&q, &k, pos, d, m.sliding.theta, false),
     };
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     q
 }
 
-fn q_only(x: &Value, pos: &Value, at: &Attn, q_proj: &Weight) -> Value {
-    let d = at.kind.head_dim();
+fn q_only(x: &Value, pos: &Value, m: &Model, at: &Attn, d: u32, q_proj: &Weight) -> Value {
     let q = ops::elemwise::rmsnorm_per_head(
         &ops::linear::matmul(x, q_proj),
         &at.q_norm,
         d,
         at.q_norm_eps,
     );
-    match &at.kind {
-        AttnKind::Full {
-            rotary_dim, theta, ..
-        } => ops::elemwise::rope_partial_q(&q, pos, *rotary_dim, d, *theta),
-        AttnKind::Sliding { theta, .. } => ops::elemwise::rope_partial_q(&q, pos, d, d, *theta),
+    match at.reading {
+        Reading::Global => {
+            ops::elemwise::rope_partial_q(&q, pos, m.global.rotary_dim, d, m.global.theta)
+        }
+        Reading::Sliding => ops::elemwise::rope_partial_q(&q, pos, d, d, m.sliding.theta),
     }
 }

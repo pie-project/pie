@@ -95,7 +95,7 @@ kernels = { path = "../kernels" }
 # THE REAL CATALOG, for the same reason `model-compiler` takes it: every unit
 # test in `src/fire/` builds its plan by hand, which checks this crate against
 # this crate's own idea of what a fire looks like. The catalog adds the one
-# thing a fixture cannot -- six model texts somebody else wrote, four planes,
+# thing a fixture cannot -- six model texts somebody else wrote, four platforms,
 # sixty layers of nested split and merge -- and `tests/every_sku_walks_its_
 # classes.rs` walks all of them with a mock `Dispatch` and no GPU in the room.
 #

@@ -1,6 +1,4 @@
-use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
 
 use super::model::{Attn, Indexer, Mlp, Model};
 
@@ -39,13 +37,9 @@ impl ForwardHybrid for Model {
             c.kv(
                 kv,
                 a.kv.clone(),
-                [1, (a.kv_lora_rank + a.qk_rope_head_dim) as u64],
+                [self.kv_lora_rank as u64, a.qk_rope_head_dim as u64],
             );
-            c.kv(
-                index,
-                a.indexer.keys.clone(),
-                [1, a.indexer.head_dim as u64],
-            );
+            c.kv(index, a.indexer.keys.clone(), [a.indexer.head_dim as u64]);
         }
         c
     }
@@ -53,13 +47,33 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        let plan = inputs.mla_plan();
+        // ONE SCHEDULE PER READER. A plan struct is a CARVING — request count,
+        // rebased query boundaries, work-item split — and it carves for ONE
+        // class. Which class is no longer left to be inferred: each plan is
+        // built off that class's own arm of the inputs, so it carries the arm's
+        // cond as its guard, and a reader in the other arm is refused by the
+        // recorder at the line that mixed them. Hence two schedules over the
+        // same shape, [decode, prefill]. `latent_attention` cuts its q with the
+        // same `Facts::qo_one()`, so its arms' conds are exactly the ones these
+        // two plans were built under, and each reader finds its own.
+        //
+        // A carving is also carved for ONE READING, and each line states it:
+        // `m.heads` queries against the `m.kv_lora_rank`-wide absorbed plane,
+        // which is exactly what every layer's `mla_decode_selected` and
+        // `mla_prefill_selected` restate. The two lines are otherwise the same
+        // numbers — the only thing that differs is the ARM they are built off,
+        // and that is the truth: one reading, two classes.
+        let (input_d, input_p) = inputs.split(&Facts::qo_one());
+        let plan = [
+            ops::attn::mla_plan(&input_d, m.heads, m.kv_lora_rank),
+            ops::attn::mla_plan(&input_p, m.heads, m.kv_lora_rank),
+        ];
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
 
         for (_, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
-            let o = latent_attention(&x, &inputs, &plan, &w.attn);
+            let o = latent_attention(&x, &inputs, &plan, m, &w.attn);
             let o = if m.tp > 1 {
                 ops::collective::all_reduce(&o)
             } else {
@@ -125,11 +139,21 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn latent_attention(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Attn) -> Value {
+/// The MLA reading — `m.heads` and `m.kv_lora_rank` — is the trunk's, stated
+/// on the schedule these two arms read; the layer's `a` carries only what
+/// varies below the reading (the head widths it splits and absorbs at, its
+/// rope theta, its scale, its weights, its spaces).
+fn latent_attention(
+    x: &Value,
+    inputs: &Input<Facts>,
+    plan: &[Value; 2],
+    m: &Model,
+    a: &Attn,
+) -> Value {
     let pages = inputs.kv(&a.kv);
     let positions = inputs.positions();
-    let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
-    let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
+    let write_page = inputs.write_page(&a.kv);
+    let write_offset = inputs.write_offset(&a.kv);
 
     let q_a = ops::linear::matmul(x, &a.q_a_proj);
     let q_a = ops::elemwise::rmsnorm(&q_a, &a.q_a_norm, a.q_a_norm_eps);
@@ -144,14 +168,14 @@ fn latent_attention(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Attn) ->
         &positions,
         &a.kv_a_norm,
         a.kv_a_norm_eps,
-        a.kv_lora_rank,
+        m.kv_lora_rank,
         a.qk_rope_head_dim,
         a.theta,
     );
     ops::attn::mla_kv_append(&kv_c, &k_pe, pages, &write_page, &write_offset);
 
     let (q_nope, q_pe) =
-        ops::attn::mla_split_q_b(&q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
+        ops::attn::mla_split_q_b(&q_b, m.heads, a.qk_nope_head_dim, a.qk_rope_head_dim);
     let q_pe = ops::elemwise::rope_partial_q(
         &q_pe,
         &positions,
@@ -163,8 +187,8 @@ fn latent_attention(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Attn) ->
     let q = ops::attn::mla_absorb_q(
         &q_nope,
         &a.kv_b_proj,
-        a.heads,
-        a.kv_lora_rank,
+        m.heads,
+        m.kv_lora_rank,
         a.qk_nope_head_dim,
         a.v_head_dim,
     );
@@ -177,22 +201,22 @@ fn latent_attention(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Attn) ->
     let scored = Value::merge(vec![
         ops::attn::mla_decode_selected(
             &dq,
-            plan,
+            &plan[0],
             &dpe,
             &d_sel,
             pages,
-            a.heads,
-            a.kv_lora_rank,
+            m.heads,
+            m.kv_lora_rank,
             a.sm_scale,
         ),
         ops::attn::mla_prefill_selected(
             &pq,
-            plan,
+            &plan[1],
             &ppe,
             &p_sel,
             pages,
-            a.heads,
-            a.kv_lora_rank,
+            m.heads,
+            m.kv_lora_rank,
             a.sm_scale,
         ),
     ]);
@@ -200,8 +224,8 @@ fn latent_attention(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Attn) ->
     let v = ops::attn::mla_absorb_out(
         &scored,
         &a.kv_b_proj,
-        a.heads,
-        a.kv_lora_rank,
+        m.heads,
+        m.kv_lora_rank,
         a.qk_nope_head_dim,
         a.v_head_dim,
     );
@@ -212,9 +236,8 @@ fn latent_attention(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Attn) ->
 fn index_select(x: &Value, q_a: &Value, inputs: &Input<Facts>, ix: &Indexer) -> Value {
     let keys = inputs.kv(&ix.keys);
     let positions = inputs.positions();
-    let index_space = inputs.space_of(&ix.keys);
-    let write_page = inputs.geometry(index_space, GeomKind::WritePage);
-    let write_offset = inputs.geometry(index_space, GeomKind::WriteOffset);
+    let write_page = inputs.write_page(&ix.keys);
+    let write_offset = inputs.write_offset(&ix.keys);
     let k = ops::attn::index_layernorm_rope(
         &ops::linear::matmul(x, &ix.k_proj),
         &positions,

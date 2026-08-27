@@ -1,4 +1,4 @@
-//! The catalog, fired. Six model texts, four planes, every lane mix that the
+//! The catalog, fired. Six model texts, four platforms, every lane mix that the
 //! design's vocabulary can name — walked with a backend that runs nothing and
 //! remembers everything.
 //!
@@ -38,16 +38,21 @@ use kernels::{
     DispatchLinear,
 };
 use model_compiler::{Budgets, DeviceProfile, Lowering, Region, compile};
-use model_dsl::Plane;
+use model_dsl::Platform;
 use model_ir::{
     Attention, Classes, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
     Plan,
 };
 
-/// Every plane a plan can be traced at. A model text may emit a different op
-/// per plane, so the split-and-merge structure is not the same graph on each,
-/// and one plane passing says nothing about the others.
-const PLANES: [Plane; 4] = [Plane::Cuda, Plane::Metal, Plane::Wgpu, Plane::Vulkan];
+/// Every platform a plan can be traced at. A model text may emit a different op
+/// per platform, so the split-and-merge structure is not the same graph on each,
+/// and one platform passing says nothing about the others.
+const PLATFORMS: [Platform; 4] = [
+    Platform::Cuda,
+    Platform::Metal,
+    Platform::Wgpu,
+    Platform::Vulkan,
+];
 
 /// A deployment's ceilings: 256 concurrent requests, 8192 token rows, the
 /// bucket lattice a decode-heavy serve rounds up to.
@@ -272,8 +277,8 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue; // `model-compiler`'s own catalog test is what says so.
             };
@@ -282,7 +287,7 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 let fire = match compose(&baked, &budgets(), &lanes) {
                     Ok(fire) => fire,
                     Err(refusal) => {
-                        wrong.push(format!("`{sku}` as {plane:?} [{name}]: {refusal}"));
+                        wrong.push(format!("`{sku}` as {platform:?} [{name}]: {refusal}"));
                         continue;
                     }
                 };
@@ -293,14 +298,14 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 if let Err(refusal) =
                     walk(&plan, &baked, &descriptor, &mut dispatch, &mut EagerSink)
                 {
-                    wrong.push(format!("`{sku}` as {plane:?} [{name}]: {refusal}"));
+                    wrong.push(format!("`{sku}` as {platform:?} [{name}]: {refusal}"));
                     continue;
                 }
 
                 let ran = dispatch.nodes();
                 if !ran.windows(2).all(|pair| pair[0] < pair[1]) {
                     wrong.push(format!(
-                        "`{sku}` as {plane:?} [{name}]: the nodes did not run once each in \
+                        "`{sku}` as {platform:?} [{name}]: the nodes did not run once each in \
                          program order",
                     ));
                 }
@@ -328,7 +333,7 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                     let missing: Vec<u32> = demanded.difference(&ran).copied().take(8).collect();
                     let extra: Vec<u32> = ran.difference(&demanded).copied().take(8).collect();
                     wrong.push(format!(
-                        "`{sku}` as {plane:?} [{name}]: {} nodes ran, {} were demanded — \
+                        "`{sku}` as {platform:?} [{name}]: {} nodes ran, {} were demanded — \
                          missing {missing:?}, extra {extra:?}",
                         ran.len(),
                         demanded.len(),
@@ -358,7 +363,7 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 let unadmitted: Vec<u32> = ran.difference(&live).copied().take(8).collect();
                 if !unadmitted.is_empty() {
                     wrong.push(format!(
-                        "`{sku}` as {plane:?} [{name}]: nodes {unadmitted:?} ran in a fire \
+                        "`{sku}` as {platform:?} [{name}]: nodes {unadmitted:?} ran in a fire \
                          whose classes do not admit them",
                     ));
                 }
@@ -374,8 +379,8 @@ fn every_sku_shows_the_sink_its_whole_template_every_fire() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue;
             };
@@ -397,7 +402,7 @@ fn every_sku_shows_the_sink_its_whole_template_every_fire() {
                 // graph serve all of them.
                 if structure.regions != template {
                     wrong.push(format!(
-                        "`{sku}` as {plane:?} [{name}]: the sink saw {} regions of {}",
+                        "`{sku}` as {platform:?} [{name}]: the sink saw {} regions of {}",
                         structure.regions.len(),
                         template.len(),
                     ));
@@ -405,7 +410,7 @@ fn every_sku_shows_the_sink_its_whole_template_every_fire() {
                 // v1: every region always-launch, one stream.
                 if structure.conds != 0 || structure.events != 0 {
                     wrong.push(format!(
-                        "`{sku}` as {plane:?} [{name}]: {} conditional and {} stream events \
+                        "`{sku}` as {platform:?} [{name}]: {} conditional and {} stream events \
                          from an artifact that lowers everything always-launch",
                         structure.conds, structure.events,
                     ));
@@ -426,7 +431,7 @@ fn a_composition_is_the_only_thing_that_changes_between_fires() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Plane::Cuda);
+        let plan = trace(Platform::Cuda);
         let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
             continue;
         };

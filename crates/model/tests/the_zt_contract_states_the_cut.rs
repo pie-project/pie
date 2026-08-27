@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use model::contract::ModelError;
-use model_dsl::{Dtype, Param, Plane, Shard};
+use model_dsl::{Dtype, Param, ParamSource, Platform, Shard};
 use model_loader::contract::{Expr, ModelContract, TensorContract, Visibility};
 
 const GROUP: u64 = 32;
@@ -66,6 +66,14 @@ fn skus() -> Vec<Sku> {
         }),
         sku("kimik3-bf16-mxfp4-kv-bf16-tp2", |src| {
             model::kimi_k3::model::Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, 2).load(src)
+        }),
+        // The C3 row: the one SKU of this catalog whose checkpoint publishes
+        // a draft head, so the one whose bijection covers `mtp.*`. Fifteen
+        // stored tensors land as fifteen declared planes and the count is a
+        // coincidence of two opposite regroupings — `mtp.fc` is one bank cut
+        // into two, and `gate_proj`/`up_proj` are two fused into one.
+        sku("qwen36-27b-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
         sku("qwen35-a3b-bf16-kv-bf16", |src| {
             model::qwen_3::model::Model::a3b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
@@ -197,7 +205,7 @@ fn state_every_sku() -> Vec<Stated> {
             .iter()
             .find(|(name, ..)| *name == sku.name)
             .unwrap_or_else(|| panic!("`{}` names no catalog row", sku.name));
-        let plan = trace(Plane::Cuda);
+        let plan = trace(Platform::Cuda);
         let path = dir.join(format!("{}.zt", sku.name));
         write_checkpoint(&path, &plan.params);
 
@@ -271,7 +279,18 @@ fn one_entry_per_plan_param_under_the_plans_own_names() {
 
     for one in stated() {
         let supply = published(&one.contract);
-        let demand: BTreeSet<&str> = one.params.iter().map(|p| p.name.as_str()).collect();
+        // **A REGISTERED PLANE IS NOT THE CHECKPOINT'S** (palo design §8). An
+        // adapter bank is a `Param` because it is a `Def::Weight` the shell
+        // reserves and the routed op indexes, and it is `ParamSource::
+        // Registered` because its bytes arrive through `register_adapter`
+        // instead of out of a `.zt`. Demanding it here would be demanding that
+        // a pretrained checkpoint ship somebody's LoRA.
+        let demand: BTreeSet<&str> = one
+            .params
+            .iter()
+            .filter(|p| p.source == ParamSource::Checkpoint)
+            .map(|p| p.name.as_str())
+            .collect();
         let named: BTreeSet<&str> = supply.keys().copied().collect();
         for name in demand.symmetric_difference(&named) {
             faults.push(format!(
@@ -458,7 +477,7 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
             .iter()
             .find(|(name, ..)| *name == sku.name)
             .unwrap_or_else(|| panic!("`{}` names no catalog row", sku.name));
-        let plan = trace(Plane::Cuda);
+        let plan = trace(Platform::Cuda);
         let path = dir.join(format!("{}-unquantized.zt", sku.name));
         write_unquantized_checkpoint(&path, &plan.params);
 

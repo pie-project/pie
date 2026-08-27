@@ -8,6 +8,7 @@ pub mod elemwise;
 pub mod encode;
 pub mod layout;
 pub mod linear;
+pub mod sources;
 pub mod tensor;
 
 pub use attn::{DecodePlan, PrefillPlan};
@@ -16,4 +17,5 @@ pub use encode::{
     head_group,
 };
 pub use kernels::KernelError;
+pub use sources::{SOURCES, resolve, source};
 pub use tensor::{KvPool, RaggedTensor, RecurrentPool, Tensor};

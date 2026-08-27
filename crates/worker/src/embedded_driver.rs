@@ -474,8 +474,16 @@ fn cuda_budgets(opts: &CudaNativeDriverOptions) -> driver_api::Budgets {
         // v1 pads nothing: a fire's shape IS its graph key (`driver-cuda`'s
         // `record.rs` argues the mechanism, and what padding would take).
         buckets: Vec::new(),
-        // palo B-adapters: design §8's banks are a budget, and no shell
-        // reserves one yet.
+        // **THE BUDGET IS AN INTENT, AND NO WORKER OPTION NAMES ONE** (palo
+        // C2). Capacity is a SHAPE the model text declares — every bank a
+        // plan carries is reserved at load whatever this number is, and
+        // `Driver::register_adapter` is checked against that shape — so what
+        // `max_adapters` states is how many the DEPLOYMENT intends to
+        // register, and `model_compiler::compile` refuses a load whose intent
+        // is bigger than what the text seats. Zero is the honest answer for a
+        // boot config with no knob for it: this worker registers none. The
+        // knob, and the request-side id that would make it worth having,
+        // arrive with the client-facing half.
         max_adapters: 0,
         page_size,
         max_context,
@@ -496,7 +504,7 @@ fn land(
     backend: &mut ::engine::driver::DriverBackend,
     snapshot_dir: &Path,
     budgets: driver_api::Budgets,
-    plane: driver_api::model_ir::Plane,
+    platform: driver_api::model_ir::Platform,
     component: crate::executor::ModelComponent,
 ) -> Result<driver_api::Loaded> {
     if component != crate::executor::ModelComponent::Full {
@@ -509,7 +517,7 @@ fn land(
             "this build loads only the full model; {component:?} needs a traced              plan the catalog does not ship"
         ));
     }
-    let request = ::engine::driver::load::request(snapshot_dir, plane, budgets, -1)?;
+    let request = ::engine::driver::load::request(snapshot_dir, platform, budgets, -1)?;
     backend.load(request).map_err(anyhow::Error::from)
 }
 
@@ -824,7 +832,7 @@ pub(crate) fn create_driver_backend_group(
         &mut backend,
         snapshot_dir,
         cuda_budgets(opts),
-        driver_api::model_ir::Plane::Cuda,
+        driver_api::model_ir::Platform::Cuda,
         component,
     )?;
     Ok(crate::translate::GroupDriver {
@@ -861,10 +869,10 @@ pub(crate) fn create_driver_backend(
     // work from. That build reaches no device, which is the truth since the
     // interpreter backend was deleted: there is no ungated flavor left to
     // fall back to.
-    let (mut backend, budgets, plane): (
+    let (mut backend, budgets, platform): (
         ::engine::driver::DriverBackend,
         driver_api::Budgets,
-        driver_api::model_ir::Plane,
+        driver_api::model_ir::Platform,
     ) = match options {
             #[cfg(not(any(
                 feature = "_driver-cuda",
@@ -905,7 +913,7 @@ pub(crate) fn create_driver_backend(
                 (
                     backend,
                     cuda_budgets(opts),
-                    driver_api::model_ir::Plane::Cuda,
+                    driver_api::model_ir::Platform::Cuda,
                 )
             }
             // METAL, BACK AT P5, AND IT HANDS OVER THE DOCUMENT — the same
@@ -944,7 +952,7 @@ pub(crate) fn create_driver_backend(
                             .unwrap_or_else(|| driver_api::Budgets::default().max_context),
                         slots: opts.total_pages.max(1),
                     },
-                    driver_api::model_ir::Plane::Metal,
+                    driver_api::model_ir::Platform::Metal,
                 )
             }
         };
@@ -958,7 +966,7 @@ pub(crate) fn create_driver_backend(
             reason = "`DriverOptions` has no variants in this build"
         )
     )]
-    let loaded = land(&mut backend, snapshot_dir, budgets, plane, component)?;
+    let loaded = land(&mut backend, snapshot_dir, budgets, platform, component)?;
 
     Ok(crate::translate::GroupDriver {
         caps: loaded.caps,

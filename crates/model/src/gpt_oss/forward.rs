@@ -1,8 +1,6 @@
-use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
 
-use super::model::Model;
+use super::model::{Model, Reading};
 
 pub struct Facts {
     pub qo_one: bool,
@@ -32,9 +30,9 @@ impl ForwardHybrid for Model {
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
+        let plane = self.kv_heads as u64 * self.head_dim as u64;
         for w in &self.layers {
-            let a = &w.attn;
-            c.kv(kv, a.kv.clone(), [2, a.kv_heads as u64 * a.head_dim as u64]);
+            c.kv(kv, w.attn.kv.clone(), [plane, plane]);
         }
         c
     }
@@ -43,17 +41,38 @@ impl ForwardHybrid for Model {
         let m = self;
 
         let positions = inputs.positions();
-        let plan_d = inputs.plan_decode();
-        let plan_p = inputs.plan_prefill();
-        let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
-        let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
+        // ONE SCHEDULE PER READING, PER CLASS. gpt-oss alternates a 128-wide
+        // sliding window with full attention over one page-id space, and a
+        // schedule is carved for one window or the other: `sched_prefill`
+        // sizes its kv chunking from `window_left` and the kernel recomputes
+        // the same count when it merges the partials, so a schedule shared
+        // between the two would put the work items and the merge at two
+        // different numbers. Each pair below IS that reading axis: its two
+        // lines differ by the window the schedule states, `Some(m.window)`
+        // against `None`, and a layer indexes its pair by the discriminant of
+        // the `Reading` it carries (0 windowed, 1 full). The class is the arm
+        // the plan is built off — a decode schedule reads the decode arm's
+        // geometry, a prefill schedule the prefill arm's, so each plan node's
+        // guard IS the class it was carved for and the recorder refuses a
+        // reader from the other arm.
+        let (input_d, input_p) = inputs.split(&Facts::qo_one());
+        let plan_d = [
+            ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
+            ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None),
+        ];
+        let plan_p = [
+            ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
+            ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None),
+        ];
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
+        let d = m.head_dim;
 
         for (_, w) in inputs.walk_layers(&m.layers) {
             let at = &w.attn;
-            let d = at.head_dim;
             let pages = inputs.kv(&at.kv);
+            let write_page = inputs.write_page(&at.kv);
+            let write_offset = inputs.write_offset(&at.kv);
 
             let x = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let q = ops::elemwise::add_bias(&at.q_bias, &ops::linear::matmul(&x, &at.q_proj));
@@ -77,21 +96,31 @@ impl ForwardHybrid for Model {
             ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
             seam::at(seam::ATTN_Q, &[&q]);
 
-            let win = at.window;
+            let win = match at.reading {
+                Reading::Windowed => Some(m.window),
+                Reading::Full => None,
+            };
             let (dq, p) = q.split(&Facts::qo_one());
             let a = Value::merge(vec![
                 {
-                    let (o, lse) = ops::attn::decode_lse(&dq, &plan_d, pages, win, d, at.sm_scale);
+                    let (o, lse) = ops::attn::decode_lse(
+                        &dq,
+                        &plan_d[at.reading as usize],
+                        pages,
+                        win,
+                        d,
+                        at.sm_scale,
+                    );
                     ops::attn::sink(&o, &lse, &at.sinks, d)
                 },
                 {
                     let (o, lse) = ops::attn::prefill_lse(
                         &p,
-                        &plan_p,
+                        &plan_p[at.reading as usize],
                         pages,
                         win,
                         d,
-                        at.kv_heads,
+                        m.kv_heads,
                         at.sm_scale,
                     );
                     ops::attn::sink(&o, &lse, &at.sinks, d)

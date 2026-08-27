@@ -8,6 +8,15 @@ pub struct Model {
 
     pub act: Dtype,
 
+    /// The one attention reading this text is carved for. Every layer reads
+    /// the same schedule, so the numbers that schedule states — query heads,
+    /// kv heads, head width, window — are facts about the model, not about a
+    /// layer. The latent plane is shared across heads, so the kv heads a
+    /// reader restates are these query `heads`.
+    pub heads: u32,
+    pub head_dim: u32,
+    pub window: u32,
+
     pub kv: Dtype,
     pub hyper: Hyper,
 
@@ -38,12 +47,9 @@ pub struct Layer {
 }
 
 pub struct Attn {
-    pub heads: u32,
-    pub head_dim: u32,
     pub rope_dim: u32,
     pub theta: f32,
     pub sm_scale: f32,
-    pub window: u32,
     pub q_down: Weight,
     pub q_norm: Weight,
     pub q_norm_eps: f32,
@@ -113,7 +119,7 @@ struct Dims {
 
 impl Model {
     pub fn base(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
-        assemble(
+        Model::new(
             w,
             act,
             kv,
@@ -146,119 +152,120 @@ impl Model {
             },
         )
     }
-}
 
-fn assemble(weights: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-    assert!(
-        matches!(tp, 1 | 2 | 4 | 8),
-        "tp {tp} is not a world this catalog ships"
-    );
+    fn new(weights: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+        assert!(
+            matches!(tp, 1 | 2 | 4 | 8),
+            "tp {tp} is not a world this catalog ships"
+        );
 
-    let heads = d.heads / tp;
-    let dense_inter = d.dense_inter / tp;
-    let moe_inter = d.moe_inter / tp;
+        let heads = d.heads / tp;
+        let dense_inter = d.dense_inter / tp;
+        let moe_inter = d.moe_inter / tp;
 
-    let hidden = d.hidden as u64;
-    let streams = d.streams as u64;
-    let q_w = heads as u64 * d.head_dim as u64;
-    let q_lora = d.q_lora as u64;
-    let o_lora = d.o_lora as u64;
+        let hidden = d.hidden as u64;
+        let streams = d.streams as u64;
+        let q_w = heads as u64 * d.head_dim as u64;
+        let q_lora = d.q_lora as u64;
+        let o_lora = d.o_lora as u64;
 
-    let layers = (0..d.layers)
-        .map(|l| {
-            let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, dim: u64| Weight::sym(n(s), [dim], weights);
-            let mix = |s: &str| Mix {
-                scale: Weight::sym(n(&format!("{s}_scale")), [3], Dtype::F32),
-                base: Weight::sym(
-                    n(&format!("{s}_base")),
-                    [2 * streams + streams * streams],
-                    Dtype::F32,
-                ),
-            };
-            Layer {
-                attn_mix: mix("attn_mix"),
-                attn: Attn {
-                    heads,
-                    head_dim: d.head_dim,
-                    rope_dim: d.rope_dim,
-                    theta: d.theta,
-                    sm_scale: (d.head_dim as f32).sqrt().recip(),
-                    window: d.window,
-                    q_down: Weight::sym(n("q_down"), [q_lora, hidden], weights),
-                    q_norm: norm("q_norm", q_lora),
-                    q_norm_eps: d.norm_eps,
-                    q_up: Weight::sym(n("q_up"), [q_w, q_lora], weights).columns(),
-                    kv_down: Weight::sym(n("kv_down"), [q_w, hidden], weights).columns(),
-                    kv_norm: Weight::sym(n("kv_norm"), [q_w], weights).columns(),
-                    kv_norm_eps: d.norm_eps,
-                    o_down: Weight::sym(n("o_down"), [o_lora, q_w], weights).rows(),
-                    o_up: Weight::sym(n("o_up"), [hidden, o_lora], weights),
-                    sink: Weight::sym(n("attn_sink"), [heads as u64], weights).columns(),
-                    kv: format!("kv.{l}"),
-                    pool: d.pool[l as usize].map(|ratio| Pool {
-                        ratio,
-                        entries: format!("pool.{l}"),
-                    }),
-                },
-                mlp_mix: mix("mlp_mix"),
-                mlp: if l < d.dense_layers {
-                    Mlp::Dense {
-                        gate_up: Weight::sym(
-                            n("gate_up"),
-                            [2 * dense_inter as u64, hidden],
-                            weights,
-                        )
-                        .packed([dense_inter as u64, dense_inter as u64]),
-                        down: Weight::sym(n("down"), [hidden, dense_inter as u64], weights).rows(),
-                        inter: dense_inter,
-                        limit: d.swiglu_limit,
-                    }
-                } else {
-                    Mlp::Routed {
-                        router: Weight::sym(n("router"), [d.experts as u64, hidden], weights),
-                        bias: Weight::sym(n("router_bias"), [d.experts as u64], weights),
-                        gate_up: Weight::sym(
-                            n("experts_gate_up"),
-                            [d.experts as u64, 2 * moe_inter as u64, hidden],
-                            weights,
-                        )
-                        .bank([moe_inter as u64, moe_inter as u64]),
-                        down: Weight::sym(
-                            n("experts_down"),
-                            [d.experts as u64, hidden, moe_inter as u64],
-                            weights,
-                        )
-                        .rows(),
-                        experts: d.experts,
-                        top_k: d.top_k,
-                        inter: moe_inter,
-                        limit: d.swiglu_limit,
-                        renorm: d.renorm,
-                        scaling: d.scaling,
-                    }
-                },
-            }
-        })
-        .collect();
+        let layers = (0..d.layers)
+            .map(|l| {
+                let n = |s: &str| format!("layer.{l}.{s}");
+                let norm = |s: &str, dim: u64| Weight::sym(n(s), [dim], weights);
+                let mix = |s: &str| Mix {
+                    scale: Weight::sym(n(&format!("{s}_scale")), [3], Dtype::F32),
+                    base: Weight::sym(
+                        n(&format!("{s}_base")),
+                        [2 * streams + streams * streams],
+                        Dtype::F32,
+                    ),
+                };
+                Layer {
+                    attn_mix: mix("attn_mix"),
+                    attn: Attn {
+                        rope_dim: d.rope_dim,
+                        theta: d.theta,
+                        sm_scale: (d.head_dim as f32).sqrt().recip(),
+                        q_down: Weight::sym(n("q_down"), [q_lora, hidden], weights),
+                        q_norm: norm("q_norm", q_lora),
+                        q_norm_eps: d.norm_eps,
+                        q_up: Weight::sym(n("q_up"), [q_w, q_lora], weights).columns(),
+                        kv_down: Weight::sym(n("kv_down"), [q_w, hidden], weights).columns(),
+                        kv_norm: Weight::sym(n("kv_norm"), [q_w], weights).columns(),
+                        kv_norm_eps: d.norm_eps,
+                        o_down: Weight::sym(n("o_down"), [o_lora, q_w], weights).rows(),
+                        o_up: Weight::sym(n("o_up"), [hidden, o_lora], weights),
+                        sink: Weight::sym(n("attn_sink"), [heads as u64], weights).columns(),
+                        kv: format!("kv.{l}"),
+                        pool: d.pool[l as usize].map(|ratio| Pool {
+                            ratio,
+                            entries: format!("pool.{l}"),
+                        }),
+                    },
+                    mlp_mix: mix("mlp_mix"),
+                    mlp: if l < d.dense_layers {
+                        Mlp::Dense {
+                            gate_up: Weight::sym(
+                                n("gate_up"),
+                                [2 * dense_inter as u64, hidden],
+                                weights,
+                            )
+                            .packed([dense_inter as u64, dense_inter as u64]),
+                            down: Weight::sym(n("down"), [hidden, dense_inter as u64], weights)
+                                .rows(),
+                            inter: dense_inter,
+                            limit: d.swiglu_limit,
+                        }
+                    } else {
+                        Mlp::Routed {
+                            router: Weight::sym(n("router"), [d.experts as u64, hidden], weights),
+                            bias: Weight::sym(n("router_bias"), [d.experts as u64], weights),
+                            gate_up: Weight::sym(
+                                n("experts_gate_up"),
+                                [d.experts as u64, 2 * moe_inter as u64, hidden],
+                                weights,
+                            )
+                            .bank([moe_inter as u64, moe_inter as u64]),
+                            down: Weight::sym(
+                                n("experts_down"),
+                                [d.experts as u64, hidden, moe_inter as u64],
+                                weights,
+                            )
+                            .rows(),
+                            experts: d.experts,
+                            top_k: d.top_k,
+                            inter: moe_inter,
+                            limit: d.swiglu_limit,
+                            renorm: d.renorm,
+                            scaling: d.scaling,
+                        }
+                    },
+                }
+            })
+            .collect();
 
-    Model {
-        hidden: d.hidden,
-        vocab: d.vocab,
-        tp,
-        act,
-        kv,
-        hyper: Hyper {
-            streams: d.streams,
-            norm_eps: d.norm_eps,
-            gate_eps: d.gate_eps,
-            alpha: d.alpha,
-            sinkhorn: d.sinkhorn,
-        },
-        embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
-        layers,
-        final_norm: Weight::sym("final_norm", [hidden], weights),
-        final_norm_eps: d.norm_eps,
+        Model {
+            hidden: d.hidden,
+            vocab: d.vocab,
+            tp,
+            act,
+            heads,
+            head_dim: d.head_dim,
+            window: d.window,
+            kv,
+            hyper: Hyper {
+                streams: d.streams,
+                norm_eps: d.norm_eps,
+                gate_eps: d.gate_eps,
+                alpha: d.alpha,
+                sinkhorn: d.sinkhorn,
+            },
+            embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
+            layers,
+            final_norm: Weight::sym("final_norm", [hidden], weights),
+            final_norm_eps: d.norm_eps,
+        }
     }
 }
 

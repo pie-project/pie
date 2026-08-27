@@ -78,6 +78,8 @@ fn every_noun_round_trips() {
                 },
                 mask: Some(Mask::new(vec![0, 5], 5)),
                 adapter: Some(2),
+                drafts: true,
+                captures_scores: true,
                 readout: Readout::Last,
             },
             Lane::decode(1, 0b0100, 99, 31),
@@ -138,6 +140,24 @@ fn every_noun_round_trips() {
     };
     assert_eq!(round_trip(&registration), registration);
     assert_eq!(round_trip(&ChannelRegistration::default()), ChannelRegistration::default());
+
+    // The correction class's residency verb (palo C2, design §8). Remote is a
+    // property and not an encoding, so a bank's rows cross the same way a
+    // checkpoint's plan does.
+    let adapter = driver_api::AdapterRegistration {
+        id: 3,
+        planes: vec![
+            driver_api::AdapterPlane {
+                bank: "layer.0.lora_a".into(),
+                bytes: vec![0x00, 0x3c, 0x00, 0xbc],
+            },
+            driver_api::AdapterPlane {
+                bank: "layer.0.lora_b".into(),
+                bytes: vec![0x00, 0x00, 0x80, 0x3f],
+            },
+        ],
+    };
+    assert_eq!(round_trip(&adapter), adapter);
 }
 
 /// A `LoadRequest` carries a real `model_ir::Plan` across the boundary, and it
@@ -150,7 +170,7 @@ fn the_plan_crosses_the_boundary() {
     let request = LoadRequest {
         plan: model_ir::Plan {
             name: "qwen3-0.8b".into(),
-            plane: model_ir::Plane::Cuda,
+            platform: model_ir::Platform::Cuda,
             params: Vec::new(),
             caches: Vec::new(),
             values: Vec::new(),

@@ -23,6 +23,40 @@ pub struct Buffer {
     bytes: usize,
 }
 
+/// A failed allocation, re-said with numbers when it was a shortfall.
+///
+/// **THE ONE STATUS WORTH TRANSLATING, AND ONLY IT.** `cudaErrorMemoryAllocation`
+/// is a fact about a size and a device, and both numbers are askable; every
+/// other status is a fact about the runtime and is left as the call and the
+/// code. [`Fault::Ceiling`] is deliberately not what comes back: that one is a
+/// fire wanting more than the load reserved, and this is a load wanting more
+/// than the card has. The free figure is what `cudaMemGetInfo` says AFTER the failure,
+/// which is the honest one — it is what was actually available to the ask —
+/// and a query that itself fails leaves the original fault alone rather than
+/// replacing a true sentence with a guess.
+#[cfg(feature = "_cuda")]
+fn out_of_room(fault: Fault, bytes: usize) -> Fault {
+    use cudarc::runtime::sys as rt;
+
+    let shortfall = matches!(
+        fault,
+        Fault::Device { code, .. } if code == rt::cudaError::cudaErrorMemoryAllocation as i32
+    );
+    if !shortfall {
+        return fault;
+    }
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: two live locals; the call only writes them.
+    let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+    if asked != rt::cudaError::cudaSuccess {
+        return fault;
+    }
+    Fault::OutOfMemory {
+        need: bytes as u64,
+        have: free as u64,
+    }
+}
+
 impl Buffer {
     /// Allocate `bytes` and zero them.
     ///
@@ -37,8 +71,20 @@ impl Buffer {
     /// caches wants no recurrent pool — and comes back as a null handle no
     /// launch is pointed at.
     ///
+    /// **AND A REFUSAL THAT DOES NOT FIT CARRIES BOTH NUMBERS** (palo C3b).
+    /// Every allocation this crate makes is sized once from a budget, so the
+    /// interesting failure is always the same one — this model does not fit
+    /// this device — and `cudaMalloc answered 2` is the least useful sentence
+    /// there is about it. `cudaErrorMemoryAllocation` is therefore turned into
+    /// a [`Fault::Ceiling`] with the ask and the free, which is the shape a
+    /// ceiling refusal already has everywhere else in this shell and which a
+    /// caller can act on: a 27B checkpoint against a 46 GiB card says so in
+    /// gibibytes instead of in an errno. Every other CUDA status stays what it
+    /// was.
+    ///
     /// # Errors
     ///
+    /// [`Fault::Ceiling`] for a request the device has no room for,
     /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
@@ -51,8 +97,13 @@ impl Buffer {
             let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
             // SAFETY: `base` is a live local; the allocation is this
             // buffer's, freed exactly once in `Drop`.
+            let allocated =
+                unsafe { crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes)) };
+            if let Err(fault) = allocated {
+                return Err(out_of_room(fault, bytes));
+            }
+            // SAFETY: `base` is the allocation just made, of `bytes` bytes.
             unsafe {
-                crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))?;
                 crate::device::ctx::check("cudaMemset", rt::cudaMemset(base, 0, bytes))?;
             }
             Ok(Buffer {

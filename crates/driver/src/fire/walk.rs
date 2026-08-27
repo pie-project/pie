@@ -49,6 +49,17 @@
 //! would renumber every region after the first prepare one and hand the whole
 //! capture somebody else's rows.
 //!
+//! # The event points, and what they do NOT do
+//!
+//! P6 stamps three fields on a region — the stream it belongs to, the events
+//! its stream waits on, the events its stream records — and this loop hands
+//! all three to the [`Sink`] in place. **It does not reorder anything.** The
+//! regions still run front to back, every node still runs once, and the
+//! zero-row and collective rules above are untouched: a fork says where the
+//! next launch lands, not when. That is what makes eager mode's no-op sink the
+//! SERIALIZATION of P6's DAG rather than a different program (see
+//! [`EagerSink`](crate::fire::EagerSink)).
+//!
 //! # Why the plan is an argument
 //!
 //! `Dispatch::exec` takes a `&Node`, and `Baked` does not carry the nodes — it
@@ -184,11 +195,18 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
         // the semantics" means.
         let conditional = !matches!(region.lowering, Lowering::AlwaysLaunch);
 
-        // P6 will hand out `fork`/`join` around this call, from the dep DAG it
-        // builds over the capture regions. Under one stream there is nothing
-        // to fork from and no event to name, and inventing one here would put
-        // a synchronization in a recorded graph that no pass asked for.
+        // P6's event points, in the one order that means what they say
+        // (`model_compiler::stream`): the region's stream waits for whatever
+        // it was told to wait for, THEN opens the fork the arms behind it will
+        // wait on, THEN runs. A plan P6 found nothing in has all three of
+        // these empty and the loop is the straight line it always was.
         sink.region_begin(region);
+        for &event in &region.wait {
+            sink.join(event);
+        }
+        if let Some(event) = region.open {
+            sink.fork(event);
+        }
         if conditional {
             sink.cond_begin(&region.lowering);
         }
@@ -217,6 +235,11 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
 
         if conditional {
             sink.cond_end();
+        }
+        // The join half: the arm records its exit on its own stream, after its
+        // last launch, and the region after the group waits on it above.
+        if let Some(event) = region.close {
+            sink.fork(event);
         }
         sink.region_end(region);
     }
@@ -460,6 +483,96 @@ mod tests {
             baked.template().len() * 2,
             "every region is opened and closed under a filter that dispatches none of it"
         );
+    }
+
+    #[test]
+    fn a_forked_template_brackets_its_arms_with_the_events_the_compiler_baked() {
+        // THE ONE THING THE WALK ADDED FOR P6, and the order is the whole of
+        // it: a region waits, then opens, then runs, then closes. The
+        // `diagram` fixture's two windows are a fork group whose arms are too
+        // cheap for the default gate, so the profile here lowers the floor
+        // rather than pretending a norm costs what an attention does.
+        let b = diagram();
+        let profile = DeviceProfile {
+            fork_floor_us: 1.0,
+            ..DeviceProfile::default()
+        };
+        let baked = compile(&b.plan, &budgets(), &profile).expect("bakes");
+        let descriptor = fire(&baked, &[Lane::new(0, 7), Lane::new(1, 1)]);
+
+        // Region 2 is the decode window and region 3 the prefill one: the
+        // group's main arm is 2 and 3 is what left the main stream.
+        assert_eq!(baked.template()[2].stream, 0);
+        assert_eq!(baked.template()[3].stream, 1);
+        let enter = baked.template()[2].open.expect("the main arm opens it");
+        let exit = baked.template()[3].close.expect("the arm closes it");
+
+        let mut dispatch = MockDispatch::new(&b.plan);
+        let mut sink = Recorder::default();
+        walk(&b.plan, &baked, &descriptor, &mut dispatch, &mut sink).expect("walks");
+
+        assert_eq!(
+            sink.events,
+            vec![
+                Event::Begin(0),
+                Event::End(0),
+                Event::Begin(1),
+                Event::End(1),
+                Event::Begin(2),
+                Event::Fork(enter.0),
+                Event::End(2),
+                Event::Begin(3),
+                Event::Join(enter.0),
+                Event::Fork(exit.0),
+                Event::End(3),
+                Event::Begin(4),
+                Event::Join(exit.0),
+                Event::End(4),
+            ],
+        );
+        // And the nodes are the same nodes, in the same order: a fork says
+        // where the next launch lands, never when.
+        assert_eq!(dispatch.nodes(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn eager_is_the_serialization_of_the_dag_and_dispatches_what_one_stream_would() {
+        // The claim `EagerSink`'s doc makes, asserted: turning the streams on
+        // changes no node, no order and no skip — only which stream a shell
+        // that reads `Region::stream` would put each launch on.
+        let b = diagram();
+        let off = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let on = compile(
+            &b.plan,
+            &budgets(),
+            &DeviceProfile {
+                fork_floor_us: 1.0,
+                ..DeviceProfile::default()
+            },
+        )
+        .expect("bakes");
+        assert!(on.forks.events > 0, "the on arm actually forked");
+
+        for lanes in [
+            vec![Lane::new(0, 7), Lane::new(1, 1)],
+            vec![Lane::new(1, 1)],
+            vec![Lane::new(0, 4)],
+            Vec::new(),
+        ] {
+            let mut a = MockDispatch::new(&b.plan);
+            walk(
+                &b.plan,
+                &off,
+                &fire(&off, &lanes),
+                &mut a,
+                &mut EagerSink,
+            )
+            .expect("walks");
+            let mut c = MockDispatch::new(&b.plan);
+            walk(&b.plan, &on, &fire(&on, &lanes), &mut c, &mut EagerSink).expect("walks");
+            assert_eq!(a.nodes(), c.nodes(), "lanes {lanes:?}");
+            assert_eq!(a.names(), c.names(), "lanes {lanes:?}");
+        }
     }
 
     #[test]

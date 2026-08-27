@@ -1,5 +1,5 @@
-//! The `CustomCuda` family: the escape hatch for a plane-specific mega-kernel
-//! that no portable decomposition covers.
+//! The `CustomCuda` family: the escape hatch for a platform-specific
+//! mega-kernel that no portable decomposition covers.
 
 use super::*;
 

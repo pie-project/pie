@@ -42,6 +42,27 @@ use model_ir::{ClassSet, Classes, Cond, ValueId};
 
 use crate::arena::{ArenaMap, Concurrency};
 use crate::layout::PqTree;
+use crate::stream::Forks;
+
+/// A recorded synchronization point: what a fork signals and a join waits on.
+///
+/// **P6'S CURRENCY, AND THE TWO VERBS IT DECOMPOSES INTO.** The capture
+/// pattern green contexts Finding 3 measured is "record an event on one
+/// stream, wait on it from another"; a fork and a join are that same pair
+/// pointed in opposite directions. So the artifact carries the two halves
+/// separately — [`Region::open`] and [`Region::close`] record,
+/// [`Region::wait`] waits — and the
+/// fork/join of design §6 is what they compose into:
+///
+/// ```text
+/// fork   signal on the main stream  +  wait on the side stream
+/// join   signal on the side stream  +  wait on the main stream
+/// ```
+///
+/// The ids are dense from zero and numbered in emission order, so a shell
+/// creates `Baked::forks().events` of them once, at load, and indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EventId(pub u32);
 
 /// One plan, baked.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,26 +88,35 @@ pub struct Baked {
     /// P7's output: one slot per plan value, static offsets, rows symbolic in
     /// the bucket.
     pub arena: ArenaMap,
-    /// P6's seam: which regions the driver may have in flight at once.
-    /// [`Concurrency::sequential`] today, which is what one stream means, and
+    /// P6's seam: which regions the driver may have in flight at once, and
     /// what the arena was carved against — two values may share bytes only if
     /// no instant holds them both, and "instant" is exactly what this relation
-    /// widens once regions can run beside each other.
+    /// widens once regions run beside each other.
+    /// [`Concurrency::sequential`] is what a plan with no fork group gets, and
+    /// it is what one stream means.
     pub concurrency: Concurrency,
+    /// P6's other output: how many streams and how many events the template
+    /// names, and the region pairs [`concurrency`](Baked::concurrency) was
+    /// built from. All zero-ish — one stream, no events, no pairs — for a plan
+    /// with nothing to overlap, and for every plan when the profile's
+    /// `side_streams` is 0.
+    pub forks: Forks,
 }
 
 impl Baked {
     /// The capture script: the regions, in the order a recorder emits them.
     ///
-    /// A METHOD AND NOT A FIELD, and the reason is that in v1 the script IS
-    /// the region table. Every region lowers as [`Lowering::AlwaysLaunch`],
-    /// there are no conditional bodies to nest and no event nodes to interleave
-    /// (one stream), so a stored `CaptureTemplate` would be a `Vec<Region>`
-    /// copied beside a `Vec<Region>` with nothing to keep the two in step.
+    /// A METHOD AND NOT A FIELD, and P6 is where that stopped being an
+    /// accident and became the answer. The script is still the region table
+    /// walked front to back — what P6 added is not a second order but two
+    /// fields ON a region: which stream it is recorded into, and which events
+    /// it waits on and signals. A fork does not reorder the walk; it says
+    /// where the walk's next launch lands. So a stored `CaptureTemplate` would
+    /// still be a `Vec<Region>` copied beside a `Vec<Region>` with nothing to
+    /// keep the two in step.
     ///
-    /// When P3 and P6 land, the script stops being a straight walk — a SWITCH
-    /// has arms, a fork has a join — and this becomes the field design §2
-    /// names. The signature is what changes then; the callers are already
+    /// P3 is the pass that can still change this: a SWITCH has arms, and arms
+    /// nest. The signature is what changes then; the callers are already
     /// asking the right question.
     #[must_use]
     pub fn template(&self) -> &[Region] {
@@ -172,13 +202,42 @@ pub struct Region {
     pub phase: Phase,
     /// How it enters the graph. Always [`Lowering::AlwaysLaunch`] today.
     pub lowering: Lowering,
-    /// Which stream it is recorded on. Always 0 today — P6 is the pass that
-    /// forks a dep DAG over capture regions into more than one.
+    /// Which stream it is recorded into (P6). `0` is the main stream, which
+    /// is where a region stays unless [`crate::stream`] found it a partner
+    /// worth overlapping with.
     pub stream: u32,
+    /// Events this region's stream waits on BEFORE its first node.
+    ///
+    /// Two things arrive here and they are the two halves of design §6's
+    /// pair: a side stream's ENTRY wait (the one event the group's main arm
+    /// opened with) and the main stream's REJOIN (one per arm that left it).
+    /// Empty for every region of a plan P6 found nothing in.
+    pub wait: Vec<EventId>,
+    /// The event recorded on this region's stream BEFORE its first node, and
+    /// after [`wait`](Region::wait) — the fork point.
+    ///
+    /// **AT THE START, AND THAT IS THE WHOLE REASON IT IS ITS OWN FIELD.** A
+    /// group's arms must be ordered after everything that ran before the
+    /// group and NOT after the group's own main arm, which is the instant
+    /// between this region's waits and its first launch. Recording it at the
+    /// end of the region BEFORE instead would be the same instant only when
+    /// that region is on the main stream — and it is not, whenever two fork
+    /// groups stand back to back, which is exactly what a transformer layer
+    /// does (the qkv pair, then the attention arms).
+    pub open: Option<EventId>,
+    /// The event recorded on this region's stream AFTER its last node — the
+    /// join point. Set on the arms that left the main stream; the region
+    /// after the group waits on every one of them.
+    pub close: Option<EventId>,
     /// What fraction of the device this region wants, if the profile has an
-    /// opinion. `None` today: SM partition is capture-baked, so a variant
-    /// multiplies bodies, and v1 ships the hint rather than the partition
-    /// (decision #14).
+    /// opinion.
+    ///
+    /// `Some` exactly on the members of a fork group, proportional to their
+    /// estimated cost and rounded to the granularity green contexts Finding 1
+    /// measured (multiples of 2 SMs, minimum 4). **NOTHING READS IT IN v1**:
+    /// the SM partition is baked at capture (Finding 5), so a variant
+    /// multiplies bodies, and decision #14 ships the hint rather than the
+    /// partition.
     pub sm_hint: Option<u32>,
     /// This run contains a `Collective`-family node.
     ///

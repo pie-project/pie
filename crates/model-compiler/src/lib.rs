@@ -30,12 +30,19 @@
 //! P8 emit        Baked
 //! ```
 //!
-//! **P0, P1, P2, P4, P5 and P7 are here.** P3, P6 and P8 are not, and the
+//! **P0, P1, P2, P4, P5, P6 and P7 are here.** P3 and P8 are not, and the
 //! seams they will fill are TYPED rather than stubbed: `Lowering` has all
-//! three variants and only `AlwaysLaunch` is ever constructed, and
-//! `Concurrency::sequential` is what one stream means. Every one of those is a
-//! true statement about a v1 artifact, not a placeholder — a plan baked today
-//! runs correctly, just not as fast as it will.
+//! three variants and only `AlwaysLaunch` is ever constructed. That is a true
+//! statement about a v1 artifact, not a placeholder — a plan baked today runs
+//! correctly, just not as fast as it will.
+//!
+//! P6 ships whole (see [`stream`]): a dependency DAG over the capture
+//! regions, a cost gate against the profile, streams handed out greedily, and
+//! the fork/join event points stamped into the region table — with the
+//! concurrency relation fed to the carve, which is the hook `Concurrency` was
+//! threaded through for. A plan with nothing to overlap, and every plan under
+//! a profile whose `side_streams` is 0, bakes stream 0 everywhere with no
+//! event point at all, and pays nothing for the pass having run.
 //!
 //! P4 ships the C1P instance whole (see [`layout`]): a real PQ-tree over the
 //! plan's classes, the feasible SET rather than one witness ordering, so that
@@ -54,18 +61,20 @@ pub mod budget;
 pub mod layout;
 pub mod refusal;
 mod region;
+pub mod stream;
 
 #[cfg(test)]
 mod fixture;
 
-use model_ir::{Operation, Plan, resolve_classes};
+use model_ir::{Classes, Def, Operands, Operation, Plan, Ty, resolve_classes};
 
-pub use arena::{ArenaMap, Concurrency, RowExpr, Slot, Span, Window};
+pub use arena::{ArenaMap, Concurrency, EXPORT_SEAMS, RowExpr, Slot, Span, Window};
 pub use baked::{
-    Baked, Fallback, FallbackRow, FallbackTable, LayoutOrder, Lowering, Phase, Region,
+    Baked, EventId, Fallback, FallbackRow, FallbackTable, LayoutOrder, Lowering, Phase, Region,
 };
-pub use budget::{Budgets, DeviceProfile};
+pub use budget::{Budgets, DeviceProfile, FamilyCosts};
 pub use layout::PqTree;
+pub use stream::Forks;
 pub use refusal::{Refusal, Share, Unrectangled};
 
 /// The fact ceiling. The class sweep is `2^F`, and past 20 it stops being a
@@ -98,11 +107,31 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // class table at once, and neither side pays for the other (decision #7).
     let classes = resolve_classes(plan).map_err(Refusal::Classes)?;
 
+    // P1's acceptance half: a `Struct` value's readers must share the window
+    // it was built in. It is asked off `node_mask` — the sweep's own answer,
+    // before regions exist — because a region is a maximal run of nodes with
+    // EQUAL masks, so the two readings are the same predicate and this one
+    // needs no pass to have run. The authoring net in `crates/model/tests`
+    // asks it in the same vocabulary against `resolve_classes` alone, which
+    // is the earliest and cheapest instant a straddling model text can be
+    // told; this is the front door's own restatement, on the load path.
+    struct_readers_share_one_window(plan, &classes)?;
+
     // P5 then P2: phase per node, then maximal runs of equal (mask, phase).
     let regions = region::coalesce(plan, &classes);
 
-    // P6's answer, for now: one stream, so nothing runs beside anything.
-    let concurrency = Concurrency::sequential(&regions, plan.nodes.len());
+    // P6. The dep DAG over the capture regions, the cost gate, the streams
+    // and the event points — stamped into `regions` in place, because a fork
+    // is a property OF a region rather than a second schedule beside it. What
+    // comes back is the relation the carve is widened by, and P7 below is the
+    // pass that was written waiting for it.
+    let mut regions = regions;
+    let forks = stream::fork(plan, &mut regions, profile);
+    let concurrency = if forks.pairs.is_empty() {
+        Concurrency::sequential(&regions, plan.nodes.len())
+    } else {
+        Concurrency::with_pairs(&regions, plan.nodes.len(), forks.pairs.iter().copied())
+    };
 
     // P4. The C1P instance is read off the region table, so it runs after P2
     // even though it is numbered before it; and it is read off the MASKS
@@ -122,6 +151,7 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
         fallback,
         arena,
         concurrency,
+        forks,
     })
 }
 
@@ -180,6 +210,84 @@ fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(),
         });
     }
 
+    // **THE ONE PLACE THE DEPLOYMENT'S ADAPTER NUMBER AND THE MODEL'S MEET**
+    // (design §8, decision 17). Capacity is a SHAPE — the leading axis of
+    // every bank the model text marked `ParamSource::Registered` — because a
+    // shape is what a weight table reserves and what the routed op indexes.
+    // `Budgets::max_adapters` is what the deployment asked to be able to
+    // register, and asking for more than the text can seat is a load that
+    // does not happen rather than a registration that is refused later:
+    // decision 17's budget is not an admission cap, so it has to be true
+    // BEFORE the first registration, not discovered at one.
+    //
+    // A plan with no bank is exempt at `max_adapters == 0` and refused above
+    // it, which is the honest reading of "this deployment wants adapters and
+    // this model text has no seat for them".
+    if budgets.max_adapters > 0 {
+        let seats = plan
+            .params
+            .iter()
+            .filter(|param| param.source == model_ir::ParamSource::Registered)
+            .map(|param| param.shape.first().copied().unwrap_or(0))
+            .min();
+        match seats {
+            None => {
+                return Err(Refusal::AdapterCapacity {
+                    asked: budgets.max_adapters,
+                    seated: 0,
+                });
+            }
+            Some(seated) if seated < u64::from(budgets.max_adapters) => {
+                return Err(Refusal::AdapterCapacity {
+                    asked: budgets.max_adapters,
+                    seated,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// P1's acceptance check: no `Struct` value may be read outside the window it
+/// was built in.
+///
+/// `Ty::Struct` is exactly the attention SCHEDULES (`StructKind` is closed and
+/// every variant is one), and [`Refusal::Straddled`] argues why a schedule
+/// cannot be sliced the way a tensor can. One pass over the nodes: the
+/// DEFINING node stands in the window its builder is dispatched in by
+/// construction, so what is compared is its class set against every reader's.
+fn struct_readers_share_one_window(plan: &Plan, classes: &Classes) -> Result<(), Refusal> {
+    let structs: Vec<bool> = plan
+        .values
+        .iter()
+        .map(|value| matches!(value.ty, Ty::Struct(_)))
+        .collect();
+
+    let mut inputs = Vec::new();
+    for (at, node) in plan.nodes.iter().enumerate() {
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        for &read in &inputs {
+            if !structs.get(read.0 as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(Def::Op(built_by)) = plan.values.get(read.0 as usize).map(|v| &v.def) else {
+                continue;
+            };
+            let planned = &classes.node_mask[*built_by as usize];
+            let reader = &classes.node_mask[at];
+            if planned != reader {
+                return Err(Refusal::Straddled {
+                    value: read,
+                    node: at as u32,
+                    planned: planned.iter().collect(),
+                    consumed: reader.iter().collect(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 

@@ -33,19 +33,63 @@
 //! this file: the geometry vectors are the interface, and a lane's pages are
 //! whatever `pages_of` says they are.
 
-use model_ir::{Attention, CacheRow, Def, Dim, Operation, Plan, Ty, ValueId};
+use model_ir::{Attention, CacheRow, Def, Dim, Operands, Operation, Plan, StructKind, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 
-/// What one kv space's consumers restate about it.
+/// A reading: query heads, kv heads, head width, sliding window — held by a
+/// cache ROW (what one page of it carries) or by a plan value (what one
+/// schedule is carved for).
 ///
-/// **THE IR DOES NOT CARRY THESE, ON PURPOSE.** `CacheRow::Kv` is storage
-/// only — a per-token row shape and an element — and heads, head width and
-/// the sliding window live on the OPS that read the space (`Attention::Decode
-/// { head_dim }`, `Attention::Prefill { head_dim, kv_heads }`). So the shell
-/// reads them off the plan rather than off a config it would then have to
-/// keep in step, and a disagreement between two consumers of one space is a
-/// refusal here instead of a schedule carved at the wrong shape.
+/// **THE IR CARRIES THESE WHERE EACH HAS AN AUTHOR.** `CacheRow::Kv` is
+/// storage only — the planes one entry is written as, and an element — so a
+/// row's heads and head width are read off the OPS that walk the space
+/// (`Attention::Decode
+/// { head_dim }`, `Attention::Prefill { head_dim, kv_heads }`), not off a
+/// config the shell would then have to keep in step. A SCHEDULE is the other
+/// way round: it is carved for ONE reading before any launch touches it, so
+/// the op that carves it states that reading outright (`Attention::PlanDecode
+/// { q_heads, kv_heads, head_dim, window }`, and `Attention::MlaPlan { heads,
+/// kv_lora_rank }` for the absorbed latent one). The shell reads it off that
+/// op, and every launch that consumes the schedule restates its share for the
+/// shell to check.
+///
+/// **WHAT THEY ARE KEYED BY IS THE WHOLE OF BUILD LOG 20's FIRST BLOCKER.**
+/// They used to be folded up to the geometry SPACE, one answer per space, and
+/// two consumers that disagreed were a refusal. That reading cannot state
+/// gemma, whose sliding layers are 2 heads of 256 under a 512-wide window
+/// while its global layers are 2 heads of 512 with no window — one sequence,
+/// one page-id space, two readings — and it cannot state gpt-oss, whose two
+/// layer kinds share a row width and alternate a 128-wide window with none.
+/// Neither model is lying: a space is the PAGE-ID space (one `page_size`, one
+/// block per slot, one lane's pages), and nothing about a page id says how
+/// wide the row it addresses is. The dev lineage says the same in its own
+/// vocabulary — one `KvCache` with `per_layer_head_dim_`,
+/// `per_layer_num_kv_heads_` and a `per_layer_window_left` on the weights —
+/// and the IR already agrees, because `CacheRow::Kv { planes }` is declared
+/// per ROW and [`Pools::reserve`](crate::store::Pools::reserve) already
+/// allocates one slab per row at that row's own planes.
+///
+/// So the facts are keyed by the thing that actually holds them:
+///
+/// ```text
+/// the ROW   head_dim, kv_heads   what a paged launch restates about this cache
+/// the PLAN  + q_heads, window    the reading one schedule is carved for
+/// ```
+///
+/// and a disagreement is still a refusal — it names a cache row whose readers
+/// give it two widths, or a plan value whose launch restates a reading its
+/// schedule was not carved for, and the sentence for a plan tells the author
+/// to state the second reading on a second plan op rather than to give up.
+///
+/// **A ROW'S BYTES ARE NOT IN HERE.** They are the declaration's:
+/// `CacheRow::Kv` names the planes one entry is written as, at their own
+/// widths, and the pool allocates what is declared. A row's facts are the
+/// RESTATEMENT the paged launches make of that row, which
+/// [`Pools::reserve`](crate::store::Pools::reserve) checks the declaration
+/// against — and which is simply absent for a row no paged launch reads (a
+/// latent page, an indexer's keys, a pooled cache's entries: the latent, index
+/// and pool launches do not feed the row pass).
 ///
 // driver::store candidate
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,117 +105,111 @@ pub struct SpaceFacts {
     pub window: Option<u32>,
 }
 
-/// Read every kv space's facts off the plan that uses them.
+/// One attention schedule as its plan op states it: which struct it defines —
+/// the builder that runs, and the workspace the builder wants — and the
+/// reading it is carved for.
 ///
-/// The answer is indexed by `space`, with `None` for a space no attention op
-/// names — a plan may declare a space its trace never reads, and refusing
-/// that would refuse a legal model.
+/// The two are not the same question, and the shell needs both. A latent
+/// schedule and a paged one can be carved for readings that look alike in
+/// [`SpaceFacts`] and still want workspaces two orders of magnitude apart,
+/// because the buffer each builder stages is shaped by its own kernels'
+/// grid ([`Inputs::reserve`](crate::inputs::Inputs::reserve)).
+///
+// driver::store candidate
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduleFacts {
+    /// The host struct the plan op's output value declares.
+    pub kind: StructKind,
+    /// The reading that schedule is carved for.
+    pub reading: SpaceFacts,
+}
+
+/// Everything the plan restates about its own caches, keyed two ways.
+///
+// driver::store candidate
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// Per `Plan::caches` ROW: what the paged launches that walk it restate
+    /// about it. `None` for a row no paged launch reads — which is a row
+    /// allocated as declared and checked against nothing, not a refusal.
+    pub rows: Vec<Option<SpaceFacts>>,
+    /// Per `Plan::values` ID: the SCHEDULE one attention plan op carves —
+    /// which struct it is and the reading it is carved for, as that op states
+    /// them. `None` for every value no plan op defines.
+    pub plans: Vec<Option<ScheduleFacts>>,
+}
+
+impl Facts {
+    /// What the paged launches restate about one cache row, or `None` for a
+    /// row none of them reads.
+    ///
+    /// A LOOKUP AND NOT A REFUSAL: the row's bytes come off its declaration,
+    /// so a row nothing restates is a row with nothing to check — the latent,
+    /// index and pool launches walk their pages without ever naming a kv head
+    /// count, and refusing them was the whole of the M22 finding.
+    #[must_use]
+    pub fn row(&self, at: usize) -> Option<SpaceFacts> {
+        self.rows.get(at).copied().flatten()
+    }
+}
+
+/// Read every cache row's and every attention schedule's facts off the plan:
+/// a row's off the launches that walk it, a schedule's off the plan op that
+/// carves it — and then check every launch's restatement against the schedule
+/// it reads.
 ///
 /// # Errors
 ///
-/// [`Fault::Unbound`] for a space whose consumers cannot be read: two ops
-/// disagreeing about the head width, or a q rectangle that is not a whole
-/// number of heads wide.
+/// [`Fault::Unbound`] for a cache row two ops give two widths, for a plan op
+/// whose output value declares no host struct, for a launch that restates a
+/// reading its schedule was not carved for, for a launch over a plan value no
+/// plan op carved, or for a q rectangle that is not a whole number of heads
+/// wide.
 ///
 // driver::store candidate
-pub fn probe(plan: &Plan) -> Result<Vec<Option<SpaceFacts>>> {
-    let spaces = plan
-        .caches
-        .iter()
-        .filter_map(|row| match row {
-            CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-            CacheRow::State { .. } => None,
-        })
-        .max()
-        .unwrap_or(0);
-    let mut found: Vec<Option<SpaceFacts>> = vec![None; spaces];
+pub fn probe(plan: &Plan) -> Result<Facts> {
+    let mut out = Facts {
+        rows: vec![None; plan.caches.len()],
+        plans: vec![None; plan.values.len()],
+    };
 
+    // Pass one: the rows. `kv_heads` is stated by the prefill arms alone, so
+    // a row only a decode reads carries zero — the reading this shell has
+    // always had, kept.
     for node in &plan.nodes {
-        let Operation::Attention(op) = &node.op else {
+        let Some(read) = reads(&node.op) else {
             continue;
         };
-        let (cache, q, head_dim, kv_heads, window) = match op {
-            Attention::Decode {
-                q,
-                cache,
-                window,
-                head_dim,
-                ..
-            }
-            | Attention::DecodeLse {
-                q,
-                cache,
-                window,
-                head_dim,
-                ..
-            }
-            | Attention::Masked {
-                q,
-                cache,
-                window,
-                head_dim,
-                ..
-            } => (*cache, *q, *head_dim, None, *window),
-            Attention::Prefill {
-                q,
-                cache,
-                window,
-                head_dim,
-                kv_heads,
-                ..
-            }
-            | Attention::PrefillLse {
-                q,
-                cache,
-                window,
-                head_dim,
-                kv_heads,
-                ..
-            } => (*cache, *q, *head_dim, Some(*kv_heads), *window),
-            _ => continue,
-        };
-        let Some(space) = space_of(plan, cache) else {
+        let Some(row) = row_of(plan, read.cache) else {
             continue;
         };
-        let width = width_of(plan, q)?;
-        if head_dim == 0 || width % u64::from(head_dim) != 0 {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "cache space {space}, whose query rectangle is {width} wide and \
-                     whose head width is {head_dim} — not a whole number of heads"
-                ),
-            });
-        }
-        let q_heads = u32::try_from(width / u64::from(head_dim)).unwrap_or(u32::MAX);
-        let seat = found.get_mut(space as usize).ok_or_else(|| Fault::Unbound {
-            what: format!("cache space {space}, which its own cache row does not declare"),
+        let seat = out.rows.get_mut(row).ok_or_else(|| Fault::Unbound {
+            what: format!("cache row {row}, which this plan does not declare"),
         })?;
         match seat {
             None => {
                 *seat = Some(SpaceFacts {
-                    head_dim,
-                    kv_heads: kv_heads.unwrap_or(0),
-                    q_heads,
-                    window,
+                    head_dim: read.head_dim,
+                    kv_heads: read.kv_heads.unwrap_or(0),
+                    q_heads: 0,
+                    window: None,
                 });
             }
             Some(known) => {
-                if known.head_dim != head_dim || known.q_heads != q_heads || known.window != window
-                {
+                if known.head_dim != read.head_dim {
                     return Err(Fault::Unbound {
                         what: format!(
-                            "cache space {space}, whose consumers disagree about its \
-                             shape: {known:?} against head_dim {head_dim}, q_heads \
-                             {q_heads}, window {window:?}"
+                            "cache row {row}, whose readers disagree about its shape: \
+                             head_dim {} against head_dim {}",
+                            known.head_dim, read.head_dim
                         ),
                     });
                 }
-                if let Some(heads) = kv_heads {
+                if let Some(heads) = read.kv_heads {
                     if known.kv_heads != 0 && known.kv_heads != heads {
                         return Err(Fault::Unbound {
                             what: format!(
-                                "cache space {space}, whose consumers state {} and \
-                                 {heads} kv heads",
+                                "cache row {row}, whose readers state {} and {heads} kv heads",
                                 known.kv_heads
                             ),
                         });
@@ -181,7 +219,378 @@ pub fn probe(plan: &Plan) -> Result<Vec<Option<SpaceFacts>>> {
             }
         }
     }
-    Ok(found)
+
+    // Pass two: the schedules, off the ops that CARVE them. A plan value is
+    // carved for ONE reading — query heads, kv heads, head width, window — and
+    // the op that builds it is where that reading has an author, so this pass
+    // reads it there rather than inferring it from whoever happens to consume
+    // the value. Beside the reading it takes the value's declared STRUCT,
+    // because the reading alone does not say which builder runs: an absorbed
+    // latent schedule and a paged one both state a head width, and the two
+    // stage workspaces of entirely different shapes.
+    for node in &plan.nodes {
+        let Some(carve) = carves(&node.op) else {
+            continue;
+        };
+        let kind = kind_of(plan, carve.plan, node.op.name())?;
+        let seat = out
+            .plans
+            .get_mut(carve.plan.0 as usize)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "plan value {}, which this plan does not declare",
+                    carve.plan.0
+                ),
+            })?;
+        *seat = Some(ScheduleFacts {
+            kind,
+            reading: carve.reading,
+        });
+    }
+
+    // Pass three: every launch restates its share of the reading it was handed
+    // — the paged ones a head width, a window, a kv head count (the prefill
+    // arms) and a q rectangle whose width names its query heads, the latent
+    // ones their `heads` and `kv_lora_rank` outright — and a restatement the
+    // schedule was not carved for is a refusal rather than a schedule read at
+    // the wrong tile.
+    for node in &plan.nodes {
+        if let Some(read) = reads(&node.op) {
+            let width = width_of(plan, read.q)?;
+            if read.head_dim == 0 || width % u64::from(read.head_dim) != 0 {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "plan value {}, whose query rectangle is {width} wide and whose head \
+                         width is {} — not a whole number of heads",
+                        read.plan.0, read.head_dim
+                    ),
+                });
+            }
+            agrees(
+                &out,
+                read.plan,
+                node.op.name(),
+                Restated {
+                    head_dim: read.head_dim,
+                    kv_heads: read.kv_heads,
+                    q_heads: u32::try_from(width / u64::from(read.head_dim)).unwrap_or(u32::MAX),
+                    window: read.window,
+                },
+            )?;
+        }
+        if let Some(read) = latents(&node.op) {
+            agrees(
+                &out,
+                read.plan,
+                node.op.name(),
+                Restated {
+                    head_dim: read.kv_lora_rank,
+                    kv_heads: None,
+                    q_heads: read.heads,
+                    window: None,
+                },
+            )?;
+        }
+    }
+    Ok(out)
+}
+
+/// One plan op's own statement: the value it defines and the reading it
+/// carves that schedule for.
+struct Carving {
+    plan: ValueId,
+    reading: SpaceFacts,
+}
+
+/// The three plan ops, as one shape.
+fn carves(op: &Operation) -> Option<Carving> {
+    let Operation::Attention(op) = op else {
+        return None;
+    };
+    match op {
+        Attention::PlanDecode {
+            q_heads,
+            kv_heads,
+            head_dim,
+            window,
+            plan,
+            ..
+        }
+        | Attention::PlanPrefill {
+            q_heads,
+            kv_heads,
+            head_dim,
+            window,
+            plan,
+            ..
+        } => Some(Carving {
+            plan: *plan,
+            reading: SpaceFacts {
+                head_dim: *head_dim,
+                kv_heads: *kv_heads,
+                q_heads: *q_heads,
+                window: *window,
+            },
+        }),
+        // A latent schedule is carved in the ABSORBED reading, which is the
+        // only one its kernels have: every query head reads the one shared
+        // latent plane and writes `kv_lora_rank` floats, so the rank IS the
+        // head width the planner sizes at (`plan_mla`'s `head_dim_o`, which
+        // sizes the split-kv partial buffer at one packed row per (token,
+        // head) — `kernels-cuda/src/attn/sched_mla.rs`, and `mla_fa2::pack`'s
+        // `o_stride_h = rank` beside it). There is no second kv head count to
+        // state — the plane is shared, not per kv head — and no window: the
+        // latent kernels carve no sliding spans.
+        Attention::MlaPlan {
+            heads,
+            kv_lora_rank,
+            plan,
+            ..
+        } => Some(Carving {
+            plan: *plan,
+            reading: SpaceFacts {
+                head_dim: *kv_lora_rank,
+                kv_heads: 0,
+                q_heads: *heads,
+                window: None,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// The host struct a plan op's output value declares.
+///
+/// It is read off the VALUE rather than off the op because that is where the
+/// trace states it — one op family builds two of them (`attention.plan_prefill`
+/// mints an `AttnPrefillPlan` or, where the trace asks for the sm90 kernels, an
+/// `AttnPrefillPlanSm90`) and the value's `Ty` is what says which, the same way
+/// `Run::declared` reads it at build time.
+///
+/// # Errors
+///
+/// [`Fault::Unbound`] for a plan op whose output declares a rectangle rather
+/// than a host struct: nothing can build such a value, and nothing can say what
+/// workspace building it would want.
+fn kind_of(plan: &Plan, value: ValueId, carver: &'static str) -> Result<StructKind> {
+    let declared = plan.values.get(value.0 as usize).map(|decl| &decl.ty);
+    let Some(Ty::Struct(kind)) = declared else {
+        return Err(Fault::Unbound {
+            what: format!(
+                "plan value {}, which the plan op `{carver}` carves a schedule into though it \
+                 declares no host struct — a schedule's kind is what says which builder runs \
+                 and how much workspace that builder stages",
+                value.0
+            ),
+        });
+    };
+    Ok(*kind)
+}
+
+/// What one launch restates about the schedule it reads. `kv_heads` is `None`
+/// for every launch that states none — the decode and masked arms, and the
+/// latent ones over their shared plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Restated {
+    head_dim: u32,
+    kv_heads: Option<u32>,
+    q_heads: u32,
+    window: Option<u32>,
+}
+
+/// Check one launch's restatement against the seat of the plan it reads.
+///
+/// # Errors
+///
+/// [`Fault::Unbound`] naming the plan value, the launch and both readings —
+/// including the case where the value carries no seat at all, because a launch
+/// over a schedule no op carved reads a carving nobody stated.
+fn agrees(facts: &Facts, plan: ValueId, launch: &'static str, restated: Restated) -> Result<()> {
+    let schedule = facts
+        .plans
+        .get(plan.0 as usize)
+        .copied()
+        .flatten()
+        .ok_or_else(|| Fault::Unbound {
+            what: format!(
+                "plan value {}, which the launch `{launch}` reads at {restated:?} though no \
+                 plan op in this plan carves it — a schedule's reading is stated by the op \
+                 that builds it, so a value nothing carved is a schedule nothing planned",
+                plan.0
+            ),
+        })?;
+    let seat = schedule.reading;
+    let disagreement = if seat.head_dim != restated.head_dim {
+        Some("the head width")
+    } else if seat.window != restated.window {
+        Some("the sliding window")
+    } else if seat.q_heads != restated.q_heads {
+        Some("the query heads")
+    } else if restated
+        .kv_heads
+        .is_some_and(|heads| seat.kv_heads != heads)
+    {
+        Some("the kv heads")
+    } else {
+        None
+    };
+    let Some(about) = disagreement else {
+        return Ok(());
+    };
+    Err(Fault::Unbound {
+        what: format!(
+            "plan value {}, whose schedule is carved for {seat:?} while the launch `{launch}` \
+             restates {restated:?} — they disagree about {about}, so the launch restates a \
+             reading its schedule was not carved for. A schedule is carved for ONE reading \
+             (the window sizes its kv chunking, the head width its tile), so the model text \
+             states the second reading on a second plan op rather than pointing a second \
+             reader at this one",
+            plan.0
+        ),
+    })
+}
+
+/// What one paged-kv launch restates, flattened out of the variant. `q` is the
+/// rectangle whose width names its query heads — the only place a paged launch
+/// writes that number down.
+struct Reader {
+    q: ValueId,
+    plan: ValueId,
+    cache: ValueId,
+    head_dim: u32,
+    kv_heads: Option<u32>,
+    window: Option<u32>,
+}
+
+/// The five paged-kv launches, as one shape.
+fn reads(op: &Operation) -> Option<Reader> {
+    let Operation::Attention(op) = op else {
+        return None;
+    };
+    match op {
+        Attention::Decode {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            ..
+        }
+        | Attention::DecodeLse {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            ..
+        }
+        | Attention::Masked {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            ..
+        } => Some(Reader {
+            q: *q,
+            plan: *plan,
+            cache: *cache,
+            head_dim: *head_dim,
+            kv_heads: None,
+            window: *window,
+        }),
+        Attention::Prefill {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            kv_heads,
+            ..
+        }
+        | Attention::PrefillLse {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            kv_heads,
+            ..
+        } => Some(Reader {
+            q: *q,
+            plan: *plan,
+            cache: *cache,
+            head_dim: *head_dim,
+            kv_heads: Some(*kv_heads),
+            window: *window,
+        }),
+        _ => None,
+    }
+}
+
+/// What one latent (mla) launch restates. It states its numbers outright
+/// rather than through a rectangle: `q` here is the ABSORBED query, already
+/// mapped into latent space by `attention.mla_absorb_q`, so its width is the
+/// same `heads x kv_lora_rank` the op names.
+struct LatentReader {
+    plan: ValueId,
+    heads: u32,
+    kv_lora_rank: u32,
+}
+
+/// The four latent launches, as one shape. They do not feed the row pass:
+/// a latent cache's pages are the compressed plane and the rope plane, which
+/// `CacheRow::Kv` already states, and no latent op restates a kv head count.
+fn latents(op: &Operation) -> Option<LatentReader> {
+    let Operation::Attention(op) = op else {
+        return None;
+    };
+    match op {
+        Attention::MlaDecode {
+            plan,
+            heads,
+            kv_lora_rank,
+            ..
+        }
+        | Attention::MlaPrefill {
+            plan,
+            heads,
+            kv_lora_rank,
+            ..
+        }
+        | Attention::MlaDecodeSelected {
+            plan,
+            heads,
+            kv_lora_rank,
+            ..
+        }
+        | Attention::MlaPrefillSelected {
+            plan,
+            heads,
+            kv_lora_rank,
+            ..
+        } => Some(LatentReader {
+            plan: *plan,
+            heads: *heads,
+            kv_lora_rank: *kv_lora_rank,
+        }),
+        _ => None,
+    }
+}
+
+/// The `Plan::caches` row a cache-id value names, or `None` for a recurrent
+/// one.
+///
+// driver::store candidate
+#[must_use]
+pub fn row_of(plan: &Plan, cache: ValueId) -> Option<usize> {
+    let Def::Cache(row) = plan.values.get(cache.0 as usize)?.def else {
+        return None;
+    };
+    match plan.caches.get(row as usize)? {
+        CacheRow::Kv { .. } => Some(row as usize),
+        CacheRow::State { .. } => None,
+    }
 }
 
 /// The space a cache-id value names, or `None` for a recurrent one.
@@ -472,26 +881,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_spaces_heads_are_read_off_the_ops_that_restate_them() {
-        // The IR carries a per-token row and an element, and nothing else:
-        // heads and head width live on `Attention::Decode`/`Prefill`, and the
-        // query head count only on the q rectangle's own declaration. Reading
-        // them here is what keeps a pool's shape and a model's text from
-        // being two opinions.
+    fn a_rows_heads_are_read_off_the_ops_that_restate_them() {
+        // A `CacheRow::Kv` carries a per-token row and an element, and nothing
+        // else: a row's heads and head width live on `Attention::Decode`/
+        // `Prefill`, which walk it. A schedule's reading is stated by the plan
+        // op that carves it, and the launches restate their share. Reading
+        // both here is what keeps a pool's shape and a model's text from being
+        // two opinions.
         let trace = model::trace_of("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the smoke's SKU");
-        let plan = trace(model_dsl::Plane::Cuda);
-        let spaces = probe(&plan).expect("a hybrid SKU's one kv space reads");
+        let plan = trace(model_dsl::Platform::Cuda);
+        let facts = probe(&plan).expect("a hybrid SKU's caches read");
 
-        assert_eq!(spaces.len(), 1, "qwen3.5 declares one kv geometry space");
+        // qwen's 18 attention layers each declare a kv row, and they agree.
+        let stated: Vec<SpaceFacts> = facts.rows.iter().flatten().copied().collect();
+        assert!(!stated.is_empty(), "qwen3.5 declares kv rows");
+        for row in &stated {
+            assert_eq!(row.head_dim, 256);
+            assert_eq!(row.kv_heads, 2);
+        }
+
+        // And one schedule of each kind, each carved for the one reading its
+        // launches share.
+        let mut readings: Vec<SpaceFacts> = facts
+            .plans
+            .iter()
+            .flatten()
+            .map(|schedule| schedule.reading)
+            .collect();
+        readings.dedup();
         assert_eq!(
-            spaces[0],
-            Some(SpaceFacts {
-                head_dim: 256,
-                kv_heads: 2,
-                q_heads: 8,
-                window: None,
-            }),
+            readings,
+            vec![
+                SpaceFacts {
+                    head_dim: 256,
+                    kv_heads: 2,
+                    q_heads: 8,
+                    window: None,
+                };
+                readings.len()
+            ],
+        );
+
+        // The kind rides beside the reading, because the reading does not say
+        // which builder runs: qwen's schedules share one reading and are still
+        // a decode schedule beside prefill ones, and each names the struct its
+        // own plan op defines.
+        let kinds: Vec<StructKind> = facts
+            .plans
+            .iter()
+            .flatten()
+            .map(|schedule| schedule.kind)
+            .collect();
+        assert!(
+            kinds.contains(&StructKind::AttnDecodePlan),
+            "qwen3.5 carves a decode schedule: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&StructKind::AttnPrefillPlan),
+            "and prefill ones: {kinds:?}"
         );
 
         // And the recurrent rows are not in it: `space_of` answers `None` for

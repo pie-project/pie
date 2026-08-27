@@ -1,16 +1,16 @@
-use model_dsl::Plane;
+use model_dsl::Platform;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let sku = args
         .next()
         .expect("usage: trace <sku> [cuda|metal|wgpu|vulkan]");
-    let plane = match args.next().as_deref() {
-        None | Some("cuda") => Plane::Cuda,
-        Some("metal") => Plane::Metal,
-        Some("wgpu") => Plane::Wgpu,
-        Some("vulkan") => Plane::Vulkan,
-        Some(other) => panic!("unknown plane `{other}`"),
+    let platform = match args.next().as_deref() {
+        None | Some("cuda") => Platform::Cuda,
+        Some("metal") => Platform::Metal,
+        Some("wgpu") => Platform::Wgpu,
+        Some("vulkan") => Platform::Vulkan,
+        Some(other) => panic!("unknown platform `{other}`"),
     };
     let rows = model::catalog();
     let row = rows
@@ -20,6 +20,6 @@ fn main() {
             let names: Vec<&str> = rows.iter().map(|(n, ..)| *n).collect();
             panic!("`{sku}` is not a catalog row; rows: {names:#?}")
         });
-    let plan = row.2(plane);
+    let plan = row.2(platform);
     println!("{}", serde_json::to_string_pretty(&plan).unwrap());
 }

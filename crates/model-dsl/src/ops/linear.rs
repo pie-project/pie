@@ -1,5 +1,5 @@
-//! The `Linear` family: the plain matmuls, the fused MLP activations, and the
-//! MoE routing/expert path.
+//! The `Linear` family: the plain matmuls, the fused MLP activations, the MoE
+//! routing/expert path, and the LoRA correction over a routed adapter bank.
 
 use super::*;
 
@@ -296,4 +296,45 @@ pub fn moe_sigmoid_gate_add(routed: &Value, shared: &Value, gate: &Value) -> Val
         &[routed, shared, gate],
     );
     y
+}
+
+/// **THE CORRECTION CLASS** (design §8): add `B[a]·(A[a]·x)` to `y`, in place,
+/// where `a` is the adapter each row's lane routes to.
+///
+/// `x` is the site's INPUT (what the base projection multiplied) and `y` its
+/// already-materialised output; the wrapper returns the corrected value, which
+/// is the same arena column — an in-place SSA pair, like `residual_add`'s.
+///
+/// **GUARD IT, AND THE GUARD IS THE WINDOW.** Design §8 puts the correction
+/// "over the adapter window", and §0 defines a window as the rows of the lanes
+/// whose word satisfies the node's cond. So the call site splits on the
+/// model's own `has_adapter` fact and this op runs over that arm: a fire no
+/// lane carried an adapter into has zero rows for it, `driver::fire::walk`
+/// skips a zero-row region outright, and the cost of the axis in that fire is
+/// exactly nothing — no launch, no empty grid, no instruction. What §8's table
+/// means by "conditional nodes: none" is the CUDA-graph kind (IF/SWITCH), and
+/// there are none here: window-split is not a conditional (design §0), and the
+/// diversity that would have wanted a branch — WHICH adapter, at what rank —
+/// is absorbed by `routes` inside the op and by the bank's own shape.
+pub fn lora_correct(x: &Value, bank_a: &Weight, bank_b: &Weight, routes: &Value, y: &Value) -> Value {
+    let r = x.rec();
+    let y_out = r.fresh(y.ty().clone());
+    r.push(
+        Linear::LoraCorrect {
+            x: x.id(),
+            bank_a: r.weight(bank_a),
+            bank_b: r.weight(bank_b),
+            routes: routes.id(),
+            y: y.id(),
+            y_out: y_out.id(),
+        },
+        &[x, routes, y],
+    );
+    // **AND THE VALUE COMES BACK UNGUARDED** ([`Value::everywhere`]). The
+    // NODE is narrow — it runs over the adapter window and nowhere else — but
+    // its output column is `y`'s, written on every row of the fire by whatever
+    // produced `y`. A consumer that inherited the guard would carry it down
+    // the whole residual stream and the next layer's split would refuse to mix
+    // with it, which is the guard leaking out of a window it was never about.
+    y_out.everywhere()
 }

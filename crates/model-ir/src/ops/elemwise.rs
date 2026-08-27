@@ -180,7 +180,7 @@ pub enum Elementwise {
         comb_mix: ValueId,
         y: ValueId,
     },
-    // `Hc::Collapse` was deleted: no plane can fire it honestly (review R5).
+    // `Hc::Collapse` was deleted: no platform can fire it honestly (review R5).
 }
 
 impl Operands for Elementwise {

@@ -193,6 +193,18 @@ pub const ROWS: &[Row] = &[
         vocab: 163_840,
         arch: "kimi_k3",
     },
+    // The one shipping SKU whose checkpoint publishes a draft head (palo C3).
+    // FIRST among the qwen rows, as it is first in `::model::catalog()` — this
+    // table is that one in order, and `the_catalog_and_the_serving_table_are_the_same_ids`
+    // is what says so. `arch` is `qwen3_5` because that is what the SKU IS: a
+    // qwen3_5 tower with fifteen `mtp.*` tensors on the end, not one trunk op
+    // changed.
+    Row {
+        id: "qwen36-27b-bf16-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen35-a3b-bf16-kv-bf16",
         layers: 40,
@@ -551,8 +563,10 @@ impl Model {
         self.tokenizer.get_special_tokens()
     }
 
-    /// The fact word a lane carries: `query_len` rows, and whether the lane
-    /// states a custom attention mask of its own.
+    /// The fact word a lane carries: `query_len` rows, whether the lane states
+    /// a custom attention mask of its own, whether it routes to an adapter
+    /// bank, whether it wants the model's draft head run over its rows, and
+    /// whether it wants its attention's mass kept.
     ///
     /// **THIS IS WHAT A FIRE IS COMPOSED FROM** (palo design §0). The driver
     /// turns a lane's word into a class, and the class into the row WINDOW
@@ -563,12 +577,48 @@ impl Model {
     /// `Classify::of(..).word()` through the catalog pointer and never reads a
     /// bit.
     ///
-    /// The engine states both halves because it knows both: a lane's rows are
-    /// the tokens it submits, and a custom mask is a lane's only once the
-    /// fire's mask has lowered (`pipeline::fire::stamp_lane_words`).
+    /// The engine states all five because it knows all five: a lane's rows are
+    /// the tokens it submits, a custom mask is a lane's only once the fire's
+    /// mask has lowered, and the adapter, the draft ask and the capture ask
+    /// are what whoever built the lane put on it
+    /// (`pipeline::fire::stamp_lane_words`).
+    ///
+    /// **THE LIST GROWS ONE ARGUMENT PER AXIS, AND SO DOES THE REFUSAL SET**
+    /// (palo C3b/C4b). `drafts` and `captures_scores` join on `adapter`'s
+    /// terms exactly: the shell asks per lane whether the class the word
+    /// resolved to runs the export's arm, and refuses BOTH directions by name
+    /// — `driver_cuda::Fault::DraftWord` and `Fault::ScoreWord`. What is
+    /// different is that these two carry no runtime input, so the wrong answer
+    /// they prevent is not "staged and never read" but "computed and nobody
+    /// told": a drafting class runs a whole transformer block into a column
+    /// no reader collects, and a capturing class writes a mass column the
+    /// readout skips. Stamping all five from ONE reading of ONE lane at one
+    /// instant is what makes the refusals unreachable from this path.
+    ///
+    /// **`adapter` HAS TO AGREE WITH `Lane::adapter`, AND THE SHELL CHECKS
+    /// THAT IT DOES.** The word puts the lane's rows inside the correction's
+    /// window or outside it (palo design §8); the id is what the arm routes
+    /// with. A word that said `has_adapter` with no id behind it would send
+    /// the arm at a routes vector nobody staged, and an id with no word would
+    /// be staged and never read — `driver_cuda::Fault::AdapterWord` refuses
+    /// both, by name, before anything launches. So the two are stamped from
+    /// ONE reading of the lane, at one instant, which is what
+    /// `stamp_lane_words` is.
     #[must_use]
-    pub fn word(&self, query_len: u32, custom_mask: bool) -> u64 {
-        (self.classify)(&::model::Request::new(query_len, custom_mask))
+    pub fn word(
+        &self,
+        query_len: u32,
+        custom_mask: bool,
+        adapter: bool,
+        drafts: bool,
+        captures_scores: bool,
+    ) -> u64 {
+        (self.classify)(
+            &::model::Request::new(query_len, custom_mask)
+                .adapted(adapter)
+                .drafting(drafts)
+                .capturing_scores(captures_scores),
+        )
     }
 
     /// Gets the KV page size.

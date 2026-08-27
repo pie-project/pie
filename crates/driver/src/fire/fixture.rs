@@ -20,7 +20,7 @@ use model_compiler::{Lowering, Region};
 use model_ir::ops::{Attention, Collective, Elementwise};
 use model_ir::{
     CacheRow, Cond, CustomCuda, Def, Dim, Dtype, Layout, Linear, Node, Operands, Operation, Plan,
-    Plane, RuntimeInput, Seam, StructKind, Ty, ValueDecl, ValueId,
+    Platform, RuntimeInput, Seam, StructKind, Ty, ValueDecl, ValueId,
 };
 
 use crate::fire::sink::{EventId, Sink};
@@ -50,7 +50,7 @@ impl Build {
         Build {
             plan: Plan {
                 name: "hand-built".to_string(),
-                plane: Plane::Cuda,
+                platform: Platform::Cuda,
                 params: Vec::new(),
                 caches: vec![CacheRow::State {
                     name: "state".to_string(),
@@ -100,7 +100,9 @@ impl Build {
     }
 
     /// A prepare node: it defines a `Ty::Struct`, which is the whole rule P5
-    /// reads.
+    /// reads. The reading it states is the one [`Build::decode`] restates —
+    /// one head of width 4, no window — because a schedule and its reader
+    /// disagreeing is a shell refusal rather than a fixture.
     pub(crate) fn prepare(&mut self, cond: Cond) -> ValueId {
         let kv_indptr = self.input(1);
         let kv_indices = self.input(1);
@@ -114,6 +116,10 @@ impl Build {
                 kv_indices,
                 last_page_len,
                 kv_len,
+                q_heads: 1,
+                kv_heads: 1,
+                head_dim: 4,
+                window: None,
                 plan,
             }
             .into(),

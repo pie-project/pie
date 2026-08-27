@@ -337,8 +337,33 @@ pub fn prefill_lse(
 }
 
 /// Prefill against the op's `mask` (packed `u8` bits) instead of the causal
-/// bound. The schedule has to cover the whole prefix — the mask rides the
-/// launch, so a windowed schedule would discard positions the mask may keep.
+/// bound, optionally inside a sliding window.
+///
+/// **THE WINDOW COMPOSES WITH THE MASK, AND ALWAYS DID.** C1 recorded a third
+/// blocker here — "fa2 instantiates no custom-mask + sliding-window arm" — and
+/// it was a misreading of the variant's own template arguments.
+/// `VariantCustom` is `flashinfer::DefaultAttention<use_custom_mask = true,
+/// use_sliding_window = true, ...>`: its `REGISTER_LOGITS_MASK` ANDs the
+/// custom bit with `kv_idx + qo_len + window_left >= kv_len + qo_idx`, and
+/// `window_left` is `params.window_left` when that is non-negative and
+/// `kv_len` — which makes the term vacuous — when it is not. So the arm the
+/// unwindowed masked path has been firing since C1 IS the windowed arm, run
+/// at `window_left = -1`. There was nothing to instantiate; there was a
+/// refusal in front of it.
+///
+/// What the refusal actually feared — "a windowed schedule would discard
+/// positions the mask may keep" — is the wrong way round for a model that
+/// states a window. Gemma's masked reading is *causal ∧ mask ∧ window*: the
+/// causal bound is already folded into the staged bits (`driver_cuda::mask`),
+/// the window is the model's own statement on the node, and a key outside it
+/// is dropped by the variant whether the schedule visited it or not. The
+/// schedule's window is not an approximation of the mask, it is the second
+/// conjunct — and it has to AGREE, because `sched_prefill` sizes its kv
+/// chunking from `window_left` and the kernel's own `num_kv_chunks` recomputes
+/// it from the same number. A full schedule under a windowed launch would put
+/// the partials and the merge at two different counts, which is the silent
+/// half of this failure and the reason [`PrefillPlan::accepts`] is asked with
+/// the stated window rather than with `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx,
@@ -353,16 +378,9 @@ pub fn masked(
 ) -> Result<(), KernelError> {
     const OP: &str = "attention.masked";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
-    if plan.window.is_some() {
-        return Err(refuse(
-            OP,
-            "this fire's masked prefill schedule was carved for a windowed reading; the \
-             window rides the launch, so the schedule has to cover the whole prefix",
-        ));
-    }
-    // The op states no kv head count, and the window agreement is the full
-    // reading the refusal above just established.
-    plan.accepts(OP, head_dim, None, None)?;
+    // The op states no kv head count; the window must be the one the schedule
+    // carved its kv spans for, windowed or not.
+    plan.accepts(OP, head_dim, None, window)?;
     // MENLO-SEAM: the op names the mask bits, but their per-request span
     // table has no IR seat — the driver binds it onto the plan at build
     // (`plan_prefill`'s `mask_indptr`).

@@ -42,7 +42,7 @@ use std::time::Instant;
 
 use driver_cuda::{Boot, Graphs, Lane, Shell};
 use model_compiler::Budgets;
-use model_dsl::{Classify, Plane, Request};
+use model_dsl::{Classify, Platform, Request};
 
 /// The catalog row this suite serves, as `serve_smoke` serves it.
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -132,7 +132,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         .expect("the checkpoint's tokenizer loads");
 
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Plane::Cuda);
+    let plan = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
         .expect("the SKU's import contract fits its own checkpoint");

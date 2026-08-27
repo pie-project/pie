@@ -97,6 +97,37 @@ pub fn fold_stage(
     };
     let ops = &bound.container.stages[index].ops;
     let types = &bound.stage_types[index];
+    // WHAT THIS FOLD IS ALLOWED TO SKIP (palo D0). The fold's only output is
+    // `fold.puts`, so a value no `ChanPut` can carry cannot change the
+    // answer — and a put whose value is BLOCKED carries a blocker rather than
+    // a value, so the value it would have carried cannot either. `demand`
+    // names the complement of both: the values some put commits `Ok`, closed
+    // backwards over operands. Everything outside it is arithmetic whose
+    // result is discarded.
+    //
+    // This is not a marginal saving. A sampler epilogue draws `RngKeyed` over
+    // the FULL LOGITS SHAPE from a host-known state channel, so the fold's
+    // "evaluate any op whose operands are known" rule materialised a
+    // vocabulary-wide noise tensor once per fire — and then discarded it,
+    // because its only consumer adds it to the device's logits and is blocked
+    // on the intrinsic. Measured on the L40S (qwen35-d0.8b, `naive-baseline`,
+    // 248320-wide output vocabulary): `HostShadow::advance` 5.33 ms per fire, which
+    // is the guest thread's whole submit and three quarters of a decode step.
+    //
+    // The skip cannot move a blocker or a value: `demand` is closed under
+    // operands, so an op with a demanded result has demanded operands and is
+    // evaluated exactly as before, while a skipped value is read by no
+    // evaluated op (if it were, that op's result would be demanded and the
+    // closure would have demanded it too). Blocker PROPAGATION is untouched —
+    // it is a function of the ops alone, which is why it can run in a pass of
+    // its own with no arithmetic at all.
+    let (demand, known_cache) = demand_set(ops, types.len(), known);
+    let known = &mut |chan: u32| -> Option<Value> {
+        known_cache
+            .get(&chan)
+            .cloned()
+            .unwrap_or_else(|| known(chan))
+    };
     let inputs = PassInputs {
         logits: None,
         mtp_logits: None,
@@ -227,6 +258,17 @@ pub fn fold_stage(
                     }
                     continue;
                 }
+                // Undemanded: no put carries this value and no evaluated op
+                // reads it, so the arithmetic is dead. It stays UNBLOCKED —
+                // pass one already decided that, and flipping it would change
+                // which operand a downstream blocker is named after.
+                if !(0..op.result_count() as usize).any(|offset| demand[next_id + offset]) {
+                    for offset in 0..op.result_count() as usize {
+                        dense.push(placeholder(types[next_id + offset]));
+                        blocked_at.push(None);
+                    }
+                    continue;
+                }
                 let ty_of = |id: tensor_ir::types::ValueId| types[id as usize];
                 // `StepError`'s `Display` is the one rendering of a step
                 // failure; re-matching the variants here would be a second
@@ -248,6 +290,81 @@ pub fn fold_stage(
         }
     }
     Ok(fold)
+}
+
+/// The values [`fold_stage`] must actually compute, and every channel value
+/// `known` answered on the way — so the caller's oracle is asked once per
+/// channel rather than once per read.
+///
+/// Two passes over the ops, neither of them arithmetic. The first propagates
+/// BLOCKEDNESS, which is a function of the op graph and the oracle alone and
+/// therefore agrees exactly with the fold's own `blocked_at`. The second walks
+/// backwards from the value of every put the first pass says commits `Ok`,
+/// closing over operands.
+fn demand_set(
+    ops: &[Op],
+    values: usize,
+    known: &mut dyn FnMut(u32) -> Option<Value>,
+) -> (Vec<bool>, BTreeMap<u32, Option<Value>>) {
+    let mut cache: BTreeMap<u32, Option<Value>> = BTreeMap::new();
+    // Pass one: blocked or not, per value id; and the same register semantics
+    // for channels the fold itself uses (a read after an in-stage put sees the
+    // pending put's blockedness).
+    let mut blocked: Vec<bool> = Vec::with_capacity(values);
+    let mut pending: BTreeMap<u32, bool> = BTreeMap::new();
+    // Where each op's results start, so the backward pass can find them.
+    let mut first_id: Vec<usize> = Vec::with_capacity(ops.len());
+    for op in ops {
+        first_id.push(blocked.len());
+        let any_blocked = op.operands().iter().any(|&arg| blocked[arg as usize]);
+        match op {
+            Op::ChanTake(chan) | Op::ChanRead(chan) => {
+                let is_blocked = match pending.get(chan) {
+                    Some(&pending_blocked) => pending_blocked,
+                    None => cache
+                        .entry(*chan)
+                        .or_insert_with(|| known(*chan))
+                        .is_none(),
+                };
+                blocked.push(is_blocked);
+            }
+            Op::ChanPut { chan, value } => {
+                pending.insert(*chan, blocked[*value as usize]);
+            }
+            Op::KernelCall { .. } | Op::IntrinsicVal { .. } | Op::Rng { .. } => blocked.push(true),
+            Op::SinkCall { .. } => {}
+            _ => {
+                for _ in 0..op.result_count() {
+                    blocked.push(any_blocked);
+                }
+            }
+        }
+    }
+
+    // Pass two: backwards from the puts that will carry a value. A put's one
+    // operand IS its value, so the `ChanPut` arm below is both the seed and
+    // the closure step — there is no separate seeding walk.
+    let mut demand = alloc::vec![false; blocked.len()];
+    for (op, &first) in ops.iter().zip(first_id.iter()).rev() {
+        let wanted = match op {
+            // A put carries its value only when that value is unblocked; a
+            // blocked one commits the blocker, and what it would have carried
+            // is never looked at. This is the whole prune — demanding every
+            // put's operand unconditionally would put the sampler's noise
+            // straight back in.
+            Op::ChanPut { value, .. } => !blocked[*value as usize],
+            // Sinks configure the forward and produce no value the fold reads.
+            Op::SinkCall { .. } => false,
+            Op::ChanTake(_) | Op::ChanRead(_) => demand[first],
+            _ => (0..op.result_count() as usize).any(|offset| demand[first + offset]),
+        };
+        if wanted {
+            for arg in op.operands() {
+                demand[arg as usize] = true;
+            }
+        }
+    }
+    (demand, cache)
 }
 
 /// A dtype-correct stand-in for a blocked value.
@@ -715,6 +832,105 @@ mod tests {
         assert!(taint.device_dependent_ports.contains(&Port::EmbedTokens));
         assert!(taint.device_dependent_ports.contains(&Port::Positions));
         assert!(!taint.host_derivable());
+    }
+
+    /// **palo D0**: the sampler epilogue's shape, which is the one this fold
+    /// used to spend milliseconds on. A keyed RNG draw over the LOGITS shape
+    /// is a pure function of a host-known state channel, so the old rule
+    /// ("evaluate any op whose operands are known") materialised a
+    /// vocabulary-wide noise tensor — and then discarded it, because its only
+    /// consumer adds it to the device's logits and is blocked on the
+    /// intrinsic.
+    ///
+    /// Asked of `demand_set` directly rather than through a stopwatch: a
+    /// timing assertion is a claim about the box, and what is actually being
+    /// claimed here is a property of the op graph.
+    #[test]
+    fn the_fold_demands_nothing_a_blocked_put_would_have_carried() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.channels.push(chan(Shape::vector(2), DType::U32, 1));
+        trace.channels.push(chan(Shape::vector(3), DType::F32, 1));
+        let ops = vec![
+            ChanRead(8), // 0 state — host-known
+            RngKeyed {
+                state: 0,
+                shape: Shape::vector(3),
+                kind: RngKind::Gumbel,
+            }, // 1 noise — the expensive one
+            ChanRead(9), // 2 — no host-known value, standing in for the
+            // logits intrinsic: what matters to this test is only that the
+            // Add below is blocked on it.
+            Add(2, 1),   // 3 perturbed — blocked on the logits
+            Cast {
+                value: 3,
+                dtype: DType::I32,
+            }, // 4
+            ChanPut { chan: 0, value: 4 },
+        ];
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: ops.clone(),
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let mut seeds = seeds();
+        seeds.push((8, Value::U32(vec![3, 0])));
+        let mut known = known_from(&seeds);
+        let (demand, _) = demand_set(&ops, bound.stage_types[1].len(), &mut known);
+        assert!(
+            !demand[1],
+            "the noise reaches only a put that commits a blocker, so nothing \
+             reads the value it would carry"
+        );
+        assert!(!demand[3] && !demand[4], "nor does anything downstream of it");
+
+        // And the fold still says exactly what it said: the put carries the
+        // logits blocker, not a value and not a different blocker.
+        let fold = fold_stage(&bound, Stage::Epilogue, &mut known_from(&seeds)).unwrap();
+        assert_eq!(
+            fold.puts.get(&0),
+            Some(&Err(EvalBlocker::UnknownChannel(9))),
+            "the skip must not move the blocker a put commits"
+        );
+    }
+
+    /// The other side of the same net: a keyed draw whose value a put really
+    /// does carry is still evaluated. A prune that took this too would turn a
+    /// host-derivable port into a device-decided one and refuse fires that
+    /// run today.
+    #[test]
+    fn the_fold_still_evaluates_what_a_put_carries() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.channels.push(chan(Shape::vector(2), DType::U32, 1));
+        let ops = vec![
+            ChanRead(8), // 0
+            RngKeyed {
+                state: 0,
+                shape: Shape::vector(3),
+                kind: RngKind::Uniform,
+            }, // 1
+            Cast {
+                value: 1,
+                dtype: DType::I32,
+            }, // 2
+            ChanPut { chan: 0, value: 2 },
+        ];
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: ops.clone(),
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let mut seeds = seeds();
+        seeds.push((8, Value::U32(vec![3, 0])));
+        let mut known = known_from(&seeds);
+        let (demand, _) = demand_set(&ops, bound.stage_types[1].len(), &mut known);
+        assert!(demand[1] && demand[2], "the put carries this value");
+        let fold = fold_stage(&bound, Stage::Epilogue, &mut known_from(&seeds)).unwrap();
+        assert!(
+            matches!(fold.puts.get(&0), Some(Ok(_))),
+            "a host-replayable keyed draw still folds to a value"
+        );
     }
 
     /// The keyed form is the opposite case and must stay untainted:

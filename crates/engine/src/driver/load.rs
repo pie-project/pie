@@ -3,12 +3,12 @@
 //! # Decision 18, from the engine's side
 //!
 //! ```text
-//!  engine                                  |  shell
-//!  ------                                  |  -----
-//!  catalog() -> (sku, tp, Trace, Classify) |
-//!  trace(Plane::Cuda) -> model_ir::Plan  --|--> compile(plan, budgets, profile)
-//!  import_of(sku)(&Source) -> Contract   --|--> Weights::resident(plan, contract, path)
-//!  Classify::of(request) -> Lane::word   --|--> compose -> walk -> replay
+//!  engine                                    |  shell
+//!  ------                                    |  -----
+//!  catalog() -> (sku, tp, Trace, Classify)   |
+//!  trace(Platform::Cuda) -> model_ir::Plan --|--> compile(plan, budgets, profile)
+//!  import_of(sku)(&Source) -> Contract     --|--> Weights::resident(plan, contract, path)
+//!  Classify::of(request) -> Lane::word     --|--> compose -> walk -> replay
 //! ```
 //!
 //! The engine links `model` anyway — a lane's fact word is the model's own
@@ -47,15 +47,15 @@ use driver_api::load::{Budgets, Checkpoint, LoadRequest};
 use driver_api::model_ir::Plan;
 use model_loader::contract::ModelContract;
 
-/// The plane every door here takes, handed out beside them: a caller that can
+/// The platform every door here takes, handed out beside them: a caller that can
 /// reach [`identify`] should not have to name `driver-api` to say which
 /// backend it is asking about.
-pub use driver_api::model_ir::Plane;
+pub use driver_api::model_ir::Platform;
 
 /// The catalog row a load names: its SKU, the tensor-parallel width it was
 /// traced for, the trace itself, and how it sorts a request into the fact
 /// word a lane carries.
-pub type Row = (&'static str, u32, fn(Plane) -> Plan, ::model::ClassifyFn);
+pub type Row = (&'static str, u32, fn(Platform) -> Plan, ::model::ClassifyFn);
 
 /// Every SKU this build ships.
 ///
@@ -67,16 +67,16 @@ pub fn catalog() -> Vec<Row> {
     ::model::catalog()
 }
 
-/// The traced supergraph for `sku`, on `plane`.
+/// The traced supergraph for `sku`, on `platform`.
 ///
 /// # Errors
 ///
 /// When this build's catalog has no such SKU — with the near misses named,
 /// because "unknown model" and "you meant the -bf16 row" are different
 /// operator actions.
-pub fn trace(sku: &str, plane: Plane) -> Result<Plan> {
+pub fn trace(sku: &str, platform: Platform) -> Result<Plan> {
     let trace = ::model::trace_of(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;
-    Ok(trace(plane))
+    Ok(trace(platform))
 }
 
 /// How `sku` sorts a request into the fact word its lanes carry — the fourth
@@ -167,7 +167,7 @@ fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
 ///
 /// When no SKU's contract both builds and fits — with each candidate's
 /// refusal, which is the only diagnosis an operator can act on.
-pub fn identify(checkpoint: &Path, plane: Plane) -> Result<&'static str> {
+pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
     let source = open_source(checkpoint)?;
     let metadata = checkpoint_metadata(checkpoint)?;
     // tp=1: `Shard::Cut` segments still describe the whole tensor, and a rank
@@ -175,10 +175,10 @@ pub fn identify(checkpoint: &Path, plane: Plane) -> Result<&'static str> {
     // budget, neither of which can change whether a tensor's SHAPE is the
     // one the contract declares — which is the only question here — so the
     // one the plan will be traced for is as good as any.
-    let backend = match plane {
-        Plane::Metal => model_loader::types::BackendKind::Metal,
-        Plane::Vulkan | Plane::Wgpu => model_loader::types::BackendKind::Vulkan,
-        Plane::Cuda => model_loader::types::BackendKind::Cuda,
+    let backend = match platform {
+        Platform::Metal => model_loader::types::BackendKind::Metal,
+        Platform::Vulkan | Platform::Wgpu => model_loader::types::BackendKind::Vulkan,
+        Platform::Cuda => model_loader::types::BackendKind::Cuda,
     };
     let target = model_loader::plan::StorageTarget::for_backend(backend, 0, 1);
 
@@ -261,13 +261,13 @@ pub fn contract_for(plan: &Plan, checkpoint: &Path) -> std::result::Result<Model
 /// A checkpoint no SKU claims, or a SKU whose trace this build does not ship.
 pub fn request(
     checkpoint: &Path,
-    plane: Plane,
+    platform: Platform,
     budgets: Budgets,
     ordinal: i32,
 ) -> Result<LoadRequest> {
-    let sku = identify(checkpoint, plane)?;
+    let sku = identify(checkpoint, platform)?;
     Ok(LoadRequest {
-        plan: trace(sku, plane)?,
+        plan: trace(sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
         ordinal,
@@ -283,12 +283,12 @@ pub fn request(
 pub fn request_for(
     sku: &str,
     checkpoint: &Path,
-    plane: Plane,
+    platform: Platform,
     budgets: Budgets,
     ordinal: i32,
 ) -> Result<LoadRequest> {
     Ok(LoadRequest {
-        plan: trace(sku, plane)?,
+        plan: trace(sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
         ordinal,

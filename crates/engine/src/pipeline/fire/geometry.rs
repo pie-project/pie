@@ -595,6 +595,21 @@ impl ReqGeometry {
                     },
                     mask: None,
                     adapter: None,
+                    // **THE TWO EXPORT AXES ARE OFF HERE, AND THAT IS THE
+                    // ADAPTER'S POSITION RESTATED** (palo C3b/C4b). The
+                    // contract carries the intents, the CUDA shell honours
+                    // them end to end, and `stamp_lane_words` reads them into
+                    // the lane's word — so any caller that sets them gets the
+                    // axis. What no path in this crate sets them FROM is a
+                    // per-request ask, because a request has nowhere to state
+                    // one: the PTIR port vocabulary this fire path is
+                    // assembled from names no draft port and no capture port,
+                    // and adding them is the client-facing half this wave
+                    // deliberately did not build (`crate::driver`'s
+                    // `register_adapter` note argues the same boundary for
+                    // the same reason).
+                    drafts: false,
+                    captures_scores: false,
                     readout: match readout.as_slice() {
                         [] => crate::driver::Readout::None,
                         [only] if *only + 1 == rows => crate::driver::Readout::Last,

@@ -1079,7 +1079,30 @@ fn stamp_lane_words(req: &mut crate::driver::FireRequest, fire_wide_mask: bool) 
     let model = crate::model::model();
     for lane in &mut req.lanes {
         let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
-        lane.word = model.word(rows, lane.mask.is_some() || fire_wide_mask);
+        // THE FACTS AFTER THE FIRST ARE READ OFF THE LANE ITSELF, and that is
+        // the whole reason they are stamped here rather than anywhere
+        // earlier: `word` and the intents it names have to be ONE READING OF
+        // ONE LANE, or the shell refuses the fire (`Fault::AdapterWord`,
+        // `Fault::DraftWord`, `Fault::ScoreWord`). Whoever put them on the
+        // lane — the working set, `crate::driver::fire` — has already run by
+        // now, so this asks the lane rather than re-deriving the answers from
+        // the request they came from.
+        //
+        // **THE TWO EXPORT AXES NEEDED NO NEW INSTANT** (palo C3b/C4b). The
+        // mask is why this function exists at all: a lane does not have its
+        // mask until `FireAttnMask::apply_to` has cut the fire's, so a word
+        // stated earlier would be stated before its inputs. `drafts` and
+        // `captures_scores` are not like that — they are on the lane from the
+        // moment the lane is built, and nothing downstream can change them —
+        // so they impose no ordering of their own and simply join the reading
+        // that already happens at the latest of the five instants.
+        lane.word = model.word(
+            rows,
+            lane.mask.is_some() || fire_wide_mask,
+            lane.adapter.is_some(),
+            lane.drafts,
+            lane.captures_scores,
+        );
     }
 }
 
@@ -1205,6 +1228,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
+    // palo D0: the guest thread's own submit, phase by phase. Compiles away
+    // without `profile-fire` (see `scheduler::probe::HostSubmitProbes`).
+    let submit_probe = crate::scheduler::probe::host_submit();
+    let submit_clock = crate::scheduler::probe::ProbeClock::start();
     {
         // Device-geometry pass (Track B): the [B,P] geometry is
         // device-produced (the program traces the wire form in-graph) and
@@ -1236,7 +1263,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // Non-blocking settlement drain (plan §6): resolved fires' KV/RS
         // txns finalize here so arena pins stay bounded by run-ahead depth
         // even when the guest never takes.
-        drain_settled(ctx, Some(&pipe_fires)).await?;
+        {
+            let began = crate::scheduler::probe::ProbeClock::start();
+            drain_settled(ctx, Some(&pipe_fires)).await?;
+            crate::probe_fire_record!(submit_probe.drain_settled_us, began.elapsed());
+        }
         if let Some(error) = pipeline_failed(&pipeline_failure) {
             return Ok(Err(error));
         }
@@ -1291,6 +1322,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             } else {
                 PortMask::NONE
             };
+            let geometry_clock = crate::scheduler::probe::ProbeClock::start();
             let (geometry, attn_mask) = {
                 let bound = &p.instance.program.bound;
                 let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
@@ -1327,6 +1359,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     }
                 }
             };
+            crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
             let accesses = p.instance.program.channel_accesses.clone();
             (
                 geometry,
@@ -1403,6 +1436,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the
         // WorkingSet translation.
+        let kv_clock = crate::scheduler::probe::ProbeClock::start();
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver);
@@ -1564,9 +1598,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
+        crate::probe_fire_record!(submit_probe.kv_prepare_us, kv_clock.elapsed());
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
+        let translation_clock = crate::scheduler::probe::ProbeClock::start();
         let (translation_version, translation) = match ws.translation() {
             Ok(translation) => translation,
             Err(error) => {
@@ -1577,6 +1613,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         req.kv_translation_version = translation_version;
         req.kv_translation = translation.as_ref().to_vec();
+        crate::probe_fire_record!(submit_probe.translation_us, translation_clock.elapsed());
         let completion = ctx
             .resources()
             .get_mut(&fwd)?
@@ -1597,6 +1634,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 container_has_lora_sink(container),
             )
         };
+        let scheduler_clock = crate::scheduler::probe::ProbeClock::start();
         let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
             &scheduler,
             req,
@@ -1614,6 +1652,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         )
         .err()
         .map(|error| format!("{error:#}"));
+        crate::probe_fire_record!(submit_probe.scheduler_submit_us, scheduler_clock.elapsed());
         if let Some(error) = submit_error {
             // The KV/RS transaction guards roll everything back on return.
             let reason = format!("pipeline: submit failed: {error}");
@@ -1623,12 +1662,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
         ticket_reservation.commit();
 
         {
+            let began = crate::scheduler::probe::ProbeClock::start();
             let p = ctx.resources().get_mut(&fwd)?;
             let p = p.bound_mut().map_err(anyhow::Error::msg)?;
             p.kv_declaration_realized = true;
             let (shadow, bound, shadow_cells) =
                 (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
             shadow.advance(bound, shadow_cells);
+            crate::probe_fire_record!(submit_probe.shadow_advance_us, began.elapsed());
         }
 
         pipe_fires
@@ -1646,6 +1687,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 cells,
                 failure: pipeline_failure,
             }));
+        crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
+        crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
     }
 }
@@ -1693,8 +1736,15 @@ pub async fn submit_frame<C: FireContext>(
         let (_, rep) = fired[0];
         return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
     }
-    if let Err(error) = validate_frame(ctx, k, &fired)? {
-        return Ok(Err(error));
+    {
+        let probe = crate::scheduler::probe::host_submit();
+        let began = crate::scheduler::probe::ProbeClock::start();
+        let verdict = validate_frame(ctx, k, &fired)?;
+        crate::probe_fire_record!(probe.validate_frame_us, began.elapsed());
+        crate::probe_fire_count!(probe.validate_frame_calls);
+        if let Err(error) = verdict {
+            return Ok(Err(error));
+        }
     }
     let (lane, seq) = {
         let pipeline = ctx.resources().get(&this)?;

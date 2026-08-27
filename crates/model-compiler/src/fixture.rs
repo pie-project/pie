@@ -10,7 +10,7 @@
 
 use model_ir::ops::{Attention, Collective, Elementwise};
 use model_ir::{
-    CacheRow, Cond, Def, Dim, Dtype, Node, Plan, Plane, RuntimeInput, Seam, StructKind, Ty,
+    CacheRow, Cond, Def, Dim, Dtype, Node, Plan, Platform, RuntimeInput, Seam, StructKind, Ty,
     ValueDecl, ValueId,
 };
 
@@ -21,7 +21,7 @@ pub(crate) struct Build {
 }
 
 /// The ordinary activation rectangle: one row per token, `width` elements
-/// wide, in the plane's activation element.
+/// wide, in the platform's activation element.
 pub(crate) fn act(width: u64) -> Ty {
     Ty::Tensor {
         shape: vec![Dim::Tokens, Dim::Const(width)],
@@ -49,7 +49,7 @@ impl Build {
         Build {
             plan: Plan {
                 name: "hand-built".to_string(),
-                plane: Plane::Cuda,
+                platform: Platform::Cuda,
                 params: Vec::new(),
                 caches: vec![CacheRow::State {
                     name: "state".to_string(),
@@ -144,7 +144,9 @@ impl Build {
     }
 
     /// A prepare node: it defines a `Ty::Struct`, which is the whole rule P5
-    /// reads.
+    /// reads. The reading it states is the one [`Build::decode`] restates —
+    /// one head of width 4, no window — because a schedule and its reader
+    /// disagreeing is a shell refusal rather than a fixture.
     pub(crate) fn prepare(&mut self, cond: Cond) -> ValueId {
         let kv_indptr = self.input(1);
         let kv_indices = self.input(1);
@@ -158,6 +160,10 @@ impl Build {
                 kv_indices,
                 last_page_len,
                 kv_len,
+                q_heads: 1,
+                kv_heads: 1,
+                head_dim: 4,
+                window: None,
                 plan,
             }
             .into(),

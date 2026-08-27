@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use driver_cuda::{Boot, Lane, Shell};
 use model_compiler::Budgets;
-use model_dsl::{Classify, Plane, Request};
+use model_dsl::{Classify, Platform, Request};
 
 /// The catalog row this smoke serves, spelled as the catalog spells it.
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -212,7 +212,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     // The engine's half: trace the row, state the load contract. Neither is
     // the shell's — `Plan` crosses the boundary, `Baked` never does.
     let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
-    let plan = trace(Plane::Cuda);
+    let plan = trace(Platform::Cuda);
     // A stock safetensors snapshot, projected into the one object model the
     // contract algebra speaks. `Source::open` would refuse it — that door is
     // for a canonical `.zt`.

@@ -74,8 +74,13 @@ pub struct CacheTable(pub Vec<CachePool>);
 /// names `kv_indptr` as a device input, and [`Run::tensor`] serves it to
 /// launches; but the plan builders are host functions that walk its
 /// *contents*, and a device handle cannot be read host-side. So the shell
-/// binds the same vector twice, and this seat is the host twin — plus the
-/// carved facts the builders take beside it.
+/// binds the same vector twice, and this seat is the host twin.
+///
+/// **THE TWINS ARE THE SPACE'S; THE READING IS THE SCHEDULE'S.** Shape,
+/// window and workspace used to sit here and moved to [`ScheduleSeat`] in
+/// C1b, because a page-id space says which page a token lands in and nothing
+/// about how wide that row is or how far back a reader may look — and gemma
+/// states two answers to both over one sequence.
 ///
 /// Bound only for cache spaces a plan op names; a plan op firing over a
 /// space with no planning seat is a binding bug and panics.
@@ -91,54 +96,37 @@ pub struct CachePlanning {
     /// `kv_indptr`: the device tensor serves launches, this twin serves the
     /// host planners.
     pub kv_len: Vec<i32>,
-
-    /// The kv-side shape this space's plans are carved at. The consuming
-    /// ops restate `head_dim`/`kv_heads` and the entries refuse a
-    /// disagreement; for a latent (mla) space, `head_dim` is the output
-    /// head width the schedule sizes at.
-    pub shape: Shape,
-
-    /// The sliding window this space's schedules are carved for; the
-    /// entries check each consumer's stated window against the plan.
-    pub window: Option<u32>,
-
-    /// The decode plan's workspace grant. Grants are disjoint carvings of
-    /// the shell's bounded pool — one per plan kind, because their staged
-    /// int images coexist within a fire.
-    pub decode_workspace: Option<Workspace>,
-
-    /// The prefill (fa2 or sm90) plan's workspace grant.
-    pub prefill_workspace: Option<Workspace>,
-
-    /// The mla plan's workspace grant.
-    pub mla_workspace: Option<Workspace>,
 }
 
-impl CachePlanning {
-    /// The decode grant, or a sentence: an ungranted workspace is a binding
-    /// bug, not a backend refusal.
-    #[must_use]
-    pub fn decode_grant(&self) -> Workspace {
-        self.decode_workspace.unwrap_or_else(|| {
-            panic!("this cache space grants no decode-plan workspace, which the shell carves before a decode plan op can fire")
-        })
-    }
+/// What ONE attention schedule is carved for, and where it is staged.
+///
+/// **KEYED BY THE PLAN VALUE, NOT BY THE SPACE** (build log 20's first
+/// blocker). A page-id space says which page a token lands in; it says
+/// nothing about how wide that row is or how far back a reader may look, and
+/// gemma states two answers to both over one sequence. So the reading and the
+/// grant belong to the schedule that was carved for them, and a family that
+/// carves two mints two plan values — which is also what makes each one's
+/// staged int image its own.
+///
+/// The reading itself comes off the PLAN OP: `Attention::PlanDecode` and its
+/// two siblings state the query heads, kv heads, head width and window their
+/// schedule is carved for, and `store::kv::probe` seats what they say. The
+/// launches restate their share and the shell refuses a disagreement.
+#[derive(Clone, Copy, Debug)]
+pub struct ScheduleSeat {
+    /// The kv-side shape this schedule is carved at, at the FIRE's lanes;
+    /// [`Run::planning`] narrows `num_requests` to the asking node's window.
+    /// The consuming ops restate `head_dim`/`kv_heads` and the entries refuse
+    /// a disagreement; for a latent (mla) schedule, `head_dim` is the output
+    /// head width it sizes at.
+    pub shape: Shape,
 
-    /// The prefill grant.
-    #[must_use]
-    pub fn prefill_grant(&self) -> Workspace {
-        self.prefill_workspace.unwrap_or_else(|| {
-            panic!("this cache space grants no prefill-plan workspace, which the shell carves before a prefill plan op can fire")
-        })
-    }
+    /// The sliding window this schedule carved its kv spans for; the entries
+    /// check each consumer's stated window against it.
+    pub window: Option<u32>,
 
-    /// The mla grant.
-    #[must_use]
-    pub fn mla_grant(&self) -> Workspace {
-        self.mla_workspace.unwrap_or_else(|| {
-            panic!("this cache space grants no mla-plan workspace, which the shell carves before an mla plan op can fire")
-        })
-    }
+    /// Where the built schedule's staged image lands.
+    pub workspace: Workspace,
 }
 
 /// One cache space's planning twin, CUT TO THE WINDOW of the node asking.
@@ -163,29 +151,10 @@ pub struct Planning<'a> {
     pub kv_len: &'a [i32],
     /// The kv-side shape, at this window's request count.
     pub shape: Shape,
-    /// The sliding window this space's schedules are carved for.
+    /// The sliding window this schedule is carved for.
     pub window: Option<u32>,
-    seat: &'a CachePlanning,
-}
-
-impl Planning<'_> {
-    /// The decode plan's workspace grant.
-    #[must_use]
-    pub fn decode_grant(&self) -> Workspace {
-        self.seat.decode_grant()
-    }
-
-    /// The prefill plan's grant.
-    #[must_use]
-    pub fn prefill_grant(&self) -> Workspace {
-        self.seat.prefill_grant()
-    }
-
-    /// The mla plan's grant.
-    #[must_use]
-    pub fn mla_grant(&self) -> Workspace {
-        self.seat.mla_grant()
-    }
+    /// Where the built schedule's staged image lands.
+    pub workspace: Workspace,
 }
 
 /// The geometry one cache space declared: the device seats the ops read,
@@ -310,10 +279,31 @@ pub struct FireBindings {
     /// token.
     pub positions: Tensor,
 
+    /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row,
+    /// `-1` for a row whose lane registered none.
+    ///
+    /// **HERE AND NOT IN [`FireTables`], BECAUSE AN OP NAMES IT.** Everything
+    /// on `tables` is a seat no `Operands` impl mentions — the driver side of
+    /// a `MENLO-SEAM` marker. This one is a declared `RuntimeInput` that
+    /// `linear.lora_correct` lists among its inputs, so it stands beside
+    /// `tokens` and `positions`, which are the other two fire-wide op-visible
+    /// vectors keyed by nothing.
+    ///
+    /// `None` for a fire no lane carried an adapter into, and that absence is
+    /// load-bearing: it is the same statement `mask` makes — nothing staged,
+    /// no seat bound, and the axis costs the fire zero bytes and zero
+    /// launches, because its window is empty and the walk skips it.
+    pub adapter_routes: Option<Tensor>,
+
     /// Per cache space, aligned with `Plan::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space, and
     /// the plan-building arms route to row `cache`'s planning twin.
     pub geometry: Vec<CacheGeometry>,
+
+    /// Per PLAN VALUE, by `Plan::values` id: the reading that schedule is
+    /// carved for and the grant it stages into. `None` for every value that
+    /// is not a plan struct some launch consumes.
+    pub schedules: Vec<Option<ScheduleSeat>>,
 
     /// The seam extras the arms bind beside the ops' named operands.
     pub tables: FireTables,
@@ -401,6 +391,18 @@ pub struct Run<'c> {
     /// MECHANISM**: it turns every resolution below from "the fire's
     /// rectangle" into "this node's window of it".
     region: &'c Cell<u32>,
+
+    /// P6's side-stream contexts, in stream order: `side[0]` is stream 1.
+    ///
+    /// **EMPTY IS THE EAGER MODE AND IT IS NOT A DEGRADATION.** A `Run` built
+    /// with no side contexts fires everything on the main one, which is the
+    /// serialization of the compiler's dependency DAG — a legal schedule of it
+    /// by construction, and the golden every recorded fire is diffed against.
+    side: &'c [&'c Ctx],
+
+    /// Which stream the walk is on, written by the same `Cursor` that writes
+    /// [`region`](Run::region), at the same instant and for the same reason.
+    stream: &'c Cell<u32>,
 }
 
 impl<'c> Run<'c> {
@@ -426,12 +428,47 @@ impl<'c> Run<'c> {
             fire,
             windows,
             region,
+            side: &[],
+            stream: region,
         }
     }
 
-    /// The stream context, for the arms.
+    /// The same `Run`, told where P6's side streams are.
+    ///
+    /// ADDITIVE, AND THE CALLER CHOOSES PER PASS. `record.rs` builds one `Run`
+    /// per fire and walks it twice — eagerly for the numbers, then capturing —
+    /// and only the capturing walk is handed the streams, because a capture is
+    /// where an event is a graph edge and an eager fire is where it would be a
+    /// real synchronization bought for nothing.
+    #[must_use]
+    pub fn across(mut self, side: &'c [&'c Ctx], stream: &'c Cell<u32>) -> Self {
+        self.side = side;
+        self.stream = stream;
+        self
+    }
+
+    /// The stream context the node being dispatched fires on, for the arms.
+    ///
+    /// **THE ONE PLACE A SIDE STREAM ENTERS THE DISPATCH PLANE**, and it is a
+    /// lookup rather than a decision: which stream a region belongs on was
+    /// decided once, at compile, by `model_compiler::stream`, and the `Cursor`
+    /// wrote it into a cell before this region's first node. A stream the load
+    /// never opened resolves back to the main one — the cursor has already
+    /// stopped the walk with `Fault::Unbound` naming it, and answering a null
+    /// handle here would turn that refusal into a launch.
     pub(crate) fn ctx(&self) -> &'c Ctx {
-        self.ctx
+        // The eager reading, asked first and by the field that MEANS it: a
+        // `Run` with no side contexts was never given a stream cell either,
+        // and `new` seats the region cell there so the type has something to
+        // hold. Reading a region index as a stream index is exactly the bug
+        // this line exists to make impossible.
+        if self.side.is_empty() {
+            return self.ctx;
+        }
+        match self.stream.get() {
+            0 => self.ctx,
+            n => self.side.get(n as usize - 1).copied().unwrap_or(self.ctx),
+        }
     }
 
     /// The fire bindings, for the plan-building arms' seam.
@@ -583,6 +620,22 @@ impl<'c> Run<'c> {
                     panic!(
                         "value {at} reads the mask bits of cache space {space}, which \
                          this fire left unbound"
+                    )
+                })
+            }
+            // THE ADAPTER AXIS'S ONE RUNTIME INPUT (design §8). Bound only
+            // when a lane of this fire carried an adapter — a fire none did
+            // stages nothing, and nothing can reach this arm either, because
+            // the correction's window is empty and the walk skips a zero-row
+            // region before it dispatches a node. So the panic is not a hole:
+            // it is the same "unbound seat" statement the mask makes one arm
+            // up, and reaching it means a word said `has_adapter` where the
+            // submission said no adapter — which `Fault::AdapterWord` refuses
+            // before anything launches.
+            Def::Input(RuntimeInput::AdapterRoutes) => {
+                self.fire.adapter_routes.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's adapter ids, which no lane of it                          carried"
                     )
                 })
             }
@@ -742,12 +795,19 @@ impl<'c> Run<'c> {
         })
     }
 
-    /// The planning twin of the cache space a plan op's geometry input
-    /// names, cut to the plan op's own window. The op states `kv_indptr` as a
-    /// device value; its `Def` says which space that is, and the space's
-    /// [`CachePlanning`] holds what the builders actually walk — the duality,
-    /// routed in one place, and windowed in the same one.
-    pub(crate) fn planning(&self, geom: ValueId) -> Planning<'_> {
+    /// Everything a plan op's builder takes, in one place: the host geometry
+    /// twins of the cache space its `kv_indptr` names, cut to the op's own
+    /// window, beside the reading and the grant of the SCHEDULE it defines.
+    ///
+    /// Two keys, because they are two facts. `kv_indptr` is a device value
+    /// whose `Def` says which space it is, and the space's
+    /// [`CachePlanning`] holds the twin the builders actually walk — the
+    /// duality, routed in one place and windowed in the same one. `plan` is
+    /// the struct value the op DEFINES, and its [`ScheduleSeat`] holds the
+    /// head width, the query heads and the window this carving is for; a
+    /// family that reads its one page-id space at two of those mints two plan
+    /// values (build log 20's first blocker).
+    pub(crate) fn planning(&self, geom: ValueId, plan: ValueId) -> Planning<'_> {
         let at = geom.0 as usize;
         let Def::Input(RuntimeInput::Geometry { space, .. }) = &self.values[at].def else {
             panic!(
@@ -759,9 +819,23 @@ impl<'c> Run<'c> {
         let seat = seat.planning.as_ref().unwrap_or_else(|| {
             panic!(
                 "cache space {space} carries no planning seat; the shell binds the host \
-                 geometry and plan facts before a plan op can fire"
+                 geometry twins before a plan op can fire"
             )
         });
+        let schedule = self
+            .fire
+            .schedules
+            .get(plan.0 as usize)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| {
+                panic!(
+                    "plan value {} carries no schedule seat; the shell reads every \
+                     schedule's reading off the plan op that defines it, so a plan op \
+                     firing without one is a value `store::kv::probe` never walked",
+                    plan.0
+                )
+            });
         let window = self.window().span;
         let first = window.lane_offset as usize;
         let lanes = window.lanes as usize;
@@ -776,10 +850,10 @@ impl<'c> Run<'c> {
                 .unwrap_or(&seat.kv_len),
             shape: Shape {
                 num_requests: window.lanes,
-                ..seat.shape
+                ..schedule.shape
             },
-            window: seat.window,
-            seat,
+            window: schedule.window,
+            workspace: schedule.workspace,
         }
     }
 

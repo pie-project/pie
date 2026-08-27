@@ -189,6 +189,16 @@ impl DispatchLinear for Run<'_> {
                     self.tensor(*y),
                 )
             }
+            // **THE CORRECTION CLASS IS NOT ON THIS PLANE** (palo C2). An
+            // honest per-op refusal and not a fake: `kernels-metal` stamps no
+            // routed low-rank pair, and a silently-skipped correction is a
+            // lane that asked for an adapter and got the base model — which
+            // is exactly the wrong output design §8 makes the capacity a
+            // budget to avoid. The arm exists because the match is total by
+            // construction; what would fill it is a metal `linear::lora`.
+            Linear::LoraCorrect { .. } => Err(KernelError::Unsupported {
+                op: "linear.lora_correct",
+            }),
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),

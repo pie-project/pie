@@ -50,12 +50,25 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    /// Inter-batch bubble histogram (always-on, HOST PROXY) — one count per fire,
-    /// bucketed by [`BUBBLE_HIST_UPPER_US`]. Yields a true p50/p99 (the masterplan
-    /// gate) across ALL fires (0 when enqueue-ahead covered the gap), unlike the
-    /// probe-gated `fire.quorum.inter_batch_bubble_us` accumulator (average,
-    /// non-zero only). The host stamp includes scheduler wake/submit overhead, so
-    /// it is a conservative upper-bound measurement.
+    /// Inter-batch bubble histogram (always-on, HOST PROXY), bucketed by
+    /// [`BUBBLE_HIST_UPPER_US`].
+    ///
+    /// **ONE COUNT PER STARVATION, NOT PER FIRE** — and the difference is not
+    /// pedantic. [`crate::scheduler::frame::FramePolicy`] records here only
+    /// when a frame is posted with nothing executing; a boundary the run-ahead
+    /// window covered adds no entry at all, zero or otherwise. So the p50 is a
+    /// median over the gaps that HAPPENED and says nothing about how often
+    /// they happen, and two arms with different starvation RATES are not
+    /// comparable through it: a fully pipelined lane whose only gaps are the
+    /// first and last of a launch reads a high p50 off two samples, while a
+    /// lockstep lane that starves on every single token reads a low one off
+    /// hundreds. Palo D0 lost time to exactly that reading (build log 19's
+    /// "bubble p50 rises 8×"). The figure to compare is
+    /// `fire.quorum.device_idle_us / total_tokens`, with
+    /// `device_idle_gaps` beside it as the rate.
+    ///
+    /// The host stamp includes scheduler wake/submit overhead, so each sample
+    /// is a conservative upper bound on the gap it measures.
     pub bubble_us_hist: [AtomicU64; BUBBLE_HIST_UPPER_US.len()],
     // ── Fire-domain probes (gated behind `profile-fire` feature). ───────────
     //
@@ -151,10 +164,16 @@ pub struct AggregateStats {
     /// `profile-fire`. Mirrors `crate::scheduler::probe::FireProbes`.
     pub fire: FireStats,
 
-    /// Inter-batch bubble histogram (one count per fire), bucketed by
-    /// [`BUBBLE_HIST_UPPER_US`] — for the p50/p99 bubble gate (masterplan M1).
-    /// HOST PROXY (device-idle stamped at the Rust enqueue point → over-counts by
-    /// the host submit/handshake delay). See [`Self::bubble_p50`].
+    /// The guest thread's own submit cost, phase by phase (palo D0). Zero
+    /// without `profile-fire`, and process-global rather than per-driver
+    /// because a submit runs on the guest's task.
+    pub host_submit: HostSubmitStats,
+
+    /// Inter-batch bubble histogram — for the p50/p99 bubble gate (masterplan
+    /// M1). HOST PROXY (device-idle stamped at the Rust enqueue point →
+    /// over-counts by the host submit/handshake delay). See
+    /// [`Self::bubble_p50`], and [`SchedulerStats::bubble_us_hist`] for what
+    /// its denominator is — one count per STARVATION, not per fire.
     pub bubble_us_hist: [u64; BUBBLE_HIST_UPPER_US.len()],
 }
 
@@ -305,6 +324,23 @@ pub struct ExecuteStats {
     pub driver_fire_us_sum: u64,
 }
 
+/// Guest-thread submit phases (palo D0). Mirrors
+/// [`crate::scheduler::probe::HostSubmitProbes`]; every field is a cumulative
+/// sum in microseconds beside the count that divides it.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct HostSubmitStats {
+    pub submits: u64,
+    pub total_us: u64,
+    pub drain_settled_us: u64,
+    pub geometry_us: u64,
+    pub kv_prepare_us: u64,
+    pub translation_us: u64,
+    pub scheduler_submit_us: u64,
+    pub shadow_advance_us: u64,
+    pub validate_frame_us: u64,
+    pub validate_frame_calls: u64,
+}
+
 #[derive(Debug, Default, serde::Serialize)]
 pub struct PostDispatchStats {
     pub avg_context_tick_us: u64,
@@ -448,6 +484,24 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         last_batch_latency_us: last_latency,
         cumulative_batch_latency_us: cumulative_latency,
         avg_batch_latency_us: avg(cumulative_latency),
+        host_submit: {
+            // Process-global, so it is READ here rather than summed over the
+            // per-driver slots — folding it into the same snapshot keeps one
+            // door for telemetry.
+            let h = crate::scheduler::probe::host_submit();
+            HostSubmitStats {
+                submits: h.submits.load(Relaxed),
+                total_us: h.total_us.load(Relaxed),
+                drain_settled_us: h.drain_settled_us.load(Relaxed),
+                geometry_us: h.geometry_us.load(Relaxed),
+                kv_prepare_us: h.kv_prepare_us.load(Relaxed),
+                translation_us: h.translation_us.load(Relaxed),
+                scheduler_submit_us: h.scheduler_submit_us.load(Relaxed),
+                shadow_advance_us: h.shadow_advance_us.load(Relaxed),
+                validate_frame_us: h.validate_frame_us.load(Relaxed),
+                validate_frame_calls: h.validate_frame_calls.load(Relaxed),
+            }
+        },
         fire: FireStats {
             avg_inter_fire_us: avg_pair(fire_inter),
             avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),

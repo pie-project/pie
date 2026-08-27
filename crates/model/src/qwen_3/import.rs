@@ -1,7 +1,7 @@
 use model_loader::contract::{Expr, ModelContract, TensorType};
 
 use super::model::{Head, Mixer, Mlp, Model};
-use crate::contract::{ALIGNMENT, ModelError, copy, declare, fused};
+use crate::contract::{ALIGNMENT, ModelError, copy, declare, extents, fused};
 
 impl Model {
     pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
@@ -130,6 +130,135 @@ impl Model {
             }
         }
 
+        // **THE DRAFT HEAD, VERIFIED BYTE-FOR-BYTE AGAINST THE CACHED
+        // CHECKPOINT INDEX.** Fifteen tensors under `mtp.*` in
+        // `models--Qwen--Qwen3.6-27B` at snapshot `6a9e13bd`, read out of
+        // `model.safetensors.index.json` and the shard headers it names:
+        //
+        // ```text
+        // mtp.fc.weight                                 BF16 [5120, 10240]
+        // mtp.pre_fc_norm_embedding.weight              BF16 [5120]
+        // mtp.pre_fc_norm_hidden.weight                 BF16 [5120]
+        // mtp.layers.0.input_layernorm.weight           BF16 [5120]
+        // mtp.layers.0.self_attn.q_proj.weight          BF16 [12288, 5120]
+        // mtp.layers.0.self_attn.k_proj.weight          BF16 [1024, 5120]
+        // mtp.layers.0.self_attn.v_proj.weight          BF16 [1024, 5120]
+        // mtp.layers.0.self_attn.o_proj.weight          BF16 [5120, 6144]
+        // mtp.layers.0.self_attn.q_norm.weight          BF16 [256]
+        // mtp.layers.0.self_attn.k_norm.weight          BF16 [256]
+        // mtp.layers.0.post_attention_layernorm.weight  BF16 [5120]
+        // mtp.layers.0.mlp.gate_proj.weight             BF16 [17408, 5120]
+        // mtp.layers.0.mlp.up_proj.weight               BF16 [17408, 5120]
+        // mtp.layers.0.mlp.down_proj.weight             BF16 [5120, 17408]
+        // mtp.norm.weight                               BF16 [5120]
+        // ```
+        //
+        // Every attention and mlp shape is a trunk attention layer's, tensor
+        // for tensor (compare `model.language_model.layers.3.self_attn.*` and
+        // `layers.0.mlp.*`), which is what makes `Mtp` reuse `gated_attn` and
+        // `dense_mlp` rather than restate them.
+        //
+        // **NO `mtp.lm_head` AND NO `mtp.embed_tokens`**, and the config says
+        // so before the index does: `mtp_use_dedicated_embeddings: false`. The
+        // draft readout goes through `lm_head.weight` and the draft embedding
+        // through `model.language_model.embed_tokens.weight` — the base
+        // planes, already claimed above, interned once by the recorder and
+        // read by both heads.
+        if let Some(mtp) = &self.mtp {
+            tensors.push(copy(
+                src,
+                &mtp.pre_fc_norm_embedding,
+                "mtp.pre_fc_norm_embedding.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &mtp.pre_fc_norm_hidden,
+                "mtp.pre_fc_norm_hidden.weight",
+            )?);
+
+            // THE ONE STORED BANK, CUT AT ITS OWN SEAM. `mtp.fc.weight` is
+            // `[hidden, 2·hidden]` and multiplies `[normed embedding | normed
+            // hidden]`, so its columns `0..hidden` are the embedding half and
+            // `hidden..2·hidden` the hidden half — the order dev concatenates
+            // in (`launch_concat_bf16_rows(ws.q, ws.y, ...)`, `ws.q` holding
+            // `rms(embed(tok))` and `ws.y` holding `rms(hidden)`). The slice
+            // is the whole of the claim: no cast, no transpose, two contiguous
+            // column bands of one tensor.
+            let half = extents(&mtp.fc_embed)[1];
+            tensors.push(declare(
+                src,
+                &mtp.fc_embed,
+                Expr::src("mtp.fc.weight").slice(1, 0, half),
+            )?);
+            tensors.push(declare(
+                src,
+                &mtp.fc_hidden,
+                Expr::src("mtp.fc.weight").slice(1, half, half),
+            )?);
+
+            let a = &mtp.attn;
+            tensors.push(copy(
+                src,
+                &mtp.mixer_norm,
+                "mtp.layers.0.input_layernorm.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &a.qg_proj,
+                "mtp.layers.0.self_attn.q_proj.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &a.k_proj,
+                "mtp.layers.0.self_attn.k_proj.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &a.v_proj,
+                "mtp.layers.0.self_attn.v_proj.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &a.o_proj,
+                "mtp.layers.0.self_attn.o_proj.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &a.q_norm,
+                "mtp.layers.0.self_attn.q_norm.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &a.k_norm,
+                "mtp.layers.0.self_attn.k_norm.weight",
+            )?);
+            tensors.push(copy(
+                src,
+                &mtp.mlp_norm,
+                "mtp.layers.0.post_attention_layernorm.weight",
+            )?);
+            match &mtp.mlp {
+                Mlp::Dense { gate_up, down, .. } => {
+                    tensors.push(fused(
+                        src,
+                        gate_up,
+                        [
+                            "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+                            "mtp.layers.0.mlp.up_proj.weight".to_string(),
+                        ],
+                    )?);
+                    tensors.push(copy(src, down, "mtp.layers.0.mlp.down_proj.weight")?);
+                }
+                Mlp::Routed { .. } => {
+                    return Err(ModelError::Illegible {
+                        name: "mtp.layers.0.mlp".to_string(),
+                        detail: "a draft head is one block and routes to no experts".to_string(),
+                    });
+                }
+            }
+            tensors.push(copy(src, &mtp.norm, "mtp.norm.weight")?);
+        }
+
         Ok(ModelContract {
             alignment: ALIGNMENT,
             tensors,
@@ -139,6 +268,22 @@ impl Model {
     }
 
     pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
+        // **A NAMED REFUSAL, NOT A SILENT HALF-LOAD.** GGUF has no settled
+        // spelling for this family's draft head — nothing in the cached
+        // artifacts states one, and inventing `blk.*.nextn.*` here would
+        // publish a contract whose names no converter writes and whose first
+        // symptom is a load that lands fourteen planes and zeroes the
+        // fifteenth. A SKU that declares a head and reads a file that cannot
+        // state one is refused at the door, by name.
+        if self.mtp.is_some() {
+            return Err(ModelError::Illegible {
+                name: "mtp".to_string(),
+                detail: "this SKU declares an MTP draft head and no GGUF \
+                         spelling of one is settled; import it from the \
+                         safetensors checkpoint"
+                    .to_string(),
+            });
+        }
         let mut tensors = vec![
             copy(src, &self.embed, "token_embd.weight")?,
             copy(src, &self.final_norm, "output_norm.weight")?,

@@ -437,6 +437,31 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
                     // and a merge is where this pass faults.
                     if plan.nodes.get(i).is_some_and(|n| n.cond.holds(word)) {
                         walk.demand(i, &mut node_mask);
+                    } else if let Some(through) = passes_through(plan, i, id) {
+                        // **A GUARDED IN-PLACE OP IS A PASS-THROUGH IN THE
+                        // CLASSES IT SKIPS** — palo design §8's correction
+                        // class, in the one pass that had to learn it.
+                        //
+                        // `linear.lora_correct` writes THROUGH the value it
+                        // corrects: `y_out` aliases `y`, one arena column,
+                        // and a class outside the adapter window simply never
+                        // runs the node and reads what the trunk already put
+                        // there. That is the identity for free — no merge, no
+                        // arm, no φ — and it is the whole reason the axis
+                        // costs a fire with no adapter lane nothing at all.
+                        //
+                        // But a demand walk that stopped here would conclude
+                        // that NOTHING produces `y_out` in those classes, and
+                        // therefore that the trunk which produces `y` is dead
+                        // in them. So the alias is followed: the demand moves
+                        // from the overwrite to the value it would have
+                        // overwritten, which is exactly what the fire will
+                        // read.
+                        //
+                        // Stated over `Operands::aliases` rather than over an
+                        // op list, so it is a fact about the IR and not a
+                        // table somebody has to remember to add to.
+                        walk.stack.push(through);
                     }
                 }
                 // A merge arm is a CONDITIONAL read: exactly one arm writes
@@ -526,6 +551,26 @@ fn intern<'a>(guards: &mut Vec<&'a Cond>, cond: &'a Cond) -> usize {
         guards.push(cond);
         guards.len() - 1
     })
+}
+
+/// The value a skipped in-place node would have left standing at `id`.
+///
+/// `Some(input)` when node `i` declares `id` as the `out` of an
+/// `Operands::aliases` pair — the SSA form of "this op overwrites its
+/// operand", which the compiler folds onto one arena slot. In a class that
+/// does not run the node, that slot holds the operand, so a reader of `id`
+/// reads `input`.
+///
+/// `None` for every other output, and that is the standing rule this is the
+/// one exception to: a value whose producer the class does not run is a hole,
+/// and the only legal way to reach one is a merge arm.
+fn passes_through(plan: &Plan, i: usize, id: ValueId) -> Option<ValueId> {
+    let mut aliases = Vec::new();
+    plan.nodes.get(i)?.op.aliases(&mut aliases);
+    aliases
+        .into_iter()
+        .find(|(out, _)| *out == id)
+        .map(|(_, input)| input)
 }
 
 /// Does this op write a cache — is it demanded for its effect, whatever a
@@ -638,7 +683,7 @@ mod tests {
             Build {
                 plan: Plan {
                     name: "hand-built".to_string(),
-                    plane: crate::Plane::Cuda,
+                    platform: crate::Platform::Cuda,
                     params: Vec::new(),
                     caches: vec![crate::CacheRow::State {
                         name: "state".to_string(),

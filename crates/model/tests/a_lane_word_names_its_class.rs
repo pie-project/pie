@@ -12,11 +12,16 @@
 //! what the engine shipped while the column did not exist), which runs, and
 //! returns a plausible token computed by the wrong kernel over the wrong rows.
 
-use model_dsl::{Attention, Operation, Plane, resolve_classes};
+use model_dsl::{Attention, Operation, Platform, resolve_classes};
 
-/// Every plane a plan can be traced at — a model text may emit a different op
-/// per plane, so a class table is per plane too.
-const PLANES: [Plane; 4] = [Plane::Cuda, Plane::Metal, Plane::Wgpu, Plane::Vulkan];
+/// Every platform a plan can be traced at — a model text may emit a different
+/// op per platform, so a class table is per platform too.
+const PLATFORMS: [Platform; 4] = [
+    Platform::Cuda,
+    Platform::Metal,
+    Platform::Wgpu,
+    Platform::Vulkan,
+];
 
 /// The row the assertion below is written against: one qwen SKU, whose
 /// `Facts` is the one bit `qo_one` and whose attention splits on it.
@@ -36,8 +41,8 @@ fn a_one_token_lane_lands_in_the_decode_class() {
     let trace = model::trace_of(QWEN).expect("this build ships the qwen row");
     let classify = model::classify_of(QWEN).expect("and its classifier");
 
-    for plane in PLANES {
-        let plan = trace(plane);
+    for platform in PLATFORMS {
+        let plan = trace(platform);
         let classes = resolve_classes(&plan).expect("the qwen plan resolves every merge");
 
         // The sweep enumerates only the bits some GUARD reads; the word packs
@@ -47,19 +52,19 @@ fn a_one_token_lane_lands_in_the_decode_class() {
         let prefill_word = classify(&model::Request::new(8, false)) & classes.mask;
         assert_ne!(
             decode_word, prefill_word,
-            "{plane:?}: a one-token lane and an eight-token lane are the same \
+            "{platform:?}: a one-token lane and an eight-token lane are the same \
              word, so `qo_one` is not a fact this classifier computes"
         );
 
         let decode = classes
             .class_of(decode_word)
-            .unwrap_or_else(|| panic!("{plane:?}: word {decode_word} names no class"));
+            .unwrap_or_else(|| panic!("{platform:?}: word {decode_word} names no class"));
         let prefill = classes
             .class_of(prefill_word)
-            .unwrap_or_else(|| panic!("{plane:?}: word {prefill_word} names no class"));
+            .unwrap_or_else(|| panic!("{platform:?}: word {prefill_word} names no class"));
         assert_ne!(
             decode, prefill,
-            "{plane:?}: both shapes compose as one class, so every fire runs \
+            "{platform:?}: both shapes compose as one class, so every fire runs \
              one attention kernel over both"
         );
 
@@ -84,13 +89,13 @@ fn a_one_token_lane_lands_in_the_decode_class() {
         assert_eq!(
             kernels(decode),
             (true, false),
-            "{plane:?}: the class a one-token lane composes as must run the \
+            "{platform:?}: the class a one-token lane composes as must run the \
              decode attention and only it"
         );
         assert_eq!(
             kernels(prefill),
             (false, true),
-            "{plane:?}: the class a multi-token lane composes as must run the \
+            "{platform:?}: the class a multi-token lane composes as must run the \
              prefill attention and only it"
         );
     }
@@ -108,21 +113,40 @@ fn every_sku_classifies_into_its_own_plan() {
     let mut faults = Vec::new();
 
     for (sku, _, trace, classify) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let Ok(classes) = resolve_classes(&plan) else {
                 continue; // `every_class_resolves_every_merge` is what says so.
             };
-            // The two shapes every fire is made of, and the mask fact beside
-            // them: four requests cover every bit any shipped `Facts` reads.
-            for (rows, masked) in [(1, false), (8, false), (1, true), (8, true)] {
-                let word = classify(&model::Request::new(rows, masked)) & classes.mask;
-                if classes.class_of(word).is_none() {
-                    faults.push(format!(
-                        "`{sku}` as {plane:?}: a {rows}-row lane with \
-                         masked={masked} classifies to word {word}, which names \
-                         no class of its own plan"
-                    ));
+            // The two shapes every fire is made of, and every axis fact
+            // beside them. **THE SWEEP IS THE PRODUCT AND NOT A SAMPLE**: a
+            // lane may set any combination — a masked drafting lane routed to
+            // an adapter is a legal submission — and the class table has to
+            // name every one of them. Thirty-two requests cover every bit any
+            // shipped `Facts` reads, which is what keeps a new axis from
+            // arriving with a corner nobody asked about.
+            for rows in [1, 8] {
+                for masked in [false, true] {
+                    for adapted in [false, true] {
+                        for drafts in [false, true] {
+                            for scores in [false, true] {
+                                let r = model::Request::new(rows, masked)
+                                    .adapted(adapted)
+                                    .drafting(drafts)
+                                    .capturing_scores(scores);
+                                let word = classify(&r) & classes.mask;
+                                if classes.class_of(word).is_none() {
+                                    faults.push(format!(
+                                        "`{sku}` as {platform:?}: a {rows}-row lane \
+                                         with masked={masked} adapted={adapted} \
+                                         drafts={drafts} scores={scores} \
+                                         classifies to word {word}, which names \
+                                         no class of its own plan"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -1,6 +1,4 @@
-use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
 
 use super::model::{Hyper, Mix, Mlp, Model};
 
@@ -35,10 +33,14 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            c.kv(kv, at.kv.clone(), [1, at.heads as u64 * at.head_dim as u64]);
+            c.kv(
+                kv,
+                at.kv.clone(),
+                [self.heads as u64 * self.head_dim as u64],
+            );
             if let Some(p) = &at.pool {
                 let pool = c.kv_space(self.kv);
-                c.kv(pool, p.entries.clone(), [1, at.head_dim as u64]);
+                c.kv(pool, p.entries.clone(), [self.head_dim as u64]);
             }
         }
         c
@@ -49,9 +51,13 @@ impl ForwardHybrid for Model {
         let hy = &m.hyper;
 
         let positions = inputs.positions();
-        let plan_p = inputs.plan_prefill();
-        let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
-        let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
+        // ONE SCHEDULE, UNSPLIT — every class here reads prefill, so the carving
+        // is built off the whole inputs rather than one class's arm, and no
+        // reader falls outside its guard. It is carved once for the model's one
+        // reading and every layer reads it; the kv heads are stated as the query
+        // heads because the latent plane is shared, which is exactly what each
+        // `prefill_lse` restates below.
+        let plan_p = ops::attn::plan_prefill(&inputs, m.heads, m.heads, m.head_dim, Some(m.window));
         let ids = inputs.tokens();
         let mut streams =
             ops::elemwise::hc_expand(&ops::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
@@ -59,6 +65,8 @@ impl ForwardHybrid for Model {
         for (_, w) in inputs.walk_layers(&m.layers) {
             let at = &w.attn;
             let pages = inputs.kv(&at.kv);
+            let write_page = inputs.write_page(&at.kv);
+            let write_offset = inputs.write_offset(&at.kv);
             let pos = &positions;
 
             let (x, post_mix, comb_mix) = gate(&streams, &w.attn_mix, hy);
@@ -66,10 +74,10 @@ impl ForwardHybrid for Model {
             let q = ops::linear::matmul(&x, &at.q_down);
             let q = ops::elemwise::rmsnorm(&q, &at.q_norm, at.q_norm_eps);
             let q = ops::linear::matmul(&q, &at.q_up);
-            let q = ops::elemwise::rmsnorm_no_scale(&q, at.head_dim, at.q_norm_eps);
+            let q = ops::elemwise::rmsnorm_no_scale(&q, m.head_dim, at.q_norm_eps);
 
             let q =
-                ops::elemwise::rope_partial_last(&q, pos, at.rope_dim, at.head_dim, at.theta, true);
+                ops::elemwise::rope_partial_last(&q, pos, at.rope_dim, m.head_dim, at.theta, true);
             seam::at(seam::ATTN_Q, &[&q]);
 
             let plane = ops::linear::matmul(&x, &at.kv_down);
@@ -78,7 +86,7 @@ impl ForwardHybrid for Model {
                 &plane,
                 pos,
                 at.rope_dim,
-                at.head_dim,
+                m.head_dim,
                 at.theta,
                 true,
             );
@@ -88,30 +96,28 @@ impl ForwardHybrid for Model {
                 &q,
                 &plan_p,
                 pages,
-                Some(at.window),
-                at.head_dim,
-                at.heads,
+                Some(m.window),
+                m.head_dim,
+                m.heads,
                 at.sm_scale,
             );
 
             let (o, lse) = match &at.pool {
                 Some(p) => {
                     let entries = inputs.kv(&p.entries);
-                    let pool_space = inputs.space_of(&p.entries);
-                    let entry_page = inputs.geometry(pool_space, GeomKind::WritePage);
-                    let entry_offset = inputs.geometry(pool_space, GeomKind::WriteOffset);
+                    let entry_page = inputs.write_page(&p.entries);
+                    let entry_offset = inputs.write_offset(&p.entries);
 
-                    let row_valid = inputs.geometry(inputs.kv_space(), GeomKind::RowValid);
-                    let request_of_token =
-                        inputs.geometry(inputs.kv_space(), GeomKind::RequestOfToken);
+                    let row_valid = inputs.row_valid();
+                    let request_of_token = inputs.request_of_token();
                     let (bpos, breq) = boundaries(pos, &row_valid, p.ratio);
                     let pooled =
-                        ops::attn::pool_gather(&bpos, &breq, pages, at.head_dim, p.ratio, m.act);
+                        ops::attn::pool_gather(&bpos, &breq, pages, m.head_dim, p.ratio, m.act);
                     let pooled = ops::elemwise::rope_partial_last(
                         &pooled,
                         pos,
                         at.rope_dim,
-                        at.head_dim,
+                        m.head_dim,
                         at.theta,
                         true,
                     );
@@ -129,15 +135,15 @@ impl ForwardHybrid for Model {
                         &request_of_token,
                         entries,
                         p.ratio,
-                        at.heads,
-                        at.head_dim,
+                        m.heads,
+                        m.head_dim,
                         at.sm_scale,
                     );
-                    ops::attn::merge_lse(&o, &lse, &po, &plse, at.heads, at.head_dim)
+                    ops::attn::merge_lse(&o, &lse, &po, &plse, m.heads, m.head_dim)
                 }
                 None => (o, lse),
             };
-            let o = ops::attn::sink(&o, &lse, &at.sink, at.head_dim);
+            let o = ops::attn::sink(&o, &lse, &at.sink, m.head_dim);
             seam::at(seam::ATTN_OUT, &[&o]);
 
             let o = ops::linear::matmul(&o, &at.o_down);

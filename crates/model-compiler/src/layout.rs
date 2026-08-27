@@ -189,17 +189,41 @@ fn constrains(plan: &Plan, region: &Region, classes: usize) -> bool {
 /// Decision #9's seat: does this region's work reach its rows through a
 /// gather, so that the row order cannot help it and need not try?
 ///
-/// **ALWAYS `false` TODAY, AND THAT IS A TRUE STATEMENT ABOUT THE IR.** The
-/// ops the exclusion is about are the weight-varied ones — MoE's routed
-/// experts, LoRA's adapter banks — and the corrections that ride with them,
-/// and the IR has no seat for a runtime-indexed weight bank yet (design's open
-/// items). Until it does, no `Operation` can answer this question differently,
-/// and a hand-written list of op names here would be the rewrite's prepare-op
-/// list all over again: a table somebody has to remember to add to.
+/// **STILL `false`, AND THE SEAT IS NO LONGER EMPTY — IT IS ANSWERED** (palo
+/// C2). The IR grew the runtime-indexed bank the old note was waiting for
+/// (`linear.lora_correct` over `ParamSource::Registered` planes, indexed by
+/// `RuntimeInput::AdapterRoutes`), and with the op in hand the question can be
+/// asked properly for the first time. The answer is no, for a reason worth
+/// stating because decision #9 reads the other way at first glance.
 ///
-/// The arguments are the ones the answer will need — the region names the
-/// nodes, the plan names their ops — so that the day the IR grows the seat,
-/// this is a function body and not a signature change rippling out to `P4`.
+/// **THE GATHER IS OVER WEIGHTS, AND THE CONSTRAINT IS ABOUT ROWS.** What
+/// tart measured — gather → grouped → scatter at 3.4× ideal against 33× for a
+/// split — is about which WEIGHT a row multiplies. A correction's rows are not
+/// gathered at all: `x`, `y` and `routes` are read at `[row_offset, rows)` of
+/// their columns, which is a slice, and a slice needs its rows contiguous. So
+/// the region is a C1P row like any other windowed region, and excluding it
+/// would not make it cheaper — it would make its window FRAGMENTED.
+///
+/// That is measured rather than argued. On qwen35-d0.8b's four classes
+/// (`{}`, `{qo_one}`, `{adapter}`, `{qo_one, adapter}`), offering the
+/// correction's `{2,3}` as a constraint beside the two attention windows gives
+/// the exact seriation `0 2 3 1` — every one of the three consecutive, no
+/// fallback row emitted. Withdrawing it leaves the frontier `[[0 2] [1 3]]`,
+/// whose canonical order puts classes 2 and 3 at positions 1 and 3, and a fire
+/// carrying an adapted prefill lane beside an adapted decode lane is then
+/// `driver_cuda::Fault::Fragmented` — a bake-integrity refusal, not a slow
+/// path, because P4's promise is what `Windows::of` reads.
+/// `crates/model-compiler/tests/every_sku_carves_an_arena.rs` pins both halves.
+///
+/// So decision #9's exclusion belongs to the FALLBACK menu — what a withdrawn
+/// consumer does instead, where `Fallback::Grouped` is the entry tart expects
+/// to dominate — and not to the constraint matrix. What would make this
+/// function answer `true` is an op that takes a row-index list rather than a
+/// rectangle: an SGMV whose segments are gathered, which is a kernel-table
+/// fact this crate still has no dependency on.
+///
+/// The arguments stay as they are — the region names the nodes, the plan names
+/// their ops — so the day such an op lands, this is a function body.
 fn gather_absorbs(_plan: &Plan, _region: &Region) -> bool {
     false
 }

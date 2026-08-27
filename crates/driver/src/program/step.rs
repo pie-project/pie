@@ -16,6 +16,19 @@ use crate::{Error, Result, shape_numel};
 pub struct PassInputs<'a> {
     pub logits: Option<&'a [f32]>,
 
+    /// The draft head's own readout, when the fire has one (palo C3b).
+    ///
+    /// **A SECOND COLUMN, BECAUSE THE FIRE HAS TWO** (design §9). The draft
+    /// logits are exported at `model_dsl::seam::MTP` and the carve gives them
+    /// a RECTANGLE OF THEIR OWN — `the_draft_readout_outlives_the_trunk_readout`
+    /// is the test that says so, and the shell's device path binds
+    /// [`IntrinsicId::MtpLogits`] at that rectangle's base rather than at an
+    /// offset into the trunk's. Leaving this `None` keeps the old reading, in
+    /// which a draft is rows `mtp_draft_row ..` of the ONE buffer — that is
+    /// [`super::plan::bounded_mtp_row_base`]'s layout, which no shipping shell
+    /// produces and which the parity fixtures still use.
+    pub mtp_logits: Option<&'a [f32]>,
+
     pub rows: u32,
 
     pub vocab: u32,
@@ -28,6 +41,7 @@ impl PassInputs<'_> {
     pub fn none() -> Self {
         PassInputs {
             logits: None,
+            mtp_logits: None,
             rows: 0,
             vocab: 0,
             mtp_draft_row: None,
@@ -88,7 +102,18 @@ fn bind_intrinsic(
             message: "unresolved value root (unsupported intrinsic) reached execution".to_owned(),
         });
     }
-    let Some(logits) = inputs.logits else {
+    // WHICH COLUMN, AND THE ANSWER IS THE INTRINSIC'S OWN (palo C3b). A draft
+    // intrinsic reads the draft column when the caller bound one; when it did
+    // not, it falls back to rows `mtp_draft_row ..` of the trunk's, which is
+    // the one-buffer layout `plan::bounded_mtp_row_base` computes and the
+    // parity fixtures still state. Both readings index by `mtp_draft_row`, so
+    // the fallback costs nothing but the choice of base.
+    let drafts_column = matches!(
+        root_intr,
+        Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)
+    );
+    let own = drafts_column && inputs.mtp_logits.is_some();
+    let Some(logits) = (if own { inputs.mtp_logits } else { inputs.logits }) else {
         return Err(Error::Program {
             message: "logits intrinsic unbound (forward did not run before step)".to_owned(),
         });
@@ -107,12 +132,19 @@ fn bind_intrinsic(
             message: "logits intrinsic shape mismatch (program vocab != model vocab)".to_owned(),
         });
     }
-    let base_row = if drafts || root_intr == Some(IntrinsicId::MtpLogits) {
+    let base_row = if drafts_column {
         u64::from(inputs.mtp_draft_row.unwrap_or(0))
     } else {
         0
     };
-    if base_row + rows_needed > u64::from(inputs.rows) {
+    // A column of its own is measured by its own height, and the trunk's rows
+    // say nothing about it.
+    let held_rows = if own {
+        (logits.len() as u64) / vocab.max(1)
+    } else {
+        u64::from(inputs.rows)
+    };
+    if base_row + rows_needed > held_rows {
         return Err(Error::Program {
             message: "logits intrinsic row range exceeds the forward's readout rows".to_owned(),
         });

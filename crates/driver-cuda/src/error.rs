@@ -160,6 +160,132 @@ pub enum Fault {
         runs_masked_arm: bool,
     },
 
+    /// An adapted lane in a fire whose loaded artifact bakes no correction.
+    ///
+    /// [`Fault::Maskless`]'s twin, for the axis beside it and for the same
+    /// reason: an adapter bank is a supergraph seat the model text either
+    /// declares or does not (design §8), and a lane routed against a plan
+    /// with no `linear.lora_correct` arm would get the base model's answer
+    /// under an adapter's name.
+    Adapterless {
+        /// Which lane asked.
+        lane: u32,
+    },
+
+    /// A lane whose fact word and whose adapter do not agree.
+    ///
+    /// [`Fault::MaskWord`]'s twin. The word chooses the class and the class
+    /// chooses whether this lane's rows fall inside the correction's WINDOW,
+    /// which is what design §8 means by "a correction op over the adapter
+    /// window". A lane inside the window with no adapter id would send the
+    /// arm at a routes vector this fire never staged; a lane outside it
+    /// carrying one would have its id staged and never read, and answer with
+    /// the base model's continuation — which is precisely the failure
+    /// decision 17 makes the capacity a budget rather than an admission cap
+    /// to avoid.
+    AdapterWord {
+        /// Which lane of the fire, in submission order.
+        lane: u32,
+        /// The word it was stamped with.
+        word: u64,
+        /// Whether the class that word resolved to runs the correction.
+        runs_correction: bool,
+    },
+
+    /// An allocation the device has no room for — the ask and the free, both
+    /// in bytes (palo C3b).
+    ///
+    /// **AN OUT-OF-MEMORY REFUSAL IS A FACT ABOUT TWO NUMBERS, AND IT SHOULD
+    /// SAY BOTH.** Every allocation this shell makes is sized once from a
+    /// budget and lives until the model is unloaded, so the interesting
+    /// failure is always "this model does not fit this device" — and
+    /// [`Fault::Device`] answers that with `cudaMalloc answered 2`, which
+    /// cannot tell a shortfall of six gigabytes from one of sixty and reads
+    /// like every other runtime failure. `device::alloc` asks
+    /// `cudaMemGetInfo` at the moment of the refusal and states what it
+    /// learned.
+    ///
+    /// Distinct from [`Fault::Ceiling`], which is a fire wanting more than the
+    /// LOAD reserved: that is a submission past a bake and this is a bake past
+    /// a card.
+    OutOfMemory {
+        /// Bytes asked for.
+        need: u64,
+        /// Bytes the device had free when the ask failed.
+        have: u64,
+    },
+
+    /// A drafting lane in a fire whose loaded artifact declares no draft head.
+    ///
+    /// [`Fault::Maskless`]'s and [`Fault::Adapterless`]'s third: an MTP head
+    /// is a supergraph arm the model text either states or does not (design
+    /// §8), and a lane that asked for drafts against a plan with no
+    /// `model_dsl::seam::MTP` export would be handed the trunk's continuation
+    /// with a draft's name on it.
+    Draftless {
+        /// Which lane asked.
+        lane: u32,
+    },
+
+    /// A lane whose fact word and whose draft ask do not agree.
+    ///
+    /// [`Fault::AdapterWord`]'s twin for the export axes, and the second wrong
+    /// answer is a different one because the axis carries no payload. A lane
+    /// whose word puts it inside the head's window and that asked for no
+    /// draft has a whole transformer block and a vocabulary-wide GEMM run over
+    /// its rows into a column nobody collects — paid for and thrown away. A
+    /// lane that asked and landed outside gets no draft at all, and an absent
+    /// column is indistinguishable from a column of zeros to the reader that
+    /// comes for it.
+    DraftWord {
+        /// Which lane of the fire, in submission order.
+        lane: u32,
+        /// The word it was stamped with.
+        word: u64,
+        /// Whether the class that word resolved to runs the draft head.
+        runs_draft_arm: bool,
+    },
+
+    /// A capturing lane in a fire whose loaded artifact declares no capture
+    /// arm — and the refusal a score READ takes when the plan states no
+    /// `attn.scores` export at all (design §9, palo C4).
+    Scoreless {
+        /// Which lane asked.
+        lane: u32,
+    },
+
+    /// A lane whose fact word and whose capture ask do not agree.
+    ///
+    /// [`Fault::DraftWord`]'s twin, one axis over. A capturing word with no
+    /// ask behind it runs the `attention.prefill_lse` arm and writes a mass
+    /// column the readout never copies; an ask with a plain word lands the
+    /// lane on the decode or prefill kernel, which produces no mass, and the
+    /// caller is handed an empty capture it cannot tell from a captured
+    /// nothing.
+    ScoreWord {
+        /// Which lane of the fire, in submission order.
+        lane: u32,
+        /// The word it was stamped with.
+        word: u64,
+        /// Whether the class that word resolved to runs the capture arm.
+        runs_capture_arm: bool,
+    },
+
+    /// A registration this load's banks cannot seat.
+    ///
+    /// **THE BUDGET IS THE SHAPE, SO A REFUSAL CARRIES NUMBERS** (design §8,
+    /// decision 17). An id past the bank's first axis, a plane whose bytes
+    /// are not the slot's, a name no `ParamSource::Registered` param carries:
+    /// each one is a caller and a model text that were not written from each
+    /// other, and each is refused at the door rather than written past a
+    /// slot's end.
+    Adapter {
+        /// The bank the registration named.
+        bank: String,
+        /// What is wrong with it.
+        why: String,
+    },
+
     /// A plan struct built over more rows than the node consuming it runs.
     ///
     /// **P4's PROMISE AT THE OTHER END** — [`Fault::Fragmented`] catches a
@@ -295,6 +421,85 @@ impl fmt::Display for Fault {
                          mask would be staged and never read"
                     )
                 }
+            }
+            Self::Adapterless { lane } => write!(
+                f,
+                "lane {lane} routes to an adapter bank and this load's artifact bakes \
+                 no corrected class: an adapter axis is a fact the MODEL declares \
+                 (design §8) and this plan has no `linear.lora_correct` arm for the id \
+                 to reach"
+            ),
+            Self::AdapterWord {
+                lane,
+                word,
+                runs_correction,
+            } => {
+                if *runs_correction {
+                    write!(
+                        f,
+                        "lane {lane}'s word {word:#x} puts it in a class that runs \
+                         `linear.lora_correct`, and it names no adapter for that arm to \
+                         route with"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "lane {lane} routes to an adapter and its word {word:#x} puts \
+                         it in a class outside the correction's window, so the id would \
+                         be staged and never read and the lane would answer with the \
+                         base model"
+                    )
+                }
+            }
+            Self::OutOfMemory { need, have } => write!(
+                f,
+                "this load wants {need} bytes of device memory and the device has \
+                 {have} free"
+            ),
+            Self::Draftless { lane } => write!(
+                f,
+                "lane {lane} asks for the model's draft head and this load's artifact                  declares none: an MTP axis is a fact the MODEL states (design §8) and                  this plan carries no `mtp` export for the readout to come from"
+            ),
+            Self::DraftWord {
+                lane,
+                word,
+                runs_draft_arm,
+            } => {
+                if *runs_draft_arm {
+                    write!(
+                        f,
+                        "lane {lane}'s word {word:#x} puts it in a class that runs the                          draft head, and it asked for no draft, so a transformer block                          and a vocabulary-wide readout would run over its rows into a                          column nobody collects"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "lane {lane} asks for a draft and its word {word:#x} puts it in                          a class outside the draft window, so no draft would be computed                          and the empty readout would be indistinguishable from a draft                          of zeros"
+                    )
+                }
+            }
+            Self::Scoreless { lane } => write!(
+                f,
+                "lane {lane} asks to capture its attention mass and this load's artifact                  declares no capture arm: a score axis is a fact the MODEL states                  (design §9) and this plan carries no `attn.scores` export to read"
+            ),
+            Self::ScoreWord {
+                lane,
+                word,
+                runs_capture_arm,
+            } => {
+                if *runs_capture_arm {
+                    write!(
+                        f,
+                        "lane {lane}'s word {word:#x} puts it in a class that runs                          `attention.prefill_lse`, and it asked for no capture, so the                          mass column would be written and never read"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "lane {lane} asks to capture its attention mass and its word                          {word:#x} puts it on the plain arm, which produces none — the                          empty capture cannot be told from a captured nothing"
+                    )
+                }
+            }
+            Self::Adapter { bank, why } => {
+                write!(f, "the adapter bank `{bank}` {why}")
             }
             Self::Straddled {
                 value,

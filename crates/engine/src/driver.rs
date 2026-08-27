@@ -55,6 +55,7 @@ pub use fire::{
 };
 
 // The contract, re-exported at the path the engine already reads it from.
+pub use ::driver_api::adapter::{AdapterPlane, AdapterRegistration};
 pub use ::driver_api::caps::Capabilities;
 pub use ::driver_api::channel::ChannelRegistration;
 pub use ::driver_api::error::{DriverError, Result as DriverResult};
@@ -115,6 +116,41 @@ pub mod verbs {
         driver
             .device_facts()
             .and_then(|facts| facts.codegen_backend.as_deref())
+    }
+
+    /// Write one adapter's planes into a loaded driver's banks (palo design
+    /// §8, decision 17).
+    ///
+    /// **THE SMALLEST HONEST DOOR, AND IT IS DELIBERATELY THE SMALLEST.** A
+    /// deployment that serves adapters wants an upload path, a registry, an
+    /// id space shared with the control plane and a way for a request to name
+    /// one — none of which is this. What the axis needed to EXIST is that the
+    /// bytes reach the bank and a lane can say which row it wants, and this
+    /// is the first half: one call, one id, one plane per bank, forwarded.
+    ///
+    /// The second half is [`Lane::adapter`](driver_api::fire::Lane::adapter),
+    /// which the contract has carried since the rewrite, which the CUDA shell
+    /// now honours end to end, and which
+    /// [`stamp_lane_words`](crate::pipeline::fire) reads to compute the lane's
+    /// fact word — so any caller that sets it gets the axis. What no path in
+    /// this crate SETS it from yet is a per-request adapter id, because a
+    /// request has nowhere to state one: the PTIR port vocabulary the fire
+    /// path is assembled from names no such port, and adding one is the
+    /// client-facing half this wave deliberately did not build.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver refused — a bank it does not declare, an id past
+    /// its capacity, a plane that is not one slot's bytes, or
+    /// [`Unsupported`](driver_api::DriverError::Unsupported) from a shell
+    /// whose loads seat no bank.
+    pub fn register_adapter(
+        driver: &mut DriverBackend,
+        registration: &driver_api::adapter::AdapterRegistration,
+    ) -> Result<()> {
+        driver
+            .register_adapter(registration)
+            .map_err(anyhow::Error::from)
     }
 
     /// A control verb's answer, as the run-ahead broker wants it.

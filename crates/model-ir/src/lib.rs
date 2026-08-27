@@ -20,5 +20,5 @@ pub use check::{Fault, check, checked};
 pub use cond::Cond;
 pub use operands::Operands;
 pub use ops::{Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operation};
-pub use plan::{CacheRow, Node, Param, Plan, Plane, Seam, Shard};
+pub use plan::{CacheRow, Node, Param, ParamSource, Plan, Platform, Seam, Shard};
 pub use value::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};

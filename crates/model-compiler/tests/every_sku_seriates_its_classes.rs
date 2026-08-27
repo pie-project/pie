@@ -1,4 +1,4 @@
-//! The catalog, seriated. Six model texts, four planes, one C1P instance each
+//! The catalog, seriated. Six model texts, four platforms, one C1P instance each
 //! (P4, design §3).
 //!
 //! WHAT IT ASSERTS, and each is a claim the design makes out loud:
@@ -25,10 +25,15 @@
 //! messages.
 
 use model_compiler::{Budgets, DeviceProfile, Phase, PqTree, Region, compile};
-use model_dsl::Plane;
+use model_dsl::Platform;
 use model_ir::Classes;
 
-const PLANES: [Plane; 4] = [Plane::Cuda, Plane::Metal, Plane::Wgpu, Plane::Vulkan];
+const PLATFORMS: [Platform; 4] = [
+    Platform::Cuda,
+    Platform::Metal,
+    Platform::Wgpu,
+    Platform::Vulkan,
+];
 
 fn budgets() -> Budgets {
     Budgets {
@@ -65,22 +70,22 @@ fn every_sku_is_consecutive_ones_and_owes_nobody_a_fallback() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue; // the arena sibling is the test that says so.
             };
 
             let Some(tree) = baked.order.tree() else {
                 wrong.push(format!(
-                    "`{sku}` as {plane:?}: P4 declined to seriate {} classes",
+                    "`{sku}` as {platform:?}: P4 declined to seriate {} classes",
                     baked.classes.classes.len(),
                 ));
                 continue;
             };
             if tree.leaves() != baked.classes.classes.len() {
                 wrong.push(format!(
-                    "`{sku}` as {plane:?}: the tree orders {} of {} classes",
+                    "`{sku}` as {platform:?}: the tree orders {} of {} classes",
                     tree.leaves(),
                     baked.classes.classes.len(),
                 ));
@@ -94,7 +99,7 @@ fn every_sku_is_consecutive_ones_and_owes_nobody_a_fallback() {
                     .map(|row| format!("n{}", row.node))
                     .collect();
                 wrong.push(format!(
-                    "`{sku}` as {plane:?}: {} consumers could not be seated in \
+                    "`{sku}` as {platform:?}: {} consumers could not be seated in \
                      one row order — {}",
                     baked.fallback.rows.len(),
                     named.join(", "),
@@ -111,8 +116,8 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue;
             };
@@ -128,7 +133,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                 .filter(|mask| mask.len() == classes)
             else {
                 wrong.push(format!(
-                    "`{sku}` as {plane:?}: no region runs in all {classes} classes",
+                    "`{sku}` as {platform:?}: no region runs in all {classes} classes",
                 ));
                 continue;
             };
@@ -137,21 +142,21 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
             let order = baked.order.class_order(everything, None);
             if order.len() != classes {
                 wrong.push(format!(
-                    "`{sku}` as {plane:?}: the fire order names {} of {classes} classes",
+                    "`{sku}` as {platform:?}: the fire order names {} of {classes} classes",
                     order.len(),
                 ));
                 continue;
             }
             if Some(&order[..]) != baked.order.tree().map(PqTree::frontier) {
                 wrong.push(format!(
-                    "`{sku}` as {plane:?}: an all-classes fire is not the frontier",
+                    "`{sku}` as {platform:?}: an all-classes fire is not the frontier",
                 ));
             }
 
             for mask in constraints(&baked.regions, &baked.classes) {
                 if !PqTree::is_interval(&order, &mask) {
                     wrong.push(format!(
-                        "`{sku}` as {plane:?}: the window over classes {mask:?} \
+                        "`{sku}` as {platform:?}: the window over classes {mask:?} \
                          breaks into {} runs of {order:?}",
                         PqTree::runs(&order, &mask),
                     ));
@@ -170,7 +175,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                 let windowed = baked.order.class_order(&region.mask, None);
                 if PqTree::runs(&windowed, &mask) != 1 {
                     wrong.push(format!(
-                        "`{sku}` as {plane:?}: a fire carrying only {mask:?} \
+                        "`{sku}` as {platform:?}: a fire carrying only {mask:?} \
                          does not get them contiguous",
                     ));
                 }
@@ -188,7 +193,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
 /// LAMINAR family: any two are disjoint or one contains the other. A laminar
 /// family is always C1P (order each set's classes together, recursively; the
 /// PQ-tree that comes out is all P-nodes), which is why the test above finds
-/// no fallback and finds it on every SKU and every plane.
+/// no fallback and finds it on every SKU and every platform.
 ///
 /// This is the assert that will fail FIRST when a model text states two
 /// crossing windows — say a `has_adapter` axis cutting across `qo_one` — and
@@ -199,8 +204,8 @@ fn todays_windows_are_a_laminar_family() {
     let mut crossing: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue;
             };
@@ -210,7 +215,7 @@ fn todays_windows_are_a_laminar_family() {
                     let shared = a.iter().filter(|c| b.contains(c)).count();
                     if shared > 0 && shared != a.len().min(b.len()) {
                         crossing.push(format!(
-                            "`{sku}` as {plane:?}: {a:?} and {b:?} cross — \
+                            "`{sku}` as {platform:?}: {a:?} and {b:?} cross — \
                              {shared} classes in common and neither contains \
                              the other",
                         ));
@@ -228,8 +233,8 @@ fn the_same_text_seriates_the_same_way_twice() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        for plane in PLANES {
-            let plan = trace(plane);
+        for platform in PLATFORMS {
+            let plan = trace(platform);
             let profile = DeviceProfile::default();
             let (Ok(once), Ok(twice)) = (
                 compile(&plan, &budgets(), &profile),
@@ -238,7 +243,7 @@ fn the_same_text_seriates_the_same_way_twice() {
                 continue;
             };
             if once.order != twice.order || once.fallback != twice.fallback {
-                wrong.push(format!("`{sku}` as {plane:?}: two bakes, two layouts"));
+                wrong.push(format!("`{sku}` as {platform:?}: two bakes, two layouts"));
             }
         }
     }

@@ -141,7 +141,7 @@ pub fn carve(base: u64, map: &ArenaMap, tokens: u64, lanes: u64) -> SlotTable {
 #[cfg(test)]
 mod tests {
     use model_compiler::{Budgets, DeviceProfile, compile};
-    use model_dsl::Plane;
+    use model_dsl::Platform;
     use model_ir::{Def, Ty};
 
     use super::*;
@@ -150,7 +150,7 @@ mod tests {
 
     fn baked() -> (model_ir::Plan, model_compiler::Baked) {
         let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
-        let plan = trace(Plane::Cuda);
+        let plan = trace(Platform::Cuda);
         let baked = compile(&plan, &Budgets::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");
         (plan, baked)

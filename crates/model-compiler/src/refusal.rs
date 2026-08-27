@@ -30,6 +30,24 @@ pub enum Refusal {
         /// The field, and what is wrong with it.
         what: &'static str,
     },
+    /// A deployment that wants more adapter banks than the model text seats.
+    ///
+    /// **CAPACITY IS A SHAPE, AND A BUDGET IS NOT AN ADMISSION CAP**
+    /// (design §8, decision 17). The bank's first axis is how many adapters
+    /// the plan reserved room for, `Budgets::max_adapters` is how many the
+    /// deployment intends to register, and the two have to agree at the LOAD:
+    /// discovering the disagreement at the two-hundredth registration would
+    /// make the capacity exactly the admission cap decision 17 refuses to
+    /// build. Both numbers are in the refusal so a reader knows which one to
+    /// change.
+    AdapterCapacity {
+        /// What `Budgets::max_adapters` asked for.
+        asked: u32,
+        /// The smallest capacity any bank of this plan declares — an id must
+        /// fit every site it will be written into. `0` when the plan declares
+        /// no bank at all.
+        seated: u64,
+    },
     /// A device profile that describes no device.
     Profile {
         /// The field, and what is wrong with it.
@@ -62,6 +80,37 @@ pub enum Refusal {
         holds: ValueId,
         /// The value that was to share it.
         shares: ValueId,
+    },
+    /// A `Struct` value — an attention SCHEDULE — built in one window and
+    /// read in another.
+    ///
+    /// **THE AUTHORING NET FOR BUILD LOG 20's SECOND BLOCKER.** A schedule is
+    /// not a row-shaped table that slices; it is a carving. How many requests
+    /// it batches, where each one's query rows begin, how its work items split
+    /// the kv and how much of its grant it padded to are all fixed when the
+    /// builder walks the window it was dispatched in. Demand then narrows the
+    /// prepare node to the UNION of the classes reading it (build log 7),
+    /// which is the right answer for a shared tensor and the wrong SHAPE for
+    /// two windowed readers: an arm standing in a narrower window hands the
+    /// schedule its OWN rebased boundaries, and every work item past the first
+    /// request indexes a `qo_indptr` that has already ended. Nothing faults on
+    /// the device — the reads land in whatever follows a `[lanes + 1]` vector
+    /// — and the answer is wrong logits.
+    ///
+    /// So it is refused at the BAKE, where the sentence can still name the
+    /// model text that has to change: mint a second plan value for the second
+    /// reader. Equality rather than containment, deliberately — a schedule
+    /// built over FEWER classes than its reader is the same failure from the
+    /// other side.
+    Straddled {
+        /// The schedule value.
+        value: ValueId,
+        /// The node that reads it from another window.
+        node: u32,
+        /// The classes the schedule was carved over.
+        planned: Vec<usize>,
+        /// The classes the reader runs in.
+        consumed: Vec<usize>,
     },
 }
 
@@ -123,6 +172,24 @@ impl Display for Refusal {
             ),
             Refusal::Budget { what } => write!(f, "the budgets {what}"),
             Refusal::Profile { what } => write!(f, "the device profile {what}"),
+            Refusal::AdapterCapacity { asked, seated } => {
+                if *seated == 0 {
+                    write!(
+                        f,
+                        "the budgets ask to register {asked} adapters and this plan \
+                         declares no bank at all: a bank is a weight the model text \
+                         marked `registered`, and capacity is its leading axis"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "the budgets ask to register {asked} adapters and the narrowest \
+                         bank of this plan seats {seated}; capacity is a shape the \
+                         model text declares, so one of the two numbers has to move \
+                         before the load and not at a registration"
+                    )
+                }
+            }
             Refusal::Classes(faults) => {
                 write!(f, "{} merges do not resolve:", faults.len())?;
                 for fault in faults {
@@ -159,6 +226,20 @@ impl Display for Refusal {
                     shares.0, holds.0,
                 )
             }
+            Refusal::Straddled {
+                value,
+                node,
+                planned,
+                consumed,
+            } => write!(
+                f,
+                "v{} is an attention schedule carved over classes {planned:?} and read \
+                 by node {node}, which runs in classes {consumed:?}. A schedule is a \
+                 carving, not a table that slices: the reader hands it boundaries \
+                 rebased to ITS window and the work items index past their end. The \
+                 model text mints a second plan value for the second reader",
+                value.0,
+            ),
         }
     }
 }

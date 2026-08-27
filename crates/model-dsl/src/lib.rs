@@ -33,11 +33,14 @@ pub use forward::*;
 /// second set of rules about what a plan may say.
 ///
 /// EVERY NAME ON IT IS ASKED FOR BY SOMEBODY, and the list narrows when that
-/// stops being true. `Attention`, `CacheRow`, `Def`, `Linear`, `Plan` and
+/// stops being true. `GeomKind` was on it until M20 and is the proof: a
+/// forward pass used to name a geometry kind to ask the runtime for a vector,
+/// and now it names the kv row instead ([`Input::write_page`]), so the name
+/// left the door. `Attention`, `CacheRow`, `Def`, `Linear`, `Plan` and
 /// `ValueId` are what `model::deployment` reads a traced plan with;
 /// `Dtype` is what a catalog row and a load contract
-/// are written in; `GeomKind` is what a forward pass asks the runtime for;
-/// `Plane` is what a trace is taken at; `Param` and `Shard` are the plan's
+/// are written in;
+/// `Platform` is what a trace is taken at; `Param` and `Shard` are the plan's
 /// demand column and the axis a rank cut runs along, which
 /// `model/tests/every_param_has_one_producer.rs` holds against the contract
 /// that fills it.
@@ -51,13 +54,13 @@ pub use forward::*;
 /// `model/tests/every_class_resolves_every_merge.rs` reads traced plans with
 /// these two, and reading a plan goes through this door.
 pub use model_ir::{
-    Attention, CacheRow, Def, Dtype, GeomKind, Linear, Operands, Operation, Param, Plan, Plane,
-    Shard, ValueId, resolve_classes,
+    Attention, CacheRow, Def, Dtype, Linear, Operands, Operation, Param, ParamSource, Plan,
+    Platform, Shard, ValueId, resolve_classes,
 };
-pub use record::{Recorder, SplitSpec, Value};
+pub use record::{Recorder, Refine, SplitSpec, Value};
 
-/// What the catalog registers per model: trace me for this plane.
-pub type TraceFn = fn(Plane) -> Plan;
+/// What the catalog registers per model: trace me for this platform.
+pub type TraceFn = fn(Platform) -> Plan;
 
 /// What the catalog registers per model: sort this request into my facts and
 /// pack them into the one `u64` a lane carries.
@@ -94,7 +97,7 @@ macro_rules! catalog {
         &[ $( (
             $name,
             $tp,
-            (|plane| $trace($name, &$m, plane)) as _,
+            (|platform| $trace($name, &$m, platform)) as _,
             (|request: &$crate::Request| $crate::word_of(|| $m, request)) as _,
         ) ),+ ]
     };
@@ -123,6 +126,41 @@ pub mod seam {
     pub const IN: Def = Def { name: "in" };
 
     pub const OUT: Def = Def { name: "out" };
+
+    /// **THE DRAFT READOUT** (design §9, palo C3). The MTP head's logits over
+    /// the draft window — a SECOND readout of the same fire, materialized
+    /// outside the graph exactly as [`OUT`] is.
+    ///
+    /// A SEAM RATHER THAN A RETURN VALUE, because `ForwardHybrid::forward`
+    /// hands back one value and the trunk's logits are it. Design §9 says an
+    /// export is "a place a declared value materializes outside the graph",
+    /// and `model_ir::check::classes`' roots are written for exactly this:
+    /// "a model that exports a second value gets the same treatment without
+    /// this file learning a new name". So the draft column is DEMANDED by
+    /// every class that runs the head, and dead in every class that does not.
+    ///
+    /// WHAT STILL OWES IT A HOME: `model_compiler::arena` gives the delivery
+    /// tail — liveness to fire end, read in every class — to the `"out"` seam
+    /// by name, and to no other. A draft column is read after the graph by the
+    /// same sampler that reads `"out"` (`driver::program`'s `MtpLogits` and
+    /// `MtpDrafts` intrinsics index the readout at `mtp_draft_row`), so it
+    /// wants the same tail. Until the compiler's export pass lands, the model
+    /// text states the export truthfully and the shell owes the pin — the same
+    /// order the masked axis went in.
+    pub const MTP: Def = Def { name: "mtp" };
+
+    /// **THE SCORE READOUT** (design §9's named archetype, palo C4). The
+    /// attention's per-query log-sum-exp over the capture window — the mass
+    /// the softmax normalized by, which is what a scores consumer actually
+    /// needs and what the kernel already hands back beside `o`.
+    ///
+    /// OBSERVATION IN-GRAPH, COMPUTATION AT THE BOUNDARY: the arm runs inside
+    /// the immutable graph and writes a declared column; whatever a guest does
+    /// with the numbers happens where guest code is allowed to happen, which
+    /// is before and after the fire.
+    pub const SCORES: Def = Def {
+        name: "attn.scores",
+    };
 
     /// Plant a seam on the values it names. The first one carries the recorder
     /// — every value of one trace carries the same one — so the slice must not

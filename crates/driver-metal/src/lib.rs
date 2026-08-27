@@ -32,10 +32,33 @@
 //!   seat, but the causal launches still read it plan-carried, beside the
 //!   `mask_enabled`/`mask_stride` no op names.
 
+pub mod api;
+pub mod arena;
+pub mod device;
 mod dispatch;
+pub mod encode;
+mod error;
+pub mod inputs;
+pub mod mask;
+pub mod program;
 pub mod run;
+pub mod serve;
+pub mod store;
+pub mod weights;
+pub mod window;
 
+pub use api::{ContractFor, DeviceBoot, Metal};
+pub use arena::Arena;
+pub use device::{Buffer, Context, Handles, Pipelines};
+pub use encode::Sink;
+pub use error::{Fault, Result};
+pub use inputs::Inputs;
+pub use program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
 pub use run::{
     CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, Run, SlotTable, StructSlot,
     WeightRow, WeightTable,
 };
+pub use serve::{Boot, Lane, Seated, Shell};
+pub use store::Pools;
+pub use weights::Weights;
+pub use window::{Cursor, Window, Windows};

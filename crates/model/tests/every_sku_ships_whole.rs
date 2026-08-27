@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use model::contract::ModelError;
-use model_dsl::Plane;
+use model_dsl::Platform;
 
 #[test]
 fn every_sku_names_a_checkpoint_it_can_be_built_from() {
@@ -95,23 +95,28 @@ fn a_sku_name_states_the_world_its_row_ships() {
 }
 
 #[test]
-fn planes_do_not_move_a_param() {
-    let planes = [Plane::Cuda, Plane::Metal, Plane::Wgpu, Plane::Vulkan];
+fn platforms_do_not_move_a_param() {
+    let platforms = [
+        Platform::Cuda,
+        Platform::Metal,
+        Platform::Wgpu,
+        Platform::Vulkan,
+    ];
 
     for (sku, _, trace, _) in model::catalog() {
-        let first = trace(planes[0]);
-        for plane in &planes[1..] {
-            let other = trace(*plane);
+        let first = trace(platforms[0]);
+        for platform in &platforms[1..] {
+            let other = trace(*platform);
             assert_eq!(
                 first.params, other.params,
-                "`{sku}` declares different weights on {plane:?} than on {:?}; \
+                "`{sku}` declares different weights on {platform:?} than on {:?}; \
                  an artifact can no longer be one file",
-                planes[0],
+                platforms[0],
             );
             assert_eq!(
                 first.caches, other.caches,
-                "`{sku}` declares different caches on {plane:?} than on {:?}",
-                planes[0],
+                "`{sku}` declares different caches on {platform:?} than on {:?}",
+                platforms[0],
             );
         }
     }

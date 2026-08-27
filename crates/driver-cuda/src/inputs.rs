@@ -24,6 +24,7 @@
 //!                          rebased `[lanes + 1]` run per WINDOW, not one
 //!                          per fire
 //! per space: mask bits     RuntimeInput::Mask { space }
+//! adapter routes           RuntimeInput::AdapterRoutes
 //! mask spans               ambient — `attention.masked`'s op-named bits have
 //!                          no seat for their per-request byte offsets, so
 //!                          the plan-prefill arm binds one onto the schedule
@@ -57,12 +58,12 @@
 use kernels_cuda::Tensor;
 use kernels_cuda::attn::plan::Workspace;
 use model_compiler::Budgets;
-use model_ir::Dtype;
+use model_ir::{Dtype, StructKind};
 
 use crate::device::Buffer;
 use crate::error::Result;
 use crate::store::SpaceSeat;
-use crate::store::kv::{Geometry, Paging, SpaceFacts};
+use crate::store::kv::{Facts, Geometry, Paging, SpaceFacts};
 
 /// The int side of one plan grant: where a built schedule's offset table is
 /// staged.
@@ -84,8 +85,14 @@ const GRANT_INT_BYTES: u64 = 8 << 20;
 /// that answer.
 const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 
-/// The largest float workspace a GRAPH-SHAPED prefill schedule can ask for,
-/// over every kv space this plan declares.
+/// The float workspace ONE graph-shaped prefill schedule can ask for.
+///
+/// Asked per PLAN VALUE, because a schedule's grant is a function of the
+/// reading it was carved at and a family may carve two out of one page-id
+/// space — gemma's global schedules want 149 MiB apiece at head width 512
+/// where its sliding ones want 74 (`store::kv::SpaceFacts`). And the KIND
+/// beside that reading picks WHICH formula is asked: this one is the paged
+/// builders', and a latent schedule's partials are [`latent_float_bytes`].
 ///
 /// **A SHORT GRANT HERE DOES NOT FAIL — IT DECLINES**, which is why it is
 /// computed rather than guessed. `plan_prefill` asked to be capturable pads
@@ -102,26 +109,59 @@ const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 /// `cta_tile_q` is bounded rather than predicted: 128 is the widest tile the
 /// schedule picks, except at `head_dim >= 256` where `plan_prefill` refuses
 /// it outright (no `KernelTraits` exist), so 64 is the bound there.
-fn graph_float_bytes(spaces: &[Option<SpaceFacts>], sms: u32) -> u64 {
-    spaces
-        .iter()
-        .flatten()
-        .map(|facts| {
-            let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
-            let tile = if facts.head_dim >= 256 { 64 } else { 128 };
-            let heads = u64::from(facts.q_heads);
-            // `tmp_v` is the partials, `tmp_s` their log-sum-exps; both are
-            // f32, and each starts on a 16-byte boundary.
-            let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
-            let s = heads * padded * tile * 4;
-            (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
-        })
-        .max()
-        .unwrap_or(0)
+fn graph_float_bytes(facts: &SpaceFacts, sms: u32) -> u64 {
+    let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
+    let tile = if facts.head_dim >= 256 { 64 } else { 128 };
+    let heads = u64::from(facts.q_heads);
+    // `tmp_v` is the partials, `tmp_s` their log-sum-exps; both are f32, and
+    // each starts on a 16-byte boundary.
+    let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
+    let s = heads * padded * tile * 4;
+    (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
+}
+
+/// The float workspace ONE latent (mla) schedule can ask for.
+///
+/// **THE LATENT PLANNER DOES NOT SIZE OFF A QUERY RECTANGLE**, which is why
+/// its sibling's formula is wrong here rather than merely generous. `plan_mla`
+/// sizes its split-kv partials off the CLUSTER GRID
+/// (`kernels-cuda/src/attn/sched_mla.rs:127-138` and `:393-397`):
+///
+/// ```text
+/// num_clusters   = SMs / cluster_size
+/// cluster_tile_q = cluster_size * CTA_TILE_Q (64)
+/// rows           = 2 * num_clusters * cluster_tile_q
+/// partial_o      = rows * 2 * head_dim_o bytes (the partials are bf16)
+/// partial_lse    = rows * 4              bytes, each 16-byte aligned
+/// ```
+///
+/// `cluster_size` cancels: the planner picks 1 or 2 CTAs per cluster from this
+/// fire's average packed query length, and whichever it picks the row count is
+/// `2 * SMs * 64` — the integer division can only round it down, so that is the
+/// bound this grant is sized at, and no fire's choice can exceed it.
+/// `head_dim_o` is the RANK, because a latent schedule is carved in the
+/// absorbed reading: every query head reads the one shared latent plane and
+/// writes `kv_lora_rank` floats (`store::kv`'s carving of `Attention::MlaPlan`).
+/// glm-5 at rank 512 on 142 SMs wants 17.8 MiB — under the floor below, where
+/// the prefill formula asked 3.3 GiB per plan value for the same schedule.
+fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
+    let rows = 2 * u64::from(sms.max(1)) * 64;
+    let partial_o = (rows * 2 * u64::from(rank)).next_multiple_of(16);
+    let partial_lse = (rows * 4).next_multiple_of(16);
+    (partial_o + partial_lse).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
 /// The alignment every carved region starts on.
 const ALIGN: u64 = 256;
+
+/// One plan value's grant, as offsets — turned into a [`Workspace`] once the
+/// store is allocated and its base address is known.
+#[derive(Clone, Copy, Debug)]
+struct Grant {
+    int_at: u64,
+    float_at: u64,
+    float_bytes: u64,
+}
 
 /// One kv space's six vectors, as offsets into the store.
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +190,11 @@ pub struct Handles {
     pub slot_ids: Tensor,
     /// The padding mask the kv writers read.
     pub row_valid: Tensor,
+    /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row.
+    /// `None` when no lane of this fire carried one — the shell then binds no
+    /// seat, exactly as it does for the mask, and the correction's window is
+    /// empty so nothing reads it.
+    pub adapter_routes: Option<Tensor>,
     /// `RuntimeInput::Mask`: the packed `u8` (query, key) bits, fire-wide.
     /// `None` when no lane of this fire carried a mask — the shell then binds
     /// no mask seat at all, so a masked consumer answers `attn::masked`'s own
@@ -191,6 +236,11 @@ pub struct Fire<'a> {
     pub windows: &'a [i32],
     /// Which recurrent bank each lane owns, in fire lane order.
     pub slot_ids: &'a [i32],
+    /// Which adapter each token ROW routes to, in fire row order, or `None`
+    /// when no lane carried one. Per ROW and not per lane, because that is
+    /// what the correction kernel indexes with: `routes[row]` beside
+    /// `x[row]`, the same shape `tokens` and `positions` have.
+    pub adapter_routes: Option<&'a [i32]>,
     /// One geometry per kv space, in space order.
     pub spaces: &'a [Geometry],
     /// This fire's expanded lane masks, or `None` when no lane carried one.
@@ -207,12 +257,19 @@ pub struct Inputs {
     window_ints: u64,
     row_valid: u64,
     slot_ids: u64,
+    adapter_routes: u64,
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
     spaces: Vec<SpaceAt>,
-    decode: Workspace,
-    prefill: Workspace,
+    /// One grant per PLAN VALUE, by value id. Grants are disjoint carvings of
+    /// the shell's bounded pool because every schedule a fire builds is
+    /// staged at once and read at once; what changed in C1b is the KEY — a
+    /// family that carves two readings out of one page-id space (gemma's
+    /// sliding beside its global, gpt-oss's windowed beside its full) mints
+    /// two plan values, and two schedules sharing one grant would overwrite
+    /// each other's staged image between the prepare pass and the launch.
+    plans: Vec<Option<Workspace>>,
 }
 
 impl Inputs {
@@ -224,7 +281,8 @@ impl Inputs {
     pub fn reserve(
         budgets: &Budgets,
         paging: Paging,
-        spaces: &[Option<SpaceFacts>],
+        spaces: usize,
+        facts: &Facts,
         classes: usize,
         sms: u32,
     ) -> Result<Inputs> {
@@ -249,6 +307,12 @@ impl Inputs {
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * 4);
+        // The adapter axis's one vector, reserved at the row ceiling like
+        // every other row-shaped table here — 32 KiB at `max_tokens = 8192`,
+        // paid by every load whether or not the plan declares a correction,
+        // because a conditional carve would make the STORE's layout depend on
+        // the plan and the addresses in it are recorded into graphs.
+        let adapter_routes = take(rows * 4);
         // The masked axis's two vectors. `context` is what a slot can hold,
         // so `rows * context` bounds every (query, key) cell a fire can
         // present, and the per-lane byte alignment costs one byte a lane.
@@ -256,11 +320,7 @@ impl Inputs {
         let mask_bytes = (rows * context).div_ceil(8) + lanes;
         let mask_bits = take(mask_bytes);
         let mask_indptr = take((lanes + 1) * 4);
-        // The prefill grant is the graph-shaped requirement or the flat
-        // floor, whichever is larger; the decode grant keeps the floor,
-        // because a decode schedule's padding carries no tile factor.
-        let prefill_float_bytes = graph_float_bytes(spaces, sms).max(GRANT_FLOAT_BYTES);
-        let spaces: Vec<SpaceAt> = (0..spaces.len())
+        let spaces: Vec<SpaceAt> = (0..spaces)
             .map(|_| SpaceAt {
                 indptr: take((lanes + 1) * 4),
                 indices: take(pages * 4),
@@ -270,10 +330,39 @@ impl Inputs {
                 write_offset: take(rows * 4),
             })
             .collect();
-        let decode_int = take(GRANT_INT_BYTES);
-        let decode_float = take(GRANT_FLOAT_BYTES);
-        let prefill_int = take(GRANT_INT_BYTES);
-        let prefill_float = take(prefill_float_bytes);
+        // One grant per plan value. The float side is the requirement of the
+        // builder that will actually run, or the flat floor, whichever is
+        // larger — computed rather than guessed, because a short grant here
+        // DECLINES to capture instead of failing (build log 13). The KIND is
+        // what picks the formula: the paged builders pad their work items out
+        // to the SM count and stage a partial per (query head, padded item,
+        // tile row), the latent one stages a partial per cluster row and knows
+        // nothing about query heads at all.
+        let grants: Vec<Option<Grant>> = facts
+            .plans
+            .iter()
+            .map(|seat| {
+                seat.map(|seat| {
+                    let floats = match seat.kind {
+                        StructKind::AttnPrefillPlan | StructKind::AttnPrefillPlanSm90 => {
+                            graph_float_bytes(&seat.reading, sms)
+                        }
+                        // The prefill bound, applied to decode: a decode
+                        // schedule stages less than this, and asking the
+                        // prefill number for it is what this shell has always
+                        // done — pre-existing, and not tightened here.
+                        StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, sms),
+                        StructKind::MlaPlan => latent_float_bytes(seat.reading.head_dim, sms),
+                    }
+                    .max(GRANT_FLOAT_BYTES);
+                    Grant {
+                        int_at: take(GRANT_INT_BYTES),
+                        float_at: take(floats),
+                        float_bytes: floats,
+                    }
+                })
+            })
+            .collect();
         let total = at;
 
         let store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
@@ -285,36 +374,30 @@ impl Inputs {
             window_ints,
             row_valid,
             slot_ids,
+            adapter_routes,
             mask_bits,
             mask_bytes,
             mask_indptr,
             spaces,
-            decode: Workspace {
-                int_ptr: base + decode_int,
-                int_bytes: GRANT_INT_BYTES as usize,
-                float_ptr: base + decode_float,
-                float_bytes: GRANT_FLOAT_BYTES as usize,
-            },
-            prefill: Workspace {
-                int_ptr: base + prefill_int,
-                int_bytes: GRANT_INT_BYTES as usize,
-                float_ptr: base + prefill_float,
-                float_bytes: usize::try_from(prefill_float_bytes).unwrap_or(usize::MAX),
-            },
+            plans: grants
+                .into_iter()
+                .map(|grant| {
+                    grant.map(|grant| Workspace {
+                        int_ptr: base + grant.int_at,
+                        int_bytes: GRANT_INT_BYTES as usize,
+                        float_ptr: base + grant.float_at,
+                        float_bytes: usize::try_from(grant.float_bytes).unwrap_or(usize::MAX),
+                    })
+                })
+                .collect(),
             store,
         })
     }
 
-    /// The decode builder's grant.
+    /// One plan value's builder grant, by value id.
     #[must_use]
-    pub fn decode_grant(&self) -> Workspace {
-        self.decode
-    }
-
-    /// The prefill builder's grant.
-    #[must_use]
-    pub fn prefill_grant(&self) -> Workspace {
-        self.prefill
+    pub fn grant(&self, plan: u32) -> Option<Workspace> {
+        self.plans.get(plan as usize).copied().flatten()
     }
 
     /// Every byte the inputs hold.
@@ -360,6 +443,20 @@ impl Inputs {
         self.store.stage(stream, self.row_valid, &valid)?;
         self.store
             .stage(stream, self.slot_ids, bytes_of(fire.slot_ids))?;
+
+        // THE ADAPTER AXIS, STAGED OR NOT STAGED — the mask's rule, for the
+        // mask's reason. A fire no lane routed writes nothing here and binds
+        // no seat, so a correction that somehow reached a launch would hit
+        // `Run::tensor`'s named panic rather than read a slab of zeros, which
+        // is every row routed to adapter 0 of a bank nobody registered.
+        let adapter_routes = match fire.adapter_routes {
+            None => None,
+            Some(routes) => {
+                self.store
+                    .stage(stream, self.adapter_routes, bytes_of(routes))?;
+                Some(routes.len() as u32)
+            }
+        };
 
         // THE MASKED AXIS, STAGED OR NOT STAGED. A fire no lane masked writes
         // nothing here and binds no seat, which is what makes
@@ -415,6 +512,7 @@ impl Inputs {
             windows: base + self.windows,
             spaces,
             slot_ids: i32s(base + self.slot_ids, lanes),
+            adapter_routes: adapter_routes.map(|rows| i32s(base + self.adapter_routes, rows)),
             row_valid: Tensor::new(base + self.row_valid, rows, 1, Dtype::U8),
             // The slab is handed over WHOLE: its entries are bits, not fire
             // rows, so `Run::cut` excludes it for the same reason it excludes

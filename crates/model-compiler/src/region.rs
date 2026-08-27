@@ -55,11 +55,14 @@ pub(crate) fn coalesce(plan: &Plan, classes: &Classes) -> Vec<Region> {
                 // are the optimization (design §4); P3 is where the profile
                 // gets consulted and some of these become `Switch` or `If`.
                 lowering: Lowering::AlwaysLaunch,
-                // ONE STREAM. P6 builds a dep DAG over the capture regions and
-                // hands out fork/join events; until it does, the walk is a
-                // straight line and `Concurrency::sequential` is the truth the
-                // arena was carved against.
+                // ONE STREAM, until P6 says otherwise. `crate::stream` builds
+                // the dep DAG over these regions and stamps the three fields
+                // below in place; a plan it finds nothing in keeps exactly
+                // what P2 wrote here, which is what "pays nothing" means.
                 stream: 0,
+                wait: Vec::new(),
+                open: None,
+                close: None,
                 // P6's other half, and deferred past it: SM partition is
                 // capture-baked, so a variant multiplies bodies (decision #14).
                 sm_hint: None,

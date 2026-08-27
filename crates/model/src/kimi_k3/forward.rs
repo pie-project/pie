@@ -1,6 +1,4 @@
-use model_dsl::{
-    Classify, ForwardHybrid, GeomKind, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
 
@@ -38,7 +36,7 @@ impl ForwardHybrid for Model {
                     c.kv(
                         kv,
                         a.kv.clone(),
-                        [1, (a.kv_lora_rank + a.qk_rope_head_dim) as u64],
+                        [self.kv_lora_rank as u64, a.qk_rope_head_dim as u64],
                     );
                 }
 
@@ -58,7 +56,21 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        let plan = inputs.mla_plan();
+        // ONE SCHEDULE PER READER. A plan struct is a CARVING — request count,
+        // rebased query boundaries, work-item split — so it is only a carving
+        // OF the class it was cut for. Each schedule is therefore built off
+        // that class's own arm of the inputs: the geometry it reads carries
+        // the arm's cond, so the plan node's guard IS the class, and a reader
+        // sitting in the other arm is refused by the recorder at the line that
+        // mixed them. The pair is [decode, prefill]. Both lines state the same
+        // reading — this text has ONE, `m.mla_heads × m.kv_lora_rank` — so what
+        // the two lines differ by is the arm, which is the whole truth of the
+        // pair.
+        let (input_d, input_p) = inputs.split(&Facts::qo_one());
+        let plan = [
+            ops::attn::mla_plan(&input_d, m.mla_heads, m.kv_lora_rank),
+            ops::attn::mla_plan(&input_p, m.mla_heads, m.kv_lora_rank),
+        ];
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
         let mut blocks: Vec<Value> = Vec::new();
@@ -71,7 +83,7 @@ impl ForwardHybrid for Model {
 
             let x = ops::elemwise::rmsnorm(&y, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
-                Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, a),
+                Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, m, a),
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
             let o = if m.tp > 1 {
@@ -153,21 +165,21 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Mla) -> Value {
+fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &[Value; 2], m: &Model, a: &Mla) -> Value {
     let pages = inputs.kv(&a.kv);
-    let write_page = inputs.geometry(inputs.kv_space(), GeomKind::WritePage);
-    let write_offset = inputs.geometry(inputs.kv_space(), GeomKind::WriteOffset);
+    let write_page = inputs.write_page(&a.kv);
+    let write_offset = inputs.write_offset(&a.kv);
     let q_a = ops::linear::matmul(x, &a.q_a_proj);
     let q_a = ops::elemwise::rmsnorm(&q_a, &a.q_a_norm, a.q_a_norm_eps);
     let (kv_c, k_pe) = ops::attn::mla_latents(
         &ops::linear::matmul(x, &a.kv_a_proj),
         &a.kv_a_norm,
         a.kv_a_norm_eps,
-        a.kv_lora_rank,
+        m.kv_lora_rank,
     );
     let (q_nope, q_pe) = ops::attn::mla_split_q_b(
         &ops::linear::matmul(&q_a, &a.q_b_proj),
-        a.heads,
+        m.mla_heads,
         a.qk_nope_head_dim,
         a.qk_rope_head_dim,
     );
@@ -176,25 +188,44 @@ fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &Value, a: &Mla) -> Value {
     let q = ops::attn::mla_absorb_q(
         &q_nope,
         &a.kv_b_proj,
-        a.heads,
-        a.kv_lora_rank,
+        m.mla_heads,
+        m.kv_lora_rank,
         a.qk_nope_head_dim,
         a.v_head_dim,
     );
     seam::at(seam::ATTN_Q, &[&q]);
 
+    // The same predicate `forward` split the inputs by, so these arms' conds
+    // are structurally equal to the arms the two schedules were built off —
+    // which is what the recorder compares when a reader meets its plan.
     let one = Facts::qo_one();
     let (dq, p) = q.split(&one);
     let (dpe, ppe) = q_pe.split(&one);
     let latent = Value::merge(vec![
-        ops::attn::mla_decode(&dq, plan, &dpe, pages, a.heads, a.kv_lora_rank, a.sm_scale),
-        ops::attn::mla_prefill(&p, plan, &ppe, pages, a.heads, a.kv_lora_rank, a.sm_scale),
+        ops::attn::mla_decode(
+            &dq,
+            &plan[0],
+            &dpe,
+            pages,
+            m.mla_heads,
+            m.kv_lora_rank,
+            a.sm_scale,
+        ),
+        ops::attn::mla_prefill(
+            &p,
+            &plan[1],
+            &ppe,
+            pages,
+            m.mla_heads,
+            m.kv_lora_rank,
+            a.sm_scale,
+        ),
     ]);
     let o = ops::attn::mla_absorb_out(
         &latent,
         &a.kv_b_proj,
-        a.heads,
-        a.kv_lora_rank,
+        m.mla_heads,
+        m.kv_lora_rank,
         a.qk_nope_head_dim,
         a.v_head_dim,
     );

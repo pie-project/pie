@@ -182,6 +182,44 @@ pub struct Lane {
     /// Which adapter bank this lane routes to (design §8). `None` is the base
     /// model.
     pub adapter: Option<u32>,
+    /// **Run the model's draft head over this lane's rows** (design §8's MTP
+    /// row, palo C3). `true` is what makes the lane's `drafts` fact true.
+    ///
+    /// **A BARE BOOLEAN, AND THAT IS THE AXIS BEING HONEST ABOUT ITSELF.**
+    /// [`Lane::mask`] and [`Lane::adapter`] are payloads whose PRESENCE states
+    /// the fact, because each axis needs something from the submission that
+    /// only the caller has — a mask's bits, a bank's row. This axis needs
+    /// nothing: the draft head reads the lane's own hidden and the lane's own
+    /// tokens, over the lane's own rows, and there is no third thing to carry.
+    /// So the intent is the whole of the field.
+    ///
+    /// **IT IS STILL A SECOND STATEMENT AND IT STILL HAS TO AGREE WITH
+    /// [`Lane::word`].** The word decides the CLASS, and the class decides
+    /// whether the head's arm covers this lane's rows. A lane whose word says
+    /// `drafts` and whose submission does not is a fire whose caller will be
+    /// handed a draft column it never asked for and will not read; a lane that
+    /// asks and whose word does not is a lane that gets no draft and is not
+    /// told. Both are refused by name before anything launches
+    /// (`driver_cuda::Fault::DraftWord`), which is [`Lane::mask`]'s rule and
+    /// [`Lane::adapter`]'s rule for the third time.
+    ///
+    /// **THE ROW ALIGNMENT IS THE CALLER'S** (`model::qwen_3`'s own note): the
+    /// head was trained on `(hidden at p, token at p+1)` and is fed `(x, tok)`
+    /// at one row, so a drafting lane's row `r` must carry the token one
+    /// position past the hidden the trunk leaves at `r`. The contract states
+    /// the requirement; no driver can check it.
+    pub drafts: bool,
+    /// **Keep this lane's attention mass** (design §9's score-capture
+    /// archetype, palo C4). `true` is what makes the lane's `captures_scores`
+    /// fact true, and what puts its per-layer log-sum-exp into
+    /// [`LaneReadout::scores`].
+    ///
+    /// [`Lane::drafts`]'s twin in every respect, including the refusal
+    /// (`driver_cuda::Fault::ScoreWord`) and including being a bare boolean:
+    /// what the capture arm needs is the bit, and everything else about the
+    /// observation — which layers, how wide, how many rows — is the model
+    /// text's to declare and the artifact's to carry.
+    pub captures_scores: bool,
     /// Which rows come back.
     pub readout: Readout,
 }
@@ -343,6 +381,28 @@ impl FireSubmission {
     }
 }
 
+/// One attention layer's captured mass, for one lane (design §9, palo C4).
+///
+/// **THE LSE, NOT A SCORE MATRIX, AND THAT IS THE HONEST EXPORT.** A full
+/// `[query, key]` score matrix is not a value a paged attention kernel ever
+/// materializes — it is streamed tile by tile and never exists whole. The
+/// log-sum-exp is what the kernel DOES hand back beside `o`; it is the
+/// normalizer every per-key score is a ratio against, and it is the quantity a
+/// capture consumer can actually be given without the graph growing a second
+/// attention.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LayerScores {
+    /// Which transformer layer this column came from, as the plan's `Seam`
+    /// row stamps it.
+    pub layer: u32,
+    /// How many of the lane's rows came back.
+    pub rows: u32,
+    /// How many query heads each row holds.
+    pub heads: u32,
+    /// The mass, row-major, `rows * heads` of them.
+    pub lse: Vec<f32>,
+}
+
 /// What one lane read back.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LaneReadout {
@@ -352,6 +412,32 @@ pub struct LaneReadout {
     pub width: u32,
     /// The values, row-major, `rows * width` of them.
     pub values: Vec<f32>,
+    /// This lane's captured attention mass, one entry per attention layer the
+    /// model text exports at `model_dsl::seam::SCORES`, in layer order. Empty
+    /// unless the lane set [`Lane::captures_scores`].
+    ///
+    /// **THE READOUT IS THE SCORE DOOR, AND THE CHOICE WAS BETWEEN THREE**
+    /// (palo C4b). Design §9 prefers the guest-at-the-boundary route — an
+    /// intrinsic the way [`Boundary::Epilogue`] binds
+    /// `IntrinsicId::Logits` — and that route is genuinely shut for this
+    /// value: the intrinsic that exists for scores
+    /// ([`IntrinsicId::AttnScore`](tensor_ir::op::IntrinsicId)) is registered
+    /// at `Stage::OnAttn`, a MID-GRAPH tap, and §9 abolished the third
+    /// boundary. It also promises the wrong numbers — `[num_heads, kv_len]`
+    /// per-key softmax weights, not a per-query mass — so pointing it at this
+    /// column would be a lie that computes. The other candidate, a
+    /// [`Pool`](crate::transfer::Pool) variant and a copy verb, is the wrong
+    /// noun: a pool is pages a caller resizes and maps, and this is an arena
+    /// rectangle the carve placed. What is left is the door the trunk's logits
+    /// already take when no guest is attached — this one — and it costs the
+    /// contract one field that is empty in every fire nobody captured.
+    ///
+    /// An epilogue-legal score intrinsic would bind against exactly the
+    /// rectangle this field is read from, so nothing here is in that route's
+    /// way; what it needs is a row in `tensor-ir`'s intrinsic table, which is
+    /// the frozen side of this wave's seam.
+    #[serde(default)]
+    pub scores: Vec<LayerScores>,
 }
 
 /// The receipt for one accepted fire.

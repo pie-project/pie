@@ -35,14 +35,12 @@
 
 use model_compiler::{Lowering, Region};
 
-/// A recorded synchronization point: what a fork signals and a join waits on.
+/// A recorded synchronization point: what a fork records and a join waits on.
 ///
-/// P6'S CURRENCY, TYPED NOW AND ISSUED LATER. The dep DAG over capture regions
-/// is what hands these out, and v1 runs one stream, so no event is ever
-/// created — but the trait that will carry them is the trait shells implement
-/// today, and adding a method to it later is a change every shell pays for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EventId(pub u32);
+/// P6'S CURRENCY. The compiler mints these — see `model_compiler::stream` —
+/// and the artifact names them on the regions themselves, so this is a
+/// re-export rather than a second numbering.
+pub use model_compiler::EventId;
 
 /// The structure events of one walk, in the order they happen.
 ///
@@ -75,11 +73,26 @@ pub trait Sink {
     /// The conditional region is closed.
     fn cond_end(&mut self);
 
-    /// Signal `event`: work after this point may proceed beside what follows
-    /// on another stream.
+    /// **RECORD `event` ON THE STREAM THIS REGION IS ON, HERE.** Anything
+    /// waiting on it may proceed from this point.
+    ///
+    /// The walk calls this at two instants and they are the two halves of
+    /// design §6's pair, decomposed so that one verb serves both:
+    ///
+    /// ```text
+    /// Region::open   at the TOP of a fork group's main arm, on the main
+    ///                stream — the fork. The arms wait on it.
+    /// Region::close  at the END of an arm, on the arm's stream — the join.
+    ///                The region after the group waits on it.
+    /// ```
+    ///
+    /// A recording sink turns this into `cudaEventRecord` inside the capture,
+    /// which is the exact shape `.wiki/tart/evidence/green_contexts.md`
+    /// Finding 3 measured: one graph, several streams, joined by events.
     fn fork(&mut self, event: EventId);
 
-    /// Wait on `event`.
+    /// **WAIT FOR `event` ON THE STREAM THIS REGION IS ON, HERE**, before the
+    /// region's first node. `Region::wait`, in order.
     fn join(&mut self, event: EventId);
 }
 
@@ -92,6 +105,26 @@ pub trait Sink {
 /// that decides whether to dispatch — so there is nothing left for a sink to
 /// carry. What the type buys is that the walk which produced a graph and the
 /// walk which produced the golden numbers are the same function, called twice.
+///
+/// # Eager IS the serialization of the DAG, and that is why the tokens cannot
+/// move
+///
+/// [`fork`](Sink::fork) and [`join`](Sink::join) are no-ops here, and every
+/// region runs on one stream in program order. That is not "streams turned
+/// off and hope": program order is a TOPOLOGICAL ORDER of P6's dependency
+/// DAG, because every edge the DAG has runs from a lower region index to a
+/// higher one — the pass builds it that way, over regions that are already in
+/// program order. Running a DAG's nodes in a topological order, one at a
+/// time, is what its edges mean.
+///
+/// So the recorded graph and the eager walk are two schedules of one DAG.
+/// Every value written by one region and read by another is separated by an
+/// edge in both; the only pairs whose relative order differs are pairs with no
+/// edge between them, which write disjoint values and disjoint arena bytes
+/// (`model_compiler::stream`'s safety argument). **A fire's numbers cannot
+/// depend on which schedule ran it**, which is why the byte-identical-tokens
+/// gate is a real gate rather than a hopeful one: eager is the golden, replay
+/// is the subject, and P6 changed only the subject.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EagerSink;
 

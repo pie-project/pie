@@ -238,3 +238,105 @@ macro_rules! probe_fire_record {
         let _ = (&$target, &$duration);
     }};
 }
+
+// =============================================================================
+// The HOST-SUBMIT probes (palo D0)
+// =============================================================================
+//
+// Everything above measures the SCHEDULER thread. Nothing measured the guest
+// thread's own submit — `pipeline::fire::submit_pass_stamped`, which is where
+// build log 19's ruling put the frame path's cost — so the ruling could not be
+// checked. These probes are process-global rather than per-driver because the
+// submit runs on the guest's task, which has no scheduler handle in hand until
+// the very last statement of the function.
+//
+// They are gated by the same `profile-fire` feature. `probe_fire_record!` is
+// not enough on its own here: every site is a REGION spanning `?` and early
+// returns, so it cannot be wrapped in `probe_fire!`, and by the time the macro
+// sees a `Duration` the site has already paid for the timestamp. `ProbeClock`
+// below is the missing half — it holds an `Instant` with the feature on and
+// nothing at all with it off, so both the clock read and the `fetch_add`
+// disappear together. What survives in a feature-off build is one relaxed
+// `OnceLock` load per submit, against a 3.5 ms fire.
+
+/// One phase of a guest-thread submit, and how many submits were seen.
+#[derive(Debug, Default)]
+pub struct HostSubmitProbes {
+    /// Submits counted (one per non-no-op frame slot).
+    pub submits: AtomicU64,
+    /// Whole `submit_pass_stamped`, from entry to the pending-fire push.
+    pub total_us: AtomicU64,
+    /// The non-blocking settlement drain at the top of the submit.
+    pub drain_settled_us: AtomicU64,
+    /// Evaluated fire geometry: the host shadow's fold, the port map and the
+    /// attention-mask lowering.
+    pub geometry_us: AtomicU64,
+    /// KV declaration resolve, demand, grant acquire and reserved prepare —
+    /// everything that takes the store lock or awaits the planner.
+    pub kv_prepare_us: AtomicU64,
+    /// The working set's page translation, copied into the request.
+    pub translation_us: AtomicU64,
+    /// The handoff to the scheduler thread.
+    pub scheduler_submit_us: AtomicU64,
+    /// `HostShadow::advance` — the fold that moves the shadow one fire on.
+    pub shadow_advance_us: AtomicU64,
+    /// `validate_frame`, which only a k > 1 frame with a live slot reaches.
+    pub validate_frame_us: AtomicU64,
+    pub validate_frame_calls: AtomicU64,
+}
+
+/// The process-global host-submit probe set.
+pub fn host_submit() -> &'static HostSubmitProbes {
+    static PROBES: std::sync::OnceLock<HostSubmitProbes> = std::sync::OnceLock::new();
+    PROBES.get_or_init(HostSubmitProbes::default)
+}
+
+/// A probe's clock. With `profile-fire` on it is an `Instant`; with the
+/// feature off it holds nothing and answers `Duration::ZERO`, so the
+/// `Instant::now()` syscall disappears along with the `fetch_add` — which
+/// `probe_fire_record!` alone cannot do, because the site has already paid for
+/// the timestamp by the time the macro sees the duration.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeClock {
+    #[cfg(feature = "profile-fire")]
+    began: std::time::Instant,
+}
+
+impl ProbeClock {
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            #[cfg(feature = "profile-fire")]
+            began: std::time::Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn elapsed(&self) -> std::time::Duration {
+        #[cfg(feature = "profile-fire")]
+        {
+            self.began.elapsed()
+        }
+        #[cfg(not(feature = "profile-fire"))]
+        {
+            std::time::Duration::ZERO
+        }
+    }
+}
+
+/// `probe_fire_count!(target)` — a probe-gated counter bump.
+#[cfg(feature = "profile-fire")]
+#[macro_export]
+macro_rules! probe_fire_count {
+    ($target:expr) => {{
+        $target.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    }};
+}
+
+#[cfg(not(feature = "profile-fire"))]
+#[macro_export]
+macro_rules! probe_fire_count {
+    ($target:expr) => {{
+        let _ = &$target;
+    }};
+}

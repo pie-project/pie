@@ -6,6 +6,14 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
+    /// The query heads are the same count under both readings, so they are a
+    /// fact about the text and not about a layer.
+    pub q_heads: u32,
+    /// The two readings this text carves attention schedules for. A layer
+    /// names one of them and states nothing about it itself.
+    pub sliding: Sliding,
+    pub global: Global,
+
     pub kv: Dtype,
     pub softcap: Option<f32>,
     pub embed: Weight,
@@ -50,8 +58,7 @@ pub struct Layer {
 }
 
 pub struct Attn {
-    pub kind: AttnKind,
-    pub q_heads: u32,
+    pub reading: Reading,
     pub sm_scale: f32,
     pub q_norm: Weight,
     pub q_norm_eps: f32,
@@ -60,46 +67,30 @@ pub struct Attn {
     pub banks: AttnBanks,
 }
 
-pub enum AttnKind {
-    Full {
-        head_dim: u32,
-        kv_heads: u32,
-        rotary_dim: u32,
-        theta: f32,
-    },
-    Sliding {
-        head_dim: u32,
-        kv_heads: u32,
-        window: u32,
-        theta: f32,
-    },
+/// Which of the text's two readings of the one sequence a layer takes. The
+/// discriminant is the index: anything the forward pass carves per reading is
+/// a two-element array `[sliding, global]` indexed by `reading as usize`.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Reading {
+    Sliding = 0,
+    Global = 1,
 }
 
-impl AttnKind {
-    pub fn head_dim(&self) -> u32 {
-        match *self {
-            AttnKind::Full { head_dim, .. } | AttnKind::Sliding { head_dim, .. } => head_dim,
-        }
-    }
-    pub fn kv_heads(&self) -> u32 {
-        match *self {
-            AttnKind::Full { kv_heads, .. } | AttnKind::Sliding { kv_heads, .. } => kv_heads,
-        }
-    }
-    pub fn theta(&self) -> f32 {
-        match *self {
-            AttnKind::Full { theta, .. } | AttnKind::Sliding { theta, .. } => theta,
-        }
-    }
-    pub fn window(&self) -> Option<u32> {
-        match *self {
-            AttnKind::Full { .. } => None,
-            AttnKind::Sliding { window, .. } => Some(window),
-        }
-    }
-    pub fn sliding(&self) -> bool {
-        matches!(self, AttnKind::Sliding { .. })
-    }
+/// The local reading: narrow heads over a window of recent keys.
+pub struct Sliding {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub window: u32,
+    pub theta: f32,
+}
+
+/// The global reading: wide heads over the whole sequence, rotated over only
+/// the leading `rotary_dim` of each head.
+pub struct Global {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub rotary_dim: u32,
+    pub theta: f32,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -138,7 +129,7 @@ struct Dims {
 
 impl Model {
     pub fn e4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        assemble(
+        Model::new(
             w,
             kv,
             tp,
@@ -167,7 +158,7 @@ impl Model {
     }
 
     pub fn b31(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        assemble(
+        Model::new(
             w,
             kv,
             tp,
@@ -194,136 +185,141 @@ impl Model {
             },
         )
     }
-}
 
-fn assemble(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-    assert!(
-        matches!(tp, 1 | 2 | 4 | 8),
-        "tp {tp} is not a world this catalog ships"
-    );
-    let q_heads = d.q_heads / tp;
-    let kv_heads = d.kv_heads / tp;
-    let global_kv_heads = d.global_kv_heads / tp;
-    let intermediate = d.intermediate / tp;
+    fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+        assert!(
+            matches!(tp, 1 | 2 | 4 | 8),
+            "tp {tp} is not a world this catalog ships"
+        );
+        let q_heads = d.q_heads / tp;
+        let kv_heads = d.kv_heads / tp;
+        let global_kv_heads = d.global_kv_heads / tp;
+        let intermediate = d.intermediate / tp;
 
-    let hidden = d.hidden as u64;
-    let full_at = |l: u32| l % d.full_every == d.full_every - 1;
-    let shared_at = |l: u32| d.shared_tail.is_some_and(|tail| l >= d.layers - tail);
-    let source = |l: u32| {
-        (0..l)
-            .rev()
-            .find(|&s| !shared_at(s) && full_at(s) == full_at(l))
-    };
-    let owner = |l: u32| match d.shared_tail {
-        None => l,
-        Some(tail) if l < d.layers - tail => l,
-        Some(tail) => source(l).unwrap_or_else(|| {
-            panic!(
-                "layer {l} borrows its kv cache and none of the {} layers \
-                 before the shared tail is of its kind (full_every {}, \
-                 shared_tail {tail})",
-                d.layers - tail,
-                d.full_every,
-            )
-        }),
-    };
-    let kind = |l: u32| {
-        if full_at(l) {
-            AttnKind::Full {
-                head_dim: d.global_head_dim,
-                kv_heads: global_kv_heads,
-                rotary_dim: d.global_rotary_dim,
-                theta: d.theta_global,
-            }
-        } else {
-            AttnKind::Sliding {
-                head_dim: d.head_dim,
-                kv_heads,
-                window: d.window,
-                theta: d.theta_local,
-            }
-        }
-    };
+        let hidden = d.hidden as u64;
+        let full_at = |l: u32| l % d.full_every == d.full_every - 1;
+        let shared_at = |l: u32| d.shared_tail.is_some_and(|tail| l >= d.layers - tail);
+        let source = |l: u32| {
+            (0..l)
+                .rev()
+                .find(|&s| !shared_at(s) && full_at(s) == full_at(l))
+        };
+        let owner = |l: u32| match d.shared_tail {
+            None => l,
+            Some(tail) if l < d.layers - tail => l,
+            Some(tail) => source(l).unwrap_or_else(|| {
+                panic!(
+                    "layer {l} borrows its kv cache and none of the {} layers \
+                     before the shared tail is of its kind (full_every {}, \
+                     shared_tail {tail})",
+                    d.layers - tail,
+                    d.full_every,
+                )
+            }),
+        };
+        let sliding = Sliding {
+            head_dim: d.head_dim,
+            kv_heads,
+            window: d.window,
+            theta: d.theta_local,
+        };
+        let global = Global {
+            head_dim: d.global_head_dim,
+            kv_heads: global_kv_heads,
+            rotary_dim: d.global_rotary_dim,
+            theta: d.theta_global,
+        };
 
-    let layers = (0..d.layers)
-        .map(|l| {
-            let n = |s: &str| format!("layer.{l}.{s}");
-            let norm = |s: &str, len: u64| Weight::sym(n(s), [len], w);
-            let ki = kind(l);
-            let hd = ki.head_dim() as u64;
-            let q_w = q_heads as u64 * hd;
-            let kv_w = ki.kv_heads() as u64 * hd;
-            let iw = intermediate as u64;
-            Layer {
-                attn: Attn {
-                    q_heads,
-                    sm_scale: d.sm_scale,
-                    q_norm: norm("q_norm", hd),
-                    q_norm_eps: d.norm_eps,
-                    kv: format!("kv.{}", owner(l)),
-                    banks: if shared_at(l) {
-                        AttnBanks::Shared {
-                            q_proj: Weight::sym(n("q_proj"), [q_w, hidden], w).columns(),
-                        }
-                    } else {
-                        AttnBanks::Owned {
-                            qkv: Weight::sym(n("qkv"), [q_w + 2 * kv_w, hidden], w)
-                                .packed([q_w, kv_w, kv_w]),
-                            k_norm: norm("k_norm", hd),
-                            k_norm_eps: d.norm_eps,
-                        }
+        let layers = (0..d.layers)
+            .map(|l| {
+                let n = |s: &str| format!("layer.{l}.{s}");
+                let norm = |s: &str, len: u64| Weight::sym(n(s), [len], w);
+                let reading = if full_at(l) {
+                    Reading::Global
+                } else {
+                    Reading::Sliding
+                };
+                let (head_dim, row_heads) = match reading {
+                    Reading::Sliding => (sliding.head_dim, sliding.kv_heads),
+                    Reading::Global => (global.head_dim, global.kv_heads),
+                };
+                let hd = head_dim as u64;
+                let q_w = q_heads as u64 * hd;
+                let kv_w = row_heads as u64 * hd;
+                let iw = intermediate as u64;
+                Layer {
+                    attn: Attn {
+                        sm_scale: d.sm_scale,
+                        q_norm: norm("q_norm", hd),
+                        q_norm_eps: d.norm_eps,
+                        kv: format!("kv.{}", owner(l)),
+                        banks: if shared_at(l) {
+                            AttnBanks::Shared {
+                                q_proj: Weight::sym(n("q_proj"), [q_w, hidden], w).columns(),
+                            }
+                        } else {
+                            AttnBanks::Owned {
+                                qkv: Weight::sym(n("qkv"), [q_w + 2 * kv_w, hidden], w)
+                                    .packed([q_w, kv_w, kv_w]),
+                                k_norm: norm("k_norm", hd),
+                                k_norm_eps: d.norm_eps,
+                            }
+                        },
+                        reading,
                     },
-                    kind: ki,
-                },
-                o_proj: Weight::sym(n("o_proj"), [hidden, q_w], w).rows(),
-                attn_norm: norm("attn_norm", hidden),
-                attn_norm_eps: d.norm_eps,
-                post_attn_norm: norm("post_attn_norm", hidden),
-                post_attn_norm_eps: d.norm_eps,
-                pre_ffw_norm: norm("pre_ffw_norm", hidden),
-                pre_ffw_norm_eps: d.norm_eps,
-                post_ffw_norm: norm("post_ffw_norm", hidden),
-                post_ffw_norm_eps: d.norm_eps,
-                gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
-                inter: intermediate,
-                down: Weight::sym(n("down"), [hidden, iw], w).rows(),
-            }
-        })
-        .collect();
+                    o_proj: Weight::sym(n("o_proj"), [hidden, q_w], w).rows(),
+                    attn_norm: norm("attn_norm", hidden),
+                    attn_norm_eps: d.norm_eps,
+                    post_attn_norm: norm("post_attn_norm", hidden),
+                    post_attn_norm_eps: d.norm_eps,
+                    pre_ffw_norm: norm("pre_ffw_norm", hidden),
+                    pre_ffw_norm_eps: d.norm_eps,
+                    post_ffw_norm: norm("post_ffw_norm", hidden),
+                    post_ffw_norm_eps: d.norm_eps,
+                    gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
+                    inter: intermediate,
+                    down: Weight::sym(n("down"), [hidden, iw], w).rows(),
+                }
+            })
+            .collect();
 
-    Model {
-        hidden: d.hidden,
-        vocab: d.vocab,
-        tp,
-        kv,
-        softcap: d.softcap,
-        embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
-        ple: d.ple_dim.map(|dim| {
-            let ple = dim as u64;
-            Ple {
-                dim,
-                model_proj: Weight::sym("ple.model_proj", [d.layers as u64 * ple, hidden], w),
-                model_norm: Weight::sym("ple.model_norm", [ple], w),
-                model_norm_eps: d.norm_eps,
-                per_layer: (0..d.layers)
-                    .map(|l| PleLayer {
-                        table: Weight::sym(
-                            format!("layer.{l}.ple_table"),
-                            [d.vocab as u64, ple],
-                            w,
-                        ),
-                        gate: Weight::sym(format!("layer.{l}.ple_gate"), [ple, hidden], w),
-                        proj: Weight::sym(format!("layer.{l}.ple_proj"), [hidden, ple], w),
-                        norm: Weight::sym(format!("layer.{l}.ple_norm"), [hidden], w),
-                        norm_eps: d.norm_eps,
-                        scalar: Weight::sym(format!("layer.{l}.ple_scalar"), [1], w),
-                    })
-                    .collect(),
-            }
-        }),
-        layers,
-        final_norm: Weight::sym("final_norm", [hidden], w),
-        final_norm_eps: d.norm_eps,
+        Model {
+            hidden: d.hidden,
+            vocab: d.vocab,
+            tp,
+            q_heads,
+            sliding,
+            global,
+            kv,
+            softcap: d.softcap,
+            embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
+            ple: d.ple_dim.map(|dim| {
+                let ple = dim as u64;
+                Ple {
+                    dim,
+                    model_proj: Weight::sym("ple.model_proj", [d.layers as u64 * ple, hidden], w),
+                    model_norm: Weight::sym("ple.model_norm", [ple], w),
+                    model_norm_eps: d.norm_eps,
+                    per_layer: (0..d.layers)
+                        .map(|l| PleLayer {
+                            table: Weight::sym(
+                                format!("layer.{l}.ple_table"),
+                                [d.vocab as u64, ple],
+                                w,
+                            ),
+                            gate: Weight::sym(format!("layer.{l}.ple_gate"), [ple, hidden], w),
+                            proj: Weight::sym(format!("layer.{l}.ple_proj"), [hidden, ple], w),
+                            norm: Weight::sym(format!("layer.{l}.ple_norm"), [hidden], w),
+                            norm_eps: d.norm_eps,
+                            scalar: Weight::sym(format!("layer.{l}.ple_scalar"), [1], w),
+                        })
+                        .collect(),
+                }
+            }),
+            layers,
+            final_norm: Weight::sym("final_norm", [hidden], w),
+            final_norm_eps: d.norm_eps,
+        }
     }
 }
 

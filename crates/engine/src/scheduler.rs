@@ -73,7 +73,7 @@ pub(crate) use dispatch::{
     register_channel, register_channels, register_channels_bind_classified, register_program,
     resize_pool,
 };
-pub use stats::AggregateStats;
+pub use stats::{AggregateStats, HostSubmitStats};
 pub use worker::BatchScheduler;
 use worker::SchedulerHandle;
 

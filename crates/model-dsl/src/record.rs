@@ -9,8 +9,8 @@ use std::ops::Mul;
 use std::rc::Rc;
 
 use model_ir::{
-    CacheRow, Cond, Def, Dim, Dtype, Node, Operands, Operation, Param, Plan, Plane, RuntimeInput,
-    Seam, Shard, Ty, ValueDecl, ValueId,
+    CacheRow, Cond, Def, Dim, Dtype, Node, Operands, Operation, Param, ParamSource, Plan, Platform,
+    RuntimeInput, Seam, Shard, Ty, ValueDecl, ValueId,
 };
 
 use crate::declare::Weight;
@@ -33,11 +33,11 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub(crate) fn new(name: &str, plane: Plane, caches: Vec<CacheRow>) -> Recorder {
+    pub(crate) fn new(name: &str, platform: Platform, caches: Vec<CacheRow>) -> Recorder {
         Recorder {
             inner: Rc::new(RefCell::new(Plan {
                 name: name.to_string(),
-                plane,
+                platform,
                 params: Vec::new(),
                 caches,
                 values: Vec::new(),
@@ -115,7 +115,7 @@ impl Recorder {
         for plane in w.planes() {
             let name = format!("{}{}", w.name, plane.suffix);
             let shard = restated(&w.shard, &w.shape, &plane.shape, &name);
-            let index = intern(&mut p, name, plane.shape, shard, plane.dtype);
+            let index = intern(&mut p, name, plane.shape, shard, plane.dtype, w.source);
             first.get_or_insert(index);
         }
         let first = first.expect("a weight stores at least one plane");
@@ -241,12 +241,27 @@ impl Recorder {
     }
 }
 
-fn intern(p: &mut Plan, name: String, shape: Vec<u64>, shard: Shard, dtype: Dtype) -> u32 {
+fn intern(
+    p: &mut Plan,
+    name: String,
+    shape: Vec<u64>,
+    shard: Shard,
+    dtype: Dtype,
+    source: ParamSource,
+) -> u32 {
     if let Some(i) = p.params.iter().position(|q| q.name == name) {
         let seen = &p.params[i];
         assert!(
             seen.shape == shape && seen.shard == shard && seen.dtype == dtype,
             "`{name}` is declared twice with two shapes"
+        );
+        // Provenance is part of the declaration, not a decoration on it: the
+        // same name landed once from the checkpoint and once from the serving
+        // door is a plane whose contents depend on which statement ran last.
+        assert!(
+            seen.source == source,
+            "`{name}` is declared twice, once from the checkpoint and once as \
+             a registered bank"
         );
         return i as u32;
     }
@@ -255,6 +270,7 @@ fn intern(p: &mut Plan, name: String, shape: Vec<u64>, shard: Shard, dtype: Dtyp
         shape,
         shard,
         dtype,
+        source,
     });
     (p.params.len() - 1) as u32
 }
@@ -334,7 +350,7 @@ impl Value {
         }
     }
 
-    pub fn split<S: SplitSpec>(&self, spec: S) -> S::Arms {
+    pub fn split<S: SplitSpec>(&self, spec: S) -> S::Arms<Value> {
         spec.arms(self)
     }
 
@@ -368,6 +384,39 @@ impl Value {
         }
     }
 
+    /// **THE SAME VALUE, READ WITHOUT ITS PRODUCER'S GUARD.**
+    ///
+    /// A normal op output is narrow exactly where its node is: the decode
+    /// attention's result exists on decode rows and nowhere else, so a
+    /// consumer that took it unguarded would be reading rows nobody wrote.
+    /// An IN-PLACE output under a guard is the other case, and design §8's
+    /// correction class is what made it real: `linear.lora_correct`'s `y_out`
+    /// aliases the `y` it adds to, so its column is written on every row of
+    /// the fire — by the trunk everywhere, and by the correction again inside
+    /// the adapter window. The value is defined everywhere; only the
+    /// CORRECTION is narrow.
+    ///
+    /// Without this, the guard would leak: `residual_add(correction, y)` would
+    /// take the correction's cond, the residual stream would be guarded from
+    /// that layer on, and the next layer's split would refuse to mix with it.
+    /// With it, the model text reads the way the mechanism works — one
+    /// statement, no merge, no arm.
+    ///
+    /// `model_ir::check::classes` is the other half: its demand walk follows
+    /// the alias when the node is not live, so the classes that skip the
+    /// correction still demand the trunk that filled the column.
+    #[must_use]
+    pub fn everywhere(&self) -> Value {
+        Value {
+            rec: self.rec.clone(),
+            id: self.id,
+            over: Some(Cond::Always),
+            ty: self.ty.clone(),
+        }
+    }
+}
+
+impl Refine for Value {
     fn refined(&self, cond: Cond) -> Value {
         Value {
             rec: self.rec.clone(),
@@ -395,24 +444,38 @@ impl Mul<f32> for Value {
     }
 }
 
+/// What a split hands out arms of. One algorithm, two carriers: a [`Value`]
+/// arm is the same traced value read under a narrower guard, and an
+/// [`Input`](crate::Input) arm is the same handle whose every value comes out
+/// under that guard. Cut by the same spec they carry structurally equal conds,
+/// which is exactly what [`Recorder::push`]'s compatibility check compares —
+/// so a schedule built off one class's arm and a query read off another's is
+/// refused at the line that mixed them.
+pub trait Refine: Sized {
+    fn refined(&self, cond: Cond) -> Self;
+}
+
+/// How a spec cuts a carrier into arms: `&Predicate` gives the two-way
+/// yes/no pair, `[Predicate; N]` the priority-ordered n-way carving. The
+/// arm computation is written once, over any [`Refine`].
 pub trait SplitSpec {
-    type Arms;
-    fn arms(self, v: &Value) -> Self::Arms;
+    type Arms<T>;
+    fn arms<T: Refine>(self, of: &T) -> Self::Arms<T>;
 }
 
 impl SplitSpec for &Predicate {
-    type Arms = (Value, Value);
+    type Arms<T> = (T, T);
 
-    fn arms(self, v: &Value) -> (Value, Value) {
+    fn arms<T: Refine>(self, of: &T) -> (T, T) {
         let c = cond_of(self);
-        (v.refined(c.clone()), v.refined(Cond::not(c)))
+        (of.refined(c.clone()), of.refined(Cond::not(c)))
     }
 }
 
 impl<const N: usize> SplitSpec for [Predicate; N] {
-    type Arms = [Value; N];
+    type Arms<T> = [T; N];
 
-    fn arms(self, v: &Value) -> [Value; N] {
+    fn arms<T: Refine>(self, of: &T) -> [T; N] {
         let mut not_prior = Cond::Always;
         self.each_ref().map(|p| {
             let mine = match p {
@@ -424,7 +487,7 @@ impl<const N: usize> SplitSpec for [Predicate; N] {
                     mine
                 }
             };
-            v.refined(mine)
+            of.refined(mine)
         })
     }
 }

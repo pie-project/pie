@@ -149,9 +149,9 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     // The plane picks an alignment and a tile budget, neither of which can
     // change whether a tensor's SHAPE is the one a contract declares — which
     // is the only question a listing asks — so the door's own note applies:
-    // one plane is as good as any, and this listing is a host-side answer
+    // one platform is as good as any, and this listing is a host-side answer
     // about files, not about a device this machine has.
-    match engine::driver::load::identify(&snap, engine::driver::load::Plane::Cuda) {
+    match engine::driver::load::identify(&snap, engine::driver::load::Platform::Cuda) {
         Ok(sku) => (true, sku.to_string()),
         // One line, because this is a table cell. The full per-candidate
         // account is what `pie model import` prints when the load is

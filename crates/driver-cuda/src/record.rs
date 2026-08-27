@@ -143,7 +143,7 @@ use model_ir::Plan;
 use crate::device::graph::{Graph, GraphExec};
 use crate::error::{Fault, Result};
 use crate::run::Run;
-use crate::window::Cursor;
+use crate::window::{Cursor, Lanes};
 
 /// Which fire of a key captures it: the fires before it are eager, and so is
 /// this one's own first pass.
@@ -253,6 +253,12 @@ pub struct Stats {
     /// Nodes in the most recently captured graph — the number decision #15's
     /// rebind cost would be multiplied by.
     pub nodes: usize,
+    /// EDGES in the most recently captured graph — **the only observable a
+    /// P6 fork has.** Capture lowers an event record and the wait behind it
+    /// into a dependency rather than into nodes, so a forked graph and a
+    /// sequential one hold the same nodes and a different topology: a chain is
+    /// `nodes - 1` edges and every fork/join pair adds one.
+    pub edges: usize,
     /// Wall-clock milliseconds spent capturing and instantiating, all keys.
     pub capture_millis: f64,
 }
@@ -273,6 +279,18 @@ pub struct Fire<'a> {
     pub descriptor: &'a FireDescriptor,
     /// The stream the shell enqueues on.
     pub stream: *mut core::ffi::c_void,
+    /// P6's side streams and event handles, when the artifact asked for any.
+    ///
+    /// **ONLY THE CAPTURING WALK IS GIVEN THESE**, and that is the whole of
+    /// this module's P6 policy. Inside a capture an event pair is two nodes
+    /// and an edge — free at replay, which is where the overlap is won.
+    /// Outside one it is a real cross-stream synchronization bought on a walk
+    /// whose numbers are the golden the replay is diffed against. So the eager
+    /// pass below runs on the main stream from end to end (see
+    /// `driver::fire::EagerSink`'s doc: that is the serialization of the same
+    /// DAG, which is why the two agree token for token) and the capture pass
+    /// records the forks.
+    pub lanes: Option<Lanes<'a>>,
     /// Which exec this fire's shape asks for.
     pub key: Key,
 }
@@ -325,14 +343,16 @@ impl Graphs {
         // 1. Prepare: the host half. Plan builders, their staging, and
         //    nothing that could be recorded — this is exactly the work dev's
         //    second constraint says must not be inside a capture.
+        let mut prepare = at.serial(region);
         walk_phases(
             at.plan,
             at.baked,
             at.descriptor,
             run,
-            &mut Cursor::new(region),
+            &mut prepare,
             Phases::Prepare,
         )?;
+        prepare.settle()?;
         let shape = run.schedule_shape();
 
         // 2. A hit is the whole fire path: one submission.
@@ -351,7 +371,7 @@ impl Graphs {
         // 3. A miss runs for real, which is where this fire's numbers come
         //    from and where every lazily-warmed thing the capture must not do
         //    gets done.
-        walk_capture(at, run, region)?;
+        walk_capture(at, run, region, Streams::Serial)?;
 
         // The sighting counts are bounded too, and for the same reason the
         // execs are: a load whose shapes wander would otherwise keep a
@@ -375,10 +395,26 @@ impl Graphs {
         //    walk, same window table, same buffers — captured is eager by
         //    construction (decision #11), and this is the line where that
         //    sentence is either true or a slogan.
+        //
+        //    **AND THE ONE PLACE THE SIDE STREAMS ARE USED.** P6's event
+        //    points go on here and nowhere else, because inside a capture a
+        //    record and the wait behind it are two graph edges and outside one
+        //    they are a real cross-stream synchronization bought on a walk
+        //    whose numbers are the golden the replay is diffed against.
+        //
+        //    A body that refuses part way leaves any arm it had already forked
+        //    mid-capture, and `cudaStreamEndCapture` on the main stream then
+        //    answers `cudaErrorStreamCaptureUnjoined` — the same poisoning a
+        //    single-stream capture already risks (`device::graph`'s own doc),
+        //    widened to the side streams. Rejoining on the error path would
+        //    mean the walk telling the cursor which events it had not reached,
+        //    which is a second schedule beside the template; a failed capture
+        //    is a failed load either way.
         let began = Instant::now();
-        let graph = Graph::capture(at.stream, || walk_capture(at, run, region))?;
+        let graph = Graph::capture(at.stream, || walk_capture(at, run, region, Streams::Forked))?;
         let exec = graph.instantiate(at.stream)?;
         self.stats.nodes = exec.nodes();
+        self.stats.edges = graph.edges();
         self.stats.capture_millis += began.elapsed().as_secs_f64() * 1000.0;
         self.stats.captures += 1;
         self.insert(at.key.clone(), Entry { exec, shape });
@@ -412,18 +448,52 @@ impl Graphs {
     }
 }
 
+/// Which schedule of P6's DAG this walk is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Streams {
+    /// One stream, program order — the serialization, and the golden.
+    Serial,
+    /// The baked streams and event points, which only a capture wants.
+    Forked,
+}
+
+impl<'a> Fire<'a> {
+    /// A cursor that stays on the main stream, and puts the stream cell back
+    /// there if a capture pass left it somewhere else.
+    fn serial(&self, region: &'a Cell<u32>) -> Cursor<'a> {
+        if let Some(lanes) = self.lanes {
+            lanes.at.set(0);
+        }
+        Cursor::new(region)
+    }
+}
+
 /// The capture-phase regions, dispatched. A fresh [`Cursor`] each time: it
 /// counts regions from zero, and the count is the window index every `Run`
 /// resolution reads.
-fn walk_capture(at: &Fire<'_>, run: &mut Run<'_>, region: &Cell<u32>) -> Result<()> {
+fn walk_capture(
+    at: &Fire<'_>,
+    run: &mut Run<'_>,
+    region: &Cell<u32>,
+    streams: Streams,
+) -> Result<()> {
+    let mut cursor = match (streams, at.lanes) {
+        (Streams::Forked, Some(lanes)) => Cursor::across(region, lanes),
+        _ => at.serial(region),
+    };
     walk_phases(
         at.plan,
         at.baked,
         at.descriptor,
         run,
-        &mut Cursor::new(region),
+        &mut cursor,
         Phases::Capture,
     )?;
+    // A `Sink` method has nowhere to return to, so the cursor kept whatever
+    // the device refused and this is where it is asked — INSIDE the capture
+    // body, so that `Graph::capture` ends the capture on the way out and the
+    // stream is usable afterwards.
+    cursor.settle()?;
     Ok(())
 }
 

@@ -7,8 +7,11 @@
 //! compiler folds the pair onto one arena slot, so the wrapper still returns a
 //! fresh `Value` (§2). Raggedness is ambient (§5): prefill/chunked wrappers
 //! take the fire-aligned tensor directly, with no indptr plumbing. Caches are
-//! storage-only ids; geometry enters the graph through [`geometry`] as
-//! declared runtime inputs, and plan ops are pure functions of them (§6, §7).
+//! storage-only ids; geometry enters the graph through
+//! [`Input`](crate::Input)'s accessors as declared runtime inputs — a runtime
+//! input is something the driver binds, not something a kernel computes, so
+//! its declaration belongs beside the handle a forward reaches for it with —
+//! and the plan ops here are pure functions of them (§6, §7).
 //!
 //! The six wrapper modules below ARE the IR's six op families, and each
 //! wrapper carries the name of the one variant it pushes: `Attention::MlaDecode`
@@ -19,10 +22,10 @@
 //! text through the plan to the driver arm.
 
 use crate::declare::Weight;
-use crate::record::{Recorder, Value};
+use crate::record::Value;
 use model_ir::{
-    Attention, Collective, CustomCuda, Dim, Dtype, Elementwise, GeomKind, Layout, Linear,
-    RuntimeInput, StructKind, Ty, ValueId,
+    Attention, Collective, CustomCuda, Dim, Dtype, Elementwise, Layout, Linear, StructKind, Ty,
+    ValueId,
 };
 
 pub mod attn;
@@ -38,45 +41,4 @@ fn tensor(rows: Dim, width: impl Into<u64>, dtype: Dtype) -> Ty {
         shape: vec![rows, Dim::Const(width.into())],
         dtype,
     }
-}
-
-/// Declares one geometry vector of kv space `space` as a runtime input (§7):
-/// indptr-shaped vectors are `lanes + 1` long, the page-table vectors are
-/// per-lane, and the fire tables — the padding mask, the token→lane map, and
-/// the write addressing — are per-token. Everything is `i32` except
-/// `RowValid`, the packed `u8` graph-padding mask. The plan wrappers fetch
-/// their own; forwards call this for the write geometry a `kv_append` takes.
-pub fn geometry(r: &Recorder, space: u32, kind: GeomKind) -> Value {
-    let (rows, dtype) = match kind {
-        GeomKind::Indptr => (Dim::LanesPlus(1), Dtype::I32),
-        GeomKind::Indices | GeomKind::SeqLens | GeomKind::LastPageLen | GeomKind::KvLen => {
-            (Dim::Lanes, Dtype::I32)
-        }
-        GeomKind::RowValid => (Dim::Tokens, Dtype::U8),
-        GeomKind::RequestOfToken | GeomKind::WritePage | GeomKind::WriteOffset => {
-            (Dim::Tokens, Dtype::I32)
-        }
-    };
-    r.input(
-        RuntimeInput::Geometry { space, kind },
-        Ty::Tensor {
-            shape: vec![rows],
-            dtype,
-        },
-    )
-}
-
-/// Declares kv space `space`'s custom attention mask as a runtime input:
-/// packed `u8` mask bits, token-aligned, read by `attention.masked`. Both
-/// planes carry the bits this way — metal's fire tables and the cuda plan's
-/// `Mask` pair; the per-request enabled bits and spans stay driver-derived
-/// for now.
-pub fn mask(r: &Recorder, space: u32) -> Value {
-    r.input(
-        RuntimeInput::Mask { space },
-        Ty::Tensor {
-            shape: vec![Dim::Tokens],
-            dtype: Dtype::U8,
-        },
-    )
 }

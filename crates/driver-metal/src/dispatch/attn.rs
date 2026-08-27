@@ -31,6 +31,10 @@ impl DispatchAttention for Run<'_> {
                 kv_indices: _,
                 last_page_len: _,
                 kv_len,
+                q_heads: _,
+                kv_heads: _,
+                head_dim: _,
+                window: _,
                 plan,
             } => {
                 match self.declared(*plan) {
@@ -43,13 +47,21 @@ impl DispatchAttention for Run<'_> {
                 let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
+                // THE AMBIENT TABLES ARE CUT LIKE THE `q` THAT WILL BE READ
+                // BESIDE THEM. The sdpa shaders index `position_ids[row]`,
+                // `req_of_token[row]` and `attention_mask_enabled[row]` by the
+                // LOCAL row of the launch, so a plan built for a windowed
+                // class has to carry the window's own slice of each. What
+                // stays absolute is what those tables CONTAIN — a lane id
+                // into the fire-wide `page_indptr` — because slicing a vector
+                // does not renumber it.
                 let built = attn::plan_decode(
                     self.ctx(),
                     kv_len,
-                    positions,
-                    t.request_of_token,
-                    t.mask,
-                    t.mask_enabled,
+                    self.cut_rows(positions),
+                    self.cut_rows(t.request_of_token),
+                    self.cut_rows(t.mask),
+                    self.cut_rows(t.mask_enabled),
                     t.mask_stride,
                 )?;
                 self.put(*plan, StructSlot::Decode(built));
@@ -64,6 +76,10 @@ impl DispatchAttention for Run<'_> {
                 kv_indices: _,
                 last_page_len: _,
                 kv_len,
+                q_heads: _,
+                kv_heads: _,
+                head_dim: _,
+                window: _,
                 plan,
             } => {
                 match self.declared(*plan) {
@@ -80,13 +96,14 @@ impl DispatchAttention for Run<'_> {
                 let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
+                // As `PlanDecode`: the window's slice of each ambient table.
                 let built = attn::plan_prefill(
                     self.ctx(),
                     kv_len,
-                    positions,
-                    t.request_of_token,
-                    t.mask,
-                    t.mask_enabled,
+                    self.cut_rows(positions),
+                    self.cut_rows(t.request_of_token),
+                    self.cut_rows(t.mask),
+                    self.cut_rows(t.mask_enabled),
                     t.mask_stride,
                 )?;
                 self.put(*plan, StructSlot::Prefill(built));
@@ -262,6 +279,8 @@ impl DispatchAttention for Run<'_> {
                 kv_indices,
                 last_page_len,
                 kv_len,
+                heads: _,
+                kv_lora_rank: _,
                 plan,
             } => {
                 let built = attn::mla::plan(
@@ -475,7 +494,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *conv_width,
                 self.tensor(*y),
             ),
@@ -489,7 +508,7 @@ impl DispatchAttention for Run<'_> {
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *conv_width,
                 self.tensor(*y),
             ),
@@ -520,7 +539,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*qkv),
                 self.tensor(*z),
                 self.tensor(*gates),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
@@ -542,7 +561,7 @@ impl DispatchAttention for Run<'_> {
                 self.ragged(*qkv),
                 self.tensor(*z),
                 self.tensor(*gates),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
@@ -567,7 +586,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*b),
                 self.tensor(*dt_bias),
                 self.tensor(*a_log),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *heads,
                 *head_dim,
                 *norm_eps,
@@ -591,7 +610,7 @@ impl DispatchAttention for Run<'_> {
                 self.tensor(*b),
                 self.tensor(*dt_bias),
                 self.tensor(*a_log),
-                self.recurrent(*state),
+                &self.recurrent(*state),
                 *heads,
                 *head_dim,
                 *norm_eps,

@@ -56,6 +56,29 @@ pub fn present() -> bool {
     }
 }
 
+/// One side stream: a second place to enqueue, and the companions an entry
+/// firing on it needs.
+///
+/// **A cuBLAS HANDLE PER STREAM, AND IT IS NOT OPTIONAL.** A handle carries
+/// the stream its GEMMs go on (`cublasSetStream_v2`), so one handle shared
+/// between two streams would mean either re-pointing it per launch — a host
+/// call inside a capture, ordering nothing — or every projection landing on
+/// the main stream whatever the region said. Gemma forks a region containing
+/// `linear.matmul` on the very first layer, so this is the ordinary case
+/// rather than a corner.
+///
+/// **NO COMMUNICATOR, DELIBERATELY.** P6 never puts a collective on a side
+/// stream (decision #5: NCCL matches by call order), so a context here that
+/// carried one would be a capability nothing may use. A collective fired on a
+/// side stream answers `Ctx::comm`'s typed refusal, which is the diagnostic
+/// worth having if the pass ever regresses.
+#[cfg_attr(not(feature = "_cuda"), allow(dead_code))]
+struct Side {
+    stream: *mut c_void,
+    cublas: *mut c_void,
+    ctx: Ctx,
+}
+
 /// One bound device and the stream this shell's whole life is enqueued on.
 pub struct Context {
     ordinal: i32,
@@ -65,6 +88,12 @@ pub struct Context {
     #[cfg_attr(not(feature = "_cuda"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
+    /// P6's side streams, in stream order: `side[0]` is stream 1. Empty until
+    /// [`Context::open_lanes`] is told how many the artifact asked for, and
+    /// empty forever for an artifact that forked nothing.
+    side: Vec<Side>,
+    /// One `cudaEvent_t` per `model_compiler::EventId`, created once at load.
+    events: Vec<crate::device::graph::Event>,
     device: Device,
     toggles: Toggles,
     capability: (i32, i32),
@@ -127,6 +156,8 @@ impl Context {
                     stream,
                     cublas,
                     ctx,
+                    side: Vec::new(),
+                    events: Vec::new(),
                     device,
                     toggles: Toggles::from_env(),
                     capability: capability(ordinal),
@@ -184,6 +215,109 @@ impl Context {
     #[must_use]
     pub fn stream(&self) -> *mut c_void {
         self.stream
+    }
+
+    /// **OPEN P6'S SIDE STREAMS AND ITS EVENTS**, once, at load, for the
+    /// counts the artifact asked for (`Baked::forks`).
+    ///
+    /// Called after `compile`, because how many streams a plan wants is
+    /// something the plan decides — and called at LOAD rather than per fire,
+    /// because a `cudaStreamCreate` inside a capture is exactly the host work
+    /// `Graph::capture`'s thread-local mode exists to refuse.
+    ///
+    /// Idempotent in the direction that matters: asking for what is already
+    /// open does nothing, and asking for fewer keeps what is there. An
+    /// artifact that forked nothing asks for `(0, 0)` and this is a no-op with
+    /// no handle created, which is the "pays nothing" half of the off arm.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
+    /// for a stream, a handle or an event the runtime refused. A failure part
+    /// way through leaves the streams already opened in place; they are
+    /// destroyed with the context.
+    pub fn open_lanes(&mut self, side: u32, events: u32) -> Result<()> {
+        #[cfg(feature = "_cuda")]
+        {
+            use cudarc::cublas::sys as blas;
+            use cudarc::runtime::sys as rt;
+
+            while self.side.len() < side as usize {
+                // SAFETY: every call takes a live local out-parameter, and the
+                // handles below are the ones the calls before them produced.
+                // This thread bound the device.
+                let opened = unsafe {
+                    let mut stream: rt::cudaStream_t = core::ptr::null_mut();
+                    check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
+                    let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
+                    let status = blas::cublasCreate_v2(&raw mut handle);
+                    if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                        rt::cudaStreamDestroy(stream);
+                        return Err(Fault::Device {
+                            call: "cublasCreate_v2",
+                            code: status as i32,
+                        });
+                    }
+                    let status = blas::cublasSetStream_v2(handle, stream.cast());
+                    if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                        blas::cublasDestroy_v2(handle);
+                        rt::cudaStreamDestroy(stream);
+                        return Err(Fault::Device {
+                            call: "cublasSetStream_v2",
+                            code: status as i32,
+                        });
+                    }
+                    let stream: *mut c_void = stream.cast();
+                    let cublas: *mut c_void = handle.cast();
+                    Side {
+                        stream,
+                        cublas,
+                        ctx: Ctx::on(stream).with_cublas(cublas),
+                    }
+                };
+                self.side.push(opened);
+            }
+            while self.events.len() < events as usize {
+                self.events.push(crate::device::graph::Event::new()?);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            if side == 0 && events == 0 {
+                return Ok(());
+            }
+            let _ = (side, events);
+            Err(Fault::Runtimeless)
+        }
+    }
+
+    /// The side streams' handles, in stream order — `streams()[0]` is stream
+    /// 1. Empty until [`open_lanes`](Context::open_lanes).
+    #[must_use]
+    pub fn side_streams(&self) -> Vec<*mut c_void> {
+        self.side.iter().map(|side| side.stream).collect()
+    }
+
+    /// The kernel contexts for the side streams, in the same order.
+    ///
+    /// A `Run` takes this slice beside [`ctx`](Context::ctx) and picks by
+    /// `Region::stream`; index 0 here is stream 1 there.
+    #[must_use]
+    pub fn side_ctx(&self) -> Vec<&Ctx> {
+        self.side.iter().map(|side| &side.ctx).collect()
+    }
+
+    /// The events, indexed by `model_compiler::EventId`.
+    #[must_use]
+    pub fn events(&self) -> &[crate::device::graph::Event] {
+        &self.events
+    }
+
+    /// How many side streams are open.
+    #[must_use]
+    pub fn lanes(&self) -> usize {
+        self.side.len()
     }
 
     /// Which device this is.
@@ -250,6 +384,16 @@ impl Drop for Context {
             // SAFETY: the shell is being torn down, so nothing else holds
             // either handle; both were produced by this context's `bind`.
             unsafe {
+                // The events first: they name points on the streams below.
+                self.events.clear();
+                for side in self.side.drain(..) {
+                    if !side.cublas.is_null() {
+                        let _ = cudarc::cublas::sys::cublasDestroy_v2(side.cublas.cast());
+                    }
+                    if !side.stream.is_null() {
+                        let _ = cudarc::runtime::sys::cudaStreamDestroy(side.stream.cast());
+                    }
+                }
                 if !self.cublas.is_null() {
                     let _ = cudarc::cublas::sys::cublasDestroy_v2(self.cublas.cast());
                 }

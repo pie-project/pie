@@ -71,12 +71,12 @@ impl Default for Budgets {
 /// second shell had no way to reach them and a host with no device had no way
 /// to reproduce a layout. Here they cross the boundary as numbers.
 ///
-/// v1 READS ONLY [`sms`](DeviceProfile::sms), and reads it to refuse a
-/// profile that says the device has none. The three microsecond figures are
-/// P3's whole decision procedure — a region is worth a conditional exactly
-/// when its body outweighs the evaluation point that guards it — and they are
-/// carried now so that P3 is a pass to write rather than a pass plus a
-/// measurement campaign.
+/// v1 READS [`sms`](DeviceProfile::sms) — to refuse a profile that says the
+/// device has none — and P6's four stream figures below. The three
+/// microsecond figures in between are P3's whole decision procedure — a
+/// region is worth a conditional exactly when its body outweighs the
+/// evaluation point that guards it — and they are carried now so that P3 is a
+/// pass to write rather than a pass plus a measurement campaign.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceProfile {
     /// Streaming multiprocessors. P6's `sm_hint` is a fraction of this, and a
@@ -94,6 +94,131 @@ pub struct DeviceProfile {
     /// How fat a region's body must be before a conditional around it pays for
     /// itself. Layer granularity or coarser, in practice.
     pub fat_region_us: f32,
+
+    /// **P6'S CAP, AND ITS OFF SWITCH.** How many streams the shell will open
+    /// BESIDE the main one. `0` is a first-class setting and not a
+    /// degradation: a plan baked at zero side streams gets stream 0 for every
+    /// region and not one event point, which is byte-for-byte the artifact
+    /// this compiler produced before P6 existed. That is what makes the
+    /// streams-off arm of a measurement a real arm rather than a claim.
+    ///
+    /// The cap is small on purpose. A fork group is the arms of one merge —
+    /// three, on the fattest catalog plan — and a stream past the last arm
+    /// costs a handle and buys nothing.
+    pub side_streams: u32,
+
+    /// What one fork/join event pair costs, in microseconds.
+    ///
+    /// INSIDE A RECORDED GRAPH THIS IS ALMOST FREE AND IT IS STILL NOT ZERO.
+    /// A capture turns `cudaEventRecord` + `cudaStreamWaitEvent` into event
+    /// nodes and a cross-stream edge, so a replay pays topology rather than a
+    /// host call; what remains is the launch of two extra nodes and the
+    /// scheduler's own cross-stream handoff. Two microseconds is the number
+    /// this build assumes and the number a shell that has measured its own
+    /// device should overwrite.
+    pub event_pair_us: f32,
+
+    /// **THE COST GATE.** How much device time BOTH sides of an overlap must
+    /// be worth before P6 will fork one of them onto a side stream.
+    ///
+    /// The saving from running B beside A is at most `min(cost A, cost B)`;
+    /// the price is one [`event_pair_us`](DeviceProfile::event_pair_us),
+    /// paid on every fire whether or not the fire has rows for either window.
+    /// So a twenty-microsecond kernel behind an event pair is a loss dressed
+    /// as a schedule, and the floor is what refuses it. Twenty microseconds
+    /// is an order of magnitude above the event pair, which is the margin a
+    /// threshold wants when the quantity it gates is estimated rather than
+    /// measured.
+    pub fork_floor_us: f32,
+
+    /// What one non-empty launch of each op family costs — P6's whole cost
+    /// model, and the reason it is a TABLE rather than a measurement.
+    pub family_us: FamilyCosts,
+
+    /// **OPS WHOSE ENTRIES CLAIM A WORKSPACE NO SECOND LAUNCH MAY BE INSIDE**,
+    /// by `Operands::name`. Two regions that each contain one are ORDERED by
+    /// P6, whatever the values and the windows say.
+    ///
+    /// THIS IS A DEVICE FACT AND IT ARRIVES THE WAY EVERY OTHER DEVICE FACT
+    /// ARRIVES — as data the caller passes, because the alternative is a
+    /// backend-neutral compiler that knows a backend's allocator. What it
+    /// describes on CUDA is `kernels_cuda::Ctx::scratch`: a slab keyed by a
+    /// static NAME, process-global, grown but never shrunk, deliberately not
+    /// per stream — an entry may not allocate per fire, because a capture
+    /// forbids it. Two concurrent launches that both take the `attn.ssm_gdn_
+    /// chunk_qk` plane get one pointer and stage into each other, and the
+    /// failure is arithmetic rather than a fault.
+    ///
+    /// EMPTY IS THE HONEST DEFAULT, not a claim that no such op exists: a
+    /// compiler with no device in the room cannot know which entries a
+    /// backend's kernels reach a shared slab through. The CUDA shell passes
+    /// `driver_cuda::EXCLUSIVE`; a golden-path walk that never launches
+    /// anything needs nothing here.
+    pub exclusive: Vec<String>,
+}
+
+/// What one launch of each op family costs at fire scale, in microseconds.
+///
+/// **AN ESTIMATE, STATED AS ONE.** A compiler cannot know a fire's
+/// composition — which windows have rows is the batch the engine happened to
+/// assemble — so it cannot know what a region will actually cost. What it can
+/// know is the CHARACTER of the ops in it, which is the same thing tart's
+/// green-context finding turns on: attention and GEMM are the fat, divergent
+/// kernels; norms and layout shuffles are not. These figures put those two
+/// groups on opposite sides of
+/// [`fork_floor_us`](DeviceProfile::fork_floor_us) and are not asked to do
+/// anything finer.
+///
+/// The defaults are read off this tree's own measurements: a qwen35-d0.8b
+/// decode fire is 3.30 ms over 423 captured nodes (build log 10), ~7.8 µs a
+/// node averaged over a body that is mostly norms and residual adds, with the
+/// projections and the attention arms carrying the rest. A deployment that
+/// has profiled its own kernels passes its own numbers, exactly as it passes
+/// its own [`sms`](DeviceProfile::sms).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FamilyCosts {
+    /// `Operation::Attention` — the schedule builders excluded (they are
+    /// `Phase::Prepare` and P6 never sees them).
+    pub attention: f32,
+    /// `Operation::Linear` — the projections and the MoE ladders.
+    pub linear: f32,
+    /// `Operation::Elementwise` — norms, residual adds, scales.
+    pub elementwise: f32,
+    /// `Operation::Layout` — embeds, splits, selects.
+    pub layout: f32,
+    /// `Operation::Collective` — never forked (a collective is a barrier),
+    /// carried so the table is total.
+    pub collective: f32,
+    /// `Operation::CustomCuda` — the fused per-family entries.
+    pub custom: f32,
+}
+
+impl FamilyCosts {
+    /// What one node of this op costs.
+    #[must_use]
+    pub fn of(&self, op: &model_ir::Operation) -> f32 {
+        match op {
+            model_ir::Operation::Attention(_) => self.attention,
+            model_ir::Operation::Linear(_) => self.linear,
+            model_ir::Operation::Elementwise(_) => self.elementwise,
+            model_ir::Operation::Layout(_) => self.layout,
+            model_ir::Operation::Collective(_) => self.collective,
+            model_ir::Operation::CustomCuda(_) => self.custom,
+        }
+    }
+}
+
+impl Default for FamilyCosts {
+    fn default() -> FamilyCosts {
+        FamilyCosts {
+            attention: 60.0,
+            linear: 40.0,
+            elementwise: 4.0,
+            layout: 4.0,
+            collective: 50.0,
+            custom: 20.0,
+        }
+    }
 }
 
 impl Default for DeviceProfile {
@@ -112,6 +237,11 @@ impl Default for DeviceProfile {
             cond_fixed_us: 5.0,
             cond_per_arm_us: 0.6,
             fat_region_us: 250.0,
+            side_streams: 2,
+            event_pair_us: 2.0,
+            fork_floor_us: 20.0,
+            family_us: FamilyCosts::default(),
+            exclusive: Vec::new(),
         }
     }
 }

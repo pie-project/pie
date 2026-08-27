@@ -432,6 +432,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // the pair the two rows above pin one each of. Its `bias` rides the
             // activation dtype, as `MoeMatmulSelectBias`'s does.
             Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
+            // The correction's routes sit at In(3), behind `x` and the two
+            // bank planes: one adapter id per token ROW, `-1` for the base
+            // model, and the same i32 pinning every routed op here states.
+            Linear::LoraCorrect { .. } => &[(In(3), I32)],
             // Channel mixing with nothing pinned: the gemms, their epilogues,
             // and the routed sum's gate ride the activation dtype they are given.
             Linear::Matmul { .. }

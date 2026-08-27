@@ -56,7 +56,7 @@ use driver::driver_api::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDoma
 use driver::driver_api::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use driver::driver_api::error::{DriverError, Result as DriverResult};
 use driver::driver_api::fire::{
-    FireId, FireSubmission, FireTicket, LaneReadout, Readout,
+    FireId, FireSubmission, FireTicket, LaneReadout, LayerScores, Readout,
 };
 use driver::driver_api::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use driver::driver_api::program::{
@@ -208,6 +208,17 @@ fn fault(fault: Fault) -> DriverError {
         Fault::Bake(_) | Fault::Load(_) | Fault::Param { .. } | Fault::Unbound { .. } => {
             DriverError::Load(fault.to_string())
         }
+        // AN EXHAUSTION, AND THE CONTRACT HAS THE SHAPE FOR IT. `Exhausted`
+        // carries the two numbers structurally rather than only in a sentence,
+        // which is what a control plane deciding where to place a model wants.
+        // Its `is_scheduling()` reading costs nothing here: that predicate is
+        // consulted on the FIRE path, and every allocation this shell makes is
+        // made at load.
+        Fault::OutOfMemory { need, have } => DriverError::Exhausted {
+            resource: "device memory",
+            wanted: need,
+            available: have,
+        },
         Fault::Ceiling { what, need, have } => DriverError::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
@@ -223,6 +234,28 @@ fn fault(fault: Fault) -> DriverError {
         Fault::Mask { .. } | Fault::Maskless { .. } | Fault::MaskWord { .. } => {
             DriverError::Invalid(fault.to_string())
         }
+        // The adapter axis's three, sorted the same way. A lane routed
+        // against an artifact with no correction, or against a word that puts
+        // it outside the correction's window, is the SUBMISSION's — a retry
+        // that states the two consistently is a real answer. A registration
+        // the banks cannot seat is `Load`: capacity is a shape the model text
+        // declared, so nothing the caller frees makes room and the fix is the
+        // model text.
+        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => {
+            DriverError::Invalid(fault.to_string())
+        }
+        // The two export axes' four, sorted by the same rule and for the same
+        // reason: a lane that asked for a draft or a capture the artifact does
+        // not declare, or that asked in a way its word does not agree with, is
+        // the SUBMISSION's. A retry that states the intent and the word as one
+        // reading of one lane is a real answer — and on the engine's path
+        // there is only one reading, because `stamp_lane_words` computes the
+        // word FROM the intent.
+        Fault::Draftless { .. }
+        | Fault::DraftWord { .. }
+        | Fault::Scoreless { .. }
+        | Fault::ScoreWord { .. } => DriverError::Invalid(fault.to_string()),
+        Fault::Adapter { .. } => DriverError::Load(fault.to_string()),
         Fault::Compile(_) | Fault::Program { .. } => DriverError::Program(fault.to_string()),
         Fault::Fire(_) => DriverError::Invalid(fault.to_string()),
     }
@@ -295,9 +328,27 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> DriverResult<ModelProfile> {
         // stand in, so advertising one would let a program bind against it and
         // then fail at its first fire, which is the opposite of a bind-time
         // contract.
-        has_mtp_logits: false,
+        // **THE DRAFT COLUMN NOW HAS SOMEWHERE TO STAND** (palo C3b). This
+        // was `false` with the note above, and the note was true: there was
+        // one rectangle and one binding. There are two now — the `mtp` export
+        // is a column of its own, held open past the last node by
+        // `model_compiler::arena`'s delivery tail and pointed at by
+        // `IntrinsicId::MtpLogits` in `Shell::fire_captured` — so this is
+        // exactly "does this load's model text declare a draft head", which
+        // is what a bind-time contract has to mean.
+        has_mtp_logits: shell.drafts(),
+        // Still `false`, and still for the reason above: `MtpDrafts` is `[k]`
+        // I32 TOKEN IDS, which is an argmax the guest can take for itself off
+        // `MtpLogits` and which no device path in this shell produces.
         has_mtp_drafts: false,
         has_value_head: false,
+        // Still `false`, and NOT because the column is missing — the capture
+        // arm writes one and `LaneReadout::scores` reads it. `AttnScore` is
+        // registered at `Stage::OnAttn`, a mid-graph tap, and design §9
+        // abolished the third boundary; it also promises `[num_heads, kv_len]`
+        // per-key softmax weights, where this axis exports a per-query mass.
+        // Advertising it would let a program bind against a shape and a place
+        // that do not exist here.
         has_attn_score: false,
         has_attn_page_mask: false,
         has_lora: false,
@@ -414,10 +465,21 @@ impl Driver for Cuda {
                 // slots apart from the seats it opened, which is `slots`.
                 state_slots: paging.slots,
                 state_slot_bytes: 0,
-                // palo B-adapters: design §8's banks are a budget, and this
-                // shell reserves none — `Budgets::max_adapters` reaches the
-                // compiler and nothing allocates for it yet.
-                adapter_banks: 0,
+                // `palo C2`: what the LOAD actually seats, read off the plan
+                // rather than off the request. `Budgets::max_adapters` is what
+                // the deployment asked for and `compile` already refused a
+                // plan that could not seat it; this is the answer, which is
+                // the smallest capacity any one bank of this model declares —
+                // an id must fit every site it will be written into, so the
+                // minimum is the honest ceiling. Zero for a model whose text
+                // declares no correction, and then `Lane::adapter` has
+                // nowhere to go and is refused by name.
+                adapter_banks: shell
+                    .banks()
+                    .iter()
+                    .map(|&(_, adapters, _)| adapters)
+                    .min()
+                    .unwrap_or(0),
                 // The pools are not virtual, so `resize_pool` is not served
                 // and zero is what says so.
                 elastic_page_bytes: 0,
@@ -472,6 +534,28 @@ impl Driver for Cuda {
         })
     }
 
+    fn register_adapter(
+        &mut self,
+        registration: &driver::driver_api::adapter::AdapterRegistration,
+    ) -> DriverResult<()> {
+        // `palo C2`: design §8's banks are declared by the model text and
+        // reserved at load; this is the write. No graph is touched — the key
+        // is a fire's composition and a bank's contents are not in it — so a
+        // registration between two fires costs a copy and leaves every
+        // recorded graph valid.
+        let planes: Vec<crate::AdapterPlane<'_>> = registration
+            .planes
+            .iter()
+            .map(|plane| crate::AdapterPlane {
+                bank: plane.bank.as_str(),
+                bytes: &plane.bytes,
+            })
+            .collect();
+        self.loaded_mut()?
+            .register_adapter(registration.id, &planes)
+            .map_err(fault)
+    }
+
     fn fire(&mut self, submission: &FireSubmission) -> DriverResult<FireTicket> {
         submission.validate()?;
         // A GUEST PROGRAM THAT CANNOT COMMIT REFUSES THE FIRE, AND IT DOES SO
@@ -509,21 +593,6 @@ impl Driver for Cuda {
             .lanes
             .iter()
             .map(|lane| {
-                if let Some(adapter) = lane.adapter {
-                    // palo B-adapters: `Lane::adapter` routes to a device
-                    // bank (design §8) and this load reserved none. A lane
-                    // that asked for one and got the base model would be
-                    // silently wrong output, which is the whole reason the
-                    // capacity is a budget rather than an admission cap.
-                    return Err(DriverError::Unsupported {
-                        verb: "adapter banks",
-                        driver: "cuda",
-                    })
-                    .map_err(|error: DriverError| {
-                        let _ = adapter;
-                        error
-                    });
-                }
                 if !lane.positions.is_empty() {
                     // The shell derives positions as `held .. held + rows`.
                     // An explicit list means a speculative fire re-feeding
@@ -566,6 +635,27 @@ impl Driver for Cuda {
                     // `compose` refuses a word this artifact has no class for
                     // — so a mask and a word that disagree cannot both pass.
                     mask: lane.mask.as_ref(),
+                    // `palo C2`, closed on this side, and by the same
+                    // argument the mask closed by one line up: an adapter is
+                    // a declared axis, the id is a runtime input, and the
+                    // PLAN decides whether anything reads it. An id against
+                    // an artifact with no `linear.lora_correct` arm is
+                    // `Fault::Adapterless`; an id that disagrees with the
+                    // word the engine stamped is `Fault::AdapterWord`. Both
+                    // are named at the fire, before anything launches, rather
+                    // than refused for every model here.
+                    adapter: lane.adapter,
+                    // `palo C3b`/`C4b`, closed the same way once more, and
+                    // the only thing that changes is that these two carry no
+                    // runtime input at all. What the submission states is the
+                    // INTENT, and the plan decides whether the artifact has
+                    // an arm for it: a draft ask against a text that declares
+                    // no head is `Fault::Draftless`, a capture ask against
+                    // one with no capture arm is `Fault::Scoreless`, and
+                    // either ask disagreeing with the word the engine stamped
+                    // is `Fault::DraftWord` / `Fault::ScoreWord`.
+                    drafts: lane.drafts,
+                    captures_scores: lane.captures_scores,
                 })
             })
             .collect::<DriverResult<Vec<_>>>()?;
@@ -579,19 +669,36 @@ impl Driver for Cuda {
                 at: attachment.at,
             })
             .collect();
-        let rows = shell.fire_attached(&seated, &attached).map_err(fault)?;
+        // The capture columns come back beside the logits, filled only for
+        // the lanes that asked (palo C4b). `fire_captured` and not
+        // `fire_attached`, because the contract has somewhere to put them.
+        let mut captured: Vec<Vec<LayerScores>> = Vec::new();
+        let rows = shell
+            .fire_captured(&seated, &attached, &mut captured)
+            .map_err(fault)?;
 
         // THE SHELL READS THE LAST ROW AND ONLY THE LAST ROW, which is
         // `Readout::Last` — the default, and the reason a prefill does not
         // hand back half a megabyte per teacher-forced position.
         let mut readouts = Vec::with_capacity(rows.len());
+        let mut captured = captured.into_iter().chain(std::iter::repeat_with(Vec::new));
         for (lane, values) in submission.lanes.iter().zip(rows) {
+            // A LANE THAT CAPTURED IS ANSWERED WHATEVER ITS `Readout` SAYS.
+            // `Readout` chooses which LOGITS rows come back; the capture is a
+            // different column with a different reader, and a lane that asked
+            // for its mass and set `Readout::None` for its logits asked for
+            // both of those things and meant them.
+            let scores = captured.next().unwrap_or_default();
             readouts.push(match &lane.readout {
-                Readout::None => LaneReadout::default(),
+                Readout::None => LaneReadout {
+                    scores,
+                    ..LaneReadout::default()
+                },
                 Readout::Last => LaneReadout {
                     rows: 1,
                     width: u32::try_from(values.len()).unwrap_or(u32::MAX),
                     values,
+                    scores,
                 },
                 Readout::Rows(_) => {
                     // palo B-readout: reading an interior row means keeping

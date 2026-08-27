@@ -15,9 +15,14 @@
 //!
 //! [`KernelError`]: kernels::KernelError
 
+use std::cell::Cell;
+
 use kernels_metal::attn::mla::MlaPlan;
 use kernels_metal::{Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor};
-use model_ir::{Def, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use model_ir::{Def, Dim, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+
+use crate::device::Handles;
+use crate::window::{Window, Windows};
 
 /// One loader-resolved weight. Most rows are one dense handle; an mxfp4 bank
 /// is two device planes under one `Def::Weight` id — the form this shell's
@@ -122,10 +127,19 @@ pub struct FireTables {
 /// What the driver binds each fire, owned by the [`Run`] for its lifetime.
 ///
 /// `tokens`, `positions`, and `geometry` are the op-visible inputs —
-/// `RuntimeInput` routes onto them in [`Run::tensor`]. The rest is ambient:
-/// the shared `indptr` (design §5 removed `qo_indptr` as a named input, so
-/// ragged views are assembled here), the fire `tables` for the plan
-/// builders, and the fact word the walk guards on.
+/// `RuntimeInput` routes onto them in [`Run::tensor`]. The `tables` are
+/// ambient: the plan builders read them and no op names them.
+///
+/// **TWO FIELDS THE CUDA SIBLING'S TWIN CARRIED ARE GONE, AND FOR THE
+/// REASONS THAT SIBLING RECORDED.** `facts` — the fire-wide fact word — was
+/// deleted from the CUDA shell in palo build log 8 with zero readers, and
+/// deleted here for the same reason: which classes run a node is
+/// `Region::mask` resolved per region against the window table, which is
+/// exactly what a fire-wide word cannot say (design §0's collapse). And the
+/// shared `indptr` is gone because a ragged view is assembled from the
+/// WINDOW's own rebased boundaries ([`Run::qo_indptr`]) — a fire-wide vector
+/// handed to a windowed launch sends every entry past the end of the
+/// rectangle it was given, by exactly the rows the classes before it hold.
 #[derive(Clone, Debug)]
 pub struct FireBindings {
     /// `RuntimeInput::Tokens`: ragged `i32`, one id per token.
@@ -135,21 +149,12 @@ pub struct FireBindings {
     /// token — also the plan builders' causal-bound table.
     pub positions: Tensor,
 
-    /// The fire's one shared boundary vector — `i32`, `[lanes + 1]` —
-    /// through which every fire-aligned value is viewed ([`Run::ragged`]).
-    pub indptr: Tensor,
-
     /// Per cache space, aligned with `Plan::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space.
     pub geometry: Vec<CacheGeometry>,
 
     /// The fire tables the attention plan builders consume.
     pub tables: FireTables,
-
-    /// The fire's fact word — `Cond::holds`'s input, read by the walk and
-    /// never by dispatch; carried here so the shell hands one bundle per
-    /// fire.
-    pub facts: u64,
 }
 
 /// One built plan payload. An enum over the three kinds this plane can be
@@ -180,6 +185,11 @@ pub struct Run<'c> {
     /// crate does to the device goes through it; nothing here names Metal.
     ctx: &'c Ctx<'c>,
 
+    /// The handle table every carve is minted into and every argument is
+    /// resolved through. A windowed cut IS a new row here — Metal binds a
+    /// buffer and an offset, so there is no address to add a row stride to.
+    handles: &'c Handles,
+
     /// The routing: `Plan::values`, read by [`Run::tensor`] to send each id
     /// to its table.
     values: &'c [ValueDecl],
@@ -200,33 +210,104 @@ pub struct Run<'c> {
 
     /// This fire's bindings.
     fire: FireBindings,
+
+    /// Every region's window, resolved once per fire from the composition's
+    /// class table. Indexed by [`region`](Run::region).
+    windows: &'c Windows,
+
+    /// Which region the walk is inside, written by
+    /// [`Cursor`](crate::window::Cursor) on `region_begin` — before that
+    /// region's nodes are dispatched. **THIS IS THE WHOLE MIXED-FIRE
+    /// MECHANISM**: the walk's `Dispatch` signature is fixed and carries no
+    /// region, so the sink and the resolver share one cell instead.
+    region: &'c Cell<u32>,
 }
 
 impl<'c> Run<'c> {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &'c Ctx<'c>,
+        handles: &'c Handles,
         values: &'c [ValueDecl],
         weights: &'c WeightTable,
         arena: &'c SlotTable,
         caches: &'c CacheTable,
         fire: FireBindings,
+        windows: &'c Windows,
+        region: &'c Cell<u32>,
     ) -> Self {
         Self {
             ctx,
+            handles,
             values,
             weights,
             arena,
             caches,
             structs: vec![None; values.len()],
             fire,
+            windows,
+            region,
         }
     }
 
-    /// The fire's fact word, for the shell to hand the walk.
-    #[must_use]
-    pub fn facts(&self) -> u64 {
-        self.fire.facts
+    /// The window of the region the walk is inside.
+    pub(crate) fn window(&self) -> &'c Window {
+        self.windows.at(self.region.get())
+    }
+
+    /// This window's own qo boundaries, rebased to start at zero.
+    pub(crate) fn qo_indptr(&self) -> Tensor {
+        self.window().indptr
+    }
+
+    /// The same vector, host-side — what an entry that needs to READ a
+    /// boundary (rather than bind it) takes.
+    ///
+    /// Unread today: every metal entry that is boundary-aware takes the
+    /// pair (`RaggedTensor`) and walks it on the device. Kept beside
+    /// [`Run::multi_token`] and [`Run::total_tokens`], which are the two
+    /// questions a host-side arm-picking builder would ask of it, because
+    /// the answer is one line and re-deriving it in a dispatch arm is how
+    /// two readings of one window come to disagree.
+    #[allow(dead_code)]
+    pub(crate) fn qo_indptr_host(&self) -> &'c [i32] {
+        &self.window().indptr_host
+    }
+
+    /// How many token rows this window covers.
+    #[allow(dead_code)]
+    pub(crate) fn total_tokens(&self) -> u32 {
+        self.window().span.rows
+    }
+
+    /// Whether any lane of this window carries more than one row — the
+    /// question a chunked linear-attention entry asks to choose its arm.
+    #[allow(dead_code)]
+    pub(crate) fn multi_token(&self) -> bool {
+        self.qo_indptr_host()
+            .windows(2)
+            .any(|pair| pair[1] - pair[0] > 1)
+    }
+
+    /// A raw ambient table, cut to this window's ROWS.
+    ///
+    /// The plan builders' tables (`positions`, `request_of_token`, the mask
+    /// planes) are staged once per fire at absolute fire rows, and the
+    /// shaders index them by the LOCAL row of the launch — `req_of_token[row]`
+    /// where `row` runs `0..q.rows`. So a windowed launch needs them cut the
+    /// way its `q` is. They are not `ValueId`s, so [`Run::tensor`]'s
+    /// declaration-driven cut cannot reach them and this is the same
+    /// arithmetic, stated for a bare handle.
+    ///
+    /// What stays ABSOLUTE is what the shaders index by lane through a
+    /// value the table itself holds: `request_of_token`'s entries are lane
+    /// ids into the fire-wide `page_indptr`, and cutting the vector does not
+    /// renumber its contents — which is exactly the property that makes one
+    /// page table serve every window.
+    pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {
+        let span = self.window().span;
+        self.slice(handle, span.row_offset, span.rows)
     }
 
     /// The encode sink, for the arms.
@@ -239,6 +320,90 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
+    /// One rectangle, sliced to `keep` rows starting at `skip`.
+    ///
+    /// The one place a windowed cut becomes a handle. A CUDA shell answers
+    /// this with `ptr + skip * stride` and no state; here the row is minted
+    /// into [`Handles`], which is also where the bounds check lives — a cut
+    /// past the end of the reservation is caught before a shader
+    /// dereferences it.
+    ///
+    /// A cut that fails is an INTEGRITY failure, not a refusal: the offsets
+    /// come from the compiler's carve and the composition's window table,
+    /// and a disagreement between those two is a bug in this crate or in the
+    /// bake. It panics with a sentence, per the file's rule.
+    fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
+        if skip == 0 && keep >= handle.rows {
+            return handle;
+        }
+        let stride = u64::from(handle.width)
+            * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
+                panic!(
+                    "a {:?} rectangle has no element size and so no row to step by",
+                    handle.dtype
+                )
+            });
+        let rows = keep.min(handle.rows.saturating_sub(skip));
+        let cut = self
+            .handles
+            .cut(handle.buf, u64::from(skip) * stride, u64::from(rows) * stride)
+            .unwrap_or_else(|fault| {
+                panic!(
+                    "the window's cut of handle {} at row {skip} for {rows} rows does \
+                     not land: {fault}",
+                    handle.buf
+                )
+            });
+        Tensor::new(cut, rows, handle.width, handle.dtype)
+    }
+
+    /// One value's rectangle, cut to the window of the node asking for it.
+    ///
+    /// **EVERY ROW-SHAPED TABLE IN THIS SHELL IS INDEXED BY ABSOLUTE FIRE
+    /// ROW** — the arena carve gives a `Dim::Tokens` value one column at the
+    /// fire's row count, the geometry vectors one entry per fire lane — so a
+    /// window is a slice, and which slice is read off the value's own leading
+    /// `Dim`. A `Dim::Const` column (a weight plane, a bias) is not
+    /// fire-aligned and is handed over whole.
+    ///
+    /// `GeomKind::Indices` is the one declared shape that is not what it
+    /// says: the IR spells the flat page-id list `Dim::Lanes` because it has
+    /// no page symbol, and its entries are pages rather than lanes. Slicing
+    /// it by a lane offset would hand a windowed consumer somebody else's
+    /// pages, so it is excluded — and its bounds vector stays absolute,
+    /// which is what makes a sliced `Indptr` still address the whole list.
+    ///
+    /// `RuntimeInput::Mask` is the second of those, for the same reason: the
+    /// IR spells the mask slab `Dim::Tokens` and its entries are (query,
+    /// key) BITS, so a row offset is not a byte offset. This plane binds the
+    /// mask through [`FireTables`] rather than through a declared input and
+    /// cuts it with [`Run::cut_rows`], which knows the stride.
+    fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
+        let at = id.0 as usize;
+        if matches!(
+            self.values[at].def,
+            Def::Input(RuntimeInput::Mask { .. })
+                | Def::Input(RuntimeInput::Geometry {
+                    kind: GeomKind::Indices,
+                    ..
+                })
+        ) {
+            return handle;
+        }
+        let Ty::Tensor { shape, .. } = &self.values[at].ty else {
+            return handle;
+        };
+        let window = self.window().span;
+        let (skip, keep) = match shape.first() {
+            Some(Dim::Tokens) => (window.row_offset, window.rows),
+            Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
+            Some(Dim::Lanes) => (window.lane_offset, window.lanes),
+            Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
+            Some(Dim::Const(_)) | None => return handle,
+        };
+        self.slice(handle, skip, keep)
+    }
+
     /// The crate's heart: one plan id in, one device handle out, routed on
     /// the id's `Def`. Every dispatch arm resolves through here, so
     /// provenance handling exists exactly once.
@@ -248,6 +413,11 @@ impl<'c> Run<'c> {
     /// arriving here is a dispatch-arm bug, answered with a panic. So is a
     /// split-plane weight: two planes resolve through [`Run::planes`].
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
+        self.cut(id, self.whole(id))
+    }
+
+    /// The same resolution, uncut — the fire-wide rectangle a value names.
+    fn whole(&self, id: ValueId) -> Tensor {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
@@ -258,6 +428,18 @@ impl<'c> Run<'c> {
             // second seat would only exist to drift, and the space
             // collapses onto it.
             Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,
+            // THE ADAPTER AXIS IS NOT SERVED HERE, AND THE PANIC IS THE
+            // HONEST ANSWER RATHER THAN A ZERO HANDLE. This plane binds no
+            // adapter bank (`linear.lora_correct` answers
+            // `KernelError::Unsupported` in this shell's dispatch arm), so
+            // nothing can reach this id: a plan carrying a correction op is
+            // refused at its first correction node, one dispatch earlier and
+            // with a sentence naming the op. Resolving a bare zero here would
+            // be routing every row to adapter zero of a bank that does not
+            // exist.
+            Def::Input(RuntimeInput::AdapterRoutes) => panic!(
+                "value {at} reads the fire's adapter ids, which this plane binds no seat                  for; `linear.lora_correct` is what refuses the plan, by name"
+            ),
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -315,13 +497,18 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// A fire-aligned value viewed through the fire's shared boundaries. The
+    /// A fire-aligned value viewed through THIS WINDOW's boundaries. The
     /// indptr is ambient (design §5): no op names it, and this pairing is
     /// where it re-enters.
+    ///
+    /// The boundaries are the window's own, rebased: `data` already points
+    /// at the window's first row, so a fire-wide vector would send every
+    /// ragged entry past the end of the rectangle it was handed, by exactly
+    /// the number of rows the classes before it occupy.
     pub(crate) fn ragged(&self, id: ValueId) -> RaggedTensor {
         RaggedTensor {
             data: self.tensor(id),
-            indptr: self.fire.indptr,
+            indptr: self.qo_indptr(),
         }
     }
 
@@ -359,6 +546,16 @@ impl<'c> Run<'c> {
     }
 
     /// The paged kv pool a cache id names.
+    ///
+    /// **NOTHING IS CUT HERE, AND THAT IS A STATEMENT ABOUT THIS PLANE'S
+    /// ABI.** The CUDA sibling slices its pool's `page_indptr`,
+    /// `last_page_lens` and `row_valid` to the window, because its schedules
+    /// number requests from the launch's own zero. The metal sdpa entries
+    /// read the page table through `kv_page_indptr[req_of_token[row]]`, and
+    /// `request_of_token` is staged with ABSOLUTE lane ids — so the table
+    /// stays fire-wide and the two agree. Slicing it here would send every
+    /// windowed launch to somebody else's pages. (`page_indices` is absolute
+    /// on both planes, for the reason `Run::cut` gives.)
     pub(crate) fn pool(&self, id: ValueId) -> &KvPool {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
@@ -369,10 +566,19 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The recurrent state pool a cache id names.
-    pub(crate) fn recurrent(&self, id: ValueId) -> &RecurrentPool {
+    /// The recurrent state pool a cache id names, with its slot map cut to
+    /// the asking node's window.
+    ///
+    /// A recurrent bank is addressed by SLOT, and every metal ssm shader
+    /// reads its slot out of `slots[r]` where `r` counts from the LAUNCH's
+    /// own zero — so a windowed scan gets the window's rows of that vector
+    /// and nothing else. The banks themselves are the model's state, whole.
+    pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
-            CachePool::Recurrent(pool) => pool,
+            CachePool::Recurrent(pool) => RecurrentPool {
+                slots: self.cut_rows(pool.slots),
+                ..*pool
+            },
             CachePool::Kv(_) => panic!(
                 "value {} is a paged kv space, and this op scans a recurrent state pool",
                 id.0

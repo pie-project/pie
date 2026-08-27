@@ -1,0 +1,1025 @@
+//! The two EXPORT axes, end to end — and the gate that says palo C3b/C4b runs.
+//!
+//! **WHAT THIS FILE IS FOR.** `masked_axis` and `adapter_banks` cover the two
+//! axes whose divergence stays inside the graph: a kernel choice and an
+//! additive correction, both of them things a fire does differently. These two
+//! are the other kind. A draft head and a score capture each write a SECOND
+//! COLUMN that a reader collects after the graph has run (palo design §9), so
+//! what has to be true of them is not only that the right arm ran but that the
+//! bytes it wrote are still there when somebody comes for them — and that a
+//! fire nobody asked either of costs nothing at all.
+//!
+//! ```text
+//! (a) a capturing lane's mass comes back, per layer, and comes back the same twice
+//! (b) a capturing lane beside two others leaves them the fire they had alone
+//! (c) the three-class composition captures once and replays identically
+//! (d) a fire no lane captured is the fire this shell always fired  — nodes and tokens
+//! (e) the refusals: a capture and a word that disagree, both ways;
+//!     a draft against a text that declares no head
+//! (f) the drafting SKU does not fit this device, and the refusal says by how much
+//! ```
+//!
+//! **WHY THE SCORE AXIS CARRIES THE WEIGHT AND THE DRAFT AXIS DOES NOT.** The
+//! one shipping SKU whose checkpoint publishes a draft head is
+//! `qwen36-27b-bf16-kv-bf16`, whose bf16 weights are ~52 GiB against an L40S's
+//! 46 GiB — it does not load, and gate (f) is the honest statement of that
+//! rather than a skipped test. What can be gated here is everything the two
+//! axes SHARE, which is nearly all of it: one export mechanism, one delivery
+//! tail in the carve, one class-set reading at load, one twin refusal shape.
+//! The score axis exercises all of it on a model that fits. What remains
+//! unproven on a device is the draft head's own arithmetic, and nothing short
+//! of a checkpoint that fits proves that.
+//!
+//! ```text
+//! cargo test -p driver-cuda --features cuda-13 --release --test export_axes -- --nocapture
+//! ```
+
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use driver_cuda::{Boot, Graphs, Lane, LayerScores, Seated, Shell};
+use model_compiler::Budgets;
+use model_dsl::{Classify, Platform, Request};
+
+/// The workhorse: small, dense, and the SKU whose model text declares the
+/// capture arm.
+const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+
+/// The one shipping SKU whose checkpoint publishes a draft head — and the one
+/// that does not fit this device.
+const DRAFTING: &str = "qwen36-27b-bf16-kv-bf16";
+
+const PROMPT: &str = "The capital of France is";
+
+/// What `serve_smoke` pins this shell to answer for [`PROMPT`] on this SKU,
+/// greedily — the golden every other suite in this crate holds itself to.
+const EXPECTED: &str = " Paris";
+
+/// How many greedy decode fires follow a prefill.
+const STEPS: usize = 8;
+
+/// One shell at a time per process — `kernels-cuda`'s scratch slabs are
+/// process-global and keyed by name (`serve_smoke.rs` argues it whole).
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn serialized() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The lane word the model's own `Classify` computes — the facts qwen
+/// declares, and no third opinion about any of them.
+fn word(query_len: u32, captures: bool) -> u64 {
+    model::qwen_3::forward::Facts::of(
+        &Request::new(query_len, false).capturing_scores(captures),
+    )
+    .word()
+}
+
+/// The word a DRAFTING request carries, which this SKU's artifact has no arm
+/// for — `Classes::mask` drops the bit, so the lane composes as the word it
+/// would have had. That is the masking `driver::fire::compose` documents, and
+/// it is why the draft refusal below is `Draftless` rather than
+/// `UnknownWord`: the two halves agree perfectly, and what is missing is the
+/// ARM.
+fn drafting_word(query_len: u32) -> u64 {
+    model::qwen_3::forward::Facts::of(&Request::new(query_len, false).drafting(true)).word()
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (at, value) in logits.iter().enumerate() {
+        assert!(value.is_finite(), "logit {at} is {value}");
+        if *value > logits[best] {
+            best = at;
+        }
+    }
+    best as u32
+}
+
+// ── the runs ─────────────────────────────────────────────────────────────
+
+/// One sequence alone in its fires: prefill then `steps` greedy decodes, every
+/// lane capturing or not as `captures` says. Returns the tokens and the
+/// prefill's captured mass.
+///
+/// **IT FIRES THE PROMPT TWICE AND KEEPS THE SECOND**, as `adapter_banks` and
+/// `masked_axis` do and for their reason: the dense autotuner tunes a GEMM
+/// shape on its second sighting, so a cold solo run and a warm mixed one are
+/// two tactic ladders. Every identity here is between STEADY STATES.
+fn solo(
+    shell: &mut Shell,
+    slot: u32,
+    prompt: &[u32],
+    captures: bool,
+    steps: usize,
+) -> (Vec<u32>, Vec<LayerScores>) {
+    shell.open(slot).expect("the slot opens");
+    let mut warm = Vec::new();
+    shell
+        .fire_captured(&[seat(slot, prompt, captures)], &[], &mut warm)
+        .expect("the warming fire");
+    shell.open(slot).expect("the slot re-opens");
+    let mut captured = Vec::new();
+    let prefill = shell
+        .fire_captured(&[seat(slot, prompt, captures)], &[], &mut captured)
+        .expect("the prefill fires");
+    let mass = captured.into_iter().next().unwrap_or_default();
+    let mut said = vec![argmax(&prefill[0])];
+    for step in 1..steps {
+        let fed = [*said.last().expect("a token to feed")];
+        let mut none = Vec::new();
+        let decode = shell
+            .fire_captured(&[seat(slot, &fed, captures)], &[], &mut none)
+            .unwrap_or_else(|why| panic!("decode step {step}: {why}"));
+        said.push(argmax(&decode[0]));
+    }
+    (said, mass)
+}
+
+/// One lane, seated with its word and its ask stated as ONE READING — which
+/// is what `engine::pipeline::fire::stamp_lane_words` is, spelled here so a
+/// gate cannot accidentally state them apart.
+fn seat<'a>(slot: u32, tokens: &'a [u32], captures: bool) -> Seated<'a> {
+    let lane = Lane {
+        slot,
+        word: word(tokens.len() as u32, captures),
+        tokens,
+    };
+    if captures {
+        Seated::capturing(lane)
+    } else {
+        Seated::of(lane)
+    }
+}
+
+/// The largest absolute difference between two captures, layer by layer.
+fn drift(left: &[LayerScores], right: &[LayerScores]) -> f32 {
+    assert_eq!(left.len(), right.len(), "two captures of one model");
+    let mut worst = 0.0f32;
+    for (a, b) in left.iter().zip(right) {
+        assert_eq!(a.layer, b.layer, "the layers came back in a different order");
+        assert_eq!((a.rows, a.heads), (b.rows, b.heads), "two shapes");
+        assert_eq!(a.lse.len(), b.lse.len(), "two lengths");
+        for (x, y) in a.lse.iter().zip(&b.lse) {
+            worst = worst.max((x - y).abs());
+        }
+    }
+    worst
+}
+
+// ── (a) the mass comes back, per layer, and comes back the same twice ────
+
+/// **AN EXPORT IS ONLY AN EXPORT IF SOMEBODY CAN READ IT.**
+///
+/// palo C4 declared the axis and proved it in the plan: a capturing lane lands
+/// in a class that runs `attention.prefill_lse`, and that arm writes a column.
+/// What it could not say is that anything ever reads the column, and it could
+/// not, because nothing did — `model_compiler::arena` gave the delivery tail
+/// to the `"out"` seam by name, so every capture column's life ended at the
+/// node that wrote it and the busiest-instant carve was free to place the next
+/// layer's rectangles on top of it. This is the gate for the other half: the
+/// tail is the export SET now, the shell resolves the seam at load, and a
+/// capturing lane's rows come back out of the arena where they lie.
+///
+/// **DETERMINISM IS THE SHARP HALF, AND IT IS SHARP BECAUSE OF WHAT WOULD
+/// BREAK IT.** A column carved over reads whatever ran last, and what ran last
+/// is a function of the composition — so a capture that were unpinned would
+/// still be finite, still be roughly the right magnitude, and would move
+/// between two fires of the same lane. Bit-for-bit equality over two identical
+/// fires is what an unpinned column cannot produce.
+#[test]
+fn a_capturing_lane_reads_its_attention_mass_and_reads_the_same_thing_twice() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the capture readout") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+
+    let layers = shell.score_layers();
+    assert!(
+        !layers.is_empty(),
+        "`{SKU}` declares no `attn.scores` export, so this file is testing nothing"
+    );
+
+    let (said, first) = solo(&mut shell, 0, &prompt, true, STEPS);
+    let (again, second) = solo(&mut shell, 0, &prompt, true, STEPS);
+
+    eprintln!(
+        "capture: {} layer(s) {:?}, {} rows x {} heads each, continuation {:?}",
+        first.len(),
+        layers,
+        first[0].rows,
+        first[0].heads,
+        tok.decode(&said, false),
+    );
+
+    assert_eq!(
+        first.len(),
+        layers.len(),
+        "the fire came back with {} capture column(s) and the artifact declares {}",
+        first.len(),
+        layers.len(),
+    );
+    for (column, layer) in first.iter().zip(&layers) {
+        assert_eq!(column.layer, *layer, "the columns are not in layer order");
+        assert_eq!(
+            column.rows as usize,
+            prompt.len(),
+            "layer {layer}'s column came back {} rows for a {}-row lane",
+            column.rows,
+            prompt.len(),
+        );
+        assert!(column.heads > 0, "layer {layer} came back zero heads wide");
+        assert_eq!(
+            column.lse.len(),
+            column.rows as usize * column.heads as usize,
+            "layer {layer}'s column is not `rows x heads` of them",
+        );
+        // A log-sum-exp over a non-empty causal row is finite and strictly
+        // greater than the largest score it normalizes, so it is never zero
+        // and never NaN. An unwritten column would be one or the other.
+        for (at, mass) in column.lse.iter().enumerate() {
+            assert!(
+                mass.is_finite(),
+                "layer {layer}, element {at} of the mass is {mass}"
+            );
+        }
+        assert!(
+            column.lse.iter().any(|mass| *mass != 0.0),
+            "layer {layer}'s whole column is zero, which is the arena as it was \
+             reserved rather than anything a kernel wrote"
+        );
+    }
+
+    assert_eq!(
+        said, again,
+        "two capturing runs of one prompt through one boot disagree"
+    );
+    let moved = drift(&first, &second);
+    assert_eq!(
+        moved, 0.0,
+        "two identical fires captured masses that differ by {moved}; a column \
+         nothing pinned reads whatever the carve placed on it last"
+    );
+}
+
+/// **THE ROW OFFSET IS READ, AND HERE IS THE TEST THAT WOULD CATCH IT NOT
+/// BEING.**
+///
+/// A capture column is the whole fire's height and a lane's mass is its own row
+/// run of it, taken at `LaneRow::row_offset` off the composition. Determinism
+/// alone does not prove that number is used: a shell that read row zero for
+/// every lane would be perfectly deterministic and perfectly wrong, and a
+/// single-lane fire cannot tell the difference because the offset IS zero.
+///
+/// Two capturing lanes of the same length and different content, in one fire,
+/// can. They land in one class, so the composition seriates them into one
+/// window at two offsets; their masses are functions of their own tokens and
+/// must differ. Read at a fixed offset they would be one lane's bytes twice.
+#[test]
+fn two_capturing_lanes_in_one_fire_read_their_own_rows() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the capture row offset") else {
+        return;
+    };
+    // Same token count, different tokens — so the two lanes share a class and
+    // a window, and only the offset tells their rows apart.
+    let (mut left, mut right) = (tok.encode(PROMPT), tok.encode("The largest planet is"));
+    let rows = left.len().min(right.len());
+    left.truncate(rows);
+    right.truncate(rows);
+    assert_eq!(left.len(), right.len());
+    assert_ne!(left, right, "two prompts that differ somewhere");
+
+    shell.open(0).expect("slot 0 opens");
+    shell.open(1).expect("slot 1 opens");
+    let mut mass: Vec<Vec<LayerScores>> = Vec::new();
+    shell
+        .fire_captured(
+            &[seat(0, &left, true), seat(1, &right, true)],
+            &[],
+            &mut mass,
+        )
+        .expect("two capturing lanes fire");
+
+    assert_eq!(mass.len(), 2, "two lanes in, two captures out");
+    let moved = drift(&mass[0], &mass[1]);
+    eprintln!(
+        "two capturing lanes, {rows} rows each: max |Δ| between their masses = {moved}"
+    );
+    assert!(
+        moved > 0.0,
+        "two lanes with different tokens captured the SAME mass, which is what a \
+         shell that read row zero for every lane would produce"
+    );
+    // And the second lane is not reading past its own run either: its rows are
+    // the ones it submitted, not the fire's.
+    for column in mass.iter().flatten() {
+        assert_eq!(
+            column.rows as usize, rows,
+            "a lane's capture is its own row run and nothing else"
+        );
+    }
+}
+
+// ── (b) a capturing lane leaves the lanes beside it alone ────────────────
+
+/// **THE C1b THREE-CLASS FIRE, WITH THE CAPTURE ARM AS THE THIRD CLASS.**
+///
+/// Decode, prefill and capture in one fire, each over its own window, and the
+/// two lanes that captured nothing must say what they said alone. This is the
+/// leak question asked exactly: the capture arm is a third arm of the
+/// attention merge, so it writes disjoint rows of the same `o` column as the
+/// other two, and a window resolved at the fire's rectangle rather than at the
+/// class's would have it write over theirs.
+///
+/// **THE IDENTITY IS ON TOKENS AND HAS TO BE** (build log 21's finding, and
+/// build log 22 restates it): a batched fire's shared GEMMs run at a different
+/// `M` than a solo one, so an unrelated lane's logits move by about one bf16
+/// ulp at a magnitude of ~20. Tokens do not move, and a leak from a
+/// vocabulary-wide arm is nowhere near an ulp.
+#[test]
+fn a_capturing_lane_beside_two_others_leaves_them_the_fire_they_had_alone() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the three-class capture fire") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+    let other = tok.encode("The largest planet is");
+
+    // The solo references, warmed.
+    let (plain_prefill, _) = solo(&mut shell, 0, &prompt, false, STEPS);
+    let (plain_other, _) = solo(&mut shell, 1, &other, false, STEPS);
+    let (capturing, _) = solo(&mut shell, 2, &prompt, true, STEPS);
+
+    // The mixed fire: lane 0 prefills plain, lane 1 prefills capturing, lane 2
+    // decodes. Three classes, three windows, one fire.
+    shell.open(0).expect("slot 0 opens");
+    shell.open(1).expect("slot 1 opens");
+    shell.open(2).expect("slot 2 opens");
+    let mut said: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut fed: Vec<Vec<u32>> = vec![prompt.clone(), prompt.clone(), other.clone()];
+    let mut captured_rows = 0usize;
+    for step in 0..STEPS {
+        let seated = [
+            Seated::of(Lane {
+                slot: 0,
+                word: word(fed[0].len() as u32, false),
+                tokens: &fed[0],
+            }),
+            Seated::capturing(Lane {
+                slot: 1,
+                word: word(fed[1].len() as u32, true),
+                tokens: &fed[1],
+            }),
+            Seated::of(Lane {
+                slot: 2,
+                word: word(fed[2].len() as u32, false),
+                tokens: &fed[2],
+            }),
+        ];
+        let mut mass: Vec<Vec<LayerScores>> = Vec::new();
+        let out = shell
+            .fire_captured(&seated, &[], &mut mass)
+            .unwrap_or_else(|why| panic!("the mixed fire at step {step}: {why}"));
+        assert!(
+            mass[0].is_empty() && mass[2].is_empty(),
+            "step {step}: a lane that captured nothing was handed a capture"
+        );
+        assert!(
+            !mass[1].is_empty(),
+            "step {step}: the capturing lane was handed nothing"
+        );
+        captured_rows += mass[1][0].rows as usize;
+        for (lane, readout) in out.iter().enumerate() {
+            let token = argmax(readout);
+            said[lane].push(token);
+            fed[lane] = vec![token];
+        }
+    }
+
+    eprintln!(
+        "mixed: plain {:?} / capturing {:?} / other {:?}  ({captured_rows} rows captured)",
+        tok.decode(&said[0], false),
+        tok.decode(&said[1], false),
+        tok.decode(&said[2], false),
+    );
+    assert_eq!(
+        said[0],
+        plain_prefill[..STEPS],
+        "the plain lane's continuation moved when a capturing lane joined its fire"
+    );
+    assert_eq!(
+        said[2],
+        plain_other[..STEPS],
+        "the second plain lane's continuation moved when a capturing lane joined \
+         its fire"
+    );
+    assert_eq!(
+        said[1],
+        capturing[..STEPS],
+        "the capturing lane's own continuation moved when two plain lanes joined \
+         its fire"
+    );
+}
+
+// ── (c) the composition captures once and replays identically ────────────
+
+/// **THE RECORDED GRAPH HAS TO CARRY THE NEW COMPOSITION TOO.**
+///
+/// The capture arm is a new class, so a fire that holds one is a new
+/// `record::Key` and a graph this shell has never recorded. What is asked is
+/// the same thing `masked_axis` asks of the masked composition: the eager walk
+/// (the serialization of the DAG) and the replayed graph agree token for
+/// token, and the mass they capture agrees bit for bit — which is the stronger
+/// half here, because a graph that replayed a stale arena address would still
+/// produce the right tokens and the wrong capture.
+#[test]
+fn a_capture_composition_captures_once_and_replays_identically() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the capture replay") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+
+    shell.set_mode(Graphs::Off);
+    let (eager, eager_mass) = solo(&mut shell, 0, &prompt, true, STEPS);
+
+    shell.set_mode(Graphs::On);
+    let (replayed, replay_mass) = solo(&mut shell, 0, &prompt, true, STEPS);
+
+    let stats = shell.graph_stats();
+    eprintln!(
+        "capture replay: {} captured ({} nodes), {} replayed | eager {:?} / replay {:?}",
+        stats.captures,
+        stats.nodes,
+        stats.replays,
+        tok.decode(&eager, false),
+        tok.decode(&replayed, false),
+    );
+    assert!(
+        stats.captures >= 1 && stats.replays >= 1,
+        "the graph mode neither captured nor replayed, so this compared eager \
+         against eager"
+    );
+    assert_eq!(
+        eager, replayed,
+        "the recorded graph's continuation differs from the eager walk's"
+    );
+    let moved = drift(&eager_mass, &replay_mass);
+    assert_eq!(
+        moved, 0.0,
+        "the recorded graph captured a mass {moved} away from the eager walk's; \
+         a replayed launch writing a stale address moves this and not the tokens"
+    );
+}
+
+// ── (d) a fire no lane captured costs the axis nothing ───────────────────
+
+/// **THE ZERO-COST CLAIM, ON THE DEVICE, AND IT IS A CLAIM ABOUT AN ABSENCE.**
+///
+/// `model/tests/the_declared_axes_are_the_ones_that_run` pins the compile-time
+/// half — a word with neither new fact composes as the classes it composed as,
+/// runs the nodes it ran, out of an arena that grew by exactly the capture
+/// columns' own bytes and nothing else. This is the runtime half: a fire no
+/// lane captured must issue the launches it always issued. The mechanism is
+/// design §0's and not a special case — the capture arm is guarded, a fire
+/// nobody captured has zero rows in its classes, and `driver::fire::walk`
+/// skips a zero-row region before it dispatches a node — so what is asserted
+/// is that the RECORDED GRAPH of a plain composition holds the same node count
+/// whether or not any other fire in the process captured, and that the tokens
+/// are the ones every other suite's golden states.
+#[test]
+fn a_fire_no_lane_captured_costs_the_axis_nothing() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the uncaptured floor") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+
+    shell.set_mode(Graphs::On);
+    let (plain, mass) = solo(&mut shell, 0, &prompt, false, STEPS);
+    assert!(
+        mass.is_empty(),
+        "a lane that captured nothing was handed {} capture column(s)",
+        mass.len(),
+    );
+    let plain_nodes = shell.graph_stats().nodes;
+
+    // Now capture on another slot, then fire the plain composition again. Its
+    // graph is already recorded and keyed by the composition, so a plain fire
+    // after a capturing one must replay the SAME graph — same node count, same
+    // tokens.
+    let (_, captured) = solo(&mut shell, 1, &prompt, true, STEPS);
+    assert!(!captured.is_empty(), "the capturing run captured nothing");
+    let (plain_again, _) = solo(&mut shell, 0, &prompt, false, STEPS);
+    let after = shell.graph_stats();
+
+    eprintln!(
+        "uncaptured floor: {plain_nodes} nodes before, {} after; {} captures / {} replays; \
+         continuation {:?}",
+        after.nodes,
+        after.captures,
+        after.replays,
+        tok.decode(&plain, false),
+    );
+    assert_eq!(
+        plain, plain_again,
+        "a plain fire's continuation moved after another slot captured"
+    );
+    let text = tok.decode(&plain, false);
+    assert!(
+        text.starts_with(EXPECTED),
+        "the uncaptured continuation is {text:?} and every other suite's golden \
+         for this prompt on this SKU starts with {EXPECTED:?}; the axis is not free"
+    );
+
+    // The launches, read off the plan rather than the clock: a fire nobody
+    // captured dispatched no `attention.prefill_lse` at all, and the artifact
+    // does carry them, so this is an absence rather than an emptiness.
+    let arms = shell
+        .plan()
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.op,
+                model_ir::Operation::Attention(model_ir::Attention::PrefillLse { .. })
+            )
+        })
+        .count();
+    assert_eq!(
+        arms,
+        shell.score_layers().len(),
+        "the SKU should state one capture arm per exported attention layer"
+    );
+}
+
+
+// ── (e) the refusals ─────────────────────────────────────────────────────
+
+/// **A CAPTURE AND A WORD THAT DISAGREE, BOTH WAYS.**
+///
+/// `Fault::MaskWord`'s and `Fault::AdapterWord`'s third, and the argument
+/// changes in one place because this axis carries no payload. A lane whose word
+/// runs the capture arm and that asked for nothing has a mass column written
+/// for it that the readout skips — paid for and thrown away. A lane that asked
+/// and whose word puts it on the plain arm gets no mass, and an empty capture
+/// is indistinguishable from a captured nothing. Both are refused before
+/// anything launches.
+#[test]
+fn a_capture_and_a_word_that_disagree_are_refused() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the capture refusals") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+
+    // Asked, and the word says the plain arm.
+    shell.open(0).expect("slot 0 opens");
+    let asked = shell.fire_seated(&[Seated::capturing(Lane {
+        slot: 0,
+        word: word(prompt.len() as u32, false),
+        tokens: &prompt,
+    })]);
+    let said = asked.expect_err("a capture with a plain word is refused").to_string();
+    eprintln!("asked, plain word: {said}");
+    assert!(
+        said.contains("asks to capture") && said.contains("plain arm"),
+        "the refusal does not say which way it went: {said}"
+    );
+
+    // The word says the capture arm, and nobody asked.
+    shell.open(0).expect("slot 0 re-opens");
+    let unasked = shell.fire_seated(&[Seated::of(Lane {
+        slot: 0,
+        word: word(prompt.len() as u32, true),
+        tokens: &prompt,
+    })]);
+    let said = unasked
+        .expect_err("a capturing word with no ask is refused")
+        .to_string();
+    eprintln!("unasked, capturing word: {said}");
+    assert!(
+        said.contains("prefill_lse") && said.contains("never read"),
+        "the refusal does not say which way it went: {said}"
+    );
+
+    // And the two stated together still fire, which is what says the refusals
+    // above are about the DISAGREEMENT and not about the axis.
+    shell.open(0).expect("slot 0 re-opens");
+    shell
+        .fire_seated(&[Seated::capturing(Lane {
+            slot: 0,
+            word: word(prompt.len() as u32, true),
+            tokens: &prompt,
+        })])
+        .expect("a capture and a capturing word are one reading of one lane");
+}
+
+/// **A DRAFT AGAINST A TEXT THAT DECLARES NO HEAD.**
+///
+/// `Fault::Maskless`'s and `Fault::Adapterless`'s third: an MTP head is a
+/// supergraph arm the model text either states or does not (design §8), and
+/// `qwen35-d0.8b` does not. A lane that asked for a draft here would be handed
+/// the trunk's continuation with a draft's name on it.
+///
+/// **AND A DRAFTING WORD ALONE IS NOT A REFUSAL, WHICH IS ALSO THE DESIGN.**
+/// `driver::fire::compose` masks a lane's word to the bits some guard READS,
+/// so a `drafts` bit against an artifact that splits on no such guard is
+/// dropped and the lane composes as the word it would have had. That is the
+/// right answer — a model may state a fact it does not split on — and it is
+/// why the refusal below is about the ASK.
+#[test]
+fn a_draft_against_a_text_that_declares_no_head_is_refused() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the draft refusal") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+    assert!(
+        !shell.drafts(),
+        "`{SKU}` declares a draft head after all, and this gate is the wrong one"
+    );
+
+    shell.open(0).expect("slot 0 opens");
+    let asked = shell.fire_seated(&[Seated::drafting(Lane {
+        slot: 0,
+        word: drafting_word(prompt.len() as u32),
+        tokens: &prompt,
+    })]);
+    let said = asked.expect_err("a draft against a headless text is refused").to_string();
+    eprintln!("drafting ask, headless text: {said}");
+    assert!(
+        said.contains("draft head") && said.contains("declares none"),
+        "the refusal does not name the axis: {said}"
+    );
+
+    // The word alone fires, and answers what a plain lane answers — the bit is
+    // masked away because no guard of this artifact reads it.
+    shell.open(0).expect("slot 0 re-opens");
+    let drafting = shell
+        .fire_seated(&[Seated::of(Lane {
+            slot: 0,
+            word: drafting_word(prompt.len() as u32),
+            tokens: &prompt,
+        })])
+        .expect("a fact this artifact does not split on is masked, not refused");
+    shell.open(1).expect("slot 1 opens");
+    let plain = shell
+        .fire_seated(&[Seated::of(Lane {
+            slot: 1,
+            word: word(prompt.len() as u32, false),
+            tokens: &prompt,
+        })])
+        .expect("the plain lane fires");
+    assert_eq!(
+        argmax(&drafting[0]),
+        argmax(&plain[0]),
+        "a masked-away fact bit changed the answer"
+    );
+}
+
+/// **A CAPTURE AGAINST A TEXT THAT DECLARES NO CAPTURE ARM.**
+///
+/// `Fault::Draftless`'s twin, and the refusal palo C4b's score door owes: a
+/// score READ against a plan with no `attn.scores` export. It needs a SKU whose
+/// model text declares none, and gemma is the family that declares nothing —
+/// `the_declared_axes_are_the_ones_that_run` pins that its snapshots hold zero
+/// draft-head tensors and its forward states no capture arm, so a capturing
+/// lane here has nowhere for its mass to come from and is told so rather than
+/// handed an empty `LaneReadout::scores` it cannot tell from a captured
+/// nothing.
+#[test]
+fn a_capture_against_a_text_that_declares_no_arm_is_refused() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = gemma::ready("the capture refusal on a plain text") else {
+        return;
+    };
+    assert!(
+        !shell.captures_scores(),
+        "gemma declares a capture arm after all, and this gate is the wrong one"
+    );
+    assert!(!shell.drafts(), "gemma declares no draft head either");
+
+    let prompt = tok.encode(PROMPT);
+    shell.open(0).expect("slot 0 opens");
+    let asked = shell.fire_seated(&[Seated::capturing(Lane {
+        slot: 0,
+        // Gemma's own word for a plain prefill: its `Facts` reads `qo_one` and
+        // `masked` and nothing else, so there is no capture bit to set and the
+        // ask stands alone — which is exactly the case under test.
+        word: model::gemma_4::forward::Facts::of(&Request::new(prompt.len() as u32, false))
+            .word(),
+        tokens: &prompt,
+    })]);
+    let said = asked
+        .expect_err("a capture against an armless text is refused")
+        .to_string();
+    eprintln!("capturing ask, armless text: {said}");
+    assert!(
+        said.contains("capture its attention mass") && said.contains("declares no capture arm"),
+        "the refusal does not name the axis: {said}"
+    );
+
+    // And the plain fire still works, which is what says the refusal is about
+    // the ASK and not about the load.
+    shell.open(0).expect("slot 0 re-opens");
+    shell
+        .fire_seated(&[Seated::of(Lane {
+            slot: 0,
+            word: model::gemma_4::forward::Facts::of(&Request::new(prompt.len() as u32, false))
+                .word(),
+            tokens: &prompt,
+        })])
+        .expect("the plain gemma lane fires");
+}
+
+/// gemma4-E4B, loaded the way `masked_axis` loads it — the budgets are the
+/// L40S's and that file argues them.
+mod gemma {
+    use super::{Boot, Budgets, Path, PathBuf, Platform, Shell};
+
+    const SKU: &str = "gemma4-e4b-bf16-kv-bf16";
+
+    fn snapshot() -> Option<PathBuf> {
+        if let Ok(stated) = std::env::var("PIE_GEMMA_SNAPSHOT") {
+            let path = PathBuf::from(stated);
+            return path.is_dir().then_some(path);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let snapshots = Path::new(&home)
+            .join(".cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots");
+        std::fs::read_dir(snapshots)
+            .ok()?
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .find(|path| path.join("tokenizer.json").exists())
+    }
+
+    pub fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
+        if !driver_cuda::device::present() {
+            eprintln!("skipping {what}: no CUDA device on this machine");
+            return None;
+        }
+        let Some(checkpoint) = snapshot() else {
+            eprintln!(
+                "skipping {what}: no gemma-4-E4B-it snapshot in the hugging face \
+                 cache (set PIE_GEMMA_SNAPSHOT)"
+            );
+            return None;
+        };
+        let Some(container) = super::container(&checkpoint) else {
+            eprintln!("skipping {what}: {checkpoint:?} holds no tensor container");
+            return None;
+        };
+        let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
+            .expect("the checkpoint's tokenizer loads");
+        let plan = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let source = ztensor_compat::index(&container).expect("the checkpoint opens");
+        let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+            .expect("the import contract fits its own checkpoint");
+        drop(source);
+
+        let shell = Shell::load(Boot {
+            plan,
+            contract: &contract,
+            checkpoint: &checkpoint,
+            budgets: Budgets::new(4, 768),
+            profile: None,
+            page_size: 16,
+            context: 1024,
+            slots: 4,
+            ordinal: 0,
+            graphs: driver_cuda::Graphs::Off,
+        })
+        .expect("the shell loads");
+        eprintln!("gemma4-e4b loaded — capture layers {:?}", shell.score_layers());
+        Some((shell, tokenizer))
+    }
+}
+
+// ── (f) the drafting SKU does not fit this device ────────────────────────
+
+/// **AN HONEST OUT-OF-MEMORY REFUSAL IS ITSELF A GATE.**
+///
+/// `qwen36-27b-bf16-kv-bf16` is the one shipping SKU whose checkpoint
+/// publishes a draft head, and its bf16 weights are ~52 GiB against this
+/// device's 46. It cannot be loaded here and this wave does not pretend
+/// otherwise. What CAN be asserted, and is worth asserting, is that the
+/// refusal is a sentence with a NUMBER in it rather than a launch failure
+/// three layers down: residency is asked for at load, against a budget the
+/// caller stated, and a shell that discovered the shortfall at its first fire
+/// would have already written the page tables.
+///
+/// Skipped, not failed, on a machine with no such snapshot — the point is the
+/// refusal's shape, and there is nothing to refuse without the checkpoint.
+#[test]
+fn the_drafting_sku_does_not_fit_this_device() {
+    let _serial = serialized();
+    if !driver_cuda::device::present() {
+        eprintln!("skipping the drafting load: no CUDA device on this machine");
+        return;
+    }
+    let Some(checkpoint) = drafting_snapshot() else {
+        eprintln!(
+            "skipping the drafting load: no Qwen3.6-27B snapshot in the hugging \
+             face cache (set PIE_DRAFTING_SNAPSHOT)"
+        );
+        return;
+    };
+    let shards = shards(&checkpoint);
+    if shards.is_empty() {
+        eprintln!("skipping the drafting load: {checkpoint:?} holds no tensor container");
+        return;
+    }
+    let plan = model::trace_of(DRAFTING).expect("the catalog ships the SKU")(Platform::Cuda);
+    // The plan is the half that DOES fit, and it is worth reading before the
+    // load refuses: this SKU declares the draft export, which is what makes
+    // the refusal below about the device rather than about the model text.
+    assert!(
+        plan.seams.iter().any(|seam| seam.seam == "mtp"),
+        "`{DRAFTING}` states no `mtp` export, so it is not the drafting SKU"
+    );
+    // ALL FIFTEEN SHARDS AS ONE NAME SPACE. `ztensor_compat::index` takes one
+    // file, which is right for the single-container SKUs every other suite
+    // loads and wrong here: a 27B checkpoint's final norm lives in the last
+    // shard, and an import contract built over the first refuses for a reason
+    // that has nothing to do with the device.
+    let source =
+        ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
+    let contract = model::import_of(DRAFTING).expect("the catalog ships an import")(&source)
+        .expect("the import contract fits its own checkpoint");
+    drop(source);
+
+    let refused = Shell::load(Boot {
+        plan,
+        contract: &contract,
+        checkpoint: &checkpoint,
+        budgets: Budgets::new(4, 256),
+        profile: None,
+        page_size: 16,
+        context: 512,
+        slots: 4,
+        ordinal: 0,
+        graphs: Graphs::Off,
+    });
+    let said = match refused {
+        Ok(shell) => {
+            let (weights, arena, pools, inputs) = shell.footprint();
+            panic!(
+                "`{DRAFTING}` LOADED on this device — weights {:.2} GiB, arena \
+                 {:.1} MiB, pools {:.1} MiB, inputs {:.1} MiB. The MTP device \
+                 gates this file skips are now runnable and should be written.",
+                weights as f64 / (1u64 << 30) as f64,
+                arena as f64 / (1 << 20) as f64,
+                pools as f64 / (1 << 20) as f64,
+                inputs as f64 / (1 << 20) as f64,
+            )
+        }
+        Err(why) => why.to_string(),
+    };
+    eprintln!("the drafting SKU on this device: {said}");
+    // THE REFUSAL CARRIES BOTH NUMBERS, and that is the whole of what this
+    // gate can assert. `cudaMalloc answered 2` is a true sentence and a
+    // useless one: it does not say whether the shortfall was six gigabytes or
+    // sixty, and it reads the same as every other runtime failure.
+    // `device::alloc` turns `cudaErrorMemoryAllocation` into a `Fault::Ceiling`
+    // with the ask and the free, so this asks for the shape rather than for a
+    // magic string.
+    assert!(
+        said.contains("device memory"),
+        "the refusal is not the one this device is entitled to give: {said}"
+    );
+    let numbers: Vec<u64> = said
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    assert!(
+        numbers.len() >= 2,
+        "the refusal states {} number(s); a ceiling is an ask AND a have: {said}",
+        numbers.len(),
+    );
+    let (need, have) = (numbers[0], numbers[1]);
+    eprintln!(
+        "  wanted {:.2} GiB, {:.2} GiB free",
+        need as f64 / (1u64 << 30) as f64,
+        have as f64 / (1u64 << 30) as f64,
+    );
+    assert!(
+        need > have,
+        "the refusal says it wanted {need} bytes and had {have}, which is not a \
+         shortfall at all"
+    );
+}
+
+// ── the load ─────────────────────────────────────────────────────────────
+
+fn snapshot() -> Option<PathBuf> {
+    if let Ok(stated) = std::env::var("PIE_SMOKE_SNAPSHOT") {
+        let path = PathBuf::from(stated);
+        return path.is_dir().then_some(path);
+    }
+    cached("models--Qwen--Qwen3.5-0.8B")
+}
+
+fn drafting_snapshot() -> Option<PathBuf> {
+    if let Ok(stated) = std::env::var("PIE_DRAFTING_SNAPSHOT") {
+        let path = PathBuf::from(stated);
+        return path.is_dir().then_some(path);
+    }
+    cached("models--Qwen--Qwen3.6-27B")
+}
+
+fn cached(repo: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let snapshots = Path::new(&home)
+        .join(".cache/huggingface/hub")
+        .join(repo)
+        .join("snapshots");
+    std::fs::read_dir(snapshots)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .find(|path| path.join("tokenizer.json").exists())
+}
+
+/// Every container in a snapshot, sorted — a sharded checkpoint's whole name
+/// space.
+fn shards(snapshot: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(snapshot)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn container(snapshot: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(snapshot)
+        .ok()?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// A loaded shell, or `None` and a sentence saying what was missing.
+fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
+    if !driver_cuda::device::present() {
+        eprintln!("skipping {what}: no CUDA device on this machine");
+        return None;
+    }
+    let Some(checkpoint) = snapshot() else {
+        eprintln!(
+            "skipping {what}: no Qwen3.5-0.8B snapshot in the hugging face cache \
+             (set PIE_SMOKE_SNAPSHOT)"
+        );
+        return None;
+    };
+    let Some(container) = container(&checkpoint) else {
+        eprintln!("skipping {what}: {checkpoint:?} holds no tensor container");
+        return None;
+    };
+    let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
+        .expect("the checkpoint's tokenizer loads");
+    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let source = ztensor_compat::index(&container).expect("the checkpoint opens");
+    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+        .expect("the import contract fits its own checkpoint");
+    drop(source);
+
+    let shell = Shell::load(Boot {
+        plan,
+        contract: &contract,
+        checkpoint: &checkpoint,
+        budgets: Budgets::new(4, 256),
+        profile: None,
+        page_size: 16,
+        context: 512,
+        slots: 4,
+        ordinal: 0,
+        graphs: Graphs::Off,
+    })
+    .expect("the shell loads");
+    let (weights, arena, pools, inputs) = shell.footprint();
+    eprintln!(
+        "{SKU} loaded — weights {:.2} GiB, arena {:.1} MiB, pools {:.1} MiB, \
+         inputs {:.1} MiB, capture layers {:?}, drafts {}",
+        weights as f64 / (1u64 << 30) as f64,
+        arena as f64 / (1 << 20) as f64,
+        pools as f64 / (1 << 20) as f64,
+        inputs as f64 / (1 << 20) as f64,
+        shell.score_layers(),
+        shell.drafts(),
+    );
+    Some((shell, tokenizer))
+}

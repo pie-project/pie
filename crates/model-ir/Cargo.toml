@@ -11,7 +11,7 @@ repository = "https://github.com/pie-project/pie"
 name = "model_ir"
 path = "src/lib.rs"
 
-# Contrast with old `model-ir`, whose manifest named every `kernels-*` plane
+# Contrast with old `model-ir`, whose manifest named every `kernels-*` platform
 # to reach their claim tables: coverage is a missing match arm now, and the
 # `Operands` impls are hand-written beside their own op enums — serde is the
 # only edge left.

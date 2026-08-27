@@ -2,17 +2,21 @@
 //! its representation as a phantom type; here `Dtype` is a plain field — one
 //! `Weight` struct, no monomorphized model trees (design §5).
 
-use model_ir::{Dtype, Shard};
+use model_ir::{Dtype, ParamSource, Shard};
 
-/// One logical weight: name, logical shape, on-device representation, and how
-/// it is laid out across ranks. The recorder interns it into `Plan::params` —
-/// one param per stored plane — the first time a wrapper touches it.
+/// One logical weight: name, logical shape, on-device representation, how it
+/// is laid out across ranks, and where its bytes come from. The recorder
+/// interns it into `Plan::params` — one param per stored plane — the first
+/// time a wrapper touches it.
 #[derive(Clone, Debug)]
 pub struct Weight {
     pub name: String,
     pub shape: Vec<u64>,
     pub dtype: Dtype,
     pub shard: Shard,
+    /// The checkpoint's, unless [`registered`](Weight::registered) says
+    /// otherwise.
+    pub source: ParamSource,
 }
 
 impl Weight {
@@ -27,7 +31,27 @@ impl Weight {
             shape: shape.into_iter().collect(),
             dtype,
             shard: Shard::Replicated,
+            source: ParamSource::Checkpoint,
         }
+    }
+
+    /// **AN ADAPTER BANK: THE BUDGET IS THE SHAPE** (design §8).
+    ///
+    /// The checkpoint does not publish this plane. It is reserved at load from
+    /// the shape declared here, zeroed — and a zeroed low-rank `A` is the
+    /// identity correction, so every unwritten row of the bank is the base
+    /// model — and filled a row at a time by `Driver::register_adapter`, which
+    /// is a pool write and a table row and NOT a recapture: the graph key is
+    /// the fire's composition and a bank's contents are not in it.
+    ///
+    /// Capacity is stated here rather than passed in at load because it is a
+    /// SHAPE, and shapes are the model text's. `model_compiler::compile`
+    /// refuses a `Budgets::max_adapters` this bank cannot seat, which is the
+    /// one place the deployment's number and the model's meet.
+    #[must_use]
+    pub fn registered(mut self) -> Weight {
+        self.source = ParamSource::Registered;
+        self
     }
 
     /// Cut along the output axis: each rank holds a column block.

@@ -93,15 +93,91 @@ use crate::baked::Region;
 use crate::budget::Budgets;
 use crate::refusal::{Refusal, Share, Unrectangled};
 
-/// The name `model_dsl::seam::OUT` states, and the only seam whose value a
-/// reader touches after the graph has run.
+/// Who reads an export after the graph has run — which is the only thing the
+/// delivery tail below needs to know about one.
 ///
-/// A STRING, BECAUSE THE VOCABULARY IS NOT IN THE IR. `model-dsl` owns the
-/// seam names — "the new IR keeps only the `Seam` rows a plan carries" — and
-/// this crate does not depend on the authoring surface. The coupling is one
-/// literal, and `tests/every_sku_carves_an_arena.rs` is what notices if it
-/// ever stops matching.
-const OUT_SEAM: &str = "out";
+/// **THE TAIL IS ABOUT THE READER, NOT ABOUT THE WRITER.** Both variants hold
+/// the column open past the last node; they differ in whose ROWS of it are
+/// spoken for, and that is a fact about who comes to collect rather than about
+/// which classes happened to write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readers {
+    /// Every class. The sampler takes the logits of every lane in the fire,
+    /// whichever behavior the lane is, so this column's rows are all of them
+    /// and it is nobody's co-tenant — even where the node that wrote it stood
+    /// in one window.
+    EveryClass,
+    /// Only the classes that ran the export. A draft readout is collected for
+    /// the lanes that drafted and for no others; a lane that asked for no
+    /// draft has none, and claiming its rows would price the column at the
+    /// whole fire's height for a reader that never looks at them.
+    ItsOwnClasses,
+}
+
+/// One declared export: a seam whose value a reader touches after the graph
+/// has run, and who that reader is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Export {
+    seam: &'static str,
+    read_by: Readers,
+}
+
+/// **THE EXPORT SET** — the names `model_dsl::seam` states for values that
+/// materialize outside the graph (design §9), and the whole of what this
+/// module knows about the authoring vocabulary.
+///
+/// STRINGS, BECAUSE THE VOCABULARY IS NOT IN THE IR. `model-dsl` owns the seam
+/// names — "the new IR keeps only the `Seam` rows a plan carries" — and this
+/// crate does not depend on the authoring surface. The coupling is this table,
+/// republished as [`crate::EXPORT_SEAMS`] so that a shell resolving the same
+/// names reads them from here instead of keeping a second copy of the literals
+/// (`driver_cuda::serve` did, until this landed), and
+/// `tests/every_sku_carves_an_arena.rs` is what notices if they ever stop
+/// matching.
+///
+/// **A SET RATHER THAN ONE NAME, AND THAT IS palo C3b/C4b's WHOLE SEAT.** Until
+/// this wave the tail belonged to `"out"` alone and the draft column was safe
+/// only because the model text stated it LAST — nothing runs after the last
+/// node, so nothing can be carved on top of it. That is a true argument about
+/// one statement order and not a property of the artifact; a text that stated
+/// its second readout anywhere else got a column the following GEMM was free to
+/// re-use, which is a wrong answer that computes (build log 25). The order is
+/// still right and the model text still keeps it; what changed is that it is no
+/// longer load-bearing.
+///
+/// The seams NOT here — `attn.q`, `attn.out`, `attn.qv`, `recurrent`, `in` —
+/// are trace-time attach points, planted once per layer, and nothing reads them
+/// after the fire. Pinning them would hold two or three activations per layer
+/// live across the whole stack, which is sixty layers of an arena that exists
+/// to be the busiest instant.
+const EXPORTS: [Export; 3] = [
+    // `model_dsl::seam::OUT` — the trunk's logits, into the engine's sampler.
+    Export {
+        seam: "out",
+        read_by: Readers::EveryClass,
+    },
+    // `model_dsl::seam::MTP` — the draft head's logits over the draft window,
+    // into the same sampler through `driver::program`'s `MtpLogits` intrinsic
+    // at `mtp_draft_row` (palo C3b).
+    Export {
+        seam: "mtp",
+        read_by: Readers::ItsOwnClasses,
+    },
+    // `model_dsl::seam::SCORES` — the attention's per-query normalizing mass,
+    // one column per attention layer, into `LaneReadout::scores` (palo C4b).
+    Export {
+        seam: "attn.scores",
+        read_by: Readers::ItsOwnClasses,
+    },
+];
+
+/// The export seam names, in the order [`EXPORTS`] states them — for a shell
+/// that has to find the same values in a `Plan` it was handed.
+///
+/// Published because the alternative is what was here before: the same literals
+/// spelled a second time in `driver-cuda`, with a comment in each place saying
+/// the other one exists.
+pub const EXPORT_SEAMS: [&str; 3] = [EXPORTS[0].seam, EXPORTS[1].seam, EXPORTS[2].seam];
 
 /// How many rows a value has, in the only terms a plan can state.
 ///
@@ -941,34 +1017,39 @@ fn lives(plan: &Plan, slots: &[Slot], classes: &Classes) -> (Vec<Option<Span>>, 
         }
     }
 
-    // THE DELIVERY TAIL, AND ONLY THE `"out"` SEAM TAKES IT. That value is
-    // read after the last node has run — logits, into the engine's sampler —
-    // by a reader no node occupies, so a value sharing its bytes would clobber
-    // it between the launch and the read.
+    // THE DELIVERY TAIL, AND EVERY DECLARED EXPORT TAKES IT ([`EXPORTS`]).
+    // These values are read after the last node has run — the trunk's logits
+    // into the engine's sampler, a draft column into the same sampler through
+    // its intrinsic, a capture column into the lane's readout — by a reader no
+    // node occupies, so a value sharing their bytes would clobber them between
+    // the launch and the read.
     //
-    // The other seams a plan carries (`attn.q`, `attn.out`, `attn.qv`,
-    // `recurrent`) are TRACE-TIME ATTACH POINTS, planted once per layer, and
-    // nothing reads them after the fire. Pinning them would hold two or three
-    // activations per layer live across the whole stack — sixty layers of an
-    // arena that exists to be the busiest instant. When a seam becomes a real
-    // export (design §9), it becomes an export OP, and this walk sees its
-    // reader without a special case.
-    for seam in plan.seams.iter().filter(|s| s.seam == OUT_SEAM) {
-        for value in &seam.values {
-            let root = root(slots, *value);
-            if slots.get(root.0 as usize).is_some_and(Slot::is_arena) {
+    // **THE TAIL IS TWO SEPARATE PINS AND ONLY ONE OF THEM IS THE SAME FOR
+    // EVERY EXPORT.** The SPAN runs to `end` in all three cases: the reader is
+    // past the last node whichever export it came for. The CLASS MASK is the
+    // reader's own — `everywhere` for `"out"`, whose sampler takes every lane
+    // of the fire, and the classes the export actually ran in for the other
+    // two, whose readers came for the drafting lanes' rows or the capturing
+    // lanes' rows and for nobody else's. Widening those to `everywhere` would
+    // be a claim about rows no reader will look at, and it would price a
+    // per-layer capture column at the whole fire's height in every SKU that
+    // declares one.
+    for export in EXPORTS {
+        for seam in plan.seams.iter().filter(|s| s.seam == export.seam) {
+            for value in &seam.values {
+                let root = root(slots, *value);
+                if !slots.get(root.0 as usize).is_some_and(Slot::is_arena) {
+                    continue;
+                }
                 spans[root.0 as usize]
                     .get_or_insert(Span {
                         first: 0,
                         last: end,
                     })
                     .last = end;
-                // AND IT IS READ IN EVERY CLASS. The sampler takes the logits
-                // of every lane in the fire, whichever behavior the lane is,
-                // so this column's rows are all of them and it is nobody's
-                // co-tenant — even where the node that wrote it stood in one
-                // window.
-                widen(&mut live_in[root.0 as usize], &everywhere);
+                if export.read_by == Readers::EveryClass {
+                    widen(&mut live_in[root.0 as usize], &everywhere);
+                }
             }
         }
     }
@@ -1045,8 +1126,8 @@ fn disjoint(a: &ClassSet, b: &ClassSet) -> bool {
 /// SIZES is what keeps a freed hole aligned too, so every offset lands aligned
 /// with no separate padding pass; the number is the largest storage-buffer
 /// offset alignment a conformant device may demand
-/// (Vulkan's `minStorageBufferOffsetAlignment`), and `Plane::Vulkan` is in the
-/// IR. It started at 16 there and was raised after a plan this compiler laid
+/// (Vulkan's `minStorageBufferOffsetAlignment`), and `Platform::Vulkan` is in
+/// the IR. It started at 16 there and was raised after a plan this compiler laid
 /// out turned out to be one such a device would refuse to bind — silently, on
 /// the adapter that tree tested on, which reports 16.
 ///

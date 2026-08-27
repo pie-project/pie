@@ -44,3 +44,16 @@ tokenizer = { path = "../tokenizer" }
 # which tensors are there, and what each part says its elements are — before it
 # decides between an identity load, a cast, and a refusal.
 ztensor = { workspace = true }
+
+[dev-dependencies]
+# THE BAKE, ASKED AT AUTHORING TIME. A model text's host gates are "does it
+# trace", "does every class resolve every merge" and — since the axes campaign
+# — "does the plan this text writes still COMPILE, and does a fire that sets
+# none of the new facts still carve the arena it carved before". The last two
+# are questions only the compiler can answer, and it answers them as a pure
+# function of the plan, with no device in the room.
+#
+# A DEV EDGE, AND IT DOES NOT CYCLE. `model-compiler`'s own `[dependencies]`
+# name `model-ir` and nothing else — its edge back to `model` is a dev edge
+# too, and two dev edges never meet in one build graph.
+model-compiler = { path = "../model-compiler" }

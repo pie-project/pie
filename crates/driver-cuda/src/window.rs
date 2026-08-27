@@ -55,6 +55,7 @@
 use std::cell::Cell;
 
 use driver::fire::{EventId, MaskSpan, Sink, WindowTable};
+use crate::device::graph::Event;
 use kernels_cuda::Tensor;
 use model_compiler::{Baked, Lowering, Region};
 use model_ir::{Attention, Def, Dtype, Operation, Plan};
@@ -281,43 +282,178 @@ fn rebase(indptr: &[i32], span: MaskSpan) -> Vec<i32> {
     cut.iter().map(|bound| bound - base).collect()
 }
 
-/// This shell's [`Sink`]: the region counter a [`Run`](crate::run::Run) reads
-/// its window out of.
+/// The stream handles and events a [`Cursor`] switches between — P6's half of
+/// the sink.
 ///
-/// **IT RECORDS NOTHING, LIKE `EagerSink`, AND CARRIES ONE NUMBER.** The walk
-/// calls [`region_begin`](Sink::region_begin) for every region of the template
-/// in order — including the ones this composition has no rows for, which is
-/// what makes the count an index rather than a guess — and a `Run` holding a
-/// shared reference to the same `Cell` then resolves each operand at that
-/// region's window. The dispatch impl and the sink cannot be one object (the
-/// walk takes two `&mut`), and this is the smallest thing that stands between
-/// them.
+/// **HANDED IN, NEVER OWNED.** The streams and the events are the context's,
+/// opened once at load (`Context::open_lanes`); what this bundle adds is the
+/// one cell the [`Run`](crate::run::Run) reads to know which of them the
+/// launch it is about to make belongs on. Same mechanism as the region cell
+/// beside it, for the same reason: the walk takes two `&mut` and the sink and
+/// the dispatch cannot be one object.
+#[derive(Debug, Clone, Copy)]
+pub struct Lanes<'a> {
+    /// The side streams, in stream order: `side[0]` is stream 1. The main
+    /// stream is not here — a region on stream 0 is the ordinary case and
+    /// needs no lookup.
+    pub side: &'a [*mut core::ffi::c_void],
+    /// The main stream, which is what an event on stream 0 is recorded on.
+    pub main: *mut core::ffi::c_void,
+    /// One event per `EventId`, in id order.
+    pub events: &'a [Event],
+    /// Which stream the walk is on now.
+    pub at: &'a Cell<u32>,
+}
+
+/// This shell's [`Sink`]: the region counter a [`Run`](crate::run::Run) reads
+/// its window out of, and — when the artifact forked — the stream switch and
+/// the event points.
+///
+/// **THE EAGER CURSOR RECORDS NOTHING, LIKE `EagerSink`, AND CARRIES ONE
+/// NUMBER.** The walk calls [`region_begin`](Sink::region_begin) for every
+/// region of the template in order — including the ones this composition has
+/// no rows for, which is what makes the count an index rather than a guess —
+/// and a `Run` holding a shared reference to the same `Cell` then resolves
+/// each operand at that region's window.
+///
+/// **[`Cursor::across`] IS THE RECORDING ONE, AND IT IS THE ONLY PLACE A
+/// STREAM SWITCH HAPPENS.** A cursor built with [`Cursor::new`] leaves the
+/// stream cell at zero forever, which is what makes the eager pass the
+/// SERIALIZATION of P6's DAG (`driver::fire::EagerSink`'s doc argues why that
+/// is correct rather than merely safe). A cursor built with `across` writes
+/// each region's stream into the cell, waits the events the region waits on
+/// and records the ones it records — the fork/join pattern
+/// `.wiki/tart/evidence/green_contexts.md` Finding 3 measured, in the order
+/// `driver::fire::walk` emits it.
+///
+/// A device call inside a `Sink` method has nowhere to return an error to, so
+/// the first one is kept and [`Cursor::settle`] is where the caller asks. That
+/// is not a swallowed error: a failed `cudaEventRecord` leaves the capture in
+/// a state the caller must not instantiate, and the caller is the code that
+/// knows it.
 #[derive(Debug)]
 pub struct Cursor<'a> {
     at: u32,
     region: &'a Cell<u32>,
+    lanes: Option<Lanes<'a>>,
+    fault: Option<Fault>,
 }
 
 impl<'a> Cursor<'a> {
-    /// A cursor writing into `region`.
+    /// A cursor writing into `region`, on the main stream from end to end.
     #[must_use]
     pub fn new(region: &'a Cell<u32>) -> Cursor<'a> {
         region.set(0);
-        Cursor { at: 0, region }
+        Cursor {
+            at: 0,
+            region,
+            lanes: None,
+            fault: None,
+        }
+    }
+
+    /// The same, plus P6: switch streams at every region boundary and put the
+    /// baked event points on the device.
+    #[must_use]
+    pub fn across(region: &'a Cell<u32>, lanes: Lanes<'a>) -> Cursor<'a> {
+        region.set(0);
+        lanes.at.set(0);
+        Cursor {
+            at: 0,
+            region,
+            lanes: Some(lanes),
+            fault: None,
+        }
+    }
+
+    /// What the device refused during the walk, if anything.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] from a `cudaEventRecord` or a `cudaStreamWaitEvent`,
+    /// or [`Fault::Unbound`] for a template naming a stream or an event this
+    /// load never opened — which is a `Baked` and a `Context` that were not
+    /// set up from each other.
+    pub fn settle(self) -> Result<()> {
+        match self.fault {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
+    }
+
+    /// The stream the current region is on, or the fault for a region naming
+    /// one this load did not open.
+    fn stream(&self, lanes: &Lanes<'a>) -> core::result::Result<*mut core::ffi::c_void, Fault> {
+        match lanes.at.get() {
+            0 => Ok(lanes.main),
+            n => lanes
+                .side
+                .get(n as usize - 1)
+                .copied()
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "region {} on stream {n}, and this load opened {}",
+                        self.at.saturating_sub(1),
+                        lanes.side.len(),
+                    ),
+                }),
+        }
+    }
+
+    /// Record or wait one event on the current stream. `record` chooses which.
+    fn event(&mut self, id: EventId, record: bool) {
+        let Some(lanes) = self.lanes else {
+            return;
+        };
+        // The first fault wins: a later call on a stream whose earlier event
+        // failed says nothing new, and the caller wants the one that started
+        // it.
+        if self.fault.is_some() {
+            return;
+        }
+        let outcome = self.stream(&lanes).and_then(|stream| {
+            let Some(event) = lanes.events.get(id.0 as usize) else {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "event {}, and this load created {}",
+                        id.0,
+                        lanes.events.len(),
+                    ),
+                });
+            };
+            if record {
+                event.record(stream)
+            } else {
+                event.wait(stream)
+            }
+        });
+        if let Err(fault) = outcome {
+            self.fault = Some(fault);
+        }
     }
 }
 
 impl Sink for Cursor<'_> {
-    fn region_begin(&mut self, _region: &Region) {
+    fn region_begin(&mut self, region: &Region) {
         self.region.set(self.at);
         self.at += 1;
+        // The stream switch, and it is the whole of it: everything the `Run`
+        // resolves afterwards fires on whatever this names, until the next
+        // region says otherwise.
+        if let Some(lanes) = self.lanes {
+            lanes.at.set(region.stream);
+        }
     }
     fn region_end(&mut self, _region: &Region) {}
     fn cond_begin(&mut self, _lowering: &Lowering) {}
     fn cond_arm(&mut self, _arm: u8) {}
     fn cond_end(&mut self) {}
-    fn fork(&mut self, _event: EventId) {}
-    fn join(&mut self, _event: EventId) {}
+    fn fork(&mut self, event: EventId) {
+        self.event(event, true);
+    }
+    fn join(&mut self, event: EventId) {
+        self.event(event, false);
+    }
 }
 
 #[cfg(test)]

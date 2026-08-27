@@ -281,17 +281,35 @@ pub fn matmul_select(
     routes: Tensor,
     y: &mut Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "linear.moe_matmul_select";
+    select_gemv(ctx, "linear.moe_matmul_select", x, bank, routes, y)
+}
 
+/// The routed dense GEMV itself, under the caller's own op name.
+///
+/// **NAMED SEPARATELY BECAUSE A SECOND OP IS THE SAME LAUNCH.** LoRA's
+/// projection half — `t[row] = A[routes[row]] · x[row]` — is a routed
+/// matmul-select at fan-out one and nothing else: same bank indexing, same
+/// per-route zero for a negative id, same float4 ladder. `linear::lora` fires
+/// this rather than stamping a twin, and passes its own `op` so that a refusal
+/// or a launch failure comes back attributed to the correction the author
+/// wrote instead of to an MoE the plan does not contain.
+pub(crate) fn select_gemv(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), KernelError> {
     /// K in whole float4 loads.
     const VEC_WIDTH: u32 = 8;
 
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
-    let fan = selected(OP, x, routes, y)?;
+    let fan = selected(op, x, routes, y)?;
     if fan.route_count > MAX_GRID_Y {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "the route run is {}, above the {MAX_GRID_Y} rows this GEMV puts on the \
                  grid's y axis; the aligned batched leg is what a wider fire wants",
@@ -301,18 +319,18 @@ pub fn matmul_select(
     }
     if x.width == 0 || x.width % VEC_WIDTH != 0 {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "K is {}, not a whole number of {VEC_WIDTH}-element float4 loads",
                 x.width
             ),
         ));
     }
-    let k = stated(OP, x.width)?;
-    let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let form = if fan.by_token { "by_token" } else { "by_route" };
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             FILE,
             symbol(&format!(

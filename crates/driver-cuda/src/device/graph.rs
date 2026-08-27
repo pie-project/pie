@@ -37,6 +37,23 @@
 //! nothing this does not already have, and it would make an unrelated
 //! thread's allocation a failed capture.
 //!
+//! # Several streams, one graph (P6)
+//!
+//! [`Event`] is the other half of this module and it is what makes a capture
+//! span more than one stream. `.wiki/tart/evidence/green_contexts.md` Finding
+//! 3 measured the pattern on real hardware and called it the make-or-break
+//! result: record an event on the capturing stream, have a second stream
+//! `cudaStreamWaitEvent` on it, launch work there, then record on the second
+//! and wait from the first — and `cudaStreamEndCapture` returns **one** graph
+//! containing both. The waits are what carry the capture across: a stream
+//! that waits on an event recorded by a capturing stream is thereafter part of
+//! that capture, and one that never rejoins leaves it
+//! `cudaErrorStreamCaptureUnjoined`.
+//!
+//! So nothing here knows what a fork group is either. The compiler's P6 says
+//! which stream and which event; `record.rs` holds the handles; this module
+//! is four more calls.
+//!
 //! [`cudaStreamBeginCapture`]: https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html
 
 use core::ffi::c_void;
@@ -162,6 +179,49 @@ impl Graph {
         }
     }
 
+    /// How many EDGES it recorded — the observable a fork actually has.
+    ///
+    /// **NODE COUNT CANNOT SEE A FORK AND EDGE COUNT CAN.** Stream capture
+    /// turns a `cudaEventRecord` and the `cudaStreamWaitEvent` behind it into
+    /// a DEPENDENCY between the launches on either side rather than into nodes
+    /// of their own, which is exactly the lowering one wants and exactly what
+    /// makes `cudaGraphGetNodes` answer the same number for a sequential
+    /// capture and a forked one. The topology is where the difference lives: a
+    /// capture on one stream is a chain, `N` nodes and `N-1` edges, and every
+    /// fork/join pair adds one edge that the chain does not have while
+    /// removing none.
+    ///
+    /// So this is what a measurement asks to say its two arms are two
+    /// different graphs, and it is the only thing on either handle that a
+    /// mis-wired side stream could not fake.
+    #[must_use]
+    pub fn edges(&self) -> usize {
+        #[cfg(feature = "_cuda")]
+        {
+            let mut count: usize = 0;
+            // SAFETY: two null endpoint arrays with a live count is the
+            // documented way to ask for the count alone.
+            let status = unsafe {
+                cudarc::runtime::sys::cudaGraphGetEdges(
+                    self.raw.cast(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &raw mut count,
+                )
+            };
+            if status == cudarc::runtime::sys::cudaError::cudaSuccess {
+                count
+            } else {
+                0
+            }
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            0
+        }
+    }
+
     /// Instantiate it, and upload it to `stream`.
     ///
     /// The upload is not decoration: instantiation allocates the exec's
@@ -270,6 +330,125 @@ impl Drop for GraphExec {
             // before it drops a cache entry (`record.rs`'s eviction).
             unsafe {
                 let _ = cudarc::runtime::sys::cudaGraphExecDestroy(self.raw.cast());
+            }
+        }
+    }
+}
+
+/// One `cudaEvent_t`: a point on a stream that another stream can wait for.
+///
+/// **CREATED WITH `cudaEventDisableTiming`**, because nothing asks it when it
+/// happened. A timing-enabled event is materially more expensive to record —
+/// the runtime writes a timestamp on the device — and the whole point of P6's
+/// gate is that an event pair has to be cheap enough to be worth a fork.
+///
+/// One event is created per `model_compiler::EventId` at load and recorded on
+/// EVERY fire that captures. That is legal and is the ordinary use: recording
+/// an event again simply overwrites what it names, and inside a capture the
+/// record and the wait are not a runtime synchronization at all — they are a
+/// DEPENDENCY between the launches on either side. Measured on this build
+/// (build log 24): a qwen capture holds 621 nodes and 620 edges with the
+/// streams off, which is exactly a chain, and 621 nodes and 631 edges with
+/// them on. The event points cost no nodes and eleven edges.
+#[derive(Debug)]
+pub struct Event {
+    raw: *mut c_void,
+}
+
+impl Event {
+    /// Create one.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] or [`Fault::Device`].
+    pub fn new() -> Result<Event> {
+        #[cfg(feature = "_cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+            let mut raw: rt::cudaEvent_t = core::ptr::null_mut();
+            // SAFETY: `raw` is a live out-parameter and this thread bound the
+            // device.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaEventCreateWithFlags",
+                    rt::cudaEventCreateWithFlags(&raw mut raw, 2), // cudaEventDisableTiming
+                )?;
+            }
+            Ok(Event { raw: raw.cast() })
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
+    /// Record this event on `stream`: the FORK half.
+    ///
+    /// Everything already enqueued on `stream` is what a waiter will have
+    /// waited for. Inside a capture this becomes an event-record node.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] or [`Fault::Device`].
+    pub fn record(&self, stream: *mut c_void) -> Result<()> {
+        #[cfg(feature = "_cuda")]
+        {
+            // SAFETY: both handles are the shell's and live for the call.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaEventRecord",
+                    cudarc::runtime::sys::cudaEventRecord(self.raw.cast(), stream.cast()),
+                )
+            }
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            let _ = stream;
+            Err(Fault::Runtimeless)
+        }
+    }
+
+    /// Make `stream` wait for this event: the JOIN half.
+    ///
+    /// Enqueue-only, like everything else this crate does on a fire: the host
+    /// does not block, the stream does. Inside a capture this is the edge that
+    /// carries the capture ONTO `stream` (or back off it), which is the whole
+    /// of Finding 3's mechanism.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] or [`Fault::Device`].
+    pub fn wait(&self, stream: *mut c_void) -> Result<()> {
+        #[cfg(feature = "_cuda")]
+        {
+            // SAFETY: both handles are the shell's and live for the call.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaStreamWaitEvent",
+                    cudarc::runtime::sys::cudaStreamWaitEvent(
+                        stream.cast(),
+                        self.raw.cast(),
+                        0,
+                    ),
+                )
+            }
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            let _ = stream;
+            Err(Fault::Runtimeless)
+        }
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        #[cfg(feature = "_cuda")]
+        if !self.raw.is_null() {
+            // SAFETY: created by this handle's `new`, destroyed once, and the
+            // shell synchronizes before it tears a load down.
+            unsafe {
+                let _ = cudarc::runtime::sys::cudaEventDestroy(self.raw.cast());
             }
         }
     }

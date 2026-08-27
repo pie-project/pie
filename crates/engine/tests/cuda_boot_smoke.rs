@@ -41,7 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
-use driver_api::model_ir::Plane;
+use driver_api::model_ir::Platform;
 use driver_api::{Budgets, FireSubmission, Lane, Readout};
 use engine::driver::backend::open;
 
@@ -140,7 +140,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
         max_context: 512,
         slots: 4,
     };
-    let request = engine::driver::load::request(&checkpoint, Plane::Cuda, budgets.clone(), 0)
+    let request = engine::driver::load::request(&checkpoint, Platform::Cuda, budgets.clone(), 0)
         .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(
         request.plan.name, SKU,
@@ -196,6 +196,8 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             kv: driver_api::KvDelta::default(),
             mask: None,
             adapter: None,
+            drafts: false,
+            captures_scores: false,
             readout: Readout::Last,
         }],
         attachments: Vec::new(),

@@ -97,6 +97,21 @@ pub enum RuntimeInput {
     /// One geometry vector of a cache space; `space` matches the group the
     /// caches declare (`CacheRow::Kv::space`).
     Geometry { space: u32, kind: GeomKind },
+    /// Which adapter bank each token row routes to (design §8); read by
+    /// `linear.lora_correct`. `i32`, one entry per token row, `-1` for the
+    /// base model.
+    ///
+    /// **BARE, LIKE `Tokens` AND `Positions`, AND NOT KEYED BY ANYTHING.**
+    /// `Mask` and `Geometry` carry a `space` because what they describe is a
+    /// page-id space's own — one mask slab per readable extent, one indptr per
+    /// page table. An adapter is a property of the REQUEST: a lane routes to
+    /// one adapter and every correction site in the plan reads the same id for
+    /// that lane's rows, so a per-site or per-bank spelling would be the same
+    /// vector interned under `sites` names, free to disagree with itself. One
+    /// vector, staged once, read by every site — which is also what makes the
+    /// zero-adapter fire's cost exactly zero: nothing is staged when no lane
+    /// carries one.
+    AdapterRoutes,
 }
 
 /// Raggedness is not a `Ty` — a leading symbolic `Dim` means the value is

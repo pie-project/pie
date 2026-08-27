@@ -4,8 +4,9 @@ use crate::operands::Operands;
 use crate::value::ValueId;
 
 /// Learned-weight channel mixing and its epilogues: the plain matmuls, the
-/// fused MLP activations that consume a projection's packed output, and the MoE
-/// routing and grouped-matmul ops that pick which weights a row multiplies.
+/// fused MLP activations that consume a projection's packed output, the MoE
+/// routing and grouped-matmul ops that pick which weights a row multiplies, and
+/// the low-rank CORRECTION that adds a routed bank's `ΔW·x` to one of them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Linear {
     Matmul {
@@ -129,6 +130,41 @@ pub enum Linear {
         gate: ValueId,
         y: ValueId,
     },
+    /// **THE CORRECTION CLASS** (design §8, decision 17): `y += B[a]·(A[a]·x)`,
+    /// where `a = routes[row]` is the adapter this row's lane registered.
+    ///
+    /// Family `Linear` by the ordered procedure's second criterion, and it is
+    /// the second criterion rather than the third: no token interacts with
+    /// another and no sequence cache is touched (so not `Attention`), and the
+    /// weights are LEARNED and the mixing is over channels (so not `Layout`'s
+    /// movement-without-compute). It reads as the MoE selects read — one bank
+    /// id, one `routes` id, the runtime index inside the op — because that is
+    /// what design §8's "follow that" names.
+    ///
+    /// **IN PLACE, AND THAT IS WHAT MAKES IT A CORRECTION.** `y_out` aliases
+    /// `y`, so the op owns no column of its own and the arena carve costs
+    /// nothing; a class whose guard does not hold never runs the node and
+    /// reads `y` unchanged, which is the identity without a merge, without an
+    /// arm, and without a φ. The additive form is the whole economy tart
+    /// measured at 1.01× the no-divergence floor: the trunk is `O(h·i)` and
+    /// this rides on it at `O(r·h)`.
+    ///
+    /// `bank_a` is `[adapters, rank, in]` and `bank_b` is `[adapters, out,
+    /// rank]` — first axis indexed by `routes`, and the LoRA scale `α/r` is
+    /// folded into `bank_b`'s contents at registration, which is where every
+    /// per-adapter number belongs (the tensor-dsl adapter surface says the
+    /// same thing about the same scale). Rank diversity is bucketed by BANK,
+    /// not by a runtime table: an adapter shorter than its bank's rank is
+    /// registered zero-padded, which is exact, and a deployment that mixes
+    /// ranks widely declares a second bank rather than a branch.
+    LoraCorrect {
+        x: ValueId,
+        bank_a: ValueId,
+        bank_b: ValueId,
+        routes: ValueId,
+        y: ValueId,
+        y_out: ValueId,
+    },
 }
 
 impl Operands for Linear {
@@ -157,6 +193,9 @@ impl Operands for Linear {
             Self::MoeSigmoidGateAdd { routed, shared, gate, .. } => {
                 sink.extend([*routed, *shared, *gate]);
             }
+            Self::LoraCorrect { x, bank_a, bank_b, routes, y, .. } => {
+                sink.extend([*x, *bank_a, *bank_b, *routes, *y]);
+            }
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -178,9 +217,35 @@ impl Operands for Linear {
             Self::MoeWeightedSum { y, .. } => sink.push(*y),
             Self::MoeBiasSum { y, .. } => sink.push(*y),
             Self::MoeSigmoidGateAdd { y, .. } => sink.push(*y),
+            Self::LoraCorrect { y_out, .. } => sink.push(*y_out),
         }
     }
-    fn aliases(&self, _sink: &mut Vec<(ValueId, ValueId)>) {}
+    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
+        match self {
+            // The correction writes THROUGH the output it corrects: one
+            // column, read and added to, so the compiler folds the SSA pair
+            // onto one arena slot and a class that skips the node reads the
+            // uncorrected value at the same address.
+            Self::LoraCorrect { y, y_out, .. } => sink.push((*y_out, *y)),
+            Self::Matmul { .. }
+            | Self::LmHead { .. }
+            | Self::MlpSwiglu { .. }
+            | Self::MlpSwigluClamp { .. }
+            | Self::MlpSwigluClampAlpha { .. }
+            | Self::MlpGegluTanh { .. }
+            | Self::MlpGegluTanhPacked { .. }
+            | Self::MlpSitu { .. }
+            | Self::MoeTopkSoftmax { .. }
+            | Self::MoeTopkSigmoid { .. }
+            | Self::MoeTopkSqrtSoftplus { .. }
+            | Self::MoeMatmulSelect { .. }
+            | Self::MoeMatmulSelectBias { .. }
+            | Self::MoeMatmulSelectQuant { .. }
+            | Self::MoeWeightedSum { .. }
+            | Self::MoeBiasSum { .. }
+            | Self::MoeSigmoidGateAdd { .. } => {}
+        }
+    }
     fn name(&self) -> &'static str {
         match self {
             Self::Matmul { .. } => "linear.matmul",
@@ -200,6 +265,7 @@ impl Operands for Linear {
             Self::MoeWeightedSum { .. } => "linear.moe_weighted_sum",
             Self::MoeBiasSum { .. } => "linear.moe_bias_sum",
             Self::MoeSigmoidGateAdd { .. } => "linear.moe_sigmoid_gate_add",
+            Self::LoraCorrect { .. } => "linear.lora_correct",
         }
     }
 }

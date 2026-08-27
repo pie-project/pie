@@ -23,3 +23,69 @@ kernels = { path = "../kernels" }
 # `KvPool`, `RecurrentPool`, the plan payloads, and the `dyn Encode` sink
 # that keeps this crate OS-portable.
 kernels-metal = { path = "../kernels-metal" }
+
+# The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`
+# (palo design §6). The shell supplies the two traits and calls the walk; it
+# never re-implements one.
+driver = { path = "../driver" }
+# `Baked` — the artifact this shell walks: the region template, the class
+# table a descriptor's counts index, and the arena's static offsets. Metal
+# records nothing (design §6: "no record.rs"), so `Baked` is read as a
+# template and never as a capture script.
+model-compiler = { path = "../model-compiler" }
+# The residency half: `ModelContract` (the caller's, per decision #18),
+# `plan::compile` and the `Execution` that runs it against the checkpoint.
+model-loader = { path = "../model-loader" }
+
+# Metal itself, and the two crates it is spoken through. TARGET-gated rather
+# than feature-gated, which is the one place this manifest diverges from
+# `driver-cuda`'s and for a reason that is not a preference: a CUDA runtime
+# is a CHOICE a machine makes (which libcudart, which ABI) and a build that
+# names it may still not have it, so the CUDA shell carries a feature and a
+# `Runtimeless` answer. Metal is not a choice — it is the platform, present
+# on every Apple target and absent from every other one — so the axis is
+# `cfg(target_vendor = "apple")`, decided by the target triple. On any other
+# target the device half compiles to its refusing twin and the whole shell,
+# the walk included, is still type-checked by a plain workspace sweep.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSError",
+] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLBlitCommandEncoder",
+    "MTLTypes",
+] }
+
+[dev-dependencies]
+# The smoke's catalog row and its load contract. A DEV dependency on purpose:
+# the engine traces and hands a `Plan` and a `ModelContract` across (design
+# §7, decision #18), so the shell itself must not know a model family.
+model = { path = "../model" }
+# `Platform`, and the `Facts`/`Request` pair the smoke computes each lane's
+# word with — `Classify::of`, engine-side in production.
+model-dsl = { path = "../model-dsl" }
+# The prompt in, the continuation out.
+tokenizer = { path = "../tokenizer" }
+# The checkpoint container the import contract is checked against, and the
+# projection that lets a stock safetensors snapshot BE one.
+ztensor = { workspace = true }
+ztensor-compat = { workspace = true }
+# The guest-program half's producer: a golden trace in, a `LaunchPackage` and
+# an emitted Metal kernel table out. A DEV edge — `program/` is handed the two
+# by its caller and never plans anything itself.
+tensor-compiler = { path = "../tensor-compiler" }
+# The container the goldens are stored as, and the profile they bind against.
+tensor-ir = { path = "../tensor-ir" }

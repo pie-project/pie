@@ -375,6 +375,22 @@ impl Session {
                  which is address zero",
             ));
         }
+        // THE DRAFT COLUMN GETS ITS OWN GUARD, BECAUSE IT IS ITS OWN BUFFER
+        // (palo C3b). `needs_mtp_logits` was a flag nothing checked while
+        // there was one rectangle to bind; now the shell binds `MtpLogits` at
+        // the `mtp` export and a load whose plan declares none binds nothing,
+        // so a program that reads drafts against a headless model would take
+        // the same address-zero dereference the line above exists to prevent.
+        if plan.needs_mtp_logits
+            && self.bound & (1u64 << (driver::tensor_ir::op::IntrinsicId::MtpLogits as u32)) == 0
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `mtp_logits` intrinsic and no buffer has \
+                 been bound to it; a model whose text declares no `mtp` export has \
+                 no draft column for it to point at",
+            ));
+        }
 
         // ── Readiness. THE SAME GATE THE HOST INTERPRETER OPENS. ──
         //

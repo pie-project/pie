@@ -44,6 +44,10 @@ use driver::driver_api::program::{
     LaunchChannel, LaunchPackage, ProgramRegistration, ValueSource,
 };
 use driver::tensor_ir::container::HostRole;
+use tensor_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
+use tensor_ir::op::Op;
+use tensor_ir::registry::Stage;
+use tensor_ir::types::Shape;
 use driver::tensor_ir::DType;
 use driver::tensor_ir::op::IntrinsicId;
 use driver::{
@@ -82,6 +86,17 @@ struct Subject {
     /// production this number is the model fire's; here it is the corpus's,
     /// and it is checked against the package's own concrete shape below.
     rows: u32,
+    /// How many rows its `mtp_logits` intrinsic reads, or zero for a program
+    /// that reads no draft column (palo C3b).
+    ///
+    /// **A SECOND NUMBER, BECAUSE THERE IS A SECOND COLUMN.** Until this wave
+    /// a draft was rows `mtp_draft_row ..` of the ONE readout, because there
+    /// was one rectangle for a shell to bind. The `mtp` export is its own
+    /// rectangle now — `model_compiler::arena` holds it open past the last
+    /// node and `Shell::fire_captured` points `IntrinsicId::MtpLogits` at its
+    /// base — so a subject that reads drafts is handed two buffers and the
+    /// host interpreter is handed the same two.
+    draft_rows: u32,
     /// Why this program is in the list.
     why: &'static str,
 }
@@ -100,6 +115,7 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "counter_pingpong",
         rows: 0,
+        draft_rows: 0,
         why: "take, add, put back into the same ring",
     },
     // Reads that peek without consuming beside a take that does, plus a
@@ -108,6 +124,7 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "dfa_ingraph",
         rows: 1,
+        draft_rows: 0,
         why: "two peeked channels, one taken, two published",
     },
     // A bool matrix in, an i32 selection out: the bool cell is the one dtype
@@ -115,6 +132,7 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "matrix_select_mask",
         rows: 4,
+        draft_rows: 0,
         why: "a packed bool matrix selects rows of the logits",
     },
     // Seven channels, four of them bool masks — causal, sliding-window,
@@ -123,6 +141,7 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "structured_masks",
         rows: 0,
+        draft_rows: 0,
         why: "three u32 inputs, four bool mask outputs",
     },
     // No channel inputs at all, one output at capacity one: the second fire
@@ -131,9 +150,88 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "matrix_mask_apply_packed",
         rows: 2,
+        draft_rows: 0,
         why: "no channel inputs; blocks on its own full output",
     },
+    // **THE DRAFT COLUMN'S DEVICE GATE** (palo C3b). Two intrinsic columns in
+    // one epilogue — `Logits [K+1, V]` and `MtpLogits [K, V]` — each argmaxed
+    // and published on its own channel. A shell that pointed the draft
+    // intrinsic at the trunk's base, or at the right base with the trunk's row
+    // offset, publishes a different token vector rather than a nearby number,
+    // and the two halves diff it byte for byte.
+    //
+    // **NOT `mtp_verify_tail`, AND THE REASON IS THE EMITTER.** The corpus
+    // does hold a two-column program — the full match-verify DAG — but its
+    // accept-prefix logic is a `cumprod`, and this backend declines a
+    // generated region containing a scan boundary
+    // (`region contains a non-generated boundary (scan)`). That is a standing
+    // codegen gap and not this axis's, so the subject is built here from the
+    // two ops the gate is actually about.
+    //
+    // **THIS IS AS FAR AS AN L40S CAN TAKE THE MTP AXIS.** The one shipping
+    // SKU whose checkpoint publishes a draft head is `qwen36-27b`, whose bf16
+    // weights are ~52 GiB against 46 (`export_axes`'s gate (f) states the
+    // refusal). What this subject proves is the PLUMBING — two rectangles, two
+    // side-table slots, two host columns, one bit-for-bit diff — on a
+    // synthetic readout, exactly as the other five prove theirs. The head's own
+    // arithmetic waits for a checkpoint that fits.
+    Subject {
+        name: MTP_SUBJECT,
+        rows: 4,
+        draft_rows: 3,
+        why: "two intrinsic columns in one epilogue, argmaxed apart",
+    },
 ];
+
+/// The one subject built here rather than read from the corpus.
+const MTP_SUBJECT: &str = "mtp_two_columns";
+
+/// `mtp_two_columns`, whole: one epilogue, two intrinsic columns, two argmaxes,
+/// two publishes.
+///
+/// Deliberately the SMALLEST program that can tell the two columns apart. Every
+/// op in it is one the other five subjects already exercise; what is new is
+/// that two `IntrinsicVal`s of different heights stand in one stage, which is
+/// the shape a draft-reading guest has and the shape the side tables are
+/// indexed for.
+fn mtp_two_columns() -> TraceContainer {
+    let (k, v) = (3u32, 8u32);
+    let out = |len: u32| ChannelDecl {
+        shape: Shape::vector(len),
+        dtype: ChanDType::Concrete(DType::I32),
+        capacity: 1,
+        host_role: HostRole::Reader,
+        seeded: false,
+    };
+    TraceContainer {
+        names: vec![],
+        channels: vec![out(k + 1), out(k)],
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                // 0: the trunk's readout, `[K+1, V]`.
+                Op::IntrinsicVal {
+                    intr: IntrinsicId::Logits,
+                    shape: Shape::matrix(k + 1, v),
+                    dtype: DType::F32,
+                },
+                // 1: the draft head's, `[K, V]` — a different height, so a
+                // binding that confused the two cannot even be shape-correct.
+                Op::IntrinsicVal {
+                    intr: IntrinsicId::MtpLogits,
+                    shape: Shape::matrix(k, v),
+                    dtype: DType::F32,
+                },
+                Op::ReduceArgmax(0),
+                Op::ReduceArgmax(1),
+                Op::ChanPut { chan: 0, value: 2 },
+                Op::ChanPut { chan: 1, value: 3 },
+            ],
+        }],
+        externs: Vec::new(),
+    }
+}
 
 /// The vocabulary every corpus program that reads `logits` was bound at.
 ///
@@ -193,16 +291,24 @@ fn golden_profile(name: &str) -> ModelProfile {
     profile
 }
 
-/// One golden, all the way to what `register_program` takes.
-fn registration(name: &str) -> ProgramRegistration {
+/// One subject's trace: the corpus's, or — for [`MTP_SUBJECT`] — this file's.
+fn container_of(name: &str) -> TraceContainer {
+    if name == MTP_SUBJECT {
+        return mtp_two_columns();
+    }
     let path = golden_dir().join(format!("{name}.txt"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{path:?} is missing"));
     let line = text
         .lines()
         .find_map(|line| line.strip_prefix("container: "))
         .unwrap_or_else(|| panic!("{name} has no container line"));
-    let container = tensor_ir::container::decode(&unhex(line))
-        .unwrap_or_else(|why| panic!("{name} does not decode: {why:?}"));
+    tensor_ir::container::decode(&unhex(line))
+        .unwrap_or_else(|why| panic!("{name} does not decode: {why:?}"))
+}
+
+/// One trace, all the way to what `register_program` takes.
+fn registration(name: &str) -> ProgramRegistration {
+    let container = container_of(name);
     let bound = tensor_ir::validate::bind(container, golden_profile(name))
         .unwrap_or_else(|why| panic!("{name} does not bind: {why:?}"));
     let stages = tensor_compiler::plan::compile_bound(&bound);
@@ -352,7 +458,12 @@ fn logits(rows: u32, name: &str) -> Vec<f32> {
 /// Run `subject` on both halves for [`FIRES`] fires and assert they never
 /// differ.
 fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
-    let Subject { name, rows, why } = *subject;
+    let Subject {
+        name,
+        rows,
+        draft_rows,
+        why,
+    } = *subject;
     let registration = registration(name);
     let package = registration.launch.clone();
     let plan: ExecPlan = adopt_launch_package_with(package.clone(), Boundaries::CUDA)
@@ -363,18 +474,33 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
         "{name}: the subject table and the package disagree about whether this \
          program reads the readout"
     );
+    assert_eq!(
+        plan.needs_mtp_logits,
+        draft_rows != 0,
+        "{name}: the subject table and the package disagree about whether this \
+         program reads the draft column"
+    );
 
     // The stated row count, checked against the package's own concrete shape:
     // a plan's shapes are symbolic and a package's are not, and the number
     // that reconciles them cannot be guessed.
+    // EACH COLUMN AGAINST ITS OWN NUMBER. `mtp_verify_tail` reads two
+    // intrinsics with different heights — `[K+1, V]` of trunk logits and
+    // `[K, V]` of drafts — so a single check against `rows` would have to be
+    // wrong about one of them.
     for value in &package.values {
-        if value.source == ValueSource::Intrinsic {
-            assert_eq!(
-                value.shape,
-                vec![rows, VOCAB],
-                "{name}: the readout this program declares is not {rows}x{VOCAB}"
-            );
+        if value.source != ValueSource::Intrinsic {
+            continue;
         }
+        let (want, which) = match value.intrinsic {
+            Some(IntrinsicId::MtpLogits) => (draft_rows, "draft column"),
+            _ => (rows, "readout"),
+        };
+        assert_eq!(
+            value.shape,
+            vec![want, VOCAB],
+            "{name}: the {which} this program declares is not {want}x{VOCAB}"
+        );
     }
 
     let seeds = seeds(&package);
@@ -421,11 +547,41 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             .unwrap_or_else(|error| panic!("{name}: binding the readout: {error}"));
         Some(buffer)
     };
+    // THE DRAFT COLUMN, RESIDENT ONCE AND POINTED AT ONCE — the same shape,
+    // the same staging, a different rectangle and a different side-table slot.
+    // Salted apart from the readout so a shell that bound the trunk's base
+    // under the draft's name reads recognisably wrong numbers rather than
+    // plausible ones.
+    let drafts = logits(draft_rows, &format!("{name}/mtp"));
+    let _draft_resident = if draft_rows == 0 {
+        None
+    } else {
+        let mut buffer = Buffer::zeroed(drafts.len() * size_of::<f32>())
+            .unwrap_or_else(|error| panic!("{name}: the draft column does not fit: {error}"));
+        let bytes: Vec<u8> = drafts.iter().flat_map(|value| value.to_le_bytes()).collect();
+        buffer
+            .write(0, &bytes)
+            .unwrap_or_else(|error| panic!("{name}: staging the draft column: {error}"));
+        plane
+            .bind_intrinsic(
+                context,
+                instance,
+                IntrinsicId::MtpLogits,
+                buffer.ptr(),
+                driver_cuda::program::launch::INTRINSIC_STORAGE_F32,
+                VOCAB,
+                VOCAB,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{name}: binding the draft column: {error}"));
+        Some(buffer)
+    };
     let inputs = if rows == 0 {
         PassInputs::none()
     } else {
         PassInputs {
             logits: Some(&readout),
+            mtp_logits: (draft_rows != 0).then_some(drafts.as_slice()),
             rows,
             vocab: VOCAB,
             mtp_draft_row: None,

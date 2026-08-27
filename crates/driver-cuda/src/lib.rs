@@ -114,6 +114,44 @@ pub mod store;
 pub mod weights;
 pub mod window;
 
+/// **THE ENTRIES THAT CLAIM A PROCESS-GLOBAL WORKSPACE**, by
+/// `model_ir::Operands::name` — what this shell hands `model_compiler`'s P6 as
+/// `DeviceProfile::exclusive`, so that two of them are never scheduled onto
+/// two streams at once.
+///
+/// `kernels_cuda::Ctx::scratch` returns a slab keyed by a static NAME:
+/// process-global, grown but never shrunk, and deliberately not per stream —
+/// an entry that allocated per fire could not be captured, which is the
+/// contract that doc states from the other side. Two launches inside one slab
+/// at the same instant stage over each other and the fire computes anyway, so
+/// the compiler is told, and it orders them.
+///
+/// The list is every op whose `kernels-cuda` entry can reach `Ctx::scratch`,
+/// read off the four modules that call it — `attn/ssm.rs` (the staging
+/// planes), `attn/pool.rs` (the boundary rope side channel), `attn/index.rs`
+/// (the top-k score plane) and `linear/lora.rs` (the correction's waist).
+/// Everything else — the flashinfer arms included — takes its workspace from
+/// its own `ScheduleSeat`, which is per plan value and therefore already
+/// disjoint between two arms (build log 21).
+///
+/// **A NAME THAT DROPS OFF THIS LIST WHEN A KERNEL GAINS A SLAB IS A RACE**,
+/// which is why `tests/no_forked_pair_shares_a_slab.rs` re-derives the
+/// question from the other end.
+pub const EXCLUSIVE: [&str; 11] = [
+    "attention.ssm_causal_conv1d",
+    "attention.ssm_causal_conv1d_chunked",
+    "attention.ssm_gdn_prep",
+    "attention.ssm_gated_delta",
+    "attention.ssm_gated_delta_chunked",
+    "attention.ssm_kda_step",
+    "attention.ssm_kda_chunked",
+    "attention.index_topk",
+    "attention.pool_boundary_decode",
+    "attention.pool_boundary_prefill",
+    "linear.lora_correct",
+];
+
+
 pub use error::{Fault, Result};
 pub use mask::{LaneMask, Staged as StagedMask};
 pub use program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
@@ -124,4 +162,11 @@ pub use run::{
 };
 pub use api::{ContractFor, Cuda, DeviceBoot};
 pub use serve::{Boot, Graphs, Lane, Seated, Shell};
+
+/// What a capturing lane's fire hands back, one entry per exported attention
+/// layer — the contract's own type, re-exported so a caller of
+/// [`Shell::fire_captured`] need not reach two crates deep for the noun its
+/// own signature is written in (design §9, palo C4b).
+pub use driver::driver_api::fire::LayerScores;
+pub use weights::AdapterPlane;
 pub use window::{Cursor, Window, Windows};

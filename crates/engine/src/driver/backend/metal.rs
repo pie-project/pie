@@ -1,115 +1,72 @@
-//! The seam to `driver-metal` — a door onto a shell that is not built yet.
+//! Opening a Metal device from a boot config.
 //!
-//! # `palo B-metal`: the shell went with the string-plan stack
+//! # What this file stopped being
 //!
-//! What stood here was a 440-line adapter over `driver_metal::serve::Shell`:
-//! `load_model` against a ported checkpoint stager, `launch` against a
-//! `FrameSubmission`, `copy_kv`/`copy_state`/`resize_pool` against the ported
-//! KV and recurrent pools, and a `CompletionBroker` per driver. That `Shell`
-//! no longer exists. `driver-metal`'s own header says why:
+//! It was a door onto a shell that did not exist: a `MetalDriver` this crate
+//! defined itself, one field (`[model] id`, carried so the refusals could
+//! name it), and every verb of the contract answering
+//! `DriverError::Unsupported`. Its own header said what was missing —
+//! *"a device to bind, a checkpoint to land, pools to reserve, and a command
+//! buffer to encode onto"* — and named `driver-cuda/serve.rs` as the shape
+//! it would take.
 //!
-//! > This crate took `driver-metal`'s name when the string-plan shell it
-//! > re-imagines was deleted with the rest of the old stack (design, porting
-//! > order step 6); serving plumbing (bind, device, serve) rejoins it as the
-//! > fabric is rewired.
+//! It took that shape. `driver-metal` is the whole shell now: `device/`,
+//! `weights.rs`, `store/`, the arena, the resident inputs, the windows,
+//! `serve.rs`, and the guest-program plane beside them. So this file is what
+//! `cuda.rs` beside it is, and for the same reasons decision 13 gives —
+//! **the `Driver` impl is the shell's**, in the crate that owns the device,
+//! and this module selects one rather than adapting one.
 //!
-//! The crate today is the DISPATCH layer only — a [`Run`](driver_metal::Run)
-//! that resolves plan ids to device handles and answers the fifteen
-//! `Dispatch*` traits — and it deliberately names no Metal API, which is what
-//! lets it build on any OS. What is missing is everything around a fire: a
-//! device to bind, a checkpoint to land, pools to reserve, and a command
-//! buffer to encode onto. `driver-cuda/serve.rs` is the shape it will take;
-//! the CUDA one is porting-order step 4 and this is a later milestone.
+//! # What is left, and it is less than the CUDA door's
 //!
-//! So this file is the door, and every verb behind it is
-//! [`DriverError::Unsupported`]. The one thing it does answer honestly is
-//! [`Driver::kind`] — a caller that selected `driver-metal` on a Mac gets a
-//! registered driver that refuses by name, rather than a build error or a
-//! plausible wrong answer.
+//! `cuda.rs` reads two things out of the boot TOML: which device, and how
+//! much of a fire to record. Neither exists here. Metal selects with
+//! `MTLCreateSystemDefaultDevice` and a Mac has one GPU, so there is no
+//! ordinal to parse; and design §6 puts no capture on this plane at all
+//! (*"no record.rs: dispatch is encode-only, so `EagerSink` per fire IS
+//! encoding"*), so there is no mode to choose. What is left is handing the
+//! shell the load door (`crate::driver::load::contract_for`) it cannot state
+//! for itself — and taking the document anyway, because a seam that refused
+//! to be handed one would be the second thing entitled to an opinion about
+//! the file's shape.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use driver_metal::{DeviceBoot, Metal};
 
-use driver_api::error::{DriverError, Result as DriverResult};
-use driver_api::fire::{FireSubmission, FireTicket};
-use driver_api::load::{LoadRequest, Loaded};
-use driver_api::Driver;
-
-/// The Metal seam, with no shell behind it.
+/// Open the system's default Metal device.
 ///
-/// One field, and it is the boot config's one key. The `shell` and `broker`
-/// pair this replaced is what a driver with a device holds; there is neither
-/// until the shell is ported.
-pub struct MetalDriver {
-    /// `[model] id`, if the boot document stated one — the operator's answer
-    /// to "which model is this", carried so the refusals can name it.
-    model_id: Option<String>,
+/// # Errors
+///
+/// A boot document that is not UTF-8 or not TOML. Binding the device itself
+/// happens at [`Driver::load`](driver_api::Driver::load), not here:
+/// `Shell::load` is one call that binds, bakes and lands, and there is
+/// nothing to bind before a plan says what to bake.
+pub fn open(config_bytes: &[u8]) -> Result<Metal> {
+    // PARSED AND NOT READ, deliberately. Nothing in this document reaches
+    // the metal shell today — see the module doc — but parsing it is what
+    // makes a malformed boot file fail HERE, at the door, rather than
+    // somewhere later that has nothing to do with it.
+    let _doc: toml::Table = std::str::from_utf8(config_bytes)
+        .map_err(|error| anyhow!("the metal boot config is not utf-8: {error}"))?
+        .parse()
+        .map_err(|error| anyhow!("the metal boot config is not TOML: {error}"))?;
+    Ok(Metal::new(DeviceBoot::default(), crate::driver::load::contract_for))
 }
 
-impl MetalDriver {
-    /// Read the boot document.
-    ///
-    /// # Errors
-    ///
-    /// None today: there is no device to fail to open. It stays a `Result`
-    /// because binding one is the first thing the ported shell will do here.
-    pub fn create(config_bytes: &[u8]) -> Result<Self> {
-        // THE ONE KEY THIS DRIVER WANTS, parsed HERE. A driver that read the
-        // boot TOML would be the second thing entitled to an opinion about
-        // its shape; the seam is engine code, so the seam reads it. A
-        // document that does not parse states no id, which is the ordinary
-        // case and not an error.
-        let model_id = std::str::from_utf8(config_bytes)
-            .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok())
-            .and_then(|doc| {
-                doc.get("model")?
-                    .as_table()?
-                    .get("id")?
-                    .as_str()
-                    .map(str::to_owned)
-            });
-        Ok(Self { model_id })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_boot_document_that_says_nothing_about_this_driver_still_opens() {
+        // The ordinary case: a document about some other role, or an empty
+        // one. There is no key this seam requires.
+        assert!(open(b"").is_ok());
+        assert!(open(b"[model]\nid = \"qwen35-d0.8b\"\n").is_ok());
     }
 
-    /// The refusal every verb answers.
-    fn refuse(&self, verb: &'static str) -> DriverError {
-        tracing::warn!(
-            model_id = ?self.model_id,
-            verb,
-            "the metal seam has no shell: `driver-metal` is the dispatch layer \
-             only, and its serving half is palo B-metal"
-        );
-        DriverError::unsupported("metal", verb)
-    }
-}
-
-impl Driver for MetalDriver {
-    fn kind(&self) -> &'static str {
-        "metal"
-    }
-
-    // `device_facts` answers `None`, which the trait's default already does
-    // and which is the truth: nothing here has bound a device. It is what
-    // makes `register_driver_backend` stamp `MemoryDomain::HostPinned` on the
-    // spec — no page of this driver's lives on a device, because it has none.
-
-    fn load(&mut self, request: LoadRequest) -> DriverResult<Loaded> {
-        // palo B-metal: the shell's `load` is `driver-cuda/serve.rs`'s in
-        // call order — bind, `compile(plan, budgets, profile)`, read the kv
-        // spaces off the plan, land the checkpoint through
-        // `model_loader::plan::compile` at `BackendKind::Metal`, reserve the
-        // arena and pools, find the `out` seam. Every one of those pieces
-        // except the residency is backend-neutral and already written.
-        let _ = request;
-        Err(self.refuse("load"))
-    }
-
-    fn fire(&mut self, submission: &FireSubmission) -> DriverResult<FireTicket> {
-        // palo B-metal: `driver::fire::walk` is generic over `Dispatch` and
-        // `Sink` (decision 11) and `driver_metal::Run` already implements the
-        // first. What a fire needs beyond it is the staging — the fire's own
-        // vectors onto a buffer — and a command buffer to encode into.
-        let _ = submission;
-        Err(self.refuse("fire"))
+    #[test]
+    fn a_boot_document_that_is_not_toml_is_refused_at_the_door() {
+        assert!(open(b"this is not = = toml").is_err());
     }
 }

@@ -1,5 +1,39 @@
 //! The checkpoint, resident: one device allocation, one row per
-//! `Plan::params`.
+//! `Plan::params` — and, in the same allocation and the same table, the
+//! adapter banks (design §8).
+//!
+//! # Why the banks live HERE and not in `store/`
+//!
+//! They are runtime-MUTABLE, which is `store/`'s whole subject, and the pull
+//! toward putting them beside the kv pages is real. Three things decide it the
+//! other way.
+//!
+//! **The table has to be one table.** `Def::Weight(i)` resolves through
+//! `WeightTable` and nowhere else (`Run::tensor` is the crate's heart, and its
+//! whole point is that provenance handling exists exactly once). A bank is a
+//! `Def::Weight` — that is the seat design §8's open item asked for, and the
+//! reason it is the right seat is that MoE already proved a routed bank needs
+//! no `Def` of its own. Splitting the STORAGE while sharing the TABLE would
+//! put one invariant in two modules; splitting both would mean a second
+//! resolution path in `Run` for a value that is a weight.
+//!
+//! **What `store/` owns is per-SEQUENCE and this is not.** A kv page belongs
+//! to a slot, a recurrent slab belongs to a slot, and `Pools::clear(slot)`
+//! is a sentence about a sequence beginning. A bank row belongs to no
+//! sequence: many lanes route to it in one fire, it outlives every one of
+//! them, and nothing about it is per slot.
+//!
+//! **Mutability here is not the fire path's.** `store/` is written by
+//! LAUNCHES, inside the graph, every fire. A bank is written by
+//! `register_adapter`, between fires, on the host — the same instant and the
+//! same mechanism the checkpoint itself was landed by. It is a second load of
+//! a few rows, not a pool.
+//!
+//! What the banks do inherit from the pools is the pointer-stability rule
+//! (`inputs.rs` argues it): the store is reserved at the model text's declared
+//! capacity and never grows, so an address recorded into a graph stays the
+//! address a later fire reads. Registering the thirty-second adapter moves
+//! nothing and recaptures nothing.
 //!
 //! # The contract arrives; the family does not
 //!
@@ -37,7 +71,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use kernels_cuda::Tensor;
-use model_ir::{Dtype, Plan};
+use model_ir::{Dtype, ParamSource, Plan};
 use model_loader::checkpoint;
 use model_loader::contract::ModelContract;
 use model_loader::error::Error as LoadError;
@@ -55,11 +89,79 @@ use crate::run::{WeightRow, WeightTable};
 /// the same reason.
 const ALIGN: u64 = 256;
 
-/// Every weight this model needs, on the device.
+/// One plane of a registered adapter, as the caller hands it over.
+///
+/// **FULL CAPACITY, NOT THE ADAPTER'S OWN RANK.** The bytes are exactly one
+/// slot of `bank`, which is that bank's declared `[rank, in]` or `[out, rank]`
+/// rectangle in the bank's own dtype. An adapter trained at a lower rank is
+/// zero-padded by the CALLER, because only the caller knows the layout it is
+/// padding: `A`'s unused ranks are trailing rows and `B`'s are a stride inside
+/// every row, so "write the prefix and leave the rest" is right for one plane
+/// and wrong for the other. A short plane is `Fault::Adapter` naming both
+/// numbers, never a partial write.
+#[derive(Debug, Clone, Copy)]
+pub struct AdapterPlane<'a> {
+    /// The bank param this plane fills, as `Plan::params` names it.
+    pub bank: &'a str,
+    /// One slot's worth of bytes.
+    pub bytes: &'a [u8],
+}
+
+/// Every weight this model needs, on the device — the checkpoint's and the
+/// banks'.
 #[derive(Debug)]
 pub struct Weights {
     store: Buffer,
     table: WeightTable,
+    /// Bank name -> (param index, adapters, bytes per adapter slot). Built at
+    /// load off `ParamSource::Registered`, which is the only place a bank is
+    /// declared; `register_adapter` is a lookup in here and a write.
+    banks: BTreeMap<String, Bank>,
+}
+
+/// One declared adapter bank: where its slots are and how big they are.
+#[derive(Debug, Clone, Copy)]
+struct Bank {
+    /// Where the bank's first slot starts in the store.
+    offset: u64,
+    /// How many adapters the first axis seats — the ceiling
+    /// `Budgets::max_adapters` is checked against, stated as a shape.
+    adapters: u32,
+    /// One adapter's bytes in this bank.
+    slot: u64,
+}
+
+/// The banks a plan declares, read off `ParamSource::Registered`.
+///
+/// **ONE STATEMENT OF WHAT A BANK IS, AND IT IS THE PARAM'S OWN.** No suffix
+/// convention, no name matching, no pairing table: a bank is a param the model
+/// text marked registered, its capacity is that param's leading axis, and one
+/// adapter's slot is everything after it. `A` and `B` are two independent
+/// banks here — the op pairs them, this module does not, and a registration
+/// names each by the name the plan gave it.
+fn banks(plan: &Plan, places: &[Place]) -> BTreeMap<String, Bank> {
+    plan.params
+        .iter()
+        .zip(places)
+        .filter(|(param, _)| param.source == ParamSource::Registered)
+        .map(|(param, place)| {
+            let adapters = u32::try_from(param.shape.first().copied().unwrap_or(0))
+                .unwrap_or(u32::MAX);
+            let slot = if adapters == 0 {
+                0
+            } else {
+                place.bytes / u64::from(adapters)
+            };
+            (
+                param.name.clone(),
+                Bank {
+                    offset: place.offset,
+                    adapters,
+                    slot,
+                },
+            )
+        })
+        .collect()
 }
 
 impl Weights {
@@ -124,7 +226,14 @@ impl Weights {
 
         let mut table = Vec::with_capacity(places.len());
         for (at, place) in places.iter().enumerate() {
-            if !landed[at] {
+            // A REGISTERED PLANE IS ONE THE CHECKPOINT DOES NOT HAVE, and
+            // demanding it is exactly what would refuse every adapter-capable
+            // load (design §8's open item, from the residency side). It is
+            // already reserved — `places` sizes every param, whatever its
+            // provenance — and already zeroed, and a zeroed low-rank `A`
+            // makes the whole bank the identity until something registers
+            // into it. What lands here is `register_adapter`'s business.
+            if !landed[at] && plan.params[at].source == ParamSource::Checkpoint {
                 return Err(Fault::Param {
                     name: plan.params[at].name.clone(),
                     why: "is a plan param the load contract never published",
@@ -146,7 +255,83 @@ impl Weights {
         Ok(Weights {
             store,
             table: WeightTable(table),
+            banks: banks(plan, &places),
         })
+    }
+
+    /// Write one adapter's planes into the banks (design §8).
+    ///
+    /// **A POOL WRITE AND A TABLE ROW, AND NOT A RECAPTURE** (decision 17).
+    /// Nothing about the graph key is a function of a bank's contents — the
+    /// key is the fire's composition — so this is a `cudaMemcpy` per plane
+    /// onto an address that was reserved at load and will not move. The
+    /// per-lane id is what a fire says afterwards, and it says it in a
+    /// submission.
+    ///
+    /// **RE-REGISTERING ZEROES THE SLOT FIRST**, because the planes are
+    /// full-capacity and a caller that skipped one would otherwise leave the
+    /// previous adapter's plane in place beside the new one's — an adapter
+    /// that is half of each. A bank this call does not name keeps whatever it
+    /// held, which is what makes a per-site registration expressible; naming
+    /// every site is the caller's business and `Fault::Adapter` names any
+    /// bank it invented.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Adapter`] for a bank this plan does not declare, an id past
+    /// the bank's capacity, or a plane whose bytes are not one slot's;
+    /// [`Fault::Device`] for the copy.
+    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
+        // Checked whole before anything is written: a registration that
+        // refuses halfway leaves a bank holding an adapter nobody described.
+        for plane in planes {
+            let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
+                bank: plane.bank.to_string(),
+                why: "is not a bank this plan declares; a bank is a weight the model \
+                      text marked `registered`, and this plan marked none by that name"
+                    .to_string(),
+            })?;
+            if id >= bank.adapters {
+                return Err(Fault::Adapter {
+                    bank: plane.bank.to_string(),
+                    why: format!(
+                        "seats {} adapters and this registration is id {id}; capacity is \
+                         a shape the model text declared, so the fix is the model text \
+                         and not a retry",
+                        bank.adapters
+                    ),
+                });
+            }
+            if plane.bytes.len() as u64 != bank.slot {
+                return Err(Fault::Adapter {
+                    bank: plane.bank.to_string(),
+                    why: format!(
+                        "seats {} bytes per adapter and this plane carries {}; a plane \
+                         is one whole slot, zero-padded by the caller past its own rank",
+                        bank.slot,
+                        plane.bytes.len()
+                    ),
+                });
+            }
+        }
+        for plane in planes {
+            let bank = self.banks[plane.bank];
+            let at = bank.offset + u64::from(id) * bank.slot;
+            self.store
+                .zero_span(at, usize::try_from(bank.slot).unwrap_or(0))?;
+            self.store.write(at, plane.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// The banks this load declared: name, capacity, and bytes per slot.
+    /// What a caller sizes its planes against, and what a gate asserts on.
+    #[must_use]
+    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
+        self.banks
+            .iter()
+            .map(|(name, bank)| (name.as_str(), bank.adapters, bank.slot))
+            .collect()
     }
 
     /// The table a fire resolves `Def::Weight(i)` through.
@@ -256,7 +441,7 @@ impl TensorSink for Landing<'_> {
 
 #[cfg(test)]
 mod tests {
-    use model_dsl::Plane;
+    use model_dsl::Platform;
 
     use super::*;
 
@@ -264,7 +449,7 @@ mod tests {
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
         let trace =
             model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
-        let plan = trace(Plane::Cuda);
+        let plan = trace(Platform::Cuda);
         let places = places(&plan).expect("every param of a bf16 SKU has an element size");
 
         assert_eq!(places.len(), plan.params.len());
