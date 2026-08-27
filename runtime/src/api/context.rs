@@ -2,7 +2,7 @@
 
 use crate::api::model::Model;
 use crate::api::pie;
-use crate::context::{self, ContextId};
+use crate::context::{self, ContextId, OpenReport};
 use crate::inference::StagedBatch;
 use crate::instance::InstanceState;
 use crate::model::ModelId;
@@ -25,6 +25,19 @@ pub struct Context {
     /// disabled for this model; the OnceLock distinguishes that from
     /// "not yet initialized".
     pub spec: OnceLock<Option<StagedBatch>>,
+}
+
+/// The bindgen-generated WIT mirror of [`OpenReport`].
+type WitOpenReport = pie::core::context::OpenReport;
+
+/// Cross the WIT boundary. Two structurally identical types, kept separate so
+/// the runtime's own representation is not pinned to the ABI.
+fn wit_report(report: OpenReport) -> WitOpenReport {
+    WitOpenReport {
+        resident_prefix_pages: report.resident_prefix_pages,
+        replayed_pages: report.replayed_pages,
+        rs_replayed: report.rs_replayed,
+    }
 }
 
 impl pie::core::context::Host for InstanceState {}
@@ -78,6 +91,38 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
+    /// `open`, additionally reporting what the open cost.
+    ///
+    /// The runtime computes this on every fork regardless; `open` just drops
+    /// it. Without this, an evicted snapshot opens successfully and silently
+    /// replays its whole prefix, and the guest cannot tell that from a hit.
+    async fn open_with_report(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<Result<(Resource<Context>, WitOpenReport), String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+        let process_id = self.id();
+
+        let snapshot_id = match context::lookup(model_id, username, name).await {
+            Ok(id) => id,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        match context::fork_with_report(model_id, snapshot_id, process_id).await {
+            Ok((context_id, report)) => {
+                let ctx = Context {
+                    context_id,
+                    model_id,
+                    spec: OnceLock::new(),
+                };
+                Ok(Ok((self.ctx().table.push(ctx)?, wit_report(report))))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
     async fn take(
         &mut self,
         model: Resource<Model>,
@@ -96,6 +141,30 @@ impl pie::core::context::HostContext for InstanceState {
                     spec: OnceLock::new(),
                 };
                 Ok(Ok(self.ctx().table.push(ctx)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    /// `take`, additionally reporting what it cost. See `open_with_report`.
+    async fn take_with_report(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<Result<(Resource<Context>, WitOpenReport), String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+        let process_id = self.id();
+
+        match context::take_with_report(model_id, username, name, process_id).await {
+            Ok((context_id, report)) => {
+                let ctx = Context {
+                    context_id,
+                    model_id,
+                    spec: OnceLock::new(),
+                };
+                Ok(Ok((self.ctx().table.push(ctx)?, wit_report(report))))
             }
             Err(e) => Ok(Err(e.to_string())),
         }
