@@ -502,7 +502,7 @@ impl ContextManager {
             (snap.committed_hashes.len(), 0)
         };
 
-        let working_count = snap.working_pages.len();
+        let working_count = if was_off_gpu { snap.working_pages.len() } else { 0 };
         let snap_rs_state = snap.rs_state;
         let source_has_state =
             snap.committed_len() * self.page_size + snap.working_page_tokens.len() > 0;
