@@ -155,6 +155,35 @@ pub struct DeviceProfile {
     /// `driver_cuda::EXCLUSIVE`; a golden-path walk that never launches
     /// anything needs nothing here.
     pub exclusive: Vec<String>,
+
+    /// **OPS WHOSE KERNEL WALKS A SEGMENT LIST INSTEAD OF A RECTANGLE**, by
+    /// `Operands::name` — the fact that turns [`Fallback::Grouped`](crate::Fallback::Grouped) from a
+    /// typed seam into a menu entry `layout::menu` may actually choose.
+    ///
+    /// A DEVICE FACT, ARRIVING AS DATA, FOR THE REASON
+    /// [`exclusive`](DeviceProfile::exclusive) ABOVE ARRIVES THAT WAY.
+    /// `layout::menu`'s standing note says it declines `Grouped` because the
+    /// entry "needs a kernel that takes a pointer/offset list — a fact about
+    /// the backend's kernel table, which this crate has no dependency on and
+    /// no business inventing". This is that fact, spelled the way every other
+    /// one is: the compiler still does not know what a segment list IS, it
+    /// only knows which op names the caller says can take one.
+    ///
+    /// What a name here promises is exactly one thing, and a shell that
+    /// cannot keep it must not state it: given the region's rows as SEVERAL
+    /// intervals, the op computes what `r` separate launches over those
+    /// intervals compute, in ONE launch, and touches no row outside them. The
+    /// last clause is the whole of why this is a per-op word rather than a
+    /// per-backend one — a kernel that writes densely over the extent it was
+    /// handed clobbers the rows in the gaps, which is what rules out
+    /// `Attention::PrefillLse`'s split-kv fold on CUDA.
+    ///
+    /// EMPTY IS THE DEFAULT AND THEREFORE THE STATUS QUO: no mask is
+    /// groupable, `menu` writes the entries it always wrote, and an artifact
+    /// baked at this default is byte-for-byte the one this compiler produced
+    /// before the field existed.
+    pub grouped: Vec<String>,
+
 }
 
 /// What one launch of each op family costs at fire scale, in microseconds.
@@ -242,6 +271,7 @@ impl Default for DeviceProfile {
             fork_floor_us: 20.0,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
+            grouped: Vec::new(),
         }
     }
 }

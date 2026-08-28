@@ -147,6 +147,15 @@ impl Graph {
         }
     }
 
+    /// **PROBE SEAM (`palo cuda-abi` wave).** The raw `cudaGraph_t`, so a
+    /// probe can walk its kernel nodes with `cuGraphGetNodes` /
+    /// `cuGraphKernelNodeGetParams`. Nothing in the fire path reads it;
+    /// `tests/descriptor_abi.rs` is the only caller.
+    #[must_use]
+    pub fn raw(&self) -> *mut c_void {
+        self.raw
+    }
+
     /// How many nodes it recorded.
     ///
     /// Reported, not used: it is the number the rebind arithmetic of decision
@@ -305,6 +314,14 @@ impl GraphExec {
     #[must_use]
     pub fn nodes(&self) -> usize {
         self.nodes
+    }
+
+    /// **PROBE SEAM (`palo cuda-abi` wave).** The raw `cudaGraphExec_t`, so a
+    /// probe can price `cudaGraphExecKernelNodeSetParams` against it.
+    /// Nothing in the fire path reads it.
+    #[must_use]
+    pub fn raw(&self) -> *mut c_void {
+        self.raw
     }
 }
 

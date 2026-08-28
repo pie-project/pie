@@ -1,23 +1,37 @@
 //! The catalog, seriated. Six model texts, four platforms, one C1P instance each
 //! (P4, design §3).
 //!
-//! WHAT IT ASSERTS, and each is a claim the design makes out loud:
+//! **THIS FILE USED TO ASSERT THE CATALOG WAS FALLBACK-FREE, AND IT USED TO
+//! PASS BY ASKING NOTHING.** Its budget wanted 32 adapter seats where no text
+//! seats more than eight, so `compile` refused all 68 SKU × platform pairs and
+//! every loop below walked over an empty answer. At a budget the catalog can
+//! actually seat, two of its claims are false — and they are false for a
+//! reason worth writing down rather than for a regression:
 //!
-//! - **every SKU is C1P** — one global row order exists under which every
-//!   windowed structural consumer in the plan reads a contiguous block. That
-//!   is the good case the whole mechanism is for: zero gather and zero copy
-//!   anywhere in the graph, every consumer a pointer offset and an extent;
-//! - **and therefore the fallback table is empty** — not because P4 promised
-//!   nothing, which is what an empty table meant before this pass landed, but
-//!   because nothing needed one;
-//! - **and it is empty for a reason that can be named** — today's masks are a
-//!   LAMINAR family (any two are nested or disjoint), and a laminar family is
-//!   always C1P. So this test is not reporting luck: it is checking that the
-//!   catalog still has the structure that makes the answer easy, and the day a
-//!   model text states two crossing windows the laminar assert is what says
-//!   which claim changed;
-//! - **the promise is kept** — every constrained mask is an interval of the
-//!   order the driver will actually be handed, which is
+//! - it claimed **every SKU is C1P**. Twelve still are. The five qwen texts
+//!   are not, because they state THREE independent binary axes — `qo_one`
+//!   (the GDN mixer's decode/prefill split), `has_adapter` (the correction's
+//!   window) and `captures_scores` (the attention merge's third arm) — and
+//!   `qwen36-27b` states a fourth in `drafts`;
+//! - it claimed **today's windows are a laminar family**, which was the reason
+//!   the first claim held: a laminar family (any two masks nested or disjoint)
+//!   is always C1P. The axes above are neither nested nor disjoint. Each cuts
+//!   the classes exactly in half and any two share exactly a quarter, so they
+//!   PAIRWISE CROSS, and that is not a shape a linear order can hold.
+//!
+//! **AND THE BOUND IS TIGHT, WHICH IS WHY THIS IS ARITHMETIC AND NOT LUCK.**
+//! An interval of size `n/2` sits at some position `a`; two of them share
+//! `n/2 - |a - b|` classes, and independence forces that to be `n/4`, so any
+//! two crossing halves sit exactly `n/4` apart — and three positions cannot be
+//! pairwise `n/4` apart. **At most two axes can be intervals and the rest
+//! pay.** So the claims below are the honest ones: which texts owe, that they
+//! owe exactly because their masks cross, and that they owe exactly the number
+//! the bound says.
+//!
+//! What has not changed:
+//!
+//! - **the promise is kept** — every constrained mask P4 SEATED is an interval
+//!   of the order the driver will actually be handed, which is
 //!   [`LayoutOrder::class_order`] and not the frontier read off the tree;
 //! - **the bake is a function of the plan** — same text, same order, twice.
 //!
@@ -35,14 +49,30 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn budgets() -> Budgets {
+/// A budget the catalog can actually seat.
+///
+/// **NOT `max_adapters: 32`, WHICH IS WHY THIS FILE ASSERTED NOTHING.**
+/// Capacity is a SHAPE — the leading axis of every bank a text marked
+/// `Registered` — and no catalog text seats more than eight, so a flat 32
+/// refused all 68 pairs. Asking each plan for its own seat count is what the
+/// two live catalog files (`every_sku_carves_an_arena`,
+/// `no_concurrent_pair_shares_a_write`) already do; the non-vacuity asserts
+/// below are the other half of not repeating the mistake.
+fn budgets_for(plan: &model_ir::Plan) -> Budgets {
+    let seats = plan
+        .params
+        .iter()
+        .filter(|param| param.source == model_ir::ParamSource::Registered)
+        .map(|param| param.shape.first().copied().unwrap_or(0))
+        .min()
+        .unwrap_or(0);
     Budgets {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         ],
-        max_adapters: 32,
+        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
     }
 }
 
@@ -65,49 +95,77 @@ fn constraints(regions: &[Region], classes: &Classes) -> Vec<Vec<u8>> {
     masks
 }
 
+/// **WHICH TEXTS OWE, AND THAT THEY OWE BECAUSE THEIR MASKS CROSS.**
+///
+/// A laminar family — any two masks nested or disjoint — is always C1P, and
+/// twelve of the catalog's seventeen SKUs still are one: `masked` inside
+/// everything, `qo_one` inside `masked`, no pair sharing a part of itself. The
+/// five qwen texts are not, and this asserts the two halves together so that
+/// neither can drift from the other: a text owes a fallback IF AND ONLY IF two
+/// of its constrained masks cross.
 #[test]
-fn every_sku_is_consecutive_ones_and_owes_nobody_a_fallback() {
+fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
     let mut wrong: Vec<String> = Vec::new();
+    let (mut baked, mut owing) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
-                continue; // the arena sibling is the test that says so.
-            };
-
-            let Some(tree) = baked.order.tree() else {
-                wrong.push(format!(
-                    "`{sku}` as {platform:?}: P4 declined to seriate {} classes",
-                    baked.classes.classes.len(),
-                ));
+            let Ok(baked_one) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default())
+            else {
+                wrong.push(format!("`{sku}` as {platform:?}: refused at its own seat count"));
                 continue;
             };
-            if tree.leaves() != baked.classes.classes.len() {
-                wrong.push(format!(
-                    "`{sku}` as {platform:?}: the tree orders {} of {} classes",
-                    tree.leaves(),
-                    baked.classes.classes.len(),
-                ));
+            baked += 1;
+
+            let masks = constraints(&baked_one.regions, &baked_one.classes);
+            let crossing: Vec<String> = masks
+                .iter()
+                .enumerate()
+                .flat_map(|(i, a)| masks[i + 1..].iter().map(move |b| (a, b)))
+                .filter(|(a, b)| {
+                    let shared = a.iter().filter(|c| b.contains(c)).count();
+                    shared > 0 && shared != a.len().min(b.len())
+                })
+                .map(|(a, b)| format!("{a:?}x{b:?}"))
+                .collect();
+            let owes = !baked_one.fallback.rows.is_empty();
+            if owes {
+                owing += 1;
             }
-            if !baked.fallback.rows.is_empty() {
-                let named: Vec<String> = baked
-                    .fallback
-                    .rows
-                    .iter()
-                    .take(8)
-                    .map(|row| format!("n{}", row.node))
-                    .collect();
+
+            if owes != !crossing.is_empty() {
                 wrong.push(format!(
-                    "`{sku}` as {platform:?}: {} consumers could not be seated in \
-                     one row order — {}",
-                    baked.fallback.rows.len(),
-                    named.join(", "),
+                    "`{sku}` as {platform:?}: owes {} rows over {} nodes, and {} crossing \
+                     pairs — {}",
+                    baked_one.fallback.rows.len(),
+                    baked_one
+                        .fallback
+                        .rows
+                        .iter()
+                        .map(|row| row.node)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    crossing.len(),
+                    if crossing.is_empty() {
+                        "a laminar family cannot need one".to_string()
+                    } else {
+                        format!("but seated them all: {}", crossing.join(" "))
+                    },
                 ));
             }
         }
     }
 
+    // NOT VACUOUS, BOTH WAYS. The budget above is what this file got wrong for
+    // so long; a green run has to prove the catalog compiled AND that both
+    // sides of the iff were exercised.
+    assert_eq!(baked, 68, "only {baked} of 68 SKU x platform pairs baked");
+    assert_eq!(
+        owing, 20,
+        "{owing} pairs owe a fallback, where the five qwen texts on four \
+         platforms are twenty — a text joined or left the crossing family",
+    );
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
@@ -118,7 +176,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
                 continue;
             };
             let classes = baked.classes.classes.len();
@@ -153,14 +211,19 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                 ));
             }
 
+            let (mut seated, mut withdrawn) = (0usize, 0usize);
             for mask in constraints(&baked.regions, &baked.classes) {
+                // **THE PROMISE IS ABOUT WHAT P4 SEATED**, and a withdrawn
+                // consumer is precisely the one it made no promise to — it got
+                // a `FallbackTable` row instead, and `driver::fire::walk`
+                // serves that row rather than reading a span it was never
+                // told to expect. Asking the question of a withdrawn mask
+                // would be asking P4 to keep a promise it declined to make.
                 if !PqTree::is_interval(&order, &mask) {
-                    wrong.push(format!(
-                        "`{sku}` as {platform:?}: the window over classes {mask:?} \
-                         breaks into {} runs of {order:?}",
-                        PqTree::runs(&order, &mask),
-                    ));
+                    withdrawn += 1;
+                    continue;
                 }
+                seated += 1;
                 // And the sub-order a fire carrying only that window gets is
                 // the window itself: dropping absent classes cannot break an
                 // interval, and this is where that stops being an argument.
@@ -180,52 +243,102 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                     ));
                 }
             }
+
+            // NOT VACUOUS: a text whose every mask was withdrawn would sail
+            // through the loop above having promised nothing.
+            if seated == 0 {
+                wrong.push(format!(
+                    "`{sku}` as {platform:?}: P4 seated none of its {withdrawn} constrained \
+                     masks, so the promise below is about an empty set",
+                ));
+            }
         }
     }
 
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
-/// WHY THE ANSWER IS EASY TODAY, checked rather than assumed.
+/// **AT MOST TWO AXES CAN BE INTERVALS, AND THE REST PAY EXACTLY.**
 ///
-/// Every window the catalog states is a nested split of another one —
-/// `masked` inside everything, `qo_one` inside `masked` — so the masks form a
-/// LAMINAR family: any two are disjoint or one contains the other. A laminar
-/// family is always C1P (order each set's classes together, recursively; the
-/// PQ-tree that comes out is all P-nodes), which is why the test above finds
-/// no fallback and finds it on every SKU and every platform.
+/// The bound, checked rather than quoted. An axis here is a constrained mask
+/// covering exactly half the classes; two of them cross iff they share a
+/// quarter, which is what "independent binary facts" means. A half-set is an
+/// interval at some position `a`, two of them share `n/2 - |a - b|`, so
+/// crossing forces `|a - b| = n/4` — and three positions cannot be pairwise
+/// `n/4` apart. Complements are one axis, not two: `qo_one` and `¬qo_one` are
+/// the same cut and a linear order that seats one seats the other.
 ///
-/// This is the assert that will fail FIRST when a model text states two
-/// crossing windows — say a `has_adapter` axis cutting across `qo_one` — and
-/// failing here rather than in the fallback count is the difference between
-/// "the catalog changed shape" and "the compiler regressed".
+/// So a text with `k` mutually crossing axes must withdraw `k - 2` of them,
+/// and no more: `qwen35` states three (`qo_one`, `has_adapter`,
+/// `captures_scores`) and pays one, `qwen36-27b` states four and pays two.
+/// A withdrawal count above the bound is a search that gave up early; below
+/// it is arithmetic that stopped being true.
 #[test]
-fn todays_windows_are_a_laminar_family() {
-    let mut crossing: Vec<String> = Vec::new();
+fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
+    let mut wrong: Vec<String> = Vec::new();
+    let mut with_axes = 0usize;
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
                 continue;
             };
+            let classes = baked.classes.classes.len();
             let masks = constraints(&baked.regions, &baked.classes);
-            for (i, a) in masks.iter().enumerate() {
-                for b in &masks[i + 1..] {
-                    let shared = a.iter().filter(|c| b.contains(c)).count();
-                    if shared > 0 && shared != a.len().min(b.len()) {
-                        crossing.push(format!(
-                            "`{sku}` as {platform:?}: {a:?} and {b:?} cross — \
-                             {shared} classes in common and neither contains \
-                             the other",
-                        ));
-                    }
-                }
+
+            // The halves, complements collapsed: keep the one whose lowest
+            // class is lower, since a mask and its complement cannot both do.
+            let halves: Vec<&Vec<u8>> = masks
+                .iter()
+                .filter(|mask| mask.len() * 2 == classes)
+                .filter(|mask| mask.first() == Some(&0) || !masks.iter().any(|other| {
+                    other.len() == mask.len() && other.iter().all(|c| !mask.contains(c))
+                }))
+                .collect();
+            let axes = halves
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| {
+                    halves[..*i].iter().all(|b| {
+                        let shared = a.iter().filter(|c| b.contains(c)).count();
+                        shared * 4 == classes
+                    })
+                })
+                .count();
+            if axes == 0 {
+                continue;
+            }
+            with_axes += 1;
+
+            // One withdrawn mask per node set the table names, deduplicated:
+            // the rows are keyed by node and a mask is stated by many.
+            let withdrawn = masks
+                .iter()
+                .filter(|mask| {
+                    baked
+                        .order
+                        .tree()
+                        .is_some_and(|tree| !PqTree::is_interval(tree.frontier(), mask))
+                })
+                .count();
+            let bound = axes.saturating_sub(2);
+            if withdrawn != bound {
+                wrong.push(format!(
+                    "`{sku}` as {platform:?}: {classes} classes, {axes} crossing axes, so the \
+                     bound is {bound} — but {withdrawn} masks are not intervals of the order \
+                     it ships",
+                ));
             }
         }
     }
 
-    assert!(crossing.is_empty(), "\n{}\n", crossing.join("\n"));
+    assert!(
+        with_axes >= 20,
+        "only {with_axes} pairs state a crossing axis at all, so the bound was \
+         not exercised",
+    );
+    assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
 #[test]
@@ -237,8 +350,8 @@ fn the_same_text_seriates_the_same_way_twice() {
             let plan = trace(platform);
             let profile = DeviceProfile::default();
             let (Ok(once), Ok(twice)) = (
-                compile(&plan, &budgets(), &profile),
-                compile(&plan, &budgets(), &profile),
+                compile(&plan, &budgets_for(&plan), &profile),
+                compile(&plan, &budgets_for(&plan), &profile),
             ) else {
                 continue;
             };

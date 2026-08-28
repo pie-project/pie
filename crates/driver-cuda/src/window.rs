@@ -65,6 +65,62 @@
 //! fragmented window the artifact owes NO fallback row for, which is P4
 //! having promised this mask consecutive and the fire finding it broken.
 //!
+//! # And when the table asks for a COPY instead
+//!
+//! `Fallback::Split` is what the menu writes ABOVE the copy/split crossover
+//! (`model_compiler::layout`'s `CROSSOVER_ROWS`: at 64 rows a two-way split
+//! measured 1.82x the ideal against a copy's 1.07x, and they converge by
+//! 2048). Below it the table asks for `Fallback::Copy`, and on a fourteen-
+//! point lattice that is ten of the fourteen buckets — every bucket a decode
+//! fire lands in.
+//!
+//! A copy is the same window read as ONE rectangle. The runs are gathered
+//! into a scratch slab, the region's nodes run once over it, and the answers
+//! are scattered back to the fire rows they came from
+//! (`kernels_cuda::layout::gather_rows`). [`Gathered`] is what such a window
+//! carries beyond a split's: the row map the two kernels read, and — because
+//! a paged consumer addresses its kv by LANE and the gathered lanes are not
+//! contiguous either — the pool tables and planning twins re-cut for the
+//! union. Those are small, host-computable and staged beside the boundary
+//! vectors; only the activations move on the device, which is the whole
+//! reason a copy is cheap.
+//!
+//! ```text
+//! classes in fire order:  [ 4 : 3 rows | 0 : 5 rows | 5 : 2 rows ]
+//! mask {4,5,6,7}:          ──run 0──                 ──run 1──
+//! split:                   launch over [0,3)         launch over [8,10)
+//! copy:                    gather rows 0 1 2 8 9  ->  ONE launch over [0,5)
+//!                          scatter back to 0 1 2 8 9
+//! ```
+//!
+//! **THE BUILDER TAKES THE SAME ANSWER AS ITS READERS.** An attention
+//! schedule is carved for one window, and a consumer standing over the union
+//! of two runs must read a schedule carved over that union — so the prepare
+//! region that builds it is copied whenever its readers are, even though P4
+//! owes it no row of its own (`driver::fire::fallback::copies` argues why the
+//! question is asked of the MASK). The two masks being equal is checked at
+//! load, by name, in [`no_schedule_straddles_its_readers`].
+//!
+//! # And when the kernel can walk the pieces itself
+//!
+//! `Fallback::Grouped` is the other answer, and this table serves it by
+//! cutting ONE window where the split cuts `r`: the span is the UNION of the
+//! `r` intervals and [`Window::segments_host`] says which of its rows belong
+//! to the consumer. That rectangle contains foreign rows — the classes P4
+//! could not keep out of the gaps — so it is only legal for an op that touches
+//! the rows it was told about and no others, which is a per-op fact the
+//! compiler is handed as `DeviceProfile::grouped` and which the artifact
+//! restates here as a `FallbackTable` row. Today one op has it:
+//! `linear.lora_correct`, whose weight side was already runtime-indexed and
+//! whose kernel is one file in this tree.
+//!
+//! ```text
+//! classes in fire order:  [ 0 : 3 rows | 2 : 4 rows | 1 : 2 rows | 3 : 5 rows ]
+//! adapter mask {2,3}:                    ──run 0──               ──run 1──
+//! Split   → 2 windows:    (3,4) and (9,5), two launches
+//! Grouped → 1 window:     (3,11), segments [(0,4), (6,5)], one launch
+//! ```
+//!
 //! # How a `Run` learns which region it is in
 //!
 //! `Dispatch::exec` takes a `&Node` and the walk's signature is fixed
@@ -79,13 +135,14 @@
 
 use std::cell::Cell;
 
-use driver::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use crate::device::graph::Event;
+use driver::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use kernels_cuda::Tensor;
-use model_compiler::{Baked, Lowering, Region};
-use model_ir::{Attention, Def, Dtype, Operation, Plan};
+use model_compiler::{Baked, Lowering, Phase, Region};
+use model_ir::{Attention, Def, Dim, Dtype, GeomKind, Operands, Operation, Plan, RuntimeInput, Ty};
 
 use crate::error::{Fault, Result};
+use crate::store::kv::Geometry;
 
 /// One window, and the qo boundaries that go with it.
 ///
@@ -99,12 +156,170 @@ use crate::error::{Fault, Result};
 #[derive(Debug, Clone)]
 pub struct Window {
     /// The rows and lanes this window covers, in fire coordinates.
+    ///
+    /// **FOR A GATHERED WINDOW THIS IS THE COMPACTED RECTANGLE**, not a
+    /// fire interval: `row_offset` and `lane_offset` are 0 and the counts are
+    /// the union's. That is the right reading and not a fudge — every
+    /// consumer of a gathered window reads the scratch rectangle, whose rows
+    /// start at its own zero, and the map back to fire coordinates is
+    /// [`Gathered::rows_host`], which is where it belongs.
     pub span: MaskSpan,
     /// `[lanes + 1]`: the window's qo boundaries, rebased to start at 0.
     pub indptr_host: Vec<i32>,
     /// The same vector, staged. `Tensor::new(0, 0, 0, ..)` until
     /// [`Windows::bind`] has been given the staging base.
     pub indptr: Tensor,
+
+    /// **`Fallback::Grouped`: WHICH ROWS OF THIS RECTANGLE ARE ACTUALLY THE
+    /// CONSUMER'S** — `[segs][2]` as `(row offset within the span, rows)`,
+    /// ascending. EMPTY for every ordinary window, which is every window of
+    /// every artifact P4 seated whole.
+    ///
+    /// A region P4 answered `Fallback::Grouped` for gets ONE window rather
+    /// than `r`, and that window's span is the UNION of the `r` intervals —
+    /// so it contains rows belonging to classes the consumer's mask does not
+    /// hold, standing in the gaps. This vector is what keeps the launch off
+    /// them, and it is rebased to the span for the same reason
+    /// [`indptr_host`](Window::indptr_host) is: the rectangle a launch is cut
+    /// at starts at its own zero.
+    pub segments_host: Vec<i32>,
+    /// The same vector, staged — beside the boundaries, in the same copy.
+    /// `Tensor::new(0, 0, 0, ..)` for a window with no segments.
+    pub segments: Tensor,
+    /// The artifact's load-time bound on the segment count
+    /// (`driver::fire::max_runs`), carried here because it is what sizes the
+    /// grid's segment axis and the fire is not allowed to size it
+    /// (decision #15).
+    pub segment_cap: u32,
+    /// Present iff this window is a [`Fallback::Copy`](model_compiler::Fallback)
+    /// — the runs it compacts, and everything a consumer needs to read them
+    /// as one.
+    pub gathered: Option<Gathered>,
+}
+
+
+impl Window {
+    /// How many segments this window states — `0` for an ordinary one.
+    #[must_use]
+    pub fn segs(&self) -> u32 {
+        self.segments_host.len() as u32 / 2
+    }
+
+    /// The longest segment's row count — the grid's row axis for a grouped
+    /// launch, and `0` when there are none.
+    #[must_use]
+    pub fn segment_rows(&self) -> u32 {
+        self.segments_host
+            .chunks_exact(2)
+            .map(|pair| pair[1].max(0) as u32)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+
+/// A `Fallback::Copy`'s window: which fire rows the compacted rectangle is
+/// made of, and the per-space tables the gathered LANES address the pool by.
+///
+/// **TWO GATHERS, AND ONLY ONE OF THEM IS ON THE DEVICE.** The activations
+/// are big rectangles and move through
+/// [`gather_rows`](kernels_cuda::layout::gather_rows). Everything else a
+/// windowed attention reads is a handful of `i32` per lane — where its pages
+/// are, how full the last one is, how long its kv is — and those are
+/// recomputed on the host for the union and staged in the same copy as the
+/// boundary vectors. A device gather of a per-lane vector would be three
+/// launches to move forty bytes.
+#[derive(Debug, Clone)]
+pub struct Gathered {
+    /// The fire intervals this rectangle compacts, in order.
+    pub runs: Vec<MaskSpan>,
+    /// `[rows]`: the FIRE row each compacted row was read from — the map both
+    /// halves of the copy read, in the two directions.
+    pub rows_host: Vec<i32>,
+    /// The same vector, staged.
+    pub rows: Tensor,
+    /// One entry per kv geometry space, in space order.
+    pub spaces: Vec<GatheredSpace>,
+}
+
+/// One kv space's geometry, re-cut for a gathered window's lanes.
+///
+/// **WHY THE PAGE-ID LIST IS COPIED AND NOT SLICED**, which is the whole
+/// reason this struct exists. A window's `page_indptr` is ordinarily a SLICE
+/// of the fire's, entries left absolute, because the page-id list it bounds
+/// is handed over whole and a contiguous run of lanes owns a contiguous run
+/// of it. Gathered lanes do not: lanes 0 and 2 own `indices[i0..i1]` and
+/// `indices[i2..i3]` with lane 1's pages standing between them, and no
+/// `[lanes + 1]` vector over the whole list can name both spans for requests
+/// 0 and 1 — request 0's end and request 1's start are one entry. So the
+/// LIST is compacted too, and the bounds over it become a fresh prefix sum.
+///
+/// The host twins beside them are the same numbers for the plan builders,
+/// which walk differences of `kv_indptr` and read `kv_len` per request
+/// (`Run::planning`'s duality).
+#[derive(Debug, Clone)]
+pub struct GatheredSpace {
+    /// `[lanes + 1]`: bounds over [`page_indices_host`](GatheredSpace::page_indices_host),
+    /// a fresh prefix sum starting at 0.
+    pub page_indptr_host: Vec<i32>,
+    /// The gathered lanes' page ids, end to end.
+    pub page_indices_host: Vec<i32>,
+    /// `[lanes]`: how full each gathered lane's last page is.
+    pub last_page_lens_host: Vec<i32>,
+    /// `[lanes]`: each gathered lane's kv length.
+    pub kv_len_host: Vec<i32>,
+    /// The four device-side ones, staged.
+    pub page_indptr: Tensor,
+    pub page_indices: Tensor,
+    pub last_page_lens: Tensor,
+    pub kv_len: Tensor,
+}
+
+/// What one fire needs to know before it can decide to copy anything.
+///
+/// **THE BUCKET AND THE TOGGLE ARE BOTH THE DEPLOYMENT'S, NOT THE
+/// ARTIFACT'S.** P4's menu is keyed by bucket range because the cost model
+/// is, and turning `Composition::bucket` — a row COUNT — into the index that
+/// range is over needs the `Budgets` only the shell holds. `enabled` is the
+/// A/B switch: `Fallback::Split` is green on device and is the oracle a copy
+/// is diffed against, so the shell ships with copies OFF and a caller turns
+/// them on.
+#[derive(Debug, Clone, Copy)]
+pub struct Copies<'a> {
+    /// Which position of `Budgets::buckets` this fire's rows land in; `0` for
+    /// a deployment that declared no lattice and therefore has one bucket.
+    pub bucket: u32,
+    /// Does this shell serve `Fallback::Copy` at all?
+    ///
+    /// **AND ALSO: IS THIS A FIRE A COPY IS SAFE IN?** A masked fire is not,
+    /// and the reason is the one [`GatheredSpace`] states about the page-id
+    /// list, in a place the gather does not reach. `attention.masked`'s bits
+    /// ride in one slab handed over whole, addressed by a per-lane vector of
+    /// ABSOLUTE byte offsets that `plan_prefill` binds onto the schedule
+    /// (`Run::mask_indptr`) — and gathered lanes own spans of that slab with
+    /// other lanes' bits standing between them, exactly as they own spans of
+    /// the page-id list. It is the same problem and it has the same answer
+    /// (compact the slab, rebuild the offsets); it is not solved here, so a
+    /// fire that staged mask bits takes the split, which is always correct.
+    /// Today's qwen texts declare no masked axis at all, so nothing this file
+    /// gates is affected; gemma's is what this line is for.
+    pub enabled: bool,
+    /// This fire's host geometry, one per kv space — what the gathered pool
+    /// tables are re-cut from.
+    pub spaces: &'a [Geometry],
+}
+
+impl Copies<'_> {
+    /// The answer for a shell that does not copy: split everything, which is
+    /// what every shell did before the copy existed.
+    #[must_use]
+    pub fn off() -> Copies<'static> {
+        Copies {
+            bucket: 0,
+            enabled: false,
+            spaces: &[],
+        }
+    }
 }
 
 /// Every region's windows, deduplicated.
@@ -131,6 +346,100 @@ pub struct Windows {
     of_region: Vec<(u32, u32)>,
 }
 
+/// Is this region's work something the copy path can actually serve?
+///
+/// **THE GATHER IS GENERAL AND THE RESOLUTION IS NOT**, which is why this
+/// asks about operands rather than about ops. A copy re-points every operand
+/// of every node at a compacted rectangle, and `Run::cut` can do that for
+/// three shapes: a token-shaped tensor becomes a slab rectangle, a cache
+/// binding becomes the gathered pool tables, and the four geometry vectors
+/// [`GatheredSpace`] re-cuts become their gathered twins. A region naming
+/// anything else — a lane-shaped value nothing gathers, a mask slab whose
+/// entries are bits rather than rows — would silently get the fire's whole
+/// vector where it asked for a window's, so it is not copied at all and takes
+/// the split, which is always correct.
+///
+/// Struct operands are exempt by construction: a plan payload is host state
+/// resolved through `Run::slot`, and its own window is the region that BUILT
+/// it — which is copied whenever this one is, for the reason
+/// `driver::fire::fallback::copies` states.
+fn copyable(plan: &Plan, region: &Region) -> bool {
+    let mut operands: Vec<model_ir::ValueId> = Vec::new();
+    for node in region.nodes.clone() {
+        let Some(node) = plan.nodes.get(node as usize) else {
+            return false;
+        };
+        macro_rules! collect {
+            ($op:expr) => {{
+                $op.inputs(&mut operands);
+                $op.outputs(&mut operands);
+            }};
+        }
+        match &node.op {
+            Operation::Attention(op) => collect!(op),
+            Operation::Linear(op) => collect!(op),
+            Operation::Elementwise(op) => collect!(op),
+            Operation::Layout(op) => collect!(op),
+            Operation::Collective(op) => collect!(op),
+            Operation::CustomCuda(op) => collect!(op),
+        }
+    }
+    operands.iter().all(|id| {
+        let Some(decl) = plan.values.get(id.0 as usize) else {
+            return false;
+        };
+        match &decl.def {
+            // The PAGED pool, whose lane tables `GatheredSpace` re-cuts — and
+            // ONLY the paged one. A recurrent bank is addressed by SLOT, and
+            // `Run::recurrent` reads `slot_ids[lane]` by slicing the window's
+            // `lane_offset`/`lanes` out of the fire-wide vector. A gathered
+            // window's span starts at lane zero and covers the compacted lane
+            // count, so that slice would hand the scan the FIRST `n` lanes'
+            // banks instead of the gathered lanes' — the page-id list's problem
+            // again, in a table `GatheredSpace` does not re-cut. Wrong state,
+            // no fault; so a region that scans one does not copy.
+            Def::Cache(c) => matches!(
+                plan.caches.get(*c as usize),
+                Some(model_ir::CacheRow::Kv { .. })
+            ),
+            // The four geometry vectors that re-cut goes through. `Indices`
+            // is compacted rather than sliced; the rest are per-lane.
+            Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
+                kind,
+                GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
+            ),
+            // The mask slab, whose entries are BITS and not rows: the span
+            // table addressing it is a per-lane vector of absolute offsets
+            // and gathering it is the page-id list's problem again
+            // ([`Copies::enabled`]). A masked fire disables copies wholesale
+            // for that reason; this says the same thing per region, so a
+            // future fire-level relaxation cannot quietly let one through.
+            Def::Input(RuntimeInput::Mask { .. }) => false,
+            _ => match &decl.ty {
+                // A plan payload: host state, not a rectangle.
+                Ty::Struct(_) => true,
+                Ty::Tensor { shape, .. } => match shape.first() {
+                    // Row-shaped: the slab.
+                    Some(Dim::Tokens) => true,
+                    // `TokensTimes(k)` is `k` rectangle rows per TOKEN row, and
+                    // `Gathered::rows_host` names token rows — one index per
+                    // `k` rows to move. `kernels_cuda::layout::move_rows`
+                    // refuses the mismatch rather than moving the wrong bytes
+                    // (`index.rows != tight.rows`), so this would be a fire
+                    // that fails rather than one that lies; it is excluded here
+                    // so that the two halves agree about what the copy path
+                    // supports. Expanding the map by `k` is the fix when a
+                    // withdrawn consumer needs one.
+                    Some(Dim::TokensTimes(_)) => false,
+                    // Window-free: handed over whole, gathered or not.
+                    Some(Dim::Const(_)) | None => true,
+                    Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                },
+            },
+        }
+    })
+}
+
 impl Windows {
     /// The windows of one fire: every region of the template resolved against
     /// this composition's class table, one per interval its mask covers.
@@ -141,18 +450,28 @@ impl Windows {
     /// the fire's class order AND which the artifact owes no `Fallback` row —
     /// a promise P4 made and this fire found broken, which is a bake-integrity
     /// failure rather than a slow path. A region P4 DID write a row for is the
-    /// slow path, and is served here as `Fallback::Split { r }` at every
-    /// bucket; `driver::fire::fallback` states what that costs against the
-    /// `Fallback::Copy` the table asks for below the crossover, and why this
-    /// shell cannot yet serve it.
-    pub fn of(baked: &Baked, classes: &WindowTable, indptr_host: &[i32]) -> Result<Windows> {
+    /// slow path, and is served here as `Fallback::Split { r }` — or, where
+    /// `copies` says this fire's bucket asks for a copy and the region's
+    /// operands admit one, as a single [`Gathered`] window.
+    pub fn of(
+        plan: &Plan,
+        baked: &Baked,
+        classes: &WindowTable,
+        indptr_host: &[i32],
+        copies: Copies<'_>,
+    ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(baked.template().len());
         let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(baked.template().len());
         let mut spans: Vec<MaskSpan> = Vec::new();
+        // The grid's segment axis, once per fire rather than once per window:
+        // it is a property of the ARTIFACT (how many intervals the shipped
+        // order breaks any mask into) and a fire may not move it.
+        let segment_cap = fallback::max_runs(baked);
 
         for (at, region) in baked.template().iter().enumerate() {
             classes.spans_into(&region.mask, &mut spans);
+            let mut segments_host: Vec<i32> = Vec::new();
             if spans.len() > 1 {
                 // The two integrity questions, asked of the artifact
                 // rather than of the fire. Did P4 PROMISE this window
@@ -170,6 +489,27 @@ impl Windows {
                         promised: fallback::promised(baked, region).then_some(bound),
                     });
                 }
+                // **P4'S OTHER ANSWER, AND THE ONE THAT CHANGES THE LAUNCH
+                // COUNT** (design §3, decision #24). `Fallback::Split` is `r`
+                // windows; `Fallback::Grouped` is ONE, over the union of the
+                // `r` intervals, carrying the intervals themselves so the
+                // kernel can skip the foreign rows between them. The walk
+                // reads the same row of the same table
+                // (`driver::fire::fallback::grouped`) and turns its launch
+                // loop once, so the two cannot disagree about how many runs
+                // this region has — which is what `at`'s panic would
+                // otherwise be for.
+                if fallback::grouped(baked, region.nodes.clone()) {
+                    let union = union_of(&spans);
+                    segments_host = spans
+                        .iter()
+                        .flat_map(|span| {
+                            [(span.row_offset - union.row_offset) as i32, span.rows as i32]
+                        })
+                        .collect();
+                    spans.clear();
+                    spans.push(union);
+                }
             }
             // An empty mask (a region no class demands) answers the zero
             // window, which is the same answer a composition without this
@@ -178,21 +518,33 @@ impl Windows {
                 spans.push(MaskSpan::default());
             }
 
+            // P4'S OTHER ANSWER. A window in pieces whose bucket asks for a
+            // copy, whose operands the copy can re-point, becomes ONE window
+            // over the compacted rectangle — and the region then costs one
+            // launch, which is the whole point.
+            if spans.len() > 1
+                && copies.enabled
+                && fallback::copies(baked, &region.mask, copies.bucket)
+                && copyable(plan, region)
+            {
+                let gathered = gather_of(&spans, indptr_host, copies.spaces);
+                of_region.push((runs.len() as u32, 1));
+                runs.push(seat(&mut windows, gathered));
+                continue;
+            }
+
             of_region.push((runs.len() as u32, spans.len() as u32));
             for &span in &spans {
-                let found = windows.iter().position(|held| held.span == span);
-                let index = match found {
-                    Some(index) => index,
-                    None => {
-                        windows.push(Window {
-                            span,
-                            indptr_host: rebase(indptr_host, span),
-                            indptr: Tensor::new(0, 0, 1, Dtype::I32),
-                        });
-                        windows.len() - 1
-                    }
+                let window = Window {
+                    span,
+                    indptr_host: rebase(indptr_host, span),
+                    indptr: Tensor::new(0, 0, 1, Dtype::I32),
+                    gathered: None,
+                    segments_host: segments_host.clone(),
+                    segments: Tensor::new(0, 0, 2, Dtype::I32),
+                    segment_cap,
                 };
-                runs.push(index as u32);
+                runs.push(seat(&mut windows, window));
             }
         }
 
@@ -215,24 +567,60 @@ impl Windows {
         self.windows.is_empty()
     }
 
-    /// Every window's rebased boundaries, end to end — what the shell stages
-    /// in one copy.
+    /// Every window's `i32` vectors, end to end — what the shell stages in
+    /// one copy.
+    ///
+    /// **ONE BLOB, AND [`bind`](Windows::bind) WALKS IT IN THE SAME ORDER.**
+    /// A window contributes its rebased boundaries; a GATHERED one
+    /// contributes its row map and its per-space pool tables behind them.
+    /// The two functions are written as one traversal in two directions for
+    /// exactly the reason the copy's own two halves are: an order that could
+    /// drift is an address that could point at another window's vector.
     #[must_use]
     pub fn packed(&self) -> Vec<i32> {
-        self.windows
-            .iter()
-            .flat_map(|window| window.indptr_host.iter().copied())
-            .collect()
+        let mut out: Vec<i32> = Vec::new();
+        for window in &self.windows {
+            out.extend_from_slice(&window.indptr_host);
+            out.extend_from_slice(&window.segments_host);
+            let Some(gathered) = &window.gathered else {
+                continue;
+            };
+            out.extend_from_slice(&gathered.rows_host);
+            for space in &gathered.spaces {
+                out.extend_from_slice(&space.page_indptr_host);
+                out.extend_from_slice(&space.page_indices_host);
+                out.extend_from_slice(&space.last_page_lens_host);
+                out.extend_from_slice(&space.kv_len_host);
+            }
+        }
+        out
     }
 
-    /// Seat the staged boundaries: `base` is where [`packed`](Windows::packed)
+    /// Seat the staged vectors: `base` is where [`packed`](Windows::packed)
     /// landed on the device.
     pub fn bind(&mut self, base: u64) {
         let mut at = base;
+        // `cols` because a segment list is `[segs][2]` where every other
+        // staged vector is `[n][1]`; the byte stride is the same and only the
+        // shape the consumer reads it at differs.
+        let mut take = |entries: usize, cols: u32| {
+            let here = at;
+            at += entries as u64 * 4;
+            Tensor::new(here, entries as u32 / cols.max(1), cols, Dtype::I32)
+        };
         for window in &mut self.windows {
-            let rows = window.indptr_host.len() as u32;
-            window.indptr = Tensor::new(at, rows, 1, Dtype::I32);
-            at += u64::from(rows) * 4;
+            window.indptr = take(window.indptr_host.len(), 1);
+            window.segments = take(window.segments_host.len(), 2);
+            let Some(gathered) = &mut window.gathered else {
+                continue;
+            };
+            gathered.rows = take(gathered.rows_host.len(), 1);
+            for space in &mut gathered.spaces {
+                space.page_indptr = take(space.page_indptr_host.len(), 1);
+                space.page_indices = take(space.page_indices_host.len(), 1);
+                space.last_page_lens = take(space.last_page_lens_host.len(), 1);
+                space.kv_len = take(space.kv_len_host.len(), 1);
+            }
         }
     }
 
@@ -247,6 +635,38 @@ impl Windows {
     #[must_use]
     pub fn runs(&self, region: u32) -> u32 {
         self.of_region.get(region as usize).map_or(0, |held| held.1)
+    }
+
+    /// How many launches this fire's walk makes over the whole template.
+    ///
+    /// **THE NUMBER A COPY EXISTS TO LOWER, AND THE ONLY ONE A CALLER CAN SEE
+    /// FROM OUTSIDE.** `driver::fire::walk` loops `Windows::runs(region)`
+    /// times per region — the same table, read the same way — so this is that
+    /// loop's total, known before a single kernel is enqueued. A fire whose
+    /// windows P4 all seated answers one per region; a split adds `r - 1` per
+    /// fragmented region; a copy takes them back off.
+    #[must_use]
+    pub fn launches(&self) -> u32 {
+        self.of_region.iter().map(|&(_, runs)| runs.max(1)).sum()
+    }
+
+    /// How many regions of this fire are served as a `Fallback::Copy`.
+    ///
+    /// Zero unless the shell was told to copy AND P4's table asked for one at
+    /// this fire's bucket AND the region's operands admitted it — which is
+    /// three questions with one visible answer, so it is worth being able to
+    /// ask it.
+    #[must_use]
+    pub fn copied(&self) -> u32 {
+        self.of_region
+            .iter()
+            .filter(|&&(start, _)| {
+                self.runs
+                    .get(start as usize)
+                    .and_then(|&index| self.windows.get(index as usize))
+                    .is_some_and(|window| window.gathered.is_some())
+            })
+            .count() as u32
     }
 
     /// The most launches any region of this fire costs — what a per-run table
@@ -362,6 +782,70 @@ pub fn no_schedule_straddles_its_readers(plan: &Plan, baked: &Baked) -> Result<(
     Ok(())
 }
 
+/// **NO GROUPED CONSUMER SHARES ITS WINDOW WITH A PREPARE REGION.**
+///
+/// The sibling of [`no_schedule_straddles_its_readers`], and it guards the one
+/// asymmetry between this shell's two ways out of a split. `Fallback::Copy` is
+/// resolved per MASK (`driver::fire::fallback::copies`) precisely so a prepare
+/// builder inherits its readers' answer: P4 offers only capture regions to its
+/// C1P instance, so a builder standing over the same window is owed no row of
+/// its own, and one that split while its reader gathered would hand the single
+/// launch a schedule describing the first interval only. `Fallback::Grouped`
+/// is resolved per REGION — the launch count is a property of the nodes'
+/// kernels, not of the window — so it has no such inheritance, and a prepare
+/// builder sharing a grouped consumer's mask would carve `r` schedules while
+/// the consumer ran once at run zero.
+///
+/// It cannot happen today: [`crate::GROUPED`] names `linear.lora_correct`
+/// alone, whose region holds no plan build. This refuses the load the day a
+/// second op is named and that stops being true, rather than letting the
+/// asymmetry be discovered as wrong numbers.
+///
+/// # Errors
+///
+/// [`Fault::Straddled`], naming the grouped region's first node and the two
+/// class sets.
+pub fn no_grouped_window_is_also_a_prepare_window(baked: &Baked) -> Result<()> {
+    for region in baked.template() {
+        if !fallback::grouped(baked, region.nodes.clone()) {
+            continue;
+        }
+        let Some(builder) = baked
+            .template()
+            .iter()
+            .find(|other| other.phase == Phase::Prepare && other.mask == region.mask)
+        else {
+            continue;
+        };
+        return Err(Fault::Straddled {
+            value: builder.nodes.start,
+            node: region.nodes.start,
+            planned: format!("{:?}", builder.mask.iter().collect::<Vec<_>>()),
+            consumed: format!("{:?}", region.mask.iter().collect::<Vec<_>>()),
+        });
+    }
+    Ok(())
+}
+
+/// The one rectangle that contains every one of these intervals.
+///
+/// **IT CONTAINS ROWS THE MASK DOES NOT**, and that is the point: a grouped
+/// launch is cut at the union and told which of its rows are its own, so the
+/// gaps are addressed by the launch and touched by nobody. Rows and lanes are
+/// unioned together because the spans break at the same classes for both
+/// (`WindowTable::spans` argues why), and the caller only ever asks this of a
+/// list `spans_into` produced, which is ascending and non-empty.
+fn union_of(spans: &[MaskSpan]) -> MaskSpan {
+    let first = spans.first().copied().unwrap_or_default();
+    let last = spans.last().copied().unwrap_or_default();
+    MaskSpan {
+        row_offset: first.row_offset,
+        rows: (last.row_offset + last.rows) - first.row_offset,
+        lane_offset: first.lane_offset,
+        lanes: (last.lane_offset + last.lanes) - first.lane_offset,
+    }
+}
+
 /// The window's qo boundaries, rebased so the first is 0.
 fn rebase(indptr: &[i32], span: MaskSpan) -> Vec<i32> {
     let first = span.lane_offset as usize;
@@ -371,6 +855,120 @@ fn rebase(indptr: &[i32], span: MaskSpan) -> Vec<i32> {
     };
     let base = cut[0];
     cut.iter().map(|bound| bound - base).collect()
+}
+
+/// Give this window a position in the fire's deduplicated list.
+///
+/// **DEDUPLICATED ON EVERYTHING, NOT ONLY THE SPAN.** A gathered window and a
+/// plain one can name the same compacted extent — `{0, 5, 0, 3}` is what a
+/// copy of two runs looks like and also what the first three lanes of a fire
+/// look like — and they are not the same window: one reads its rows where
+/// they lie and the other reads them out of a slab. Comparing the runs beside
+/// the span is what keeps a region from being handed the other one's.
+fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
+    let same = |held: &Window| {
+        held.span == window.span
+            && held.segments_host == window.segments_host
+            && held.gathered.as_ref().map(|g| &g.runs) == window.gathered.as_ref().map(|g| &g.runs)
+    };
+    let index = match windows.iter().position(same) {
+        Some(index) => index,
+        None => {
+            windows.push(window);
+            windows.len() - 1
+        }
+    };
+    index as u32
+}
+
+/// Build the gathered window a list of runs compacts to.
+///
+/// Three things fall out of the run list and nothing else does:
+///
+/// - **the row map**, which is the runs' rows concatenated in run order. That
+///   order is the one the compacted rectangle is in, so it is also the order
+///   the lanes and their qo boundaries have to be in — a gather that laid the
+///   rows down in one order and the boundaries in another would hand the
+///   launch a ragged view of somebody else's requests.
+/// - **the qo boundaries**, rebased over the union: each run's per-lane row
+///   counts, appended, prefix-summed from 0. Not `rebase(indptr, span)` of any
+///   one run — the union is what the single launch stands over.
+/// - **the per-space pool tables**, re-cut lane by lane
+///   ([`GatheredSpace`] argues why the page-id list is copied).
+fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Window {
+    let mut rows_host: Vec<i32> = Vec::new();
+    let mut lanes: Vec<usize> = Vec::new();
+    let mut bounds: Vec<i32> = vec![0];
+    for run in runs {
+        for row in run.row_offset..run.row_offset + run.rows {
+            rows_host.push(row as i32);
+        }
+        for lane in run.lane_offset..run.lane_offset + run.lanes {
+            let lane = lane as usize;
+            // The lane's own row count, off the fire-wide boundaries, added
+            // to the running total — which IS the rebase, done once over the
+            // union instead of once per run.
+            let width = indptr_host
+                .get(lane + 1)
+                .zip(indptr_host.get(lane))
+                .map_or(0, |(end, start)| end - start);
+            bounds.push(bounds.last().copied().unwrap_or(0) + width);
+            lanes.push(lane);
+        }
+    }
+
+    let gathered_spaces = spaces
+        .iter()
+        .map(|space| {
+            let mut page_indptr_host: Vec<i32> = vec![0];
+            let mut page_indices_host: Vec<i32> = Vec::new();
+            let mut last_page_lens_host: Vec<i32> = Vec::new();
+            let mut kv_len_host: Vec<i32> = Vec::new();
+            for &lane in &lanes {
+                let start = space.indptr.get(lane).copied().unwrap_or(0).max(0) as usize;
+                let end = space.indptr.get(lane + 1).copied().unwrap_or(0).max(0) as usize;
+                let pages = space.indices.get(start..end).unwrap_or(&[]);
+                page_indices_host.extend_from_slice(pages);
+                page_indptr_host.push(page_indices_host.len() as i32);
+                last_page_lens_host.push(space.last_page_len.get(lane).copied().unwrap_or(0));
+                kv_len_host.push(space.kv_len.get(lane).copied().unwrap_or(0));
+            }
+            GatheredSpace {
+                page_indptr_host,
+                page_indices_host,
+                last_page_lens_host,
+                kv_len_host,
+                page_indptr: Tensor::new(0, 0, 1, Dtype::I32),
+                page_indices: Tensor::new(0, 0, 1, Dtype::I32),
+                last_page_lens: Tensor::new(0, 0, 1, Dtype::I32),
+                kv_len: Tensor::new(0, 0, 1, Dtype::I32),
+            }
+        })
+        .collect();
+
+    Window {
+        span: MaskSpan {
+            row_offset: 0,
+            rows: rows_host.len() as u32,
+            lane_offset: 0,
+            lanes: lanes.len() as u32,
+        },
+        indptr_host: bounds,
+        indptr: Tensor::new(0, 0, 1, Dtype::I32),
+        // A COPY AND A GROUPED WINDOW ARE THE TWO WAYS OUT OF A SPLIT AND
+        // NEVER THE SAME WAY: a gathered rectangle holds only the consumer's
+        // own rows, so there is nothing for a segment list to keep a launch
+        // off (`walk`'s rule 4 gives `Grouped` the tie for the same reason).
+        segments_host: Vec::new(),
+        segments: Tensor::new(0, 0, 2, Dtype::I32),
+        segment_cap: 0,
+        gathered: Some(Gathered {
+            runs: runs.to_vec(),
+            rows: Tensor::new(0, 0, 1, Dtype::I32),
+            rows_host,
+            spaces: gathered_spaces,
+        }),
+    }
 }
 
 /// Where the walk is: which region of the template, and which run of that

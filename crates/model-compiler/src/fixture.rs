@@ -172,6 +172,37 @@ impl Build {
         plan
     }
 
+    /// The same plan build, but reading its `kv_indptr` from a value the
+    /// caller names rather than from a fresh runtime input.
+    ///
+    /// THE ONE SHAPE `region::hoist` REFUSES, when the caller hands it an op's
+    /// output: a plan build over an activation is host work with no instant to
+    /// run in — after the graph computed the number, and before the graph the
+    /// build's own struct is read by.
+    pub(crate) fn prepare_over(&mut self, kv_indptr: ValueId, cond: Cond) -> ValueId {
+        let kv_indices = self.input(1);
+        let last_page_len = self.input(1);
+        let kv_len = self.input(1);
+        let node = self.plan.nodes.len() as u32;
+        let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
+        self.push(
+            Attention::PlanDecode {
+                kv_indptr,
+                kv_indices,
+                last_page_len,
+                kv_len,
+                q_heads: 1,
+                kv_heads: 1,
+                head_dim: 4,
+                window: None,
+                plan,
+            }
+            .into(),
+            cond,
+        );
+        plan
+    }
+
     /// The attention that reads a prepare node's struct.
     pub(crate) fn decode(&mut self, q: ValueId, plan: ValueId, cond: Cond) -> ValueId {
         let cache = self.cache();

@@ -20,9 +20,11 @@ use std::cell::Cell;
 use kernels_cuda::attn::plan::{
     DecodePlan, Device, MlaPlan, PrefillPlan, PrefillPlanSm90, Shape, Toggles, Workspace,
 };
+use kernels_cuda::linear::lora::Segments;
 use kernels_cuda::{Ctx, KvPool, RaggedTensor, RecurrentPool, Tensor};
-use model_ir::{Def, Dim, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
+use crate::dispatch::copy::CopyPlan;
 use crate::window::{At, Window, Windows};
 
 /// One loader-resolved weight. Most rows are one dense handle; an mxfp4 bank
@@ -60,8 +62,23 @@ pub struct SlotTable(pub Vec<Option<Tensor>>);
 /// gone: `write_page`/`write_offset` are op-named inputs now.)
 #[derive(Clone, Copy, Debug)]
 pub enum CachePool {
-    /// A paged kv space (`CacheRow::Kv`).
-    Kv(KvPool),
+    /// A paged kv space (`CacheRow::Kv`), and which geometry space's tables
+    /// address it.
+    ///
+    /// **THE SPACE RIDES ALONG BECAUSE A GATHERED WINDOW HAS ITS OWN.** A
+    /// pool's page bounds and last-page fills are the fire's, seated per
+    /// geometry space at bind; a `Fallback::Copy` re-cuts them for its
+    /// compacted lanes and seats the result per space too
+    /// (`window::GatheredSpace`), so resolving one means knowing which space
+    /// this row belongs to. The number is the cache row's own declaration
+    /// (`CacheRow::Kv { space }`) — restated here rather than looked up,
+    /// because `Run::pool` holds the pool and not the plan's cache table.
+    Kv {
+        /// The `CacheRow::Kv` space this row's geometry comes from.
+        space: u32,
+        /// The storage and the tables addressing it.
+        pool: KvPool,
+    },
     /// A recurrent state space (`CacheRow::State`).
     Recurrent(RecurrentPool),
 }
@@ -375,6 +392,15 @@ pub struct Run<'c> {
     /// to its table.
     values: &'c [ValueDecl],
 
+    /// `Plan::nodes`, for the one thing a resolution cannot do from a value
+    /// id alone: read a whole REGION's operands at once.
+    ///
+    /// A `Fallback::Copy` compacts every rectangle the region touches into
+    /// one slab, so it has to enumerate them before the first node runs —
+    /// which is a question about the region, not about any one op. Nothing
+    /// else here reads it; the walk still hands each arm its own `&Node`.
+    nodes: &'c [Node],
+
     /// `Def::Weight` rows, loader-resolved.
     weights: &'c WeightTable,
 
@@ -432,6 +458,20 @@ pub struct Run<'c> {
     /// Which stream the walk is on, written by the same `Cursor` that writes
     /// [`place`](Run::place), at the same instant and for the same reason.
     stream: &'c Cell<u32>,
+
+    /// The `Fallback::Copy` currently in force: which rectangles the region
+    /// the walk is inside compacted, and where in the scratch slab each one
+    /// landed.
+    ///
+    /// **WRITTEN BY `Serve::gather`, READ BY [`Run::cut`], AND IT CANNOT GO
+    /// STALE.** The walk brackets a copied region's nodes with `gather` and
+    /// `scatter`, so the plan is rebuilt immediately before the first node
+    /// and is still the current one at the last; `CopyPlan::region` carries
+    /// which region it was built for, and `cut` refuses a mismatch rather
+    /// than reading another region's slab offsets. A region that is not
+    /// copied never consults it — `Window::gathered` is `None` and the cut is
+    /// the slice it always was.
+    copy: CopyPlan,
 }
 
 impl<'c> Run<'c> {
@@ -440,6 +480,7 @@ impl<'c> Run<'c> {
     pub fn new(
         ctx: &'c Ctx,
         values: &'c [ValueDecl],
+        nodes: &'c [Node],
         weights: &'c WeightTable,
         arena: &'c SlotTable,
         caches: &'c CacheTable,
@@ -450,6 +491,7 @@ impl<'c> Run<'c> {
         Self {
             ctx,
             values,
+            nodes,
             weights,
             arena,
             caches,
@@ -460,7 +502,34 @@ impl<'c> Run<'c> {
             place,
             side: &[],
             stream: &place.region,
+            copy: CopyPlan::default(),
         }
+    }
+
+    /// `Plan::values`, for the copy plan's own shape reading.
+    pub(crate) fn values(&self) -> &'c [ValueDecl] {
+        self.values
+    }
+
+    /// `Plan::nodes`, for the same.
+    pub(crate) fn nodes(&self) -> &'c [Node] {
+        self.nodes
+    }
+
+    /// Which region of the template the walk is inside.
+    pub(crate) fn at_region(&self) -> u32 {
+        self.place.region.get()
+    }
+
+    /// The FIRE-WIDE rectangle a value names, before any window is applied —
+    /// what a copy's gather reads from and its scatter writes back to.
+    pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
+        self.whole(id)
+    }
+
+    /// Take the copy plan the region's gather just built.
+    pub(crate) fn seat_copy(&mut self, plan: CopyPlan) {
+        self.copy = plan;
     }
 
     /// The same `Run`, told where P6's side streams are.
@@ -510,6 +579,32 @@ impl<'c> Run<'c> {
     /// the run the walk is on.
     pub(crate) fn window(&self) -> &'c Window {
         self.windows.at(self.place.region.get(), self.place.run.get())
+    }
+
+    /// **THE ROWS OF THIS WINDOW THAT ARE ACTUALLY THE NODE'S**, for a region
+    /// P4 answered `Fallback::Grouped` for — and `None` for every other
+    /// region, which is every region of every artifact P4 seated whole.
+    ///
+    /// A grouped window's span is the UNION of the intervals its mask covers,
+    /// so [`Run::cut`] hands the arm a rectangle with foreign rows standing in
+    /// the gaps; this is the list that keeps the launch off them. An arm that
+    /// takes it MUST honour it — reaching a grouped window without asking is
+    /// running the correction over rows whose lanes never asked for one — and
+    /// an arm whose kernel cannot honour it must never have been named in
+    /// `DeviceProfile::grouped`, because that is the word that made the
+    /// compiler write the row.
+    pub(crate) fn segments(&self) -> Option<Segments> {
+        let window = self.window();
+        let count = window.segs();
+        if count == 0 {
+            return None;
+        }
+        Some(Segments {
+            list: window.segments,
+            count,
+            cap: window.segment_cap,
+            max_rows: window.segment_rows(),
+        })
     }
 
     /// Where this run's payload for `id` sits in [`structs`](Run::structs).
@@ -595,6 +690,15 @@ impl<'c> Run<'c> {
     /// rectangle ([`crate::mask`] argues both halves).
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
+        // **THE OTHER ANSWER, ASKED FIRST** (design §3). A gathered window's
+        // rows do not lie in the arena at all — they were compacted into a
+        // scratch slab before the region's first node — so a slice of the
+        // fire-wide column is not a narrower reading of the same bytes, it is
+        // the wrong bytes. `compacted` is the whole of what a copy changes
+        // about resolution.
+        if self.window().gathered.is_some() {
+            return self.compacted(id, handle);
+        }
         if matches!(
             self.values[at].def,
             Def::Input(RuntimeInput::Mask { .. })
@@ -633,6 +737,63 @@ impl<'c> Run<'c> {
             handle.width,
             handle.dtype,
         )
+    }
+
+    /// [`Run::cut`]'s other half: what a `Fallback::Copy` resolves to.
+    ///
+    /// **THREE ANSWERS, AND THEY ARE THE THREE `window::copyable` ADMITS.**
+    /// A row-shaped value is the slab rectangle the region's gather laid it
+    /// in; the four kv geometry vectors are the twins re-cut for the gathered
+    /// lanes ([`GatheredSpace`](crate::window::GatheredSpace)); everything
+    /// window-free is handed over whole, exactly as a split hands it over.
+    /// Nothing else can arrive — `Windows::of` declines to gather a region
+    /// naming anything else, and the region then takes the split, which is
+    /// always correct.
+    fn compacted(&self, id: ValueId, handle: Tensor) -> Tensor {
+        let at = id.0 as usize;
+        let gathered = self
+            .window()
+            .gathered
+            .as_ref()
+            .expect("`compacted` is reached only through a gathered window");
+        if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
+            let Some(space) = gathered.spaces.get(*space as usize) else {
+                return handle;
+            };
+            return match kind {
+                GeomKind::Indptr => space.page_indptr,
+                GeomKind::Indices => space.page_indices,
+                GeomKind::LastPageLen => space.last_page_lens,
+                GeomKind::KvLen => space.kv_len,
+                // `window::copyable` admits no other kind into a copied
+                // region, so this is the arm nothing reaches — and it
+                // answers the fire-wide vector rather than a wrong window,
+                // which is the conservative direction.
+                _ => handle,
+            };
+        }
+        let Ty::Tensor { shape, .. } = &self.values[at].ty else {
+            return handle;
+        };
+        match shape.first() {
+            Some(Dim::Tokens | Dim::TokensTimes(_)) => {
+                assert_eq!(
+                    self.copy.region,
+                    self.place.region.get(),
+                    "value {at} is being resolved inside a copied region whose gather \
+                     has not run; `driver::fire::walk` brackets a copied region's \
+                     nodes and this is what says the bracket was lost",
+                );
+                self.copy.tight(handle.ptr).unwrap_or_else(|| {
+                    panic!(
+                        "value {at} is row-shaped and its column was not compacted; the \
+                         copy plan is built from the same region's operands the walk is \
+                         dispatching, so a miss is a plan and a template built apart"
+                    )
+                })
+            }
+            _ => handle,
+        }
     }
 
     /// The crate's heart: one plan id in, one device handle out, routed on
@@ -770,8 +931,32 @@ impl<'c> Run<'c> {
     /// is not (its bounds stay absolute).
     pub(crate) fn pool(&self, id: ValueId) -> KvPool {
         match self.cache(id) {
-            CachePool::Kv(pool) => {
+            CachePool::Kv { space, pool } => {
                 let window = self.window().span;
+                // **A GATHERED WINDOW'S TABLES ARE RE-CUT, NOT SLICED**, and
+                // the page-id list is the reason: gathered lanes own spans of
+                // it with other lanes' pages standing between them, and no
+                // `[lanes + 1]` bounds vector over the whole list can name
+                // two such spans as requests 0 and 1
+                // (`window::GatheredSpace`). So the list is compacted with
+                // the lanes and the bounds are a fresh prefix sum over it.
+                //
+                // `row_valid` is the one table a gather does NOT need: its
+                // entries are 1 for a row this fire means and 0 for a
+                // bucket's padding, every gathered row is one the fire
+                // means, and the count is the gathered count — so the
+                // window's own prefix of the fire-wide vector holds exactly
+                // the values a gathered one would.
+                if let Some(gathered) = &self.window().gathered {
+                    let seat = gathered.spaces.get(*space as usize);
+                    return KvPool {
+                        page_indptr: seat.map_or(pool.page_indptr, |seat| seat.page_indptr),
+                        page_indices: seat.map_or(pool.page_indices, |seat| seat.page_indices),
+                        last_page_lens: seat.map_or(pool.last_page_lens, |seat| seat.last_page_lens),
+                        row_valid: skip(pool.row_valid, 0, window.rows),
+                        ..*pool
+                    };
+                }
                 KvPool {
                     page_indptr: skip(pool.page_indptr, window.lane_offset, window.lanes + 1),
                     last_page_lens: skip(pool.last_page_lens, window.lane_offset, window.lanes),
@@ -802,7 +987,7 @@ impl<'c> Run<'c> {
                     ..*pool
                 }
             }
-            CachePool::Kv(_) => panic!(
+            CachePool::Kv { .. } => panic!(
                 "value {} is a paged kv space, and this op scans a recurrent state pool",
                 id.0
             ),
@@ -879,20 +1064,38 @@ impl<'c> Run<'c> {
                     plan.0
                 )
             });
-        let window = self.window().span;
-        let first = window.lane_offset as usize;
-        let lanes = window.lanes as usize;
+        let window = self.window();
+        let span = window.span;
+        // **A GATHERED WINDOW'S TWINS ARE THE ONES RE-CUT WITH ITS LANES.**
+        // The comment on `Planning` says a slice is the whole adaptation
+        // because "the window is contiguous in lanes"; a copy's is not, so
+        // the builder gets the union's vectors — the page bounds as a fresh
+        // prefix sum over the compacted page-id list, the kv lengths lane by
+        // lane in gathered order. `num_requests` is the union's lane count,
+        // which is what makes the ONE schedule cover every run.
+        let (kv_indptr, kv_len) = match window.gathered.as_ref().and_then(|g| g.spaces.get(*space as usize)) {
+            Some(gathered) => (
+                gathered.page_indptr_host.as_slice(),
+                gathered.kv_len_host.as_slice(),
+            ),
+            None => {
+                let first = span.lane_offset as usize;
+                let lanes = span.lanes as usize;
+                (
+                    seat.kv_indptr
+                        .get(first..=first + lanes)
+                        .unwrap_or(&seat.kv_indptr),
+                    seat.kv_len
+                        .get(first..first + lanes)
+                        .unwrap_or(&seat.kv_len),
+                )
+            }
+        };
         Planning {
-            kv_indptr: seat
-                .kv_indptr
-                .get(first..=first + lanes)
-                .unwrap_or(&seat.kv_indptr),
-            kv_len: seat
-                .kv_len
-                .get(first..first + lanes)
-                .unwrap_or(&seat.kv_len),
+            kv_indptr,
+            kv_len,
             shape: Shape {
-                num_requests: window.lanes,
+                num_requests: span.lanes,
                 ..schedule.shape
             },
             window: schedule.window,

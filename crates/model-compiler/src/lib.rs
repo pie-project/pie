@@ -24,7 +24,8 @@
 //! P2 regions     coalesce adjacent nodes with equal (mask, phase)
 //! P3 lowering    per region: always-launch (default) | SWITCH | IF
 //! P4 layout      C1P over structural consumers -> global class order
-//! P5 phases      Struct-output nodes -> prepare, rest -> capture
+//! P5 phases      Struct-output nodes -> prepare, rest -> capture, and the
+//!                prepare half hoisted in front of the capture half (§5)
 //! P6 streams     dep DAG over capture regions -> fork/join events
 //! P7 arena       liveness carve; offsets fully static
 //! P8 emit        Baked
@@ -124,7 +125,16 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     struct_readers_share_one_window(plan, &classes)?;
 
     // P5 then P2: phase per node, then maximal runs of equal (mask, phase).
-    let regions = region::coalesce(plan, &classes);
+    let mut regions = region::coalesce(plan, &classes);
+
+    // P5's second half: THE PREPARE HALF RUNS FIRST, WHOLE (design §5). A
+    // model text may state its plan builds anywhere it likes — qwen3.6 states
+    // the multi-token-prediction head's after the trunk, because the head IS
+    // after the trunk — and `coalesce` keeps program order, so without this
+    // the artifact carries a host op standing after the graph reads its slot.
+    // It runs HERE, before P3, so that every pass below reads one region table
+    // and no pass has to know that a second order exists.
+    region::hoist(plan, &mut regions)?;
 
     // P3. Which regions enter the graph behind a conditional node — and P6
     // below reads the answer, because `stream::forkable` refuses to fork one
@@ -132,7 +142,6 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // rather than a preference: a conditional body is a child graph and a
     // fork's event pair is an edge inside one parent graph, so an arm that
     // was both is a dependency that cannot be expressed (see [`lowering`]).
-    let mut regions = regions;
     lowering::lower(plan, &mut regions, &classes, budgets, profile);
 
     // P6. The dep DAG over the capture regions, the cost gate, the streams

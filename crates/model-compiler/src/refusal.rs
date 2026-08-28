@@ -112,6 +112,38 @@ pub enum Refusal {
         /// The classes the reader runs in.
         consumed: Vec<usize>,
     },
+    /// A prepare node that reads an activation a capture node computed.
+    ///
+    /// **THE PRECONDITION OF P5's HOIST, ASKED OUT LOUD** (design §5). Prepare
+    /// work is host work — a `std::vector`, a work estimate, a pageable upload
+    /// — and host work inside `cudaStreamBeginCapture` is either refused by
+    /// the driver or, worse, recorded as nothing. So the prepare half of the
+    /// template runs BEFORE the capture half, whole, and `region::hoist` moves
+    /// it there; `driver::fire::walk`'s rule 3 is the same claim asked of the
+    /// artifact.
+    ///
+    /// The move is sound exactly while nothing in the prepare half needs a
+    /// number the graph has not computed yet. A `Ty::Struct` definer is
+    /// supposed to be a plan build over CACHE GEOMETRY and RUNTIME INPUTS —
+    /// the indptr, the page indices, the last-page length — every one of which
+    /// the driver binds before the fire begins, and every one of which is a
+    /// `Def::Input`. One that reads an activation instead is a plan build that
+    /// cannot be hoisted and a capture that cannot contain it: there is no
+    /// instant that is both after the activation and before the graph.
+    ///
+    /// Refused rather than half-hoisted, because the alternative is a template
+    /// whose two halves each look fine and whose composition reads a slot
+    /// before it was written. The model text's answer is to compute the number
+    /// the plan build wants on the host, as a runtime input, rather than in
+    /// the graph.
+    HoistBlocked {
+        /// The prepare node — the `Ty::Struct` definer.
+        node: u32,
+        /// The value it reads that a capture node produces.
+        value: ValueId,
+        /// The capture node that produces it.
+        produced_by: u32,
+    },
 }
 
 /// Which of the IR's two column-sharing rules a [`Refusal::Mismatch`] is
@@ -238,6 +270,19 @@ impl Display for Refusal {
                  carving, not a table that slices: the reader hands it boundaries \
                  rebased to ITS window and the work items index past their end. The \
                  model text mints a second plan value for the second reader",
+                value.0,
+            ),
+            Refusal::HoistBlocked {
+                node,
+                value,
+                produced_by,
+            } => write!(
+                f,
+                "prepare node {node} reads v{}, which capture node {produced_by} computes. \
+                 A prepare op is host work that a captured graph cannot contain, so P5 \
+                 hoists the whole prepare half in front of the capture half — and there \
+                 is no instant that is both after an activation and before the graph. \
+                 The model text computes that number as a runtime input instead",
                 value.0,
             ),
         }

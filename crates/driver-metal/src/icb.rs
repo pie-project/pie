@@ -131,6 +131,20 @@ pub struct Icb {
     /// Reservation identity → the retained buffer, so a rebind can move an
     /// offset without re-resolving a handle table that has been rewound.
     slabs: HashMap<u64, Slab>,
+    /// The device-side rebind, once a derived table has been lowered into it
+    /// (`crate::rebind`). `None` until [`Icb::attach`], and this buffer is
+    /// rewritten by the HOST meanwhile — which is what keeps the shader an
+    /// ADDITION rather than a fork.
+    rebinder: Option<crate::rebind::Rebinder>,
+    /// Whether something other than the host rebind last wrote the commands.
+    ///
+    /// **TWO REBINDS, ONE BUFFER, AND NEITHER TRUSTS THE OTHER'S RECORD.**
+    /// `rebind` diffs against `built`; the shader diffs against its own
+    /// `live` words. A fire through one after a fire through the other would
+    /// diff against a record of somebody else's writes, so each marks the
+    /// other stale and a stale rebind writes every component rather than the
+    /// ones it believes moved.
+    stale: bool,
 }
 
 // SAFETY: as `Buffer` and `Pipelines` — the Metal objects here are
@@ -144,6 +158,7 @@ impl std::fmt::Debug for Icb {
             .field("slots", &self.built.len())
             .field("residents", &self.residents.len())
             .field("constants", &self.constants.bytes())
+            .field("rebinder", &self.rebinder)
             .finish()
     }
 }
@@ -171,6 +186,85 @@ impl Icb {
     #[must_use]
     pub fn constant_bytes(&self) -> u64 {
         self.constants.bytes()
+    }
+
+    /// Lower a derived [`DescriptorAbi`](crate::abi::DescriptorAbi) into the
+    /// device tables `icb::rebind` reads, so this buffer can be rewritten by
+    /// the GPU from the descriptor alone.
+    ///
+    /// `room` is how many bytes of packed fire descriptor to reserve — a
+    /// number the caller has, since it is `FireDescriptor::bytes()` at the
+    /// widest batch its budgets admit.
+    ///
+    /// # Errors
+    ///
+    /// As `crate::rebind::lower`: [`Fault::Unstructured`] when the table is
+    /// not this buffer's, [`Fault::Ceiling`] past the shader's fixed arrays,
+    /// [`Fault::Shader`] for an arm that will not compile.
+    pub fn attach(
+        &mut self,
+        device: &Context,
+        pipelines: &Pipelines,
+        abi: &crate::abi::DescriptorAbi,
+        room: u64,
+    ) -> Result<crate::rebind::Lowered> {
+        let encoded: Vec<(u32, u32)> = self.built.iter().map(|s| (s.region, s.run)).collect();
+        let rebinder = crate::rebind::lower(
+            device,
+            pipelines,
+            &self.icb,
+            &encoded,
+            abi,
+            &self.slabs,
+            room,
+        )?;
+        let census = rebinder.census();
+        self.rebinder = Some(rebinder);
+        // The lowering says nothing about what the builder left encoded, and
+        // the first shader rebind writes every slot from scratch — so the
+        // host's record of what is in the buffer is void from here.
+        self.stale = true;
+        Ok(census)
+    }
+
+    /// Whether a derived table has been lowered into this buffer.
+    #[must_use]
+    pub fn rebinds_on_device(&self) -> bool {
+        self.rebinder.is_some()
+    }
+
+    /// What the lowering produced.
+    #[must_use]
+    pub fn lowered(&self) -> Option<crate::rebind::Lowered> {
+        self.rebinder.as_ref().map(crate::rebind::Rebinder::census)
+    }
+
+    /// One fire with no host walk at all: write the descriptor, dispatch
+    /// `icb::rebind`, execute the buffer.
+    ///
+    /// **THIS IS THE WAVE'S WHOLE CLAIM IN ONE FUNCTION.** What reaches the
+    /// device is the packed descriptor and nothing else; the grids, the
+    /// windowed cuts, the staged scalars, the arm of every entry that has two
+    /// and the reset of every slot standing in an empty window are all
+    /// computed by the GPU out of the law table lowered at load.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Unbound`] when no table was lowered, and whatever
+    /// `crate::rebind::fire` said.
+    pub fn execute_rebound(&mut self, device: &Context, descriptor: &[u8]) -> Result<()> {
+        let Icb {
+            icb,
+            built,
+            residents,
+            rebinder,
+            ..
+        } = self;
+        let rebinder = rebinder.as_mut().ok_or_else(|| Fault::Unbound {
+            what: "a lowered descriptor table, which this buffer never had one attached"
+                .to_string(),
+        })?;
+        crate::rebind::fire(rebinder, device, icb, residents, built.len(), descriptor)
     }
 
     /// Rewrite every component of every slot that this composition moves.
@@ -222,6 +316,9 @@ impl Icb {
             }
         }
 
+        // A buffer the shader last wrote is a buffer this record does not
+        // describe, so every slot is written again rather than diffed.
+        let forced = std::mem::take(&mut self.stale);
         let mut moved = Rebound::default();
         for (key, slots) in &held {
             match wanted.get(key) {
@@ -232,7 +329,7 @@ impl Icb {
                     // skipped with no error, and a barriered slot that merely
                     // exits immediately still costs 2.13 µs.
                     for index in slots {
-                        if self.built[*index].live {
+                        if self.built[*index].live || forced {
                             unsafe { self.icb.indirectComputeCommandAtIndex(*index).reset() };
                             self.built[*index].live = false;
                             moved.turned_off += 1;
@@ -254,10 +351,22 @@ impl Icb {
                         });
                     }
                     for (index, source) in slots.iter().zip(theirs) {
-                        self.slot(device, pipelines, *index, &taped.slots[*source], &mut moved)?;
+                        self.slot(
+                            device,
+                            pipelines,
+                            *index,
+                            &taped.slots[*source],
+                            forced,
+                            &mut moved,
+                        )?;
                     }
                 }
             }
+        }
+        // And the shader's own record is void for the same reason this one
+        // was: the host has just written every command it names.
+        if let Some(rebinder) = self.rebinder.as_mut() {
+            rebinder.desync()?;
         }
         Ok(moved)
     }
@@ -269,12 +378,13 @@ impl Icb {
         pipelines: &Pipelines,
         index: usize,
         wanted: &Slot,
+        forced: bool,
         moved: &mut Rebound,
     ) -> Result<()> {
         let command = unsafe { self.icb.indirectComputeCommandAtIndex(index) };
         // A slot that was reset holds nothing at all, so every part of it is
         // written again rather than diffed against a command that is gone.
-        let revived = !self.built[index].live;
+        let revived = forced || !self.built[index].live;
         let rearmed = revived || self.built[index].point != wanted.point;
         if rearmed {
             // The entry picked another arm — `linear`'s gemv/gemm split is the
@@ -605,6 +715,8 @@ impl<'a> Builder<'a> {
             built,
             residents,
             slabs,
+            rebinder: None,
+            stale: false,
         })
     }
 

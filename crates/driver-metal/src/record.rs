@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use kernels_metal::{ArgValue, Encode, Fire, KernelError};
 
 use crate::device::{Handles, handles::NIL};
-use crate::window::At;
+use crate::window::{At, Windows};
 
 /// One recorded argument: what the encoder would have bound, not what the
 /// entry said.
@@ -124,6 +124,19 @@ pub struct Slot {
     pub region: u32,
     /// Which run of that region's window.
     pub run: u32,
+    /// How many token rows that run's window covered.
+    ///
+    /// **NOT A COMPONENT OF THE DISPATCH, AND RECORDED ANYWAY.** Nothing an
+    /// ICB slot holds is this number; it is the walk's own reading of the
+    /// descriptor at the moment the dispatch was made. Two things downstream
+    /// need it and neither can infer it: a tiling law is a ceiling over the
+    /// window's rows (`abi::Law::Ceil`), and an entry that picks its arm off
+    /// the window picks it off this (`abi::Pick::Rows`). Deriving it from the
+    /// dispatch's own numbers instead would be a model of what the entry did,
+    /// which is the one thing this recorder does not have.
+    pub window_rows: u32,
+    /// How many lanes that run's window covered.
+    pub window_lanes: u32,
 }
 
 /// A shader point, owned rather than borrowed so a recording outlives the
@@ -206,16 +219,21 @@ impl Recording {
 pub struct Tape<'a> {
     handles: &'a Handles,
     place: &'a At,
+    /// This fire's resolved windows, read at the cursor — the one number a
+    /// row carries that the dispatch itself does not ([`Slot::window_rows`]).
+    windows: &'a Windows,
     slots: RefCell<Vec<Slot>>,
 }
 
 impl<'a> Tape<'a> {
-    /// An empty tape over one load's handle table and one walk's cursor.
+    /// An empty tape over one load's handle table, one walk's cursor and
+    /// this fire's windows.
     #[must_use]
-    pub fn new(handles: &'a Handles, place: &'a At) -> Tape<'a> {
+    pub fn new(handles: &'a Handles, place: &'a At, windows: &'a Windows) -> Tape<'a> {
         Tape {
             handles,
             place,
+            windows,
             slots: RefCell::new(Vec::new()),
         }
     }
@@ -278,13 +296,18 @@ impl Encode for Tape<'_> {
         for (at, arg) in args.iter().enumerate() {
             resolved.push(self.resolve(fire, at, *arg)?);
         }
+        let region = self.place.region.get();
+        let run = self.place.run.get();
+        let window = self.windows.at(region, run).span;
         self.slots.borrow_mut().push(Slot {
             point: Point::of(fire),
             lanes: fire.lanes,
             group: fire.group,
             args: resolved,
-            region: self.place.region.get(),
-            run: self.place.run.get(),
+            region,
+            run,
+            window_rows: window.rows,
+            window_lanes: window.lanes,
         });
         Ok(())
     }

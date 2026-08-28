@@ -254,4 +254,49 @@ __global__ void split_qkv_devwin(
     }
 }
 
+/// **THE ROW MOVEMENT `Fallback::Copy` IS MADE OF** (palo design §3).
+///
+/// A windowed consumer P4 could not seat stands over several row intervals of
+/// the fire. `gather_rows` reads those rows out of the fire-wide rectangle
+/// and lays them down as one; `scatter_rows` puts the answers back where they
+/// came from. `index[i]` is the FIRE row the `i`-th compacted row stands at,
+/// and the two kernels are the same map read in the two directions — which is
+/// what makes the pair a permutation of bytes and not an arithmetic step.
+///
+/// `U` is a COPY UNIT and never a number: the caller picks the widest one the
+/// row's byte width and both addresses admit, so a bf16 activation and an f32
+/// log-sum-exp move through the same kernel and neither is rounded, promoted
+/// or canonicalised on the way.
+template <class U>
+__global__ void gather_rows(
+    const U* __restrict__ wide,
+    U* __restrict__ tight,
+    const i32* __restrict__ index,
+    int units)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    const U* src = wide + static_cast<long long>(index[n]) * units;
+    U* dst = tight + static_cast<long long>(n) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
+template <class U>
+__global__ void scatter_rows(
+    const U* __restrict__ tight,
+    U* __restrict__ wide,
+    const i32* __restrict__ index,
+    int units)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    const U* src = tight + static_cast<long long>(n) * units;
+    U* dst = wide + static_cast<long long>(index[n]) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
 }

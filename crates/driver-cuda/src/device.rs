@@ -25,6 +25,8 @@
 pub mod alloc;
 pub mod ctx;
 pub mod graph;
+/// **PROBE ONLY** (`palo cuda-abi` wave): captured-graph introspection.
+pub mod nodes;
 
 pub use alloc::Buffer;
 pub use ctx::{Context, present};

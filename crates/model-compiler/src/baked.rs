@@ -380,9 +380,11 @@ impl LayoutOrder {
 ///
 /// A row here names a consumer the C1P instance could not seat — see
 /// [`crate::layout`] for which one gets withdrawn and why — and
-/// `driver::fire::fallback` is what reads it: [`Fallback::Split`] is served at
-/// every bucket, and the [`Fallback::Copy`] this table asks for below the
-/// crossover is a performance debt rather than an unimplemented one.
+/// `driver::fire::fallback` is what reads it, at the bucket the fire landed in
+/// (`fallback::answer_at`): [`Fallback::Split`] is what every shell serves, and
+/// [`Fallback::Copy`] is served by a shell that publishes a row gather and says
+/// so (`fallback::Serve`) — `driver-cuda` does; `driver-metal` does not, and
+/// splits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FallbackTable {
     /// One row per (node, bucket range) that needs one.

@@ -306,6 +306,35 @@ impl Frame {
             .expect("the pass is open until `commit` closes it")
     }
 
+    /// Close the open pass and open another in the same command buffer.
+    ///
+    /// **THE ONE PLACE A FIRE NEEDS TWO PASSES, AND IT IS WHY.** The rebind
+    /// shader WRITES the indirect command buffer that the call after it
+    /// EXECUTES, and an `executeCommandsInBuffer:` in the same pass as the
+    /// dispatch that wrote the commands would be reading them concurrently:
+    /// a compute pass is serial between dispatches, and
+    /// `executeCommandsInBuffer:` is not a dispatch. Two passes in one
+    /// command buffer is the ordering Metal states for that — the second
+    /// encoder observes everything the first one wrote — and it costs one
+    /// encoder open rather than a second commit.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Deviceless`] off Apple, [`Fault::Device`] when the command
+    /// buffer would not open another pass.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
+        }
+        let encoder = self.buffer.computeCommandEncoder().ok_or(Fault::Device {
+            call: "computeCommandEncoder",
+            why: "the command buffer would not open a second compute pass".to_string(),
+        })?;
+        self.encoder = Some(encoder);
+        Ok(self.encoder.as_deref().expect("just opened"))
+    }
+
     /// Close the pass, commit the buffer, and wait for the device.
     ///
     /// # Errors

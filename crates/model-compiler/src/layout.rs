@@ -57,7 +57,25 @@
 //! copy-free. So the pass WITHDRAWS the offending constraint, restores the
 //! tree it had, and writes the consumer's nodes into the
 //! [`FallbackTable`](crate::FallbackTable). See [`menu`] for the cost model
-//! and [`insertion_order`] for which constraint gets withdrawn.
+//! and [`choose`] for which constraint gets withdrawn.
+//!
+//! # The menu grew an entry, and it grew a seat rather than an opinion
+//!
+//! `Fallback::Grouped` — one launch that walks a segment list instead of `r`
+//! launches over `r` rectangles — was a typed seam nothing constructed,
+//! because choosing it means knowing that some backend has such a kernel and
+//! this crate has no dependency that could tell it. [`DeviceProfile::grouped`]
+//! is that dependency, inverted: the caller names the ops, by
+//! `Operands::name`, exactly as it names the workspace-exclusive ones. A mask
+//! every stating region [`composed_of`] such ops gets `Grouped` from [`menu`],
+//! at every bucket. An empty list — the default — is the pass as it was.
+//!
+//! WHAT IT DOES NOT CHANGE IS WHICH CONSUMER LOSES. That is
+//! [`choose`], it is decided by COST — and a groupable consumer is nearly
+//! free to lose, since `Grouped` is one launch where a split is `r`. So
+//! naming an op in [`DeviceProfile::grouped`] is also what makes its window
+//! the cheap one to withdraw: the score window keeps its interval, the
+//! correction takes a segment list, and neither pays a split.
 
 mod pq;
 
@@ -83,6 +101,14 @@ pub use pq::{Leaf, PqTree};
 /// pass declining is what keeps it from being stated in two places that could
 /// disagree.
 const MAX_CLASSES: usize = u8::MAX as usize + 1;
+
+/// The most distinct masks this pass will search exhaustively over.
+///
+/// `2^k` tree builds, once per load. See [`choose`] for why `k` is small by
+/// construction and stays that way: it counts the DISTINCT guard masks a
+/// model text states, not the classes those guards name. The catalog's
+/// widest text is 7 against 16 classes.
+const MAX_SEARCH_MASKS: usize = 12;
 
 /// The row count at which splitting a GEMM stops losing to copying its rows
 /// contiguous, and the device that number was measured on.
@@ -141,15 +167,15 @@ pub(crate) fn seriate(
         matrix.entry(mask).or_default().push(r);
     }
 
-    let mut tree = PqTree::universe(count);
-    let mut withdrawn: Vec<Vec<Leaf>> = Vec::new();
-    for mask in insertion_order(&matrix) {
-        // `reduce` is atomic: a `false` leaves the tree exactly as it was, so
-        // withdrawing the constraint is nothing more than not counting it.
-        if !tree.reduce(&mask) {
-            withdrawn.push(mask);
-        }
-    }
+    // Asked once here because the answer is wanted in two places and a second
+    // walk of the plan is a second answer waiting to disagree: could a shell
+    // serve this consumer GROUPED?
+    let groupable: BTreeMap<&Vec<Leaf>, bool> = matrix
+        .iter()
+        .map(|(mask, stated_by)| (mask, composed_of(plan, regions, stated_by, &profile.grouped)))
+        .collect();
+
+    let (tree, withdrawn) = choose(plan, regions, &matrix, &groupable, count, profile);
 
     let mut rows: Vec<FallbackRow> = Vec::new();
     for mask in &withdrawn {
@@ -160,7 +186,12 @@ pub(crate) fn seriate(
         // one kernel over pointer plus extent — the free case, spelled in the
         // menu's own vocabulary rather than by omitting the row and leaving
         // the day a stability pick chooses differently to fend for itself.
-        let answer = menu(PqTree::runs(tree.frontier(), mask), budgets, profile);
+        let answer = menu(
+            PqTree::runs(tree.frontier(), mask),
+            groupable[mask],
+            budgets,
+            profile,
+        );
         for &r in &matrix[mask] {
             for node in regions[r].nodes.clone() {
                 rows.extend(answer.iter().map(|(buckets, fallback)| FallbackRow {
@@ -232,41 +263,218 @@ fn gather_absorbs(_plan: &Plan, _region: &Region) -> bool {
     false
 }
 
+/// Is every region that stated this mask composed ENTIRELY of ops the caller
+/// named?
+///
+/// **THE ANSWER IS THE CALLER'S AND THE QUESTION IS THIS PASS'S**
+/// (decision #24). Two profile lists ask it. [`DeviceProfile::grouped`] asks
+/// "could a shell serve this consumer as one launch over a segment list" —
+/// `gather_absorbs` above settles that a correction's rows are a SLICE and so
+/// belong in the constraint matrix, but says nothing about what a withdrawn
+/// one does, and design §3's menu has an entry for exactly this: "gather the
+/// rows into one contiguous block, run once", which for an op whose weight
+/// side is already runtime-indexed degenerates into "hand the kernel the
+/// intervals and let it walk them". Whether a backend has such a kernel is a
+/// fact about a kernel table this crate has no dependency on, so it arrives by
+/// op name, exactly as [`DeviceProfile::exclusive`] does.
+///
+/// **EVERY NODE, NOT ANY NODE.** A region is dispatched as a unit — P2
+/// coalesced these nodes precisely because they share a mask, and the walk
+/// loops over the region's whole node range once per launch — so one launch
+/// for the region means one launch for every node in it. A region holding one
+/// groupable op beside one that is not is a region that must still be split,
+/// and answering `true` for it would be this pass promising a launch count the
+/// walk cannot deliver and the second op cannot survive.
+///
+/// An empty list answers `false` for everything, which is the status quo and
+/// the default for both.
+fn composed_of(plan: &Plan, regions: &[Region], stated_by: &[usize], names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    stated_by.iter().all(|&r| {
+        regions[r].nodes.clone().all(|node| {
+            plan.nodes.get(node as usize).is_some_and(|node| {
+                names
+                    .iter()
+                    .any(|named| named == model_ir::Operands::name(&node.op))
+            })
+        })
+    })
+}
+
 /// The order constraints are offered to the tree in: MOST CLASSES FIRST, ties
 /// broken by the mask itself so that a bake is a function of its inputs.
 ///
-/// WHY DESCENDING, AND WHAT IT REALLY BUYS. The greedy is "insert until one
-/// fails, withdraw that one", so the insertion order decides WHICH consumer
-/// pays when the family is not C1P — the loser is always a late arrival. Two
-/// arguments point the same way:
+/// **P3 AND P6'S TABLE, READ A THIRD TIME.** `DeviceProfile::family_us` is
+/// where a deployment that profiled its own kernels puts the answer, and the
+/// conditional gate and the fork gate already ask it "how expensive is this
+/// region". A cost model of this pass's own would be a second answer to the
+/// same question, free to disagree with theirs.
 ///
-/// - **Cost.** A mask's class count is, near enough, the width of the window
-///   the consumer runs over. The fallback is paid in that window's rows —
-///   `2 x bytes` for a copy, `r` launches for a split — so withdrawing the
-///   SMALLEST set is withdrawing the cheapest one to lose. That is the
-///   argument that survives; it is about the objective rather than about the
-///   algorithm.
-/// - **Freedom.** Design §3's reading is that a bigger set constrains less.
-///   It is true at the ends and a heuristic in between: one set of size `k`
-///   over `n` classes leaves `(n-k+1)! · k!` orderings, which is `24` at both
-///   `k = 1` and `k = n` — no constraint at all — and ties at `12` for `k = 2`
-///   and `k = 3` over four classes. So the ordering by size is not monotone in
-///   how much freedom it costs, and it is the cost argument above, not this
-///   one, that decides the direction.
+/// WHY NODES AND NOT ROWS, AND WHY THAT IS ENOUGH TO RANK. What a withdrawal
+/// actually costs is `node_cost x (fallback_ratio - 1)`, summed over the
+/// buckets a deployment fires at and weighted by how often the composition
+/// straddles at all — and neither factor is known here (`CROSSOVER_ROWS` is
+/// one measured point, and the composition distribution is the engine's).
+/// What IS known is that both factors are near enough common across the
+/// candidates of one plan for the ranking to survive dropping them: on
+/// qwen35-d0.8b the two feasible withdrawals fragment in 158 and 159 of the
+/// 255 compositions, so the choice is decided by the nodes alone — 24 linear
+/// nodes at 40 us against 6 attention nodes at 60 us, a factor of 2.65. The
+/// day the engine reports its own distribution, THIS is the function that
+/// grows the weight, and nothing above it moves.
+///
+/// **AND A GROUPABLE CONSUMER IS NEARLY FREE TO LOSE, WHICH IS WHY THE TWO
+/// FEATURES COMPOSE.** `Fallback::Grouped` is one launch over a segment list
+/// where a split is `r` — the kernel walks the intervals itself and no bytes
+/// move — so withdrawing such a mask costs the fire almost nothing and this
+/// returns almost nothing for it. That is what makes the search pick it: on
+/// qwen3.5 the adapter window is 24 linear nodes against the score window's 6
+/// attention ones and would never lose on cost alone, but a shell that names
+/// `linear.lora_correct` makes it the cheap one, the score window keeps its
+/// interval, and NEITHER pays a split. The factor is a placeholder — one
+/// launch against `r` is not literally free — held above zero so that a
+/// groupable mask still loses to withdrawing nothing at all.
+fn withdrawal_cost(
+    plan: &Plan,
+    regions: &[Region],
+    rows: &[usize],
+    groupable: bool,
+    profile: &DeviceProfile,
+) -> f32 {
+    let discount = if groupable { GROUPED_DISCOUNT } else { 1.0 };
+    discount * rows.iter()
+        .flat_map(|&r| regions[r].nodes.clone())
+        .filter_map(|node| plan.nodes.get(node as usize))
+        .map(|node| profile.family_us.of(&node.op))
+        .sum::<f32>()
+}
+
+/// What a groupable consumer's withdrawal costs, as a fraction of a split's.
+///
+/// A PLACEHOLDER WITH A DIRECTION, not a measurement. What a grouped launch
+/// actually costs over a seated one is the segment loop's own overhead, and
+/// nobody has measured it for any op; what is known is that it is one launch
+/// where the alternative is `r`, and that the PoC measured 681 recorded nodes
+/// against 825 on a four-interval qwen3.5 fire. Small enough that a groupable
+/// mask loses to any other candidate, large enough that withdrawing nothing
+/// still wins.
+const GROUPED_DISCOUNT: f32 = 0.05;
+
+/// The tree that ships, and the masks it makes no promise to.
+///
+/// **EXACT, NOT GREEDY, AND THE INSTANCE IS WHY.** Choosing a minimum-weight
+/// set of rows to delete so that a 0/1 matrix has the consecutive-ones
+/// property is NP-hard in general. It is not hard HERE, because `k` — the
+/// number of DISTINCT guard masks — is small by construction: a model text
+/// states one or two per split site, so `k` grows with the facts a text
+/// splits on, roughly `2F`, and NOT with the `2^F` classes those facts name.
+/// Today's catalog runs `k` of 2, 4, 6 and 7 against class counts of 2, 3, 8
+/// and 16. At `k = 7` the whole power set is 128 tree builds, once per load,
+/// and the answer is the optimum rather than an approximation of it.
+///
+/// WHAT THE OLD ORDER GOT WRONG, AND IT WAS NOT THE ALGORITHM. The greedy
+/// this replaces inserted masks by descending class count and withdrew
+/// whichever failed — and on qwen35-d0.8b all four size-four masks tie, so
+/// the loser was decided by `BTreeMap`'s lexicographic order on CLASS
+/// INDICES, which is to say by the bit numbers the model text happened to
+/// give its facts. `captures_scores` paid because it is `fact(3)` and
+/// `has_adapter` is `fact(1)`. Swapping those two declarations would have
+/// moved a 2.65x cost with nothing in the tree to say so, and `Predicate`'s
+/// own note — "a bit is a POSITION AND NOTHING ELSE" — would have been false
+/// while reading as true. A cost never reads a class index, so the property
+/// holds by construction here rather than by care.
+///
+/// Ties keep the lowest candidate word, so a bake is still a function of its
+/// inputs (`tests/every_sku_seriates_its_classes.rs` pins that).
+fn choose(
+    plan: &Plan,
+    regions: &[Region],
+    matrix: &BTreeMap<Vec<Leaf>, Vec<usize>>,
+    groupable: &BTreeMap<&Vec<Leaf>, bool>,
+    count: usize,
+    profile: &DeviceProfile,
+) -> (PqTree, Vec<Vec<Leaf>>) {
+    let masks: Vec<&Vec<Leaf>> = matrix.keys().collect();
+    let costs: Vec<f32> = masks
+        .iter()
+        .map(|mask| withdrawal_cost(plan, regions, &matrix[*mask], groupable[*mask], profile))
+        .collect();
+
+    if masks.len() > MAX_SEARCH_MASKS {
+        return concede(&masks, &costs, count);
+    }
+
+    // `drop` is a bitmask over `masks`, ascending, so `0` — withdraw nothing —
+    // is tried first and wins outright when the family is C1P. A strict `<`
+    // keeps the earliest candidate on a tie, and a superset of a feasible set
+    // is feasible at a higher cost, so nothing needs to be said about
+    // minimality: the cheapest feasible set is minimal or it would not be the
+    // cheapest.
+    let mut best: Option<(f32, u32, PqTree)> = None;
+    for drop in 0u32..(1 << masks.len()) {
+        let cost: f32 = (0..masks.len())
+            .filter(|i| drop >> i & 1 == 1)
+            .map(|i| costs[i])
+            .sum();
+        if best.as_ref().is_some_and(|(held, _, _)| cost >= *held) {
+            continue;
+        }
+        let mut tree = PqTree::universe(count);
+        if !(0..masks.len())
+            .filter(|i| drop >> i & 1 == 0)
+            .all(|i| tree.reduce(masks[i]))
+        {
+            continue;
+        }
+        best = Some((cost, drop, tree));
+    }
+
+    let (_, drop, tree) = best.expect("withdrawing every mask leaves a universe tree");
+    let withdrawn = (0..masks.len())
+        .filter(|i| drop >> i & 1 == 1)
+        .map(|i| masks[i].clone())
+        .collect();
+    (tree, withdrawn)
+}
+
+/// The search's fallback past [`MAX_SEARCH_MASKS`]: offer the constraints
+/// MOST EXPENSIVE FIRST and withdraw whatever will not go in.
 ///
 /// A LATER ITEM, DOCUMENTED HERE BECAUSE THIS IS WHERE IT LANDS. Tucker's
 /// forbidden-submatrix characterisation (Tucker, JCTB 1972) turns an
 /// infeasible instance into a CERTIFICATE — the exact set of mutually
-/// conflicting consumers — so the planner can withdraw the one that is
-/// cheapest across the whole conflict instead of the one that happened to
-/// arrive last. That is a strictly better cut point and it needs the
-/// certificate, which needs the null tree this pass deliberately never builds.
-fn insertion_order(matrix: &BTreeMap<Vec<Leaf>, Vec<usize>>) -> Vec<Vec<Leaf>> {
-    // `BTreeMap` yields the masks in ascending lexicographic order and the
-    // sort below is stable, so equal-sized masks keep it.
-    let mut masks: Vec<Vec<Leaf>> = matrix.keys().cloned().collect();
-    masks.sort_by_key(|mask| std::cmp::Reverse(mask.len()));
-    masks
+/// conflicting consumers — which is what the search below stops needing at
+/// this scale and would want again past [`MAX_SEARCH_MASKS`], where the
+/// exhaustive enumeration gives way to this greedy.
+///
+/// The same greedy the exhaustive search degenerates to, ordered by the same
+/// number it optimises, so the two agree wherever both are affordable and the
+/// cheap consumer is the one that loses either way. No catalog text reaches
+/// this path today; it is here because a `2^k` with no ceiling is a load-time
+/// hang waiting for a text nobody has written yet.
+fn concede(masks: &[&Vec<Leaf>], costs: &[f32], count: usize) -> (PqTree, Vec<Vec<Leaf>>) {
+    let mut order: Vec<usize> = (0..masks.len()).collect();
+    // Descending cost; the mask itself breaks ties, so a bake is a function of
+    // its inputs here too.
+    order.sort_by(|&a, &b| {
+        costs[b]
+            .partial_cmp(&costs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| masks[a].cmp(masks[b]))
+    });
+
+    let mut tree = PqTree::universe(count);
+    let mut withdrawn = Vec::new();
+    for i in order {
+        // `reduce` is atomic: a `false` leaves the tree exactly as it was, so
+        // withdrawing the constraint is nothing more than not counting it.
+        if !tree.reduce(masks[i]) {
+            withdrawn.push(masks[i].clone());
+        }
+    }
+    (tree, withdrawn)
 }
 
 /// What one withdrawn consumer does instead, per bucket range.
@@ -277,21 +485,41 @@ fn insertion_order(matrix: &BTreeMap<Vec<Leaf>, Vec<usize>>) -> Vec<Vec<Leaf>> {
 /// that declared no bucket lattice has one implicit bucket at
 /// [`Budgets::max_tokens`], and gets one row covering it.
 ///
-/// THE OTHER TWO ITEMS ON DESIGN §3'S MENU ARE NOT CHOSEN, AND NOT BECAUSE
-/// THEY ARE WORSE. [`Fallback::Grouped`] is the option tart expects to
-/// dominate both of these, and it needs a kernel that takes a pointer/offset
+/// **[`Fallback::Grouped`] IS CHOSEN WHEN, AND ONLY WHEN, THE CALLER SAID ITS
+/// KERNEL EXISTS** ([`groupable`], [`DeviceProfile::grouped`]). The standing
+/// note here was that the entry "needs a kernel that takes a pointer/offset
 /// list — a fact about the backend's kernel table, which this crate has no
-/// dependency on and no business inventing. [`Fallback::View`] needs a
-/// consumer that takes a stride or an index list for free, which is the same
-/// fact. Both variants exist on the enum so that a shell with the answer has
-/// somewhere to put it; choosing one here would be this crate claiming to know
-/// what a kernel it has never seen supports.
-fn menu(runs: u32, budgets: &Budgets, profile: &DeviceProfile) -> Vec<(Range<u32>, Fallback)> {
+/// dependency on and no business inventing", and that is still true; what
+/// changed is that the fact now has a seat to arrive in, so declining is no
+/// longer the only honest answer available.
+///
+/// It is written at EVERY bucket, and that is a claim rather than a shrug. The
+/// split/copy cut above exists because a split's cost is `r` launches and `r`
+/// partial tiles, which loses at decode scale and wins at prefill scale, while
+/// a copy's cost is `2 x bytes` at every scale — two curves, so a crossover. A
+/// grouped launch pays neither: one launch, no copy, and the segments are the
+/// same rows the split would have run over. There is no scale at which it
+/// loses to a thing that does strictly more work, so there is no cut point to
+/// state, and stating one anyway would be inventing a second number nobody
+/// measured.
+///
+/// [`Fallback::View`] is still not chosen, for the reason `Grouped` was not:
+/// it needs a consumer that takes a stride or an index list for free, and no
+/// profile field says which those are.
+fn menu(
+    runs: u32,
+    groupable: bool,
+    budgets: &Budgets,
+    profile: &DeviceProfile,
+) -> Vec<(Range<u32>, Fallback)> {
     let lattice: &[u32] = if budgets.buckets.is_empty() {
         std::slice::from_ref(&budgets.max_tokens)
     } else {
         &budgets.buckets
     };
+    if groupable {
+        return vec![(0..lattice.len() as u32, Fallback::Grouped)];
+    }
     let crossover = CROSSOVER_ROWS * profile.sms as f32 / CROSSOVER_SMS;
     let cut = lattice
         .iter()
@@ -405,15 +633,19 @@ mod tests {
     #[test]
     fn the_one_consumer_that_cannot_be_seated_is_the_one_that_pays() {
         // {A,B}, {B,C}, {C,A} over the first three classes: pairwise
-        // overlapping, no common interval order. The greedy seats the first
-        // two and withdraws the third; the plan is NOT refused, and the two
-        // that were seated keep their promise.
+        // overlapping, no common interval order, so exactly one of the three
+        // must pay. The plan is NOT refused, and the two that were seated keep
+        // their promise. The diagonal is stated ONCE and the axes twice, so it
+        // is also the cheapest to lose and `choose` picks it for that reason
+        // rather than for the order it arrived in.
         let mut b = Build::new();
         let x = b.input(8);
         let y = b.op(x, 8, Cond::Always);
         b.append(y, Cond::not(fact(1))); // node 1: classes {0, 1}
-        b.append(y, either_but_not_both()); // node 2: classes {1, 2}
-        b.append(y, Cond::not(fact(0))); // node 3: classes {0, 2}
+        b.append(y, Cond::not(fact(1))); // node 2: the same window, again
+        b.append(y, either_but_not_both()); // node 3: classes {1, 2}
+        b.append(y, Cond::not(fact(0))); // node 4: classes {0, 2}
+        b.append(y, Cond::not(fact(0))); // node 5: the same window, again
         b.out(y);
 
         let baked = bake(&b);
@@ -422,7 +654,7 @@ mod tests {
 
         // Exactly one consumer fell back, and it is the diagonal one.
         let nodes: Vec<u32> = baked.fallback.rows.iter().map(|row| row.node).collect();
-        assert_eq!(nodes, [2]);
+        assert_eq!(nodes, [3]);
         assert!(PqTree::is_interval(&frontier(&baked), &[0, 1]));
         assert!(PqTree::is_interval(&frontier(&baked), &[0, 2]));
         assert!(!PqTree::is_interval(&frontier(&baked), &[1, 2]));
@@ -525,14 +757,14 @@ mod tests {
             ..Budgets::default()
         };
         assert_eq!(
-            menu(3, &budgets, &reference),
+            menu(3, false, &budgets, &reference),
             vec![(0..2, Fallback::Copy), (2..5, Fallback::Split { r: 3 })],
         );
 
         // A wider device needs more rows before a split has tiles to fill it.
         let wider = DeviceProfile::default();
         assert_eq!(
-            menu(2, &budgets, &wider),
+            menu(2, false, &budgets, &wider),
             vec![(0..3, Fallback::Copy), (3..5, Fallback::Split { r: 2 })],
         );
 
@@ -544,25 +776,154 @@ mod tests {
             ..Budgets::default()
         };
         assert_eq!(
-            menu(2, &prefill, &wider),
+            menu(2, false, &prefill, &wider),
             vec![(0..2, Fallback::Split { r: 2 })],
         );
         let decode = Budgets {
             buckets: vec![1, 2, 4],
             ..Budgets::default()
         };
-        assert_eq!(menu(2, &decode, &wider), vec![(0..3, Fallback::Copy)]);
+        assert_eq!(menu(2, false, &decode, &wider), vec![(0..3, Fallback::Copy)]);
     }
 
     #[test]
-    fn the_bigger_sets_are_offered_first() {
+    fn the_cheapest_conflicting_consumer_pays_whatever_its_class_numbers() {
+        // THE REGRESSION THIS PASS EXISTS FOR. The same three-cycle, with the
+        // cheap consumer moved onto the LEXICOGRAPHICALLY FIRST mask: `{0,1}`
+        // is stated once and the other two twice. The order this replaced
+        // offered masks by descending class count and broke the tie — all
+        // three are size two — on the class indices themselves, so it seated
+        // `{0,1}` and `{0,2}` and withdrew `{1,2}`, paying 120 to save 60
+        // because of how the model text numbered its facts. A cost never
+        // reads a class index, so the answer here is the other one.
+        let mut b = Build::new();
+        let x = b.input(8);
+        let y = b.op(x, 8, Cond::Always);
+        b.append(y, Cond::not(fact(1))); // node 1: classes {0, 1}, stated once
+        b.append(y, either_but_not_both()); // node 2: classes {1, 2}
+        b.append(y, either_but_not_both()); // node 3: the same window, again
+        b.append(y, Cond::not(fact(0))); // node 4: classes {0, 2}
+        b.append(y, Cond::not(fact(0))); // node 5: the same window, again
+        b.out(y);
+
+        let baked = bake(&b);
+        assert_eq!(baked.classes.classes.len(), 4);
+
+        let nodes: Vec<u32> = baked.fallback.rows.iter().map(|row| row.node).collect();
+        assert_eq!(nodes, [1], "the one node that is cheaper to lose than two");
+        assert!(PqTree::is_interval(&frontier(&baked), &[1, 2]));
+        assert!(PqTree::is_interval(&frontier(&baked), &[0, 2]));
+        assert!(!PqTree::is_interval(&frontier(&baked), &[0, 1]));
+    }
+
+    #[test]
+    fn the_search_and_the_greedy_agree_where_both_are_affordable() {
+        // `concede` is the path past `MAX_SEARCH_MASKS`, and nothing in the
+        // catalog reaches it — so the only thing that can keep it honest is
+        // running it beside the search on an instance small enough for both.
+        let mut b = Build::new();
+        let x = b.input(8);
+        let y = b.op(x, 8, Cond::Always);
+        b.append(y, Cond::not(fact(1)));
+        b.append(y, either_but_not_both());
+        b.append(y, either_but_not_both());
+        b.append(y, Cond::not(fact(0)));
+        b.append(y, Cond::not(fact(0)));
+        b.out(y);
+
+        let baked = bake(&b);
+        let profile = DeviceProfile::default();
+        let count = baked.classes.classes.len();
         let mut matrix: BTreeMap<Vec<Leaf>, Vec<usize>> = BTreeMap::new();
-        for mask in [vec![2, 3], vec![0, 1, 2], vec![0, 1], vec![1, 2, 3]] {
-            matrix.insert(mask, vec![0]);
+        for (r, region) in baked.regions.iter().enumerate() {
+            if constrains(&b.plan, region, count) {
+                matrix
+                    .entry(region.mask.iter().map(|c| c as Leaf).collect())
+                    .or_default()
+                    .push(r);
+            }
         }
+        let masks: Vec<&Vec<Leaf>> = matrix.keys().collect();
+        let costs: Vec<f32> = masks
+            .iter()
+            .map(|mask| withdrawal_cost(&b.plan, &baked.regions, &matrix[*mask], false, &profile))
+            .collect();
+
+        let groupable: BTreeMap<&Vec<Leaf>, bool> =
+            matrix.keys().map(|mask| (mask, false)).collect();
+        let (_, greedy) = concede(&masks, &costs, count);
+        let (_, searched) = choose(&b.plan, &baked.regions, &matrix, &groupable, count, &profile);
+        assert_eq!(greedy, searched, "costs {costs:?} over masks {masks:?}");
+        assert_eq!(searched.len(), 1, "the family is a three-cycle; one pays");
+    }
+
+
+    /// **A GROUPABLE CONSUMER IS ANSWERED AT EVERY BUCKET, AND THE COPY/SPLIT
+    /// CROSSOVER IS NOT CONSULTED.** One launch over a segment list does
+    /// strictly less work than `r` launches over `r` rectangles at every
+    /// scale, so there is no cut point — and inventing one would be inventing
+    /// a number nobody measured.
+    #[test]
+    fn a_groupable_consumer_is_answered_grouped_at_every_bucket() {
+        let budgets = Budgets {
+            buckets: vec![1, 64, 512, 1024, 8192],
+            ..Budgets::default()
+        };
+        let profile = DeviceProfile::default();
         assert_eq!(
-            insertion_order(&matrix),
-            vec![vec![0, 1, 2], vec![1, 2, 3], vec![0, 1], vec![2, 3]],
+            menu(3, true, &budgets, &profile),
+            vec![(0..5, Fallback::Grouped)],
+        );
+        // The same lattice, the same runs, the same device — and without the
+        // word, the two entries the menu has always written.
+        assert_eq!(
+            menu(3, false, &budgets, &profile),
+            vec![(0..3, Fallback::Copy), (3..5, Fallback::Split { r: 3 })],
+        );
+    }
+
+    /// **A REGION IS GROUPED AS A UNIT OR NOT AT ALL.** The walk dispatches a
+    /// region's whole node range once per launch, so one launch for the region
+    /// is one launch for every node in it — and a region holding one groupable
+    /// op beside one that is not must still be split.
+    #[test]
+    fn one_ungroupable_node_disqualifies_the_region_that_holds_it() {
+        let mut b = Build::new();
+        let x = b.input(8);
+        let y = b.op(x, 8, Cond::Always);
+        let guarded = b.op(y, 8, fact(0));
+        b.out(guarded);
+
+        assert_eq!(b.plan.nodes.len(), 2, "one shared op and one guarded one");
+        // The op the fixture's `Build::op` emits, and a name no plan states.
+        let named = model_ir::Operands::name(&b.plan.nodes[0].op).to_string();
+        let region = Region {
+            nodes: 0..2,
+            mask: model_ir::ClassSet::of([0]),
+            phase: Phase::Capture,
+            lowering: crate::Lowering::AlwaysLaunch,
+            stream: 0,
+            wait: Vec::new(),
+            open: None,
+            close: None,
+            sm_hint: None,
+            collective: false,
+        };
+        let regions = [region];
+
+        assert!(
+            composed_of(&b.plan, &regions, &[0], std::slice::from_ref(&named)),
+            "both nodes are the same op and it is named",
+        );
+        assert!(!composed_of(
+            &b.plan,
+            &regions,
+            &[0],
+            &["linear.matmul".to_string()]
+        ));
+        assert!(
+            !composed_of(&b.plan, &regions, &[0], &[]),
+            "the empty list is the status quo and groups nothing",
         );
     }
 }

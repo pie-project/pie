@@ -74,7 +74,7 @@ fn indptr(rows: &[u32]) -> Vec<i32> {
 
 #[test]
 fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
-    let (_, baked) = sku();
+    let (plan, baked) = sku();
 
     // Classes 0, 4 and 5 at once — the smallest composition that leaves the
     // score-capture window in pieces, with class 0's rows standing between
@@ -89,8 +89,17 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
     // The boundaries, in FIRE order: class 4's lane, then class 0's, then
     // class 5's.
     let boundaries = indptr(&[5, 3, 2]);
-    let windows = Windows::of(&baked, fire.classes(), &boundaries)
-        .expect("a fragmented window is a slow path, not a fault");
+    // Copies OFF: this file is the SPLIT's gate, and the copy the same
+    // table asks for below the crossover is gated in
+    // `a_copied_window_is_one_launch_over_the_same_rows.rs`.
+    let windows = Windows::of(
+        &plan,
+        &baked,
+        fire.classes(),
+        &boundaries,
+        driver_cuda::window::Copies::off(),
+    )
+    .expect("a fragmented window is a slow path, not a fault");
 
     let mut split = 0usize;
     for (at, region) in baked.template().iter().enumerate() {
@@ -157,7 +166,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
 /// did not go away with the hard fault it used to raise.
 #[test]
 fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
-    let (_, baked) = sku();
+    let (plan, baked) = sku();
 
     // A class table the shell was NOT handed by `compose`: every class one
     // row and one lane, in ASCENDING class order rather than the baked one.
@@ -188,8 +197,14 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
         .expect("some seated window is not an interval of the ascending order");
     assert_eq!(fallback::bound(&baked, &seated.mask), 1);
 
-    let refusal = Windows::of(&baked, &ascending, &indptr(&vec![1; count]))
-        .expect_err("a promise P4 made and this table broke");
+    let refusal = Windows::of(
+        &plan,
+        &baked,
+        &ascending,
+        &indptr(&vec![1; count]),
+        driver_cuda::window::Copies::off(),
+    )
+    .expect_err("a promise P4 made and this table broke");
     let said = refusal.to_string();
     assert!(said.contains("no fallback row"), "{said}");
 }

@@ -36,15 +36,53 @@ namespace pie::linear {
 // stays in L1 and no shared-memory staging is written for it; `rank` is the
 // bank's declared capacity, and an adapter registered shorter than that was
 // zero-padded at registration, which contributes exactly zero to `acc`.
+//
+// ── `segments`: `Fallback::Grouped`, and why it is NULLABLE ──────────────
+//
+// P4 lays the fire's rows out in one class order and cannot always make a
+// windowed consumer's classes an interval of it. When it cannot, the
+// correction's rows are SEVERAL intervals of the rectangle this launch was
+// handed, with rows belonging to other classes standing in the gaps. The
+// answer this file serves is design §3's `Fallback::Grouped`: instead of `r`
+// launches over `r` sub-rectangles, ONE launch over the union, told where the
+// intervals are.
+//
+// `segments` is `[segs][2]` — `(first row of this launch's rectangle, how many
+// rows)` — and `nullptr` means what it has always meant: the rows are
+// `[0, gridDim.y)` and the caller is a window P4 seated. That null arm is not
+// a compatibility shim, it is the common case, and it must stay byte-identical
+// because it is the oracle the grouped arm is checked against.
+//
+// **THE GRID IS MAX-GRID PLUS EARLY EXIT** (decision #15). `z` is the segment
+// and its extent is the artifact's load-time bound on the segment count
+// (`driver::fire::max_runs`), not this fire's; `y` is the row within the
+// segment and its extent is the longest segment. Both overshoot and both
+// return before reading anything, which is a handful of empty blocks against
+// a binary search per block or a host-side grid that moves per fire.
+//
+// **THE GAPS ARE NEVER TOUCHED, AND THAT IS THE WHOLE SAFETY ARGUMENT.** This
+// kernel writes exactly the rows the segments name, so the foreign rows inside
+// the union are read by nobody and written by nobody. A kernel that wrote
+// densely over the extent it was handed could not take this treatment — which
+// is exactly why `Attention::PrefillLse`'s split-kv fold cannot, and why the
+// profile names ops rather than backends.
 template <class T>
 __global__ void lora_combine(
     const i32* __restrict__ routes,
     const T* __restrict__ t,
     const T* __restrict__ bank_b,
     T* __restrict__ y,
+    const i32* __restrict__ segments,
+    int segs,
     int rank, int out_width, long long adapter_stride)
 {
-    const int row = blockIdx.y;
+    int row = blockIdx.y;
+    if (segments != nullptr) {
+        const int seg = blockIdx.z;
+        if (seg >= segs) return;
+        if ((int)blockIdx.y >= segments[2 * seg + 1]) return;
+        row = segments[2 * seg] + (int)blockIdx.y;
+    }
     const int adapter = routes[row];
     if (adapter < 0) return;
 

@@ -6,6 +6,7 @@ pub mod attn;
 pub mod collective;
 pub mod elemwise;
 pub mod encode;
+pub mod icb;
 pub mod layout;
 pub mod linear;
 pub mod sources;

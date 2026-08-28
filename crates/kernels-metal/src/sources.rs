@@ -50,6 +50,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("elemwise/norm_rms.metal", include_str!(concat!(source_root!(), "/elemwise/norm_rms.metal"))),
     ("elemwise/norm_vector.metal", include_str!(concat!(source_root!(), "/elemwise/norm_vector.metal"))),
     ("elemwise/rope_neox.metal", include_str!(concat!(source_root!(), "/elemwise/rope_neox.metal"))),
+    ("icb/rebind.metal", include_str!(concat!(source_root!(), "/icb/rebind.metal"))),
     ("layout/blit.metal", include_str!(concat!(source_root!(), "/layout/blit.metal"))),
     ("layout/deinterleave.metal", include_str!(concat!(source_root!(), "/layout/deinterleave.metal"))),
     ("layout/embed.metal", include_str!(concat!(source_root!(), "/layout/embed.metal"))),

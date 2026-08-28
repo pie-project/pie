@@ -34,7 +34,7 @@
 //! messages, where a failing run shows them and a passing run costs nothing.
 
 use model_compiler::{
-    Budgets, DeviceProfile, Lowering, Slot, collectives_are_never_elided, compile,
+    Budgets, DeviceProfile, Lowering, Phase, Slot, collectives_are_never_elided, compile,
 };
 use model_dsl::Platform;
 use model_ir::ValueId;
@@ -290,8 +290,25 @@ fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
+/// **THE TILING IS THE CLAIM; PROGRAM ORDER IS NOW THE CLAIM PER PHASE**
+/// (design §5). Every node still lands in exactly one region — that is what
+/// makes a region the unit the descriptor carries a row count for — but the
+/// region TABLE is no longer one ascending run over the nodes, because P5
+/// hoists the prepare half in front of the capture half
+/// (`model_compiler::region::hoist`). It has to: prepare ops are host work
+/// that writes descriptor slots the graph then reads, and a model text may
+/// state one anywhere it likes. qwen3.6 states its multi-token-prediction plan
+/// build after the trunk, and before the hoist that made every composition of
+/// that SKU unfireable.
+///
+/// So the claim is asked in three parts, and together they are stricter than
+/// the single ascending run they replace: the regions COVER every node exactly
+/// once; each PHASE's regions ascend, which is the dataflow inside the graph
+/// and a topological order among the plan builds; and every prepare region
+/// stands before every capture one, which is the property
+/// `driver::fire::walk` refuses a template for lacking.
 #[test]
-fn the_regions_tile_every_plan_in_program_order() {
+fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
@@ -300,23 +317,47 @@ fn the_regions_tile_every_plan_in_program_order() {
             let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
                 continue;
             };
-            let mut covered = 0u32;
+            // Exactly once: a node counted twice is a rectangle written twice,
+            // and a node counted never is a launch nothing emits.
+            let mut times = vec![0u32; plan.nodes.len()];
             for region in &baked.regions {
-                if region.nodes.start != covered {
-                    wrong.push(format!(
-                        "`{sku}` as {platform:?}: a region starts at {} with {covered} \
-                         nodes covered",
-                        region.nodes.start,
-                    ));
-                    break;
+                for node in region.nodes.clone() {
+                    if let Some(slot) = times.get_mut(node as usize) {
+                        *slot += 1;
+                    }
                 }
-                covered = region.nodes.end;
             }
-            if covered as usize != plan.nodes.len() {
+            let covered = times.iter().filter(|&&n| n == 1).count();
+            if covered != plan.nodes.len() {
                 wrong.push(format!(
-                    "`{sku}` as {platform:?}: the regions cover {covered} of {} nodes",
+                    "`{sku}` as {platform:?}: the regions cover {covered} of {} nodes \
+                     exactly once — {} twice or more, {} not at all",
                     plan.nodes.len(),
+                    times.iter().filter(|&&n| n > 1).count(),
+                    times.iter().filter(|&&n| n == 0).count(),
                 ));
+            }
+            // Prepare first, whole, and each half ascending inside itself.
+            let mut captured = false;
+            let mut at = [0u32; 2];
+            for (r, region) in baked.regions.iter().enumerate() {
+                let half = usize::from(region.phase == Phase::Capture);
+                if region.phase == Phase::Capture {
+                    captured = true;
+                } else if captured {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: prepare region {r} stands after the \
+                         graph body that reads its slots",
+                    ));
+                }
+                if region.nodes.start < at[half] {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: region {r} starts at {} behind {} in \
+                         its own phase",
+                        region.nodes.start, at[half],
+                    ));
+                }
+                at[half] = region.nodes.end;
             }
             // Coalescing has to actually coalesce: a plan whose every node is
             // its own region is a pass that ran and did nothing.

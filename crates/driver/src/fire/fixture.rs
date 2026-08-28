@@ -204,6 +204,19 @@ pub(crate) struct MockDispatch<'p> {
     /// An op name this backend answers `Unsupported` for — what a real one
     /// does when a family reaches a `Run` that has no kernel for it.
     pub(crate) refuse: Option<&'static str>,
+    /// Does this backend claim to serve `Fallback::Copy`?
+    ///
+    /// **OFF BY DEFAULT, WHICH IS THE SHIPPING DEFAULT TOO.** A mock that
+    /// copied unasked would make every existing split assertion in this file
+    /// a statement about a path those tests were not written for.
+    /// Claim a row gather this mock does not have to own: it records the
+    /// two calls and moves nothing, which is exactly enough to check what
+    /// the WALK does about a `Fallback::Copy` row. What the bytes come out
+    /// as is a shell's gate, not this one's. Set it directly.
+    pub(crate) copies: bool,
+    /// `(region's first node, gather or scatter)` in call order — the record
+    /// that says a copied region was bracketed exactly once.
+    pub(crate) moved: Vec<(u32, &'static str)>,
     plan: &'p Plan,
 }
 
@@ -219,9 +232,12 @@ impl<'p> MockDispatch<'p> {
             at,
             seen: Vec::new(),
             refuse: None,
+            copies: false,
+            moved: Vec::new(),
             plan,
         }
     }
+
 
     /// The node indices the walk ran, in order.
     pub(crate) fn nodes(&self) -> Vec<u32> {
@@ -302,6 +318,22 @@ impl DispatchCollective for MockDispatch<'_> {
 impl DispatchCustomCuda for MockDispatch<'_> {
     fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
         self.note(op)
+    }
+}
+
+impl crate::fire::fallback::Serve for MockDispatch<'_> {
+    fn copies(&self, _region: &model_compiler::Region) -> bool {
+        self.copies
+    }
+
+    fn gather(&mut self, region: &model_compiler::Region) -> Result<(), KernelError> {
+        self.moved.push((region.nodes.start, "gather"));
+        Ok(())
+    }
+
+    fn scatter(&mut self, region: &model_compiler::Region) -> Result<(), KernelError> {
+        self.moved.push((region.nodes.start, "scatter"));
+        Ok(())
     }
 }
 

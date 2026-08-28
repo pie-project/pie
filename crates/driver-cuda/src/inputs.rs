@@ -299,6 +299,7 @@ impl Inputs {
     /// # Errors
     ///
     /// [`Fault::Device`](crate::Fault::Device) for the allocation.
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         budgets: &Budgets,
         paging: Paging,
@@ -306,6 +307,7 @@ impl Inputs {
         facts: &Facts,
         classes: usize,
         runs: u32,
+        gathered: usize,
         sms: u32,
     ) -> Result<Inputs> {
         let rows = u64::from(budgets.max_tokens);
@@ -316,7 +318,34 @@ impl Inputs {
         // zero window every empty region shares. Reserved rather than
         // measured, because these addresses are recorded into a graph that is
         // never re-captured (the note at the top of this file).
-        let window_ints = (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1);
+        //
+        // **AND A WINDOW CARRIES MORE THAN BOUNDARIES.** Two menu entries add
+        // to the `lanes + 1` per window slot, and both are paid whether or not
+        // the shell serves them — making the STORE's layout depend on a policy
+        // word would make an address depend on it, and addresses go into
+        // graphs:
+        //
+        // - `2 * runs` for the SEGMENT LIST a `Fallback::Grouped` window
+        //   carries (`Windows::packed` stages both in the one copy). `runs` is
+        //   `driver::fire::max_runs`, the artifact's own bound on how many
+        //   intervals any mask breaks into, so the ceiling holds for every
+        //   fire this load can be handed; an artifact P4 seated whole answers
+        //   `1` and pays two ints per slot for a list it never fills.
+        // - `per_gathered` for what a GATHERED window carries beside them
+        //   (`window::Gathered`, `Fallback::Copy`): the row map the gather and
+        //   the scatter read, and per kv space the page bounds, the compacted
+        //   page-id list and the two per-lane vectors. `gathered` is
+        //   `driver::fire::fragmentable` — how many distinct masks this
+        //   artifact can ever find in pieces, which is 0 for every artifact P4
+        //   seated whole and 1 for today's qwen texts.
+        let per_gathered = rows + spaces as u64 * (3 * lanes + 1 + pages);
+        let window_slots = (classes * (classes + 1) / 2 + 1) as u64;
+        // `+ (lanes + 1)` per gathered window because it is a slot BEYOND the
+        // `k(k+1)/2 + 1` runs: `seat` deliberately does not dedupe a gathered
+        // window against a plain one of the same span (they mean two different
+        // things by that rectangle), so its own boundary vector is an extra.
+        let window_ints = window_slots * (lanes + 1 + 2 * u64::from(runs.max(1)))
+            + gathered as u64 * (per_gathered + lanes + 1);
 
         let mut at = 0u64;
         let mut take = |bytes: u64| {

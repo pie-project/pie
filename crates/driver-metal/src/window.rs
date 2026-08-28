@@ -152,9 +152,12 @@ impl Windows {
     /// a promise P4 made and this fire found broken, which is a bake-integrity
     /// failure rather than a slow path. A region P4 DID write a row for is the
     /// slow path, and is served here as `Fallback::Split { r }` at every
-    /// bucket; `driver::fire::fallback` states what that costs against the
-    /// `Fallback::Copy` the table asks for below the crossover, and why this
-    /// shell cannot yet serve it.
+    /// bucket. THE OTHER ANSWER IS NOT THIS PLANE'S YET: the table asks for
+    /// `Fallback::Copy` below the crossover and `driver-cuda` serves it, out
+    /// of a row gather (`kernels_cuda::layout::gather_rows`) and a scratch
+    /// slab; `kernels-metal` publishes neither, so this shell's
+    /// `driver::fire::Serve` impl is the default and every fragmented window
+    /// here splits.
     pub fn of(baked: &Baked, classes: &WindowTable, indptr_host: &[i32]) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(baked.template().len());
@@ -180,6 +183,18 @@ impl Windows {
                         promised: fallback::promised(baked, region).then_some(bound),
                     });
                 }
+                // **THIS PLANE SERVES `Fallback::Split` AND NOT
+                // `Fallback::Grouped`**, and the reason it need not check is
+                // that it cannot be handed one: P4 writes a `Grouped` row only
+                // for a region whose every op the caller named in
+                // `DeviceProfile::grouped`, and this shell names none (the
+                // CUDA one passes `driver_cuda::GROUPED`; see
+                // `driver_cuda::window::Windows::of` for what honouring the
+                // row costs). The day it names one, this is where the union
+                // window and its segment list go — and until then a `Grouped`
+                // row reaching here would be `driver::fire::walk` turning its
+                // launch loop once against `r` windows cut below, which
+                // computes only the first interval.
             }
             // An empty mask (a region no class demands) answers the zero
             // window, which is the same answer a composition without this

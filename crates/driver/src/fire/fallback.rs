@@ -34,19 +34,25 @@
 //! split at 1.82× the ideal against a copy's 1.07× at 64 rows, converging by
 //! 512 (`model_compiler::layout`'s `CROSSOVER_ROWS`).
 //!
-//! So a [`Fallback::Copy`] row — which is what the table asks for at every
-//! bucket below the crossover — is served as a split today, and that is a
-//! performance debt rather than a correctness one. What `Copy` needs is a
-//! scratch rectangle the fire's arena does not carve and a gather/scatter
-//! pair no `kernels` entry publishes; [`Fallback::Grouped`] and
-//! [`Fallback::View`] need the same kind of thing (an op that takes an offset
-//! list rather than a rectangle), which is exactly why `model_compiler::menu`
-//! declines to choose them. This module is where the answer is read, so this
-//! module is where a shell that grows those kernels states that it can serve
-//! them.
+//! [`Fallback::Copy`] — gather the window's scattered rows into one
+//! contiguous rectangle, run the consumer ONCE over it, scatter the answers
+//! back — is the entry the table asks for at every bucket below the
+//! crossover, and it is served now by any shell that answers [`Serve`]. It
+//! needs two things a split does not: a scratch rectangle the fire's arena
+//! deliberately does not carve (`model_compiler::arena`'s carve has no spare)
+//! and a row gather/scatter pair (`kernels_cuda::layout::gather_rows`). Both
+//! are the SHELL's, which is why the choice is asked of the shell here rather
+//! than decided for it: [`Serve::copies`] is a backend saying it has them,
+//! and a backend that has not answers `false` and gets the split it always
+//! got.
+//!
+//! [`Fallback::Grouped`] and [`Fallback::View`] still need what they always
+//! needed — an op that takes an offset list rather than a rectangle — which
+//! is exactly why `model_compiler::menu` declines to choose them.
 
 use core::ops::Range;
 
+use kernels::KernelError;
 use model_compiler::{Baked, Fallback, Phase, PqTree, Region};
 use model_ir::ClassSet;
 
@@ -61,12 +67,12 @@ use model_ir::ClassSet;
 /// `driver_cuda::Fault::Fragmented` keeps, narrowed to it.
 ///
 /// A region with rows is a region P4 could not seat and owes an answer for,
-/// and the caller's job is to pay one. The answers are returned rather than
-/// resolved against this fire's bucket because the only entry a shell serves
-/// today is [`Fallback::Split`] and it serves it at every bucket; the day one
-/// serves [`Fallback::Copy`] below the crossover, the bucket is the argument
-/// that picks between them and `FallbackRow::buckets` indexes
-/// `Budgets::buckets` to say where the cut is.
+/// and the caller's job is to pay one. The answers are returned UNRESOLVED —
+/// all of them, in lattice order — because the question "what does P4 say
+/// about this node" has more than one answer and pretending otherwise is what
+/// hid the copy for as long as it was hidden. [`answer_at`] is the resolution,
+/// and it takes the bucket because only the caller holds the lattice that
+/// `FallbackRow::buckets` indexes.
 ///
 /// The scan is linear over a table with tens of rows and is asked only about
 /// a region a fire ALREADY found fragmented, which is the rare case by
@@ -82,6 +88,172 @@ pub fn answers(baked: &Baked, nodes: Range<u32>) -> Vec<Fallback> {
     }
     found
 }
+
+/// P4's answer for one region AT ONE BUCKET, which is the resolution
+/// [`answers`] deliberately does not make.
+///
+/// **THE MENU IS BUCKET-KEYED BECAUSE THE COST MODEL IS**
+/// (`model_compiler::layout`'s `CROSSOVER_ROWS`): a two-way split of a 64-row
+/// GEMM measured 1.82x the ideal against a copy's 1.07x, and by 2048 rows
+/// they converge and the split is free. So a node owed a fallback carries two
+/// rows over a bucket lattice that straddles the crossover, and asking "what
+/// does P4 say about this node" without saying which fire is asking gets both
+/// of them back.
+///
+/// `bucket` INDEXES [`Budgets::buckets`](model_compiler::Budgets::buckets) —
+/// which is what `FallbackRow::buckets` is a range of — and a deployment that
+/// declared no lattice has one implicit bucket at index 0. The caller holds
+/// the budgets and this crate does not, which is why the index is an
+/// argument: `Composition::bucket` is the bucket's ROW COUNT, and turning
+/// that into a position is a lookup in a table only the shell has.
+#[must_use]
+pub fn answer_at(baked: &Baked, nodes: Range<u32>, bucket: u32) -> Option<Fallback> {
+    baked
+        .fallback
+        .rows
+        .iter()
+        .find(|row| nodes.contains(&row.node) && row.buckets.contains(&bucket))
+        .map(|row| row.fallback)
+}
+
+/// Is `Fallback::Copy` this artifact's answer, at this bucket, for every
+/// region standing over `mask`?
+///
+/// **THE MASK IS THE KEY AND THE NODES ARE NOT, AND A PREPARE REGION IS
+/// WHY.** A copy runs its consumer ONCE over a gathered rectangle, and a
+/// consumer of an attention schedule cannot do that unless the schedule was
+/// also carved once — over the same union of runs, at the same request count.
+/// P4 offers only capture regions to its C1P instance
+/// (`model_compiler::layout::constrains`), so the builder that carves the
+/// schedule is owed no row at all even though its window fragments in exactly
+/// the same fires as its readers'; [`promised`] already says so. If the
+/// builder split while its reader copied, the one gathered launch would read
+/// a schedule describing the first interval's lanes and index past it for
+/// every request after them — wrong logits, no fault.
+///
+/// So the question is asked of the MASK, and the builder inherits its
+/// readers' answer because it shares their window. That the two masks are
+/// equal is not a hope: `driver_cuda::window::no_schedule_straddles_its_readers`
+/// refuses a bake where they differ, at load, by name.
+///
+/// A mask no region is owed a row for answers `false` — which is every mask
+/// P4 seated, where the question never arises because the window is one
+/// interval anyway.
+#[must_use]
+pub fn copies(baked: &Baked, mask: &ClassSet, bucket: u32) -> bool {
+    baked
+        .template()
+        .iter()
+        .filter(|region| &region.mask == mask)
+        .any(|region| answer_at(baked, region.nodes.clone(), bucket) == Some(Fallback::Copy))
+}
+
+/// **THE SHELL'S HALF OF `Fallback::Copy`**: what a backend must be able to
+/// do before [`walk`](crate::fire::walk) will stop splitting.
+///
+/// A copy is three device steps around the consumer — gather the window's
+/// scattered rows into a contiguous rectangle, run the region's nodes once
+/// over it, scatter the answers back — and all three are the shell's: the
+/// rectangle is scratch the arena does not carve, and the movement is a
+/// kernel `kernels` publishes no entry for. The walk knows WHEN a copy is
+/// owed (P4's table, read by [`copies`]) and nothing about how to pay one, so
+/// the two halves meet here.
+///
+/// **THE DEFAULT IS `false`, AND THAT IS THE WHOLE COMPATIBILITY STORY.** A
+/// backend that says nothing serves every fragmented window as
+/// [`Fallback::Split`], which is what every backend did before this trait
+/// existed and is always correct — `model_compiler::layout`'s menu is a cost
+/// model, not a semantics. So `impl Serve for MyRun {}` is a complete
+/// implementation, and a shell opts in one method at a time.
+///
+/// # The contract, both ways
+///
+/// - **[`copies`](Serve::copies) is asked once per region per fire**, after
+///   the sink has been told which region this is, and before the launch loop
+///   turns. A backend that answers `true` is promising that the two calls
+///   below will succeed and that its operand resolution already points at the
+///   gathered rectangle — the walk dispatches the region's nodes exactly as
+///   it would have, and cannot tell the difference.
+/// - **the pair brackets the nodes, on the region's own stream.** Gather is
+///   enqueued before the first node and scatter after the last, inside
+///   whatever conditional and event brackets the region carries, so a copy is
+///   ordered against the region's producers and consumers the way the region
+///   itself is.
+/// - **neither runs in a prepare pass.** They are launches, and a prepare
+///   pass is host work on an open stream; the walk filters them by the same
+///   [`Phases`](crate::fire::Phases) rule it filters nodes by.
+pub trait Serve {
+    /// Does this backend serve `region`'s fragmented window as a copy in this
+    /// fire?
+    ///
+    /// Asked ONLY of a region this fire actually found in pieces, so a
+    /// backend may answer it by reading state it built for exactly those.
+    /// The honest `false` — no gather kernel, no scratch, or a deployment
+    /// that turned the path off — costs nothing but the split.
+    fn copies(&self, _region: &Region) -> bool {
+        false
+    }
+
+    /// Lay the window's scattered rows down as one rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend's row movement answered. The default is
+    /// unreachable — the walk calls it only behind a `true`
+    /// [`copies`](Serve::copies) — and refuses rather than panicking, because
+    /// a backend that overrides one method and not the other should learn it
+    /// from a fire and not from a crash.
+    fn gather(&mut self, _region: &Region) -> Result<(), KernelError> {
+        Err(unserved("gather"))
+    }
+
+    /// Put the answers back where the rows came from.
+    ///
+    /// # Errors
+    ///
+    /// As [`gather`](Serve::gather).
+    fn scatter(&mut self, _region: &Region) -> Result<(), KernelError> {
+        Err(unserved("scatter"))
+    }
+}
+
+fn unserved(half: &'static str) -> KernelError {
+    KernelError::Backend {
+        op: "fallback.copy",
+        detail: format!("this backend answered `Serve::copies` but publishes no row {half}"),
+    }
+}
+
+/// Did P4 answer [`Fallback::Grouped`] for this region — ONE launch that walks
+/// the intervals itself, rather than one launch per interval?
+///
+/// **THE ONE QUESTION `driver::fire::walk` ASKS ABOUT A FALLBACK KIND**, and
+/// the first one it has ever asked. Every other entry on the menu is served by
+/// the same loop at a different cost: `Split { r }` IS the loop, `Copy` is
+/// served as a split and owes a copy, `View` is unbuilt. `Grouped` is the one
+/// that changes the loop's TRIP COUNT, so the walk cannot serve it by reading
+/// the number of spans and must read the table instead — see that function's
+/// rule 4 for what the branch cost and why it was still the right shape.
+///
+/// P4 writes this row for a consumer whose every node the caller declared
+/// groupable ([`DeviceProfile::grouped`](model_compiler::DeviceProfile::grouped)),
+/// and it writes it at every bucket, so a `true` here is unconditional in the
+/// fire's size. A shell that reads it must serve the region's whole node range
+/// in one dispatch over the segment list; a shell that cannot must not have
+/// named the ops.
+///
+/// Asked only of a region a fire ALREADY found fragmented — for a window that
+/// covers one interval the two answers are the same launch — which keeps the
+/// linear scan on the rare path where [`answers`] puts it.
+#[must_use]
+pub fn grouped(baked: &Baked, nodes: Range<u32>) -> bool {
+    baked
+        .fallback
+        .rows
+        .iter()
+        .any(|row| nodes.contains(&row.node) && row.fallback == Fallback::Grouped)
+}
+
 
 /// The most launches a mask's window can ever cost: how many runs it breaks
 /// into under the class order the artifact SHIPS.
@@ -133,6 +305,30 @@ pub fn bound(baked: &Baked, mask: &ClassSet) -> u32 {
 #[must_use]
 pub fn promised(baked: &Baked, region: &Region) -> bool {
     region.phase == Phase::Capture && answers(baked, region.nodes.clone()).is_empty()
+}
+
+/// How many DISTINCT windows this artifact can ever have in pieces.
+///
+/// **A LOAD-TIME COUNT, AND WHAT A COPY'S STAGING IS RESERVED AGAINST.** A
+/// gathered window carries per-lane tables the fire stages beside the
+/// boundary vectors, and those addresses are recorded into graphs that are
+/// never re-captured — so the room for them is taken once, at the ceiling, in
+/// the same breath as everything else in `driver_cuda::inputs`.
+///
+/// It is the count of distinct MASKS, not of regions: sixty layers stating
+/// one window state one window, and the fire's window table deduplicates them
+/// for the same reason. Masks P4 seated are excluded, because
+/// [`bound`] is `1` for them and a window that is never in pieces is never
+/// gathered.
+#[must_use]
+pub fn fragmentable(baked: &Baked) -> usize {
+    let mut seen: Vec<&ClassSet> = Vec::new();
+    for region in baked.template() {
+        if bound(baked, &region.mask) > 1 && !seen.contains(&&region.mask) {
+            seen.push(&region.mask);
+        }
+    }
+    seen.len()
 }
 
 /// The most launches ANY region of this artifact can cost, over every fire it

@@ -958,7 +958,7 @@ impl Shell {
                 pipelines,
                 handles,
             )),
-            Mode::Record | Mode::Replay => Encoded::Taped(Tape::new(handles, &place)),
+            Mode::Record | Mode::Replay => Encoded::Taped(Tape::new(handles, &place, &windows)),
             #[cfg(target_vendor = "apple")]
             Mode::Build { slots, constants } => Encoded::Built(crate::icb::Builder::new(
                 device, pipelines, handles, &place, slots, constants,

@@ -33,18 +33,61 @@
 //! quietly repairing it here would hide a P2/P5 bug behind a fire that mostly
 //! works.
 //!
-//! **4. A window that is not one interval is not one launch** (design §3).
-//! P4 chooses one row order for the whole plan and makes as many windowed
-//! consumers consecutive under it as a PQ-tree can; the ones it cannot seat
-//! get a `Fallback` row instead, and `Fallback::Split { r }` says what this
-//! loop does about them — dispatch the region's nodes once per maximal
-//! interval, each over its own pointer and extent. The consecutive case is
-//! that loop turning once, so there is no branch on the fallback anywhere
-//! here: the number of launches is `WindowTable::spans(mask).len()`, which is
-//! `1` for a window P4 seated, `0` for a window this composition has no rows
-//! for, and `r` for the one it withdrew. THE UNION OF THE RUNS IS THE WINDOW
-//! — the intervals partition the mask's rows — which is what makes the split
-//! a slow path and not a different answer.
+//! **4. A window that is not one interval is not one launch — unless the
+//! shell or a kernel says otherwise** (design §3). P4 chooses one row order
+//! for the whole plan and makes as many windowed consumers consecutive under
+//! it as a PQ-tree can; the ones it cannot seat get a `Fallback` row instead,
+//! and the menu it writes is bucket-keyed because the cost model is
+//! (`model_compiler::layout`'s `CROSSOVER_ROWS`).
+//!
+//! `Split` is this loop turning `r` times — dispatch the region's nodes once
+//! per maximal interval, each over its own pointer and extent — and the
+//! consecutive case is that same loop turning once. THE UNION OF THE RUNS IS
+//! THE WINDOW — the intervals partition the mask's rows — which is what makes
+//! a split a slow path and not a different answer.
+//!
+//! **THIS RULE USED TO SAY "SO THERE IS NO BRANCH ON THE FALLBACK ANYWHERE
+//! HERE", AND THAT IS NO LONGER TRUE.** The claim was that the launch count is
+//! `WindowTable::spans(mask).len()` and nothing else — `1` for a window P4
+//! seated, `0` for a window this composition has no rows for, `r` for the one
+//! it withdrew — so every other entry on the menu was a difference in COST the
+//! walk could stay ignorant of. That held only while every entry a shell
+//! served was served by re-running the same dispatch over a smaller rectangle,
+//! and two entries are not:
+//!
+//! - **`Copy`** gathers the window's scattered rows into one rectangle, runs
+//!   the SAME nodes over it once, and scatters the answers back. The bytes it
+//!   computes are the bytes a split computes, and the gate for it is
+//!   bit-identity against one. Asked of the SHELL
+//!   ([`fallback::Serve::copies`](crate::fire::fallback::Serve::copies)),
+//!   because paying a copy needs a scratch rectangle the arena does not carve
+//!   and a row-movement kernel `kernels` publishes no entry for; a backend
+//!   with neither answers `false` and gets the split it always got.
+//! - **`Grouped`** is ONE launch handed the whole interval list, which the
+//!   kernel walks itself (the SGMV shape — rows contiguous within a segment,
+//!   the weight side already runtime-indexed). Asked of the TABLE
+//!   ([`fallback::grouped`](crate::fire::fallback::grouped)), because whether
+//!   a kernel takes a segment list is what `DeviceProfile::grouped` carries
+//!   into the bake.
+//!
+//! Both collapse the trip count to 1 where the span count is `r`, and no
+//! reading of the spans recovers that — hence the branch. `Grouped` wins the
+//! tie: it moves no bytes, so a region that could be either is never gathered.
+//! Both are asked ONLY of a region this fire already found in pieces, so the
+//! scan stays on the path P4 exists to make rare, and a fire of an artifact
+//! that seated everything never touches the table at all.
+//!
+//! It is worth being plain about what the branch costs, because the old
+//! sentence was a design property and not an accident. A walk that reads the
+//! fallback table is a walk whose trip count depends on something other than
+//! the descriptor, so "captured ≡ eager" (decision #11) now rests on the table
+//! being the same in both passes rather than on there being nothing to
+//! disagree about. It is — `Baked` is immutable and both passes are handed the
+//! same one — and a shell's own window table reads the same answer from the
+//! same place (`driver_cuda::window::Windows::of`), so a disagreement is a
+//! panic there and not a wrong window here. The alternative was to let the
+//! COMPILER emit a one-span answer, which would have meant `Baked` knowing
+//! what a segment list is; the branch is the smaller of the two.
 //!
 //! # The phase filter, and why it is not a second walk
 //!
@@ -104,6 +147,7 @@ use crate::Result;
 use crate::fire::Fault;
 use crate::fire::compose::MaskSpan;
 use crate::fire::descriptor::FireDescriptor;
+use crate::fire::fallback::Serve;
 use crate::fire::sink::Sink;
 
 /// Walk one fire.
@@ -120,7 +164,7 @@ use crate::fire::sink::Sink;
 /// template whose phases are out of order, and
 /// [`Error::Kernel`](crate::Error::Kernel) for whatever the backend answered —
 /// which is always about the backend and never about the plan.
-pub fn walk<D: Dispatch, S: Sink>(
+pub fn walk<D: Dispatch + Serve, S: Sink>(
     plan: &Plan,
     baked: &Baked,
     descriptor: &FireDescriptor,
@@ -173,7 +217,7 @@ impl Phases {
 /// # Errors
 ///
 /// As [`walk()`].
-pub fn walk_phases<D: Dispatch, S: Sink>(
+pub fn walk_phases<D: Dispatch + Serve, S: Sink>(
     plan: &Plan,
     baked: &Baked,
     descriptor: &FireDescriptor,
@@ -225,6 +269,21 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
         // composition that has no rows for it.
         descriptor.spans_into(&region.mask, &mut runs);
 
+        // Rule 4's branch, and the whole of it. A region P4 answered
+        // `Fallback::Grouped` for is ONE launch over the intervals rather than
+        // one launch per interval — the kernel takes the segment list and
+        // walks it — so the trip count is 1 where the span count is `r`, and
+        // the shell resolves that launch at the UNION of the runs (its own
+        // window table cuts the same one window, off the same table, so the
+        // two cannot disagree about how many there are).
+        //
+        // ASKED ONLY WHEN THE WINDOW IS ACTUALLY IN PIECES. One span and one
+        // launch are the same launch whatever the table says, and an empty
+        // window is the zero-row pass below either way; so the scan happens on
+        // the path P4 exists to make rare, and a fire of an artifact that
+        // seated everything never touches the table at all.
+        let grouped = runs.len() > 1 && crate::fire::fallback::grouped(baked, region.nodes.clone());
+
         // P3's answer, and the two instants a recording sink needs it at.
         //
         // **SEMANTICALLY THIS CHANGES NOTHING**, which is what "conditionals
@@ -265,6 +324,26 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
             sink.cond_arm(arm);
         }
 
+        // RULE 4'S ONE BRANCH (see the header). A region this fire found in
+        // pieces that the shell says it copies runs ONCE, over a rectangle
+        // the shell gathered the pieces into; every other region runs the
+        // loop rule 4 always ran. The question is asked after
+        // `region_begin`, because that is what tells a shell's cursor which
+        // region is being asked about — and only of a region actually in
+        // pieces, so a plan P4 seated whole never reaches a backend's answer
+        // at all.
+        //
+        // NOT IN A PREPARE PASS. A gather is a launch and a prepare pass is
+        // host work on an open stream; the same filter that holds the nodes
+        // back holds these back, for the same reason. The prepare region's
+        // own copy is not a launch — a plan builder over a gathered window
+        // simply builds ONE schedule over the union — so it needs nothing
+        // here beyond `launches == 1`, which the line below gives it.
+        let copy = !grouped && runs.len() > 1 && dispatch.copies(region);
+        if copy && phases.admits(region.phase) {
+            dispatch.gather(region)?;
+        }
+
         // The launches. `max(1)` is the empty window: it turns once, at zero
         // rows, so the collective rule below still sees every node of every
         // region exactly as it did when a window was one span or none.
@@ -275,11 +354,23 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
         // function of the class table — which the engine replicates
         // identically across ranks — so every rank issues the same number of
         // them in the same order. What would break the rendezvous is a rank
-        // deciding the count from something local, and nothing here does.
-        let launches = runs.len().max(1);
+        // deciding the count from something local, and nothing here does. A
+        // COPIED or GROUPED region issues ONE, and that is the same argument:
+        // both read the artifact's table and this fire's class table, both of
+        // them replicated, and never anything about this rank.
+        let once = grouped || copy;
+        let launches = if once { 1 } else { runs.len().max(1) };
         for launch in 0..launches {
             sink.run(launch as u32, launches as u32);
-            let rows = runs.get(launch).map_or(0, |span| span.rows);
+            // One launch stands over ALL the window's rows — the gather made
+            // that true for a copy, the segment list for a grouped region —
+            // so the zero-row skip below reads their sum and not the first
+            // interval's count.
+            let rows = if once {
+                runs.iter().map(|span| span.rows).sum()
+            } else {
+                runs.get(launch).map_or(0, |span| span.rows)
+            };
 
             for node in region.nodes.clone() {
                 // Resolved before the filter, so that a template naming a node
@@ -303,6 +394,14 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
                 }
                 dispatch.exec(node)?;
             }
+        }
+
+        // The copy's other half, behind the last node and inside the same
+        // brackets: the gathered rectangle's rows go back to the fire rows
+        // they were read from. Rows the window does not cover are untouched,
+        // which is what keeps a copy one consumer's slow path.
+        if copy && phases.admits(region.phase) {
+            dispatch.scatter(region)?;
         }
 
         if close {

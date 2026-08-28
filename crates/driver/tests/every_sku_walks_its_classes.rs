@@ -18,7 +18,7 @@
 //!   run. Too few is a window silently missing from a mixed batch, which
 //!   presents as garbage tokens for the requests in the class that was
 //!   dropped; too many is a kernel reading rows that belong to somebody else;
-//! - **every node ran at most once, in program order** — a driver that
+//! - **every dispatch followed the template's region order** — a driver that
 //!   dispatched a node twice would write its output rectangle twice, and the
 //!   second write is a race against the reader in between;
 //! - **collectives ran regardless** — decision #5. The one node family whose
@@ -37,7 +37,7 @@ use kernels::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear,
 };
-use model_compiler::{Budgets, DeviceProfile, Lowering, Region, compile};
+use model_compiler::{Budgets, DeviceProfile, Lowering, Phase, Region, compile};
 use model_dsl::Platform;
 use model_ir::{
     Attention, Classes, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
@@ -55,7 +55,23 @@ const PLATFORMS: [Platform; 4] = [
 ];
 
 /// A deployment's ceilings: 256 concurrent requests, 8192 token rows, the
-/// bucket lattice a decode-heavy serve rounds up to.
+/// bucket lattice a decode-heavy serve rounds up to, and NO adapters.
+///
+/// **`max_adapters: 0` IS WHAT MAKES THIS FILE A TEST** (palo C2, design §8).
+/// It sat at a flat 32 from before the IR had a bank seat, and `compile` now
+/// refuses a load whose ask is bigger than the model text's own capacity — so
+/// 32 refused all sixty-eight SKU x platform pairs, every `let Ok(baked) =
+/// ... else { continue }` below took the `continue`, and three tests that
+/// assert on an empty `wrong` passed by never running a body. The bug this
+/// file exists to catch — a `Phase::Prepare` region standing after a
+/// `Phase::Capture` one, which is `Fault::PrepareAfterCapture` on every
+/// composition of qwen3.6 — sat behind that skip for as long as it was there.
+///
+/// Zero is the number that seats the WHOLE catalog rather than the subset with
+/// a bank: five families declare none, qwen declares eight, and a plan with no
+/// bank is exempt at zero and refused above it. The adapter axis has its own
+/// files (`driver-cuda/tests/adapter_banks.rs`), which ask each plan for what
+/// it seats; what this one is about is the walk, on every text there is.
 fn budgets() -> Budgets {
     Budgets {
         max_lanes: 256,
@@ -63,8 +79,24 @@ fn budgets() -> Budgets {
         buckets: vec![
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         ],
-        max_adapters: 32,
+        max_adapters: 0,
     }
+}
+
+/// **THE NON-VACUITY ASSERT, AND WHY EVERY TEST HERE ENDS WITH ONE.** Each
+/// loop below skips a pair `compile` refuses, deliberately — which platform a
+/// text bakes on is `model-compiler`'s own catalog test to answer, not this
+/// one's. The cost of that reading is that a bake nothing can seat is
+/// indistinguishable from a walk with nothing wrong in it: `wrong` is empty
+/// either way. So the count of pairs that actually got walked is asserted
+/// against the catalog's own size, and the day a SKU stops baking this file
+/// says so instead of going quiet.
+fn no_pair_was_skipped(walked: usize, of: usize) {
+    assert_eq!(
+        walked, of,
+        "{walked} of {of} SKU x platform pairs were walked — the rest were \
+         refused at `compile` and every assertion in this test skipped them",
+    );
 }
 
 /// A backend that runs nothing and remembers everything: `(node index, op
@@ -163,6 +195,10 @@ impl DispatchCustomCuda for MockDispatch {
         self.note(op)
     }
 }
+/// The default: this backend has no row gather, so every fragmented window it
+/// meets is a `Fallback::Split` — which is what this file's launch counts
+/// have always been about.
+impl driver::fire::Serve for MockDispatch {}
 
 /// A sink that counts what the structure was, so the walk's claim — every
 /// region, in template order, rows or no rows — can be checked against the
@@ -282,13 +318,17 @@ fn mixes(classes: &Classes) -> Vec<(String, Vec<Lane>)> {
 #[test]
 fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
     let mut wrong: Vec<String> = Vec::new();
+    let catalog = model::catalog();
+    let pairs = catalog.len() * PLATFORMS.len();
+    let mut walked = 0usize;
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
             let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue; // `model-compiler`'s own catalog test is what says so.
             };
+            walked += 1;
 
             for (name, lanes) in mixes(&baked.classes) {
                 let fire = match compose(&baked, &budgets(), &lanes) {
@@ -309,11 +349,30 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                     continue;
                 }
 
+                // **TEMPLATE ORDER, NOT PROGRAM ORDER, AND ONCE PER LAUNCH.**
+                // This used to assert the node indices strictly ascend — each
+                // node once, in the order the trace stated them — and two
+                // landed passes have made that the wrong claim about the
+                // artifact rather than a claim the walk broke. P5's hoist puts
+                // the prepare regions in front of the graph body, so the
+                // template is deliberately no longer program order; and rule
+                // 4 dispatches a region's nodes once per interval of a window
+                // P4 could not seat, so a node legitimately runs `r` times.
+                // What survives, and is what the assertion was always really
+                // about, is that the walk followed the TEMPLATE: the region a
+                // dispatch belongs to never goes backwards.
                 let ran = dispatch.nodes();
-                if !ran.windows(2).all(|pair| pair[0] < pair[1]) {
+                let region_of = |node: u32| {
+                    baked
+                        .template()
+                        .iter()
+                        .position(|region| region.nodes.contains(&node))
+                };
+                let visited: Vec<Option<usize>> = ran.iter().map(|&n| region_of(n)).collect();
+                if !visited.windows(2).all(|pair| pair[0] <= pair[1]) {
                     wrong.push(format!(
-                        "`{sku}` as {platform:?} [{name}]: the nodes did not run once each in \
-                         program order",
+                        "`{sku}` as {platform:?} [{name}]: the dispatches did not follow the \
+                         template's region order",
                     ));
                 }
                 let ran: BTreeSet<u32> = ran.into_iter().collect();
@@ -379,19 +438,26 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
     }
 
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
+    no_pair_was_skipped(walked, pairs);
 }
 
 #[test]
 fn every_sku_shows_the_sink_its_whole_template_every_fire() {
     let mut wrong: Vec<String> = Vec::new();
+    let catalog = model::catalog();
+    let pairs = catalog.len() * PLATFORMS.len();
+    let mut walked = 0usize;
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
             let plan = trace(platform);
             let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
                 continue;
             };
+            walked += 1;
             let template: Vec<u32> = baked.template().iter().map(|r| r.nodes.start).collect();
+            // Set by the first mix, compared by the rest.
+            let mut shape: Option<(usize, usize)> = None;
 
             for (name, lanes) in mixes(&baked.classes) {
                 let Ok(fire) = compose(&baked, &budgets(), &lanes) else {
@@ -414,19 +480,100 @@ fn every_sku_shows_the_sink_its_whole_template_every_fire() {
                         template.len(),
                     ));
                 }
-                // v1: every region always-launch, one stream.
-                if structure.conds != 0 || structure.events != 0 {
-                    wrong.push(format!(
-                        "`{sku}` as {platform:?} [{name}]: {} conditional and {} stream events \
-                         from an artifact that lowers everything always-launch",
-                        structure.conds, structure.events,
-                    ));
+                // **COMPOSITION-INDEPENDENT, WHICH IS THE CLAIM THAT MATTERS.**
+                // This used to assert zero conditionals and zero stream events
+                // — true of a v1 that lowered everything always-launch on one
+                // stream, and false since P6 (fork/join) and P3 (one region of
+                // one SKU) landed. Zero was never the property the recorded
+                // graph needs; SAMENESS is. One graph serves every composition
+                // only if the brackets it was recorded with do not depend on
+                // which windows a fire happens to fill, so every mix of one
+                // artifact must show the sink the same counts.
+                match shape {
+                    None => shape = Some((structure.conds, structure.events)),
+                    Some(first) if first != (structure.conds, structure.events) => {
+                        wrong.push(format!(
+                            "`{sku}` as {platform:?} [{name}]: {} conditional and {} stream \
+                             events, where another mix of the same artifact showed {first:?}",
+                            structure.conds, structure.events,
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
         }
     }
 
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
+    no_pair_was_skipped(walked, pairs);
+}
+
+/// **THE BUG THIS FILE WAS SUPPOSED TO CATCH, ASKED DIRECTLY** (design §5).
+///
+/// Prepare ops are host work that writes descriptor slots the graph then
+/// reads, so a `Phase::Prepare` region standing after a `Phase::Capture` one
+/// is a slot written after it was read — and [`walk`]'s rule 3 REFUSES such a
+/// template rather than reordering it, because the order is the compiler's
+/// output. `model_compiler`'s P5 is what puts the prepare half in front.
+///
+/// It went unseen because a supergraph has no obligation to state its host
+/// work first: qwen3.6 appends the multi-token-prediction head after the
+/// trunk, so the head's flashinfer plan build — the one `Ty::Struct` definer
+/// in that text that is not at the top — landed three hundred and thirty-nine
+/// regions deep, and `Fault::PrepareAfterCapture` was the answer to EVERY
+/// composition of that SKU. Every other text in the catalog states its plan
+/// builds before its first launch and is unaffected, which is exactly the
+/// shape of bug one SKU hides from a suite that skips it.
+///
+/// Asked twice, and the pair is the point: the ARTIFACT's phases are ordered,
+/// which is P5's claim, and the WALK accepts every composition of it, which is
+/// the claim a fire depends on. The first without the second would pass on a
+/// template the walk rejects for some other reason.
+#[test]
+fn no_sku_bakes_a_prepare_region_behind_the_graph_that_reads_its_slots() {
+    let mut wrong: Vec<String> = Vec::new();
+    let catalog = model::catalog();
+    let pairs = catalog.len() * PLATFORMS.len();
+    let mut walked = 0usize;
+
+    for (sku, _, trace, _) in catalog {
+        for platform in PLATFORMS {
+            let plan = trace(platform);
+            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+                continue;
+            };
+            walked += 1;
+
+            let mut captured = false;
+            for (at, region) in baked.template().iter().enumerate() {
+                match region.phase {
+                    Phase::Capture => captured = true,
+                    Phase::Prepare if captured => wrong.push(format!(
+                        "`{sku}` as {platform:?}: region {at} (nodes {}..{}) is host prepare \
+                         work standing after the graph body",
+                        region.nodes.start, region.nodes.end,
+                    )),
+                    Phase::Prepare => {}
+                }
+            }
+
+            for (name, lanes) in mixes(&baked.classes) {
+                let Ok(fire) = compose(&baked, &budgets(), &lanes) else {
+                    continue;
+                };
+                let descriptor = FireDescriptor::of(&fire);
+                let mut dispatch = MockDispatch::new(&plan);
+                if let Err(refusal) =
+                    walk(&plan, &baked, &descriptor, &mut dispatch, &mut EagerSink)
+                {
+                    wrong.push(format!("`{sku}` as {platform:?} [{name}]: {refusal}"));
+                }
+            }
+        }
+    }
+
+    assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
+    no_pair_was_skipped(walked, pairs);
 }
 
 #[test]
@@ -436,12 +583,16 @@ fn a_composition_is_the_only_thing_that_changes_between_fires() {
     // wildly different batches must never need a second `compile` — and the
     // windows those batches produce must tile their rows exactly, every time.
     let mut wrong: Vec<String> = Vec::new();
+    let catalog = model::catalog();
+    let pairs = catalog.len();
+    let mut walked = 0usize;
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in catalog {
         let plan = trace(Platform::Cuda);
         let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
             continue;
         };
+        walked += 1;
 
         for (name, lanes) in mixes(&baked.classes) {
             let Ok(fire) = compose(&baked, &budgets(), &lanes) else {
@@ -490,4 +641,5 @@ fn a_composition_is_the_only_thing_that_changes_between_fires() {
     }
 
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
+    no_pair_was_skipped(walked, pairs);
 }

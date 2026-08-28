@@ -315,6 +315,36 @@ fn streams_from_env(stated: u32) -> u32 {
     }
 }
 
+/// **THE GROUPED ARM'S OFF SWITCH.** [`crate::GROUPED`] — the ops whose
+/// kernels walk a segment list — is named to the compiler by default, so a
+/// consumer P4 withdraws is served as ONE launch over that list instead of `r`
+/// launches over `r` rectangles. `PIE_CUDA_GROUPED=off|0|none` empties it.
+///
+/// **ON BY DEFAULT, AND IT MOVES THE WITHDRAWAL AS WELL AS THE ANSWER.**
+/// Naming an op here does not only change how a withdrawn consumer is served:
+/// the withdrawal itself is chosen by cost (`model_compiler::layout::choose`)
+/// and a groupable consumer is nearly free to lose, so naming one MOVES WHICH
+/// CONSUMER IS WITHDRAWN. On today's catalog that is the whole point — the
+/// score window keeps its interval, the correction takes a segment list, and
+/// the qwen texts go from twelve fallback rows that cost launches to
+/// twenty-four that cost none. The off switch stays because a measurement
+/// needs an off arm, not because the kernels are in doubt.
+///
+/// Read ONCE, at load, beside `PIE_CUDA_STREAMS`, into the COMPILER's input
+/// and not into a shell flag — for exactly that switch's reason. The two arms
+/// of a Grouped-versus-Split measurement must be the same ROW ORDER with a
+/// different answer on it, and the row order is baked: a shell that declined
+/// at dispatch time to use a `Grouped` row it had baked would be a third
+/// thing, agreeing with neither arm and with `driver::fire::walk`'s launch
+/// count least of all.
+#[must_use]
+fn grouped_from_env() -> Vec<String> {
+    match std::env::var("PIE_CUDA_GROUPED").ok().as_deref() {
+        Some("off" | "0" | "none") => Vec::new(),
+        _ => crate::GROUPED.iter().map(|op| (*op).to_string()).collect(),
+    }
+}
+
 /// Everything a load states.
 pub struct Boot<'a> {
     /// The traced supergraph. The ENGINE traces it and hands it across
@@ -502,6 +532,22 @@ pub struct Attached {
 }
 
 /// One loaded model, serving.
+/// What one fire's window table cost, in launches — the fallback made
+/// countable.
+///
+/// `launches` is every region's run count summed, which is one per region for
+/// an artifact P4 seated whole. `copied` is how many of them were served as a
+/// `Fallback::Copy`; the launches those regions would have cost as splits is
+/// `launches` under [`Shell::set_copies`]`(false)` for the same fire, which is
+/// the A/B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FireCost {
+    /// Every region's launches, summed.
+    pub launches: u32,
+    /// How many regions were gathered into one launch instead of split.
+    pub copied: u32,
+}
+
 pub struct Shell {
     device: Context,
     plan: Plan,
@@ -538,6 +584,32 @@ pub struct Shell {
     /// draft readout when the model text states one, and the capture columns.
     exports: Exports,
     graphs: Graphs,
+    /// Does this shell serve `Fallback::Copy` where P4's table asks for one?
+    ///
+    /// **OFF BY DEFAULT, AND THAT IS THE A/B AND NOT TIMIDITY.**
+    /// `Fallback::Split` is green on device and is what every existing gate
+    /// in this crate was written against, so it stays the shipping answer and
+    /// the free oracle: a copy computes the same bytes over the same rows,
+    /// which is a claim only a byte-for-byte diff against a split can settle.
+    /// One shell, one set of addresses, one word changed — the same argument
+    /// [`Shell::set_mode`] makes about graphs.
+    ///
+    /// ON BY DEFAULT: below the copy/split crossover — ten of a fourteen-point
+    /// lattice, which is every bucket a decode fire lands in — the table asks
+    /// for a copy and tart measured 1.07x the ideal against a split's 1.82x.
+    /// `PIE_CUDA_FALLBACK_COPY=off|0|false` turns it off at load;
+    /// [`Shell::set_copies`] flips it between fires.
+    copies: bool,
+    /// What the last fire's window table cost, in launches.
+    ///
+    /// **THE ONE OBSERVABLE OF A FALLBACK FROM OUTSIDE.** Whether a region
+    /// ran once or `r` times is invisible in the tokens — a split and a copy
+    /// compute the same numbers, which is the whole claim — so a gate that
+    /// wants to say "and it stopped splitting" has nothing to count unless
+    /// this is written down. It is read off `Windows` before a kernel is
+    /// enqueued, not measured, because `Windows::runs` IS the number the walk
+    /// loops on.
+    last: FireCost,
     cache: GraphCache,
     /// The guest-program plane (design §9). Empty until something registers a
     /// program, and never touched by [`Shell::fire`] — see
@@ -578,6 +650,29 @@ impl Shell {
         // [`crate::EXCLUSIVE`] — the profile's own doc argues why it is data
         // and not knowledge.
         profile.exclusive = crate::EXCLUSIVE.iter().map(|op| (*op).to_string()).collect();
+        // And the other kernel-table fact, stated the same way and for the
+        // same reason: which ops this shell can run over a SEGMENT LIST in one
+        // launch, which is what lets P4 answer `Fallback::Grouped` for a
+        // consumer it could not seat. See [`crate::GROUPED`].
+        //
+        // **WITH AN OFF ARM, FOR THE REASON `PIE_CUDA_STREAMS` HAS ONE.** A
+        // measurement whose off arm is a different artifact is a measurement
+        // of two things, and the only honest way to price `Grouped` against
+        // `Split` is to bake the SAME row order twice and move only the
+        // answer. `PIE_CUDA_GROUPED=off` empties the list, which withdraws the
+        // same consumer and serves it as `r` launches; anything else is this
+        // shell's real capability. That is not the caller's to state — a
+        // profile may carry its own microseconds, it may not claim a kernel
+        // this crate does not ship — which is why the switch is beside the
+        // stream one rather than on `Boot`.
+        //
+        // WHICH CONSUMER GETS WITHDRAWN IS THE CALLER'S, and by default it is
+        // nobody: `DeviceProfile::grouped` is empty unless a `Boot`
+        // profile names an op, so on this catalog the correction is seated,
+        // this list is consulted for a mask that is never withdrawn, and no
+        // baked byte moves. That field is a PoC scaffold and reading its doc
+        // is the only way to know what setting it means.
+        profile.grouped = grouped_from_env();
         let baked = compile(&boot.plan, &boot.budgets, &profile)?;
         // The streams and the events the artifact asked for, opened once,
         // here: a `cudaStreamCreate` on the fire path would be host work
@@ -597,6 +692,7 @@ impl Shell {
         // instant — region masks are static — and the sentence names the
         // model text rather than the fire.
         crate::window::no_schedule_straddles_its_readers(&boot.plan, &baked)?;
+        crate::window::no_grouped_window_is_also_a_prepare_window(&baked)?;
         // Whether this artifact has anywhere for a mask to GO. `masked` is a
         // fact the model declares (design §8), so a plan with no
         // `attention.masked` arm cannot serve one, and accepting the bits
@@ -666,6 +762,7 @@ impl Shell {
             &facts,
             baked.classes.classes.len(),
             driver::fire::max_runs(&baked),
+            driver::fire::fragmentable(&baked),
             device.device().num_sm,
         )?;
 
@@ -687,6 +784,14 @@ impl Shell {
             held: vec![0; boot.slots as usize],
             exports,
             graphs: Graphs::from_env(boot.graphs),
+            // Read once, at load, beside every other environment word this
+            // shell reads: a `getenv` between two launches is a syscall on
+            // the fire path.
+            copies: !matches!(
+                std::env::var("PIE_CUDA_FALLBACK_COPY").ok().as_deref(),
+                Some("off" | "0" | "false")
+            ),
+            last: FireCost::default(),
             cache: GraphCache::new(),
             programs: ProgramPlane::default(),
         })
@@ -859,10 +964,49 @@ impl Shell {
         self.graphs = graphs;
     }
 
+    /// Does this shell serve `Fallback::Copy`? See [`Shell::copies`]'s field.
+    #[must_use]
+    pub fn copying(&self) -> bool {
+        self.copies
+    }
+
+    /// Turn the copy path on or off between fires — the other A/B, and the
+    /// one whose oracle is free.
+    ///
+    /// A copy and a split compute the same numbers over the same rows by
+    /// construction (a gather moves bytes), so flipping this word between two
+    /// otherwise identical fires and diffing the logits is a complete test of
+    /// the claim. One shell, for `set_mode`'s reason: two loads would be two
+    /// residencies and two tuner histories, and a difference could be either.
+    pub fn set_copies(&mut self, copies: bool) {
+        // The graph cache is keyed on this (`record::Key`), so flipping it
+        // misses rather than replaying a body recorded under the other policy.
+        self.copies = copies;
+    }
+
+    /// What the last fire's window table cost. See [`FireCost`].
+    #[must_use]
+    pub fn last_fire_cost(&self) -> FireCost {
+        self.last
+    }
+
     /// What this load's graph cache has done.
     #[must_use]
     pub fn graph_stats(&self) -> record::Stats {
         self.cache.stats()
+    }
+
+    /// **PROBE SEAM (`palo cuda-abi` wave), off by default.** Ask this load's
+    /// captures to keep their `cudaGraph_t` so a probe can walk the recorded
+    /// kernel nodes. The fire path does not read it.
+    pub fn keep_graphs(&mut self, keep: bool) {
+        self.cache.keep_graphs(keep);
+    }
+
+    /// The graphs kept by [`Shell::keep_graphs`], in capture order.
+    #[must_use]
+    pub fn kept_graphs(&self) -> &[(record::Key, crate::device::Graph)] {
+        self.cache.kept()
     }
 
     /// **WHAT P6 BAKED FOR THIS LOAD, AND WHAT THIS SHELL OPENED FOR IT**:
@@ -1112,6 +1256,8 @@ impl Shell {
             held,
             exports,
             graphs,
+            copies,
+            last,
             cache,
             // NAMED, NOT `..`: the guest-program plane is touched at the
             // fire's BOUNDARIES and nowhere between them, and spelling the
@@ -1121,6 +1267,7 @@ impl Shell {
             programs,
         } = self;
         let graphs = *graphs;
+        let copies = *copies;
 
         // ── 0. THE GATE. Nothing has launched, so a refusal here is free. ──
         //
@@ -1435,7 +1582,37 @@ impl Shell {
         //    view inside it is cut by — rebased, because a sub-rectangle
         //    starts at its own zero. This is the whole of what makes a mixed
         //    fire legal, and `crate::window` is where it is argued.
-        let mut windows = Windows::of(baked, composition.classes(), &indptr_host)?;
+        //    A region P4 could not seat gets `Fallback::Split` here — one
+        //    window per interval — unless this shell serves copies and P4's
+        //    table asks for one at this fire's bucket, in which case it gets
+        //    ONE window over the compacted rectangle instead
+        //    (`crate::window::Gathered`). The bucket is a POSITION in the
+        //    lattice because `FallbackRow::buckets` is a range of positions,
+        //    and `Composition::bucket` is the row count that position holds;
+        //    a deployment that declared no lattice has one bucket, at 0.
+        let bucket = budgets
+            .buckets
+            .iter()
+            .position(|&rows| rows == composition.bucket())
+            .unwrap_or(0) as u32;
+        let mut windows = Windows::of(
+            plan,
+            baked,
+            composition.classes(),
+            &indptr_host,
+            crate::window::Copies {
+                bucket,
+                // A masked fire takes the split: `Copies::enabled`'s own doc
+                // says which vector a gather would still have to compact and
+                // why it is the page-id list's problem again.
+                enabled: copies && masks.iter().all(|lane| lane.mask.is_none()),
+                spaces: &geometries,
+            },
+        )?;
+        *last = FireCost {
+            launches: windows.launches(),
+            copied: windows.copied(),
+        };
         let boundaries = windows.packed();
 
         // 4b. THE MASK BITS. A lane states its mask as runs over its own
@@ -1592,6 +1769,7 @@ impl Shell {
         let mut run = Run::new(
             device.ctx(),
             &plan.values,
+            &plan.nodes,
             weights.table(),
             &slots,
             &caches,
@@ -1614,7 +1792,7 @@ impl Shell {
                     descriptor: &descriptor,
                     stream: device.stream(),
                     lanes: forked,
-                    key: record::Key::of(composition.classes()),
+                    key: record::Key::of(composition.classes(), self.copies),
                 },
                 &mut run,
                 &place,

@@ -141,6 +141,31 @@ pub mod window;
 /// question from the other end.
 pub const EXCLUSIVE: [&str; 0] = [];
 
+/// **THE OPS THIS SHELL CAN RUN OVER A SEGMENT LIST IN ONE LAUNCH** — what
+/// `DeviceProfile::grouped` is handed, and therefore what lets P4 answer
+/// `Fallback::Grouped` for a consumer it could not seat (design §3,
+/// decision #24).
+///
+/// The list is the shell's answer to a question the compiler cannot ask, in
+/// the shape [`EXCLUSIVE`] above already established. What a name here
+/// promises is one sentence: handed the union of the consumer's row intervals
+/// PLUS the intervals, the op computes what a launch per interval computes,
+/// and touches no row in the gaps between them. `Windows::of` cuts the union
+/// window, `Run::segments` carries the list, and `linear/lora.cuh` is where
+/// the promise is kept.
+///
+/// **ONE NAME, AND THE REASON THE SECOND CANDIDATE IS NOT HERE.** The other
+/// windowed consumer this catalog cannot seat is `attention.prefill_lse`, and
+/// it fails the second clause twice over: flashinfer's `q_indptr` doubles as
+/// the offset and the length of a request's query rows, so there is no seat
+/// for a second offset; and under capture the split-kv fold writes densely
+/// over the whole row extent it was handed, which would clobber every
+/// neighbour standing in a gap. Neither is a kernel this tree owns. The
+/// correction is: it is ours, it is one file, and its weight side was already
+/// runtime-indexed — which is the whole of why it is the one that could go
+/// first.
+pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
+
 
 pub use error::{Fault, Result};
 pub use mask::{LaneMask, Staged as StagedMask};
@@ -151,7 +176,7 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use api::{ContractFor, Cuda, DeviceBoot};
-pub use serve::{Boot, Graphs, Lane, Seated, Shell};
+pub use serve::{Boot, FireCost, Graphs, Lane, Seated, Shell};
 
 /// What a capturing lane's fire hands back, one entry per exported attention
 /// layer — the contract's own type, re-exported so a caller of

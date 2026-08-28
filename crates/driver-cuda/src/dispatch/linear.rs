@@ -227,6 +227,16 @@ impl DispatchLinear for Run<'_> {
                 routes,
                 y: _,
                 y_out,
+            //
+            // AND THE SEGMENTS, WHICH ARE THIS ARM'S ALONE ON THIS PLANE.
+            // `Run::segments` is `None` for a window P4 seated — every row of
+            // the rectangle is a row of the correction — and `Some` for one it
+            // answered `Fallback::Grouped` for, where the rectangle is the
+            // union of the correction's intervals and the list says which of
+            // its rows are its own. This is the only op `driver_cuda::GROUPED`
+            // names, and it is the only arm here that may take a grouped
+            // window: the compiler wrote that row BECAUSE this shell named
+            // this op, so the two statements are one.
             } => linear::lora::correct(
                 self.ctx(),
                 self.tensor(*x),
@@ -234,6 +244,7 @@ impl DispatchLinear for Run<'_> {
                 self.tensor(*bank_b),
                 self.tensor(*routes),
                 &mut self.tensor(*y_out),
+                self.segments(),
             ),
             Linear::MoeSigmoidGateAdd {
                 routed,

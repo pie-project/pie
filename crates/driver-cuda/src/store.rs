@@ -308,7 +308,7 @@ impl Pools {
                             dtype,
                         )
                     };
-                    CachePool::Kv(KvPool {
+                    CachePool::Kv { space, pool: KvPool {
                         keys: plane(0, keys_width),
                         // A one-plane row seats `values_at == 0` and the key
                         // plane's own width, so both handles are the one
@@ -341,7 +341,8 @@ impl Pools {
                         block_size: 0,
                         max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
                         pages_in_batch: narrow(u64::from(seats.pages)),
-                    })
+                    },
+                    }
                 }
                 Shape::State { stride } => CachePool::Recurrent(RecurrentPool {
                     // One row serves both seats. A `CacheRow::State` is one

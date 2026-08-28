@@ -301,6 +301,27 @@ pub struct Concurrency {
     /// Region pairs that may be in flight together, `(lo, hi)` with `lo < hi`,
     /// sorted. Empty means "one stream": nothing runs beside anything.
     pairs: Vec<(u32, u32)>,
+    /// [`pairs`](Concurrency::pairs) again, as the two members' NODE RANGES
+    /// rather than their region indices — `((start, end), (start, end))`,
+    /// half-open, parallel to `pairs` and empty whenever it is.
+    ///
+    /// **THE TABLE THAT REPLACED AN ASSUMPTION** (P5's hoist).
+    /// [`overlap`](Concurrency::overlap) used to ask which regions a span
+    /// passes through by taking the RANGE between its two endpoints' region
+    /// indices, which is the touched set exactly while region index rises with
+    /// node index. P5 moves the prepare regions to the front, so it does not:
+    /// a range between two endpoints can now skip a region standing between
+    /// them, and skipping one is a missed overlap, which is two values handed
+    /// the same bytes while both are live.
+    ///
+    /// So the question is asked the way it was always meant: a region's nodes
+    /// are a run, a span is a run, and "does this span touch this region" is
+    /// the two runs MEETING — arithmetic on node indices, which no reordering
+    /// of the table can move. Carried per PAIR rather than per region because
+    /// that is the shape `overlap` reads it in: a linear walk over the handful
+    /// of pairs P6 found, instead of the quadratic product of two touched
+    /// sets that a per-region table would make it iterate.
+    paired: Vec<((u32, u32), (u32, u32))>,
 }
 
 impl Concurrency {
@@ -310,6 +331,7 @@ impl Concurrency {
         Concurrency {
             region_of: map_regions(regions, nodes),
             pairs: Vec::new(),
+            paired: Vec::new(),
         }
     }
 
@@ -328,9 +350,20 @@ impl Concurrency {
             .collect();
         pairs.sort_unstable();
         pairs.dedup();
+        let bounds = |r: u32| {
+            regions.get(r as usize).map_or((u32::MAX, 0), |region| {
+                (region.nodes.start, region.nodes.end)
+            })
+        };
+        // A pair naming a region the table does not hold gets `(MAX, 0)`, an
+        // empty run that meets nothing — the same "answer nothing" reading the
+        // range version took, kept because a caller may hand `with_pairs` any
+        // numbers it likes.
+        let paired = pairs.iter().map(|&(a, b)| (bounds(a), bounds(b))).collect();
         Concurrency {
             region_of: map_regions(regions, nodes),
             pairs,
+            paired,
         }
     }
 
@@ -357,38 +390,26 @@ impl Concurrency {
     /// pair and the only answer there is under one stream. Then, only if P6
     /// has said some regions run together, the wider question: does a's life
     /// touch a region that runs beside one b's life touches?
+    ///
+    /// The second half is a walk over the PAIRS rather than over the regions
+    /// (see [`paired`](Concurrency::paired)) — one pass, no allocation, and
+    /// nothing in it reads the region table's ORDER, which P5's hoist is free
+    /// to change.
     #[must_use]
     pub fn overlap(&self, a: Span, b: Span) -> bool {
         if a.first <= b.last && b.first <= a.last {
             return true;
         }
-        if self.pairs.is_empty() {
-            return false;
-        }
-        for ra in self.spanned(a) {
-            for rb in self.spanned(b) {
-                let key = if ra < rb { (ra, rb) } else { (rb, ra) };
-                if ra != rb && self.pairs.binary_search(&key).is_ok() {
-                    return true;
-                }
-            }
-        }
-        false
+        self.paired
+            .iter()
+            .any(|&(one, two)| (meets(one, a) && meets(two, b)) || (meets(one, b) && meets(two, a)))
     }
+}
 
-    /// The regions a span passes through, ascending and deduplicated. Regions
-    /// are runs of adjacent nodes, so this is a contiguous range.
-    fn spanned(&self, span: Span) -> impl Iterator<Item = u32> + '_ {
-        let lo = self.region_of(span.first);
-        let hi = self.region_of(span.last);
-        // An index the map does not hold answers `u32::MAX`, and a range that
-        // started there would be a walk over four billion regions. It cannot
-        // happen — spans run over `0..=nodes.len()` and the map is that long —
-        // and answering nothing is the reading that stays cheap if it ever did.
-        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-        let empty = hi == u32::MAX;
-        (lo..=hi).take(if empty { 0 } else { usize::MAX })
-    }
+/// Does a region's half-open node run `start..end` meet a span's inclusive
+/// `first..=last`?
+fn meets((start, end): (u32, u32), span: Span) -> bool {
+    start <= span.last && span.first < end
 }
 
 fn map_regions(regions: &[Region], nodes: usize) -> Vec<u32> {
@@ -1587,6 +1608,78 @@ mod tests {
         assert!(
             apart.bytes >= shared.bytes,
             "running regions together cannot need fewer bytes",
+        );
+    }
+
+    #[test]
+    fn the_overlap_relation_does_not_change_when_the_region_table_is_reordered() {
+        // **THE ASSUMPTION P5's HOIST BROKE, PINNED.** `overlap` used to read
+        // the regions a value's life touches off the RANGE between its two
+        // endpoints' region indices, which is the touched set exactly while
+        // region index rises with node index — and P5 moves the prepare
+        // regions to the front, so it no longer does. A missed region is a
+        // missed overlap, and a missed overlap is two live values handed the
+        // same bytes.
+        //
+        // The check is the invariance itself: the same plan, the same pairs
+        // named by the same regions, asked once in program order and once
+        // with the table rotated so that no region index means what it did.
+        // Nothing about which values are live together moved, so nothing
+        // about the answer may.
+        let mut b = Build::new();
+        let x = b.input(8);
+        let q = b.op(x, 8, Cond::Always); // r0
+        let d = b.op(q, 8, fact(0)); // r1
+        let p = b.op(q, 8, Cond::not(fact(0))); // r2
+        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
+        let y = b.op(o, 8, Cond::Always); // r3
+        b.out(y);
+
+        let classes = resolve_classes(&b.plan).expect("resolves");
+        let regions = region::coalesce(&b.plan, &classes);
+        let nodes = b.plan.nodes.len();
+        let straight = Concurrency::with_pairs(&regions, nodes, [(1, 2)]);
+
+        // The same table, rotated: r3 first, then r0, r1, r2. The pair now
+        // names regions 2 and 3, because the two regions it always meant moved.
+        let mut rotated = regions.clone();
+        rotated.rotate_right(1);
+        let turned = Concurrency::with_pairs(&rotated, nodes, [(2, 3)]);
+
+        // Every pair of spans over the plan, asked both ways.
+        let last = nodes as u32;
+        for af in 0..=last {
+            for al in af..=last {
+                for bf in 0..=last {
+                    for bl in bf..=last {
+                        let one = Span {
+                            first: af,
+                            last: al,
+                        };
+                        let two = Span {
+                            first: bf,
+                            last: bl,
+                        };
+                        assert_eq!(
+                            straight.overlap(one, two),
+                            turned.overlap(one, two),
+                            "{one:?} vs {two:?} answered differently after a rotation",
+                        );
+                    }
+                }
+            }
+        }
+
+        // And it is not vacuously equal: the pair does widen somebody.
+        let d_only = Span { first: 1, last: 1 };
+        let p_only = Span { first: 2, last: 2 };
+        assert!(
+            straight.overlap(d_only, p_only),
+            "the pair widens these two"
+        );
+        assert!(
+            !Concurrency::sequential(&regions, nodes).overlap(d_only, p_only),
+            "and one stream does not",
         );
     }
 

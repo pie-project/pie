@@ -38,7 +38,7 @@
 use kernels::KernelError;
 use model_ir::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/lora.cuh";
@@ -52,6 +52,34 @@ const BLOCK: u32 = 256;
 /// other scratch here.
 const WAIST: &str = "linear.lora.waist";
 
+/// **`Fallback::Grouped`, AS THE FEW NUMBERS A LAUNCH NEEDS FOR IT** (design
+/// §3, decision #15).
+///
+/// A correction whose window P4 could not seat covers several intervals of the
+/// rectangle it is handed rather than one. The shell may answer that with `r`
+/// calls to [`correct`] over `r` sub-rectangles — always legal, and the oracle
+/// — or with ONE call over their union plus this: where the intervals are, so
+/// the combine can skip the foreign rows standing between them.
+///
+/// WHY THE BOUND IS SEPARATE FROM THE COUNT. `count` is this fire's; `cap` is
+/// the artifact's (`driver::fire::max_runs`), and it is what the grid's `z`
+/// extent is sized at so that the grid does not move with the composition. The
+/// blocks between the two return immediately (decision #15: max-grid plus
+/// early exit, because the shell cannot rebind a captured launch's extent —
+/// palo build log 10).
+#[derive(Debug, Clone, Copy)]
+pub struct Segments {
+    /// `[count, 2]` i32, on the device: `(first row of the rectangle `x` and
+    /// `y` were cut to, how many rows)`, ascending, non-overlapping.
+    pub list: Tensor,
+    /// How many entries `list` holds this fire.
+    pub count: u32,
+    /// The load-time bound on `count` — the grid's `z` extent.
+    pub cap: u32,
+    /// The largest `rows` any entry states — the grid's `y` extent.
+    pub max_rows: u32,
+}
+
 /// `y += B[a]·(A[a]·x)` over the rows `routes` gives an adapter.
 ///
 /// `x` is `[rows, in]`, `y` is `[rows, out]`, `bank_a` is `[adapters,
@@ -60,6 +88,24 @@ const WAIST: &str = "linear.lora.waist";
 /// rank]` shapes the model text declared. The rank is not an argument: it is
 /// `bank_a.width / x.width`, and the two banks are checked against each other,
 /// because a rank stated twice is a rank free to disagree with itself.
+///
+/// `segments` is `None` for the window P4 seated — every row of the rectangle
+/// is a row of the correction — and `Some` for the one it withdrew: the
+/// rectangle is then the UNION of the correction's intervals, and the segments
+/// say which of its rows are actually corrected. See [`Segments`], and
+/// `linear/lora.cuh`'s own note for why the accumulate can take that treatment
+/// and a dense-writing kernel cannot.
+///
+/// **THE PROJECTION HALF IS NOT TOLD.** `select_gemv` runs over the whole
+/// rectangle either way, so a grouped call computes a waist row for the
+/// foreign rows in the gaps as well. That is correct rather than merely
+/// harmless: those rows belong to classes OUTSIDE the correction's window, the
+/// shell refuses a lane that carries an adapter against a word that does not
+/// route (`driver_cuda::Fault::AdapterWord`), so their route is `-1` and the
+/// select writes them a zero row — which the combine then never reads,
+/// because no segment names them. The cost is real and it is the price of not
+/// teaching an MoE kernel about layout: one gather-free GEMV over the gap
+/// rows, against the `r - 1` extra launches of both halves that a split pays.
 ///
 /// # Errors
 ///
@@ -74,6 +120,7 @@ pub fn correct(
     bank_b: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    segments: Option<Segments>,
 ) -> Result<(), KernelError> {
     const OP: &str = "linear.lora_correct";
 
@@ -141,15 +188,34 @@ pub fn correct(
     let rank_i = stated(OP, rank)?;
     let out_i = stated(OP, out_width)?;
     let stride = i64::from(out_i) * i64::from(rank_i);
+    // The grid, and the two shapes it has. Without segments it is the one it
+    // has always been — one block row per row of the rectangle, `z` of one —
+    // and the kernel's null arm reads `blockIdx.y` as the row. With them it is
+    // `(segment, row within segment)`, at the artifact's bound rather than at
+    // this fire's count, and both axes early-exit.
+    let (grid, list, segs) = match segments {
+        None => ([out_width.div_ceil(BLOCK), rows, 1], ArgValue::ABSENT, 0i32),
+        Some(segments) => (
+            [
+                out_width.div_ceil(BLOCK),
+                segments.max_rows.max(1),
+                segments.cap.max(segments.count).max(1),
+            ],
+            segments.list.arg(),
+            stated(OP, segments.count)?,
+        ),
+    };
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::lora_combine<{t}>")))
-            .apply(Launch::grid([out_width.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid(grid, [BLOCK, 1, 1])),
         &[
             routes.arg(),
             projected.arg(),
             bank_b.arg(),
             y.arg(),
+            list,
+            segs.arg(),
             rank_i.arg(),
             out_i.arg(),
             stride.arg(),

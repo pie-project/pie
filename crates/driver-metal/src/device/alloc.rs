@@ -57,6 +57,18 @@ pub(crate) fn slab_id(slab: &Slab) -> u64 {
     0
 }
 
+/// One reservation's address in the GPU's own address space.
+///
+/// **THE ONE NUMBER AN ARGUMENT BUFFER OF POINTERS IS MADE OF.** A tier-2
+/// argument buffer encodes a `device T*` member as exactly this 64-bit value,
+/// so a shell filling one writes the address rather than calling an encoder —
+/// which is what lets `icb::rebind` hold 45 reservations through one binding
+/// instead of 45.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn slab_address(slab: &Slab) -> u64 {
+    slab.gpuAddress()
+}
+
 /// One device reservation: a buffer and its length.
 ///
 /// Cloning is a RETAIN, not a copy — the same bytes under a second owner,

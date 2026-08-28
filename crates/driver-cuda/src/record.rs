@@ -175,15 +175,27 @@ pub const MAX_EXECS: usize = 32;
 /// Two fires share an exec iff they share this. Offsets are absent because
 /// they are prefix sums of the rows beside them — carrying a derived number
 /// in a key is a second answer waiting to disagree with the first.
+///
+/// **AND THE COPY POLICY, WHICH IS NOT A SHAPE.** Every other input to what a
+/// graph CONTAINS is derived from the class table: the artifact is immutable
+/// and the windows come out of these numbers. `Shell::set_copies` is the
+/// exception — it changes the body itself, since a copied region records a
+/// gather, ONE launch and a scatter where a split records `r` launches. A key
+/// that ignored it would replay a split graph for a fire that asked to copy,
+/// which is not merely stale: the A/B `set_copies` exists for would be
+/// comparing a graph against itself while `last_fire_cost` reported otherwise.
+/// (`set_mode`'s doc argues its key "still means what it meant"; that argument
+/// does not transfer, and this is why.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     shape: Box<[u32]>,
+    copies: bool,
 }
 
 impl Key {
     /// The key of one fire's class table.
     #[must_use]
-    pub fn of(classes: &WindowTable) -> Key {
+    pub fn of(classes: &WindowTable, copies: bool) -> Key {
         let mut shape = Vec::with_capacity(classes.len() * 2);
         for class in classes.as_slice() {
             shape.push(class.rows);
@@ -191,6 +203,7 @@ impl Key {
         }
         Key {
             shape: shape.into_boxed_slice(),
+            copies,
         }
     }
 
@@ -302,6 +315,13 @@ pub struct Graphs {
     order: Vec<Key>,
     warm: HashMap<Key, u32>,
     stats: Stats,
+    /// **PROBE SEAM (`palo cuda-abi` wave), off by default.** When set, a
+    /// capture keeps its `cudaGraph_t` beside the exec instead of dropping
+    /// it, so a probe can walk the recorded kernel nodes. Nothing in the fire
+    /// path reads either field; the capture, the instantiate and the launch
+    /// are unchanged whether it is set or not.
+    keep: bool,
+    kept: Vec<(Key, Graph)>,
 }
 
 impl Graphs {
@@ -324,6 +344,21 @@ impl Graphs {
     #[must_use]
     pub fn holds(&self, key: &Key) -> bool {
         self.execs.contains_key(key)
+    }
+
+    /// **PROBE SEAM (`palo cuda-abi` wave).** Ask captures to keep their
+    /// graphs. Off by default and never set by the fire path.
+    pub fn keep_graphs(&mut self, keep: bool) {
+        self.keep = keep;
+        if !keep {
+            self.kept.clear();
+        }
+    }
+
+    /// The graphs kept by [`Graphs::keep_graphs`], in capture order.
+    #[must_use]
+    pub fn kept(&self) -> &[(Key, Graph)] {
+        &self.kept
     }
 
     /// Run one fire: prepare eagerly, then replay or record.
@@ -416,6 +451,9 @@ impl Graphs {
         self.stats.edges = graph.edges();
         self.stats.capture_millis += began.elapsed().as_secs_f64() * 1000.0;
         self.stats.captures += 1;
+        if self.keep {
+            self.kept.push((at.key.clone(), graph));
+        }
         self.insert(at.key.clone(), Entry { exec, shape });
         Ok(Mode::Captured)
     }
@@ -543,10 +581,10 @@ mod tests {
         // lanes over three. A fire with the same classes present but a
         // different prefill length is a DIFFERENT key — its extents differ —
         // and a fire with no prefill lanes at all is another again.
-        let mixed = Key::of(&table(&[(10, 2), (3, 3)]));
-        assert_eq!(mixed, Key::of(&table(&[(10, 2), (3, 3)])));
-        assert_ne!(mixed, Key::of(&table(&[(9, 2), (3, 3)])));
-        assert_ne!(mixed, Key::of(&table(&[(0, 0), (3, 3)])));
+        let mixed = Key::of(&table(&[(10, 2), (3, 3)]), false);
+        assert_eq!(mixed, Key::of(&table(&[(10, 2), (3, 3)]), false));
+        assert_ne!(mixed, Key::of(&table(&[(9, 2), (3, 3)]), false));
+        assert_ne!(mixed, Key::of(&table(&[(0, 0), (3, 3)]), false));
         assert_eq!(mixed.to_string(), "[10r/2l 3r/3l]");
     }
 
@@ -554,7 +592,7 @@ mod tests {
     fn the_key_ignores_offsets_because_they_are_the_rows_added_up() {
         // Two tables built from the same counts have the same offsets by
         // construction; carrying them in the key would be a second answer.
-        let one = Key::of(&table(&[(4, 4), (7, 1)]));
+        let one = Key::of(&table(&[(4, 4), (7, 1)]), false);
         let two = Key::of(&WindowTable::new(vec![
             ClassWindow {
                 row_offset: 0,
@@ -568,14 +606,26 @@ mod tests {
                 lane_offset: 4,
                 lanes: 1,
             },
-        ]));
+        ]), false);
         assert_eq!(one, two);
+    }
+
+    /// **THE COPY POLICY IS PART OF THE KEY**, because it is part of the
+    /// BODY: a copied region records a gather, one launch and a scatter where
+    /// a split records `r` launches. Two fires of the same shape under two
+    /// policies are two graphs, and a cache that could not tell them apart
+    /// would replay one for the other.
+    #[test]
+    fn the_same_shape_under_two_copy_policies_is_two_keys() {
+        let shape = table(&[(10, 2), (3, 3)]);
+        assert_ne!(Key::of(&shape, false), Key::of(&shape, true));
+        assert_eq!(Key::of(&shape, true), Key::of(&shape, true));
     }
 
     #[test]
     fn an_empty_cache_holds_nothing_and_says_so() {
         let graphs = Graphs::new();
-        assert!(!graphs.holds(&Key::of(&table(&[(1, 1)]))));
+        assert!(!graphs.holds(&Key::of(&table(&[(1, 1)]), false)));
         assert_eq!(graphs.stats(), Stats::default());
     }
 }

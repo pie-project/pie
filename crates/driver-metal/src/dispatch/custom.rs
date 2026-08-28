@@ -14,3 +14,11 @@ impl DispatchCustomCuda for Run<'_> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }
+
+/// **THE DEFAULT, AND IT IS A COMPLETE IMPLEMENTATION.** This plane publishes
+/// no row gather and carves no scratch rectangle, so every window P4 could
+/// not seat is served here as `Fallback::Split { r }` — one launch per
+/// interval, which is always correct and is what this shell has always done.
+/// The day `kernels-metal` grows a `gather_rows`, this is the one place that
+/// changes.
+impl driver::fire::Serve for Run<'_> {}

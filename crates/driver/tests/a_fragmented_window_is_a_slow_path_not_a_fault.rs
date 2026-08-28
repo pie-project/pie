@@ -168,6 +168,11 @@ impl DispatchCustomCuda for MockDispatch {
         self.note(op)
     }
 }
+/// The default: no row gather, so every fragmented window this file fires is
+/// served as `Fallback::Split` — which is this file's whole subject. The copy
+/// the same table asks for below the crossover is gated next door, in
+/// `a_copied_window_is_one_launch_over_the_same_rows.rs`.
+impl driver::fire::Serve for MockDispatch {}
 
 /// A sink that writes down how many runs each region was cut into — the
 /// structure event the split adds, and the one a shell's cursor turns into a
@@ -389,13 +394,20 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
             continue;
         }
         owed += 1;
-        // PRE-EXISTING AND NOT THIS TEST'S SUBJECT. qwen3.6-27b is the one
-        // catalog text P3 lowers a conditional for (its MTP head), and its
-        // template puts a prepare region AFTER that capture body — which
-        // `driver::fire::walk` refuses by name, for every composition, split
-        // or no split. It is named here rather than skipped silently: this
-        // file's claim is about fragmented windows, and that SKU cannot be
-        // walked at all until the phase order is fixed in P2/P5.
+        // THE DEBT THIS BLOCK WAS OPENED FOR IS PAID, AND THE GUARD STAYS.
+        // qwen3.6-27b used to land here: its multi-token-prediction head is
+        // appended after the trunk, so the head's plan build — a `Ty::Struct`
+        // definer, and therefore `Phase::Prepare` — stood after three hundred
+        // and thirty-nine capture regions, and `driver::fire::walk` refused
+        // every composition of it by name, split or no split. P5 now hoists
+        // the prepare half in front of the capture half
+        // (`model_compiler::region::hoist`), so the list below is empty.
+        //
+        // The check is kept rather than deleted because an EMPTY list is the
+        // claim: this file's subject is fragmented windows, and a text the
+        // walk refuses outright never reaches `fire_and_check`, so a
+        // regression in the phase order would quietly shrink what this test
+        // covers instead of failing it.
         if walk(
             &plan,
             &baked,
@@ -432,8 +444,9 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
     );
     assert_eq!(
         unwalkable,
-        ["qwen36-27b-bf16-kv-bf16"],
-        "the set of catalog texts `walk` refuses outright changed",
+        [] as [&str; 0],
+        "a catalog text `walk` refuses outright never reaches the split path below, \
+         so its fragmented windows go unchecked",
     );
 }
 
