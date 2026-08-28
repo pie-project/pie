@@ -41,7 +41,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use driver_cuda::{Boot, Graphs, Lane, Shell};
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 /// The catalog row this suite serves, as `serve_smoke` serves it.
@@ -132,17 +132,17 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         .expect("the checkpoint's tokenizer loads");
 
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Platform::Cuda);
+    let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
         .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: Budgets::new(4, 256),
+        budget: Budget::new(4, 256),
         profile: None,
         page_size: 16,
         context: 512,

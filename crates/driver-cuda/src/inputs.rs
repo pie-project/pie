@@ -57,7 +57,7 @@
 
 use kernels_cuda::Tensor;
 use kernels_cuda::attn::plan::Workspace;
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_ir::{Dtype, StructKind};
 
 use crate::device::Buffer;
@@ -301,7 +301,7 @@ impl Inputs {
     /// [`Fault::Device`](crate::Fault::Device) for the allocation.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
-        budgets: &Budgets,
+        budget: &Budget,
         paging: Paging,
         spaces: usize,
         facts: &Facts,
@@ -310,9 +310,9 @@ impl Inputs {
         gathered: usize,
         sms: u32,
     ) -> Result<Inputs> {
-        let rows = u64::from(budgets.max_tokens);
-        let lanes = u64::from(budgets.max_lanes);
-        let pages = u64::from(budgets.max_lanes) * u64::from(paging.pages_per_slot);
+        let rows = u64::from(budget.max_tokens);
+        let lanes = u64::from(budget.max_lanes);
+        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
         // A window is one contiguous run of the fire's class order, so a plan
         // of `k` classes has at most `k(k+1)/2` of them — plus one for the
         // zero window every empty region shares. Reserved rather than

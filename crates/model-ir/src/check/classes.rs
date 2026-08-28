@@ -22,9 +22,9 @@
 //!
 //! - cache writes: the kv/state appends and the fused write op, which exist
 //!   for their effect and hand nothing back that a later node reads;
-//! - `Plan::seams`: a value that materializes outside the graph (design §9),
+//! - `Trace::seams`: a value that materializes outside the graph (design §9),
 //!   and — the discovery that settled the third root — THE PLAN'S OUTPUT IS
-//!   ONE OF THESE. The IR has no `Plan::outputs` field, and the trace does not
+//!   ONE OF THESE. The IR has no `Trace::outputs` field, and the trace does not
 //!   need one: `model_dsl::trace_hybrid` ends with
 //!   `rec.seam(seam::OUT.name, &[&logits])`, so the value a `forward` returns
 //!   is recorded as the `"out"` seam row. Rooting every seam value roots the
@@ -42,19 +42,19 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
 use crate::ops::{Attention, CustomCuda};
-use crate::{Cond, Def, Operands, Operation, Plan, ValueId};
+use crate::{Guard, Def, Operands, Operation, Trace, ValueId};
 
 /// One deduplicated behavior: the fact words that run the same nodes and
 /// resolve every merge the same way, and the nodes their guards admit.
 ///
 /// `live` is what the fact word says CAN run; the nodes a class actually runs
-/// are `live` narrowed by demand, which is what [`Classes::node_mask`]
+/// are `live` narrowed by demand, which is what [`ClassTable::node_mask`]
 /// carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Class {
     /// Every fact word in this class, ascending. Never empty.
     pub words: Vec<u64>,
-    /// Node indices whose `cond` holds for these words, ascending.
+    /// Node indices whose `guard` holds for these words, ascending.
     pub live: Vec<u32>,
 }
 
@@ -79,11 +79,11 @@ impl ClassSet {
     /// The set of exactly these class indices, in any order.
     ///
     /// WHY A NON-COMPILER CALLER BUILDS ONE. The sweep below answers what a
-    /// plan CAN run, once, at bake — that is [`Classes::node_mask`], and
+    /// plan CAN run, once, at bake — that is [`ClassTable::node_mask`], and
     /// nobody outside this crate has any business writing it. The fire path
     /// asks the mirror-image question every launch and gets a set of classes
     /// back for its trouble: which classes did this batch TURN OUT to contain?
-    /// That answer is the argument `model_compiler::LayoutOrder::class_order`
+    /// That answer is the argument `model_compiler::ClassOrder::class_order`
     /// takes, so a driver composing a fire has to be able to say it in this
     /// type — otherwise the one caller the seriation exists for is the one
     /// caller that cannot knock on the door, and reaches a layer further down
@@ -141,18 +141,18 @@ impl ClassSet {
 /// What one sweep of a plan found. This is P1's whole output as well as the
 /// author's report: the compiler keeps it, the test suite throws it away.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Classes {
+pub struct ClassTable {
     /// The deduplicated behaviors, in ascending order of representative word.
     pub classes: Vec<Class>,
     /// Node index → the classes that RUN it (live and demanded).
     pub node_mask: Vec<ClassSet>,
-    /// The plan's `Def::Merge` values in `Plan::values` order — the row key of
-    /// [`merge_arm`](Classes::merge_arm), since a merge is a value and there
+    /// The plan's `Def::Merge` values in `Trace::values` order — the row key of
+    /// [`merge_arm`](ClassTable::merge_arm), since a merge is a value and there
     /// is no separate merge id space to index by.
     pub merges: Vec<ValueId>,
     /// Merge row × class → the one arm that writes here, or `None` where no
     /// class demanded the merge. Rows are parallel to
-    /// [`merges`](Classes::merges); [`arms_of`](Classes::arms_of) looks one up
+    /// [`merges`](ClassTable::merges); [`arms_of`](ClassTable::arms_of) looks one up
     /// by `ValueId`.
     pub merge_arm: Vec<Vec<Option<u8>>>,
     /// The bits the sweep ran over: `(1 << F) - 1` for the `F` this plan's
@@ -163,7 +163,7 @@ pub struct Classes {
     /// READS. The two agree in every catalog text today and are not required
     /// to: a model may state a fact it does not yet split on, and a word with
     /// that bit set names no class here. Masking with this before
-    /// [`class_of`](Classes::class_of) is what keeps that from reading as "the
+    /// [`class_of`](ClassTable::class_of) is what keeps that from reading as "the
     /// engine and the shell disagree about what is loaded".
     pub mask: u64,
     /// Node indices demanded in no class at all. A report, not a fault: a plan
@@ -173,7 +173,7 @@ pub struct Classes {
     pub dead: Vec<u32>,
 }
 
-impl Classes {
+impl ClassTable {
     /// The per-class arm resolution of one merge, or `None` if that value is
     /// not a merge in this plan.
     #[must_use]
@@ -235,8 +235,8 @@ impl Fault {
     /// wide and says nothing about the three bits that are off. The plan comes
     /// back in here for exactly that: the width to pad to.
     #[must_use]
-    pub fn say(&self, plan: &Plan) -> String {
-        let width = fact_width(plan).max(1);
+    pub fn say(&self, trace: &Trace) -> String {
+        let width = fact_width(trace).max(1);
         let word = format!("0b{:0width$b}", self.word());
         match self {
             Fault::Uncovered { merge, .. } => format!(
@@ -279,7 +279,7 @@ impl Display for Fault {
 impl std::error::Error for Fault {}
 
 /// How many fact bits this plan actually splits on: one past the highest bit
-/// any guard names, and 0 for a plan no `Cond::Fact` appears in.
+/// any guard names, and 0 for a plan no `Guard::Fact` appears in.
 ///
 /// THE PLAN NO LONGER DECLARES A VOCABULARY, AND DOES NOT NEED TO. A fact list
 /// was a second statement of what the guards already say, free to disagree
@@ -292,9 +292,9 @@ impl std::error::Error for Fault {}
 /// resolves by, so a bit that only ever appears in one is still a bit two fact
 /// words can be told apart by.
 #[must_use]
-pub fn fact_width(plan: &Plan) -> usize {
-    let nodes = plan.nodes.iter().map(|node| &node.cond);
-    let arms = plan
+pub fn fact_width(trace: &Trace) -> usize {
+    let nodes = trace.nodes.iter().map(|node| &node.guard);
+    let arms = trace
         .values
         .iter()
         .filter_map(|decl| match &decl.def {
@@ -322,10 +322,10 @@ pub fn fact_width(plan: &Plan) -> usize {
 /// # Panics
 ///
 /// If the plan's guards reach past 20 fact bits. The sweep is `2^F`, and past
-/// 20 it stops being a sweep; the same ceiling `Cond::simplified` states.
+/// 20 it stops being a sweep; the same ceiling `Guard::simplified` states.
 #[must_use = "the classes are P1's output; dropping them re-runs the sweep"]
-pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
-    let facts = fact_width(plan);
+pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
+    let facts = fact_width(trace);
     assert!(facts <= 20, "a plan over {facts} facts");
 
     // Every guard the plan states, deduplicated by structure. Two fact words
@@ -334,16 +334,16 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
     // BOTH matter. Deduplicating on the live node set alone would conflate two
     // words that resolve a merge differently, which is possible whenever an
     // arm is a split of a value no node guards (a runtime input, say).
-    let mut guards: Vec<&Cond> = Vec::new();
-    let node_guard: Vec<usize> = plan
+    let mut guards: Vec<&Guard> = Vec::new();
+    let node_guard: Vec<usize> = trace
         .nodes
         .iter()
-        .map(|node| intern(&mut guards, &node.cond))
+        .map(|node| intern(&mut guards, &node.guard))
         .collect();
 
     let mut merges: Vec<ValueId> = Vec::new();
-    let mut merge_row: Vec<Option<usize>> = vec![None; plan.values.len()];
-    for (idx, decl) in plan.values.iter().enumerate() {
+    let mut merge_row: Vec<Option<usize>> = vec![None; trace.values.len()];
+    for (idx, decl) in trace.values.iter().enumerate() {
         let Def::Merge(arms) = &decl.def else {
             continue;
         };
@@ -389,7 +389,7 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
     }
 
     // The backward demand walk, once per class.
-    let mut node_mask = vec![ClassSet::default(); plan.nodes.len()];
+    let mut node_mask = vec![ClassSet::default(); trace.nodes.len()];
     let mut merge_arm = vec![vec![None; classes.len()]; merges.len()];
     let mut faults = Vec::new();
     let mut ins: Vec<ValueId> = Vec::new();
@@ -397,26 +397,26 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
     for (c, class) in classes.iter().enumerate() {
         let word = class.word();
         let mut walk = Walk {
-            plan,
+            trace,
             class: c,
-            node: vec![false; plan.nodes.len()],
-            value: vec![false; plan.values.len()],
+            node: vec![false; trace.nodes.len()],
+            value: vec![false; trace.values.len()],
             stack: Vec::new(),
             ins: &mut ins,
         };
 
         // Roots: the effects this class owes the world.
         for &j in &class.live {
-            if writes_cache(&plan.nodes[j as usize].op) {
+            if writes_cache(&trace.nodes[j as usize].op) {
                 walk.demand(j as usize, &mut node_mask);
             }
         }
-        for seam in &plan.seams {
+        for seam in &trace.seams {
             walk.stack.extend(seam.values.iter().copied());
         }
 
         while let Some(id) = walk.stack.pop() {
-            let Some(decl) = plan.values.get(id.0 as usize) else {
+            let Some(decl) = trace.values.get(id.0 as usize) else {
                 continue; // `check` names an out-of-range id; the walk skips it.
             };
             if walk.value[id.0 as usize] {
@@ -435,9 +435,9 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
                     // A producer the class does not run cannot be walked
                     // through. That hole is only ever reached through a merge,
                     // and a merge is where this pass faults.
-                    if plan.nodes.get(i).is_some_and(|n| n.cond.holds(word)) {
+                    if trace.nodes.get(i).is_some_and(|n| n.guard.holds(word)) {
                         walk.demand(i, &mut node_mask);
-                    } else if let Some(through) = passes_through(plan, i, id) {
+                    } else if let Some(through) = passes_through(trace, i, id) {
                         // **A GUARDED IN-PLACE OP IS A PASS-THROUGH IN THE
                         // CLASSES IT SKIPS** — palo design §8's correction
                         // class, in the one pass that had to learn it.
@@ -505,7 +505,7 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
         .map(|(j, _)| j as u32)
         .collect();
 
-    Ok(Classes {
+    Ok(ClassTable {
         classes,
         node_mask,
         merges,
@@ -519,7 +519,7 @@ pub fn resolve_classes(plan: &Plan) -> Result<Classes, Vec<Fault>> {
 /// a visit. `ins` is borrowed from the caller because every class refills it
 /// once per demanded node and none of them wants its own allocation.
 struct Walk<'a> {
-    plan: &'a Plan,
+    trace: &'a Trace,
     class: usize,
     node: Vec<bool>,
     value: Vec<bool>,
@@ -537,7 +537,7 @@ impl Walk<'_> {
         self.node[node] = true;
         node_mask[node].insert(self.class);
         self.ins.clear();
-        self.plan.nodes[node].op.inputs(self.ins);
+        self.trace.nodes[node].op.inputs(self.ins);
         self.stack.extend(self.ins.iter().copied());
     }
 }
@@ -546,7 +546,7 @@ impl Walk<'_> {
 /// Structural equality is the right identity here: two spellings of one
 /// predicate are two guards, which costs a class the sweep would otherwise
 /// merge and never costs correctness.
-fn intern<'a>(guards: &mut Vec<&'a Cond>, cond: &'a Cond) -> usize {
+fn intern<'a>(guards: &mut Vec<&'a Guard>, cond: &'a Guard) -> usize {
     guards.iter().position(|g| *g == cond).unwrap_or_else(|| {
         guards.push(cond);
         guards.len() - 1
@@ -564,9 +564,9 @@ fn intern<'a>(guards: &mut Vec<&'a Cond>, cond: &'a Cond) -> usize {
 /// `None` for every other output, and that is the standing rule this is the
 /// one exception to: a value whose producer the class does not run is a hole,
 /// and the only legal way to reach one is a merge arm.
-fn passes_through(plan: &Plan, i: usize, id: ValueId) -> Option<ValueId> {
+fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
     let mut aliases = Vec::new();
-    plan.nodes.get(i)?.op.aliases(&mut aliases);
+    trace.nodes.get(i)?.op.aliases(&mut aliases);
     aliases
         .into_iter()
         .find(|(out, _)| *out == id)
@@ -660,10 +660,10 @@ mod tests {
 
     /// A plan built by hand, one statement per line. `model-dsl` is the
     /// authoring surface and cannot be reached from here — it depends on this
-    /// crate — so these tests say in `Def` and `Cond` what a forward pass says
+    /// crate — so these tests say in `Def` and `Guard` what a forward pass says
     /// in `split` and `Value::merge`.
     struct Build {
-        plan: Plan,
+        trace: Trace,
         inputs: u32,
     }
 
@@ -674,14 +674,14 @@ mod tests {
         }
     }
 
-    fn fact(bit: u8) -> Cond {
-        Cond::Fact(bit)
+    fn fact(bit: u8) -> Guard {
+        Guard::Fact(bit)
     }
 
     impl Build {
         fn new() -> Build {
             Build {
-                plan: Plan {
+                trace: Trace {
                     name: "hand-built".to_string(),
                     platform: crate::Platform::Cuda,
                     params: Vec::new(),
@@ -698,8 +698,8 @@ mod tests {
         }
 
         fn value(&mut self, def: Def) -> ValueId {
-            self.plan.values.push(ValueDecl { def, ty: act() });
-            ValueId((self.plan.values.len() - 1) as u32)
+            self.trace.values.push(ValueDecl { def, ty: act() });
+            ValueId((self.trace.values.len() - 1) as u32)
         }
 
         /// A demand sink: something the driver binds, distinct per call.
@@ -716,28 +716,28 @@ mod tests {
         }
 
         /// One guarded op over `x`, handing back its output.
-        fn op(&mut self, x: ValueId, cond: Cond) -> ValueId {
-            let node = self.plan.nodes.len() as u32;
+        fn op(&mut self, x: ValueId, guard: Guard) -> ValueId {
+            let node = self.trace.nodes.len() as u32;
             let y = self.value(Def::Op(node));
-            self.plan.nodes.push(Node {
+            self.trace.nodes.push(Node {
                 op: Elementwise::MulScalar {
                     s: 2.0,
                     x,
                     x_out: y,
                 }
                 .into(),
-                cond,
+                guard,
                 layer: None,
             });
             y
         }
 
         /// A cache write: an effect root, and it returns nothing.
-        fn append(&mut self, x: ValueId, cond: Cond) -> usize {
+        fn append(&mut self, x: ValueId, guard: Guard) -> usize {
             let cache = self.cache();
             let page = self.input();
             let offset = self.input();
-            self.plan.nodes.push(Node {
+            self.trace.nodes.push(Node {
                 op: Attention::KvAppendShared {
                     plane: x,
                     cache,
@@ -745,20 +745,20 @@ mod tests {
                     write_offset: offset,
                 }
                 .into(),
-                cond,
+                guard,
                 layer: None,
             });
-            self.plan.nodes.len() - 1
+            self.trace.nodes.len() - 1
         }
 
-        fn merge(&mut self, arms: &[(ValueId, Cond)]) -> ValueId {
+        fn merge(&mut self, arms: &[(ValueId, Guard)]) -> ValueId {
             self.value(Def::Merge(arms.to_vec()))
         }
 
         /// The `"out"` seam — what a trace writes the forward's return value
         /// as, and therefore what roots the walk.
         fn out(&mut self, v: ValueId) -> &mut Build {
-            self.plan.seams.push(crate::Seam {
+            self.trace.seams.push(crate::Seam {
                 seam: "out".to_string(),
                 values: vec![v],
                 layer: None,
@@ -766,8 +766,8 @@ mod tests {
             self
         }
 
-        fn resolve(&self) -> Result<Classes, Vec<Fault>> {
-            resolve_classes(&self.plan)
+        fn resolve(&self) -> Result<ClassTable, Vec<Fault>> {
+            resolve_classes(&self.trace)
         }
     }
 
@@ -779,8 +779,8 @@ mod tests {
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
-        let p = b.op(q, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))]);
+        let p = b.op(q, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))]);
         b.out(o);
 
         let classes = b.resolve().expect("a covering split resolves");
@@ -803,14 +803,14 @@ mod tests {
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
-        let m = b.op(q, Cond::and(Cond::not(fact(0)), fact(1)));
-        let o = b.merge(&[(d, fact(0)), (m, Cond::and(Cond::not(fact(0)), fact(1)))]);
+        let m = b.op(q, Guard::and(Guard::not(fact(0)), fact(1)));
+        let o = b.merge(&[(d, fact(0)), (m, Guard::and(Guard::not(fact(0)), fact(1)))]);
         b.out(o);
 
         let faults = b.resolve().expect_err("a hole is a fault");
         assert_eq!(faults, vec![Fault::Uncovered { merge: o, word: 0 }]);
         assert_eq!(
-            faults[0].say(&b.plan),
+            faults[0].say(&b.trace),
             "merge v3 is demanded for fact word 0b00, and no arm holds there — \
              those rows are never written",
         );
@@ -822,9 +822,9 @@ mod tests {
         // the same rows.
         let mut b = Build::new();
         let q = b.input();
-        let a = b.op(q, Cond::Always);
+        let a = b.op(q, Guard::Always);
         let d = b.op(q, fact(0));
-        let o = b.merge(&[(a, Cond::Always), (d, fact(0))]);
+        let o = b.merge(&[(a, Guard::Always), (d, fact(0))]);
         b.out(o);
 
         let faults = b.resolve().expect_err("a race is a fault");
@@ -852,13 +852,13 @@ mod tests {
         let qo_one = fact(1);
         let mut b = Build::new();
         let x = b.input();
-        let md = Cond::and(masked.clone(), qo_one.clone());
-        let mp = Cond::and(masked.clone(), Cond::not(qo_one));
+        let md = Guard::and(masked.clone(), qo_one.clone());
+        let mp = Guard::and(masked.clone(), Guard::not(qo_one));
         let attn_md = b.op(x, md.clone());
         let attn_mp = b.op(x, mp.clone());
         let inner = b.merge(&[(attn_md, md), (attn_mp, mp)]);
-        let plain = b.op(x, Cond::not(masked.clone()));
-        let outer = b.merge(&[(inner, masked.clone()), (plain, Cond::not(masked))]);
+        let plain = b.op(x, Guard::not(masked.clone()));
+        let outer = b.merge(&[(inner, masked.clone()), (plain, Guard::not(masked))]);
         b.out(outer);
 
         let classes = b.resolve().expect("legal nesting resolves");
@@ -887,14 +887,14 @@ mod tests {
         let masked = fact(1);
         let mut b = Build::new();
         let q = b.input();
-        let hot = Cond::and(qo_one.clone(), masked.clone());
-        let cold = Cond::and(qo_one.clone(), Cond::not(masked));
+        let hot = Guard::and(qo_one.clone(), masked.clone());
+        let cold = Guard::and(qo_one.clone(), Guard::not(masked));
         let one = b.op(q, hot.clone());
         let two = b.op(q, cold.clone());
         let inner = b.merge(&[(one, hot), (two, cold)]);
         let used = b.op(inner, qo_one.clone());
-        let rest = b.op(q, Cond::not(qo_one.clone()));
-        let o = b.merge(&[(used, qo_one.clone()), (rest, Cond::not(qo_one))]);
+        let rest = b.op(q, Guard::not(qo_one.clone()));
+        let o = b.merge(&[(used, qo_one.clone()), (rest, Guard::not(qo_one))]);
         b.out(o);
 
         let classes = b.resolve().expect("an undemanded gap is not a fault");
@@ -918,9 +918,9 @@ mod tests {
     fn a_cache_write_is_its_own_root_and_an_unread_op_is_dead() {
         let mut b = Build::new();
         let q = b.input();
-        let k = b.op(q, Cond::Always); // node 0
-        let append = b.append(k, Cond::Always); // node 1: hands nothing back
-        b.op(q, Cond::Always); // node 2: nobody ever reads it
+        let k = b.op(q, Guard::Always); // node 0
+        let append = b.append(k, Guard::Always); // node 1: hands nothing back
+        b.op(q, Guard::Always); // node 2: nobody ever reads it
         b.out(q);
 
         let classes = b.resolve().expect("no merges, no faults");

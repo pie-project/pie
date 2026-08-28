@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use driver::fire::{Lane as FireLane, compose};
 use driver_metal::abi::{self, At, Axis};
 use driver_metal::{Boot, Lane, Recording, Shell};
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -88,7 +88,7 @@ fn ready(what: &str) -> Option<Shell> {
         return None;
     };
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Platform::Metal);
+    let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
@@ -97,7 +97,7 @@ fn ready(what: &str) -> Option<Shell> {
         plan,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: Budgets::new(16, 640),
+        budget: Budget::new(16, 640),
         profile: None,
         page_size: 16,
         context: 512,
@@ -154,7 +154,7 @@ fn classes_of(shell: &Shell, batch: &[Synthetic]) -> Vec<(u32, u32)> {
         .map(|s| FireLane::new(s.word, s.tokens.len() as u32))
         .collect();
     let composed =
-        compose(shell.baked(), shell.budgets(), &submitted).expect("the batch composes");
+        compose(shell.compiled_model(), shell.budget(), &submitted).expect("the batch composes");
     composed
         .classes()
         .as_slice()
@@ -182,7 +182,7 @@ fn the_extent_table_is_derived_from_two_walks_and_verified_on_a_third() {
     };
 
     // The classes this artifact bakes, and which of them a word reaches.
-    let baked_classes = shell.baked().classes.classes.len();
+    let baked_classes = shell.compiled_model().classes.classes.len();
     let decode = classes_of(&shell, &batch(&[(1, 1)]));
     let prefill = classes_of(&shell, &batch(&[(1, 8)]));
     eprintln!("the artifact bakes {baked_classes} classes");

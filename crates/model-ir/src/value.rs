@@ -4,10 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cond::Cond;
+use crate::guard::Guard;
 
 /// One id space for every value in a plan: op outputs, weights, cache
-/// bindings, runtime inputs, merges. Indexes `Plan::values`.
+/// bindings, runtime inputs, merges. Indexes `Trace::values`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub u32);
 
@@ -128,20 +128,20 @@ pub enum Ty {
 pub enum Def {
     /// Bound by the driver each fire.
     Input(RuntimeInput),
-    /// Index into `Plan::params`. Weights are plain values — no `WeightId`;
+    /// Index into `Trace::params`. Weights are plain values — no `WeightId`;
     /// the compiler skips non-`Op` defs during allocation.
     Weight(u32),
-    /// Index into `Plan::caches` — storage only; geometry arrives as `Input`.
+    /// Index into `Trace::caches` — storage only; geometry arrives as `Input`.
     /// Distinct from `Weight` because caches are written during a fire.
     Cache(u32),
-    /// Output of `Plan::nodes[i]`; the index is cross-checked by the validator.
+    /// Output of `Trace::nodes[i]`; the index is cross-checked by the validator.
     Op(u32),
     /// φ-node: data, never dispatched — the compiler resolves it to slot
     /// aliasing.
-    Merge(Vec<(ValueId, Cond)>),
+    Merge(Vec<(ValueId, Guard)>),
 }
 
-/// One row of `Plan::values`: provenance and type, orthogonal by construction.
+/// One row of `Trace::values`: provenance and type, orthogonal by construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValueDecl {
     pub def: Def,

@@ -33,7 +33,7 @@
 //! this file: the geometry vectors are the interface, and a lane's pages are
 //! whatever `pages_of` says they are.
 
-use model_ir::{Attention, CacheRow, Def, Dim, Operands, Operation, Plan, StructKind, Ty, ValueId};
+use model_ir::{Attention, CacheRow, Def, Dim, Operands, Operation, Trace, StructKind, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 
@@ -129,11 +129,11 @@ pub struct ScheduleFacts {
 // driver::store candidate
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
-    /// Per `Plan::caches` ROW: what the paged launches that walk it restate
+    /// Per `Trace::caches` ROW: what the paged launches that walk it restate
     /// about it. `None` for a row no paged launch reads — which is a row
     /// allocated as declared and checked against nothing, not a refusal.
     pub rows: Vec<Option<SpaceFacts>>,
-    /// Per `Plan::values` ID: the SCHEDULE one attention plan op carves —
+    /// Per `Trace::values` ID: the SCHEDULE one attention plan op carves —
     /// which struct it is and the reading it is carved for, as that op states
     /// them. `None` for every value no plan op defines.
     pub plans: Vec<Option<ScheduleFacts>>,
@@ -167,20 +167,20 @@ impl Facts {
 /// wide.
 ///
 // driver::store candidate
-pub fn probe(plan: &Plan) -> Result<Facts> {
+pub fn probe(trace: &Trace) -> Result<Facts> {
     let mut out = Facts {
-        rows: vec![None; plan.caches.len()],
-        plans: vec![None; plan.values.len()],
+        rows: vec![None; trace.caches.len()],
+        plans: vec![None; trace.values.len()],
     };
 
     // Pass one: the rows. `kv_heads` is stated by the prefill arms alone, so
     // a row only a decode reads carries zero — the reading this shell has
     // always had, kept.
-    for node in &plan.nodes {
+    for node in &trace.nodes {
         let Some(read) = reads(&node.op) else {
             continue;
         };
-        let Some(row) = row_of(plan, read.cache) else {
+        let Some(row) = row_of(trace, read.cache) else {
             continue;
         };
         let seat = out.rows.get_mut(row).ok_or_else(|| Fault::Unbound {
@@ -228,11 +228,11 @@ pub fn probe(plan: &Plan) -> Result<Facts> {
     // because the reading alone does not say which builder runs: an absorbed
     // latent schedule and a paged one both state a head width, and the two
     // stage workspaces of entirely different shapes.
-    for node in &plan.nodes {
+    for node in &trace.nodes {
         let Some(carve) = carves(&node.op) else {
             continue;
         };
-        let kind = kind_of(plan, carve.plan, node.op.name())?;
+        let kind = kind_of(trace, carve.plan, node.op.name())?;
         let seat = out
             .plans
             .get_mut(carve.plan.0 as usize)
@@ -254,9 +254,9 @@ pub fn probe(plan: &Plan) -> Result<Facts> {
     // ones their `heads` and `kv_lora_rank` outright — and a restatement the
     // schedule was not carved for is a refusal rather than a schedule read at
     // the wrong tile.
-    for node in &plan.nodes {
+    for node in &trace.nodes {
         if let Some(read) = reads(&node.op) {
-            let width = width_of(plan, read.q)?;
+            let width = width_of(trace, read.q)?;
             if read.head_dim == 0 || width % u64::from(read.head_dim) != 0 {
                 return Err(Fault::Unbound {
                     what: format!(
@@ -372,8 +372,8 @@ fn carves(op: &Operation) -> Option<Carving> {
 /// [`Fault::Unbound`] for a plan op whose output declares a rectangle rather
 /// than a host struct: nothing can build such a value, and nothing can say what
 /// workspace building it would want.
-fn kind_of(plan: &Plan, value: ValueId, carver: &'static str) -> Result<StructKind> {
-    let declared = plan.values.get(value.0 as usize).map(|decl| &decl.ty);
+fn kind_of(trace: &Trace, value: ValueId, carver: &'static str) -> Result<StructKind> {
+    let declared = trace.values.get(value.0 as usize).map(|decl| &decl.ty);
     let Some(Ty::Struct(kind)) = declared else {
         return Err(Fault::Unbound {
             what: format!(
@@ -578,16 +578,16 @@ fn latents(op: &Operation) -> Option<LatentReader> {
     }
 }
 
-/// The `Plan::caches` row a cache-id value names, or `None` for a recurrent
+/// The `Trace::caches` row a cache-id value names, or `None` for a recurrent
 /// one.
 ///
 // driver::store candidate
 #[must_use]
-pub fn row_of(plan: &Plan, cache: ValueId) -> Option<usize> {
-    let Def::Cache(row) = plan.values.get(cache.0 as usize)?.def else {
+pub fn row_of(trace: &Trace, cache: ValueId) -> Option<usize> {
+    let Def::Cache(row) = trace.values.get(cache.0 as usize)?.def else {
         return None;
     };
-    match plan.caches.get(row as usize)? {
+    match trace.caches.get(row as usize)? {
         CacheRow::Kv { .. } => Some(row as usize),
         CacheRow::State { .. } => None,
     }
@@ -597,11 +597,11 @@ pub fn row_of(plan: &Plan, cache: ValueId) -> Option<usize> {
 ///
 // driver::store candidate
 #[must_use]
-pub fn space_of(plan: &Plan, cache: ValueId) -> Option<u32> {
-    let Def::Cache(row) = plan.values.get(cache.0 as usize)?.def else {
+pub fn space_of(trace: &Trace, cache: ValueId) -> Option<u32> {
+    let Def::Cache(row) = trace.values.get(cache.0 as usize)?.def else {
         return None;
     };
-    match plan.caches.get(row as usize)? {
+    match trace.caches.get(row as usize)? {
         CacheRow::Kv { space, .. } => Some(*space),
         CacheRow::State { .. } => None,
     }
@@ -611,8 +611,8 @@ pub fn space_of(plan: &Plan, cache: ValueId) -> Option<u32> {
 /// dim, which is the IR's own reading of `rows x width`.
 ///
 // driver::store candidate
-pub fn width_of(plan: &Plan, value: ValueId) -> Result<u64> {
-    let decl = plan
+pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
+    let decl = trace
         .values
         .get(value.0 as usize)
         .ok_or_else(|| Fault::Unbound {

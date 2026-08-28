@@ -127,7 +127,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     );
 
     // 2. THE ENGINE TRACES. `request` identifies the checkpoint against the
-    //    catalog, traces that SKU's plan, and states the ceilings; `Baked`
+    //    catalog, traces that SKU's plan, and states the ceilings; `CompiledModel`
     //    never crosses (decision 18).
     let budgets = Budgets {
         max_lanes: 4,
@@ -143,13 +143,13 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     let request = engine::driver::load::request(&checkpoint, Platform::Cuda, budgets.clone(), 0)
         .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(
-        request.plan.name, SKU,
+        request.trace.name, SKU,
         "the checkpoint identifies as the row this smoke is about"
     );
 
     // 3. THE LOAD, and what it answers about itself.
     let loaded = driver.load(request).expect("the checkpoint lands");
-    assert_eq!(loaded.facts.plan_name, SKU);
+    assert_eq!(loaded.facts.trace_name, SKU);
     assert!(
         loaded.facts.weight_bytes > 0 && loaded.facts.arena_bytes > 0,
         "a load that reserved nothing did not happen: {:?}",

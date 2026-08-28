@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use driver_cuda::{AdapterPlane, Boot, Graphs, Lane, LayerScores, Seated, Shell};
-use model_compiler::{Budgets, DeviceProfile, Fallback, FamilyCosts};
+use model_compiler::{Budget, DeviceProfile, Fallback, FamilyCosts};
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -113,8 +113,8 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
-fn budgets(seats: u32) -> Budgets {
-    Budgets {
+fn budget(seats: u32) -> Budget {
+    Budget {
         max_lanes: 8,
         max_tokens: 256,
         buckets: Vec::new(),
@@ -319,8 +319,8 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-    let seats = plan
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
@@ -352,12 +352,12 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         std::env::set_var("PIE_CUDA_FALLBACK_COPY", "off");
     }
 
-    let budgets = budgets(u32::try_from(seats).expect("a capacity fits a u32"));
+    let budget = budget(u32::try_from(seats).expect("a capacity fits a u32"));
     let mut shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: budgets.clone(),
+        budget: budget.clone(),
         // **THE TWO ARMS MUST WITHDRAW THE SAME CONSUMER**, or they are two
         // artifacts and the comparison prices nothing. The withdrawal is
         // chosen by cost (`model_compiler::layout::choose`), and naming an op
@@ -387,9 +387,9 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
     register(&mut shell, &planes);
 
     // ── the premise, read off the bake rather than assumed ───────────────
-    let baked = shell.baked();
+    let compiled = shell.compiled_model();
     let corrections: Vec<u32> = shell
-        .plan()
+        .trace()
         .nodes
         .iter()
         .enumerate()
@@ -398,7 +398,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         .collect();
     let mut grouped_rows = 0usize;
     let mut split_rows = 0usize;
-    for row in &baked.fallback.rows {
+    for row in &compiled.fallback.rows {
         if !corrections.contains(&row.node) {
             continue;
         }
@@ -414,7 +414,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
 
     // How many intervals the adapter window covers in the mixed composition
     // below — composed against the artifact this arm actually loaded.
-    let mask = baked
+    let mask = compiled
         .template()
         .iter()
         .find(|region| region.nodes.clone().any(|node| corrections.contains(&node)))
@@ -428,7 +428,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         let rows = fresh.len() as u32;
         mixed.push(driver::fire::Lane::new(word(rows, adapted, captures), rows));
     }
-    let runs = driver::fire::compose(baked, &budgets, &mixed)
+    let runs = driver::fire::compose(compiled, &budget, &mixed)
         .expect("the mixed fire composes")
         .classes()
         .spans(&mask)

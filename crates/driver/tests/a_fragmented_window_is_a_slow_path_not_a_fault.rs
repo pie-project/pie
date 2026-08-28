@@ -6,7 +6,7 @@
 //! `model_compiler`'s P4 solves one C1P instance over the whole plan and, for
 //! every windowed consumer it cannot make an interval of the row order,
 //! WITHDRAWS the constraint and writes the consumer's nodes into
-//! `Baked::fallback` with an answer per bucket range (design §3). Nothing read
+//! `CompiledModel::fallback` with an answer per bucket range (design §3). Nothing read
 //! that table. A fire whose class order left such a window in pieces was a
 //! `driver_cuda::Fault::Fragmented` — a hard refusal, justified in prose by
 //! "the catalog bakes an empty `FallbackTable` today".
@@ -55,11 +55,11 @@ use kernels::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear,
 };
-use model_compiler::{Baked, Budgets, DeviceProfile, Lowering, Region, compile};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, Lowering, Region, compile};
 use model_dsl::Platform;
 use model_ir::{
     Attention, ClassSet, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
-    Plan,
+    Trace,
 };
 
 /// A deployment's ceilings, at an adapter capacity the catalog can seat.
@@ -70,8 +70,8 @@ use model_ir::{
 /// (SKU × platform) pairs — so every one of those tests walks its loop and
 /// asserts nothing. At 8 the five qwen texts bake, and they are the texts that
 /// owe fallback rows.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -92,9 +92,9 @@ struct MockDispatch {
 }
 
 impl MockDispatch {
-    fn new(plan: &Plan) -> MockDispatch {
+    fn new(trace: &Trace) -> MockDispatch {
         MockDispatch {
-            at: plan
+            at: trace
                 .nodes
                 .iter()
                 .enumerate()
@@ -248,12 +248,12 @@ fn covered(spans: &[MaskSpan]) -> (Vec<u32>, Vec<u32>) {
 /// vacuously.
 fn fire_and_check(
     what: &str,
-    plan: &Plan,
-    baked: &Baked,
+    trace: &Trace,
+    compiled: &CompiledModel,
     lanes: &[Lane],
     wrong: &mut Vec<String>,
 ) -> usize {
-    let fire = match compose(baked, &budgets(), lanes) {
+    let fire = match compose(compiled, &budget(), lanes) {
         Ok(fire) => fire,
         Err(refusal) => {
             wrong.push(format!("{what}: the fire does not compose — {refusal}"));
@@ -262,17 +262,17 @@ fn fire_and_check(
     };
     let descriptor = FireDescriptor::of(&fire);
 
-    let mut dispatch = MockDispatch::new(plan);
+    let mut dispatch = MockDispatch::new(trace);
     let mut runs = Runs::default();
     // THE ASSERTION THE WHOLE FILE IS FOR: this used to be a refusal.
-    if let Err(refusal) = walk(plan, baked, &descriptor, &mut dispatch, &mut runs) {
+    if let Err(refusal) = walk(trace, compiled, &descriptor, &mut dispatch, &mut runs) {
         wrong.push(format!("{what}: the fire is refused — {refusal}"));
         return 0;
     }
 
     let counts = dispatch.counts();
     let mut fragmented = 0usize;
-    for (at, region) in baked.template().iter().enumerate() {
+    for (at, region) in compiled.template().iter().enumerate() {
         let spans = descriptor.spans(&region.mask);
         if spans.len() > 1 {
             fragmented += 1;
@@ -289,13 +289,13 @@ fn fire_and_check(
             // promised is the bake-integrity failure `Fault::Fragmented`
             // keeps, and a fire that produced one would mean the class order
             // did not come from P4's tree.
-            if fallback::promised(baked, region) {
+            if fallback::promised(compiled, region) {
                 wrong.push(format!(
                     "{what}: region {at} is in {} pieces and P4 promised it whole",
                     spans.len(),
                 ));
             }
-            let bound = fallback::bound(baked, &region.mask);
+            let bound = fallback::bound(compiled, &region.mask);
             if spans.len() > bound as usize {
                 wrong.push(format!(
                     "{what}: region {at} covers {} runs where its baked order breaks \
@@ -347,7 +347,7 @@ fn fire_and_check(
             ));
         }
         for node in region.nodes.clone() {
-            let collective = matches!(plan.nodes[node as usize].op, Operation::Collective(_));
+            let collective = matches!(trace.nodes[node as usize].op, Operation::Collective(_));
             let want = if spans.is_empty() {
                 usize::from(collective)
             } else {
@@ -368,8 +368,8 @@ fn fire_and_check(
 
 /// One lane per class, so every window of the artifact is non-empty at once —
 /// which is the composition that fragments every mask P4 withdrew.
-fn every_class(baked: &Baked) -> Vec<Lane> {
-    baked
+fn every_class(compiled: &CompiledModel) -> Vec<Lane> {
+    compiled
         .classes
         .classes
         .iter()
@@ -386,11 +386,11 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
     let mut unwalkable: Vec<&str> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+        let trace = trace(Platform::Cuda);
+        let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
             continue; // an adapter capacity this text cannot seat; not this test's subject.
         };
-        if baked.fallback.rows.is_empty() {
+        if compiled.fallback.rows.is_empty() {
             continue;
         }
         owed += 1;
@@ -409,12 +409,12 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
         // regression in the phase order would quietly shrink what this test
         // covers instead of failing it.
         if walk(
-            &plan,
-            &baked,
+            &trace,
+            &compiled,
             &FireDescriptor::of(
-                &compose(&baked, &budgets(), &every_class(&baked)).expect("composes"),
+                &compose(&compiled, &budget(), &every_class(&compiled)).expect("composes"),
             ),
-            &mut MockDispatch::new(&plan),
+            &mut MockDispatch::new(&trace),
             &mut EagerSink,
         )
         .is_err()
@@ -424,9 +424,9 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
         }
         fragmented += fire_and_check(
             &format!("`{sku}` every-class"),
-            &plan,
-            &baked,
-            &every_class(&baked),
+            &trace,
+            &compiled,
+            &every_class(&compiled),
             &mut wrong,
         );
     }
@@ -458,8 +458,8 @@ fn the_smallest_qwen_fire_that_fragments_a_window_is_three_lanes() {
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
-    let plan = trace(Platform::Cuda);
-    let baked = compile(&plan, &budgets(), &DeviceProfile::default()).expect("`{SKU}` bakes");
+    let trace = trace(Platform::Cuda);
+    let compiled = compile(&trace, &budget(), &DeviceProfile::default()).expect("`{SKU}` bakes");
 
     // Eight classes over four fact bits, and the score-capture window is
     // `{4,5,6,7}` — the classes whose word sets bit 3. P4 seats it against
@@ -467,18 +467,18 @@ fn the_smallest_qwen_fire_that_fragments_a_window_is_three_lanes() {
     // is the smallest one that does not.
     let words: Vec<u64> = [0usize, 4, 5]
         .iter()
-        .map(|&class| baked.classes.classes[class].word())
+        .map(|&class| compiled.classes.classes[class].word())
         .collect();
     let lanes: Vec<Lane> = words.iter().map(|&word| Lane::new(word, 1)).collect();
 
-    let fire = compose(&baked, &budgets(), &lanes).expect("three lanes compose");
+    let fire = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     assert_eq!(fire.present(), [4, 0, 5], "class 0 stands between 4 and 5");
 
     let mut wrong: Vec<String> = Vec::new();
     let fragmented = fire_and_check(
         &format!("`{SKU}` {{0,4,5}}"),
-        &plan,
-        &baked,
+        &trace,
+        &compiled,
         &lanes,
         &mut wrong,
     );
@@ -490,10 +490,10 @@ fn the_smallest_qwen_fire_that_fragments_a_window_is_three_lanes() {
 
     // And the split is two launches over the three rows: one for class 4's
     // row, one for class 5's, with class 0's row standing between them.
-    let scores = baked
+    let scores = compiled
         .template()
         .iter()
-        .find(|region| !fallback::answers(&baked, region.nodes.clone()).is_empty())
+        .find(|region| !fallback::answers(&compiled, region.nodes.clone()).is_empty())
         .expect("some region is owed a fallback");
     let descriptor = FireDescriptor::of(&fire);
     let spans = descriptor.spans(&scores.mask);

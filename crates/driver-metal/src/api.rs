@@ -8,7 +8,7 @@
 //! [`Driver`] is the other shape: a caller opens a driver first
 //! (`engine::driver::backend::open::metal`, from a boot config that has no
 //! model in it), registers it, and only then calls [`Driver::load`] with a
-//! traced `Plan`. There is no `Shell` to have a `Driver` impl on until the
+//! traced `Trace`. There is no `Shell` to have a `Driver` impl on until the
 //! verb that makes one has been called.
 //!
 //! So [`Metal`] is a `Shell` that has not happened yet: the device knobs a
@@ -18,7 +18,7 @@
 //!
 //! # The contract the wrapper cannot state, and how it is supplied
 //!
-//! [`LoadRequest`] carries `{ plan, checkpoint, budgets, ordinal }` and NOT a
+//! [`LoadRequest`] carries `{ trace, checkpoint, budgets, ordinal }` and NOT a
 //! `ModelContract` — deliberately, because `driver-api`'s dependency floor is
 //! `model-ir`, `tensor-ir`, `serde`, `thiserror` (its own header), and a
 //! contract type in it would put `model-loader` in the graph of everyone who
@@ -32,8 +32,8 @@
 //! ```text
 //!   engine (links `model`)                    driver-metal (links no family)
 //!   ----------------------                    ------------------------------
-//!   fn contract_for(plan, path) -> Contract ─▶ Metal::new(boot, contract_for)
-//!     model::import_of(plan.name)                 … load(request) calls it
+//!   fn contract_for(trace, path) -> Contract ─▶ Metal::new(boot, contract_for)
+//!     model::import_of(trace.name)                 … load(request) calls it
 //! ```
 //!
 //! One pointer, resolved by the party that already links the catalog, and no
@@ -93,8 +93,8 @@ use driver::driver_api::program::{
 use driver::driver_api::tensor_ir::registry::{GeometryClass, ModelProfile, PortMask};
 use driver::driver_api::tensor_ir::types::DType;
 use driver::driver_api::transfer::MemoryDomain;
-use model_compiler::{Budgets, DeviceProfile};
-use model_ir::Plan;
+use model_compiler::{Budget, DeviceProfile};
+use model_ir::Trace;
 use model_loader::contract::ModelContract;
 
 use crate::error::Fault;
@@ -108,7 +108,7 @@ use crate::serve::{Boot, Lane, Seated, Shell};
 /// this crate must not know a model family, so the party that links the
 /// catalog supplies the lookup. Identical to the CUDA sibling's type on
 /// purpose — one door, one signature, whichever shell is behind it.
-pub type ContractFor = fn(&Plan, &Path) -> std::result::Result<ModelContract, String>;
+pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
 /// The device knobs a boot config states, before any model is loaded.
 ///
@@ -339,18 +339,18 @@ fn extents(stated: &BindExtents) -> driver::Extents {
 
 /// The ceilings the compiler bakes against, out of the ones the load states.
 ///
-/// The contract carries seven numbers and `model_compiler::Budgets` takes
+/// The contract carries seven numbers and `model_compiler::Budget` takes
 /// four; the other three (`page_size`, `max_context`, `slots`) are the POOLS'
 /// and go to [`Boot`] directly. Converted in one place, which is the whole
-/// reason `driver-api` states its own `Budgets` rather than depending on the
+/// reason `driver-api` states its own `Budget` rather than depending on the
 /// compiler (`load.rs`'s note).
 ///
 /// `max_adapters` crosses unchanged even though this plane seats no bank: it
 /// is a BAKE input, and the compiler is entitled to refuse a plan that cannot
 /// carve what the deployment asked for. What the load then ADVERTISES is a
 /// different number, and it is zero — see [`Driver::load`].
-fn bake_budgets(budgets: &LoadBudgets) -> Budgets {
-    Budgets {
+fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+    Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
@@ -378,8 +378,8 @@ fn bake_budgets(budgets: &LoadBudgets) -> Budgets {
 /// bind time and fail at its first fire, which is the opposite of a
 /// bind-time contract.
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> DriverResult<ModelProfile> {
-    let plan = shell.plan();
-    let layers = plan
+    let trace = shell.trace();
+    let layers = trace
         .nodes
         .iter()
         .filter_map(|node| node.layer)
@@ -441,7 +441,7 @@ impl Driver for Metal {
             ));
         }
         let LoadRequest {
-            plan,
+            trace,
             checkpoint,
             budgets,
             ordinal,
@@ -472,13 +472,13 @@ impl Driver for Metal {
             ));
         };
         let path = PathBuf::from(path);
-        let contract = (self.contract_for)(&plan, &path).map_err(DriverError::Load)?;
+        let contract = (self.contract_for)(&trace, &path).map_err(DriverError::Load)?;
 
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &path,
-            budgets: bake_budgets(&budgets),
+            budget: bake_budgets(&budgets),
             // `None` takes this device's own core count AND `side_streams: 0`
             // — the metal reading of P6, stated in `Shell::load` rather than
             // here so that a reader of the shell learns it. Costs are input,
@@ -492,7 +492,7 @@ impl Driver for Metal {
         })
         .map_err(fault)?;
 
-        let plan_name = shell.plan().name.clone();
+        let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let paging = shell.paging();
         let profile = profile(&shell, &budgets)?;
@@ -622,7 +622,7 @@ impl Driver for Metal {
         self.caps = Some(caps.clone());
         Ok(Loaded {
             facts: LoadFacts {
-                plan_name,
+                trace_name,
                 weight_bytes,
                 arena_bytes,
                 pool_bytes,
@@ -785,6 +785,22 @@ impl Driver for Metal {
             });
         }
         Ok(FireTicket { id, readouts })
+    }
+
+    /// **NOTHING TO WARM, SAID OUT LOUD.** The advisory next-fire hint
+    /// exists for a driver whose fire path keys prepared state on the
+    /// composition — `driver-cuda`'s folded exec cache prebinds the hinted
+    /// composition under the running fire. This shell keys nothing on a
+    /// composition ahead of time: every fire encodes its own command
+    /// buffer from the submission it is handed. Stated as an explicit
+    /// empty body rather than left to the trait default so that the next
+    /// reader — and the day this shell grows a graph cache of its own —
+    /// finds the decision where the other verbs are, not in a default it
+    /// has to know exists. (`bind_thread` above earns its body the same
+    /// way: "nothing to do" is a real answer, and this shell says it
+    /// itself.)
+    fn expect_fire(&mut self, submission: &FireSubmission) {
+        let _ = submission;
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> DriverResult<ProgramId> {

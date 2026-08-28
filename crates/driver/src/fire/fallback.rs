@@ -48,12 +48,12 @@
 //!
 //! [`Fallback::Grouped`] and [`Fallback::View`] still need what they always
 //! needed — an op that takes an offset list rather than a rectangle — which
-//! is exactly why `model_compiler::menu` declines to choose them.
+//! is exactly why `model_compiler::layout`'s menu declines to choose them.
 
 use core::ops::Range;
 
 use kernels::KernelError;
-use model_compiler::{Baked, Fallback, Phase, PqTree, Region};
+use model_compiler::{CompiledModel, Fallback, Phase, PqTree, Region};
 use model_ir::ClassSet;
 
 /// Every answer P4 wrote for a region's nodes, deduplicated, in the order the
@@ -78,9 +78,9 @@ use model_ir::ClassSet;
 /// a region a fire ALREADY found fragmented, which is the rare case by
 /// construction — the whole point of P4 is that it is rare.
 #[must_use]
-pub fn answers(baked: &Baked, nodes: Range<u32>) -> Vec<Fallback> {
+pub fn answers(compiled: &CompiledModel, nodes: Range<u32>) -> Vec<Fallback> {
     let mut found: Vec<Fallback> = Vec::new();
-    for row in &baked.fallback.rows {
+    for row in &compiled.fallback.rows {
         if !nodes.contains(&row.node) || found.contains(&row.fallback) {
             continue;
         }
@@ -100,15 +100,15 @@ pub fn answers(baked: &Baked, nodes: Range<u32>) -> Vec<Fallback> {
 /// does P4 say about this node" without saying which fire is asking gets both
 /// of them back.
 ///
-/// `bucket` INDEXES [`Budgets::buckets`](model_compiler::Budgets::buckets) —
+/// `bucket` INDEXES [`Budget::buckets`](model_compiler::Budget::buckets) —
 /// which is what `FallbackRow::buckets` is a range of — and a deployment that
 /// declared no lattice has one implicit bucket at index 0. The caller holds
 /// the budgets and this crate does not, which is why the index is an
 /// argument: `Composition::bucket` is the bucket's ROW COUNT, and turning
 /// that into a position is a lookup in a table only the shell has.
 #[must_use]
-pub fn answer_at(baked: &Baked, nodes: Range<u32>, bucket: u32) -> Option<Fallback> {
-    baked
+pub fn answer_at(compiled: &CompiledModel, nodes: Range<u32>, bucket: u32) -> Option<Fallback> {
+    compiled
         .fallback
         .rows
         .iter()
@@ -140,12 +140,12 @@ pub fn answer_at(baked: &Baked, nodes: Range<u32>, bucket: u32) -> Option<Fallba
 /// P4 seated, where the question never arises because the window is one
 /// interval anyway.
 #[must_use]
-pub fn copies(baked: &Baked, mask: &ClassSet, bucket: u32) -> bool {
-    baked
+pub fn copies(compiled: &CompiledModel, mask: &ClassSet, bucket: u32) -> bool {
+    compiled
         .template()
         .iter()
         .filter(|region| &region.mask == mask)
-        .any(|region| answer_at(baked, region.nodes.clone(), bucket) == Some(Fallback::Copy))
+        .any(|region| answer_at(compiled, region.nodes.clone(), bucket) == Some(Fallback::Copy))
 }
 
 /// **THE SHELL'S HALF OF `Fallback::Copy`**: what a backend must be able to
@@ -246,8 +246,8 @@ fn unserved(half: &'static str) -> KernelError {
 /// covers one interval the two answers are the same launch — which keeps the
 /// linear scan on the rare path where [`answers`] puts it.
 #[must_use]
-pub fn grouped(baked: &Baked, nodes: Range<u32>) -> bool {
-    baked
+pub fn grouped(compiled: &CompiledModel, nodes: Range<u32>) -> bool {
+    compiled
         .fallback
         .rows
         .iter()
@@ -261,7 +261,7 @@ pub fn grouped(baked: &Baked, nodes: Range<u32>) -> bool {
 /// **AN UPPER BOUND ON EVERY FIRE, WHICH IS WHY IT IS THE NUMBER A LOAD SIZES
 /// AGAINST.** A fire orders its classes by that same order with the absent
 /// ones dropped
-/// ([`LayoutOrder::class_order`](model_compiler::LayoutOrder::class_order)),
+/// ([`ClassOrder::class_order`](model_compiler::ClassOrder::class_order)),
 /// and dropping a class can only CLOSE a gap — two of the mask's classes that
 /// were separated only by absent ones become adjacent. So no composition can
 /// find more runs than this, and a fire that does has a class order that did
@@ -277,9 +277,9 @@ pub fn grouped(baked: &Baked, nodes: Range<u32>) -> bool {
 /// offers only capture regions to the C1P instance, so a plan builder's
 /// window is neither promised nor answered for.
 #[must_use]
-pub fn bound(baked: &Baked, mask: &ClassSet) -> u32 {
-    let classes = baked.classes.classes.len();
-    let order = baked.order.class_order(&ClassSet::of(0..classes), None);
+pub fn bound(compiled: &CompiledModel, mask: &ClassSet) -> u32 {
+    let classes = compiled.classes.classes.len();
+    let order = compiled.order.class_order(&ClassSet::of(0..classes), None);
     let mask: Vec<u8> = mask.iter().map(|class| class as u8).collect();
     PqTree::runs(&order, &mask).max(1)
 }
@@ -303,8 +303,8 @@ pub fn bound(baked: &Baked, mask: &ClassSet) -> u32 {
 /// blast radius across every baked order, so it is named here rather than
 /// made here.)
 #[must_use]
-pub fn promised(baked: &Baked, region: &Region) -> bool {
-    region.phase == Phase::Capture && answers(baked, region.nodes.clone()).is_empty()
+pub fn promised(compiled: &CompiledModel, region: &Region) -> bool {
+    region.phase == Phase::Capture && answers(compiled, region.nodes.clone()).is_empty()
 }
 
 /// How many DISTINCT windows this artifact can ever have in pieces.
@@ -321,10 +321,10 @@ pub fn promised(baked: &Baked, region: &Region) -> bool {
 /// [`bound`] is `1` for them and a window that is never in pieces is never
 /// gathered.
 #[must_use]
-pub fn fragmentable(baked: &Baked) -> usize {
+pub fn fragmentable(compiled: &CompiledModel) -> usize {
     let mut seen: Vec<&ClassSet> = Vec::new();
-    for region in baked.template() {
-        if bound(baked, &region.mask) > 1 && !seen.contains(&&region.mask) {
+    for region in compiled.template() {
+        if bound(compiled, &region.mask) > 1 && !seen.contains(&&region.mask) {
             seen.push(&region.mask);
         }
     }
@@ -341,11 +341,11 @@ pub fn fragmentable(baked: &Baked) -> usize {
 /// measurement: most fires split nothing, and every artifact P4 seated whole
 /// answers `1`, which is the shape that state had before the split existed.
 #[must_use]
-pub fn max_runs(baked: &Baked) -> u32 {
-    baked
+pub fn max_runs(compiled: &CompiledModel) -> u32 {
+    compiled
         .template()
         .iter()
-        .map(|region| bound(baked, &region.mask))
+        .map(|region| bound(compiled, &region.mask))
         .max()
         .unwrap_or(1)
         .max(1)
@@ -355,8 +355,8 @@ pub fn max_runs(baked: &Baked) -> u32 {
 mod tests {
     use super::*;
     use crate::fire::fixture::{Build, fact};
-    use model_compiler::{Budgets, DeviceProfile, compile};
-    use model_ir::Cond;
+    use model_compiler::{Budget, DeviceProfile, compile};
+    use model_ir::Guard;
 
     /// The smallest plan P4 cannot seat: two facts, and a window on each axis
     /// AND on the diagonal.
@@ -371,17 +371,17 @@ mod tests {
     fn crossing() -> Build {
         let mut b = Build::new();
         let x = b.input(8);
-        let mut v = b.op(x, 4, Cond::Always);
-        let xor = Cond::or(
-            Cond::and(fact(0), Cond::not(fact(1))),
-            Cond::and(Cond::not(fact(0)), fact(1)),
+        let mut v = b.op(x, 4, Guard::Always);
+        let xor = Guard::or(
+            Guard::and(fact(0), Guard::not(fact(1))),
+            Guard::and(Guard::not(fact(0)), fact(1)),
         );
         for axis in [fact(0), fact(1), xor] {
             let taken = b.op(v, 4, axis.clone());
-            let other = b.op(v, 4, Cond::not(axis.clone()));
-            v = b.merge(&[(taken, axis.clone()), (other, Cond::not(axis))], 4);
+            let other = b.op(v, 4, Guard::not(axis.clone()));
+            v = b.merge(&[(taken, axis.clone()), (other, Guard::not(axis))], 4);
         }
-        let y = b.op(v, 4, Cond::Always);
+        let y = b.op(v, 4, Guard::Always);
         b.out(y);
         b
     }
@@ -389,17 +389,17 @@ mod tests {
     #[test]
     fn a_seated_region_is_owed_nothing_and_a_withdrawn_one_names_its_answer() {
         let b = crossing();
-        let baked = compile(&b.plan, &Budgets::new(8, 64), &DeviceProfile::default())
+        let compiled = compile(&b.trace, &Budget::new(8, 64), &DeviceProfile::default())
             .expect("the fixture bakes");
         assert!(
-            !baked.fallback.rows.is_empty(),
+            !compiled.fallback.rows.is_empty(),
             "three crossing windows over four classes are not C1P",
         );
 
         // The region the table names, and one it does not.
-        let owed: Vec<u32> = baked.fallback.rows.iter().map(|row| row.node).collect();
-        for region in baked.template() {
-            let answers = answers(&baked, region.nodes.clone());
+        let owed: Vec<u32> = compiled.fallback.rows.iter().map(|row| row.node).collect();
+        for region in compiled.template() {
+            let answers = answers(&compiled, region.nodes.clone());
             let named = region.nodes.clone().any(|node| owed.contains(&node));
             assert_eq!(named, !answers.is_empty(), "region {:?}", region.nodes);
         }
@@ -411,27 +411,27 @@ mod tests {
         // A lattice that reaches past the crossover, so the menu writes the
         // split entry beside the copy one and states an `r` this can be
         // checked against.
-        let wide = Budgets {
+        let wide = Budget {
             max_lanes: 8,
             max_tokens: 4096,
             buckets: vec![64, 4096],
             max_adapters: 0,
         };
-        let baked = compile(&b.plan, &wide, &DeviceProfile::default()).expect("the fixture bakes");
+        let compiled = compile(&b.trace, &wide, &DeviceProfile::default()).expect("the fixture bakes");
 
         // THE TWO ANSWERS AGREE, which is the claim `bound`'s doc makes about
         // deriving the number from the order rather than reading it off the
         // table: P4 counts `r` on the frontier it shipped, and so does this.
         let mut checked = 0;
-        for region in baked.template() {
-            let stated = answers(&baked, region.nodes.clone())
+        for region in compiled.template() {
+            let stated = answers(&compiled, region.nodes.clone())
                 .into_iter()
                 .find_map(|answer| match answer {
                     Fallback::Split { r } => Some(r),
                     _ => None,
                 });
             if let Some(stated) = stated {
-                assert_eq!(bound(&baked, &region.mask), stated, "{:?}", region.nodes);
+                assert_eq!(bound(&compiled, &region.mask), stated, "{:?}", region.nodes);
                 assert!(stated > 1, "a withdrawn consumer costs more than one launch");
                 checked += 1;
             }
@@ -440,9 +440,9 @@ mod tests {
 
         // A seated region is bounded at one launch — the promise, in the same
         // vocabulary.
-        for region in baked.template() {
-            if promised(&baked, region) {
-                assert_eq!(bound(&baked, &region.mask), 1, "{:?}", region.nodes);
+        for region in compiled.template() {
+            if promised(&compiled, region) {
+                assert_eq!(bound(&compiled, &region.mask), 1, "{:?}", region.nodes);
             }
         }
     }
@@ -450,12 +450,12 @@ mod tests {
     #[test]
     fn a_prepare_region_is_promised_nothing_because_p4_never_constrained_it() {
         let b = crossing();
-        let baked = compile(&b.plan, &Budgets::new(8, 64), &DeviceProfile::default())
+        let compiled = compile(&b.trace, &Budget::new(8, 64), &DeviceProfile::default())
             .expect("the fixture bakes");
-        for region in baked.template() {
+        for region in compiled.template() {
             if region.phase == Phase::Prepare {
                 assert!(
-                    !promised(&baked, region),
+                    !promised(&compiled, region),
                     "a prepare region's window is neither promised nor answered for",
                 );
             }

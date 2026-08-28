@@ -28,19 +28,19 @@
 
 use driver::driver_api::fire::Mask;
 use driver_cuda::{Fault, LaneMask, Seated};
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::Platform;
-use model_ir::{Attention, Operation, Plan};
+use model_ir::{Attention, Operation, Trace};
 
 /// A deployment's ceilings, small: nothing in the host half loads a
 /// checkpoint.
-fn budgets() -> Budgets {
-    Budgets::new(8, 512)
+fn budget() -> Budget {
+    Budget::new(8, 512)
 }
 
 /// How many `attention.masked` arms a SKU's trace carries.
-fn masked_arms(plan: &Plan) -> usize {
-    plan.nodes
+fn masked_arms(trace: &Trace) -> usize {
+    trace.nodes
         .iter()
         .filter(|node| matches!(node.op, Operation::Attention(Attention::Masked { .. })))
         .count()
@@ -98,10 +98,10 @@ fn gemma_is_the_only_family_that_declares_the_masked_axis() {
 /// weights.
 #[test]
 fn gemma_s_one_kv_space_carries_two_readings_and_probes_them_apart() {
-    let plan = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
+    let trace = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
         Platform::Cuda,
     );
-    let facts = driver_cuda::store::kv::probe(&plan).expect(
+    let facts = driver_cuda::store::kv::probe(&trace).expect(
         "gemma's caches probe: the readings are keyed by row and by plan, not folded \
          up to the space",
     );
@@ -141,7 +141,7 @@ fn gemma_s_one_kv_space_carries_two_readings_and_probes_them_apart() {
     );
 
     // The one space is still one space — that is the point of the ruling.
-    let spaces = plan
+    let spaces = trace
         .caches
         .iter()
         .filter_map(|row| match row {
@@ -183,21 +183,21 @@ fn every_sku_probes_its_caches() {
 ///
 /// The fix was model text, and the net that catches the next one is upstream
 /// of this file: `model_compiler::compile` refuses a straddle by name
-/// (`Refusal::Straddled`) off `Classes::node_mask`, and
+/// (`model_compiler::Error::Straddled`) off `ClassTable::node_mask`, and
 /// `crates/model/tests/no_schedule_straddles_its_readers.rs` asks the same
 /// predicate one pass earlier, with no compiler in the room. This is the
-/// shell's own restatement over a `Baked`, kept because the shell asks it at
-/// load and a `Baked` can arrive from anywhere.
+/// shell's own restatement over a `CompiledModel`, kept because the shell asks it at
+/// load and a `CompiledModel` can arrive from anywhere.
 #[test]
 fn no_sku_straddles_a_schedule() {
     let mut straddled: Vec<String> = Vec::new();
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+        let trace = trace(Platform::Cuda);
+        let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
             straddled.push(format!("`{sku}`: does not bake"));
             continue;
         };
-        if let Err(fault) = driver_cuda::window::no_schedule_straddles_its_readers(&plan, &baked) {
+        if let Err(fault) = driver_cuda::window::no_schedule_straddles_its_readers(&trace, &compiled) {
             straddled.push(format!("`{sku}`: {fault}"));
         }
     }
@@ -226,10 +226,10 @@ fn no_sku_straddles_a_schedule() {
 /// arithmetic is [`the_masked_arm_says_what_the_causal_arm_says`].
 #[test]
 fn gemma_states_a_sliding_window_on_most_of_its_masked_arms() {
-    let plan = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
+    let trace = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
         Platform::Cuda,
     );
-    let windowed = plan
+    let windowed = trace
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
@@ -238,7 +238,7 @@ fn gemma_states_a_sliding_window_on_most_of_its_masked_arms() {
         })
         .filter(Option::is_some)
         .count();
-    let arms = masked_arms(&plan);
+    let arms = masked_arms(&trace);
     assert_eq!((windowed, arms), (35, 42), "five layers of every six slide");
 }
 /// The bits a lane's runs expand to are the bits the device text addresses.
@@ -659,7 +659,7 @@ mod common {
     use std::path::{Path, PathBuf};
 
     use driver_cuda::{Boot, Shell};
-    use model_compiler::Budgets;
+    use model_compiler::Budget;
     use model_dsl::{Classify, Platform, Request};
 
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -706,16 +706,16 @@ mod common {
         };
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
         let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &checkpoint,
-            budgets: Budgets::new(4, 256),
+            budget: Budget::new(4, 256),
             profile: None,
             page_size: 16,
             context: 512,
@@ -735,7 +735,7 @@ mod gemma {
 
     use driver::driver_api::fire::Mask;
     use driver_cuda::{Boot, Lane, Seated, Shell};
-    use model_compiler::Budgets;
+    use model_compiler::Budget;
     use model_dsl::{Classify, Platform, Request};
 
     const SKU: &str = "gemma4-e4b-bf16-kv-bf16";
@@ -903,7 +903,7 @@ mod gemma {
         };
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let plan = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let trace = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
         let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
@@ -911,10 +911,10 @@ mod gemma {
 
         let booted = std::time::Instant::now();
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &checkpoint,
-            budgets: Budgets::new(4, 768),
+            budget: Budget::new(4, 768),
             profile: None,
             page_size: 16,
             context: 1024,

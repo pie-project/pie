@@ -25,9 +25,9 @@
 
 use driver::fire::{Lane, MaskSpan, WindowTable, compose, fallback};
 use driver_cuda::window::Windows;
-use model_compiler::{Baked, Budgets, DeviceProfile, compile};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
 use model_dsl::Platform;
-use model_ir::Plan;
+use model_ir::Trace;
 
 /// The SKU whose `captures_scores` window P4 withdraws, and the one the
 /// reproduction numbers in this file's doc were measured on.
@@ -36,8 +36,8 @@ const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 /// A deployment's ceilings at an adapter capacity the catalog can seat. At the
 /// 32 the other catalog sweeps ask for, `compile` refuses every SKU on adapter
 /// capacity and this file would assert nothing.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -47,19 +47,19 @@ fn budgets() -> Budgets {
     }
 }
 
-fn sku() -> (Plan, Baked) {
+fn sku() -> (Trace, CompiledModel) {
     let (_, _, trace, _) = model::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
-    let plan = trace(Platform::Cuda);
-    let baked = compile(&plan, &budgets(), &DeviceProfile::default())
+    let trace = trace(Platform::Cuda);
+    let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
     assert!(
-        !baked.fallback.rows.is_empty(),
+        !compiled.fallback.rows.is_empty(),
         "`{SKU}` owes fallback rows — that is the premise of this file",
     );
-    (plan, baked)
+    (trace, compiled)
 }
 
 /// The fire's qo boundaries: one entry per lane plus the closing bound, which
@@ -74,16 +74,16 @@ fn indptr(rows: &[u32]) -> Vec<i32> {
 
 #[test]
 fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
-    let (plan, baked) = sku();
+    let (plan, compiled) = sku();
 
     // Classes 0, 4 and 5 at once — the smallest composition that leaves the
     // score-capture window in pieces, with class 0's rows standing between
     // class 4's and class 5's.
     let lanes: Vec<Lane> = [(0usize, 3u32), (4, 5), (5, 2)]
         .iter()
-        .map(|&(class, rows)| Lane::new(baked.classes.classes[class].word(), rows))
+        .map(|&(class, rows)| Lane::new(compiled.classes.classes[class].word(), rows))
         .collect();
-    let fire = compose(&baked, &budgets(), &lanes).expect("three lanes compose");
+    let fire = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     assert_eq!(fire.present(), [4, 0, 5]);
 
     // The boundaries, in FIRE order: class 4's lane, then class 0's, then
@@ -94,7 +94,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
     // `a_copied_window_is_one_launch_over_the_same_rows.rs`.
     let windows = Windows::of(
         &plan,
-        &baked,
+        &compiled,
         fire.classes(),
         &boundaries,
         driver_cuda::window::Copies::off(),
@@ -102,7 +102,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
     .expect("a fragmented window is a slow path, not a fault");
 
     let mut split = 0usize;
-    for (at, region) in baked.template().iter().enumerate() {
+    for (at, region) in compiled.template().iter().enumerate() {
         let at = at as u32;
         let spans = fire.classes().spans(&region.mask);
         assert_eq!(
@@ -166,13 +166,13 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
 /// did not go away with the hard fault it used to raise.
 #[test]
 fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
-    let (plan, baked) = sku();
+    let (plan, compiled) = sku();
 
     // A class table the shell was NOT handed by `compose`: every class one
     // row and one lane, in ASCENDING class order rather than the baked one.
-    // That is what a `Baked` and a `WindowTable` built from different things
+    // That is what a `CompiledModel` and a `WindowTable` built from different things
     // look like, and it is exactly what the variant is for.
-    let count = baked.classes.classes.len();
+    let count = compiled.classes.classes.len();
     let ascending = WindowTable::new(
         (0..count)
             .map(|at| driver::fire::ClassWindow {
@@ -188,18 +188,18 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
     // of the shipped order and of every sub-order of it — that this table
     // nevertheless breaks. `{1,3,5,7}` is one: the qo_one classes, contiguous
     // in the frontier P4 found and every other class apart in `0..8`.
-    let seated = baked
+    let seated = compiled
         .template()
         .iter()
         .find(|region| {
-            fallback::promised(&baked, region) && ascending.span(&region.mask).is_err()
+            fallback::promised(&compiled, region) && ascending.span(&region.mask).is_err()
         })
         .expect("some seated window is not an interval of the ascending order");
-    assert_eq!(fallback::bound(&baked, &seated.mask), 1);
+    assert_eq!(fallback::bound(&compiled, &seated.mask), 1);
 
     let refusal = Windows::of(
         &plan,
-        &baked,
+        &compiled,
         &ascending,
         &indptr(&vec![1; count]),
         driver_cuda::window::Copies::off(),

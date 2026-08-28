@@ -1,5 +1,17 @@
-//! **PROBE ONLY (`palo cuda-abi` wave): what a captured graph says about
-//! itself.** Nothing in the fire path calls anything here.
+//! **What a captured graph says about itself** (`palo cuda-abi` wave).
+//!
+//! **HALF OF THIS MODULE IS NO LONGER A PROBE.** [`walk`] was written to
+//! answer one question — is a captured graph a host-side map from node to
+//! kernel argument? — and the answer was yes for 621 of 621 nodes, so
+//! `.wiki/palo/cuda-abi.md` §7 promotes it: [`crate::device::map`] builds a
+//! load-time table on top of this walk, and step 4's exec cache rebinds
+//! against that table on the fire path. What stays probe-only is everything
+//! that WRITES: [`rebind`] mutates an instantiated exec to price the writes
+//! and to find out which fields the driver validates, and
+//! [`exec_footprint`] instantiates copies to weigh one. Neither is called
+//! from a fire, and the split is deliberate — reading a graph is derivable
+//! from the graph alone, and writing one needs a policy that lives in
+//! `record.rs`.
 //!
 //! Build log 10 ruled a per-fire `cudaGraphExecKernelNodeSetParams` rebind
 //! unreachable because "rebinding needs a host-side map from graph node to
@@ -67,6 +79,18 @@ pub struct Node {
     pub symbol: String,
     /// The `CUfunction` address — identity of the entrypoint this node runs.
     pub func: u64,
+    /// **The live `CUgraphNode_t`.**
+    ///
+    /// [`func`](Node::func) is an identity to compare and to print; this is
+    /// the handle `cudaGraphExecKernelNodeSetParams` takes, and a table that
+    /// held only the number could describe a rebind without being able to
+    /// perform one. Null in a build with no runtime, where no node is ever
+    /// constructed at all.
+    pub node: *mut core::ffi::c_void,
+    /// **The live `CUfunction`**, for the same reason and with the same
+    /// caveat: a patch that re-states a node's parameters has to re-state its
+    /// entrypoint, and the driver wants the pointer rather than its address.
+    pub entry: *mut core::ffi::c_void,
     /// The launch grid, in blocks.
     pub grid: [u32; 3],
     /// The block shape, in threads.
@@ -97,6 +121,14 @@ pub struct Walked {
     pub ambiguous: usize,
     /// How many dependency edges the graph holds.
     pub edges: usize,
+    /// Every dependency edge, as `(from, to)` in the CANONICAL order — the
+    /// same numbering [`Node::at`] carries after the sort.
+    ///
+    /// The count above is what a census prints; this is what a topology
+    /// fingerprint hashes, and the two are kept apart because an edge whose
+    /// endpoints the enumeration did not name (the `index_of` miss below) is
+    /// counted by the driver and cannot be placed by us.
+    pub links: Vec<(usize, usize)>,
 }
 
 #[cfg(not(feature = "_cuda"))]
@@ -154,12 +186,14 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
     let index_of = |node: dr::CUgraphNode| handles.iter().position(|held| *held == node);
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); count];
     let mut indegree = vec![0usize; count];
+    let mut links: Vec<(usize, usize)> = Vec::with_capacity(edge_count);
     for at in 0..edge_count {
         let (Some(a), Some(b)) = (index_of(from[at]), index_of(to[at])) else {
             continue;
         };
         succ[a].push(b);
         indegree[b] += 1;
+        links.push((a, b));
     }
 
     // 3. Longest-path depth: Kahn, taking the max over predecessors.
@@ -199,6 +233,8 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
                 kind,
                 symbol: String::new(),
                 func: 0,
+                node: (*node).cast(),
+                entry: core::ptr::null_mut(),
                 grid: [0; 3],
                 block: [0; 3],
                 smem: 0,
@@ -222,6 +258,8 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
             kind,
             symbol,
             func: params.func.addr() as u64,
+            node: (*node).cast(),
+            entry: params.func.cast(),
             grid: [params.gridDimX, params.gridDimY, params.gridDimZ],
             block: [params.blockDimX, params.blockDimY, params.blockDimZ],
             smem: params.sharedMemBytes,
@@ -243,14 +281,25 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
             ambiguous += 1;
         }
     }
+    // The sort moved every node; an edge named in the ENUMERATION's numbering
+    // now points at the wrong row, so it is re-based before anyone reads it.
+    // A fingerprint that hashed stale pairs would be stable and meaningless.
+    let mut place = vec![0usize; count];
+    for (canonical, node) in nodes.iter().enumerate() {
+        place[node.at] = canonical;
+    }
     for (at, node) in nodes.iter_mut().enumerate() {
         node.at = at;
+    }
+    for link in &mut links {
+        *link = (place[link.0], place[link.1]);
     }
 
     Ok(Walked {
         nodes,
         ambiguous,
         edges: edge_count,
+        links,
     })
 }
 

@@ -107,7 +107,7 @@ fn build_model(
     // memory-derived capacities — those flow through the per-driver entries.
     let group0_caps = drivers.groups[0].caps.clone();
     let snapshot_dir = drivers.groups[0].snapshot_dir.clone();
-    let drivers_facts = drivers.groups[0].facts.plan_name.clone();
+    let drivers_facts = drivers.groups[0].facts.trace_name.clone();
     // The metadata was lifted once when the model was resolved; this only
     // decides which of the two shapes the runtime is being handed. Only the
     // tokenizer half varies -- the config is there either way.

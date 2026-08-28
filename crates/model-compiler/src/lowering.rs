@@ -61,7 +61,7 @@
 //! So the group is free and the ACTIVATION is not, and P3 asks for the
 //! activation's own proof: at most one arm may be demanded by any composition
 //! the budgets admit. A composition is a set of classes; with
-//! [`max_lanes`](crate::Budgets::max_lanes) at two or more, any two classes
+//! [`max_lanes`](crate::Budget::max_lanes) at two or more, any two classes
 //! can co-fire, so the proof holds exactly when every class resolves the merge
 //! to the same arm (in which case there is no group) or when a fire cannot
 //! hold two classes at all — `max_lanes == 1`. A one-lane deployment is a real
@@ -114,10 +114,10 @@
 //! and prints the two numbers per SKU, so a text that gains a vision encoder
 //! or a speculative branch is found by the pass and named by the test.
 
-use model_ir::{Classes, Def, Plan, ValueId};
+use model_ir::{ClassTable, Def, Trace, ValueId};
 
-use crate::baked::{Lowering, Phase, Region};
-use crate::budget::{Budgets, DeviceProfile};
+use crate::compiled::{Lowering, Phase, Region};
+use crate::budget::{Budget, DeviceProfile};
 
 /// What one region's nodes cost, at the profile's family table.
 ///
@@ -125,11 +125,11 @@ use crate::budget::{Budgets, DeviceProfile};
 /// P6 gates a fork with it and P3 gates a conditional with it; two spellings
 /// of "what does this region cost" would be two passes free to disagree about
 /// the same region on the same profile.
-pub(crate) fn region_us(plan: &Plan, region: &Region, profile: &DeviceProfile) -> f32 {
+pub(crate) fn region_us(trace: &Trace, region: &Region, profile: &DeviceProfile) -> f32 {
     region
         .nodes
         .clone()
-        .filter_map(|node| plan.nodes.get(node as usize))
+        .filter_map(|node| trace.nodes.get(node as usize))
         .map(|node| profile.family_us.of(&node.op))
         .sum()
 }
@@ -158,10 +158,10 @@ fn nodes(region: &Region) -> f32 {
 /// STRICT — a device that charges nothing for an empty launch has nothing for
 /// a conditional to save.
 pub(crate) fn lower(
-    plan: &Plan,
+    trace: &Trace,
     regions: &mut [Region],
-    classes: &Classes,
-    budgets: &Budgets,
+    classes: &ClassTable,
+    budget: &Budget,
     profile: &DeviceProfile,
 ) {
     let all = classes.classes.len();
@@ -175,7 +175,7 @@ pub(crate) fn lower(
     // would be the arrangement tart measured as the loser (9.8 µs against
     // 22.6 at K=32).
     let mut claimed = vec![false; regions.len()];
-    for group in switch_groups(plan, regions, classes, budgets, profile) {
+    for group in switch_groups(trace, regions, classes, budget, profile) {
         for (arm, &at) in group.members.iter().enumerate() {
             claimed[at] = true;
             regions[at].lowering = Lowering::Switch {
@@ -195,7 +195,7 @@ pub(crate) fn lower(
         if !windowed(region, all) {
             continue;
         }
-        if !fat(plan, region, profile) {
+        if !fat(trace, region, profile) {
             continue;
         }
         // One body, so `arms` is 1: an `IF` is `cudaGraphCondTypeIf` and the
@@ -228,8 +228,8 @@ fn windowed(region: &Region, all: usize) -> bool {
 
 /// Design §4's own gate: is the body worth an evaluation point that is paid
 /// whether it is taken or not?
-fn fat(plan: &Plan, region: &Region, profile: &DeviceProfile) -> bool {
-    region_us(plan, region, profile) >= profile.fat_region_us
+fn fat(trace: &Trace, region: &Region, profile: &DeviceProfile) -> bool {
+    region_us(trace, region, profile) >= profile.fat_region_us
 }
 
 /// The gate always-launch forces: are the launches this skips worth more than
@@ -262,10 +262,10 @@ struct Group {
 /// SWITCH would be a conditional over some of the exclusive set, which is not
 /// exclusive.
 fn switch_groups(
-    plan: &Plan,
+    trace: &Trace,
     regions: &[Region],
-    classes: &Classes,
-    budgets: &Budgets,
+    classes: &ClassTable,
+    budget: &Budget,
     profile: &DeviceProfile,
 ) -> Vec<Group> {
     // Which region defines each value, for the arms to be looked up by. Two
@@ -273,7 +273,7 @@ fn switch_groups(
     // the plan's own statement of who wrote a value (`Def::Op`), and it is
     // total — the same direction build log 24 (b) reads a cache write in, and
     // for the same reason.
-    let mut region_of = vec![usize::MAX; plan.nodes.len()];
+    let mut region_of = vec![usize::MAX; trace.nodes.len()];
     for (at, region) in regions.iter().enumerate() {
         for node in region.nodes.clone() {
             if let Some(slot) = region_of.get_mut(node as usize) {
@@ -281,7 +281,7 @@ fn switch_groups(
             }
         }
     }
-    let defines: Vec<usize> = plan
+    let defines: Vec<usize> = trace
         .values
         .iter()
         .map(|decl| match decl.def {
@@ -292,7 +292,7 @@ fn switch_groups(
 
     let mut groups = Vec::new();
     let mut taken = vec![false; regions.len()];
-    for (value, decl) in plan.values.iter().enumerate() {
+    for (value, decl) in trace.values.iter().enumerate() {
         let Def::Merge(arms) = &decl.def else {
             continue;
         };
@@ -300,7 +300,7 @@ fn switch_groups(
         if arms.len() < 2 || arms.len() > usize::from(u8::MAX) {
             continue;
         }
-        if !fire_exclusive(classes, merge, budgets) {
+        if !fire_exclusive(classes, merge, budget) {
             continue;
         }
         let members: Vec<usize> = arms
@@ -324,7 +324,7 @@ fn switch_groups(
         let all = classes.classes.len();
         if !members
             .iter()
-            .all(|&at| windowed(&regions[at], all) && fat(plan, &regions[at], profile))
+            .all(|&at| windowed(&regions[at], all) && fat(trace, &regions[at], profile))
         {
             continue;
         }
@@ -352,7 +352,7 @@ fn switch_groups(
 /// **CAN A FIRE HOLD TWO LIVE ARMS OF THIS MERGE?** — the proof obligation
 /// decision #4 does not discharge.
 ///
-/// `Classes::merge_arm` says which arm each CLASS resolves the merge to. A
+/// `ClassTable::merge_arm` says which arm each CLASS resolves the merge to. A
 /// composition is a set of classes, so the arms live in a fire are the image
 /// of that set; a SWITCH is sound exactly when that image can never hold two.
 /// Two readings make it so, and only one of them ever produces a group:
@@ -364,8 +364,8 @@ fn switch_groups(
 /// - **one arm, everywhere.** Every class that demands the merge resolves it
 ///   to the same arm, which is a merge with nothing to switch over; the group
 ///   is then one member and `switch_groups` has already declined it.
-fn fire_exclusive(classes: &Classes, merge: ValueId, budgets: &Budgets) -> bool {
-    if budgets.max_lanes <= 1 {
+fn fire_exclusive(classes: &ClassTable, merge: ValueId, budget: &Budget) -> bool {
+    if budget.max_lanes <= 1 {
         return true;
     }
     let Some(arms) = classes.arms_of(merge) else {
@@ -386,7 +386,7 @@ mod tests {
     use super::*;
     use crate::fixture::{Build, fact};
     use crate::{compile, region};
-    use model_ir::{Cond, resolve_classes};
+    use model_ir::{Guard, resolve_classes};
 
     /// A profile that will take anything a region offers: no floor, no fixed
     /// cost. What it is FOR is stating that the gates and not the machinery
@@ -406,32 +406,32 @@ mod tests {
     fn split(width: usize) -> Build {
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let mut d = q;
         for _ in 0..width {
             d = b.op(d, 8, fact(0));
         }
         let mut p = q;
         for _ in 0..width {
-            p = b.op(p, 8, Cond::not(fact(0)));
+            p = b.op(p, 8, Guard::not(fact(0)));
         }
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
         b
     }
 
-    fn lowerings(plan: &model_ir::Plan, budgets: &Budgets, profile: &DeviceProfile) -> Vec<Lowering> {
-        let classes = resolve_classes(plan).expect("covers");
-        let mut regions = region::coalesce(plan, &classes);
-        lower(plan, &mut regions, &classes, budgets, profile);
+    fn lowerings(trace: &model_ir::Trace, budget: &Budget, profile: &DeviceProfile) -> Vec<Lowering> {
+        let classes = resolve_classes(trace).expect("covers");
+        let mut regions = region::coalesce(trace, &classes);
+        lower(trace, &mut regions, &classes, budget, profile);
         regions.into_iter().map(|r| r.lowering).collect()
     }
 
     #[test]
     fn a_batching_deployment_gets_ifs_and_never_a_switch() {
         let b = split(10);
-        let got = lowerings(&b.plan, &Budgets::new(8, 64), &eager());
+        let got = lowerings(&b.trace, &Budget::new(8, 64), &eager());
         assert_eq!(got.iter().filter(|l| **l == Lowering::If).count(), 2);
         assert!(!got.iter().any(|l| matches!(l, Lowering::Switch { .. })));
     }
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn a_one_lane_deployment_gets_the_switch_the_same_arms_could_not_have() {
         let b = split(10);
-        let got = lowerings(&b.plan, &Budgets::new(1, 64), &eager());
+        let got = lowerings(&b.trace, &Budget::new(1, 64), &eager());
         let arms: Vec<&Lowering> = got
             .iter()
             .filter(|l| matches!(l, Lowering::Switch { .. }))
@@ -459,7 +459,7 @@ mod tests {
             fat_region_us: 0.0,
             ..DeviceProfile::default()
         };
-        let got = lowerings(&b.plan, &Budgets::new(8, 64), &profile);
+        let got = lowerings(&b.trace, &Budget::new(8, 64), &profile);
         assert!(got.iter().all(|l| *l == Lowering::AlwaysLaunch));
     }
 
@@ -469,17 +469,17 @@ mod tests {
         let x = b.input(8);
         let mut y = x;
         for _ in 0..40 {
-            y = b.op(y, 8, Cond::Always);
+            y = b.op(y, 8, Guard::Always);
         }
         b.out(y);
-        let got = lowerings(&b.plan, &Budgets::new(8, 64), &eager());
+        let got = lowerings(&b.trace, &Budget::new(8, 64), &eager());
         assert!(got.iter().all(|l| *l == Lowering::AlwaysLaunch));
     }
 
     #[test]
     fn the_off_arm_bakes_the_artifact_p3_never_touched() {
         let b = split(10);
-        let budgets = Budgets::new(8, 64);
+        let budget = Budget::new(8, 64);
         let off = DeviceProfile {
             fat_region_us: f32::INFINITY,
             ..eager()
@@ -493,7 +493,7 @@ mod tests {
         };
         for profile in [&off, &zeroed] {
             assert!(
-                lowerings(&b.plan, &budgets, profile)
+                lowerings(&b.trace, &budget, profile)
                     .iter()
                     .all(|l| *l == Lowering::AlwaysLaunch),
                 "the off arm constructs nothing"
@@ -501,14 +501,14 @@ mod tests {
         }
         // And the whole artifact is the one P2 wrote, not merely its
         // lowerings: this is the D1 pattern's own claim.
-        let plain = compile(&b.plan, &budgets, &off).expect("bakes");
+        let plain = compile(&b.trace, &budget, &off).expect("bakes");
         let neutral = DeviceProfile {
             side_streams: 0,
             ..DeviceProfile::default()
         };
         let baseline = compile(
-            &b.plan,
-            &budgets,
+            &b.trace,
+            &budget,
             &DeviceProfile {
                 fat_region_us: f32::INFINITY,
                 ..neutral
@@ -522,16 +522,16 @@ mod tests {
     fn a_collective_region_stays_always_launch_however_fat_it_is() {
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
         let mut g = b.all_gather(a, 8, fact(0));
         for _ in 0..20 {
             g = b.op(g, 8, fact(0));
         }
-        let o = b.merge(&[(g, fact(0)), (a, Cond::not(fact(0)))], 8);
+        let o = b.merge(&[(g, fact(0)), (a, Guard::not(fact(0)))], 8);
         b.out(o);
-        let got = lowerings(&b.plan, &Budgets::new(8, 64), &eager());
-        let classes = resolve_classes(&b.plan).expect("covers");
-        let regions = region::coalesce(&b.plan, &classes);
+        let got = lowerings(&b.trace, &Budget::new(8, 64), &eager());
+        let classes = resolve_classes(&b.trace).expect("covers");
+        let regions = region::coalesce(&b.trace, &classes);
         for (at, region) in regions.iter().enumerate() {
             if region.collective {
                 assert_eq!(got[at], Lowering::AlwaysLaunch, "region {at}");
@@ -545,19 +545,19 @@ mod tests {
         // two arms this profile conditionalizes are the two arms P6 would
         // otherwise have overlapped.
         let b = split(10);
-        let budgets = Budgets::new(8, 64);
+        let budget = Budget::new(8, 64);
         let on = DeviceProfile {
             side_streams: 2,
             ..eager()
         };
-        let baked = compile(&b.plan, &budgets, &on).expect("bakes");
-        assert!(baked.regions.iter().any(|r| r.lowering == Lowering::If));
-        for region in &baked.regions {
+        let compiled = compile(&b.trace, &budget, &on).expect("bakes");
+        assert!(compiled.regions.iter().any(|r| r.lowering == Lowering::If));
+        for region in &compiled.regions {
             if region.lowering != Lowering::AlwaysLaunch {
                 assert_eq!(region.stream, 0, "a conditional body is single-stream");
                 assert!(region.open.is_none() && region.close.is_none());
             }
         }
-        assert!(baked.forks.pairs.is_empty());
+        assert!(compiled.streams.pairs.is_empty());
     }
 }

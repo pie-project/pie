@@ -50,7 +50,7 @@
 pub mod kv;
 
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
-use model_ir::{CacheRow, Dtype, Plan};
+use model_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::Buffer;
 use crate::error::{Fault, Result};
@@ -166,11 +166,11 @@ impl Pools {
     /// which page, never how wide the row it addresses is, and gemma's
     /// sliding and global layers share one page-id space at two widths
     /// ([`SpaceFacts`](crate::store::kv::SpaceFacts)).
-    pub fn reserve(plan: &Plan, paging: Paging, facts: &Facts) -> Result<Pools> {
-        let mut slabs = Vec::with_capacity(plan.caches.len());
-        let mut shapes = Vec::with_capacity(plan.caches.len());
+    pub fn reserve(trace: &Trace, paging: Paging, facts: &Facts) -> Result<Pools> {
+        let mut slabs = Vec::with_capacity(trace.caches.len());
+        let mut shapes = Vec::with_capacity(trace.caches.len());
 
-        for (index, row) in plan.caches.iter().enumerate() {
+        for (index, row) in trace.caches.iter().enumerate() {
             match row {
                 CacheRow::Kv {
                     name,

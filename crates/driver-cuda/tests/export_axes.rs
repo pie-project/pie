@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use driver_cuda::{Boot, Graphs, Lane, LayerScores, Seated, Shell};
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::{Classify, Platform, Request};
 
 /// The workhorse: small, dense, and the SKU whose model text declares the
@@ -77,7 +77,7 @@ const STEPS: usize = 8;
 /// The ceilings every shell in this file loads at — named because gate (g)
 /// bakes the same plan a second time to check its own premise, and two
 /// budgets would be two artifacts.
-const BUDGETS: Budgets = Budgets {
+const BUDGETS: Budget = Budget {
     max_lanes: 4,
     max_tokens: 256,
     buckets: Vec::new(),
@@ -102,7 +102,7 @@ fn word(query_len: u32, captures: bool) -> u64 {
 }
 
 /// The word a DRAFTING request carries, which this SKU's artifact has no arm
-/// for — `Classes::mask` drops the bit, so the lane composes as the word it
+/// for — `ClassTable::mask` drops the bit, so the lane composes as the word it
 /// would have had. That is the masking `driver::fire::compose` documents, and
 /// it is why the draft refusal below is `Draftless` rather than
 /// `UnknownWord`: the two halves agree perfectly, and what is missing is the
@@ -564,7 +564,7 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
     // captured dispatched no `attention.prefill_lse` at all, and the artifact
     // does carry them, so this is an absence rather than an emptiness.
     let arms = shell
-        .plan()
+        .trace()
         .nodes
         .iter()
         .filter(|node| {
@@ -631,15 +631,15 @@ fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_to
     // at the same budgets, compose the same three words, and count the windows
     // that come back in pieces.
     let split_windows = {
-        let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-        let baked = compile(&plan, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
+        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
         let words = [
             driver::fire::Lane::new(word(1, true), 1),
             driver::fire::Lane::new(word(late.len() as u32, true), late.len() as u32),
             driver::fire::Lane::new(word(1, false), 1),
         ];
-        let fire = driver::fire::compose(&baked, &BUDGETS, &words).expect("the fire composes");
-        baked
+        let fire = driver::fire::compose(&compiled, &BUDGETS, &words).expect("the fire composes");
+        compiled
             .template()
             .iter()
             .filter(|region| fire.classes().spans(&region.mask).len() > 1)
@@ -1019,7 +1019,7 @@ fn a_capture_against_a_text_that_declares_no_arm_is_refused() {
 /// gemma4-E4B, loaded the way `masked_axis` loads it — the budgets are the
 /// L40S's and that file argues them.
 mod gemma {
-    use super::{Boot, Budgets, Path, PathBuf, Platform, Shell};
+    use super::{Boot, Budget, Path, PathBuf, Platform, Shell};
 
     const SKU: &str = "gemma4-e4b-bf16-kv-bf16";
 
@@ -1055,17 +1055,17 @@ mod gemma {
         };
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let plan = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let trace = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
         let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
 
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &checkpoint,
-            budgets: Budgets::new(4, 768),
+            budget: Budget::new(4, 768),
             profile: None,
             page_size: 16,
             context: 1024,
@@ -1113,12 +1113,12 @@ fn the_drafting_sku_does_not_fit_this_device() {
         eprintln!("skipping the drafting load: {checkpoint:?} holds no tensor container");
         return;
     }
-    let plan = model::trace_of(DRAFTING).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = model::trace_of(DRAFTING).expect("the catalog ships the SKU")(Platform::Cuda);
     // The plan is the half that DOES fit, and it is worth reading before the
     // load refuses: this SKU declares the draft export, which is what makes
     // the refusal below about the device rather than about the model text.
     assert!(
-        plan.seams.iter().any(|seam| seam.seam == "mtp"),
+        trace.seams.iter().any(|seam| seam.seam == "mtp"),
         "`{DRAFTING}` states no `mtp` export, so it is not the drafting SKU"
     );
     // ALL FIFTEEN SHARDS AS ONE NAME SPACE. `ztensor_compat::index` takes one
@@ -1133,10 +1133,10 @@ fn the_drafting_sku_does_not_fit_this_device() {
     drop(source);
 
     let refused = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: BUDGETS,
+        budget: BUDGETS,
         profile: None,
         page_size: 16,
         context: 512,
@@ -1272,17 +1272,17 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: BUDGETS,
+        budget: BUDGETS,
         profile: None,
         page_size: 16,
         context: 512,

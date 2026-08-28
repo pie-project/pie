@@ -1,10 +1,10 @@
-//! Plans built by hand, a mock backend, and a sink that writes down what it
+//! Traces built by hand, a mock backend, and a sink that writes down what it
 //! was told — the test vocabulary for every file in `fire/`.
 //!
 //! `model-dsl` is the authoring surface and CANNOT be reached from a unit test
 //! here: it is a dev-dependency, which means it exists for
 //! `tests/every_sku_walks_its_classes.rs` and not for `src/`. So these say in
-//! `Def`, `Ty` and `Cond` what a forward pass says in `split` and
+//! `Def`, `Ty` and `Guard` what a forward pass says in `split` and
 //! `Value::merge`, the same way `model_compiler::fixture` and
 //! `model_ir::check::classes`' own tests do. The catalog test is the one that
 //! checks the two agree.
@@ -19,15 +19,15 @@ use kernels::{
 use model_compiler::{Lowering, Region};
 use model_ir::ops::{Attention, Collective, Elementwise};
 use model_ir::{
-    CacheRow, Cond, CustomCuda, Def, Dim, Dtype, Layout, Linear, Node, Operands, Operation, Plan,
+    CacheRow, Guard, CustomCuda, Def, Dim, Dtype, Layout, Linear, Node, Operands, Operation, Trace,
     Platform, RuntimeInput, Seam, StructKind, Ty, ValueDecl, ValueId,
 };
 
 use crate::fire::sink::{EventId, Sink};
 
-/// A plan under construction.
+/// A trace under construction.
 pub(crate) struct Build {
-    pub(crate) plan: Plan,
+    pub(crate) trace: Trace,
     inputs: u32,
 }
 
@@ -40,15 +40,15 @@ pub(crate) fn act(width: u64) -> Ty {
     }
 }
 
-/// `Cond::Fact(bit)`, spelled short.
-pub(crate) fn fact(bit: u8) -> Cond {
-    Cond::Fact(bit)
+/// `Guard::Fact(bit)`, spelled short.
+pub(crate) fn fact(bit: u8) -> Guard {
+    Guard::Fact(bit)
 }
 
 impl Build {
     pub(crate) fn new() -> Build {
         Build {
-            plan: Plan {
+            trace: Trace {
                 name: "hand-built".to_string(),
                 platform: Platform::Cuda,
                 params: Vec::new(),
@@ -65,8 +65,8 @@ impl Build {
     }
 
     pub(crate) fn value(&mut self, def: Def, ty: Ty) -> ValueId {
-        self.plan.values.push(ValueDecl { def, ty });
-        ValueId((self.plan.values.len() - 1) as u32)
+        self.trace.values.push(ValueDecl { def, ty });
+        ValueId((self.trace.values.len() - 1) as u32)
     }
 
     /// A demand sink the driver binds, distinct per call.
@@ -83,8 +83,8 @@ impl Build {
     }
 
     /// One guarded op over `x`, minting a fresh `width`-wide rectangle.
-    pub(crate) fn op(&mut self, x: ValueId, width: u64, cond: Cond) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+    pub(crate) fn op(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
         self.push(
             Elementwise::RmsnormNoScale {
@@ -94,7 +94,7 @@ impl Build {
                 y,
             }
             .into(),
-            cond,
+            guard,
         );
         y
     }
@@ -103,12 +103,12 @@ impl Build {
     /// reads. The reading it states is the one [`Build::decode`] restates —
     /// one head of width 4, no window — because a schedule and its reader
     /// disagreeing is a shell refusal rather than a fixture.
-    pub(crate) fn prepare(&mut self, cond: Cond) -> ValueId {
+    pub(crate) fn prepare(&mut self, guard: Guard) -> ValueId {
         let kv_indptr = self.input(1);
         let kv_indices = self.input(1);
         let last_page_len = self.input(1);
         let kv_len = self.input(1);
-        let node = self.plan.nodes.len() as u32;
+        let node = self.trace.nodes.len() as u32;
         let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
         self.push(
             Attention::PlanDecode {
@@ -123,15 +123,15 @@ impl Build {
                 plan,
             }
             .into(),
-            cond,
+            guard,
         );
         plan
     }
 
     /// The attention that reads a prepare node's struct.
-    pub(crate) fn decode(&mut self, q: ValueId, plan: ValueId, cond: Cond) -> ValueId {
+    pub(crate) fn decode(&mut self, q: ValueId, plan: ValueId, guard: Guard) -> ValueId {
         let cache = self.cache();
-        let node = self.plan.nodes.len() as u32;
+        let node = self.trace.nodes.len() as u32;
         let o = self.value(Def::Op(node), act(4));
         self.push(
             Attention::Decode {
@@ -144,27 +144,27 @@ impl Build {
                 o,
             }
             .into(),
-            cond,
+            guard,
         );
         o
     }
 
     /// A collective — the family the walk may never elide.
-    pub(crate) fn all_gather(&mut self, x: ValueId, width: u64, cond: Cond) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+    pub(crate) fn all_gather(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
-        self.push(Collective::AllGather { x, y }.into(), cond);
+        self.push(Collective::AllGather { x, y }.into(), guard);
         y
     }
 
-    pub(crate) fn merge(&mut self, arms: &[(ValueId, Cond)], width: u64) -> ValueId {
+    pub(crate) fn merge(&mut self, arms: &[(ValueId, Guard)], width: u64) -> ValueId {
         self.value(Def::Merge(arms.to_vec()), act(width))
     }
 
     /// The `"out"` seam — what a trace writes the forward's return value as,
     /// and therefore what roots the demand walk.
     pub(crate) fn out(&mut self, v: ValueId) -> &mut Build {
-        self.plan.seams.push(Seam {
+        self.trace.seams.push(Seam {
             seam: "out".to_string(),
             values: vec![v],
             layer: None,
@@ -172,10 +172,10 @@ impl Build {
         self
     }
 
-    fn push(&mut self, op: Operation, cond: Cond) {
-        self.plan.nodes.push(Node {
+    fn push(&mut self, op: Operation, guard: Guard) {
+        self.trace.nodes.push(Node {
             op,
-            cond,
+            guard,
             layer: None,
         });
     }
@@ -186,10 +186,10 @@ impl Build {
 ///
 /// **HOW IT KNOWS THE NODE INDEX**, since the contract does not tell it. A
 /// `Dispatch*` method is handed the OP and not the node — deliberately, since
-/// "`cond` and `layer` are the driver walk's business" — so the mock builds
+/// "`guard` and `layer` are the driver walk's business" — so the mock builds
 /// one map at construction from each node's op-payload ADDRESS to its index,
 /// and looks the incoming reference up in it. The payload lives inside the
-/// `Plan`'s node vector, which outlives the walk and is never moved during
+/// `Trace`'s node vector, which outlives the walk and is never moved during
 /// one, so the address is a stable identity. No `unsafe`: a reference cast to
 /// `usize` is a comparison of two things the borrow checker already proved are
 /// alive.
@@ -217,12 +217,12 @@ pub(crate) struct MockDispatch<'p> {
     /// `(region's first node, gather or scatter)` in call order — the record
     /// that says a copied region was bracketed exactly once.
     pub(crate) moved: Vec<(u32, &'static str)>,
-    plan: &'p Plan,
+    trace: &'p Trace,
 }
 
 impl<'p> MockDispatch<'p> {
-    pub(crate) fn new(plan: &'p Plan) -> MockDispatch<'p> {
-        let at = plan
+    pub(crate) fn new(trace: &'p Trace) -> MockDispatch<'p> {
+        let at = trace
             .nodes
             .iter()
             .enumerate()
@@ -234,7 +234,7 @@ impl<'p> MockDispatch<'p> {
             refuse: None,
             copies: false,
             moved: Vec::new(),
-            plan,
+            trace,
         }
     }
 
@@ -259,7 +259,7 @@ impl<'p> MockDispatch<'p> {
             .get(&address)
             .expect("every dispatched op is a node of the plan the mock was built from");
         assert!(
-            (node as usize) < self.plan.nodes.len(),
+            (node as usize) < self.trace.nodes.len(),
             "the mock's map is built from the plan's own nodes",
         );
         self.seen.push((node, op.name()));

@@ -75,7 +75,7 @@ use crate::record::{Arg, Recording, Slot};
 /// qwen35-d0.8b binds at most eighteen arguments in one dispatch
 /// (`descriptor_abi::every_capture_phase_slot_is_a_dispatch`). The ceiling is
 /// stated at ICB creation and cannot be raised afterwards, and the M1 Max
-/// accepts 8, 16, 31, 32, 64 and 128 alike, so this is a `Budgets`-shaped
+/// accepts 8, 16, 31, 32, 64 and 128 alike, so this is a `Budget`-shaped
 /// number with room rather than a device limit.
 pub const MAX_BINDINGS: usize = 32;
 

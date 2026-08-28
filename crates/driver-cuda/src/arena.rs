@@ -38,7 +38,7 @@
 //! [`SlotTable`]: crate::run::SlotTable
 
 use kernels_cuda::Tensor;
-use model_compiler::{ArenaMap, Slot};
+use model_compiler::{ArenaMap, Placement};
 use model_ir::ValueId;
 
 use crate::device::Buffer;
@@ -112,15 +112,15 @@ impl Arena {
 /// and a test that needed a GPU to check it would not be run.
 #[must_use]
 pub fn carve(base: u64, map: &ArenaMap, tokens: u64, lanes: u64) -> SlotTable {
-    let mut rows: Vec<Option<Tensor>> = Vec::with_capacity(map.slots.len());
-    for value in 0..map.slots.len() {
+    let mut rows: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
+    for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
         // An alias IS its root's rectangle — a merge's arms write disjoint
         // row windows of the merged column, and an in-place result is its
         // operand — so the root is followed here rather than at every read.
         let root = map.root(value);
-        rows.push(match map.slots.get(root.0 as usize) {
-            Some(Slot::Arena {
+        rows.push(match map.placements.get(root.0 as usize) {
+            Some(Placement::Arena {
                 offset,
                 rows: expr,
                 width,
@@ -140,7 +140,7 @@ pub fn carve(base: u64, map: &ArenaMap, tokens: u64, lanes: u64) -> SlotTable {
 
 #[cfg(test)]
 mod tests {
-    use model_compiler::{Budgets, DeviceProfile, compile};
+    use model_compiler::{Budget, DeviceProfile, compile};
     use model_dsl::Platform;
     use model_ir::{Def, Ty};
 
@@ -148,21 +148,21 @@ mod tests {
 
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-    fn baked() -> (model_ir::Plan, model_compiler::Baked) {
+    fn compiled() -> (model_ir::Trace, model_compiler::CompiledModel) {
         let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
-        let plan = trace(Platform::Cuda);
-        let baked = compile(&plan, &Budgets::new(4, 64), &DeviceProfile::default())
+        let trace = trace(Platform::Cuda);
+        let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");
-        (plan, baked)
+        (trace, compiled)
     }
 
     #[test]
     fn every_op_output_resolves_and_nothing_else_does() {
-        let (plan, baked) = baked();
-        let slots = carve(1 << 20, &baked.arena, 13, 2);
+        let (trace, compiled) = compiled();
+        let slots = carve(1 << 20, &compiled.arena, 13, 2);
 
-        assert_eq!(slots.0.len(), plan.values.len(), "one row per plan value");
-        for (at, decl) in plan.values.iter().enumerate() {
+        assert_eq!(slots.0.len(), trace.values.len(), "one row per trace value");
+        for (at, decl) in trace.values.iter().enumerate() {
             let bound = slots.0[at].is_some();
             match &decl.def {
                 // A φ resolves like the op output it merges: the compiler
@@ -187,9 +187,9 @@ mod tests {
 
     #[test]
     fn a_rectangle_grows_with_the_fire_and_its_offset_does_not() {
-        let (_, baked) = baked();
-        let small = carve(0, &baked.arena, 1, 1);
-        let large = carve(0, &baked.arena, 64, 4);
+        let (_, compiled) = compiled();
+        let small = carve(0, &compiled.arena, 1, 1);
+        let large = carve(0, &compiled.arena, 64, 4);
 
         let mut moved = 0;
         for (a, b) in small.0.iter().zip(&large.0) {
@@ -209,15 +209,15 @@ mod tests {
 
     #[test]
     fn the_out_seam_lands_the_vocabulary_at_one_row_per_token() {
-        let (plan, baked) = baked();
-        let out = plan
+        let (trace, compiled) = compiled();
+        let out = trace
             .seams
             .iter()
             .find(|seam| seam.seam == "out")
             .and_then(|seam| seam.values.first().copied())
             .expect("every traced plan carries an out seam");
 
-        let slots = carve(0, &baked.arena, 7, 1);
+        let slots = carve(0, &compiled.arena, 7, 1);
         let logits = slots.0[out.0 as usize].expect("the out seam is an arena rectangle");
         assert_eq!(logits.rows, 7, "one row of logits per token row");
         assert_eq!(logits.width, 248_320, "the SKU's vocabulary");
@@ -226,16 +226,16 @@ mod tests {
 
     #[test]
     fn the_carve_fits_the_allocation_it_asks_for() {
-        let (_, baked) = baked();
-        let slots = carve(0, &baked.arena, 64, 4);
+        let (_, compiled) = compiled();
+        let slots = carve(0, &compiled.arena, 64, 4);
         for handle in slots.0.iter().flatten() {
             let end = handle.ptr
                 + handle.elements()
                     * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0);
             assert!(
-                end <= baked.arena.bytes,
+                end <= compiled.arena.bytes,
                 "a rectangle ending at {end} in an arena of {} bytes",
-                baked.arena.bytes
+                compiled.arena.bytes
             );
         }
     }

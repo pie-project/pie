@@ -29,9 +29,9 @@
 
 use driver::fire::{Lane, MaskSpan, compose, fallback};
 use driver_cuda::window::{Copies, Windows};
-use model_compiler::{Baked, Budgets, DeviceProfile, Fallback, FamilyCosts, PqTree, compile};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, Fallback, FamilyCosts, PqTree, compile};
 use model_dsl::Platform;
-use model_ir::{ClassSet, Operands, Plan};
+use model_ir::{ClassSet, Operands, Trace};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
@@ -41,8 +41,8 @@ const CORRECTION: &str = "linear.lora_correct";
 /// A deployment's ceilings at an adapter capacity the catalog can seat. At the
 /// 32 the other catalog sweeps ask for, `compile` refuses every SKU on adapter
 /// capacity and this file would assert nothing.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -79,27 +79,27 @@ fn arms() -> (DeviceProfile, DeviceProfile) {
     (split, grouped)
 }
 
-fn sku() -> (Plan, Baked, Baked) {
+fn sku() -> (Trace, CompiledModel, CompiledModel) {
     let (_, _, trace, _) = model::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
-    let plan = trace(Platform::Cuda);
+    let trace = trace(Platform::Cuda);
     let (split, grouped) = arms();
-    let split = compile(&plan, &budgets(), &split).expect("the split arm bakes");
-    let grouped = compile(&plan, &budgets(), &grouped).expect("the grouped arm bakes");
-    (plan, split, grouped)
+    let split = compile(&trace, &budget(), &split).expect("the split arm bakes");
+    let grouped = compile(&trace, &budget(), &grouped).expect("the grouped arm bakes");
+    (trace, split, grouped)
 }
 
 /// Which regions hold a correction, and the mask they state.
-fn correction_regions(plan: &Plan, baked: &Baked) -> Vec<u32> {
-    baked
+fn correction_regions(trace: &Trace, compiled: &CompiledModel) -> Vec<u32> {
+    compiled
         .template()
         .iter()
         .enumerate()
         .filter(|(_, region)| {
             region.nodes.clone().any(|node| {
-                plan.nodes
+                trace.nodes
                     .get(node as usize)
                     .is_some_and(|node| node.op.name() == CORRECTION)
             })
@@ -120,8 +120,8 @@ fn indptr(rows: &[u32]) -> Vec<i32> {
 /// One lane per class, prefill lanes three rows and decode lanes one — the
 /// composition that presents every behaviour at once, and therefore the one
 /// that fragments the adapter window the most.
-fn one_lane_per_class(baked: &Baked) -> Vec<Lane> {
-    baked
+fn one_lane_per_class(compiled: &CompiledModel) -> Vec<Lane> {
+    compiled
         .classes
         .classes
         .iter()
@@ -152,7 +152,7 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
     assert_eq!(regions, correction_regions(&plan, &grouped));
 
     let lanes = one_lane_per_class(&split);
-    let fire = compose(&split, &budgets(), &lanes).expect("eight lanes compose");
+    let fire = compose(&split, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let boundaries = indptr(&rows);
 
@@ -254,7 +254,7 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
 fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let (plan, _, grouped) = sku();
     let lanes = one_lane_per_class(&grouped);
-    let fire = compose(&grouped, &budgets(), &lanes).expect("eight lanes compose");
+    let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let mut windows = Windows::of(&plan, &grouped, fire.classes(), &indptr(&rows), Copies::off()).expect("the windows");
 
@@ -324,14 +324,14 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .expect("the catalog ships the SKU");
-    let plan = trace(Platform::Cuda);
+    let trace = trace(Platform::Cuda);
     // The shell's real profile with its grouped-capable ops named.
     let profile = DeviceProfile {
         grouped: driver_cuda::GROUPED.iter().map(|op| (*op).to_string()).collect(),
         ..DeviceProfile::default()
     };
-    let shipped = compile(&plan, &budgets(), &profile).expect("the shipped bake");
-    let plain = compile(&plan, &budgets(), &DeviceProfile::default()).expect("the plain bake");
+    let shipped = compile(&trace, &budget(), &profile).expect("the shipped bake");
+    let plain = compile(&trace, &budget(), &DeviceProfile::default()).expect("the plain bake");
     // The default bake pays launches: the score window is withdrawn and owed a
     // `Copy` below the crossover and a `Split` above it, two rows per node.
     assert!(
@@ -364,10 +364,10 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
     );
 
     let lanes = one_lane_per_class(&shipped);
-    let fire = compose(&shipped, &budgets(), &lanes).expect("eight lanes compose");
+    let fire = compose(&shipped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let windows =
-        Windows::of(&plan, &shipped, fire.classes(), &indptr(&rows), Copies::off())
+        Windows::of(&trace, &shipped, fire.classes(), &indptr(&rows), Copies::off())
             .expect("the windows");
     // A segment list where the artifact answered `Grouped` and NOWHERE ELSE:
     // one window, `r` segments; and every region the table said nothing about

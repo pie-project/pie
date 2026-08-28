@@ -36,9 +36,9 @@
 //! RELATION between two bakes of the same plan — so every assertion here is a
 //! comparison between profiles, and the numbers ride in the message.
 
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::Platform;
-use model_ir::{Operands, Plan};
+use model_ir::{Operands, Trace};
 
 /// **THE ELEVEN NAMES THE SHELL USED TO PUBLISH**, kept as the BEFORE of a
 /// measurement rather than as a rule.
@@ -89,15 +89,15 @@ fn as_it_was() -> DeviceProfile {
     }
 }
 
-fn budgets_for(plan: &Plan) -> Budgets {
-    let seats = plan
+fn budgets_for(trace: &Trace) -> Budget {
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
         .map(|param| param.shape.first().copied().unwrap_or(0))
         .min()
         .unwrap_or(0);
-    Budgets {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -107,18 +107,18 @@ fn budgets_for(plan: &Plan) -> Budgets {
     }
 }
 
-fn claims(list: &[&str], plan: &Plan, region: &model_compiler::Region) -> Vec<&'static str> {
+fn claims(list: &[&str], trace: &Trace, region: &model_compiler::Region) -> Vec<&'static str> {
     region
         .nodes
         .clone()
-        .filter_map(|node| plan.nodes.get(node as usize))
+        .filter_map(|node| trace.nodes.get(node as usize))
         .map(|node| node.op.name())
         .filter(|name| list.contains(name))
         .collect()
 }
 
-fn forked(baked: &model_compiler::Baked) -> usize {
-    baked.regions.iter().filter(|r| r.stream != 0).count()
+fn forked(compiled: &model_compiler::CompiledModel) -> usize {
+    compiled.regions.iter().filter(|r| r.stream != 0).count()
 }
 
 /// **THE INVARIANT, WHICHEVER NAMES THE LIST HOLDS.** Two regions that both
@@ -132,14 +132,14 @@ fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let Ok(baked) = compile(&plan, &budgets_for(&plan), &profile) else {
+        let trace = trace(Platform::Cuda);
+        let Ok(compiled) = compile(&trace, &budgets_for(&trace), &profile) else {
             continue;
         };
-        for &(a, b) in &baked.forks.pairs {
+        for &(a, b) in &compiled.streams.pairs {
             let (x, y) = (
-                claims(&driver_cuda::EXCLUSIVE, &plan, &baked.regions[a as usize]),
-                claims(&driver_cuda::EXCLUSIVE, &plan, &baked.regions[b as usize]),
+                claims(&driver_cuda::EXCLUSIVE, &trace, &compiled.regions[a as usize]),
+                claims(&driver_cuda::EXCLUSIVE, &trace, &compiled.regions[b as usize]),
             );
             if !x.is_empty() && !y.is_empty() {
                 wrong.push(format!(
@@ -182,36 +182,36 @@ fn the_per_stream_slab_gives_back_the_arms_the_name_key_silenced() {
     let mut recovered = 0usize;
 
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let before = compile(&plan, &budgets_for(&plan), &was).expect("bakes");
-        let after = compile(&plan, &budgets_for(&plan), &now).expect("bakes");
-        let free = compile(&plan, &budgets_for(&plan), &neutral).expect("bakes");
-        let named = plan
+        let trace = trace(Platform::Cuda);
+        let before = compile(&trace, &budgets_for(&trace), &was).expect("bakes");
+        let after = compile(&trace, &budgets_for(&trace), &now).expect("bakes");
+        let free = compile(&trace, &budgets_for(&trace), &neutral).expect("bakes");
+        let named = trace
             .nodes
             .iter()
             .any(|node| WAS.contains(&node.op.name()));
 
         table.push(format!(
             "  {sku}: was {}/{}/{}, is {}/{}/{}  (streams/events/forked){}",
-            before.forks.streams,
-            before.forks.events,
+            before.streams.streams,
+            before.streams.events,
             forked(&before),
-            after.forks.streams,
-            after.forks.events,
+            after.streams.streams,
+            after.streams.events,
             forked(&after),
             if named { "  ← names one of the eleven" } else { "" },
         ));
 
         // 1. The empty list IS the neutral profile, so the two bakes agree.
-        if forked(&after) != forked(&free) || after.forks.events != free.forks.events {
+        if forked(&after) != forked(&free) || after.streams.events != free.streams.events {
             wrong.push(format!(
                 "`{sku}`: this shell's profile bakes {} forked regions and {} events \
                  where the backend-neutral one bakes {} and {}, and the shell's \
                  exclusive list is empty",
                 forked(&after),
-                after.forks.events,
+                after.streams.events,
                 forked(&free),
-                free.forks.events,
+                free.streams.events,
             ));
         }
 
@@ -271,15 +271,15 @@ fn the_off_arm_is_the_artifact_and_not_a_flag() {
         ..profile()
     };
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let baked = compile(&plan, &budgets_for(&plan), &off).expect("bakes");
+        let trace = trace(Platform::Cuda);
+        let compiled = compile(&trace, &budgets_for(&trace), &off).expect("bakes");
         assert!(
-            baked.regions.iter().all(|r| {
+            compiled.regions.iter().all(|r| {
                 r.stream == 0 && r.wait.is_empty() && r.open.is_none() && r.close.is_none()
             }),
             "`{sku}` forked with the streams off",
         );
-        assert_eq!(baked.forks.events, 0, "`{sku}` minted an event with the streams off");
-        assert_eq!(baked.forks.streams, 1, "`{sku}` asked for a stream it will not open");
+        assert_eq!(compiled.streams.events, 0, "`{sku}` minted an event with the streams off");
+        assert_eq!(compiled.streams.streams, 1, "`{sku}` asked for a stream it will not open");
     }
 }

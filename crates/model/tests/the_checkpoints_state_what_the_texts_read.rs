@@ -197,8 +197,8 @@ fn the_qwen36_import_covers_its_plan_over_the_real_census() {
     });
 
     let trace = model::trace_of("qwen36-27b-bf16-kv-bf16").expect("and its trace");
-    let plan = trace(Platform::Cuda);
-    let demand: BTreeSet<&str> = plan
+    let trace = trace(Platform::Cuda);
+    let demand: BTreeSet<&str> = trace
         .params
         .iter()
         .filter(|p| p.source == ParamSource::Checkpoint)

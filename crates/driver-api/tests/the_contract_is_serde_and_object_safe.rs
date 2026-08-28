@@ -160,15 +160,15 @@ fn every_noun_round_trips() {
     assert_eq!(round_trip(&adapter), adapter);
 }
 
-/// A `LoadRequest` carries a real `model_ir::Plan` across the boundary, and it
+/// A `LoadRequest` carries a real `model_ir::Trace` across the boundary, and it
 /// survives the trip.
 ///
 /// This is decision 18 as a test: the plan is what crosses, so a remote driver
-/// gets one for free, and nothing about `Baked` appears anywhere in the value.
+/// gets one for free, and nothing about `CompiledModel` appears anywhere in the value.
 #[test]
 fn the_plan_crosses_the_boundary() {
     let request = LoadRequest {
-        plan: model_ir::Plan {
+        trace: model_ir::Trace {
             name: "qwen3-0.8b".into(),
             platform: model_ir::Platform::Cuda,
             params: Vec::new(),
@@ -182,7 +182,7 @@ fn the_plan_crosses_the_boundary() {
         ordinal: 0,
     };
     let there_and_back = round_trip(&request);
-    assert_eq!(there_and_back.plan, request.plan);
+    assert_eq!(there_and_back.trace, request.trace);
     assert_eq!(there_and_back.budgets, request.budgets);
 }
 

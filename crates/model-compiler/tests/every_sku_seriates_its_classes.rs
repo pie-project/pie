@@ -32,15 +32,15 @@
 //!
 //! - **the promise is kept** — every constrained mask P4 SEATED is an interval
 //!   of the order the driver will actually be handed, which is
-//!   [`LayoutOrder::class_order`] and not the frontier read off the tree;
+//!   [`ClassOrder::class_order`] and not the frontier read off the tree;
 //! - **the bake is a function of the plan** — same text, same order, twice.
 //!
 //! SILENT ON PURPOSE, like its sibling: the numbers ride in the assert
 //! messages.
 
-use model_compiler::{Budgets, DeviceProfile, Phase, PqTree, Region, compile};
+use model_compiler::{Budget, DeviceProfile, Phase, PqTree, Region, compile};
 use model_dsl::Platform;
-use model_ir::Classes;
+use model_ir::ClassTable;
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -58,15 +58,15 @@ const PLATFORMS: [Platform; 4] = [
 /// two live catalog files (`every_sku_carves_an_arena`,
 /// `no_concurrent_pair_shares_a_write`) already do; the non-vacuity asserts
 /// below are the other half of not repeating the mistake.
-fn budgets_for(plan: &model_ir::Plan) -> Budgets {
-    let seats = plan
+fn budgets_for(trace: &model_ir::Trace) -> Budget {
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
         .map(|param| param.shape.first().copied().unwrap_or(0))
         .min()
         .unwrap_or(0);
-    Budgets {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -80,7 +80,7 @@ fn budgets_for(plan: &model_ir::Plan) -> Budgets {
 /// is neither empty nor every class. The same rule `model_compiler::layout`
 /// applies, restated here on the public surface — a test that read the pass's
 /// own answer for what to check would be checking nothing.
-fn constraints(regions: &[Region], classes: &Classes) -> Vec<Vec<u8>> {
+fn constraints(regions: &[Region], classes: &ClassTable) -> Vec<Vec<u8>> {
     let mut masks: Vec<Vec<u8>> = regions
         .iter()
         .filter(|region| {
@@ -106,17 +106,17 @@ fn constraints(regions: &[Region], classes: &Classes) -> Vec<Vec<u8>> {
 #[test]
 fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
     let mut wrong: Vec<String> = Vec::new();
-    let (mut baked, mut owing) = (0usize, 0usize);
+    let (mut compiled, mut owing) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked_one) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default())
+            let trace = trace(platform);
+            let Ok(baked_one) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default())
             else {
                 wrong.push(format!("`{sku}` as {platform:?}: refused at its own seat count"));
                 continue;
             };
-            baked += 1;
+            compiled += 1;
 
             let masks = constraints(&baked_one.regions, &baked_one.classes);
             let crossing: Vec<String> = masks
@@ -160,7 +160,7 @@ fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
     // NOT VACUOUS, BOTH WAYS. The budget above is what this file got wrong for
     // so long; a green run has to prove the catalog compiled AND that both
     // sides of the iff were exercised.
-    assert_eq!(baked, 68, "only {baked} of 68 SKU x platform pairs baked");
+    assert_eq!(compiled, 68, "only {compiled} of 68 SKU x platform pairs compiled");
     assert_eq!(
         owing, 20,
         "{owing} pairs owe a fallback, where the five qwen texts on four \
@@ -175,15 +175,15 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
-            let classes = baked.classes.classes.len();
+            let classes = compiled.classes.classes.len();
 
             // A fire carrying every class: the widest region's mask IS that
             // set, since a transformer's embed and norms run everywhere.
-            let Some(everything) = baked
+            let Some(everything) = compiled
                 .regions
                 .iter()
                 .map(|region| &region.mask)
@@ -197,7 +197,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
             };
 
             // The order the driver is handed, not the one read off the tree.
-            let order = baked.order.class_order(everything, None);
+            let order = compiled.order.class_order(everything, None);
             if order.len() != classes {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the fire order names {} of {classes} classes",
@@ -205,14 +205,14 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                 ));
                 continue;
             }
-            if Some(&order[..]) != baked.order.tree().map(PqTree::frontier) {
+            if Some(&order[..]) != compiled.order.tree().map(PqTree::frontier) {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: an all-classes fire is not the frontier",
                 ));
             }
 
             let (mut seated, mut withdrawn) = (0usize, 0usize);
-            for mask in constraints(&baked.regions, &baked.classes) {
+            for mask in constraints(&compiled.regions, &compiled.classes) {
                 // **THE PROMISE IS ABOUT WHAT P4 SEATED**, and a withdrawn
                 // consumer is precisely the one it made no promise to — it got
                 // a `FallbackTable` row instead, and `driver::fire::walk`
@@ -227,7 +227,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                 // And the sub-order a fire carrying only that window gets is
                 // the window itself: dropping absent classes cannot break an
                 // interval, and this is where that stops being an argument.
-                let region = baked
+                let region = compiled
                     .regions
                     .iter()
                     .find(|region| {
@@ -235,7 +235,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                             && mask.iter().all(|&c| region.mask.contains(c as usize))
                     })
                     .expect("the mask came off a region");
-                let windowed = baked.order.class_order(&region.mask, None);
+                let windowed = compiled.order.class_order(&region.mask, None);
                 if PqTree::runs(&windowed, &mask) != 1 {
                     wrong.push(format!(
                         "`{sku}` as {platform:?}: a fire carrying only {mask:?} \
@@ -280,12 +280,12 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
-            let classes = baked.classes.classes.len();
-            let masks = constraints(&baked.regions, &baked.classes);
+            let classes = compiled.classes.classes.len();
+            let masks = constraints(&compiled.regions, &compiled.classes);
 
             // The halves, complements collapsed: keep the one whose lowest
             // class is lower, since a mask and its complement cannot both do.
@@ -316,7 +316,7 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
             let withdrawn = masks
                 .iter()
                 .filter(|mask| {
-                    baked
+                    compiled
                         .order
                         .tree()
                         .is_some_and(|tree| !PqTree::is_interval(tree.frontier(), mask))
@@ -347,11 +347,11 @@ fn the_same_text_seriates_the_same_way_twice() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
+            let trace = trace(platform);
             let profile = DeviceProfile::default();
             let (Ok(once), Ok(twice)) = (
-                compile(&plan, &budgets_for(&plan), &profile),
-                compile(&plan, &budgets_for(&plan), &profile),
+                compile(&trace, &budgets_for(&trace), &profile),
+                compile(&trace, &budgets_for(&trace), &profile),
             ) else {
                 continue;
             };

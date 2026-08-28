@@ -27,7 +27,7 @@
 //! this file first. Each verb's marker below names its own half; the shared
 //! frame is:
 //!
-//! * **identity and admission** — which `Plan` the peer loaded, which
+//! * **identity and admission** — which `Trace` the peer loaded, which
 //!   [`Capabilities`](driver_api::Capabilities) it answered, and the scratch
 //!   grant (base page + count) the caller may address inside its pool. The
 //!   old `ScratchGrant` + `HelloRequest`/`HelloResponse` pair.
@@ -155,7 +155,7 @@ impl Driver for RemoteDriver {
 
     fn load(&mut self, request: LoadRequest) -> Result<Loaded> {
         // palo B-remote: the plan crosses here, and it is the one noun the
-        // rewrite made cheap — `model_ir::Plan` is serde. What the envelope
+        // rewrite made cheap — `model_ir::Trace` is serde. What the envelope
         // adds is the CHECKPOINT question: a `Checkpoint::Path` is a path in
         // the PEER's filesystem, and a caller that means its own has to say
         // so.
@@ -173,6 +173,21 @@ impl Driver for RemoteDriver {
         // drops the other.
         let _ = submission;
         Err(self.refuse("fire"))
+    }
+
+    fn expect_fire(&mut self, submission: &FireSubmission) {
+        // AN ADVISORY DOES NOT EARN A ROUND TRIP. Every refusal in this stub
+        // marks a verb the palo B-remote envelope must carry; this one is
+        // deliberately NOT one of them. The hint's whole value is host work
+        // hidden under a running fire on the device's own lane thread —
+        // shipping it over a transport puts a network round trip on the
+        // engine's dispatch path to save the PEER ~261 us it could only
+        // cash if the frame arrived in time anyway. A remote deployment
+        // that wants the prebind states the hint on the peer's side, where
+        // the peer's scheduler holds the next frame. So: an explicit
+        // nothing, not a `refuse` — an advisory cannot be served wrongly,
+        // and a caller must not hear an error for stating one.
+        let _ = submission;
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {

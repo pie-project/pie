@@ -22,10 +22,10 @@ fn every_class_resolves_every_merge() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            if let Err(unresolved) = resolve_classes(&plan) {
+            let trace = trace(platform);
+            if let Err(unresolved) = resolve_classes(&trace) {
                 for fault in &unresolved {
-                    faults.push(format!("`{sku}` as {platform:?}: {}", fault.say(&plan)));
+                    faults.push(format!("`{sku}` as {platform:?}: {}", fault.say(&trace)));
                 }
             }
         }
@@ -43,12 +43,12 @@ fn no_shipped_plan_computes_something_nothing_reads() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(classes) = resolve_classes(&plan) else {
+            let trace = trace(platform);
+            let Ok(classes) = resolve_classes(&trace) else {
                 continue; // the test above is the one that says so.
             };
             for &node in &classes.dead {
-                let op = &plan.nodes[node as usize];
+                let op = &trace.nodes[node as usize];
                 faults.push(format!(
                     "`{sku}` as {platform:?}: node {node} ({}) is demanded in no \
                      class — nothing reads what it computes",

@@ -49,7 +49,7 @@ pub use model_compiler::EventId;
 /// division is what lets one `Run` serve both modes: the dispatch impl is the
 /// same object in an eager fire and a recorded one.
 pub trait Sink {
-    /// A region is about to run. Regions arrive in `Baked::template` order,
+    /// A region is about to run. Regions arrive in `CompiledModel::template` order,
     /// every one of them, whether or not this fire has rows for it — the
     /// structure is composition-independent, which is the property that makes
     /// one recorded graph serve every composition.

@@ -39,10 +39,10 @@
 //! tens of microseconds. So: one pass over the lanes to count, one pass per
 //! present class to seriate, no allocation per lane, and the word -> class
 //! lookup memoized across the fire — a batch of 256 lanes carries at most a
-//! handful of distinct words, and `Classes::class_of` is a scan over the
+//! handful of distinct words, and `ClassTable::class_of` is a scan over the
 //! sweep's dedup'd word lists rather than a hash.
 
-use model_compiler::{ArenaMap, Baked, Budgets, Window};
+use model_compiler::{ArenaMap, CompiledModel, Budget, Extent};
 use model_ir::{ClassSet, ValueId};
 
 use crate::fire::Fault;
@@ -58,7 +58,7 @@ use crate::{Error, Result};
 /// its adapter, its tokens) rides in buffers the driver already binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lane {
-    /// The lane's fact bits. `Cond::Fact(bit)` indexes them.
+    /// The lane's fact bits. `Guard::Fact(bit)` indexes them.
     pub word: u64,
     /// How many token rows this lane contributes — 1 for a decode step, the
     /// prompt length for a prefill, `1 + drafts` for speculative rows.
@@ -137,7 +137,7 @@ pub struct MaskSpan {
 /// by the walk against whichever one is in hand.
 ///
 /// Indexed by class POSITION, which is what a `ClassSet` iterates and what
-/// `Classes::node_mask` was built against. A table of the wrong width does not
+/// `ClassTable::node_mask` was built against. A table of the wrong width does not
 /// fail to find a class; it finds the wrong one, which is why
 /// [`walk()`](fn@crate::fire::walk) checks the width before it walks.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -356,7 +356,7 @@ pub struct LaneRow {
 
 /// One fire's composition: which windows have rows, where, and in what order.
 ///
-/// WHAT IT IS NOT is a schedule. The script is baked (`Baked::template`) and
+/// WHAT IT IS NOT is a schedule. The script is baked (`CompiledModel::template`) and
 /// the same one runs every fire; this is the DATA that script reads. Which is
 /// why a composition can be built, thrown away and built again 5000 times a
 /// second without anything being recompiled or recaptured (design §5).
@@ -420,7 +420,7 @@ impl Composition {
     /// halves together, and it is a delegation because the arithmetic belongs
     /// to the carve that chose the offsets.
     #[must_use]
-    pub fn value_window(&self, arena: &ArenaMap, value: ValueId) -> Option<Window> {
+    pub fn value_window(&self, arena: &ArenaMap, value: ValueId) -> Option<Extent> {
         arena.window(value, u64::from(self.rows), u64::from(self.lane_count()))
     }
 }
@@ -437,11 +437,11 @@ impl Composition {
 /// are the same kind of thing: a batch this artifact cannot describe, refused
 /// before a byte is written rather than launched into columns that are too
 /// short for it.
-pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Composition> {
-    if lanes.len() > budgets.max_lanes as usize {
+pub fn compose(compiled: &CompiledModel, budget: &Budget, lanes: &[Lane]) -> Result<Composition> {
+    if lanes.len() > budget.max_lanes as usize {
         return Err(Fault::TooManyLanes {
             lanes: lanes.len(),
-            max: budgets.max_lanes,
+            max: budget.max_lanes,
         }
         .into());
     }
@@ -450,7 +450,7 @@ pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Compo
     // is a `Vec` and the lookup is linear because a fire's DISTINCT words are
     // few — two in the diagram above, a handful in the worst catalog plan —
     // and a hash of a `u64` costs more than the scan it would replace.
-    let count = baked.classes.classes.len();
+    let count = compiled.classes.classes.len();
     let mut memo: Vec<(u64, u32)> = Vec::new();
     let mut of_lane: Vec<u32> = Vec::with_capacity(lanes.len());
     let mut tally: Vec<(u64, u32)> = vec![(0, 0); count];
@@ -463,16 +463,16 @@ pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Compo
         }
         // THE WORD IS MASKED TO THE BITS THE SWEEP RAN OVER. A lane's word
         // comes from the model's `Classify`, which packs every fact the model
-        // COMPUTES; `Classes::mask` is the bits some guard READS. A model may
+        // COMPUTES; `ClassTable::mask` is the bits some guard READS. A model may
         // state a fact it does not split on — and then a lane that sets it
         // carries a word no class enumerates, which would surface as
         // `UnknownWord`: "the engine and the shell disagree about what is
         // loaded", said about two halves that agree perfectly.
-        let word = lane.word & baked.classes.mask;
+        let word = lane.word & compiled.classes.mask;
         let class = match memo.iter().find(|(seen, _)| *seen == word) {
             Some((_, class)) => *class,
             None => {
-                let class = baked.classes.class_of(word).ok_or(Fault::UnknownWord {
+                let class = compiled.classes.class_of(word).ok_or(Fault::UnknownWord {
                     lane: i,
                     word: lane.word,
                 })? as u32;
@@ -488,10 +488,10 @@ pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Compo
         of_lane.push(class);
     }
 
-    if rows > u64::from(budgets.max_tokens) {
+    if rows > u64::from(budget.max_tokens) {
         return Err(Fault::TooManyRows {
             rows,
-            max: budgets.max_tokens,
+            max: budget.max_tokens,
         }
         .into());
     }
@@ -520,7 +520,7 @@ pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Compo
     // never a truncation, and a fire that could ever reach one has already
     // been turned away upstream.
     let present = ClassSet::of((0..count).filter(|&class| tally[class].1 > 0));
-    let order: Vec<u32> = baked
+    let order: Vec<u32> = compiled
         .order
         .class_order(&present, None)
         .into_iter()
@@ -570,7 +570,7 @@ pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Compo
         classes: WindowTable::new(classes),
         order,
         rows,
-        bucket: bucket_of(budgets, rows)?,
+        bucket: bucket_of(budget, rows)?,
     })
 }
 
@@ -580,12 +580,12 @@ pub fn compose(baked: &Baked, budgets: &Budgets, lanes: &[Lane]) -> Result<Compo
 /// deployment that has not chosen a shape lattice, and the honest bucket for a
 /// fire of `rows` rows is then `rows` itself — one graph per size, which is
 /// what a golden-path eager walk wants and what a test builds with
-/// `Budgets::new`.
-fn bucket_of(budgets: &Budgets, rows: u32) -> Result<u32> {
-    if budgets.buckets.is_empty() {
+/// `Budget::new`.
+fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
+    if budget.buckets.is_empty() {
         return Ok(rows);
     }
-    budgets
+    budget
         .buckets
         .iter()
         .copied()
@@ -593,7 +593,7 @@ fn bucket_of(budgets: &Budgets, rows: u32) -> Result<u32> {
         .ok_or_else(|| {
             Error::Fire(Fault::NoBucket {
                 rows,
-                top: budgets.buckets.last().copied().unwrap_or(0),
+                top: budget.buckets.last().copied().unwrap_or(0),
             })
         })
 }
@@ -604,18 +604,18 @@ mod tests {
     use crate::fire::fixture::{Build, fact};
     use crate::{Error, fire::Fault};
     use model_compiler::{DeviceProfile, compile};
-    use model_ir::{Cond, ValueId};
+    use model_ir::{Guard, ValueId};
 
     /// A deployment small enough to state in an assert: 8 lanes, 64 rows, no
     /// bucket lattice.
-    fn budgets() -> Budgets {
-        Budgets::new(8, 64)
+    fn budget() -> Budget {
+        Budget::new(8, 64)
     }
 
     /// The same, said from inside a test that shadowed the name with a
     /// lattice of its own.
-    fn budgets_without_a_lattice() -> Budgets {
-        Budgets::new(8, 64)
+    fn budgets_without_a_lattice() -> Budget {
+        Budget::new(8, 64)
     }
 
     /// Design §0's diagram, as a plan: a shared producer, an attention pair
@@ -628,12 +628,12 @@ mod tests {
     fn diagram() -> (Build, ValueId) {
         let mut b = Build::new();
         let x = b.input(8);
-        let plan = b.prepare(Cond::Always); // node 0 — prepare, every class
-        let q = b.op(x, 4, Cond::Always); // node 1 — every class
+        let plan = b.prepare(Guard::Always); // node 0 — prepare, every class
+        let q = b.op(x, 4, Guard::Always); // node 1 — every class
         let d = b.decode(q, plan, fact(0)); // node 2 — the decode window
-        let p = b.op(q, 4, Cond::not(fact(0))); // node 3 — the prefill window
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 4);
-        let y = b.op(o, 4, Cond::Always); // node 4 — every class again
+        let p = b.op(q, 4, Guard::not(fact(0))); // node 3 — the prefill window
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
+        let y = b.op(o, 4, Guard::Always); // node 4 — every class again
         b.out(y);
         (b, y)
     }
@@ -644,8 +644,8 @@ mod tests {
     const PREFILL: u32 = 3;
 
     /// The rows one node runs over — its region's mask, against this fire.
-    fn rows_of(baked: &Baked, fire: &Composition, node: u32) -> u32 {
-        let region = baked
+    fn rows_of(compiled: &CompiledModel, fire: &Composition, node: u32) -> u32 {
+        let region = compiled
             .template()
             .iter()
             .find(|r| r.nodes.contains(&node))
@@ -657,7 +657,7 @@ mod tests {
     fn the_thirteen_row_diagram_windows_the_way_the_design_draws_it() {
         // fire (R=5): lane0 prefill(7) lane1 prefill(3) lane2..4 decode(1 each)
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         let lanes = [
             Lane::new(0, 7),
             Lane::new(0, 3),
@@ -665,14 +665,14 @@ mod tests {
             Lane::new(1, 1),
             Lane::new(1, 1),
         ];
-        let fire = compose(&baked, &budgets(), &lanes).expect("composes");
+        let fire = compose(&compiled, &budget(), &lanes).expect("composes");
 
         assert_eq!(fire.rows(), 13);
         assert_eq!(fire.lane_count(), 5);
         assert_eq!(fire.present().len(), 2);
 
-        let prefill = baked.classes.class_of(0).expect("word 0 is a class");
-        let decode = baked.classes.class_of(1).expect("word 1 is a class");
+        let prefill = compiled.classes.class_of(0).expect("word 0 is a class");
+        let decode = compiled.classes.class_of(1).expect("word 1 is a class");
         let p = fire.classes().class(prefill);
         let d = fire.classes().class(decode);
         assert_eq!((p.rows, p.lanes), (10, 2), "two prefill lanes, ten rows");
@@ -689,34 +689,34 @@ mod tests {
 
         // And this is the diagram's actual claim: one kernel over all 13 rows
         // for the shared ops, one over each window for the split pair.
-        assert_eq!(rows_of(&baked, &fire, SHARED), 13);
-        assert_eq!(rows_of(&baked, &fire, DECODE), 3);
-        assert_eq!(rows_of(&baked, &fire, PREFILL), 10);
+        assert_eq!(rows_of(&compiled, &fire, SHARED), 13);
+        assert_eq!(rows_of(&compiled, &fire, DECODE), 3);
+        assert_eq!(rows_of(&compiled, &fire, PREFILL), 10);
     }
 
     #[test]
     fn an_all_decode_fire_leaves_the_prefill_window_empty() {
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         let lanes = [Lane::new(1, 1), Lane::new(1, 1), Lane::new(1, 1)];
-        let fire = compose(&baked, &budgets(), &lanes).expect("composes");
+        let fire = compose(&compiled, &budget(), &lanes).expect("composes");
 
         assert_eq!(fire.rows(), 3);
         assert_eq!(fire.present().len(), 1, "one class has lanes");
         // An empty window is a zero, not an absence: the class still has a
         // window, and it has no rows.
-        assert_eq!(rows_of(&baked, &fire, PREFILL), 0);
-        assert_eq!(rows_of(&baked, &fire, DECODE), 3);
-        assert_eq!(rows_of(&baked, &fire, SHARED), 3);
+        assert_eq!(rows_of(&compiled, &fire, PREFILL), 0);
+        assert_eq!(rows_of(&compiled, &fire, DECODE), 3);
+        assert_eq!(rows_of(&compiled, &fire, SHARED), 3);
         // The decode class starts at row 0 — an absent class occupies nothing.
-        let decode = baked.classes.class_of(1).expect("word 1 is a class");
+        let decode = compiled.classes.class_of(1).expect("word 1 is a class");
         assert_eq!(fire.classes().class(decode).row_offset, 0);
     }
 
     #[test]
     fn lanes_keep_submission_order_inside_a_class() {
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         // Interleaved on submission: prefill, decode, prefill, decode.
         let lanes = [
             Lane::new(0, 5),
@@ -724,7 +724,7 @@ mod tests {
             Lane::new(0, 2),
             Lane::new(1, 1),
         ];
-        let fire = compose(&baked, &budgets(), &lanes).expect("composes");
+        let fire = compose(&compiled, &budget(), &lanes).expect("composes");
 
         // Grouped by class, and the sources inside each group ascend: lane 2
         // never runs before lane 0.
@@ -763,20 +763,20 @@ mod tests {
         // the consumer is one launch.
         let mut b = Build::new();
         let x = b.input(4);
-        let q = b.op(x, 4, Cond::Always);
+        let q = b.op(x, 4, Guard::Always);
         let one = b.op(q, 4, fact(0));
-        let other = b.op(q, 4, Cond::not(fact(0)));
-        let o = b.merge(&[(one, fact(0)), (other, Cond::not(fact(0)))], 4);
+        let other = b.op(q, 4, Guard::not(fact(0)));
+        let o = b.merge(&[(one, fact(0)), (other, Guard::not(fact(0)))], 4);
         let m = b.op(o, 4, fact(1));
-        let um = b.op(o, 4, Cond::not(fact(1)));
-        let out = b.merge(&[(m, fact(1)), (um, Cond::not(fact(1)))], 4);
+        let um = b.op(o, 4, Guard::not(fact(1)));
+        let out = b.merge(&[(m, fact(1)), (um, Guard::not(fact(1)))], 4);
         b.out(out);
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
-        assert_eq!(baked.classes.classes.len(), 4);
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
+        assert_eq!(compiled.classes.classes.len(), 4);
 
         // `one` is node 1, guarded `qo_one`: it runs in the two classes whose
         // word has bit 0 set, words 0b01 and 0b11.
-        let region = baked
+        let region = compiled
             .template()
             .iter()
             .find(|r| r.nodes.contains(&1))
@@ -788,7 +788,7 @@ mod tests {
             Lane::new(0b10, 1),
             Lane::new(0b11, 1),
         ];
-        let fire = compose(&baked, &budgets(), &all).expect("composes");
+        let fire = compose(&compiled, &budget(), &all).expect("composes");
         let spans = fire.classes().segments(&region.mask);
         assert_eq!(fire.classes().rows_of(&region.mask), 2);
         assert_eq!(
@@ -805,7 +805,7 @@ mod tests {
         );
 
         let only = [Lane::new(0b01, 2), Lane::new(0b11, 3)];
-        let fire = compose(&baked, &budgets(), &only).expect("composes");
+        let fire = compose(&compiled, &budget(), &only).expect("composes");
         let spans = fire.classes().segments(&region.mask);
         assert_eq!(
             spans,
@@ -817,24 +817,24 @@ mod tests {
     #[test]
     fn a_bit_no_guard_reads_is_masked_off_rather_than_refused() {
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         // One guarded bit, so the sweep covers words 0 and 1. A lane carrying
         // bit 1 as well is a model computing a fact this plan does not split
         // on — which is the same behaviour as the same lane without it, and
         // not two halves disagreeing about what is loaded.
-        let plain = compose(&baked, &budgets(), &[Lane::new(0b01, 1)]).expect("composes");
-        let extra = compose(&baked, &budgets(), &[Lane::new(0b11, 1)]).expect("composes");
-        assert_eq!(rows_of(&baked, &plain, DECODE), 1);
-        assert_eq!(rows_of(&baked, &extra, DECODE), 1);
-        assert_eq!(rows_of(&baked, &extra, PREFILL), 0);
+        let plain = compose(&compiled, &budget(), &[Lane::new(0b01, 1)]).expect("composes");
+        let extra = compose(&compiled, &budget(), &[Lane::new(0b11, 1)]).expect("composes");
+        assert_eq!(rows_of(&compiled, &plain, DECODE), 1);
+        assert_eq!(rows_of(&compiled, &extra, DECODE), 1);
+        assert_eq!(rows_of(&compiled, &extra, PREFILL), 0);
     }
 
     #[test]
     fn a_lane_of_no_rows_is_refused_before_it_takes_a_seat() {
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         assert_eq!(
-            compose(&baked, &budgets(), &[Lane::new(1, 1), Lane::new(0, 0)]),
+            compose(&compiled, &budget(), &[Lane::new(1, 1), Lane::new(0, 0)]),
             Err(Error::Fire(Fault::EmptyLane { lane: 1 })),
         );
     }
@@ -842,17 +842,17 @@ mod tests {
     #[test]
     fn the_ceilings_are_the_budget_s_and_the_refusal_carries_them() {
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
 
         let crowd: Vec<Lane> = (0..9).map(|_| Lane::new(1, 1)).collect();
         assert_eq!(
-            compose(&baked, &budgets(), &crowd),
+            compose(&compiled, &budget(), &crowd),
             Err(Error::Fire(Fault::TooManyLanes { lanes: 9, max: 8 })),
         );
 
         let long = [Lane::new(0, 40), Lane::new(0, 40)];
         assert_eq!(
-            compose(&baked, &budgets(), &long),
+            compose(&compiled, &budget(), &long),
             Err(Error::Fire(Fault::TooManyRows { rows: 80, max: 64 })),
         );
     }
@@ -860,43 +860,43 @@ mod tests {
     #[test]
     fn a_fire_rounds_up_to_a_bucket_and_one_above_them_all_is_refused() {
         let (b, _) = diagram();
-        let mut budgets = budgets();
-        budgets.buckets = vec![1, 4, 16];
-        let baked = compile(&b.plan, &budgets, &DeviceProfile::default()).expect("bakes");
+        let mut budget = budget();
+        budget.buckets = vec![1, 4, 16];
+        let compiled = compile(&b.trace, &budget, &DeviceProfile::default()).expect("bakes");
 
-        let fire = compose(&baked, &budgets, &[Lane::new(0, 5)]).expect("composes");
+        let fire = compose(&compiled, &budget, &[Lane::new(0, 5)]).expect("composes");
         assert_eq!((fire.rows(), fire.bucket()), (5, 16));
-        let fire = compose(&baked, &budgets, &[Lane::new(1, 1)]).expect("composes");
+        let fire = compose(&compiled, &budget, &[Lane::new(1, 1)]).expect("composes");
         assert_eq!((fire.rows(), fire.bucket()), (1, 1));
 
         // 17 rows round up to nothing, so there is no graph to launch them in.
         assert_eq!(
-            compose(&baked, &budgets, &[Lane::new(0, 17)]),
+            compose(&compiled, &budget, &[Lane::new(0, 17)]),
             Err(Error::Fire(Fault::NoBucket { rows: 17, top: 16 })),
         );
 
         // A budget with no lattice is a deployment that has not chosen one,
         // and then the bucket is the fire's own size.
         let open = super::tests::budgets_without_a_lattice();
-        let baked = compile(&b.plan, &open, &DeviceProfile::default()).expect("bakes");
-        let fire = compose(&baked, &open, &[Lane::new(0, 5)]).expect("composes");
+        let compiled = compile(&b.trace, &open, &DeviceProfile::default()).expect("bakes");
+        let fire = compose(&compiled, &open, &[Lane::new(0, 5)]).expect("composes");
         assert_eq!(fire.bucket(), 5);
     }
 
     #[test]
     fn a_value_s_offset_is_static_and_only_its_length_moves() {
         let (b, y) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
 
-        let small = compose(&baked, &budgets(), &[Lane::new(1, 1)]).expect("composes");
+        let small = compose(&compiled, &budget(), &[Lane::new(1, 1)]).expect("composes");
         let big =
-            compose(&baked, &budgets(), &[Lane::new(0, 7), Lane::new(1, 1)]).expect("composes");
+            compose(&compiled, &budget(), &[Lane::new(0, 7), Lane::new(1, 1)]).expect("composes");
 
         let one = small
-            .value_window(&baked.arena, y)
+            .value_window(&compiled.arena, y)
             .expect("y is in the arena");
         let eight = big
-            .value_window(&baked.arena, y)
+            .value_window(&compiled.arena, y)
             .expect("y is in the arena");
         assert_eq!(
             one.offset, eight.offset,
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(eight.bytes, 8 * 4 * 2);
         assert_eq!(
             eight,
-            baked
+            compiled
                 .arena
                 .window(y, u64::from(big.rows()), u64::from(big.lane_count()))
                 .expect("the same question, asked of the carve directly"),
@@ -997,11 +997,11 @@ mod tests {
         // Not an error: a rank whose batch is empty still has collectives to
         // join (decision #5), and `walk` is where that is spelled.
         let (b, _) = diagram();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
-        let fire = compose(&baked, &budgets(), &[]).expect("composes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
+        let fire = compose(&compiled, &budget(), &[]).expect("composes");
         assert_eq!(fire.rows(), 0);
         assert_eq!(fire.lane_count(), 0);
         assert!(fire.present().is_empty());
-        assert_eq!(rows_of(&baked, &fire, SHARED), 0);
+        assert_eq!(rows_of(&compiled, &fire, SHARED), 0);
     }
 }

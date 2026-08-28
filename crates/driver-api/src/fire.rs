@@ -156,7 +156,7 @@ pub enum Readout {
 pub struct Lane {
     /// Which pool slot this request's sequence lives in.
     pub slot: u32,
-    /// **The lane's fact bits.** `Cond::Fact(bit)` indexes them; the model's
+    /// **The lane's fact bits.** `Guard::Fact(bit)` indexes them; the model's
     /// own `Classify::of` computed them (decision 18). A word this load's
     /// artifact has no class for is a refusal, not a default: it means the
     /// engine and the shell disagree about what is loaded.

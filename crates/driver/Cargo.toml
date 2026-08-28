@@ -69,9 +69,9 @@ tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
 
 # THE ARTIFACT THE FIRE WALKS, and the arrow points this way on purpose.
-# `compile(plan, budgets, profile) -> Baked` is pure and knows nothing about a
+# `compile(plan, budgets, profile) -> CompiledModel` is pure and knows nothing about a
 # driver; `driver::fire::walk` iterates what it produced. Every shell then
-# holds the two together — the `Plan` for its nodes, the `Baked` for the
+# holds the two together — the `Plan` for its nodes, the `CompiledModel` for the
 # regions over them — which is the arrangement `model_compiler::baked`'s own
 # docs describe, and the reason `walk` takes both.
 model-compiler = { path = "../model-compiler" }
@@ -85,7 +85,7 @@ model-ir = { path = "../model-ir" }
 
 # The dispatch contract, and ONLY the contract: six `Dispatch*` traits, the
 # aggregate `exec`, and `KernelError`. The one walk written over that contract
-# used to live inside `kernels` and could not stay there -- it needs `Baked`,
+# used to live inside `kernels` and could not stay there -- it needs `CompiledModel`,
 # and a contract crate that knew what a compiler is would invert the layering
 # every backend depends on (palo decisions #11 and #12). So the walk moved here
 # and the dependency runs this way: driver knows kernels, kernels knows nothing.

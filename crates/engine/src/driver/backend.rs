@@ -228,6 +228,10 @@ pub use remote::{RemoteDisconnectHandle, RemoteDriver};
 // that did not travel to the host). See `cuda::envelopes_resolved`.
 #[cfg(feature = "_driver-cuda")]
 pub use cuda::envelopes_resolved;
+// And its palo-E sibling: the fold's motion mirror, which is how an
+// engine-level gate sees the next-fire hint land (`cuda::fold_observed`).
+#[cfg(feature = "_driver-cuda")]
+pub use cuda::fold_observed;
 
 struct DriverRegistration {
     spec: DriverSpec,

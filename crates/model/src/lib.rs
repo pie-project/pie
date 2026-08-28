@@ -23,7 +23,7 @@ pub use model_dsl::{ClassifyFn, Request};
 ///
 /// THE FOURTH COLUMN IS WHAT LETS A LANE STATE ITS CLASS. Nothing outside a
 /// family's own module can say which bit `qo_one` is — a plan's
-/// `Cond::Fact(bit)` numbers its bits and stops there — so before this column
+/// `Guard::Fact(bit)` numbers its bits and stops there — so before this column
 /// existed the engine's fire path submitted every lane as word 0, the
 /// all-false class, and a decode lane composed as a prefill one. `catalog!`
 /// closes each family's `Classify::of(..).word()` into a plain pointer here,

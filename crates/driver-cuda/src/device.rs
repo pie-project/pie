@@ -25,7 +25,11 @@
 pub mod alloc;
 pub mod ctx;
 pub mod graph;
-/// **PROBE ONLY** (`palo cuda-abi` wave): captured-graph introspection.
+/// The load-time rebind table one capture publishes (`palo cuda-abi` §7,
+/// step 3), and the diff between two of them.
+pub mod map;
+/// Captured-graph introspection: the walk [`map`] is built on, and the
+/// write-side probes that are still only probes.
 pub mod nodes;
 
 pub use alloc::Buffer;

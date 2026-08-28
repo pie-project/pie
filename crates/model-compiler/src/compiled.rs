@@ -28,9 +28,9 @@
 //!   nodes it will carry; what a prepare op writes into which descriptor slot
 //!   is the descriptor's question.
 //! - `params` / `caches` / `seams` — P8's static tables. Today a caller holds
-//!   the `Plan` beside the `Baked` and reads them there; the tables exist so
+//!   the `Trace` beside the `CompiledModel` and reads them there; the tables exist so
 //!   that a shell need not, and copying them out before anything reads them
-//!   would be a second spelling of `Plan::params` with nothing keeping the two
+//!   would be a second spelling of `Trace::params` with nothing keeping the two
 //!   in step.
 //! - `identity: CacheIdentity` — plan hash x compiler version. A hash of a
 //!   plan is a hash of its serialization, and this crate deliberately depends
@@ -38,11 +38,11 @@
 
 use std::ops::Range;
 
-use model_ir::{ClassSet, Classes, ValueId};
+use model_ir::{ClassSet, ClassTable, ValueId};
 
 use crate::arena::{ArenaMap, Concurrency};
-use crate::layout::PqTree;
-use crate::stream::Forks;
+use crate::pq::PqTree;
+use crate::stream::StreamPlan;
 
 /// A recorded synchronization point: what a fork signals and a join waits on.
 ///
@@ -60,28 +60,28 @@ use crate::stream::Forks;
 /// ```
 ///
 /// The ids are dense from zero and numbered in emission order, so a shell
-/// creates `Baked::forks().events` of them once, at load, and indexes.
+/// creates `CompiledModel::streams.events` of them once, at load, and indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EventId(pub u32);
 
 /// One plan, baked.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Baked {
+pub struct CompiledModel {
     /// P1's output, whole.
     ///
     /// DESIGN §2 SPELLS THIS `Vec<Class>` AND THIS KEEPS THE WHOLE
-    /// [`Classes`]. `merge_arm` is what resolves a phi at the fire — which arm
+    /// [`ClassTable`]. `merge_arm` is what resolves a phi at the fire — which arm
     /// wrote a class's rows — and `node_mask` is what a region's mask was
     /// folded from; both are already in hand, and re-deriving either means
     /// running the 2^F sweep a second time. `classes.classes` is still the
     /// design's field, one dot further in.
-    pub classes: Classes,
+    pub classes: ClassTable,
     /// P2's output: maximal runs of adjacent nodes that run in the same
     /// classes and belong to the same phase. Program order, and the record
     /// script walks them front to back.
     pub regions: Vec<Region>,
     /// P4's output: the global class order, as the whole feasible set.
-    pub order: LayoutOrder,
+    pub order: ClassOrder,
     /// P4's other output: what the consumers that order could not seat do
     /// instead, per bucket range.
     pub fallback: FallbackTable,
@@ -96,14 +96,14 @@ pub struct Baked {
     /// it is what one stream means.
     pub concurrency: Concurrency,
     /// P6's other output: how many streams and how many events the template
-    /// names, and the region pairs [`concurrency`](Baked::concurrency) was
+    /// names, and the region pairs [`concurrency`](CompiledModel::concurrency) was
     /// built from. All zero-ish — one stream, no events, no pairs — for a plan
     /// with nothing to overlap, and for every plan when the profile's
     /// `side_streams` is 0.
-    pub forks: Forks,
+    pub streams: StreamPlan,
 }
 
-impl Baked {
+impl CompiledModel {
     /// The capture script: the regions, in the order a recorder emits them.
     ///
     /// A METHOD AND NOT A FIELD, and P6 is where that stopped being an
@@ -201,7 +201,7 @@ pub enum Lowering {
     /// with no exclusive sibling to switch against.
     ///
     /// **IT CARRIES NOTHING, AND THE PREDICATE IS [`Region::mask`].** Design
-    /// §4 spells this `If { cond }`; a `Cond` here would be the authoring-level
+    /// §4 spells this `If { cond }`; a `Guard` here would be the authoring-level
     /// guard, and what the device evaluates is
     /// `descriptor.rows_of(region.mask) > 0` — the same number always-launch
     /// reads, asked one node earlier. Carrying the guard beside the mask would
@@ -220,14 +220,14 @@ pub enum Lowering {
 /// managed one, and each extra boundary is a launch, not a recapture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Region {
-    /// The half-open run of `Plan::nodes` this region covers.
+    /// The half-open run of `Trace::nodes` this region covers.
     pub nodes: Range<u32>,
     /// The classes that run these nodes. Every node in the run has this exact
     /// mask — that equality is what defines the run — so a fire's row count
     /// for the region is one number, which is what the descriptor carries.
     ///
     /// An EMPTY mask is a region no class demands. `resolve_classes` reports
-    /// those as `Classes::dead`; they stay here so that node indices keep
+    /// those as `ClassTable::dead`; they stay here so that node indices keep
     /// meaning what they mean, and a shipped plan has none
     /// (`model/tests/every_class_resolves_every_merge.rs` says so).
     pub mask: ClassSet,
@@ -276,7 +276,7 @@ pub struct Region {
     pub sm_hint: Option<u32>,
     /// This run contains a `Collective`-family node.
     ///
-    /// P0 RECORDS IT AND P3 IS BOUND BY IT. A collective takes any `cond` it
+    /// P0 RECORDS IT AND P3 IS BOUND BY IT. A collective takes any `guard` it
     /// likes — a rank's guard is its own business — but a region carrying one
     /// may never become a conditional body, because a zero-count collective
     /// still has to join the rendezvous. See [`Lowering`].
@@ -293,13 +293,13 @@ pub struct Region {
 /// order closest to the previous fire, which is what keeps pointers from
 /// churning. See [`crate::layout`] for the instance and the greedy.
 ///
-/// ADDITIVE, AND [`Identity`](LayoutOrder::Identity) IS STILL A TRUE ANSWER.
+/// ADDITIVE, AND [`Identity`](ClassOrder::Identity) IS STILL A TRUE ANSWER.
 /// It is what a plan gets when P4 declines to seriate it — more classes than a
 /// `u8` names, or none at all — and it is correct for every plan, since a
 /// consumer whose classes are not an interval simply runs as more than one
 /// launch. It is no longer what `compile` returns for an ordinary plan.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum LayoutOrder {
+pub enum ClassOrder {
     /// Lanes fire in the order the engine assembled them: classes ascending.
     #[default]
     Identity,
@@ -308,7 +308,7 @@ pub enum LayoutOrder {
     Seriated(PqTree),
 }
 
-impl LayoutOrder {
+impl ClassOrder {
     /// The order the classes PRESENT in one fire are seriated in.
     ///
     /// THE ONE THING THE FIRE PATH ASKS. A fire has rows for some subset of
@@ -336,8 +336,8 @@ impl LayoutOrder {
         // v1's whole use of last fire's order. See above.
         let _ = prev;
         match self {
-            LayoutOrder::Identity => present.iter().map(|class| class as u8).collect(),
-            LayoutOrder::Seriated(tree) => tree
+            ClassOrder::Identity => present.iter().map(|class| class as u8).collect(),
+            ClassOrder::Seriated(tree) => tree
                 .frontier()
                 .iter()
                 .copied()
@@ -349,14 +349,14 @@ impl LayoutOrder {
     /// The feasible set itself, when P4 solved one.
     ///
     /// [`PqTree::admits`] is the question the stability pick needs and
-    /// [`class_order`](LayoutOrder::class_order) cannot answer: "is the order
-    /// I am already bound to still legal?". `None` is [`Identity`](LayoutOrder::Identity),
+    /// [`class_order`](ClassOrder::class_order) cannot answer: "is the order
+    /// I am already bound to still legal?". `None` is [`Identity`](ClassOrder::Identity),
     /// which promises nothing and therefore admits everything.
     #[must_use]
     pub fn tree(&self) -> Option<&PqTree> {
         match self {
-            LayoutOrder::Identity => None,
-            LayoutOrder::Seriated(tree) => Some(tree),
+            ClassOrder::Identity => None,
+            ClassOrder::Seriated(tree) => Some(tree),
         }
     }
 }
@@ -394,11 +394,11 @@ pub struct FallbackTable {
 /// One row of the [`FallbackTable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FallbackRow {
-    /// Index into `Plan::nodes`.
+    /// Index into `Trace::nodes`.
     pub node: u32,
-    /// The half-open range of `Budgets::buckets` indices this answer covers.
+    /// The half-open range of `Budget::buckets` indices this answer covers.
     /// A deployment that declared no bucket lattice has ONE implicit bucket at
-    /// `Budgets::max_tokens`, and a row over it reads `0..1`.
+    /// `Budget::max_tokens`, and a row over it reads `0..1`.
     pub buckets: Range<u32>,
     /// What to do instead.
     pub fallback: Fallback,

@@ -12,13 +12,13 @@
 //! load                                  fire
 //! ----                                  ----
 //! bind the device, probe it once        lane words  -> compose
-//! compile(plan, budgets, profile)       regions     -> windows
+//! compile(trace, budgets, profile)       regions     -> windows
 //! read the kv spaces off the plan       seats       -> page geometry
 //! land the checkpoint                   stage the resident inputs
 //! reserve arena, pools, inputs          carve the slot table
 //! find the "out" seam                   build the cache table
 //!                                       Run::new
-//!                                       walk(plan, baked, desc, run, Cursor)
+//!                                       walk(trace, baked, desc, run, Cursor)
 //!                                       synchronize, read the last row
 //! ```
 //!
@@ -84,21 +84,53 @@
 //! side streams the compiler may hand out; unset leaves the profile's own
 //! figure (2).
 //!
+//! **`PIE_CUDA_BUCKETS=off|<ascending list>` is the shape lattice**, and it is
+//! read into the COMPILER's `Budget` for `PIE_CUDA_STREAMS`'s reason: which
+//! buckets exist decides P4's fallback menu (`FallbackRow::buckets` is a range
+//! of lattice POSITIONS), so a shell that invented a lattice after the bake
+//! would be answering questions the artifact was not asked. A `Boot` that
+//! states its own lattice keeps it; one that states none gets
+//! [`default_lattice`] — and `off` is how a caller asks for the empty lattice
+//! back, which is one graph per exact size and a bucket that is the fire's own
+//! row count.
+//!
+//! **`PIE_CUDA_PAD=off|0|false` is D4's off switch** (`.wiki/palo/cuda-abi.md`
+//! §3). ON by default: before each walk this shell stamps the fire's rows and
+//! its bucket onto every stream context (`Ctx::arm`), and the entries that
+//! hand a shape to cuBLASLt round their `M` up to the bucket so the library's
+//! unpublished arm table stops being a function of the batch
+//! (`kernels_cuda::Ctx::opaque_rows` carries the whole safety argument). `off`
+//! arms nothing, which is the A/B arm the tail-waste measurement needs — the
+//! tokens must be byte-identical across it, because everything the padding
+//! computes lands in rows no reader has.
+//!
+//! **`PIE_CUDA_FOLD=on` is D5-lite** (`.wiki/palo/cuda-abi.md` §6b, §7 step
+//! 4), OFF by default: under `Graphs::On`, one exec per BUCKET, captured once
+//! at a synthetic full composition and rebound on the host per fire — empty
+//! windows become `cudaGraphNodeSetEnabled` bits (the correctness mechanism
+//! for library launches, which own no zero-row contract), moving arguments
+//! become `cudaGraphExecKernelNodeSetParams` restatements derived from a
+//! throwaway capture of the real walk and CACHED per composition. Off is
+//! today's keyed path exactly, which is what every fold gate diffs against;
+//! see [`fold_from_env`] and `record.rs`'s fold section for the policy.
+//!
 //! # What v1 does not do
 //!
-//! tp=1, so no collective ever fires, and no bucket padding — a fire's shape
-//! IS its key (`record.rs` argues the mechanism, and what padding would take).
-//! The PTIR prologue and epilogue are wired ([`Shell::fire_attached`]); what
-//! is not is a guest program INSIDE the graph, which design §9 rules out
-//! rather than defers.
+//! tp=1, so no collective ever fires, and padding buys no KEY collapse — a
+//! fire's shape is still its key, because two fires can share a bucket and
+//! differ in the per-class split, and the captured windowed extents would then
+//! be the other fire's (`record.rs` argues the mechanism; the cuda-abi note's
+//! own CORRECTION argues why D4 alone collapses nothing). The PTIR prologue
+//! and epilogue are wired ([`Shell::fire_attached`]); what is not is a guest
+//! program INSIDE the graph, which design §9 rules out rather than defers.
 
 use std::cell::Cell;
 use std::path::Path;
 
-use driver::fire::{FireDescriptor, Lane as FireLane, compose, walk};
+use driver::fire::{Composition, FireDescriptor, Lane as FireLane, compose, walk};
 use kernels_cuda::attn::plan::Shape;
-use model_compiler::{Baked, Budgets, DeviceProfile, compile};
-use model_ir::{Dtype, Plan, ValueId};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
+use model_ir::{Dtype, Trace, ValueId};
 use model_loader::contract::ModelContract;
 
 use crate::arena::Arena;
@@ -174,8 +206,8 @@ impl Exports {
     /// # Errors
     ///
     /// [`Fault::Unbound`] for a plan with no `out` seam.
-    fn of(plan: &Plan, baked: &Baked) -> Result<Exports> {
-        let out = plan
+    fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Exports> {
+        let out = trace
             .seams
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
@@ -186,7 +218,7 @@ impl Exports {
                 ),
             })?;
         let named = |name: &str| -> Vec<Export> {
-            plan.seams
+            trace.seams
                 .iter()
                 .filter(|seam| seam.seam == name)
                 .flat_map(|seam| {
@@ -198,7 +230,7 @@ impl Exports {
                 .map(|(layer, value)| Export {
                     value,
                     layer,
-                    classes: writer_classes(plan, baked, value),
+                    classes: writer_classes(trace, compiled, value),
                 })
                 .collect()
         };
@@ -226,11 +258,11 @@ impl Exports {
 /// pooled attention's are both `[rows, heads]` F32. Asking which regions hold
 /// the writing node is the one reading that cannot be fooled by a model text
 /// reusing an op.
-fn writer_classes(plan: &Plan, baked: &Baked, value: ValueId) -> model_ir::ClassSet {
+fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
     use model_ir::Operands;
     let mut outputs: Vec<ValueId> = Vec::new();
     let mut writers: Vec<u32> = Vec::new();
-    for (at, node) in plan.nodes.iter().enumerate() {
+    for (at, node) in trace.nodes.iter().enumerate() {
         outputs.clear();
         node.op.outputs(&mut outputs);
         if outputs.contains(&value) {
@@ -238,7 +270,7 @@ fn writer_classes(plan: &Plan, baked: &Baked, value: ValueId) -> model_ir::Class
         }
     }
     let mut classes = model_ir::ClassSet::default();
-    for region in baked.template() {
+    for region in compiled.template() {
         if !region.nodes.clone().any(|node| writers.contains(&node)) {
             continue;
         }
@@ -345,12 +377,203 @@ fn grouped_from_env() -> Vec<String> {
     }
 }
 
+/// **THE LATTICE A DEPLOYMENT GETS WHEN IT STATES NONE**: the powers of two
+/// from [`LATTICE_FLOOR`] up to and including `max_tokens`.
+///
+/// `Budget::buckets` is a deployment's dial and `Budget::new` leaves it
+/// empty, which `compose::bucket_of` reads — correctly — as "one graph per
+/// exact size, and the honest bucket for a fire of `rows` rows is `rows`".
+/// That answer makes every consumer of the lattice a no-op: P4's fallback menu
+/// collapses to one bucket at position 0, and D4's padding rounds a fire up to
+/// itself. A shell whose whole business is firing on a real device should not
+/// ship that as its default, because a dial nobody set is not a measurement of
+/// the dial's zero.
+///
+/// **POWERS OF TWO, BECAUSE GEOMETRIC IS WHAT BOUNDS THE TAIL.** Above the
+/// floor a fire never computes more than twice its own rows, which is D4's
+/// whole cost argument stated as a ratio rather than as a hope. It is also the
+/// spacing of the fourteen-point lattice `crate::window`'s header prices the
+/// copy/split crossover on and `every_sku_walks_its_classes` walks, so the two
+/// consumers of `Budget::buckets` are looking at the same kind of object.
+///
+/// The ceiling is included even when it is not a power of two, because a fire
+/// AT `max_tokens` must have a bucket and `Fault::NoBucket` is the refusal for
+/// a fire above the lattice, not for the largest one the budget admits.
+#[must_use]
+fn default_lattice(max_tokens: u32) -> Vec<u32> {
+    let mut lattice: Vec<u32> =
+        core::iter::successors(Some(LATTICE_FLOOR), |point| point.checked_mul(2))
+            .take_while(|point| *point < max_tokens)
+            .collect();
+    lattice.push(max_tokens);
+    lattice
+}
+
+/// **WHERE THE DEFAULT LATTICE STARTS, AND WHY IT IS NOT 1.**
+///
+/// A lattice is free to name every small size, and the fourteen-point one this
+/// tree quotes does. D4 asks for the opposite at the bottom, for two reasons
+/// the census measured:
+///
+/// * **The arm flip at one row is the whole point.** `.wiki/palo/cuda-abi.md`
+///   §1: a one-lane decode takes the gemv arm and a two-lane one does not —
+///   127 launches change kernel across that boundary, and the 423-node
+///   topology it produces is a shape of its own. §3's promise is that "the
+///   gemv↔gemm arm flip at ×1 dies (M ≥ 2 always)", and a lattice naming 1
+///   keeps it alive. §3's own worked example — "decode 3 lanes padded to 8" —
+///   is a lattice whose first point is this one.
+/// * **A boundary is where two fires stop agreeing.** Padding does not remove
+///   the arithmetic drift between two compositions; it QUANTIZES it (two fires
+///   compute the same numbers iff they share a bucket — see
+///   `a_padded_fire_is_in_bounds_and_says_something_true`). Every extra point
+///   at the bottom is one more place where a lane fired alone and the same
+///   lane fired beside two others land on different sides, and at decode
+///   scale that is the commonest pair a deployment has.
+///
+/// What it costs is the tail on the smallest fires, where the cost argument is
+/// strongest rather than weakest: a decode fire's linear layers are
+/// weight-bound — 1.40 GiB of weight reads against eight rows of activation —
+/// so the rows below the floor ride reads that were happening anyway.
+/// `the_tail_a_padded_decode_computes_rides_the_weight_reads` is that claim
+/// with a number on it, and a deployment that measures otherwise on its own
+/// hardware states its own `Budget::buckets`.
+const LATTICE_FLOOR: u32 = 8;
+
+/// **THE LATTICE, OFF THE ENVIRONMENT.** `PIE_CUDA_BUCKETS=off` restores the
+/// empty lattice (`bucket == rows`, which is what a `Budget::new` test asks
+/// for); a comma-separated ascending list states one outright; anything else
+/// leaves what the `Boot` stated, and a `Boot` that stated nothing gets
+/// [`default_lattice`].
+///
+/// **READ INTO THE COMPILER'S INPUT, NOT INTO A SHELL FLAG**, for the reason
+/// `PIE_CUDA_STREAMS` and `PIE_CUDA_GROUPED` are: the lattice is baked. P4
+/// writes one fallback row per bucket RANGE, so moving the lattice moves which
+/// consumer is withdrawn and how it is served, and a shell that re-bucketed a
+/// fire after the bake would be reading a table whose index means something
+/// else. The two arms of a lattice measurement have to be two artifacts.
+///
+/// A list this function cannot parse, or one P0 refuses (not strictly
+/// ascending, or a bucket past the token ceiling), is not silently repaired:
+/// an unparseable entry falls back to the stated lattice and a lattice P0
+/// dislikes comes back as `Fault::Bake` with the compiler's own sentence in
+/// it. Nothing here invents a third lattice nobody asked for.
+#[must_use]
+fn lattice_from_env(stated: Vec<u32>, max_tokens: u32) -> Vec<u32> {
+    match std::env::var("PIE_CUDA_BUCKETS").ok().as_deref() {
+        Some("off" | "0" | "none") => Vec::new(),
+        Some(text) if text.contains(|c: char| c.is_ascii_digit()) => {
+            let parsed: Option<Vec<u32>> = text
+                .split(',')
+                .map(|point| point.trim().parse::<u32>().ok())
+                .collect();
+            match parsed {
+                Some(lattice) if !lattice.is_empty() => lattice,
+                _ => stated,
+            }
+        }
+        _ if stated.is_empty() => default_lattice(max_tokens),
+        _ => stated,
+    }
+}
+
+/// **D4'S OFF SWITCH.** `PIE_CUDA_PAD=off|0|false` stops this shell arming the
+/// pad, so every entry sees the extent the walk resolved and cuBLASLt's
+/// heuristic follows the batch again — today's behaviour, exactly.
+///
+/// **ON BY DEFAULT, AND UNLIKE ITS NEIGHBOURS IT IS A SHELL FLAG AND NOT A
+/// COMPILER INPUT.** `PIE_CUDA_STREAMS` and `PIE_CUDA_GROUPED` bake different
+/// artifacts because what they move is a baked decision; padding moves no
+/// baked byte at all. `Composition::bucket` is computed either way, no window
+/// changes, no row is staged differently, and the key a capture is filed under
+/// is the same exact per-class vector. The only difference between the two
+/// arms is the integer one entry hands a library — which is precisely why the
+/// A/B is worth running: byte-identical tokens across it is the claim that the
+/// tail rows belong to nobody.
+///
+/// Read ONCE, at load, beside every other environment word this shell reads.
+#[must_use]
+fn pad_from_env() -> bool {
+    !matches!(
+        std::env::var("PIE_CUDA_PAD").ok().as_deref(),
+        Some("off" | "0" | "false")
+    )
+}
+
+/// **D5-LITE'S SWITCH, OFF BY DEFAULT** (`.wiki/palo/cuda-abi.md` §6b, §7
+/// step 4). `PIE_CUDA_FOLD=on|1|true` folds the composition axis: one exec
+/// per bucket, captured once at a synthetic full composition, rebound on the
+/// host per fire — empty windows as `cudaGraphNodeSetEnabled` bits, moving
+/// arguments as `cudaGraphExecKernelNodeSetParams` restatements derived from
+/// a throwaway capture of the real walk. Off is today's keyed path, exactly,
+/// which is the A/B arm every fold gate diffs against; [`Shell::set_fold`]
+/// flips it between fires so the A/B is one load, like `set_mode`'s.
+///
+/// OFF by default because the fold's default arm is today's shipping answer
+/// until the gates say otherwise — the same posture `PIE_CUDA_GRAPHS` took
+/// while capture was landing. A fold-path refusal is never silent: every one
+/// lands in [`record::FoldStats::refusals`] by name, and the refused bucket
+/// or composition serves the keyed path.
+#[must_use]
+fn fold_from_env() -> bool {
+    matches!(
+        std::env::var("PIE_CUDA_FOLD").ok().as_deref(),
+        Some("on" | "1" | "true")
+    )
+}
+
+/// **THE PIPELINE'S SWITCH, ON BY DEFAULT** (step 5). `PIE_CUDA_PIPELINE=off`
+/// restores step 4's fold exactly: one exec per bucket, every rebind on the
+/// critical path between prepare and launch. On, a hot bucket lazily
+/// instantiates a TWIN exec on its first back-to-back fire, a fire whose
+/// composition some seat already holds launches with zero host writing (the
+/// ping-pong swap), and a fire whose successor the caller stated
+/// ([`Shell::expect`]) applies that successor's binding to the idle exec
+/// AFTER its own launch and BEFORE its sync — host work the GPU never waits
+/// on. On by default because it changes nothing a fire computes — the same
+/// bindings land on an exec that is not in flight (poc-c measured the
+/// overlap legal and hidden) — and the off arm exists for the A/B, not as a
+/// safety hatch.
+#[must_use]
+fn pipeline_from_env() -> bool {
+    !matches!(
+        std::env::var("PIE_CUDA_PIPELINE").ok().as_deref(),
+        Some("off" | "0" | "false")
+    )
+}
+
+/// **THE DISABLE POLICY** (§6c finding 2), `PIE_CUDA_FOLD_DISABLE=all|library`.
+///
+/// `all` — the default — disables every absent-window node of a folded
+/// exec, step 4's answer: correct for library nodes (which own no zero-row
+/// contract) and pie nodes alike, at ~1.3 µs of dispatch per disabled node.
+/// `library` keeps pie windowed nodes ENABLED at zero rows — their count
+/// cells written to zero by a fitted zero form, an empty launch on the
+/// zero-row contract (~1 µs) — and disables only the library residue. The
+/// default is `all` because the measurement said so: of the all-decode
+/// binding's 120 absent-window nodes, 36 are pie nodes the fit can zero and
+/// 84 are library nodes that must disable either way, and steady decode
+/// measured the two policies at parity — 3.439 against 3.440 ms/fire,
+/// byte-identical tokens (the policy gate in `tests/fold_gate.rs`; the full
+/// numbers ride in `.wiki/palo/cuda-abi.md` §6d). A 0.3 µs/node rate
+/// difference across 36 nodes is ~11 µs, under this workload's noise floor
+/// — so the arm with the structurally simpler failure story ships (a
+/// disabled node cannot compute; a zero form is a fitted claim), and the
+/// other stays one environment word away for the SKU where the pie share
+/// is large enough to read.
+#[must_use]
+fn fold_disable_from_env() -> bool {
+    matches!(
+        std::env::var("PIE_CUDA_FOLD_DISABLE").ok().as_deref(),
+        Some("library" | "lib")
+    )
+}
+
 /// Everything a load states.
 pub struct Boot<'a> {
     /// The traced supergraph. The ENGINE traces it and hands it across
-    /// (decision #18); `Baked` never crosses, which is why this is a `Plan`
+    /// (decision #18); `CompiledModel` never crosses, which is why this is a `Trace`
     /// and the compile happens on this side.
-    pub plan: Plan,
+    pub trace: Trace,
     /// How the checkpoint's bytes become this plan's params. Stated by the
     /// caller for the same reason: it is the model's declaration, and a shell
     /// that derived it would need an arm per family.
@@ -358,7 +581,7 @@ pub struct Boot<'a> {
     /// A snapshot directory, or one container file.
     pub checkpoint: &'a Path,
     /// The ceilings every fire is baked against.
-    pub budgets: Budgets,
+    pub budget: Budget,
     /// What the device charges. `None` takes the defaults with this device's
     /// measured SM count in them — costs are input, not knowledge, and an
     /// unmeasured deployment should still bake something that runs.
@@ -460,6 +683,31 @@ pub struct Seated<'a> {
     pub captures_scores: bool,
 }
 
+/// One lane of the fold's SYNTHETIC composition — the owned side of a
+/// [`Seated`] the arming pass borrows. A private carrier, not a submission
+/// type: nothing outside [`Shell::arm_at`] builds one, and nothing it
+/// carries ever executes (capture does not).
+struct Synthetic {
+    /// The class's representative word (`Class::word`) — the one part of a
+    /// submission decision #18 says the shell must not invent, invented here
+    /// anyway and honestly: the sweep's own table is where the word comes
+    /// from, so it names exactly the class it must.
+    word: u64,
+    /// Placeholder ids, one per row.
+    tokens: Vec<u32>,
+    /// An all-allowed mask, for a class whose window runs the masked arm.
+    mask: Option<Mask>,
+    /// Adapter row 0, for a class inside the correction's window.
+    adapter: Option<u32>,
+    /// The word's draft bit, mirrored (`Fault::DraftWord` is checked per
+    /// lane, synthetic or not).
+    drafts: bool,
+    /// The word's capture bit, mirrored.
+    captures: bool,
+    /// Which real slot lends its page arithmetic.
+    slot: u32,
+}
+
 impl<'a> Seated<'a> {
     /// A lane whose page table, token count and masking are the shell's —
     /// which for the mask means none.
@@ -550,9 +798,9 @@ pub struct FireCost {
 
 pub struct Shell {
     device: Context,
-    plan: Plan,
-    baked: Baked,
-    budgets: Budgets,
+    trace: Trace,
+    compiled: CompiledModel,
+    budget: Budget,
     weights: Weights,
     arena: Arena,
     pools: Pools,
@@ -600,6 +848,38 @@ pub struct Shell {
     /// `PIE_CUDA_FALLBACK_COPY=off|0|false` turns it off at load;
     /// [`Shell::set_copies`] flips it between fires.
     copies: bool,
+    /// Does this shell arm D4's pad before each walk?
+    ///
+    /// **ON BY DEFAULT, AND IT IS THE ARMING THAT IS OPTIONAL, NOT THE
+    /// NUMBER.** `Composition::bucket` is computed on both arms and the
+    /// entries read `Ctx::opaque_rows` on both; `false` simply never stamps
+    /// the pair onto a context, so `opaque_rows` answers the extent it was
+    /// handed and every launch is the one this shell made before D4.
+    /// `PIE_CUDA_PAD=off|0|false` at load — see [`pad_from_env`].
+    pad: bool,
+    /// Does this shell fold the composition axis (`PIE_CUDA_FOLD`)? See
+    /// [`fold_from_env`]; [`Shell::set_fold`] flips it between fires.
+    fold: bool,
+    /// Is the fire currently running the SYNTHETIC arming pass? Set by
+    /// [`Shell::maybe_arm_fold`] around its recursive `fire_captured` call
+    /// and read in exactly three places: the arming pass must not try to arm
+    /// again, must route to `record::Graphs::arm_fold`, and must return
+    /// before the readback — nothing it computes is anybody's numbers.
+    arming: bool,
+    /// Is the arming pass the zero-form PROBE (§6c finding 2) rather than
+    /// the template? Set beside [`Shell::arming`] by the same caller, read
+    /// in one place: the walk dispatch routes a probing pass to
+    /// `record::Graphs::arm_probe` — a second synthetic capture at
+    /// perturbed rows, fitted against the template, never instantiated.
+    probing: bool,
+    /// Every class some fire of this load has had rows in — the arming
+    /// ladder's second rung. The FULL composition is the design; when its
+    /// capture refuses (a class whose kernels were never JIT-warmed cannot
+    /// compile inside a thread-local capture), the union of classes real
+    /// traffic has exercised is the largest template this load can honestly
+    /// capture, and a fire bringing a class outside it refuses the fold by
+    /// name at alignment.
+    seen_classes: model_ir::ClassSet,
     /// What the last fire's window table cost, in launches.
     ///
     /// **THE ONE OBSERVABLE OF A FALLBACK FROM OUTSIDE.** Whether a region
@@ -627,7 +907,19 @@ impl Shell {
     /// residency, [`Fault::Unbound`] for a plan naming a seat this shell does
     /// not bind.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        let mut boot = boot;
         let mut device = Context::bind(boot.ordinal)?;
+
+        // **THE SHAPE LATTICE, BEFORE THE BAKE AND NOWHERE ELSE.** A `Boot`
+        // that stated one keeps it; one that stated none — which is every
+        // `Budget::new` caller, and so every test and the worker's own
+        // embedded driver — gets the powers of two up to its ceiling rather
+        // than the empty lattice, because an empty lattice makes P4's bucket
+        // ranges collapse to one position and D4's padding round every fire up
+        // to itself. `lattice_from_env` argues why this is the compiler's
+        // input and not a shell flag, and `PIE_CUDA_BUCKETS=off` is how a
+        // caller asks for the empty lattice back.
+        boot.budget.buckets = lattice_from_env(boot.budget.buckets, boot.budget.max_tokens);
 
         // Costs are input (design §6's `layout/` lineage row): the shell
         // measured the device once at bind, and hands the numbers to a
@@ -673,26 +965,26 @@ impl Shell {
         // baked byte moves. That field is a PoC scaffold and reading its doc
         // is the only way to know what setting it means.
         profile.grouped = grouped_from_env();
-        let baked = compile(&boot.plan, &boot.budgets, &profile)?;
+        let compiled = compile(&boot.trace, &boot.budget, &profile)?;
         // The streams and the events the artifact asked for, opened once,
         // here: a `cudaStreamCreate` on the fire path would be host work
         // between two launches, and inside a capture it is what
         // `Graph::capture`'s thread-local mode refuses by name.
-        device.open_lanes(baked.forks.streams.saturating_sub(1), baked.forks.events)?;
+        device.open_lanes(compiled.streams.streams.saturating_sub(1), compiled.streams.events)?;
 
         // Heads, head widths and windows are on the ops, not on
         // `CacheRow::Kv`, so they are read off the plan rather than off a
         // config beside it — per cache ROW for the bytes a page holds, per
         // PLAN VALUE for the reading a schedule is carved at
         // (`kv::SpaceFacts`, and build log 20's first blocker).
-        let facts = kv::probe(&boot.plan)?;
+        let facts = kv::probe(&boot.trace)?;
         // The window argument's bake-time half, asked once: no attention
         // schedule may be carved over more classes than the arm consuming it
         // runs in. A per-fire check would be the same answer at a worse
         // instant — region masks are static — and the sentence names the
         // model text rather than the fire.
-        crate::window::no_schedule_straddles_its_readers(&boot.plan, &baked)?;
-        crate::window::no_grouped_window_is_also_a_prepare_window(&baked)?;
+        crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
+        crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         // Whether this artifact has anywhere for a mask to GO. `masked` is a
         // fact the model declares (design §8), so a plan with no
         // `attention.masked` arm cannot serve one, and accepting the bits
@@ -706,10 +998,10 @@ impl Shell {
         // is what lets the shell check that they agree
         // (`Fault::{Maskless, MaskWord}`).
         let mut masked = model_ir::ClassSet::default();
-        for region in baked.template() {
+        for region in compiled.template() {
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
-                    boot.plan.nodes.get(node as usize).map(|node| &node.op),
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(model_ir::Operation::Attention(model_ir::Attention::Masked { .. }))
                 )
             });
@@ -727,10 +1019,10 @@ impl Shell {
         // composition NO class of this set has rows never stages the routes
         // vector, never binds the seat, and never launches the arm.
         let mut corrected = model_ir::ClassSet::default();
-        for region in baked.template() {
+        for region in compiled.template() {
             let runs_correction = region.nodes.clone().any(|node| {
                 matches!(
-                    boot.plan.nodes.get(node as usize).map(|node| &node.op),
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(model_ir::Operation::Linear(model_ir::Linear::LoraCorrect { .. }))
                 )
             });
@@ -742,11 +1034,11 @@ impl Shell {
         }
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
 
-        let weights = Weights::resident(&boot.plan, boot.contract, boot.checkpoint)?;
-        let arena = Arena::reserve(&baked.arena)?;
-        let pools = Pools::reserve(&boot.plan, paging, &facts)?;
+        let weights = Weights::resident(&boot.trace, boot.contract, boot.checkpoint)?;
+        let arena = Arena::reserve(&compiled.arena)?;
+        let pools = Pools::reserve(&boot.trace, paging, &facts)?;
         let spaces = boot
-            .plan
+            .trace
             .caches
             .iter()
             .filter_map(|row| match row {
@@ -756,23 +1048,23 @@ impl Shell {
             .max()
             .unwrap_or(0);
         let inputs = Inputs::reserve(
-            &boot.budgets,
+            &boot.budget,
             paging,
             spaces,
             &facts,
-            baked.classes.classes.len(),
-            driver::fire::max_runs(&baked),
-            driver::fire::fragmentable(&baked),
+            compiled.classes.classes.len(),
+            driver::fire::max_runs(&compiled),
+            driver::fire::fragmentable(&compiled),
             device.device().num_sm,
         )?;
 
-        let exports = Exports::of(&boot.plan, &baked)?;
+        let exports = Exports::of(&boot.trace, &compiled)?;
 
         Ok(Shell {
             device,
-            plan: boot.plan,
-            baked,
-            budgets: boot.budgets,
+            trace: boot.trace,
+            compiled,
+            budget: boot.budget,
             weights,
             arena,
             pools,
@@ -791,8 +1083,18 @@ impl Shell {
                 std::env::var("PIE_CUDA_FALLBACK_COPY").ok().as_deref(),
                 Some("off" | "0" | "false")
             ),
+            pad: pad_from_env(),
+            fold: fold_from_env(),
+            arming: false,
+            probing: false,
+            seen_classes: model_ir::ClassSet::default(),
             last: FireCost::default(),
-            cache: GraphCache::new(),
+            cache: {
+                let mut cache = GraphCache::new();
+                cache.set_pipeline(pipeline_from_env());
+                cache.set_fold_library(fold_disable_from_env());
+                cache
+            },
             programs: ProgramPlane::default(),
         })
     }
@@ -858,22 +1160,22 @@ impl Shell {
         self.held.get(slot as usize).copied().unwrap_or(0)
     }
 
-    /// The plan this shell serves.
+    /// The trace this shell serves.
     #[must_use]
-    pub fn plan(&self) -> &Plan {
-        &self.plan
+    pub fn trace(&self) -> &Trace {
+        &self.trace
     }
 
     /// The artifact it was baked into.
     #[must_use]
-    pub fn baked(&self) -> &Baked {
-        &self.baked
+    pub fn compiled_model(&self) -> &CompiledModel {
+        &self.compiled
     }
 
     /// The ceilings it was baked against.
     #[must_use]
-    pub fn budgets(&self) -> &Budgets {
-        &self.budgets
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     /// How its pools hand pages out.
@@ -911,7 +1213,7 @@ impl Shell {
     ///
     /// [`Fault::Unbound`] for an out value whose width is symbolic.
     pub fn out_width(&self) -> Result<u64> {
-        kv::width_of(&self.plan, self.exports.out)
+        kv::width_of(&self.trace, self.exports.out)
     }
 
     /// Does this load's model text declare a draft head (design §8's MTP
@@ -984,6 +1286,93 @@ impl Shell {
         self.copies = copies;
     }
 
+    /// Does this shell fold the composition axis? See [`Shell::fold`]'s field.
+    #[must_use]
+    pub fn folding(&self) -> bool {
+        self.fold
+    }
+
+    /// Turn the fold on or off between fires — the third A/B, and it is one
+    /// load for [`Shell::set_mode`]'s reason: two loads would be two
+    /// residencies and two tuner histories, and a difference could be either.
+    /// Buckets already armed stay armed; turning the fold off simply stops
+    /// routing fires through them, exactly as `set_mode(Off)` leaves keyed
+    /// execs resident.
+    pub fn set_fold(&mut self, fold: bool) {
+        self.fold = fold;
+    }
+
+    /// Turn the fold's pipeline on or off between fires — the twin exec and
+    /// the ahead-of-sync prebind (`PIE_CUDA_PIPELINE`, [`pipeline_from_env`]).
+    /// Off is step 4's fold exactly, which is what the pipelined revisit
+    /// gate diffs against; one load, for [`Shell::set_mode`]'s reason.
+    pub fn set_pipeline(&mut self, pipeline: bool) {
+        self.cache.set_pipeline(pipeline);
+    }
+
+    /// Is the fold's pipeline on?
+    #[must_use]
+    pub fn pipelining(&self) -> bool {
+        self.cache.pipelined()
+    }
+
+    /// Choose the fold's disable policy between fires
+    /// (`PIE_CUDA_FOLD_DISABLE`, [`fold_disable_from_env`]): `false`
+    /// disables every absent-window node, `true` keeps pie windowed nodes
+    /// enabled at fitted zero rows and disables only the library residue.
+    pub fn set_fold_library(&mut self, library: bool) {
+        self.cache.set_fold_library(library);
+    }
+
+    /// **THE NEXT FIRE, STATED** — the pipeline's hint, and the seam the
+    /// engine's frame scheduler reaches through: it seals frames EARLY and
+    /// posts at run-ahead depth 2 (`engine::scheduler::frame`,
+    /// `DEFAULT_DISPATCH_DEPTH`), so at the moment it submits fire N it
+    /// usually holds fire N+1 sealed — composition known, tokens not yet.
+    /// The composition is all the prebind needs: after fire N's launch and
+    /// before its sync, the fold applies N+1's cached binding to an exec
+    /// that is not in flight, and fire N+1 finds its composition already
+    /// bound.
+    ///
+    /// The lanes' TOKEN CONTENTS are irrelevant here (a binding is enables
+    /// and arguments derived from the composition, and the tokens are
+    /// staged per fire), so a caller may state next-fire lanes whose tokens
+    /// it has not sampled yet. An empty slice clears the hint. A hint that
+    /// turns out wrong costs nothing but the hidden host work: the next
+    /// fire simply rebinds as it would have anyway.
+    ///
+    /// Stating a batch the artifact cannot compose clears the hint too —
+    /// the fire that actually submits it will say why, and a hint is not
+    /// the place to fail anybody.
+    pub fn expect(&mut self, lanes: &[Lane<'_>]) {
+        if lanes.is_empty() {
+            self.cache.fold_expect(None);
+            return;
+        }
+        let submitted: Vec<FireLane> = lanes
+            .iter()
+            .map(|lane| FireLane::new(lane.word, lane.tokens.len() as u32))
+            .collect();
+        let hint = compose(&self.compiled, &self.budget, &submitted)
+            .ok()
+            .map(|composition| {
+                (
+                    record::FoldKey {
+                        bucket: composition.bucket(),
+                        copies: self.copies,
+                    },
+                    record::Key::of(composition.classes(), self.copies),
+                )
+            });
+        self.cache.fold_expect(hint);
+    }
+
+    /// What this load's fold has done. See [`record::FoldStats`].
+    #[must_use]
+    pub fn fold_stats(&self) -> record::FoldStats {
+        self.cache.fold_stats()
+    }
+
     /// What the last fire's window table cost. See [`FireCost`].
     #[must_use]
     pub fn last_fire_cost(&self) -> FireCost {
@@ -1020,11 +1409,11 @@ impl Shell {
     /// graph from a sequential one. So a measurement that wants to say its two
     /// arms are two different artifacts asks here.
     #[must_use]
-    pub fn forks(&self) -> (u32, u32, usize, usize) {
+    pub fn streams(&self) -> (u32, u32, usize, usize) {
         (
-            self.baked.forks.streams,
-            self.baked.forks.events,
-            self.baked.regions.iter().filter(|r| r.stream != 0).count(),
+            self.compiled.streams.streams,
+            self.compiled.streams.events,
+            self.compiled.regions.iter().filter(|r| r.stream != 0).count(),
             self.device.lanes(),
         )
     }
@@ -1084,6 +1473,19 @@ impl Shell {
     #[must_use]
     pub fn envelopes_resolved() -> u64 {
         crate::program::ports::resolved()
+    }
+
+    /// The fold's process-global motion mirror —
+    /// `(folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins)` —
+    /// for a caller that cannot reach a shell instance: the serving engine's
+    /// gates, which hold the driver behind `Box<dyn Driver>` on a lane
+    /// thread. See [`record::fold_observed`] for what is published, where,
+    /// and why process-global is the honest scope. An instance in hand
+    /// should ask [`Shell::fold_stats`] instead — it answers the full
+    /// census.
+    #[must_use]
+    pub fn fold_observed() -> (u64, u64, u64, u64, u64, u64, u64) {
+        record::fold_observed()
     }
 
     /// The first channel of instance `instance_id` whose declared requirement
@@ -1213,6 +1615,229 @@ impl Shell {
         self.fire_captured(lanes, attachments, &mut Vec::new())
     }
 
+    /// Arm this fire's bucket with a folded exec, if this is the fire to do
+    /// it (`record::Graphs::fold_due` — the signature has warmed and the
+    /// bucket holds neither exec nor refusal).
+    ///
+    /// **NOTHING HERE CAN FAIL A FIRE.** Arming is an optimization pass over
+    /// somebody else's fire; every refusal it meets is tallied by name in
+    /// [`record::FoldStats::refusals`] and the fire proceeds keyed. The
+    /// composition arithmetic is re-done here — pure, microseconds — because
+    /// the alternative is threading a probe result through the staging that
+    /// has not happened yet.
+    ///
+    /// The ladder: the FULL composition first (`.wiki/palo/cuda-abi.md` §4b
+    /// — every class non-empty, so every region's launches are in the
+    /// template), then the union of classes real traffic has exercised. The
+    /// second rung exists because a class no fire ever ran has un-JIT-ed
+    /// kernels and un-grown scratch slabs, and both are host work a
+    /// thread-local capture refuses by design — a refusal the full rung
+    /// NAMES rather than dodges, so the day a workload warms every class the
+    /// full template is what arms.
+    fn maybe_arm_fold(&mut self, lanes: &[Seated<'_>]) {
+        let submitted: Vec<FireLane> = lanes
+            .iter()
+            .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
+            .collect();
+        let Ok(composition) = compose(&self.compiled, &self.budget, &submitted) else {
+            // A batch the artifact cannot describe: the fire itself is about
+            // to say so properly.
+            return;
+        };
+        let key = record::FoldKey {
+            bucket: composition.bucket(),
+            copies: self.copies,
+        };
+        let signature = record::Key::of(composition.classes(), self.copies);
+        if !self.cache.fold_due(&key, &signature) {
+            return;
+        }
+
+        let count = self.compiled.classes.classes.len();
+        let full: Vec<usize> = (0..count).collect();
+        let mut seen: Vec<usize> = (0..count)
+            .filter(|class| self.seen_classes.contains(*class))
+            .collect();
+        for class in composition.present() {
+            if !seen.contains(&(*class as usize)) {
+                seen.push(*class as usize);
+            }
+        }
+        seen.sort_unstable();
+
+        let rungs: Vec<Vec<usize>> = if seen == full {
+            vec![full]
+        } else {
+            vec![full, seen]
+        };
+        for classes in rungs {
+            let rung = classes.len();
+            match self.arm_at(&composition, key, &classes, false) {
+                Ok(()) => {
+                    // The zero-form PROBE (§6c finding 2): a second
+                    // synthetic capture of the SAME rung at perturbed rows,
+                    // fitted against the template so the `library` disable
+                    // policy has its zero forms. A refusal costs that
+                    // policy its table for this bucket — the nodes stay
+                    // disable-only, which is the correct fallback — and is
+                    // tallied, never fatal: the bucket just armed.
+                    if let Err(why) = self.arm_at(&composition, key, &classes, true) {
+                        self.cache
+                            .fold_note(&format!("probing at {rung} classes: {why}"));
+                    }
+                    return;
+                }
+                // An `Unbound` here is the fold's own sentence, written for
+                // this tally; anything else is the device's and keeps its
+                // full Display form.
+                Err(Fault::Unbound { what }) => self
+                    .cache
+                    .fold_note(&format!("arming at {rung} classes: {what}")),
+                Err(why) => self
+                    .cache
+                    .fold_note(&format!("arming at {rung} classes: {why}")),
+            }
+        }
+        self.cache.fold_refuse(
+            key,
+            "every synthetic composition refused; the bucket stays keyed",
+        );
+    }
+
+    /// One rung of the arming ladder: stage a synthetic composition over
+    /// exactly `classes` and run it through the ordinary fire path with
+    /// [`Shell::arming`] set, so `record::Graphs::arm_fold` captures the
+    /// template off the same staging every real fire uses.
+    ///
+    /// The synthetic geometry is the REAL composition's where the class is
+    /// present and one one-row lane where it is not — plausible by
+    /// construction (the planners see row counts a real fire could have
+    /// brought) and small by construction (a class the fire did not bring
+    /// asks for no scratch a warmed fire has not already grown). Rows shrink
+    /// off the largest class until the total sits inside the bucket, and a
+    /// bucket too tight to seat every class refuses by name.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the synthetic fire refused — staging, a planner on synthetic
+    /// geometry (kill factor 5), the capture, the census, the instantiate.
+    /// The caller tallies the sentence; nothing is retried.
+    fn arm_at(
+        &mut self,
+        real: &Composition,
+        key: record::FoldKey,
+        classes: &[usize],
+        probe: bool,
+    ) -> Result<()> {
+        let bucket = key.bucket;
+        if classes.len() as u32 > self.budget.max_lanes {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "{} classes and max_lanes {}; the template needs one lane per class",
+                    classes.len(),
+                    self.budget.max_lanes
+                ),
+            });
+        }
+        let mut rows: Vec<u32> = classes
+            .iter()
+            .map(|class| real.classes().class(*class).rows.max(1))
+            .collect();
+        let mut total: u32 = rows.iter().sum();
+        while total > bucket {
+            let (at, most) = rows
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by_key(|(_, rows)| *rows)
+                .expect("a rung is never classless");
+            if most <= 1 {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "{} one-row classes cannot fit inside bucket {bucket}",
+                        rows.len()
+                    ),
+                });
+            }
+            let cut = (total - bucket).min(most - 1);
+            rows[at] -= cut;
+            total -= cut;
+        }
+        // The PROBE'S PERTURBATION: every class whose rows CAN move, moves —
+        // shrink where there is slack, grow where the bucket has headroom —
+        // because the fit's whole signal is a window row count at two
+        // values. A class stuck at one row with no headroom stays put and
+        // its segments simply fit nothing, which the fit reads as "no
+        // signal" and answers with the disable-only fallback.
+        if probe {
+            for count in &mut rows {
+                if *count > 1 {
+                    *count -= 1;
+                    total -= 1;
+                } else if total < bucket {
+                    *count += 1;
+                    total += 1;
+                }
+            }
+        }
+
+        let slots = self.held.len().max(1) as u32;
+        let owned: Vec<Synthetic> = classes
+            .iter()
+            .zip(&rows)
+            .enumerate()
+            .map(|(at, (&class, &rows))| Synthetic {
+                word: self.compiled.classes.classes[class].word(),
+                // Token id 0 in every cell: the synthetic pass never
+                // executes, so the ids only have to be stageable.
+                tokens: vec![0u32; rows as usize],
+                // An all-allowed mask over the post-append extent, for a
+                // class whose window runs the masked arm — the word and the
+                // payload have to agree (`Fault::MaskWord`), and "attend
+                // everything" is the plausible geometry that plans like any
+                // real mask.
+                mask: self.masked.contains(class).then(|| {
+                    Mask::new(vec![0, rows + 1], u64::from(rows) + 1)
+                }),
+                adapter: self.corrected.contains(class).then_some(0),
+                drafts: self
+                    .exports
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|mtp| mtp.classes.contains(class)),
+                captures: self.exports.capturing.contains(class),
+                // Real slots, round-robin: the page arithmetic needs a slot
+                // that exists, and `held: Some(1)` below keeps the borrow
+                // from touching the slot's own counting or clearing its
+                // banks.
+                slot: (at as u32) % slots,
+            })
+            .collect();
+        let seated: Vec<Seated<'_>> = owned
+            .iter()
+            .map(|lane| Seated {
+                lane: Lane {
+                    slot: lane.slot,
+                    word: lane.word,
+                    tokens: &lane.tokens,
+                },
+                pages: &[],
+                held: Some(1),
+                mask: lane.mask.as_ref(),
+                adapter: lane.adapter,
+                drafts: lane.drafts,
+                captures_scores: lane.captures,
+            })
+            .collect();
+
+        self.arming = true;
+        self.probing = probe;
+        let armed = self.fire_captured(&seated, &[], &mut Vec::new());
+        self.arming = false;
+        self.probing = false;
+        armed.map(|_| ())
+    }
+
     /// The same fire, with the capture columns read back (design §9, palo C4).
     ///
     /// `scores` is filled with one entry per SUBMITTED lane, in submission
@@ -1240,11 +1865,19 @@ impl Shell {
         attachments: &[Attached],
         scores: &mut Vec<Vec<LayerScores>>,
     ) -> Result<Vec<Vec<f32>>> {
+        // ── THE FOLD'S ARMING INSTANT (`PIE_CUDA_FOLD`). Before ANY of this
+        //    fire's staging: the synthetic pass stages into the same reserved
+        //    input buffers, and running it first is what lets the real fire
+        //    overwrite them cleanly afterwards. The guard on `arming` is the
+        //    recursion base — the synthetic pass is itself a `fire_captured`.
+        if self.fold && !self.arming && self.graphs.records() {
+            self.maybe_arm_fold(lanes);
+        }
         let Shell {
             device,
-            plan,
-            baked,
-            budgets,
+            trace,
+            compiled,
+            budget,
             weights,
             arena,
             pools,
@@ -1257,6 +1890,11 @@ impl Shell {
             exports,
             graphs,
             copies,
+            pad,
+            fold,
+            arming,
+            probing,
+            seen_classes,
             last,
             cache,
             // NAMED, NOT `..`: the guest-program plane is touched at the
@@ -1268,6 +1906,10 @@ impl Shell {
         } = self;
         let graphs = *graphs;
         let copies = *copies;
+        let pad = *pad;
+        let fold = *fold;
+        let arming = *arming;
+        let probing = *probing;
 
         // ── 0. THE GATE. Nothing has launched, so a refusal here is free. ──
         //
@@ -1352,7 +1994,15 @@ impl Shell {
             .iter()
             .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
             .collect();
-        let composition = compose(baked, budgets, &submitted)?;
+        let composition = compose(compiled, budget, &submitted)?;
+        // The fold's traffic memory: which classes real fires have exercised
+        // is what the arming ladder's second rung captures, and a synthetic
+        // pass must not count as traffic.
+        if !arming {
+            for class in composition.present() {
+                seen_classes.insert(*class as usize);
+            }
+        }
         let descriptor = FireDescriptor::of(&composition);
         let rows = composition.rows();
         let lane_count = composition.lane_count();
@@ -1590,14 +2240,14 @@ impl Shell {
         //    lattice because `FallbackRow::buckets` is a range of positions,
         //    and `Composition::bucket` is the row count that position holds;
         //    a deployment that declared no lattice has one bucket, at 0.
-        let bucket = budgets
+        let bucket = budget
             .buckets
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
         let mut windows = Windows::of(
-            plan,
-            baked,
+            trace,
+            compiled,
             composition.classes(),
             &indptr_host,
             crate::window::Copies {
@@ -1609,10 +2259,13 @@ impl Shell {
                 spaces: &geometries,
             },
         )?;
-        *last = FireCost {
-            launches: windows.launches(),
-            copied: windows.copied(),
-        };
+        // The synthetic pass is not the last fire anybody means.
+        if !arming {
+            *last = FireCost {
+                launches: windows.launches(),
+                copied: windows.copied(),
+            };
+        }
         let boundaries = windows.packed();
 
         // 4b. THE MASK BITS. A lane states its mask as runs over its own
@@ -1643,7 +2296,7 @@ impl Shell {
         // 6. The three tables a `Run` resolves through: the arena's
         //    rectangles at this fire's rows, the pools' storage under this
         //    fire's page tables, and the loader's weights, which never move.
-        let slots = arena.slots(&baked.arena, u64::from(rows), u64::from(lane_count));
+        let slots = arena.slots(&compiled.arena, u64::from(rows), u64::from(lane_count));
         let caches = pools.table(&inputs.seats(&handles, pages, rows, lane_count))?;
 
         // 7. The geometry seats, and their host twins. THE DUALITY: the IR
@@ -1766,10 +2419,44 @@ impl Shell {
             events: device.events(),
             at: &stream,
         });
+        // **D4: THE BUCKET REACHES THE ENTRIES, AND NOTHING ELSE MOVES**
+        // (`.wiki/palo/cuda-abi.md` §3, refined form). `Composition::bucket`
+        // has been computed on every fire since compose was written and read
+        // by nobody but the fallback menu's position lookup above. Here it
+        // stops being decorative: the pair (this fire's rows, the lattice
+        // point above them) rides into the walk, and the entries that hand a
+        // shape to cuBLASLt — and only those, and only in a region whose
+        // window is the whole fire — round their `M` up to it, so the
+        // library's unpublished shape→kernel table stops being a function of
+        // the batch the engine happened to assemble.
+        //
+        // **HANDED TO THE `Run` AND NOT TO THE CONTEXTS**, which is what makes
+        // the windowed boundary structural rather than conventional: the pad
+        // is gated per REGION, by `Run::ctx`, against the window the shell
+        // built from that region's mask. A pad written onto a context here
+        // would still be armed when the walk stepped into a windowed region,
+        // and the only thing an entry could then check is one extent against
+        // another — a test a window whose rows happen to equal the fire's
+        // passes. It also reaches every side stream for free, because
+        // `Run::ctx` is what picks the side stream too.
+        //
+        // The composition is the ONE source: rows and bucket come off the
+        // same `Composition` that carved the windows this walk resolves in, so
+        // there is no second reading to fall out of step with. The off arm
+        // hands `bucket == rows`, which is the same nothing a deployment with
+        // no lattice hands.
+        let armed = kernels_cuda::Pad {
+            rows: composition.rows(),
+            bucket: if pad {
+                composition.bucket()
+            } else {
+                composition.rows()
+            },
+        };
         let mut run = Run::new(
             device.ctx(),
-            &plan.values,
-            &plan.nodes,
+            &trace.values,
+            &trace.nodes,
             weights.table(),
             &slots,
             &caches,
@@ -1777,41 +2464,117 @@ impl Shell {
             &windows,
             &place,
         )
-        .across(&side_ctx, &stream);
+        .across(&side_ctx, &stream)
+        .quantized(armed);
         // TWO MODES, ONE WALK (design §6, decision #11). Off and Shaped run
         // it whole; On splits it at the phase boundary — prepare on the open
         // stream, then the capture regions either replayed from this shape's
         // graph or run and recorded into one. Which is why `record::fire`
         // takes the same arguments `walk` does and answers the same errors:
         // it is not another path, it is the same one at two instants.
-        if graphs.records() {
-            cache.fire(
-                &record::Fire {
-                    plan,
-                    baked,
-                    descriptor: &descriptor,
-                    stream: device.stream(),
-                    lanes: forked,
-                    key: record::Key::of(composition.classes(), self.copies),
-                },
-                &mut run,
-                &place,
-            )?;
+        let walked = if graphs.records() {
+            let fire = record::Fire {
+                trace,
+                compiled,
+                descriptor: &descriptor,
+                stream: device.stream(),
+                lanes: forked,
+                key: record::Key::of(composition.classes(), copies),
+                bucket: composition.bucket(),
+            };
+            if arming {
+                // The synthetic pass: prepare on the host, one tapped
+                // capture, one instantiate — nothing executes and nothing
+                // launches. `maybe_arm_fold` owns what a refusal means.
+                // The PROBE variant captures a second geometry and fits the
+                // zero forms instead of instantiating anything.
+                if probing {
+                    cache.arm_probe(&fire, &mut run, &place)
+                } else {
+                    cache.arm_fold(&fire, &mut run, &place)
+                }
+            } else if fold {
+                cache.fire_folded(&fire, &mut run, &place).map(|_mode| ())
+            } else {
+                cache.fire(&fire, &mut run, &place).map(|_mode| ())
+            }
         } else {
             walk(
-                plan,
-                baked,
+                trace,
+                compiled,
                 &descriptor,
                 &mut run,
                 &mut Cursor::new(&place),
-            )?;
-        }
+            )
+            .map_err(Fault::from)
+        };
         drop(run);
+        // **THE PAD IS THE FIRE'S, SO IT ENDS WITH THE FIRE** — including the
+        // fire that ended in a refusal, which is why the walk's answer is held
+        // rather than `?`-ed above. A context outlives every fire on it and a
+        // pad left armed would still name the last fire's row count; the next
+        // thing to fire on this stream is a guest program's epilogue, a
+        // registration's copy or the next fire's warm pass, and none of them
+        // is the fire that number was true of.
+        device.ctx().disarm();
+        for ctx in &side_ctx {
+            ctx.disarm();
+        }
+        walked?;
 
         // 9. The one synchronization a fire has, and it is here because a
         //    caller asked for numbers — every entry below is enqueue-only by
         //    design (decision #15).
+        //
+        //    **WHAT THIS SYNC GUARDS, ENUMERATED — because the pipeline
+        //    (step 5) moved work around it and each guard had to be moved
+        //    explicitly or shown not to move.**
+        //
+        //    - **The readback.** The logits and score reads below are the
+        //      caller's return value, and this is why the sync CANNOT cross
+        //      the fire boundary while `fire` returns numbers: a one-deep
+        //      pipeline that deferred fire N's sync into fire N+1 would have
+        //      to defer fire N's readback with it, and fire N's caller is
+        //      already holding the Vec. (The engine's own decode loop feeds
+        //      each fire the previous fire's argmax, so it could not submit
+        //      N+1 before reading N either — the dependency is the
+        //      workload's, not this shell's.) So the pipeline overlaps the
+        //      OTHER side instead: fire N+1's binding is applied to an idle
+        //      exec between fire N's launch and this line
+        //      (`record::Graphs::prebind`), which is host work the GPU never
+        //      waits on. The day lanes resolve their tokens on-device
+        //      (`palo B3` envelopes) is the day a fire can return without
+        //      numbers and this sync can move; the seam is ready for it.
+        //    - **Error attribution.** Every launch is enqueue-only, so an
+        //      async fault surfaces at the next blocking call; this sync is
+        //      what makes that call carry THIS fire's name instead of some
+        //      later fire's staging. The prebind writes it hides are
+        //      host-side calls that answer their own errors synchronously
+        //      (`apply_binding` names the seat it half-wrote and drops it),
+        //      so nothing new hides behind this line.
+        //    - **Staging lifetime.** The host vectors staged at step 5 drop
+        //      when this call returns; their `cudaMemcpyAsync` copies are
+        //      pageable and complete host-side at enqueue, and this sync is
+        //      the belt over that.
+        //    - **Eviction and teardown.** `record.rs` drops execs and
+        //      bindings on the argument that every fire ends synchronized —
+        //      an exec that is not this fire's has finished. The prebind
+        //      keeps that argument intact by never touching an exec that is
+        //      in flight (the twin, or another bucket's seat).
+        //    - **Bookkeeping order.** `held`, `pools.clear`, the pad disarm
+        //      — host state the NEXT fire's staging reads; all written
+        //      after this line, none moved.
         device.synchronize()?;
+
+        // The synthetic arming pass ends here: it computed nothing (capture
+        // does not execute), so there is no readout to take, no scores to
+        // copy, no epilogue to run, and — load-bearing — no `held` to
+        // advance: its lanes borrowed real slots for their page arithmetic
+        // and stated `held` explicitly so nothing of the shell's counting
+        // moves.
+        if arming {
+            return Ok(Vec::new());
+        }
 
         let out = exports.out;
         let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -2044,4 +2807,77 @@ fn bf16(bits: u16) -> f32 {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LATTICE_FLOOR, default_lattice};
+
+    /// The lattice a `Boot` that stated none is served, spelled out: geometric
+    /// above a floor of eight, so that no fire computes more than twice its own
+    /// rows and no decode fire lands on a bucket boundary its solo twin missed.
+    #[test]
+    fn the_default_lattice_is_geometric_above_the_floor() {
+        assert_eq!(
+            default_lattice(8192),
+            vec![8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        );
+    }
+
+    /// **THE ARM FLIP AT ONE ROW IS WHAT THE FLOOR EXISTS TO KILL** (the
+    /// cuda-abi census: a one-lane decode takes the gemv arm, a two-lane one
+    /// does not, and 127 launches change kernel across that boundary). A
+    /// lattice naming 1 would leave it exactly where it was.
+    #[test]
+    fn no_default_lattice_names_a_bucket_that_keeps_the_gemv_arm_alive() {
+        for ceiling in [8u32, 16, 64, 256, 8192] {
+            assert!(
+                default_lattice(ceiling).iter().all(|point| *point > 1),
+                "a lattice for {ceiling} rows puts a fire on M=1"
+            );
+        }
+    }
+
+    /// Two properties P0 refuses a lattice for (`model_compiler`'s `accept`):
+    /// it must strictly ascend, and no point may pass the token ceiling. A
+    /// default that could not be baked would turn every unstated lattice into
+    /// `Fault::Bake`.
+    #[test]
+    fn the_default_lattice_ascends_and_stops_at_the_ceiling() {
+        for ceiling in [1u32, 2, 3, 4, 63, 64, 65, 256, 511, 8192] {
+            let lattice = default_lattice(ceiling);
+            assert_eq!(
+                *lattice.last().expect("a lattice is never empty"),
+                ceiling,
+                "a fire AT the ceiling must have a bucket"
+            );
+            assert!(
+                lattice.windows(2).all(|pair| pair[0] < pair[1]),
+                "{lattice:?} does not strictly ascend"
+            );
+            assert!(
+                lattice.iter().all(|point| *point <= ceiling),
+                "{lattice:?} names a bucket past the token ceiling"
+            );
+        }
+    }
+
+    /// The waste D4 pays is bounded by the lattice's ratio, and a geometric
+    /// lattice is what makes that a sentence with a number in it: no fire ever
+    /// computes more than twice the rows it has.
+    #[test]
+    fn no_fire_above_the_floor_is_padded_past_twice_its_own_rows() {
+        let lattice = default_lattice(8192);
+        for rows in LATTICE_FLOOR..=8192 {
+            let bucket = lattice
+                .iter()
+                .copied()
+                .find(|point| *point >= rows)
+                .expect("every row count up to the ceiling has a bucket");
+            assert!(
+                u64::from(bucket) < 2 * u64::from(rows),
+                "a fire of {rows} rows pads to {bucket}"
+            );
+        }
+    }
 }

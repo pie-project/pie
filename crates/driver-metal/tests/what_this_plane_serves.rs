@@ -40,7 +40,7 @@
 
 use std::collections::BTreeSet;
 
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_ir::{Operands, Operation, Platform};
 
 /// The op names this plane answers `KernelError::Unsupported` for, read off
@@ -107,13 +107,13 @@ const SERVED: &str = "qwen35-d0.8b-bf16-kv-bf16";
 /// node has every class in its mask, so every fire dispatches it and the
 /// first one refuses. The CONDITIONAL set is the guarded ones, which cost a
 /// fire whose composition gives their window no rows exactly nothing.
-fn refusals(plan: &model_ir::Plan) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+fn refusals(trace: &model_ir::Trace) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
     let mut fatal = BTreeSet::new();
     let mut guarded = BTreeSet::new();
-    for node in &plan.nodes {
+    for node in &trace.nodes {
         let name = op_name(&node.op);
         if let Some(refused) = REFUSED.iter().find(|refused| **refused == name) {
-            if matches!(node.cond, model_ir::Cond::Always) {
+            if matches!(node.guard, model_ir::Guard::Always) {
                 fatal.insert(*refused);
             } else {
                 guarded.insert(*refused);
@@ -135,7 +135,7 @@ fn op_name(op: &Operation) -> &'static str {
 
 #[test]
 fn the_census_of_what_this_plane_can_bake() {
-    let budgets = Budgets::new(8, 2048);
+    let budget = Budget::new(8, 2048);
     let profile = DeviceProfile {
         side_streams: 0,
         ..DeviceProfile::default()
@@ -143,15 +143,15 @@ fn the_census_of_what_this_plane_can_bake() {
     let mut clears = Vec::new();
     let mut report = String::new();
     for (sku, _tp, trace, _classify) in model::catalog() {
-        let plan = trace(Platform::Metal);
-        let probed = driver_metal::store::kv::probe(&plan);
-        let (fatal, guarded) = refusals(&plan);
-        let baked = compile(&plan, &budgets, &profile);
-        let straddles = baked
+        let trace = trace(Platform::Metal);
+        let probed = driver_metal::store::kv::probe(&trace);
+        let (fatal, guarded) = refusals(&trace);
+        let compiled = compile(&trace, &budget, &profile);
+        let straddles = compiled
             .as_ref()
             .ok()
-            .map(|baked| driver_metal::window::no_schedule_straddles_its_readers(&plan, baked));
-        let verdict = match (&probed, &baked, &straddles) {
+            .map(|compiled| driver_metal::window::no_schedule_straddles_its_readers(&trace, compiled));
+        let verdict = match (&probed, &compiled, &straddles) {
             (Err(why), ..) => format!("kv probe refuses: {why}"),
             (_, Err(why), _) => format!("the bake refuses: {why}"),
             (_, _, Some(Err(why))) => format!("a schedule straddles: {why}"),
@@ -184,7 +184,7 @@ fn the_census_of_what_this_plane_can_bake() {
 /// answer must come from the plan rather than from a guess.
 #[test]
 fn every_refused_name_is_one_the_ir_can_actually_spell() {
-    let budgets = Budgets::new(8, 2048);
+    let budget = Budget::new(8, 2048);
     let profile = DeviceProfile {
         side_streams: 0,
         ..DeviceProfile::default()
@@ -194,12 +194,12 @@ fn every_refused_name_is_one_the_ir_can_actually_spell() {
     // then be documenting a kernel plane that has moved on.
     let mut spoken: BTreeSet<&'static str> = BTreeSet::new();
     for (_sku, _tp, trace, _classify) in model::catalog() {
-        let plan = trace(Platform::Metal);
-        for node in &plan.nodes {
+        let trace = trace(Platform::Metal);
+        for node in &trace.nodes {
             spoken.insert(op_name(&node.op));
         }
     }
-    let _ = (budgets, profile);
+    let _ = (budget, profile);
     let unreachable: Vec<&&str> = REFUSED
         .iter()
         .filter(|name| !spoken.contains(**name))

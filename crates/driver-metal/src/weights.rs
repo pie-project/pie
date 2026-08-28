@@ -1,5 +1,5 @@
 //! The checkpoint, resident: one device allocation, one row per
-//! `Plan::params` — and, in the same allocation and the same table, the
+//! `Trace::params` — and, in the same allocation and the same table, the
 //! adapter banks (design §8).
 //!
 //! # Why the banks live HERE and not in `store/`
@@ -56,7 +56,7 @@
 //!
 //! This module takes a [`ModelContract`] and never asks which model it
 //! describes. That is decision #18 read from the residency side: the engine
-//! links `model`, traces the `Plan` and states the load contract; the shell
+//! links `model`, traces the `Trace` and states the load contract; the shell
 //! compiles the contract against a checkpoint and lands the bytes. A shell
 //! that reached for `model::qwen_3` would be a shell that has to grow an arm
 //! per family, which is exactly the shape the string-plan era had.
@@ -66,7 +66,7 @@
 //! The load contract publishes one `Visibility::Public` entry per plan param,
 //! **under the param's own name** — `embed`, `layer.7.q_proj` — and the
 //! checkpoint's spellings live inside the expressions. So the bijection this
-//! module needs is `plan.params[i].name == published name`, which is the
+//! module needs is `trace.params[i].name == published name`, which is the
 //! property `model/tests/the_zt_contract_states_the_cut.rs` asserts for every
 //! SKU in the catalog. Both directions are checked here anyway, because the
 //! consequence of a hole is not a missing tensor: it is
@@ -92,7 +92,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use kernels_metal::Tensor;
-use model_ir::{Dtype, ParamSource, Plan};
+use model_ir::{Dtype, ParamSource, Trace};
 use model_loader::checkpoint;
 use model_loader::contract::ModelContract;
 use model_loader::error::Error as LoadError;
@@ -123,7 +123,7 @@ const ALIGN: u64 = 256;
 /// never a partial write.
 #[derive(Debug, Clone, Copy)]
 pub struct AdapterPlane<'a> {
-    /// The bank param this plane fills, as `Plan::params` names it.
+    /// The bank param this plane fills, as `Trace::params` names it.
     pub bank: &'a str,
     /// One slot's worth of bytes.
     pub bytes: &'a [u8],
@@ -147,7 +147,7 @@ struct Bank {
     /// Where the bank's first slot starts in the store.
     offset: u64,
     /// How many adapters the first axis seats — the ceiling
-    /// `Budgets::max_adapters` is checked against, stated as a shape.
+    /// `Budget::max_adapters` is checked against, stated as a shape.
     adapters: u32,
     /// One adapter's bytes in this bank.
     slot: u64,
@@ -161,8 +161,8 @@ struct Bank {
 /// adapter's slot is everything after it. `A` and `B` are two independent
 /// banks here — the op pairs them, this module does not, and a registration
 /// names each by the name the plan gave it.
-fn banks(plan: &Plan, places: &[Place]) -> BTreeMap<String, Bank> {
-    plan.params
+fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
+    trace.params
         .iter()
         .zip(places)
         .filter(|(param, _)| param.source == ParamSource::Registered)
@@ -209,7 +209,7 @@ impl Weights {
     pub fn resident(
         device: &Context,
         handles: &Handles,
-        plan: &Plan,
+        trace: &Trace,
         contract: &ModelContract,
         path: &Path,
     ) -> Result<Weights> {
@@ -229,7 +229,7 @@ impl Weights {
         let target = StorageTarget::for_backend(BackendKind::Metal, 0, 1);
         let landing = compile(&metadata, contract, target)?;
 
-        let places = places(plan)?;
+        let places = places(trace)?;
         let total = places.last().map_or(0, |p| p.offset + p.reserved);
         let mut store = Buffer::zeroed(device, total)?;
 
@@ -240,7 +240,7 @@ impl Weights {
         let mut scratch = vec![0u8; usize::try_from(landing.memory.arena_bytes()).unwrap_or(0)];
         let mut backing: &mut [u8] = &mut scratch;
 
-        let index: BTreeMap<&str, usize> = plan
+        let index: BTreeMap<&str, usize> = trace
             .params
             .iter()
             .enumerate()
@@ -269,9 +269,9 @@ impl Weights {
             // provenance — and already zeroed, and a zeroed low-rank `A`
             // makes the whole bank the identity until something registers
             // into it. What lands here is `register_adapter`'s business.
-            if !landed[at] && plan.params[at].source == ParamSource::Checkpoint {
+            if !landed[at] && trace.params[at].source == ParamSource::Checkpoint {
                 return Err(Fault::Param {
-                    name: plan.params[at].name.clone(),
+                    name: trace.params[at].name.clone(),
                     why: "is a plan param the load contract never published",
                 });
             }
@@ -291,7 +291,7 @@ impl Weights {
         Ok(Weights {
             store,
             table: WeightTable(table),
-            banks: banks(plan, &places),
+            banks: banks(trace, &places),
         })
     }
 
@@ -405,10 +405,10 @@ struct Place {
 /// take whatever arrived; this one refuses a plane that is not the size its
 /// own declaration says it is, which is the only cheap check there is that a
 /// contract and a plan describe the same model.
-fn places(plan: &Plan) -> Result<Vec<Place>> {
-    let mut out = Vec::with_capacity(plan.params.len());
+fn places(trace: &Trace) -> Result<Vec<Place>> {
+    let mut out = Vec::with_capacity(trace.params.len());
     let mut at = 0u64;
-    for param in &plan.params {
+    for param in &trace.params {
         let element =
             model_compiler::arena::elem_bytes(param.dtype).ok_or_else(|| Fault::Param {
                 name: param.name.clone(),
@@ -487,12 +487,12 @@ mod tests {
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
         let trace =
             model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
-        let plan = trace(Platform::Metal);
-        let places = places(&plan).expect("every param of a bf16 SKU has an element size");
+        let trace = trace(Platform::Metal);
+        let places = places(&trace).expect("every param of a bf16 SKU has an element size");
 
-        assert_eq!(places.len(), plan.params.len());
+        assert_eq!(places.len(), trace.params.len());
         let mut end = 0u64;
-        for (place, param) in places.iter().zip(&plan.params) {
+        for (place, param) in places.iter().zip(&trace.params) {
             assert!(
                 place.offset >= end,
                 "`{}` overlaps its predecessor",

@@ -35,7 +35,33 @@ pub fn act_x_wt(
         act.rows, y.rows,
         "the activation's rows are the rows the result lands"
     );
-    let m = stated(op, y.rows)?;
+    // **D4: THE OPAQUE CALLEE SEES THE BUCKET** (`.wiki/palo/cuda-abi.md` §3,
+    // refined form). Below this entry is `dense`, and below `dense` is
+    // cuBLASLt's shape→algorithm function — a heuristic nobody publishes and
+    // which the probe caught swapping kernels and splitK factors on M alone.
+    // Rounding M up to the fire's lattice point is the one lever that freezes
+    // it without knowing it: the library is handed a per-bucket constant, so
+    // its private decisions become per-bucket constants too. Nothing else in
+    // this call moves — N and K are the weight's and are already shape
+    // constants, and every kernel this tree owns keeps its live extent.
+    //
+    // The rows `[rows, bucket)` this makes the gemm read and write are in
+    // bounds (the arena reserves at the ceiling, P0 refuses a lattice above
+    // it) and harmless (a gemm is row-independent, so the garbage that lands
+    // there stays there) — and they are NOBODY'S only because the driver
+    // declined to arm a windowed region at all. This entry does not and cannot
+    // check that: `Ctx::opaque_rows` carries both gates and the argument for
+    // each. What the entry owes is the extent of the rectangle it was handed,
+    // which is what it passes.
+    //
+    // **AND ONE THING THIS DOES NOT PRESERVE, STATED WHERE IT IS DONE.** A
+    // padded call is a different cuBLASLt kernel, and a different kernel is a
+    // different reduction order: the live rows come back numerically equal and
+    // not bit-equal to the unpadded call's. Two fires agree bit-for-bit iff
+    // they share a bucket. That is the price of freezing the arm, it is what
+    // freezing the arm MEANS, and it is measured in
+    // `a_padded_fire_is_in_bounds_and_says_something_true`.
+    let m = ctx.opaque_rows(stated(op, y.rows)?);
     let n = stated(op, y.width)?;
     let k = stated(op, act.width)?;
 

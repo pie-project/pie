@@ -1,22 +1,22 @@
-//! Plans built by hand, one statement per line — the test vocabulary for
+//! Traces built by hand, one statement per line — the test vocabulary for
 //! every pass in this crate.
 //!
 //! `model-dsl` is the authoring surface and CANNOT be reached from a unit
 //! test here: it is a dev-dependency, which means it exists for
 //! `tests/every_sku_carves_an_arena.rs` and not for `src/`. So these say in
-//! `Def`, `Ty` and `Cond` what a forward pass says in `split` and
+//! `Def`, `Ty` and `Guard` what a forward pass says in `split` and
 //! `Value::merge`, the same way `model_ir::check::classes`' own tests do. The
 //! catalog test is the one that checks the two agree.
 
 use model_ir::ops::{Attention, Collective, Elementwise};
 use model_ir::{
-    CacheRow, Cond, Def, Dim, Dtype, Node, Plan, Platform, RuntimeInput, Seam, StructKind, Ty,
+    CacheRow, Guard, Def, Dim, Dtype, Node, Trace, Platform, RuntimeInput, Seam, StructKind, Ty,
     ValueDecl, ValueId,
 };
 
-/// A plan under construction.
+/// A trace under construction.
 pub(crate) struct Build {
-    pub(crate) plan: Plan,
+    pub(crate) trace: Trace,
     inputs: u32,
 }
 
@@ -39,15 +39,15 @@ pub(crate) fn block(rows: u64, width: u64) -> Ty {
     }
 }
 
-/// `Cond::Fact(bit)`, spelled short.
-pub(crate) fn fact(bit: u8) -> Cond {
-    Cond::Fact(bit)
+/// `Guard::Fact(bit)`, spelled short.
+pub(crate) fn fact(bit: u8) -> Guard {
+    Guard::Fact(bit)
 }
 
 impl Build {
     pub(crate) fn new() -> Build {
         Build {
-            plan: Plan {
+            trace: Trace {
                 name: "hand-built".to_string(),
                 platform: Platform::Cuda,
                 params: Vec::new(),
@@ -64,8 +64,8 @@ impl Build {
     }
 
     pub(crate) fn value(&mut self, def: Def, ty: Ty) -> ValueId {
-        self.plan.values.push(ValueDecl { def, ty });
-        ValueId((self.plan.values.len() - 1) as u32)
+        self.trace.values.push(ValueDecl { def, ty });
+        ValueId((self.trace.values.len() - 1) as u32)
     }
 
     /// A demand sink the driver binds, distinct per call.
@@ -84,8 +84,8 @@ impl Build {
     /// One guarded op over `x`, minting a fresh `width`-wide rectangle.
     /// `rmsnorm.no_scale` because it declares NO in-place alias — the ordinary
     /// case, where a result needs bytes of its own.
-    pub(crate) fn op(&mut self, x: ValueId, width: u64, cond: Cond) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+    pub(crate) fn op(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
         self.push(
             Elementwise::RmsnormNoScale {
@@ -95,7 +95,7 @@ impl Build {
                 y,
             }
             .into(),
-            cond,
+            guard,
         );
         y
     }
@@ -103,8 +103,8 @@ impl Build {
     /// The same op, minting a rectangle of the declared `ty` instead of the
     /// ordinary token-shaped one — what a test reaches for when the SHAPE is
     /// the thing under test.
-    pub(crate) fn shaped(&mut self, x: ValueId, ty: Ty, cond: Cond) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+    pub(crate) fn shaped(&mut self, x: ValueId, ty: Ty, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), ty);
         self.push(
             Elementwise::RmsnormNoScale {
@@ -114,17 +114,17 @@ impl Build {
                 y,
             }
             .into(),
-            cond,
+            guard,
         );
         y
     }
 
     /// One op that writes THROUGH its operand — `Operands::aliases` says so,
     /// and the carve is expected to fold the two onto one column.
-    pub(crate) fn in_place(&mut self, x: ValueId, width: u64, cond: Cond) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+    pub(crate) fn in_place(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
         let x_out = self.value(Def::Op(node), act(width));
-        self.push(Elementwise::MulScalar { s: 2.0, x, x_out }.into(), cond);
+        self.push(Elementwise::MulScalar { s: 2.0, x, x_out }.into(), guard);
         x_out
     }
 
@@ -135,11 +135,11 @@ impl Build {
         x: ValueId,
         y: ValueId,
         width: u64,
-        cond: Cond,
+        guard: Guard,
     ) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+        let node = self.trace.nodes.len() as u32;
         let y_out = self.value(Def::Op(node), act(width));
-        self.push(Elementwise::ResidualAdd { x, y, y_out }.into(), cond);
+        self.push(Elementwise::ResidualAdd { x, y, y_out }.into(), guard);
         y_out
     }
 
@@ -147,12 +147,12 @@ impl Build {
     /// reads. The reading it states is the one [`Build::decode`] restates —
     /// one head of width 4, no window — because a schedule and its reader
     /// disagreeing is a shell refusal rather than a fixture.
-    pub(crate) fn prepare(&mut self, cond: Cond) -> ValueId {
+    pub(crate) fn prepare(&mut self, guard: Guard) -> ValueId {
         let kv_indptr = self.input(1);
         let kv_indices = self.input(1);
         let last_page_len = self.input(1);
         let kv_len = self.input(1);
-        let node = self.plan.nodes.len() as u32;
+        let node = self.trace.nodes.len() as u32;
         let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
         self.push(
             Attention::PlanDecode {
@@ -167,7 +167,7 @@ impl Build {
                 plan,
             }
             .into(),
-            cond,
+            guard,
         );
         plan
     }
@@ -179,11 +179,11 @@ impl Build {
     /// output: a plan build over an activation is host work with no instant to
     /// run in — after the graph computed the number, and before the graph the
     /// build's own struct is read by.
-    pub(crate) fn prepare_over(&mut self, kv_indptr: ValueId, cond: Cond) -> ValueId {
+    pub(crate) fn prepare_over(&mut self, kv_indptr: ValueId, guard: Guard) -> ValueId {
         let kv_indices = self.input(1);
         let last_page_len = self.input(1);
         let kv_len = self.input(1);
-        let node = self.plan.nodes.len() as u32;
+        let node = self.trace.nodes.len() as u32;
         let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
         self.push(
             Attention::PlanDecode {
@@ -198,15 +198,15 @@ impl Build {
                 plan,
             }
             .into(),
-            cond,
+            guard,
         );
         plan
     }
 
     /// The attention that reads a prepare node's struct.
-    pub(crate) fn decode(&mut self, q: ValueId, plan: ValueId, cond: Cond) -> ValueId {
+    pub(crate) fn decode(&mut self, q: ValueId, plan: ValueId, guard: Guard) -> ValueId {
         let cache = self.cache();
-        let node = self.plan.nodes.len() as u32;
+        let node = self.trace.nodes.len() as u32;
         let o = self.value(Def::Op(node), act(4));
         self.push(
             Attention::Decode {
@@ -219,21 +219,21 @@ impl Build {
                 o,
             }
             .into(),
-            cond,
+            guard,
         );
         o
     }
 
     /// A collective — the family P3 may never elide.
-    pub(crate) fn all_gather(&mut self, x: ValueId, width: u64, cond: Cond) -> ValueId {
-        let node = self.plan.nodes.len() as u32;
+    pub(crate) fn all_gather(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
-        self.push(Collective::AllGather { x, y }.into(), cond);
+        self.push(Collective::AllGather { x, y }.into(), guard);
         y
     }
 
     /// A cache write: an effect root, and it hands nothing back.
-    pub(crate) fn append(&mut self, x: ValueId, cond: Cond) -> usize {
+    pub(crate) fn append(&mut self, x: ValueId, guard: Guard) -> usize {
         let cache = self.cache();
         let write_page = self.input(1);
         let write_offset = self.input(1);
@@ -245,19 +245,19 @@ impl Build {
                 write_offset,
             }
             .into(),
-            cond,
+            guard,
         );
-        self.plan.nodes.len() - 1
+        self.trace.nodes.len() - 1
     }
 
-    pub(crate) fn merge(&mut self, arms: &[(ValueId, Cond)], width: u64) -> ValueId {
+    pub(crate) fn merge(&mut self, arms: &[(ValueId, Guard)], width: u64) -> ValueId {
         self.value(Def::Merge(arms.to_vec()), act(width))
     }
 
     /// The `"out"` seam — what a trace writes the forward's return value as,
     /// and therefore what roots the demand walk and pins the arena to fire end.
     pub(crate) fn out(&mut self, v: ValueId) -> &mut Build {
-        self.plan.seams.push(Seam {
+        self.trace.seams.push(Seam {
             seam: "out".to_string(),
             values: vec![v],
             layer: None,
@@ -265,10 +265,10 @@ impl Build {
         self
     }
 
-    fn push(&mut self, op: model_ir::Operation, cond: Cond) {
-        self.plan.nodes.push(Node {
+    fn push(&mut self, op: model_ir::Operation, guard: Guard) {
+        self.trace.nodes.push(Node {
             op,
-            cond,
+            guard,
             layer: None,
         });
     }

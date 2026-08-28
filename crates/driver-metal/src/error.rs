@@ -58,7 +58,7 @@ pub enum Fault {
     },
 
     /// The compiler refused to bake the plan against these budgets.
-    Bake(model_compiler::Refusal),
+    Bake(model_compiler::Error),
 
     /// The loader refused to land the checkpoint against this plan.
     Load(model_loader::error::Error),
@@ -85,7 +85,7 @@ pub enum Fault {
     /// `driver::fire::fallback`). What is left here is the case where the bake
     /// and the fire disagree: a mask P4 promised consecutive that came back in
     /// pieces, or one whose pieces outnumber the `Fallback::Split { r }` P4
-    /// counted on the order it shipped. Neither can happen to a `Baked` and a
+    /// counted on the order it shipped. Neither can happen to a `CompiledModel` and a
     /// `WindowTable` built from each other.
     Fragmented {
         /// The template region.
@@ -330,8 +330,8 @@ impl fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
-impl From<model_compiler::Refusal> for Fault {
-    fn from(refusal: model_compiler::Refusal) -> Self {
+impl From<model_compiler::Error> for Fault {
+    fn from(refusal: model_compiler::Error) -> Self {
         Self::Bake(refusal)
     }
 }

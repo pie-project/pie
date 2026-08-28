@@ -21,7 +21,7 @@ use kernels_cuda::attn::plan::{
     DecodePlan, Device, MlaPlan, PrefillPlan, PrefillPlanSm90, Shape, Toggles, Workspace,
 };
 use kernels_cuda::linear::lora::Segments;
-use kernels_cuda::{Ctx, KvPool, RaggedTensor, RecurrentPool, Tensor};
+use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
 use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::dispatch::copy::CopyPlan;
@@ -40,7 +40,7 @@ pub enum WeightRow {
     Planes { codes: Tensor, scales: Tensor },
 }
 
-/// Loader-resolved weights, one row per `Plan::params` entry —
+/// Loader-resolved weights, one row per `Trace::params` entry —
 /// `Def::Weight(i)` resolves to row `i`. `None` marks a param the shell has
 /// not bound; resolving such a row is a binding bug and panics.
 #[derive(Clone, Debug, Default)]
@@ -83,7 +83,7 @@ pub enum CachePool {
     Recurrent(RecurrentPool),
 }
 
-/// Cache-index-indexed pools, aligned with `Plan::caches`.
+/// Cache-index-indexed pools, aligned with `Trace::caches`.
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable(pub Vec<CachePool>);
 
@@ -281,7 +281,7 @@ pub struct FireTables {
 /// [`Run::qo_indptr`] and [`Run::qo_indptr_host`].
 ///
 /// **THE FACT WORD IS NOT HERE EITHER.** It used to ride along as one `u64`
-/// for the whole fire, for a `Cond::holds` the walk stopped asking when
+/// for the whole fire, for a `Guard::holds` the walk stopped asking when
 /// regions grew masks: which classes run a node is `Region::mask`, resolved
 /// per region against the window table, and nothing on this side ever read
 /// the word. A fire-wide word is exactly the collapse design §0's vocabulary
@@ -312,7 +312,7 @@ pub struct FireBindings {
     /// launches, because its window is empty and the walk skips it.
     pub adapter_routes: Option<Tensor>,
 
-    /// Per cache space, aligned with `Plan::caches`:
+    /// Per cache space, aligned with `Trace::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space, and
     /// the plan-building arms route to row `cache`'s planning twin.
     pub geometry: Vec<CacheGeometry>,
@@ -388,11 +388,11 @@ pub struct Run<'c> {
     /// through it, enqueue only.
     ctx: &'c Ctx,
 
-    /// The routing: `Plan::values`, read by [`Run::tensor`] to send each id
+    /// The routing: `Trace::values`, read by [`Run::tensor`] to send each id
     /// to its table.
     values: &'c [ValueDecl],
 
-    /// `Plan::nodes`, for the one thing a resolution cannot do from a value
+    /// `Trace::nodes`, for the one thing a resolution cannot do from a value
     /// id alone: read a whole REGION's operands at once.
     ///
     /// A `Fallback::Copy` compacts every rectangle the region touches into
@@ -472,6 +472,23 @@ pub struct Run<'c> {
     /// copied never consults it — `Window::gathered` is `None` and the cut is
     /// the slice it always was.
     copy: CopyPlan,
+
+    /// **D4'S TWO NUMBERS, AND THE WALK IS WHERE THEY ARE GATED**
+    /// (`.wiki/palo/cuda-abi.md` §3, refined form): this fire's total rows and
+    /// the lattice point above them. `Pad::default()` — a bucket that is not
+    /// above the rows — is a shell that padded nothing, which is
+    /// `PIE_CUDA_PAD=off`, a deployment with no lattice, and every `Run` built
+    /// before this field existed.
+    ///
+    /// **HELD HERE RATHER THAN STAMPED ON THE CONTEXT ONCE PER FIRE**, because
+    /// the question padding turns on is not "which fire" but "which REGION" —
+    /// see [`Run::ctx`]. A pad the shell wrote onto the context at the top of
+    /// the fire would still be there when the walk stepped into a windowed
+    /// region, and the entry would then be left inferring from an extent
+    /// whether its launch owns the fire's tail. An extent cannot answer that:
+    /// a window's rows and a fire's rows are both `u32`, and they can be
+    /// equal. The window can answer it, and the walk is holding one.
+    pad: Pad,
 }
 
 impl<'c> Run<'c> {
@@ -503,15 +520,30 @@ impl<'c> Run<'c> {
             side: &[],
             stream: &place.region,
             copy: CopyPlan::default(),
+            pad: Pad::default(),
         }
     }
 
-    /// `Plan::values`, for the copy plan's own shape reading.
+    /// The same `Run`, told this fire's row count and the bucket it rounds up
+    /// to — D4's quantization, armed.
+    ///
+    /// ADDITIVE, AND THE SHELL CHOOSES: a `Run` never handed one pads nothing,
+    /// which is the `PIE_CUDA_PAD=off` arm and every caller that predates the
+    /// design. `pad.rows` must be the COMPOSITION's rows, not a window's —
+    /// [`Run::ctx`] compares a window's span against it and the comparison is
+    /// the whole safety argument.
+    #[must_use]
+    pub fn quantized(mut self, pad: Pad) -> Self {
+        self.pad = pad;
+        self
+    }
+
+    /// `Trace::values`, for the copy plan's own shape reading.
     pub(crate) fn values(&self) -> &'c [ValueDecl] {
         self.values
     }
 
-    /// `Plan::nodes`, for the same.
+    /// `Trace::nodes`, for the same.
     pub(crate) fn nodes(&self) -> &'c [Node] {
         self.nodes
     }
@@ -561,13 +593,67 @@ impl<'c> Run<'c> {
         // and `new` seats the region cell there so the type has something to
         // hold. Reading a region index as a stream index is exactly the bug
         // this line exists to make impossible.
-        if self.side.is_empty() {
-            return self.ctx;
+        let ctx = if self.side.is_empty() {
+            self.ctx
+        } else {
+            match self.stream.get() {
+                0 => self.ctx,
+                n => self.side.get(n as usize - 1).copied().unwrap_or(self.ctx),
+            }
+        };
+        // **AND THE SECOND THING THIS LOOKUP ANSWERS: MAY THIS REGION PAD?**
+        // (`.wiki/palo/cuda-abi.md` §3's boundary.) Every dispatch arm reaches
+        // its context through here and does so with the cursor already on the
+        // node it is about to launch, so this is the last instant at which the
+        // WINDOW is still in hand and the first at which an entry could ask.
+        // Deciding it here rather than in the entry is not tidiness: an entry
+        // sees an extent, and an extent cannot distinguish the fire's rows
+        // from a window that happens to hold as many.
+        ctx.arm(self.here());
+        ctx
+    }
+
+    /// **THE PAD THIS REGION IS ALLOWED**, and the argument for every clause.
+    ///
+    /// D4 pads an opaque callee's `M` up to the bucket so that cuBLASLt's
+    /// unpublished shape→kernel table stops following the batch. What that
+    /// buys is bought with the rows `[rows, bucket)`, and those rows are safe
+    /// to scribble on exactly when they are the FIRE's tail — reserved by the
+    /// arena at `max_tokens`, promised by P0 to be above every bucket, and
+    /// spoken for by nobody. A WINDOWED launch's tail is a different thing
+    /// entirely: the rows above a window are the next class's rows of the same
+    /// column, and under `ArenaMap::co_tenants` or a merge those are somebody's
+    /// real bytes. Padding one is a clobber that computes and never faults.
+    ///
+    /// So a region pads only if its window IS the whole fire:
+    ///
+    /// * **`row_offset == 0` and `rows >= the fire's`** — the mask covers every
+    ///   class that has rows, read off the window the shell built FROM the
+    ///   mask (`Windows::of`). This is the clause the entry could not make: it
+    ///   compares a window's span against the composition, where an entry can
+    ///   only compare one extent against another.
+    /// * **not gathered** — a `Fallback::Copy` compacted its rows into a
+    ///   scratch slab cut to the rows it gathered, so past them is the next
+    ///   thing in the slab rather than a reserved tail. (A gathered window
+    ///   cannot span the whole fire anyway — gathering needs two intervals and
+    ///   two intervals need a gap — but the clause is written because that is
+    ///   an argument, and this is a bounds check.)
+    /// * **no segment list** — a `Fallback::Grouped` window's span is the UNION
+    ///   of its intervals and the gaps hold foreign rows, so its span covering
+    ///   the fire says nothing about the rows it owns.
+    ///
+    /// A region that fails any clause gets `Pad::default()`, which
+    /// [`Ctx::opaque_rows`] answers with the extent it was handed.
+    fn here(&self) -> Pad {
+        if self.pad.bucket <= self.pad.rows {
+            return Pad::default();
         }
-        match self.stream.get() {
-            0 => self.ctx,
-            n => self.side.get(n as usize - 1).copied().unwrap_or(self.ctx),
-        }
+        let window = self.window();
+        let whole = window.span.row_offset == 0
+            && window.span.rows >= self.pad.rows
+            && window.gathered.is_none()
+            && window.segs() == 0;
+        if whole { self.pad } else { Pad::default() }
     }
 
     /// The fire bindings, for the plan-building arms' seam.
@@ -1105,7 +1191,7 @@ impl<'c> Run<'c> {
 
     /// The `StructKind` a plan op's output value declares — how the
     /// prefill-building arm tells fa2 from sm90: the trace wrote the choice
-    /// into `Plan::values`, the arm only follows it.
+    /// into `Trace::values`, the arm only follows it.
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {
             Ty::Struct(kind) => *kind,

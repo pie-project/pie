@@ -51,7 +51,7 @@ use crate::translate::ModelDrivers;
 ///
 /// **WORKER VOCABULARY NOW.** It was `driver_api::ModelComponent`, and the
 /// contract dropped it because it says WHICH GRAPH to load by enum, and that
-/// is now which `Plan` you hand over (`driver-api::load`'s header: "the
+/// is now which `Trace` you hand over (`driver-api::load`'s header: "the
 /// encoder is a traced plan like any other"). What it still means here is
 /// which of a deployment's two loads a worker is: a decode worker's full
 /// model, or an encode partner's encoder.

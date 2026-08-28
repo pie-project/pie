@@ -1,7 +1,7 @@
 //! The catalog, baked. Six model texts, four platforms, one `compile` each.
 //!
 //! WHY THE REAL CATALOG AND NOT A FIXTURE. Every unit test in `src/` builds
-//! its plan by hand out of `Def` and `Cond`, which means every one of them
+//! its plan by hand out of `Def` and `Guard`, which means every one of them
 //! checks this crate against this crate's own idea of what a plan looks like.
 //! What the catalog adds is the only thing a fixture cannot: plans written by
 //! somebody else, in the authoring surface, at the size and the shape the
@@ -34,7 +34,7 @@
 //! messages, where a failing run shows them and a passing run costs nothing.
 
 use model_compiler::{
-    Budgets, DeviceProfile, Lowering, Phase, Slot, collectives_are_never_elided, compile,
+    Budget, DeviceProfile, Lowering, Phase, Placement, collectives_are_never_elided, compile,
 };
 use model_dsl::Platform;
 use model_ir::ValueId;
@@ -61,15 +61,15 @@ const PLATFORMS: [Platform; 4] = [
 /// bank and qwen for declaring eight. So the fixture asks each plan for what
 /// it seats — which is what a worker does, and which keeps the bank-declaring
 /// SKUs baking AT their ceiling rather than under it.
-fn budgets_for(plan: &model_ir::Plan) -> Budgets {
-    let seats = plan
+fn budgets_for(trace: &model_ir::Trace) -> Budget {
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
         .map(|param| param.shape.first().copied().unwrap_or(0))
         .min()
         .unwrap_or(0);
-    Budgets {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -85,9 +85,9 @@ fn every_sku_bakes_on_every_platform() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            if let Err(refusal) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) {
-                refused.push(format!("`{sku}` as {platform:?}: {}", refusal.say(&plan)));
+            let trace = trace(platform);
+            if let Err(refusal) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) {
+                refused.push(format!("`{sku}` as {platform:?}: {}", refusal.say(&trace)));
             }
         }
     }
@@ -101,12 +101,12 @@ fn no_sku_carves_an_arena_that_shares_live_bytes() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue; // the test above is the one that says so.
             };
 
-            let clashes = baked.arena.clashes(&baked.concurrency);
+            let clashes = compiled.arena.clashes(&compiled.concurrency);
             if !clashes.is_empty() {
                 let named: Vec<String> = clashes
                     .iter()
@@ -121,14 +121,14 @@ fn no_sku_carves_an_arena_that_shares_live_bytes() {
                 ));
             }
 
-            let bytes = baked.arena.bytes;
+            let bytes = compiled.arena.bytes;
             if bytes == 0 {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the arena is empty, so the forward \
                      pass computed nothing",
                 ));
             }
-            let floor = baked.arena.live_bound();
+            let floor = compiled.arena.live_bound();
             if bytes < floor {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the arena is {bytes} bytes and the \
@@ -169,24 +169,24 @@ fn the_refined_clash_rule_agrees_with_the_v1_oracle_wherever_no_column_is_shared
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
-            let arena = &baked.arena;
+            let arena = &compiled.arena;
 
             // Every rectangle got a class mask, and it is the same table the
             // spans are indexed by.
-            if arena.live_in.len() != arena.slots.len() {
+            if arena.live_in.len() != arena.placements.len() {
                 wrong.push(format!(
-                    "`{sku}` as {platform:?}: {} class masks for {} slots",
+                    "`{sku}` as {platform:?}: {} class masks for {} placements",
                     arena.live_in.len(),
-                    arena.slots.len(),
+                    arena.placements.len(),
                 ));
             }
 
             let shared: Vec<(ValueId, ValueId)> = co_tenants(arena);
-            let blind = arena.clashes_blind(&baked.concurrency);
+            let blind = arena.clashes_blind(&compiled.concurrency);
             if shared.is_empty() && !blind.is_empty() {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the carve shares no column and the v1 \
@@ -197,7 +197,7 @@ fn the_refined_clash_rule_agrees_with_the_v1_oracle_wherever_no_column_is_shared
             }
             // And in every case the refined answer is a SUBSET of the older
             // one: a weakening, never a different question.
-            let refined = arena.clashes(&baked.concurrency);
+            let refined = arena.clashes(&compiled.concurrency);
             if refined.iter().any(|pair| !blind.contains(pair)) {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the refined guard reports a pair the \
@@ -227,9 +227,9 @@ fn the_refined_clash_rule_agrees_with_the_v1_oracle_wherever_no_column_is_shared
 /// are a few hundred rectangles, so it is cheaper than the compile that made
 /// them.
 fn co_tenants(arena: &model_compiler::ArenaMap) -> Vec<(ValueId, ValueId)> {
-    let rectangles: Vec<ValueId> = (0..arena.slots.len() as u32)
+    let rectangles: Vec<ValueId> = (0..arena.placements.len() as u32)
         .map(ValueId)
-        .filter(|v| matches!(arena.slots[v.0 as usize], Slot::Arena { .. }))
+        .filter(|v| matches!(arena.placements[v.0 as usize], Placement::Arena { .. }))
         .collect();
     let mut found = Vec::new();
     for (i, a) in rectangles.iter().enumerate() {
@@ -258,24 +258,24 @@ fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
-            let total: u64 = baked
+            let total: u64 = compiled
                 .arena
-                .slots
+                .placements
                 .iter()
-                .map(model_compiler::Slot::bytes)
+                .map(model_compiler::Placement::bytes)
                 .sum();
-            let bytes = baked.arena.bytes;
+            let bytes = compiled.arena.bytes;
             if bytes * 2 > total {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the arena is {bytes} bytes against a \
                      {total}-byte sum — the liveness walk shared almost nothing",
                 ));
             }
-            let floor = baked.arena.live_bound();
+            let floor = compiled.arena.live_bound();
             if bytes > floor {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the arena is {bytes} bytes and the \
@@ -313,14 +313,14 @@ fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
             // Exactly once: a node counted twice is a rectangle written twice,
             // and a node counted never is a launch nothing emits.
-            let mut times = vec![0u32; plan.nodes.len()];
-            for region in &baked.regions {
+            let mut times = vec![0u32; trace.nodes.len()];
+            for region in &compiled.regions {
                 for node in region.nodes.clone() {
                     if let Some(slot) = times.get_mut(node as usize) {
                         *slot += 1;
@@ -328,11 +328,11 @@ fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
                 }
             }
             let covered = times.iter().filter(|&&n| n == 1).count();
-            if covered != plan.nodes.len() {
+            if covered != trace.nodes.len() {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the regions cover {covered} of {} nodes \
                      exactly once — {} twice or more, {} not at all",
-                    plan.nodes.len(),
+                    trace.nodes.len(),
                     times.iter().filter(|&&n| n > 1).count(),
                     times.iter().filter(|&&n| n == 0).count(),
                 ));
@@ -340,7 +340,7 @@ fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
             // Prepare first, whole, and each half ascending inside itself.
             let mut captured = false;
             let mut at = [0u32; 2];
-            for (r, region) in baked.regions.iter().enumerate() {
+            for (r, region) in compiled.regions.iter().enumerate() {
                 let half = usize::from(region.phase == Phase::Capture);
                 if region.phase == Phase::Capture {
                     captured = true;
@@ -361,12 +361,12 @@ fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
             }
             // Coalescing has to actually coalesce: a plan whose every node is
             // its own region is a pass that ran and did nothing.
-            if !plan.nodes.is_empty() && baked.regions.len() == plan.nodes.len() {
+            if !trace.nodes.is_empty() && compiled.regions.len() == trace.nodes.len() {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: {} regions for {} nodes — nothing \
                      coalesced",
-                    baked.regions.len(),
-                    plan.nodes.len(),
+                    compiled.regions.len(),
+                    trace.nodes.len(),
                 ));
             }
         }
@@ -391,17 +391,17 @@ fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
-            if !collectives_are_never_elided(&baked) {
+            if !collectives_are_never_elided(&compiled) {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: a region carrying a collective is not \
                      always-launch",
                 ));
             }
-            let conditional = baked
+            let conditional = compiled
                 .regions
                 .iter()
                 .filter(|r| r.lowering != Lowering::AlwaysLaunch)
@@ -419,7 +419,7 @@ fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
             // lowering: host work and collectives stay where the walk puts
             // them. Which regions fork, and that their writes are disjoint, is
             // `tests/no_concurrent_pair_shares_a_write.rs`.
-            for (at, region) in baked.regions.iter().enumerate() {
+            for (at, region) in compiled.regions.iter().enumerate() {
                 if region.stream == 0 {
                     continue;
                 }
@@ -462,8 +462,8 @@ fn every_correction_region_gets_a_window_of_one_run() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue; // `every_sku_bakes_on_every_platform` is what says so.
             };
             // Where each class stands in the order P4 chose, with every class
@@ -472,18 +472,18 @@ fn every_correction_region_gets_a_window_of_one_run() {
             // sub-order of an ordering that makes a set consecutive still
             // makes it consecutive).
             let mut every = model_ir::ClassSet::default();
-            for class in 0..baked.classes.classes.len() {
+            for class in 0..compiled.classes.classes.len() {
                 every.insert(class);
             }
-            let order = baked.order.class_order(&every, None);
+            let order = compiled.order.class_order(&every, None);
             let mut at = vec![0usize; order.len()];
             for (position, &class) in order.iter().enumerate() {
                 at[class as usize] = position;
             }
-            for (index, region) in baked.template().iter().enumerate() {
+            for (index, region) in compiled.template().iter().enumerate() {
                 let corrects = region.nodes.clone().any(|node| {
                     matches!(
-                        plan.nodes.get(node as usize).map(|n| &n.op),
+                        trace.nodes.get(node as usize).map(|n| &n.op),
                         Some(Operation::Linear(Linear::LoraCorrect { .. }))
                     )
                 });

@@ -3,22 +3,24 @@
 //! that does not happen, named at the door, rather than a graph that is
 //! quietly missing a kernel and produces numbers anyway.
 
-use std::fmt::{self, Display, Formatter};
-
-use model_ir::{ClassFault, Plan, ValueId};
+use model_ir::{ClassFault, Trace, ValueId};
 
 /// The reason `compile` would not bake this plan.
 ///
 /// EVERY VARIANT NAMES A PLACE. A refusal a reader cannot act on is a crash
 /// with better manners, so each one carries the value or the number that
-/// caused it; [`say`](Refusal::say) spells the class faults' fact words at the
+/// caused it; [`say`](Error::say) spells the class faults' fact words at the
 /// plan's own width, which is the half a `Display` without the plan cannot do.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Refusal {
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum Error {
     /// More facts than the class sweep is a sweep over. `resolve_classes`
     /// asserts this ceiling; the compiler is a front door and answers it as a
     /// refusal instead, because a panic in a load path takes the process with
     /// it.
+    #[error(
+        "the plan guards on {facts} fact bits; the class sweep is 2^F \
+         and stops being a sweep past 20"
+    )]
     TooManyFacts {
         /// How many fact bits the plan's guards reach. The ceiling is 20.
         facts: usize,
@@ -26,6 +28,7 @@ pub enum Refusal {
     /// A budget that cannot describe a fire: no lanes, no tokens, fewer rows
     /// than lanes (a lane carries at least one row), or a bucket lattice that
     /// does not ascend or reaches past the ceiling.
+    #[error("the budgets {what}")]
     Budget {
         /// The field, and what is wrong with it.
         what: &'static str,
@@ -34,14 +37,15 @@ pub enum Refusal {
     ///
     /// **CAPACITY IS A SHAPE, AND A BUDGET IS NOT AN ADMISSION CAP**
     /// (design §8, decision 17). The bank's first axis is how many adapters
-    /// the plan reserved room for, `Budgets::max_adapters` is how many the
+    /// the plan reserved room for, `Budget::max_adapters` is how many the
     /// deployment intends to register, and the two have to agree at the LOAD:
     /// discovering the disagreement at the two-hundredth registration would
     /// make the capacity exactly the admission cap decision 17 refuses to
     /// build. Both numbers are in the refusal so a reader knows which one to
     /// change.
+    #[error("{}", adapter_capacity(*.asked, *.seated))]
     AdapterCapacity {
-        /// What `Budgets::max_adapters` asked for.
+        /// What `Budget::max_adapters` asked for.
         asked: u32,
         /// The smallest capacity any bank of this plan declares — an id must
         /// fit every site it will be written into. `0` when the plan declares
@@ -49,6 +53,7 @@ pub enum Refusal {
         seated: u64,
     },
     /// A device profile that describes no device.
+    #[error("the device profile {what}")]
     Profile {
         /// The field, and what is wrong with it.
         what: &'static str,
@@ -57,8 +62,10 @@ pub enum Refusal {
     /// writes, or two arms writing one row range. ALL of them, because a
     /// coverage hole is usually one authoring mistake seen from several
     /// classes at once.
+    #[error("{}", class_faults(.0))]
     Classes(Vec<ClassFault>),
     /// A value the arena cannot cut a rectangle out of.
+    #[error("v{} has no arena rectangle: {}", .value.0, unrectangled(.why))]
     Unrectangled {
         /// The value whose declared type could not be sized.
         value: ValueId,
@@ -73,6 +80,13 @@ pub enum Refusal {
     /// this first (`Fault::MergeArmTy` — an arm's type must BE the merge's);
     /// this is the front door's own reading, on a plan that may not have been
     /// through the validator.
+    #[error(
+        "v{} must share v{}'s column — {} — and the two are \
+         declared at different sizes",
+        .shares.0,
+        .holds.0,
+        rule(.kind)
+    )]
     Mismatch {
         /// Which sharing rule was being applied.
         kind: Share,
@@ -102,6 +116,14 @@ pub enum Refusal {
     /// reader. Equality rather than containment, deliberately — a schedule
     /// built over FEWER classes than its reader is the same failure from the
     /// other side.
+    #[error(
+        "v{} is an attention schedule carved over classes {planned:?} and read \
+         by node {node}, which runs in classes {consumed:?}. A schedule is a \
+         carving, not a table that slices: the reader hands it boundaries \
+         rebased to ITS window and the work items index past their end. The \
+         model text mints a second plan value for the second reader",
+        .value.0
+    )]
     Straddled {
         /// The schedule value.
         value: ValueId,
@@ -136,6 +158,14 @@ pub enum Refusal {
     /// before it was written. The model text's answer is to compute the number
     /// the plan build wants on the host, as a runtime input, rather than in
     /// the graph.
+    #[error(
+        "prepare node {node} reads v{}, which capture node {produced_by} computes. \
+         A prepare op is host work that a captured graph cannot contain, so P5 \
+         hoists the whole prepare half in front of the capture half — and there \
+         is no instant that is both after an activation and before the graph. \
+         The model text computes that number as a runtime input instead",
+        .value.0
+    )]
     HoistBlocked {
         /// The prepare node — the `Ty::Struct` definer.
         node: u32,
@@ -146,7 +176,7 @@ pub enum Refusal {
     },
 }
 
-/// Which of the IR's two column-sharing rules a [`Refusal::Mismatch`] is
+/// Which of the IR's two column-sharing rules a [`Error::Mismatch`] is
 /// about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Share {
@@ -173,7 +203,7 @@ pub enum Unrectangled {
     PackedElement,
 }
 
-impl Refusal {
+impl Error {
     /// The refusal as a sentence, with class faults' fact words spelled at the
     /// plan's own width.
     ///
@@ -182,11 +212,11 @@ impl Refusal {
     /// which of the plan's other bits are off, so the plan comes back in here.
     /// Every other variant says the same thing `Display` does.
     #[must_use]
-    pub fn say(&self, plan: &Plan) -> String {
+    pub fn say(&self, trace: &Trace) -> String {
         match self {
-            Refusal::Classes(faults) => faults
+            Error::Classes(faults) => faults
                 .iter()
-                .map(|fault| fault.say(plan))
+                .map(|fault| fault.say(trace))
                 .collect::<Vec<_>>()
                 .join("\n"),
             other => other.to_string(),
@@ -194,99 +224,53 @@ impl Refusal {
     }
 }
 
-impl Display for Refusal {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Refusal::TooManyFacts { facts } => write!(
-                f,
-                "the plan guards on {facts} fact bits; the class sweep is 2^F \
-                 and stops being a sweep past 20",
-            ),
-            Refusal::Budget { what } => write!(f, "the budgets {what}"),
-            Refusal::Profile { what } => write!(f, "the device profile {what}"),
-            Refusal::AdapterCapacity { asked, seated } => {
-                if *seated == 0 {
-                    write!(
-                        f,
-                        "the budgets ask to register {asked} adapters and this plan \
-                         declares no bank at all: a bank is a weight the model text \
-                         marked `registered`, and capacity is its leading axis"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "the budgets ask to register {asked} adapters and the narrowest \
-                         bank of this plan seats {seated}; capacity is a shape the \
-                         model text declares, so one of the two numbers has to move \
-                         before the load and not at a registration"
-                    )
-                }
-            }
-            Refusal::Classes(faults) => {
-                write!(f, "{} merges do not resolve:", faults.len())?;
-                for fault in faults {
-                    write!(f, "\n  {fault}")?;
-                }
-                Ok(())
-            }
-            Refusal::Unrectangled { value, why } => {
-                let why = match why {
-                    Unrectangled::SymbolicWidth => {
-                        "its shape is symbolic past the leading dim, and the \
-                         row algebra is one symbol wide"
-                    }
-                    Unrectangled::PackedElement => {
-                        "its element is a packed storage plane with no \
-                         per-element byte size"
-                    }
-                };
-                write!(f, "v{} has no arena rectangle: {why}", value.0)
-            }
-            Refusal::Mismatch {
-                kind,
-                holds,
-                shares,
-            } => {
-                let rule = match kind {
-                    Share::InPlace => "the op writes through it in place",
-                    Share::MergeArm => "it is an arm of that merge",
-                };
-                write!(
-                    f,
-                    "v{} must share v{}'s column — {rule} — and the two are \
-                     declared at different sizes",
-                    shares.0, holds.0,
-                )
-            }
-            Refusal::Straddled {
-                value,
-                node,
-                planned,
-                consumed,
-            } => write!(
-                f,
-                "v{} is an attention schedule carved over classes {planned:?} and read \
-                 by node {node}, which runs in classes {consumed:?}. A schedule is a \
-                 carving, not a table that slices: the reader hands it boundaries \
-                 rebased to ITS window and the work items index past their end. The \
-                 model text mints a second plan value for the second reader",
-                value.0,
-            ),
-            Refusal::HoistBlocked {
-                node,
-                value,
-                produced_by,
-            } => write!(
-                f,
-                "prepare node {node} reads v{}, which capture node {produced_by} computes. \
-                 A prepare op is host work that a captured graph cannot contain, so P5 \
-                 hoists the whole prepare half in front of the capture half — and there \
-                 is no instant that is both after an activation and before the graph. \
-                 The model text computes that number as a runtime input instead",
-                value.0,
-            ),
+/// [`Error::AdapterCapacity`]'s sentence — two of them, because `seated == 0`
+/// is a different authoring mistake (no bank at all) than a bank that is too
+/// narrow, and one format string cannot branch.
+fn adapter_capacity(asked: u32, seated: u64) -> String {
+    if seated == 0 {
+        format!(
+            "the budgets ask to register {asked} adapters and this plan \
+             declares no bank at all: a bank is a weight the model text \
+             marked `registered`, and capacity is its leading axis"
+        )
+    } else {
+        format!(
+            "the budgets ask to register {asked} adapters and the narrowest \
+             bank of this plan seats {seated}; capacity is a shape the \
+             model text declares, so one of the two numbers has to move \
+             before the load and not at a registration"
+        )
+    }
+}
+
+/// [`Error::Classes`]'s sentence: the count, then every fault on its own line.
+fn class_faults(faults: &[ClassFault]) -> String {
+    let mut text = format!("{} merges do not resolve:", faults.len());
+    for fault in faults {
+        text.push_str(&format!("\n  {fault}"));
+    }
+    text
+}
+
+/// [`Error::Unrectangled`]'s reason clause.
+fn unrectangled(why: &Unrectangled) -> &'static str {
+    match why {
+        Unrectangled::SymbolicWidth => {
+            "its shape is symbolic past the leading dim, and the \
+             row algebra is one symbol wide"
+        }
+        Unrectangled::PackedElement => {
+            "its element is a packed storage plane with no \
+             per-element byte size"
         }
     }
 }
 
-impl std::error::Error for Refusal {}
+/// [`Error::Mismatch`]'s sharing-rule clause.
+fn rule(kind: &Share) -> &'static str {
+    match kind {
+        Share::InPlace => "the op writes through it in place",
+        Share::MergeArm => "it is an arm of that merge",
+    }
+}

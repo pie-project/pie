@@ -45,7 +45,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use driver_cuda::{Boot, Lane, Shell};
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 /// The catalog row this smoke serves, spelled as the catalog spells it.
@@ -218,9 +218,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         .expect("the checkpoint's tokenizer loads");
 
     // The engine's half: trace the row, state the load contract. Neither is
-    // the shell's — `Plan` crosses the boundary, `Baked` never does.
+    // the shell's — `Trace` crosses the boundary, `CompiledModel` never does.
     let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
-    let plan = trace(Platform::Cuda);
+    let trace = trace(Platform::Cuda);
     // A stock safetensors snapshot, projected into the one object model the
     // contract algebra speaks. `Source::open` would refuse it — that door is
     // for a canonical `.zt`.
@@ -236,13 +236,13 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
 
     let booted = Instant::now();
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
         // Small on purpose: the arena reserves `max_tokens` rows of a
         // 248320-wide logit column, and this test needs a prompt, not a
         // batch.
-        budgets: Budgets::new(4, 256),
+        budget: Budget::new(4, 256),
         profile: None,
         page_size: 16,
         context: 512,

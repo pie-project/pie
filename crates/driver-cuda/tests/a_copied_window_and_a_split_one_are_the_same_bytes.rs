@@ -53,7 +53,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use driver_cuda::{Boot, Graphs, LayerScores, Seated, Shell};
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -67,7 +67,7 @@ const PLAIN: &str = "Water boils at";
 
 /// The ceilings, named because this file bakes the same plan a second time to
 /// check its own premise and two budgets would be two artifacts.
-const BUDGETS: Budgets = Budgets {
+const BUDGETS: Budget = Budget {
     max_lanes: 4,
     max_tokens: 256,
     buckets: Vec::new(),
@@ -77,7 +77,7 @@ const BUDGETS: Budgets = Budgets {
 /// The wider ceilings gate (e) needs: five lanes, and an adapter seat, which
 /// is what makes the classes `{6,7}` reachable and therefore what makes the
 /// withdrawn window break into all THREE of the runs P4 counted.
-const WIDE: Budgets = Budgets {
+const WIDE: Budget = Budget {
     max_lanes: 8,
     max_tokens: 256,
     buckets: Vec::new(),
@@ -187,14 +187,14 @@ fn same_mass(left: &[Vec<LayerScores>], right: &[Vec<LayerScores>], what: &str) 
 /// crossover that put this bucket on the split side, would leave every
 /// assertion below comparing a fire against itself and passing.
 ///
-/// So the artifact is asked directly. Baked at the same budgets from the same
+/// So the artifact is asked directly. CompiledModel at the same budgets from the same
 /// catalog text: some region's window must come back in pieces under this
 /// composition, and P4's table must answer `Copy` for it at this fire's
 /// bucket. NO DEVICE — it is a statement about the bake.
 #[test]
 fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-    let baked = compile(&plan, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
 
     // The three lanes of `fire_it`, as words: a capturing decode, a capturing
     // prefill and a plain prefill.
@@ -203,19 +203,19 @@ fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
         driver::fire::Lane::new(word(5, true), 5),
         driver::fire::Lane::new(word(4, false), 4),
     ];
-    let fire = driver::fire::compose(&baked, &BUDGETS, &lanes).expect("the fire composes");
+    let fire = driver::fire::compose(&compiled, &BUDGETS, &lanes).expect("the fire composes");
     // An empty lattice is one implicit bucket, at index 0 — which is what the
     // shell computes too, and the number the table is read at.
     let bucket = 0u32;
 
     let mut fragmented = 0usize;
     let mut copied = 0usize;
-    for region in baked.template() {
+    for region in compiled.template() {
         if fire.classes().spans(&region.mask).len() < 2 {
             continue;
         }
         fragmented += 1;
-        if driver::fire::fallback::copies(&baked, &region.mask, bucket) {
+        if driver::fire::fallback::copies(&compiled, &region.mask, bucket) {
             copied += 1;
         }
     }
@@ -286,7 +286,7 @@ fn the_same_fragmented_fire_split_and_copied_is_the_same_bytes_in_fewer_launches
         split_cost.launches,
     );
     // AND THE SAVING IS EXACTLY THE ONE THE ARTIFACT PREDICTS: every copied
-    // region falls from its run count to one, and nothing else moves. Baked
+    // region falls from its run count to one, and nothing else moves. CompiledModel
     // again from the same text at the same budgets, so the number comes from
     // P4 rather than from the shell agreeing with itself.
     let (fragmented, extra) = predicted();
@@ -327,17 +327,17 @@ fn the_same_fragmented_fire_split_and_copied_is_the_same_bytes_in_fewer_launches
 /// split pays for them beyond one apiece)` — read off a fresh bake of the same
 /// text at the same budgets, which is where the number belongs.
 fn predicted() -> (u32, u32) {
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-    let baked = compile(&plan, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
     let lanes = [
         driver::fire::Lane::new(word(1, true), 1),
         driver::fire::Lane::new(word(5, true), 5),
         driver::fire::Lane::new(word(4, false), 4),
     ];
-    let fire = driver::fire::compose(&baked, &BUDGETS, &lanes).expect("the fire composes");
+    let fire = driver::fire::compose(&compiled, &BUDGETS, &lanes).expect("the fire composes");
     let mut fragmented = 0u32;
     let mut extra = 0u32;
-    for region in baked.template() {
+    for region in compiled.template() {
         let runs = fire.classes().spans(&region.mask).len() as u32;
         if runs > 1 {
             fragmented += 1;
@@ -487,8 +487,8 @@ fn wide_word(query_len: u32, captures: bool, adapter: bool) -> u64 {
 /// `(fragmented windows, launches a split pays beyond one apiece)` for the
 /// five-lane composition, off a fresh bake.
 fn predicted_wide() -> (u32, u32) {
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-    let baked = compile(&plan, &WIDE, &DeviceProfile::default()).expect("the SKU bakes");
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let compiled = compile(&trace, &WIDE, &DeviceProfile::default()).expect("the SKU bakes");
     let lanes = [
         driver::fire::Lane::new(wide_word(5, true, false), 5),
         driver::fire::Lane::new(wide_word(3, false, false), 3),
@@ -496,10 +496,10 @@ fn predicted_wide() -> (u32, u32) {
         driver::fire::Lane::new(wide_word(1, false, false), 1),
         driver::fire::Lane::new(wide_word(1, true, false), 1),
     ];
-    let fire = driver::fire::compose(&baked, &WIDE, &lanes).expect("the five lanes compose");
+    let fire = driver::fire::compose(&compiled, &WIDE, &lanes).expect("the five lanes compose");
     let mut fragmented = 0u32;
     let mut extra = 0u32;
-    for region in baked.template() {
+    for region in compiled.template() {
         let runs = fire.classes().spans(&region.mask).len() as u32;
         if runs > 1 {
             fragmented += 1;
@@ -733,7 +733,7 @@ fn ready_wide(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     load(what, WIDE, 8)
 }
 
-fn load(what: &str, budgets: Budgets, slots: u32) -> Option<(Shell, tokenizer::Tokenizer)> {
+fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tokenizer)> {
     if !driver_cuda::device::present() {
         eprintln!("skipping {what}: no CUDA device on this machine");
         return None;
@@ -751,7 +751,7 @@ fn load(what: &str, budgets: Budgets, slots: u32) -> Option<(Shell, tokenizer::T
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
@@ -770,10 +770,10 @@ fn load(what: &str, budgets: Budgets, slots: u32) -> Option<(Shell, tokenizer::T
         std::env::set_var("PIE_CUDA_GROUPED", "off");
     }
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets,
+        budget,
         profile: None,
         page_size: 16,
         context: 512,

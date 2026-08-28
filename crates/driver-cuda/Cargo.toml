@@ -31,7 +31,7 @@ kernels-cuda = { path = "../kernels-cuda" }
 # (palo design §6). The shell supplies the two traits and calls the walk; it
 # never re-implements one.
 driver = { path = "../driver" }
-# `Baked` — the artifact this shell records and replays: the region template,
+# `CompiledModel` — the artifact this shell records and replays: the region template,
 # the class table a descriptor's counts index, and the arena's static offsets.
 model-compiler = { path = "../model-compiler" }
 # The residency half: `ModelContract` (the caller's, per decision #18 — the

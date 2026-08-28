@@ -76,6 +76,23 @@ pub fn envelopes_resolved() -> u64 {
     driver_cuda::Shell::envelopes_resolved()
 }
 
+/// The CUDA fold's motion counters —
+/// `(folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins)` —
+/// re-exported on `envelopes_resolved`'s argument exactly: the shell is a
+/// private link of this crate, the instance lives behind `Box<dyn Driver>`
+/// on a scheduler lane thread, and what an engine-level fold gate diffs is
+/// this process-global mirror before and after a serving loop. `prebinds`
+/// moving is the one observable that the engine's own next-fire hint
+/// (`Driver::expect_fire`, stated from `scheduler::worker::fire_frame`)
+/// reached the shell — nothing else in the engine can say so, because a
+/// hint that lands leaves no trace in any completion. The two micros
+/// columns split the same binding work into its on-critical-path and
+/// hidden halves, which is the number the `PIE_CUDA_PIPELINE` A/B moves.
+#[must_use]
+pub fn fold_observed() -> (u64, u64, u64, u64, u64, u64, u64) {
+    driver_cuda::Shell::fold_observed()
+}
+
 /// Which device `[model] device` names.
 ///
 /// `"cuda:1"`, `"1"` and an absent key all mean something, and the third

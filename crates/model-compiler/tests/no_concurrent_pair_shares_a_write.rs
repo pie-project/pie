@@ -36,9 +36,9 @@
 //! assertion above, because nothing shares anything when nothing is
 //! concurrent.
 
-use model_compiler::{ArenaMap, Budgets, DeviceProfile, Phase, Region, Slot, compile};
+use model_compiler::{ArenaMap, Budget, DeviceProfile, Phase, Region, Placement, compile};
 use model_dsl::Platform;
-use model_ir::{Operands, Plan, ValueId};
+use model_ir::{Operands, Trace, ValueId};
 
 /// Every platform a plan can be traced at — a model text may emit a different op
 /// per platform, so the DAG is not the same DAG on each.
@@ -49,15 +49,15 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn budgets_for(plan: &Plan) -> Budgets {
-    let seats = plan
+fn budgets_for(trace: &Trace) -> Budget {
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
         .map(|param| param.shape.first().copied().unwrap_or(0))
         .min()
         .unwrap_or(0);
-    Budgets {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -73,15 +73,15 @@ fn no_concurrent_pair_shares_a_written_value() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue; // `every_sku_carves_an_arena` is what says so.
             };
-            for &(a, b) in &baked.forks.pairs {
-                let (ra, rb) = (&baked.regions[a as usize], &baked.regions[b as usize]);
-                let shared: Vec<ValueId> = writes(&plan, ra)
+            for &(a, b) in &compiled.streams.pairs {
+                let (ra, rb) = (&compiled.regions[a as usize], &compiled.regions[b as usize]);
+                let shared: Vec<ValueId> = writes(&trace, ra)
                     .into_iter()
-                    .filter(|value| writes(&plan, rb).contains(value))
+                    .filter(|value| writes(&trace, rb).contains(value))
                     .collect();
                 if !shared.is_empty() {
                     wrong.push(format!(
@@ -126,14 +126,14 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets_for(&plan), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
                 continue;
             };
 
             // The global statement first: the arena's own invariant, asked
             // with P6's wider notion of "live at one instant".
-            let clashes = baked.arena.clashes(&baked.concurrency);
+            let clashes = compiled.arena.clashes(&compiled.concurrency);
             if !clashes.is_empty() {
                 let named: Vec<String> = clashes
                     .iter()
@@ -151,11 +151,11 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
             // Then the per-pair one, which is the sharper question: not "may
             // these two values be live together" but "do these two REGIONS
             // write into one another's rectangles".
-            for &(a, b) in &baked.forks.pairs {
-                let (ra, rb) = (&baked.regions[a as usize], &baked.regions[b as usize]);
-                for x in writes(&plan, ra) {
-                    for y in writes(&plan, rb) {
-                        if !overlaps(&baked.arena, x, y) {
+            for &(a, b) in &compiled.streams.pairs {
+                let (ra, rb) = (&compiled.regions[a as usize], &compiled.regions[b as usize]);
+                for x in writes(&trace, ra) {
+                    for y in writes(&trace, rb) {
+                        if !overlaps(&compiled.arena, x, y) {
                             continue;
                         }
                         // THE ONE LEGAL SHARING, AND IT IS THE POINT OF THE
@@ -170,8 +170,8 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
                         // may never share one), and the two regions' masks are
                         // disjoint (so `Run::cut` sends each write to rows the
                         // other never touches).
-                        if root(&baked.arena, x) == root(&baked.arena, y)
-                            && cut_per_class(&baked.arena, x)
+                        if root(&compiled.arena, x) == root(&compiled.arena, y)
+                            && cut_per_class(&compiled.arena, x)
                             && !ra.mask.iter().any(|class| rb.mask.contains(class))
                         {
                             continue;
@@ -181,9 +181,9 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
                              each other and write overlapping bytes — v{} at {:?} \
                              against v{} at {:?}",
                             x.0,
-                            baked.arena.slots[x.0 as usize],
+                            compiled.arena.placements[x.0 as usize],
                             y.0,
-                            baked.arena.slots[y.0 as usize],
+                            compiled.arena.placements[y.0 as usize],
                         ));
                     }
                 }
@@ -217,31 +217,31 @@ fn the_catalog_forks_where_it_declares_disjoint_windows() {
     let mut table: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let baked =
-            compile(&plan, &budgets_for(&plan), &DeviceProfile::default()).expect("bakes");
-        let forked = baked.regions.iter().filter(|r| r.stream != 0).count();
+        let trace = trace(Platform::Cuda);
+        let compiled =
+            compile(&trace, &budgets_for(&trace), &DeviceProfile::default()).expect("bakes");
+        let forked = compiled.regions.iter().filter(|r| r.stream != 0).count();
         table.push(format!(
             "  {sku}: {} streams, {} events, {forked} forked of {} regions",
-            baked.forks.streams,
-            baked.forks.events,
-            baked.regions.len(),
+            compiled.streams.streams,
+            compiled.streams.events,
+            compiled.regions.len(),
         ));
 
         // A fork and a join are the same fact counted twice: an artifact that
         // opened a stream and minted no event would be a side stream nothing
         // ever waited for, and one that minted an event and opened no stream
         // would be a synchronization with itself.
-        if (baked.forks.streams > 1) != (baked.forks.events > 0)
-            || (baked.forks.streams > 1) != (forked > 0)
-            || (baked.forks.streams > 1) != !baked.forks.pairs.is_empty()
+        if (compiled.streams.streams > 1) != (compiled.streams.events > 0)
+            || (compiled.streams.streams > 1) != (forked > 0)
+            || (compiled.streams.streams > 1) != !compiled.streams.pairs.is_empty()
         {
             wrong.push(format!(
                 "`{sku}`: {} streams, {} events, {forked} forked, {} pairs — a fork \
                  without a join, or the reverse",
-                baked.forks.streams,
-                baked.forks.events,
-                baked.forks.pairs.len(),
+                compiled.streams.streams,
+                compiled.streams.events,
+                compiled.streams.pairs.len(),
             ));
         }
 
@@ -251,14 +251,14 @@ fn the_catalog_forks_where_it_declares_disjoint_windows() {
         // one count worth stating exactly. It is a FLOOR, not an equality: a
         // family that later declares a fourth arm should reach four, and
         // another family reaching three is not gemma's business.
-        if sku.starts_with("gemma4-") && baked.forks.streams < 3 {
+        if sku.starts_with("gemma4-") && compiled.streams.streams < 3 {
             wrong.push(format!(
                 "`{sku}` asked for {} streams: gemma declares three attention arms \
                  over disjoint classes and they should reach three",
-                baked.forks.streams,
+                compiled.streams.streams,
             ));
         }
-        if FORKS.iter().any(|family| sku.starts_with(family)) && baked.forks.streams == 1 {
+        if FORKS.iter().any(|family| sku.starts_with(family)) && compiled.streams.streams == 1 {
             wrong.push(format!(
                 "`{sku}` found no fork group, and its model text splits attention \
                  into arms over disjoint classes",
@@ -288,11 +288,11 @@ fn the_off_arm_bakes_what_the_pass_never_ran_and_costs_no_bytes() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let budgets = budgets_for(&plan);
+            let trace = trace(platform);
+            let budget = budgets_for(&trace);
             let (Ok(on), Ok(quiet)) = (
-                compile(&plan, &budgets, &DeviceProfile::default()),
-                compile(&plan, &budgets, &off),
+                compile(&trace, &budget, &DeviceProfile::default()),
+                compile(&trace, &budget, &off),
             ) else {
                 continue;
             };
@@ -303,7 +303,7 @@ fn the_off_arm_bakes_what_the_pass_never_ran_and_costs_no_bytes() {
                     "`{sku}` as {platform:?}: the off arm forked anyway"
                 ));
             }
-            if !quiet.concurrency.pairs().is_empty() || quiet.forks.events != 0 {
+            if !quiet.concurrency.pairs().is_empty() || quiet.streams.events != 0 {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: the off arm carries a concurrency relation",
                 ));
@@ -329,11 +329,11 @@ fn the_off_arm_bakes_what_the_pass_never_ran_and_costs_no_bytes() {
 }
 
 /// Every value a region's nodes write.
-fn writes(plan: &Plan, region: &Region) -> Vec<ValueId> {
+fn writes(trace: &Trace, region: &Region) -> Vec<ValueId> {
     let mut all = Vec::new();
     let mut scratch = Vec::new();
     for node in region.nodes.clone() {
-        let Some(node) = plan.nodes.get(node as usize) else {
+        let Some(node) = trace.nodes.get(node as usize) else {
             continue;
         };
         scratch.clear();
@@ -345,12 +345,12 @@ fn writes(plan: &Plan, region: &Region) -> Vec<ValueId> {
     all
 }
 
-/// The rectangle a value ends up in, following `Slot::Alias` to its root.
+/// The rectangle a value ends up in, following `Placement::Alias` to its root.
 fn root(arena: &ArenaMap, value: ValueId) -> ValueId {
     let mut at = value;
-    for _ in 0..arena.slots.len() {
-        match arena.slots.get(at.0 as usize) {
-            Some(Slot::Alias(to)) => at = *to,
+    for _ in 0..arena.placements.len() {
+        match arena.placements.get(at.0 as usize) {
+            Some(Placement::Alias(to)) => at = *to,
             _ => return at,
         }
     }
@@ -366,8 +366,8 @@ fn overlaps(arena: &ArenaMap, a: ValueId, b: ValueId) -> bool {
 }
 
 fn rect(arena: &ArenaMap, value: ValueId) -> Option<(u64, u64)> {
-    match arena.slots.get(root(arena, value).0 as usize) {
-        Some(Slot::Arena { offset, bytes, .. }) => Some((*offset, *bytes)),
+    match arena.placements.get(root(arena, value).0 as usize) {
+        Some(Placement::Arena { offset, bytes, .. }) => Some((*offset, *bytes)),
         _ => None,
     }
 }
@@ -381,7 +381,7 @@ fn rect(arena: &ArenaMap, value: ValueId) -> Option<(u64, u64)> {
 /// of it.
 fn cut_per_class(arena: &ArenaMap, value: ValueId) -> bool {
     matches!(
-        arena.slots.get(root(arena, value).0 as usize),
-        Some(Slot::Arena { rows, .. }) if rows.cut_per_class(),
+        arena.placements.get(root(arena, value).0 as usize),
+        Some(Placement::Arena { rows, .. }) if rows.cut_per_class(),
     )
 }

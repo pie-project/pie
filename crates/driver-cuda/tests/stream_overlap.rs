@@ -59,7 +59,7 @@ struct Block {
     edges: usize,
     /// What P6 baked for this arm: `(streams, events, forked regions, side
     /// streams opened)`.
-    forks: (u32, u32, usize, usize),
+    streams: (u32, u32, usize, usize),
     /// How many token rows each of the two non-decode windows carried.
     rows: u32,
 }
@@ -106,7 +106,7 @@ fn the_three_class_fire_says_the_same_thing_with_the_streams_on_and_here_is_the_
                 block.replays,
                 block.nodes,
                 block.edges,
-                block.forks,
+                block.streams,
             );
         }
     }
@@ -157,16 +157,16 @@ fn the_three_class_fire_says_the_same_thing_with_the_streams_on_and_here_is_the_
     // **AND THE TWO ARMS ARE TWO ARTIFACTS**, asserted rather than printed:
     // a measurement whose arms baked the same graph is a measurement of noise.
     assert_eq!(
-        off[0].forks,
+        off[0].streams,
         (1, 0, 0, 0),
         "the off arm forked, so it is not an off arm",
     );
-    let (streams, events, forked, open) = on[0].forks;
+    let (streams, events, forked, open) = on[0].streams;
     assert!(
         streams == 3 && events > 0 && forked > 0 && open == 2,
         "the on arm baked {:?} — gemma's three attention arms should reach three \
          streams and this shell should have opened two beside the main one",
-        on[0].forks,
+        on[0].streams,
     );
     // The launches are the same launches — the fork moved none of them — and
     // the TOPOLOGY is what changed. A chain of `n` nodes has `n - 1` edges;
@@ -223,7 +223,7 @@ fn a_qwen_decode_beside_a_prefill_says_the_same_thing_with_the_streams_on() {
                 block.replays,
                 block.nodes,
                 block.edges,
-                block.forks,
+                block.streams,
             );
         }
     }
@@ -249,13 +249,13 @@ fn a_qwen_decode_beside_a_prefill_says_the_same_thing_with_the_streams_on() {
             );
         }
     }
-    assert_eq!(off[0].forks, (1, 0, 0, 0));
-    let (streams, events, forked, open) = on[0].forks;
+    assert_eq!(off[0].streams, (1, 0, 0, 0));
+    let (streams, events, forked, open) = on[0].streams;
     assert!(
         streams > 1 && events > 0 && forked > 0 && open + 1 == streams as usize,
         "the on arm baked {:?} — qwen's full-attention arms are what the slab \
-         rule leaves it, and the shell opens one stream per baked one",
-        on[0].forks,
+         rule leaves it, and the shell opens one stream per compiled one",
+        on[0].streams,
     );
     assert!(
         on[0].edges > off[0].edges,
@@ -274,7 +274,7 @@ mod gemma {
 
     use driver::driver_api::fire::Mask;
     use driver_cuda::{Boot, Seated, Shell};
-    use model_compiler::{Budgets, DeviceProfile};
+    use model_compiler::{Budget, DeviceProfile};
     use model_dsl::{Classify, Platform, Request};
 
     use super::{Block, FIRES};
@@ -363,16 +363,16 @@ mod gemma {
         let container = container(&checkpoint).expect("a tensor container");
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let plan = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let trace = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
         let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &checkpoint,
-            budgets: Budgets::new(4, 768),
+            budget: Budget::new(4, 768),
             profile: Some(DeviceProfile {
                 sms: 142,
                 side_streams,
@@ -495,7 +495,7 @@ mod gemma {
             replays: stats.replays,
             nodes: stats.nodes,
             edges: stats.edges,
-            forks: shell.forks(),
+            streams: shell.streams(),
             rows: fresh.len() as u32,
         }
     }
@@ -507,7 +507,7 @@ mod qwen {
     use std::time::Instant;
 
     use driver_cuda::{Boot, Seated, Shell};
-    use model_compiler::{Budgets, DeviceProfile};
+    use model_compiler::{Budget, DeviceProfile};
     use model_dsl::{Classify, Platform, Request};
 
     use super::{Block, FIRES};
@@ -566,16 +566,16 @@ mod qwen {
         let container = container(&checkpoint).expect("a tensor container");
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
         let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &checkpoint,
-            budgets: Budgets::new(4, 256),
+            budget: Budget::new(4, 256),
             profile: Some(DeviceProfile {
                 sms: 142,
                 side_streams,
@@ -665,7 +665,7 @@ mod qwen {
             replays: stats.replays,
             nodes: stats.nodes,
             edges: stats.edges,
-            forks: shell.forks(),
+            streams: shell.streams(),
             rows: fresh.len() as u32,
         }
     }

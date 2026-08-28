@@ -12,13 +12,13 @@
 //! load                                  fire
 //! ----                                  ----
 //! bind the device                       lane words  -> compose
-//! compile(plan, budgets, profile)       regions     -> windows
+//! compile(trace, budgets, profile)       regions     -> windows
 //! read the kv spaces off the plan       seats       -> page geometry
 //! land the checkpoint                   write the resident inputs
 //! reserve arena, pools, inputs          carve the slot table
 //! find the "out" seam                   build the cache table
 //!                                       open one command buffer
-//!                                       walk(plan, baked, desc, run, Cursor)
+//!                                       walk(trace, baked, desc, run, Cursor)
 //!                                       commit + wait, read the last row
 //! ```
 //!
@@ -65,8 +65,8 @@
 use std::path::Path;
 
 use driver::fire::{FireDescriptor, Lane as FireLane, compose, walk};
-use model_compiler::{Baked, Budgets, DeviceProfile, compile};
-use model_ir::{Dtype, Plan, ValueId};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
+use model_ir::{Dtype, Trace, ValueId};
 use model_loader::contract::ModelContract;
 
 use crate::arena::Arena;
@@ -89,9 +89,9 @@ const OUT_SEAM: &str = "out";
 /// Everything a load states.
 pub struct Boot<'a> {
     /// The traced supergraph. The ENGINE traces it and hands it across
-    /// (decision #18); `Baked` never crosses, which is why this is a `Plan`
+    /// (decision #18); `CompiledModel` never crosses, which is why this is a `Trace`
     /// and the compile happens on this side.
-    pub plan: Plan,
+    pub trace: Trace,
     /// How the checkpoint's bytes become this plan's params. Stated by the
     /// caller for the same reason: it is the model's declaration, and a shell
     /// that derived it would need an arm per family.
@@ -99,7 +99,7 @@ pub struct Boot<'a> {
     /// A snapshot directory, or one container file.
     pub checkpoint: &'a Path,
     /// The ceilings every fire is baked against.
-    pub budgets: Budgets,
+    pub budget: Budget,
     /// What the device charges. `None` takes the defaults.
     ///
     /// **THE FORK GROUPS ARE BAKED OFF, AND THE DEFAULT SAYS SO.** P6's
@@ -186,9 +186,9 @@ pub struct Shell {
     /// The handle table. Sealed after the weight rows are minted, rewound at
     /// the end of every fire.
     handles: Handles,
-    plan: Plan,
-    baked: Baked,
-    budgets: Budgets,
+    trace: Trace,
+    compiled: CompiledModel,
+    budget: Budget,
     weights: Weights,
     arena: Arena,
     pools: Pools,
@@ -259,19 +259,19 @@ impl Shell {
             side_streams: 0,
             ..DeviceProfile::default()
         });
-        let baked = compile(&boot.plan, &boot.budgets, &profile)?;
+        let compiled = compile(&boot.trace, &boot.budget, &profile)?;
 
         // Heads, head widths and windows are on the ops, not on
         // `CacheRow::Kv`, so they are read off the plan rather than off a
         // config beside it — per cache ROW for the bytes a page holds, per
         // PLAN VALUE for the reading a schedule is carved at.
-        let facts = kv::probe(&boot.plan)?;
+        let facts = kv::probe(&boot.trace)?;
         // The window argument's bake-time half, asked once: no attention
         // schedule may be carved over more classes than the arm consuming it
         // runs in. A per-fire check would be the same answer at a worse
         // instant — region masks are static — and the sentence names the
         // model text rather than the fire.
-        crate::window::no_schedule_straddles_its_readers(&boot.plan, &baked)?;
+        crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
 
         // Whether this artifact has anywhere for a mask to GO. Kept as a
         // CLASS SET rather than a boolean, because the question a fire asks
@@ -279,10 +279,10 @@ impl Shell {
         // masked arm? The word and the mask are stamped at two instants by
         // two parties, and this set is what lets the shell check they agree.
         let mut masked = model_ir::ClassSet::default();
-        for region in baked.template() {
+        for region in compiled.template() {
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
-                    boot.plan.nodes.get(node as usize).map(|node| &node.op),
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(model_ir::Operation::Attention(model_ir::Attention::Masked { .. }))
                 )
             });
@@ -296,17 +296,17 @@ impl Shell {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
         let handles = Handles::new();
         let weights =
-            Weights::resident(&device, &handles, &boot.plan, boot.contract, boot.checkpoint)?;
+            Weights::resident(&device, &handles, &boot.trace, boot.contract, boot.checkpoint)?;
         // **THE WEIGHT ROWS ARE THE LOAD-LIVED HANDLES, AND THIS IS THE
         // WATERMARK.** Everything minted after this line belongs to one fire
         // and is dropped at the end of it (`Handles::rewind`); everything
         // before it is read by every fire for the life of the load.
         handles.seal();
 
-        let arena = Arena::reserve(&device, &baked.arena)?;
-        let pools = Pools::reserve(&device, &boot.plan, paging, &facts)?;
+        let arena = Arena::reserve(&device, &compiled.arena)?;
+        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         let spaces = boot
-            .plan
+            .trace
             .caches
             .iter()
             .filter_map(|row| match row {
@@ -317,14 +317,14 @@ impl Shell {
             .unwrap_or(0);
         let inputs = Inputs::reserve(
             &device,
-            &boot.budgets,
+            &boot.budget,
             paging,
             spaces,
-            baked.classes.classes.len(),
+            compiled.classes.classes.len(),
         )?;
 
         let out = boot
-            .plan
+            .trace
             .seams
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
@@ -339,9 +339,9 @@ impl Shell {
             device,
             pipelines: Pipelines::new(),
             handles,
-            plan: boot.plan,
-            baked,
-            budgets: boot.budgets,
+            trace: boot.trace,
+            compiled,
+            budget: boot.budget,
             weights,
             arena,
             pools,
@@ -392,22 +392,22 @@ impl Shell {
         self.held.get(slot as usize).copied().unwrap_or(0)
     }
 
-    /// The plan this shell serves.
+    /// The trace this shell serves.
     #[must_use]
-    pub fn plan(&self) -> &Plan {
-        &self.plan
+    pub fn trace(&self) -> &Trace {
+        &self.trace
     }
 
     /// The artifact this shell walks.
     #[must_use]
-    pub fn baked(&self) -> &Baked {
-        &self.baked
+    pub fn compiled_model(&self) -> &CompiledModel {
+        &self.compiled
     }
 
     /// The ceilings every fire is composed against.
     #[must_use]
-    pub fn budgets(&self) -> &Budgets {
-        &self.budgets
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     /// How the pools are paged.
@@ -473,9 +473,9 @@ impl Shell {
     pub fn out_width(&self) -> Result<u64> {
         let slots = self.arena.slots(
             &self.handles,
-            &self.baked.arena,
-            u64::from(self.budgets.max_tokens),
-            u64::from(self.budgets.max_lanes),
+            &self.compiled.arena,
+            u64::from(self.budget.max_tokens),
+            u64::from(self.budget.max_lanes),
         )?;
         slots.0[self.out.0 as usize]
             .map(|logits| u64::from(logits.width))
@@ -712,9 +712,9 @@ impl Shell {
             device,
             pipelines,
             handles,
-            plan,
-            baked,
-            budgets,
+            trace,
+            compiled,
+            budget,
             weights,
             arena,
             pools,
@@ -750,7 +750,7 @@ impl Shell {
             .iter()
             .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
             .collect();
-        let composition = compose(baked, budgets, &submitted)?;
+        let composition = compose(compiled, budget, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
         let rows = composition.rows();
         let lane_count = composition.lane_count();
@@ -862,7 +862,7 @@ impl Shell {
         //    ragged view inside it is cut by — rebased, because a
         //    sub-rectangle starts at its own zero. This is the whole of what
         //    makes a mixed fire legal, and `crate::window` argues it.
-        let mut windows = Windows::of(baked, composition.classes(), &indptr_host)?;
+        let mut windows = Windows::of(compiled, composition.classes(), &indptr_host)?;
         let boundaries = windows.packed();
 
         // 5. Write the resident inputs. **THERE IS NO STAGING COPY ON THIS
@@ -891,7 +891,7 @@ impl Shell {
         //    fire's page tables, and the loader's weights, which never move.
         let slots = arena.slots(
             handles,
-            &baked.arena,
+            &compiled.arena,
             u64::from(rows),
             u64::from(lane_count),
         )?;
@@ -970,7 +970,7 @@ impl Shell {
             let mut run = Run::new(
                 &sink,
                 handles,
-                &plan.values,
+                &trace.values,
                 weights.table(),
                 &slots,
                 &caches,
@@ -978,7 +978,7 @@ impl Shell {
                 &windows,
                 &place,
             );
-            walk(plan, baked, &descriptor, &mut run, &mut Cursor::new(&place))?;
+            walk(trace, compiled, &descriptor, &mut run, &mut Cursor::new(&place))?;
         }
 
         let classes: Vec<(u32, u32)> = composition

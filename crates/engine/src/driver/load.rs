@@ -6,7 +6,7 @@
 //!  engine                                    |  shell
 //!  ------                                    |  -----
 //!  catalog() -> (sku, tp, Trace, Classify)   |
-//!  trace(Platform::Cuda) -> model_ir::Plan --|--> compile(plan, budgets, profile)
+//!  trace(Platform::Cuda) -> model_ir::Trace --|--> compile(trace, budgets, profile)
 //!  import_of(sku)(&Source) -> Contract     --|--> Weights::resident(plan, contract, path)
 //!  Classify::of(request) -> Lane::word     --|--> compose -> walk -> replay
 //! ```
@@ -14,7 +14,7 @@
 //! The engine links `model` anyway — a lane's fact word is the model's own
 //! `Classify::of`, computed per lane on the fire path — so the supergraph is
 //! already in this address space and handing it across costs a `serde` round
-//! trip a remote driver was going to need regardless. `model_compiler::Baked`
+//! trip a remote driver was going to need regardless. `model_compiler::CompiledModel`
 //! never crosses: the region template, the class table and the arena carve are
 //! answers about a DEVICE.
 //!
@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use driver_api::load::{Budgets, Checkpoint, LoadRequest};
-use driver_api::model_ir::Plan;
+use driver_api::model_ir::Trace;
 use model_loader::contract::ModelContract;
 
 /// The platform every door here takes, handed out beside them: a caller that can
@@ -55,7 +55,7 @@ pub use driver_api::model_ir::Platform;
 /// The catalog row a load names: its SKU, the tensor-parallel width it was
 /// traced for, the trace itself, and how it sorts a request into the fact
 /// word a lane carries.
-pub type Row = (&'static str, u32, fn(Platform) -> Plan, ::model::ClassifyFn);
+pub type Row = (&'static str, u32, fn(Platform) -> Trace, ::model::ClassifyFn);
 
 /// Every SKU this build ships.
 ///
@@ -74,7 +74,7 @@ pub fn catalog() -> Vec<Row> {
 /// When this build's catalog has no such SKU — with the near misses named,
 /// because "unknown model" and "you meant the -bf16 row" are different
 /// operator actions.
-pub fn trace(sku: &str, platform: Platform) -> Result<Plan> {
+pub fn trace(sku: &str, platform: Platform) -> Result<Trace> {
     let trace = ::model::trace_of(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;
     Ok(trace(platform))
 }
@@ -86,7 +86,7 @@ pub fn trace(sku: &str, platform: Platform) -> Result<Plan> {
 /// what `driver::fire::compose` turns into a class and therefore into the row
 /// window every guarded node runs over; a fire that submits word 0 for every
 /// lane runs its decode rows through the prefill arm. The engine could not
-/// state it while the catalog shipped three columns — a plan's `Cond::Fact`
+/// state it while the catalog shipped three columns — a plan's `Guard::Fact`
 /// numbers its bits and no reader outside a family's module can name them —
 /// and this is the pointer that closed the hole (`palo B-word`).
 ///
@@ -293,19 +293,19 @@ fn checkpoint_metadata(checkpoint: &Path) -> Result<model_loader::checkpoint::Ch
 /// A `String`, not an `anyhow::Error`, because the shell's own refusal type
 /// carries a sentence and the pointer must not put an error crate in a
 /// driver's signature.
-pub fn contract_for(plan: &Plan, checkpoint: &Path) -> std::result::Result<ModelContract, String> {
-    let import = ::model::import_of(&plan.name).ok_or_else(|| {
+pub fn contract_for(trace: &Trace, checkpoint: &Path) -> std::result::Result<ModelContract, String> {
+    let import = ::model::import_of(&trace.name).ok_or_else(|| {
         format!(
             "this build ships no import contract for {:?}, so a checkpoint's \
              tensors cannot be mapped onto its params",
-            plan.name
+            trace.name
         )
     })?;
     let source = open_source(checkpoint).map_err(|error| format!("{error:#}"))?;
     import(&source).map_err(|error| {
         format!(
             "the import contract for {:?} does not fit {checkpoint:?}: {error}",
-            plan.name
+            trace.name
         )
     })
 }
@@ -323,7 +323,7 @@ pub fn request(
 ) -> Result<LoadRequest> {
     let sku = identify(checkpoint, platform)?;
     Ok(LoadRequest {
-        plan: trace(sku, platform)?,
+        trace: trace(sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
         ordinal,
@@ -344,7 +344,7 @@ pub fn request_for(
     ordinal: i32,
 ) -> Result<LoadRequest> {
     Ok(LoadRequest {
-        plan: trace(sku, platform)?,
+        trace: trace(sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
         ordinal,

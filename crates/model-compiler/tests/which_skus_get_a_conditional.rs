@@ -37,10 +37,10 @@
 //!    from the plan.
 
 use model_compiler::{
-    Baked, Budgets, DeviceProfile, Lowering, Phase, Region, collectives_are_never_elided, compile,
+    CompiledModel, Budget, DeviceProfile, Lowering, Phase, Region, collectives_are_never_elided, compile,
 };
 use model_dsl::Platform;
-use model_ir::Plan;
+use model_ir::Trace;
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -49,15 +49,15 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn budgets_for(plan: &Plan) -> Budgets {
-    let seats = plan
+fn budgets_for(trace: &Trace) -> Budget {
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
         .map(|param| param.shape.first().copied().unwrap_or(0))
         .min()
         .unwrap_or(0);
-    Budgets {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -85,11 +85,11 @@ fn forced() -> DeviceProfile {
     }
 }
 
-fn cost(plan: &Plan, region: &Region, profile: &DeviceProfile) -> f32 {
+fn cost(trace: &Trace, region: &Region, profile: &DeviceProfile) -> f32 {
     region
         .nodes
         .clone()
-        .filter_map(|node| plan.nodes.get(node as usize))
+        .filter_map(|node| trace.nodes.get(node as usize))
         .map(|node| profile.family_us.of(&node.op))
         .sum()
 }
@@ -100,19 +100,19 @@ fn launches(region: &Region) -> f32 {
 }
 
 /// Every gate P3 asks, asked again on the far side of the pass.
-fn admits(plan: &Plan, baked: &Baked, at: usize, profile: &DeviceProfile) -> bool {
-    let region = &baked.regions[at];
+fn admits(trace: &Trace, compiled: &CompiledModel, at: usize, profile: &DeviceProfile) -> bool {
+    let region = &compiled.regions[at];
     let windowed = region.phase == Phase::Capture
         && !region.collective
         && !region.mask.is_empty()
-        && region.mask.len() < baked.classes.classes.len();
+        && region.mask.len() < compiled.classes.classes.len();
     let arms = match region.lowering {
         Lowering::Switch { arms, .. } => arms,
         _ => 1,
     };
     let paid = profile.cond_fixed_us + profile.cond_per_arm_us * f32::from(arms);
     windowed
-        && cost(plan, region, profile) >= profile.fat_region_us
+        && cost(trace, region, profile) >= profile.fat_region_us
         && launches(region) * profile.empty_launch_us > paid
 }
 
@@ -122,22 +122,22 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let budgets = budgets_for(&plan);
+            let trace = trace(platform);
+            let budget = budgets_for(&trace);
             for profile in [DeviceProfile::default(), forced()] {
-                let Ok(baked) = compile(&plan, &budgets, &profile) else {
+                let Ok(compiled) = compile(&trace, &budget, &profile) else {
                     continue; // `every_sku_carves_an_arena` is what says so.
                 };
-                for at in 0..baked.regions.len() {
-                    let region = &baked.regions[at];
+                for at in 0..compiled.regions.len() {
+                    let region = &compiled.regions[at];
                     let conditional = region.lowering != Lowering::AlwaysLaunch;
-                    if conditional != admits(&plan, &baked, at, &profile) {
+                    if conditional != admits(&trace, &compiled, at, &profile) {
                         wrong.push(format!(
                             "`{sku}` as {platform:?} at fat={}: region {at} lowered \
                              {:?} and the gates say {}",
                             profile.fat_region_us,
                             region.lowering,
-                            admits(&plan, &baked, at, &profile),
+                            admits(&trace, &compiled, at, &profile),
                         ));
                     }
                     // The composition rule with P6, on the artifact.
@@ -155,7 +155,7 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
                         ));
                     }
                 }
-                if !collectives_are_never_elided(&baked) {
+                if !collectives_are_never_elided(&compiled) {
                     wrong.push(format!(
                         "`{sku}` as {platform:?}: a collective region became a \
                          conditional body — decision #5",
@@ -186,15 +186,15 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
 fn turning_conditionals_on_moves_one_field_and_nothing_else() {
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let budgets = budgets_for(&plan);
+            let trace = trace(platform);
+            let budget = budgets_for(&trace);
             let off = DeviceProfile {
                 fat_region_us: f32::INFINITY,
                 ..forced()
             };
             let (Ok(with), Ok(without)) = (
-                compile(&plan, &budgets, &forced()),
-                compile(&plan, &budgets, &off),
+                compile(&trace, &budget, &forced()),
+                compile(&trace, &budget, &off),
             ) else {
                 continue;
             };
@@ -238,13 +238,13 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
     let mut chosen = 0usize;
 
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let budgets = budgets_for(&plan);
-        let Ok(baked) = compile(&plan, &budgets, &profile) else {
+        let trace = trace(Platform::Cuda);
+        let budget = budgets_for(&trace);
+        let Ok(compiled) = compile(&trace, &budget, &profile) else {
             continue;
         };
-        let classes = baked.classes.classes.len();
-        let windowed: Vec<&Region> = baked
+        let classes = compiled.classes.classes.len();
+        let windowed: Vec<&Region> = compiled
             .regions
             .iter()
             .filter(|r| {
@@ -256,10 +256,10 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
             .collect();
         let fattest = windowed
             .iter()
-            .map(|r| cost(&plan, r, &profile))
+            .map(|r| cost(&trace, r, &profile))
             .fold(0.0f32, f32::max);
         let widest = windowed.iter().map(|r| r.nodes.len()).max().unwrap_or(0);
-        let picked: Vec<usize> = baked
+        let picked: Vec<usize> = compiled
             .regions
             .iter()
             .enumerate()
@@ -269,15 +269,15 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
         chosen += picked.len();
         // The cross-check: the pass's answer against the gates computed here,
         // from the same profile and the plan alone.
-        let independent: Vec<usize> = (0..baked.regions.len())
-            .filter(|&at| admits(&plan, &baked, at, &profile))
+        let independent: Vec<usize> = (0..compiled.regions.len())
+            .filter(|&at| admits(&trace, &compiled, at, &profile))
             .collect();
         assert_eq!(
             picked, independent,
             "`{sku}`: P3's answer is not the gates' answer",
         );
 
-        let forced_on = compile(&plan, &budgets, &forced()).expect("bakes");
+        let forced_on = compile(&trace, &budget, &forced()).expect("bakes");
         let would = forced_on
             .regions
             .iter()

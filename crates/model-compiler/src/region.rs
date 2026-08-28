@@ -27,22 +27,22 @@
 //! it there is restoring an order rather than choosing one. [`hoist`] proves
 //! that of the plan in front of it instead of assuming it.
 
-use model_ir::{Def, Operands, Operation, Plan, Ty, ValueId};
+use model_ir::{Def, Operands, Operation, Trace, Ty, ValueId};
 
-use crate::baked::{Lowering, Phase, Region};
-use crate::refusal::Refusal;
-use model_ir::Classes;
+use crate::compiled::{Lowering, Phase, Region};
+use crate::error::Error;
+use model_ir::ClassTable;
 
 /// The regions of a plan, in program order, covering every node exactly once.
-pub(crate) fn coalesce(plan: &Plan, classes: &Classes) -> Vec<Region> {
+pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Vec<Region> {
     let mut regions: Vec<Region> = Vec::new();
     let mut outs: Vec<ValueId> = Vec::new();
 
-    for (j, node) in plan.nodes.iter().enumerate() {
+    for (j, node) in trace.nodes.iter().enumerate() {
         let j = j as u32;
-        let phase = phase_of(plan, node, &mut outs);
+        let phase = phase_of(trace, node, &mut outs);
         let collective = matches!(node.op, Operation::Collective(_));
-        // `node_mask` is parallel to `plan.nodes`, so the index is the same
+        // `node_mask` is parallel to `trace.nodes`, so the index is the same
         // one — but this crate is a front door, and a plan whose sweep and
         // node list disagree gets the conservative reading rather than a
         // panic: an absent mask is the empty one, which runs in no class.
@@ -114,12 +114,12 @@ pub(crate) fn coalesce(plan: &Plan, classes: &Classes) -> Vec<Region> {
 ///
 /// # Errors
 ///
-/// [`Refusal::HoistBlocked`] when a prepare node reads a value a capture node
+/// [`Error::HoistBlocked`] when a prepare node reads a value a capture node
 /// computes — see that variant for why the answer is a refusal and not a
 /// partial hoist. The check runs over the whole plan before a single region
 /// moves, so a refused plan leaves the table untouched.
-pub(crate) fn hoist(plan: &Plan, regions: &mut Vec<Region>) -> Result<(), Refusal> {
-    hoistable(plan)?;
+pub(crate) fn hoist(trace: &Trace, regions: &mut Vec<Region>) -> Result<(), Error> {
+    hoistable(trace)?;
     // The common case, and the one every other catalog text is in: a plan
     // that already states its host work first is left alone, byte for byte,
     // and pays this pass one scan.
@@ -153,19 +153,19 @@ pub(crate) fn hoist(plan: &Plan, regions: &mut Vec<Region>) -> Result<(), Refusa
 /// Asked over NODES rather than over regions, and transitively through
 /// `Def::Merge`, because a phi is data and not a dispatch — the arms are what
 /// actually wrote the bytes, and an arm is a node with a phase.
-fn hoistable(plan: &Plan) -> Result<(), Refusal> {
+fn hoistable(trace: &Trace) -> Result<(), Error> {
     let prepare: Vec<bool> = {
         let mut outs = Vec::new();
-        plan.nodes
+        trace.nodes
             .iter()
-            .map(|node| phase_of(plan, node, &mut outs) == Phase::Prepare)
+            .map(|node| phase_of(trace, node, &mut outs) == Phase::Prepare)
             .collect()
     };
 
     let mut inputs = Vec::new();
     let mut stack: Vec<ValueId> = Vec::new();
-    let mut seen: Vec<bool> = vec![false; plan.values.len()];
-    for (at, node) in plan.nodes.iter().enumerate() {
+    let mut seen: Vec<bool> = vec![false; trace.values.len()];
+    for (at, node) in trace.nodes.iter().enumerate() {
         if !prepare[at] {
             continue;
         }
@@ -178,10 +178,10 @@ fn hoistable(plan: &Plan) -> Result<(), Refusal> {
                 Some(slot) if !*slot => *slot = true,
                 _ => continue,
             }
-            match plan.values.get(value.0 as usize).map(|decl| &decl.def) {
+            match trace.values.get(value.0 as usize).map(|decl| &decl.def) {
                 Some(Def::Op(by)) => {
                     if !prepare.get(*by as usize).copied().unwrap_or(false) {
-                        return Err(Refusal::HoistBlocked {
+                        return Err(Error::HoistBlocked {
                             node: at as u32,
                             value,
                             produced_by: *by,
@@ -207,11 +207,11 @@ fn hoistable(plan: &Plan) -> Result<(), Refusal> {
 /// the arena. The rewrite kept a hand-written list of prepare kernels beside
 /// the ops that were on it, and a new plan builder that nobody remembered to
 /// add ran inside the capture, where its host allocation could not go.
-fn phase_of(plan: &Plan, node: &model_ir::Node, outs: &mut Vec<ValueId>) -> Phase {
+fn phase_of(trace: &Trace, node: &model_ir::Node, outs: &mut Vec<ValueId>) -> Phase {
     outs.clear();
     node.op.outputs(outs);
     let host = outs.iter().any(|v| {
-        plan.values
+        trace.values
             .get(v.0 as usize)
             .is_some_and(|decl| matches!(decl.ty, Ty::Struct(_)))
     });
@@ -222,18 +222,18 @@ fn phase_of(plan: &Plan, node: &model_ir::Node, outs: &mut Vec<ValueId>) -> Phas
 mod tests {
     use super::*;
     use crate::fixture::{Build, fact};
-    use model_ir::{Cond, resolve_classes};
+    use model_ir::{Guard, resolve_classes};
 
     fn regions_of(b: &Build) -> Vec<Region> {
-        let classes = resolve_classes(&b.plan).expect("the fixture plans resolve");
-        coalesce(&b.plan, &classes)
+        let classes = resolve_classes(&b.trace).expect("the fixture plans resolve");
+        coalesce(&b.trace, &classes)
     }
 
     /// P2 and P5 together, which is what `compile` calls and therefore what
     /// every claim about the TEMPLATE has to be asked of.
     fn hoisted(b: &Build) -> Vec<Region> {
         let mut regions = regions_of(b);
-        hoist(&b.plan, &mut regions).expect("the fixture plans hoist");
+        hoist(&b.trace, &mut regions).expect("the fixture plans hoist");
         regions
     }
 
@@ -242,9 +242,9 @@ mod tests {
         // Three unconditional ops in a chain: one mask, one phase, one run.
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
-        let c = b.op(a, 8, Cond::Always);
-        let d = b.op(c, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
+        let c = b.op(a, 8, Guard::Always);
+        let d = b.op(c, 8, Guard::Always);
         b.out(d);
 
         let regions = regions_of(&b);
@@ -263,11 +263,11 @@ mod tests {
         // the runs on either side of them — three neighbors, four regions.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always); // node 0: everywhere
+        let q = b.op(x, 8, Guard::Always); // node 0: everywhere
         let d = b.op(q, 8, fact(0)); // node 1: qo_one only
-        let p = b.op(q, 8, Cond::not(fact(0))); // node 2: the other class
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always); // node 3: everywhere again
+        let p = b.op(q, 8, Guard::not(fact(0))); // node 2: the other class
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always); // node 3: everywhere again
         b.out(y);
 
         let regions = regions_of(&b);
@@ -291,9 +291,9 @@ mod tests {
         // thing that can split this run is the phase, which is the point.
         let mut b = Build::new();
         let x = b.input(4);
-        let q = b.op(x, 4, Cond::Always); // node 0: capture
-        let plan = b.prepare(Cond::Always); // node 1: defines a Struct
-        let o = b.decode(q, plan, Cond::Always); // node 2: capture
+        let q = b.op(x, 4, Guard::Always); // node 0: capture
+        let plan = b.prepare(Guard::Always); // node 1: defines a Struct
+        let o = b.decode(q, plan, Guard::Always); // node 2: capture
         b.out(o);
 
         let regions = regions_of(&b);
@@ -311,10 +311,10 @@ mod tests {
     fn two_prepare_nodes_in_a_row_are_one_region() {
         let mut b = Build::new();
         let x = b.input(4);
-        let one = b.prepare(Cond::Always);
-        let two = b.prepare(Cond::Always);
-        let a = b.decode(x, one, Cond::Always);
-        let c = b.decode(a, two, Cond::Always);
+        let one = b.prepare(Guard::Always);
+        let two = b.prepare(Guard::Always);
+        let a = b.decode(x, one, Guard::Always);
+        let c = b.decode(a, two, Guard::Always);
         b.out(c);
 
         let regions = regions_of(&b);
@@ -333,8 +333,8 @@ mod tests {
         // this is the pass that makes it not happen.
         let mut b = Build::new();
         let x = b.input(4);
-        let trunk = b.op(x, 4, Cond::Always); // node 0: capture
-        let more = b.op(trunk, 4, Cond::Always); // node 1: capture
+        let trunk = b.op(x, 4, Guard::Always); // node 0: capture
+        let more = b.op(trunk, 4, Guard::Always); // node 1: capture
         let plan = b.prepare(fact(0)); // node 2: the late plan build
         let head = b.decode(more, plan, fact(0)); // node 3: capture
         b.out(head);
@@ -367,8 +367,8 @@ mod tests {
         // topological order, which is why keeping it needs no argument.
         let mut b = Build::new();
         let x = b.input(4);
-        let one = b.prepare(Cond::Always); // node 0
-        let a = b.decode(x, one, Cond::Always); // node 1
+        let one = b.prepare(Guard::Always); // node 0
+        let a = b.decode(x, one, Guard::Always); // node 1
         let two = b.prepare(fact(0)); // node 2 — a different mask, so a
         let c = b.decode(a, two, fact(0)); // node 3   different region
         b.out(c);
@@ -388,8 +388,8 @@ mod tests {
     fn a_plan_whose_prepare_already_leads_is_left_exactly_as_it_stood() {
         let mut b = Build::new();
         let x = b.input(4);
-        let one = b.prepare(Cond::Always);
-        let a = b.decode(x, one, Cond::Always);
+        let one = b.prepare(Guard::Always);
+        let a = b.decode(x, one, Guard::Always);
         b.out(a);
 
         assert_eq!(hoisted(&b), regions_of(&b));
@@ -403,17 +403,17 @@ mod tests {
         // is a refusal naming all three.
         let mut b = Build::new();
         let x = b.input(4);
-        let computed = b.op(x, 4, Cond::Always); // node 0: capture
-        let plan = b.prepare_over(computed, Cond::Always); // node 1
-        let o = b.decode(computed, plan, Cond::Always); // node 2
+        let computed = b.op(x, 4, Guard::Always); // node 0: capture
+        let plan = b.prepare_over(computed, Guard::Always); // node 1
+        let o = b.decode(computed, plan, Guard::Always); // node 2
         b.out(o);
 
         let mut regions = regions_of(&b);
         let stood = regions.clone();
-        let refusal = hoist(&b.plan, &mut regions).expect_err("an activation blocks the hoist");
+        let refusal = hoist(&b.trace, &mut regions).expect_err("an activation blocks the hoist");
         assert_eq!(
             refusal,
-            Refusal::HoistBlocked {
+            Error::HoistBlocked {
                 node: 1,
                 value: computed,
                 produced_by: 0,
@@ -430,27 +430,27 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(4);
         let d = b.op(x, 4, fact(0));
-        let p = b.op(x, 4, Cond::not(fact(0)));
-        let m = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 4);
-        let plan = b.prepare_over(m, Cond::Always);
-        let o = b.decode(m, plan, Cond::Always);
+        let p = b.op(x, 4, Guard::not(fact(0)));
+        let m = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
+        let plan = b.prepare_over(m, Guard::Always);
+        let o = b.decode(m, plan, Guard::Always);
         b.out(o);
 
         let mut regions = regions_of(&b);
-        let refusal = hoist(&b.plan, &mut regions).expect_err("the arms are activations too");
-        assert!(matches!(refusal, Refusal::HoistBlocked { node: 2, .. }));
+        let refusal = hoist(&b.trace, &mut regions).expect_err("the arms are activations too");
+        assert!(matches!(refusal, Error::HoistBlocked { node: 2, .. }));
     }
 
     #[test]
     fn a_collective_marks_the_region_that_carries_it() {
-        // A collective takes any cond it likes — this one is guarded — and the
+        // A collective takes any guard it likes — this one is guarded — and the
         // flag is what stops P3 putting the region it lands in inside an
         // elidable body (decision #5).
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
         let g = b.all_gather(a, 8, fact(0));
-        let o = b.merge(&[(g, fact(0)), (a, Cond::not(fact(0)))], 8);
+        let o = b.merge(&[(g, fact(0)), (a, Guard::not(fact(0)))], 8);
         b.out(o);
 
         let regions = regions_of(&b);
@@ -464,20 +464,20 @@ mod tests {
     fn every_node_lands_in_exactly_one_region() {
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
-        let m = b.op(q, 8, Cond::and(Cond::not(fact(0)), fact(1)));
-        let p = b.op(q, 8, Cond::and(Cond::not(fact(0)), Cond::not(fact(1))));
+        let m = b.op(q, 8, Guard::and(Guard::not(fact(0)), fact(1)));
+        let p = b.op(q, 8, Guard::and(Guard::not(fact(0)), Guard::not(fact(1))));
         let o = b.merge(
             &[
                 (d, fact(0)),
-                (m, Cond::and(Cond::not(fact(0)), fact(1))),
-                (p, Cond::and(Cond::not(fact(0)), Cond::not(fact(1)))),
+                (m, Guard::and(Guard::not(fact(0)), fact(1))),
+                (p, Guard::and(Guard::not(fact(0)), Guard::not(fact(1)))),
             ],
             8,
         );
-        let y = b.op(o, 8, Cond::Always);
-        b.append(y, Cond::Always);
+        let y = b.op(o, 8, Guard::Always);
+        b.append(y, Guard::Always);
         b.out(y);
 
         let regions = regions_of(&b);
@@ -486,6 +486,6 @@ mod tests {
             assert_eq!(region.nodes.start, covered, "regions tile the node list");
             covered = region.nodes.end;
         }
-        assert_eq!(covered as usize, b.plan.nodes.len());
+        assert_eq!(covered as usize, b.trace.nodes.len());
     }
 }

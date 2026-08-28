@@ -1,7 +1,7 @@
 //! The fact-bit predicate algebra a model splits on. A model names its own
 //! bits — `Facts::qo_one()` is a hand-written constructor over
 //! [`Predicate::fact(0)`](Predicate::fact) — and `Value::split` lowers
-//! predicates to `Cond` trees on the nodes they guard.
+//! predicates to `Guard` trees on the nodes they guard.
 
 use std::ops::{BitAnd, Not};
 
@@ -10,7 +10,7 @@ use std::ops::{BitAnd, Not};
 ///
 /// A bit is a POSITION AND NOTHING ELSE. The name a model calls it by lives in
 /// that model's own `Facts` impl, where it is the name of the constructor and
-/// of the struct field, and it never travels into the plan: `Cond::Fact(bit)`
+/// of the struct field, and it never travels into the plan: `Guard::Fact(bit)`
 /// is what a guard is, `fact_width` reads the plan's F off those guards, and a
 /// second list of names would be a second statement of the same fact, free to
 /// disagree with them.

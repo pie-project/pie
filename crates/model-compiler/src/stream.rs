@@ -167,14 +167,14 @@
 //! `tests/no_concurrent_pair_shares_a_write.rs` is clause 1 and clause 2 over
 //! the whole catalog.
 
-use model_ir::{ClassSet, Def, Operands, Operation, Plan, ValueId};
+use model_ir::{ClassSet, Def, Operands, Operation, Trace, ValueId};
 
-use crate::baked::{EventId, Lowering, Phase, Region};
+use crate::compiled::{EventId, Lowering, Phase, Region};
 use crate::budget::DeviceProfile;
 
 /// What P6 decided, beside the regions it stamped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Forks {
+pub struct StreamPlan {
     /// Region pairs that may be in flight together — what
     /// [`Concurrency::with_pairs`](crate::Concurrency::with_pairs) is built
     /// from and what the carve is widened by.
@@ -195,30 +195,30 @@ pub struct Forks {
 ///
 /// The class table is not an argument: every question this pass asks about
 /// classes is asked of a REGION's mask, which P2 already folded out of
-/// `Classes::node_mask`, and taking the table as well would be two spellings
+/// `ClassTable::node_mask`, and taking the table as well would be two spellings
 /// of one fact.
-pub(crate) fn fork(plan: &Plan, regions: &mut [Region], profile: &DeviceProfile) -> Forks {
+pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfile) -> StreamPlan {
     if profile.side_streams == 0 || regions.len() < 3 {
         // The off arm, and the trivial one. A plan with fewer than three
         // regions has no group with a neighbour on both sides.
-        return Forks {
+        return StreamPlan {
             pairs: Vec::new(),
             events: 0,
             streams: 1,
         };
     }
 
-    let touches = Touches::of(plan, regions, profile);
+    let touches = Touches::of(trace, regions, profile);
     let ordered = closure(regions, &touches);
     // The same estimator P3 gates a conditional with — one spelling of "what
     // does this region cost", so the two passes cannot disagree about the same
     // region on the same profile.
     let costs: Vec<f32> = regions
         .iter()
-        .map(|region| crate::lowering::region_us(plan, region, profile))
+        .map(|region| crate::lowering::region_us(trace, region, profile))
         .collect();
 
-    let mut forks = Forks {
+    let mut forks = StreamPlan {
         pairs: Vec::new(),
         events: 0,
         streams: 1,
@@ -258,7 +258,7 @@ fn seat(
     costs: &[f32],
     profile: &DeviceProfile,
     group: core::ops::Range<usize>,
-    forks: &mut Forks,
+    forks: &mut StreamPlan,
 ) {
     let main = group.start;
     // THE GATE, asked once per member against the arm it would overlap.
@@ -377,7 +377,7 @@ fn group_at(
 /// not: NCCL matches calls by ORDER, so a collective on a side stream is a
 /// rendezvous whose position in the program is no longer the position every
 /// other rank sees (decision #5, one step past elision). A region no class
-/// runs — `Classes::dead`, and shipped plans have none — may not either: an
+/// runs — `ClassTable::dead`, and shipped plans have none — may not either: an
 /// empty mask is disjoint from everything, which would make it a candidate
 /// with every region in the plan for no reason at all.
 ///
@@ -422,12 +422,12 @@ struct Touches {
 }
 
 impl Touches {
-    fn of(plan: &Plan, regions: &[Region], profile: &DeviceProfile) -> Touches {
-        let spaces_of: Vec<Option<u32>> = plan
+    fn of(trace: &Trace, regions: &[Region], profile: &DeviceProfile) -> Touches {
+        let spaces_of: Vec<Option<u32>> = trace
             .values
             .iter()
             .map(|value| match value.def {
-                Def::Cache(row) => Some(match plan.caches.get(row as usize) {
+                Def::Cache(row) => Some(match trace.caches.get(row as usize) {
                     Some(model_ir::CacheRow::Kv { space, .. }) => *space,
                     // A state bank shares no page space with anything, so it
                     // is numbered above every kv space it could collide with.
@@ -443,9 +443,9 @@ impl Touches {
         // consumer of the merge it fills visible at all — without it, three
         // arms that write `m`, `d`, `p` and a consumer that reads `o` share
         // no value and the whole neighbourhood looks independent.
-        let mut through: Vec<Option<Vec<ValueId>>> = vec![None; plan.values.len()];
-        for at in 0..plan.values.len() {
-            resolve(plan, &mut through, ValueId(at as u32));
+        let mut through: Vec<Option<Vec<ValueId>>> = vec![None; trace.values.len()];
+        for at in 0..trace.values.len() {
+            resolve(trace, &mut through, ValueId(at as u32));
         }
 
         let mut touches = Touches {
@@ -461,7 +461,7 @@ impl Touches {
             let mut barrier = false;
             let mut exclusive = false;
             for node in region.nodes.clone() {
-                let Some(node) = plan.nodes.get(node as usize) else {
+                let Some(node) = trace.nodes.get(node as usize) else {
                     continue;
                 };
                 barrier |= matches!(node.op, Operation::Collective(_));
@@ -532,12 +532,12 @@ impl Touches {
 /// The values a name resolves to once every phi in front of it is walked
 /// through. A plain value is itself; a `Def::Merge` is the union of its arms,
 /// recursively, because §0's legal nesting puts merges inside merges.
-fn resolve(plan: &Plan, through: &mut Vec<Option<Vec<ValueId>>>, value: ValueId) {
+fn resolve(trace: &Trace, through: &mut Vec<Option<Vec<ValueId>>>, value: ValueId) {
     let at = value.0 as usize;
     if through.get(at).is_some_and(Option::is_some) {
         return;
     }
-    let Some(decl) = plan.values.get(at) else {
+    let Some(decl) = trace.values.get(at) else {
         return;
     };
     // Seated before the recursion, so a plan whose merges somehow cycle
@@ -548,7 +548,7 @@ fn resolve(plan: &Plan, through: &mut Vec<Option<Vec<ValueId>>>, value: ValueId)
     };
     let mut all = Vec::new();
     for (arm, _) in arm_list {
-        resolve(plan, through, *arm);
+        resolve(trace, through, *arm);
         if let Some(Some(reached)) = through.get(arm.0 as usize) {
             all.extend_from_slice(reached);
         }
@@ -620,8 +620,8 @@ fn closure(regions: &[Region], touches: &Touches) -> Ordered {
 mod tests {
     use super::*;
     use crate::fixture::{Build, fact};
-    use crate::{Budgets, compile};
-    use model_ir::Cond;
+    use crate::{Budget, compile};
+    use model_ir::Guard;
 
     /// The §0 diagram, at three arms: a shared producer, three windows no
     /// value passes between, a shared consumer. This is gemma's attention
@@ -629,19 +629,19 @@ mod tests {
     fn three_arms() -> Build {
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always); // r0 — everywhere
-        let m = b.op(q, 8, Cond::and(fact(0), fact(1))); // r1
-        let d = b.op(q, 8, Cond::and(fact(0), Cond::not(fact(1)))); // r2
-        let p = b.op(q, 8, Cond::not(fact(0))); // r3
+        let q = b.op(x, 8, Guard::Always); // r0 — everywhere
+        let m = b.op(q, 8, Guard::and(fact(0), fact(1))); // r1
+        let d = b.op(q, 8, Guard::and(fact(0), Guard::not(fact(1)))); // r2
+        let p = b.op(q, 8, Guard::not(fact(0))); // r3
         let o = b.merge(
             &[
-                (m, Cond::and(fact(0), fact(1))),
-                (d, Cond::and(fact(0), Cond::not(fact(1)))),
-                (p, Cond::not(fact(0))),
+                (m, Guard::and(fact(0), fact(1))),
+                (d, Guard::and(fact(0), Guard::not(fact(1)))),
+                (p, Guard::not(fact(0))),
             ],
             8,
         );
-        let y = b.op(o, 8, Cond::Always); // r4
+        let y = b.op(o, 8, Guard::Always); // r4
         b.out(y);
         b
     }
@@ -660,8 +660,8 @@ mod tests {
         // The fixture's ops are `Elementwise`, which the family table prices
         // below the floor, so the gate is opened by lowering the floor rather
         // than by pretending a norm costs what an attention does.
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        let template = baked.template();
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        let template = compiled.template();
         assert_eq!(template.len(), 5);
 
         assert_eq!(template[1].stream, 0, "the first arm keeps the main stream");
@@ -684,26 +684,26 @@ mod tests {
             .collect();
         assert_eq!(template[4].wait, exits);
         assert_eq!(template[4].stream, 0);
-        assert_eq!(baked.forks.streams, 3);
-        assert_eq!(baked.forks.events, 3, "one entry and one exit per arm");
+        assert_eq!(compiled.streams.streams, 3);
+        assert_eq!(compiled.streams.events, 3, "one entry and one exit per arm");
     }
 
     #[test]
     fn the_relation_the_carve_sees_is_exactly_the_pairs_on_different_streams() {
         let b = three_arms();
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        assert_eq!(baked.forks.pairs, vec![(1, 2), (1, 3), (2, 3)]);
-        assert_eq!(baked.concurrency.pairs(), baked.forks.pairs);
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        assert_eq!(compiled.streams.pairs, vec![(1, 2), (1, 3), (2, 3)]);
+        assert_eq!(compiled.concurrency.pairs(), compiled.streams.pairs);
         // And the carve stayed sound under the wider relation, which is the
         // whole reason the hook was threaded through before this pass landed.
-        assert!(baked.arena.clashes(&baked.concurrency).is_empty());
+        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
     }
 
     #[test]
     fn two_arms_over_one_side_stream_run_on_it_in_turn_and_are_not_paired() {
         let b = three_arms();
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(1, 1.0)).expect("bakes");
-        let template = baked.template();
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(1, 1.0)).expect("bakes");
+        let template = compiled.template();
         assert_eq!(
             (template[1].stream, template[2].stream, template[3].stream),
             (0, 1, 1),
@@ -712,20 +712,20 @@ mod tests {
         // They are independent, so sharing a stream is a legal order — and
         // they are NOT concurrent, so the carve may still give them one
         // column.
-        assert_eq!(baked.forks.pairs, vec![(1, 2), (1, 3)]);
-        assert_eq!(baked.forks.streams, 2);
+        assert_eq!(compiled.streams.pairs, vec![(1, 2), (1, 3)]);
+        assert_eq!(compiled.streams.streams, 2);
     }
 
     #[test]
     fn the_off_switch_bakes_the_artifact_p6_never_touched() {
         let b = three_arms();
-        let off = compile(&b.plan, &Budgets::new(4, 16), &profile(0, 1.0)).expect("bakes");
+        let off = compile(&b.trace, &Budget::new(4, 16), &profile(0, 1.0)).expect("bakes");
         assert!(off.template().iter().all(|r| r.stream == 0));
         assert!(off.template().iter().all(|r| r.wait.is_empty()));
         assert!(off.template().iter().all(|r| r.open.is_none()));
         assert!(off.template().iter().all(|r| r.close.is_none()));
         assert!(off.template().iter().all(|r| r.sm_hint.is_none()));
-        assert_eq!(off.forks, Forks { pairs: Vec::new(), events: 0, streams: 1 });
+        assert_eq!(off.streams, StreamPlan { pairs: Vec::new(), events: 0, streams: 1 });
         assert!(off.concurrency.pairs().is_empty());
     }
 
@@ -734,10 +734,10 @@ mod tests {
         // The default floor is 20 us and the fixture's elementwise ops are
         // priced at 4: the candidates are found and then declined.
         let b = three_arms();
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 20.0)).expect("bakes");
-        assert!(baked.template().iter().all(|r| r.stream == 0));
-        assert_eq!(baked.forks.events, 0);
-        assert!(baked.concurrency.pairs().is_empty());
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 20.0)).expect("bakes");
+        assert!(compiled.template().iter().all(|r| r.stream == 0));
+        assert_eq!(compiled.streams.events, 0);
+        assert!(compiled.concurrency.pairs().is_empty());
     }
 
     #[test]
@@ -747,19 +747,19 @@ mod tests {
         // have called them candidates; the WAW edge is what does not.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
-        let p = b.op(q, 8, Cond::not(fact(0)));
+        let p = b.op(q, 8, Guard::not(fact(0)));
         // `p` reads `d`: a RAW edge between the two windows, disjoint masks
         // notwithstanding.
-        let s = b.residual_add(d, p, 8, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (s, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let s = b.residual_add(d, p, 8, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (s, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
 
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
         assert!(
-            baked.template().iter().all(|r| r.stream == 0),
+            compiled.template().iter().all(|r| r.stream == 0),
             "a path between them is not a candidate",
         );
     }
@@ -770,21 +770,21 @@ mod tests {
         // as well as a region that may not be elided (decision #5).
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let g = b.all_gather(q, 8, fact(0));
-        let p = b.op(q, 8, Cond::not(fact(0)));
-        let o = b.merge(&[(g, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let p = b.op(q, 8, Guard::not(fact(0)));
+        let o = b.merge(&[(g, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
 
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        let collective = baked
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        let collective = compiled
             .template()
             .iter()
             .find(|r| r.collective)
             .expect("the plan has one");
         assert_eq!(collective.stream, 0);
-        assert!(baked.template().iter().all(|r| r.stream == 0));
+        assert!(compiled.template().iter().all(|r| r.stream == 0));
     }
 
     #[test]
@@ -796,19 +796,19 @@ mod tests {
         // page belongs to a lane and classes partition the lanes.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
         b.append(d, fact(0));
-        let p = b.op(q, 8, Cond::not(fact(0)));
-        b.append(p, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let p = b.op(q, 8, Guard::not(fact(0)));
+        b.append(p, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
 
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
         // The two append windows have disjoint masks, so the space they share
         // does not order them and the later one forks.
-        let forked: Vec<u32> = baked.template().iter().map(|r| r.stream).collect();
+        let forked: Vec<u32> = compiled.template().iter().map(|r| r.stream).collect();
         assert!(
             forked.iter().any(|&s| s != 0),
             "disjoint classes over one space are candidates: {forked:?}",
@@ -818,8 +818,8 @@ mod tests {
     #[test]
     fn the_assignment_is_a_pure_function_of_the_plan() {
         let b = three_arms();
-        let once = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        let twice = compile(&b.plan, &Budgets::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        let once = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
+        let twice = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
         assert_eq!(once, twice);
     }
 }

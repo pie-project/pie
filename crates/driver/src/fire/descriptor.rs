@@ -287,22 +287,22 @@ mod tests {
     use crate::fire::compose::{Lane, compose};
     use crate::fire::fixture::{Build, fact};
     use crate::{Error, fire::Fault};
-    use model_compiler::{Budgets, DeviceProfile, compile};
-    use model_ir::Cond;
+    use model_compiler::{Budget, DeviceProfile, compile};
+    use model_ir::Guard;
 
-    fn budgets() -> Budgets {
-        Budgets::new(8, 64)
+    fn budget() -> Budget {
+        Budget::new(8, 64)
     }
 
     /// The design §0 split, in four nodes.
     fn plan() -> Build {
         let mut b = Build::new();
         let x = b.input(4);
-        let q = b.op(x, 4, Cond::Always);
+        let q = b.op(x, 4, Guard::Always);
         let d = b.op(q, 4, fact(0));
-        let p = b.op(q, 4, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 4);
-        let y = b.op(o, 4, Cond::Always);
+        let p = b.op(q, 4, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
+        let y = b.op(o, 4, Guard::Always);
         b.out(y);
         b
     }
@@ -310,7 +310,7 @@ mod tests {
     /// The §0 diagram's fire, as a descriptor.
     fn descriptor() -> FireDescriptor {
         let b = plan();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         let lanes = [
             Lane::new(0, 7),
             Lane::new(0, 3),
@@ -318,7 +318,7 @@ mod tests {
             Lane::new(1, 1),
             Lane::new(1, 1),
         ];
-        FireDescriptor::of(&compose(&baked, &budgets(), &lanes).expect("composes"))
+        FireDescriptor::of(&compose(&compiled, &budget(), &lanes).expect("composes"))
     }
 
     #[test]
@@ -352,10 +352,10 @@ mod tests {
     #[test]
     fn the_table_a_device_reads_is_the_table_the_walk_reads() {
         let b = plan();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         let fire = compose(
-            &baked,
-            &budgets(),
+            &compiled,
+            &budget(),
             &[Lane::new(0, 7), Lane::new(1, 1), Lane::new(1, 1)],
         )
         .expect("composes");
@@ -363,7 +363,7 @@ mod tests {
 
         assert_eq!(packed.rows, fire.rows());
         assert_eq!(packed.lane_count(), fire.lane_count());
-        for region in baked.template() {
+        for region in compiled.template() {
             assert_eq!(
                 packed.rows_of(&region.mask),
                 fire.classes().rows_of(&region.mask),
@@ -424,8 +424,8 @@ mod tests {
         // what makes "an empty window is a count, not an absence" true on the
         // wire as well as in the struct.
         let b = plan();
-        let baked = compile(&b.plan, &budgets(), &DeviceProfile::default()).expect("bakes");
-        let fire = compose(&baked, &budgets(), &[]).expect("composes");
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
+        let fire = compose(&compiled, &budget(), &[]).expect("composes");
         let descriptor = FireDescriptor::of(&fire);
 
         assert_eq!(descriptor.classes.len(), 2);

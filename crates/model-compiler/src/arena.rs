@@ -18,7 +18,7 @@
 //! [`ArenaMap::window`]'s arithmetic, not a recapture.
 //!
 //! The two meet at the budget. A column is RESERVED at its maximum under
-//! [`Budgets`] — `Tokens` at `max_tokens`, `TokensTimes(k)` at
+//! [`Budget`] — `Tokens` at `max_tokens`, `TokensTimes(k)` at
 //! `max_tokens * k`, `Lanes` at `max_lanes`, `LanesPlus(k)` at
 //! `max_lanes + k` — and a smaller fire writes its first rows and leaves the
 //! tail alone. The arena buffer has to be that big anyway, since it is
@@ -86,12 +86,12 @@
 //! overlap even if their node ranges do not.
 
 use model_ir::{
-    ClassSet, Classes, Def, Dim, Dtype, Operands, Plan, RuntimeInput, StructKind, Ty, ValueId,
+    ClassSet, ClassTable, Def, Dim, Dtype, Operands, Trace, RuntimeInput, StructKind, Ty, ValueId,
 };
 
-use crate::baked::Region;
-use crate::budget::Budgets;
-use crate::refusal::{Refusal, Share, Unrectangled};
+use crate::compiled::Region;
+use crate::budget::Budget;
+use crate::error::{Error, Share, Unrectangled};
 
 /// Who reads an export after the graph has run — which is the only thing the
 /// delivery tail below needs to know about one.
@@ -172,7 +172,7 @@ const EXPORTS: [Export; 3] = [
 ];
 
 /// The export seam names, in the order [`EXPORTS`] states them — for a shell
-/// that has to find the same values in a `Plan` it was handed.
+/// that has to find the same values in a `Trace` it was handed.
 ///
 /// Published because the alternative is what was here before: the same literals
 /// spelled a second time in `driver-cuda`, with a comment in each place saying
@@ -218,8 +218,8 @@ impl RowExpr {
 
     /// The most rows this can be under `budgets` — what the column reserves.
     #[must_use]
-    pub fn max(self, budgets: &Budgets) -> u64 {
-        self.at(u64::from(budgets.max_tokens), u64::from(budgets.max_lanes))
+    pub fn max(self, budget: &Budget) -> u64 {
+        self.at(u64::from(budget.max_tokens), u64::from(budget.max_lanes))
     }
 
     /// Does a windowed reader see only its OWN classes' rows of this column?
@@ -270,14 +270,14 @@ impl RowExpr {
 /// the IR already can, through `Operands::aliases`, which allocates nothing
 /// and shares by construction.
 ///
-/// `last == plan.nodes.len()` is the instant AFTER the graph: the `"out"`
+/// `last == trace.nodes.len()` is the instant AFTER the graph: the `"out"`
 /// seam's value is read there, by a reader no node occupies. Giving that time
 /// an index rather than a special case is what keeps the rule one sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     /// The node that writes the value.
     pub first: u32,
-    /// The last node that reads it, or `plan.nodes.len()` for a seam export.
+    /// The last node that reads it, or `trace.nodes.len()` for a seam export.
     pub last: u32,
 }
 
@@ -429,14 +429,14 @@ fn map_regions(regions: &[Region], nodes: usize) -> Vec<u32> {
 
 /// Where one value lives at the fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Slot {
+pub enum Placement {
     /// Bound by the driver each fire — tokens, positions, a mask, a geometry
     /// vector. Outside the arena: the driver owns the buffer.
     Runtime(RuntimeInput),
-    /// A loader-resident weight table, by index into `Plan::params`. Outside
+    /// A loader-resident weight table, by index into `Trace::params`. Outside
     /// the arena: it is written once at residency and read forever.
     Param(u32),
-    /// A cache space, by index into `Plan::caches`. Outside the arena: it
+    /// A cache space, by index into `Trace::caches`. Outside the arena: it
     /// outlives the fire, which is what makes it a cache.
     Cache(u32),
     /// A rectangle of the arena: `rows x width` elements of `dtype`, at a
@@ -474,29 +474,29 @@ pub enum Slot {
     Struct(StructKind),
 }
 
-impl Slot {
+impl Placement {
     /// The bytes a kernel touches — zero for anything that is not a rectangle
     /// of the arena.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         match self {
-            Slot::Arena { bytes, .. } => *bytes,
-            Slot::Runtime(_)
-            | Slot::Param(_)
-            | Slot::Cache(_)
-            | Slot::Alias(_)
-            | Slot::Struct(_) => 0,
+            Placement::Arena { bytes, .. } => *bytes,
+            Placement::Runtime(_)
+            | Placement::Param(_)
+            | Placement::Cache(_)
+            | Placement::Alias(_)
+            | Placement::Struct(_) => 0,
         }
     }
 
     fn is_arena(&self) -> bool {
-        matches!(self, Slot::Arena { .. })
+        matches!(self, Placement::Arena { .. })
     }
 }
 
 /// The byte range one value occupies in one fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Window {
+pub struct Extent {
     /// Byte offset into the arena — the slot's static offset.
     pub offset: u64,
     /// Bytes THIS fire touches, which is at most the slot's reservation.
@@ -506,8 +506,8 @@ pub struct Window {
 /// The arena, carved: one slot per plan value, and what it all adds up to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArenaMap {
-    /// Indexed by [`ValueId`], parallel to `Plan::values`.
-    pub slots: Vec<Slot>,
+    /// Indexed by [`ValueId`], parallel to `Trace::values`.
+    pub placements: Vec<Placement>,
     /// Each value's life, indexed the same way. `None` for a value with no
     /// rectangle of its own.
     ///
@@ -517,12 +517,12 @@ pub struct ArenaMap {
     /// aliasing rules — which is to say, having a second copy of the rules.
     pub spans: Vec<Option<Span>>,
     /// The classes each value's life falls in, indexed the same way — the
-    /// union of `Classes::node_mask` over every node that touches it, through
+    /// union of `ClassTable::node_mask` over every node that touches it, through
     /// aliases, and every class for the `"out"` seam, which is read after the
     /// fire by a reader that is not in any one class.
     ///
     /// EMPTY MEANS "NO CLASS RUNS IT", AND THAT IS NOT A LICENCE. A rectangle
-    /// only dead nodes touch is one `Classes::dead` already reports and the
+    /// only dead nodes touch is one `ClassTable::dead` already reports and the
     /// compiler is free to drop; while it is kept, the reading that cannot be
     /// wrong is that its classes are unknown, so an empty set co-tenants with
     /// nobody.
@@ -541,7 +541,7 @@ impl ArenaMap {
     /// The rectangle a value finally names, following aliases.
     #[must_use]
     pub fn root(&self, value: ValueId) -> ValueId {
-        root(&self.slots, value)
+        root(&self.placements, value)
     }
 
     /// Where a value sits in a fire of `tokens` rows over `lanes` requests, or
@@ -550,16 +550,16 @@ impl ArenaMap {
     /// THE DRIVER'S WHOLE ARITHMETIC, and it is this short because the offset
     /// is static: only the length moves with the bucket.
     #[must_use]
-    pub fn window(&self, value: ValueId, tokens: u64, lanes: u64) -> Option<Window> {
+    pub fn window(&self, value: ValueId, tokens: u64, lanes: u64) -> Option<Extent> {
         let root = self.root(value);
-        match self.slots.get(root.0 as usize)? {
-            Slot::Arena {
+        match self.placements.get(root.0 as usize)? {
+            Placement::Arena {
                 offset,
                 rows,
                 width,
                 dtype,
                 ..
-            } => Some(Window {
+            } => Some(Extent {
                 offset: *offset,
                 bytes: rows
                     .at(tokens, lanes)
@@ -591,24 +591,24 @@ impl ArenaMap {
     /// ONE rectangle, and this is what a plan gets when it wants the sharing
     /// without having said `merge`.
     ///
-    /// A `Slot::Alias`, a runtime binding, a param, a cache and a struct all
+    /// A `Placement::Alias`, a runtime binding, a param, a cache and a struct all
     /// answer `false`: they are not rectangles of this arena, so there is no
     /// column to share.
     #[must_use]
     pub fn co_tenants(&self, a: ValueId, b: ValueId) -> bool {
-        let (Some(x), Some(y)) = (self.slots.get(a.0 as usize), self.slots.get(b.0 as usize))
+        let (Some(x), Some(y)) = (self.placements.get(a.0 as usize), self.placements.get(b.0 as usize))
         else {
             return false;
         };
         let (
-            Slot::Arena {
+            Placement::Arena {
                 offset: a_at,
                 bytes: a_bytes,
                 rows: a_rows,
                 width: a_width,
                 dtype: a_dtype,
             },
-            Slot::Arena {
+            Placement::Arena {
                 offset: b_at,
                 bytes: b_bytes,
                 rows: b_rows,
@@ -739,11 +739,11 @@ impl ArenaMap {
 
     /// `(value, span, offset, bytes)` for every rectangle of the arena.
     fn live(&self) -> Vec<(ValueId, Span, u64, u64)> {
-        self.slots
+        self.placements
             .iter()
             .enumerate()
             .filter_map(|(id, slot)| match slot {
-                Slot::Arena { offset, bytes, .. } => Some((
+                Placement::Arena { offset, bytes, .. } => Some((
                     ValueId(id as u32),
                     self.spans[id].expect("the carve spans every arena slot"),
                     *offset,
@@ -760,20 +760,20 @@ impl ArenaMap {
 ///
 /// # Errors
 ///
-/// [`Refusal::Unrectangled`] for a declared type the row algebra cannot size,
-/// [`Refusal::Mismatch`] for two values the IR says share one column and
+/// [`Error::Unrectangled`] for a declared type the row algebra cannot size,
+/// [`Error::Mismatch`] for two values the IR says share one column and
 /// declares at different sizes.
 pub(crate) fn carve(
-    plan: &Plan,
-    budgets: &Budgets,
-    classes: &Classes,
+    trace: &Trace,
+    budget: &Budget,
+    classes: &ClassTable,
     conc: &Concurrency,
-) -> Result<ArenaMap, Refusal> {
-    let mut slots = rectangles(plan, budgets)?;
-    fold_in_place(plan, &mut slots)?;
-    fold_merges(plan, &mut slots)?;
-    flatten(&mut slots);
-    let (spans, live_in) = lives(plan, &slots, classes);
+) -> Result<ArenaMap, Error> {
+    let mut placements = rectangles(trace, budget)?;
+    fold_in_place(trace, &mut placements)?;
+    fold_merges(trace, &mut placements)?;
+    flatten(&mut placements);
+    let (spans, live_in) = lives(trace, &placements, classes);
 
     // BOTH WALKS, AND THE SMALLER WINS. The tightened walk can only ever merge
     // blocks the conservative one had to keep apart, so on the argument it
@@ -783,17 +783,17 @@ pub(crate) fn carve(
     // tie is what turns "should not regress" into "cannot", and it is what
     // makes a plan the tightening buys nothing on lay out BYTE-IDENTICALLY to
     // the way it laid out before this pass existed.
-    let mut conservative = slots.clone();
+    let mut conservative = placements.clone();
     let blind = place(&mut conservative, &spans, &live_in, conc, Columns::PerValue);
-    let shared = place(&mut slots, &spans, &live_in, conc, Columns::Shared);
-    let (slots, bytes) = if shared < blind {
-        (slots, shared)
+    let shared = place(&mut placements, &spans, &live_in, conc, Columns::Shared);
+    let (placements, bytes) = if shared < blind {
+        (placements, shared)
     } else {
         (conservative, blind)
     };
 
     Ok(ArenaMap {
-        slots,
+        placements,
         spans,
         live_in,
         bytes,
@@ -802,37 +802,37 @@ pub(crate) fn carve(
 
 /// One slot per value, every rectangle sized at the budget's ceiling and every
 /// offset still zero.
-fn rectangles(plan: &Plan, budgets: &Budgets) -> Result<Vec<Slot>, Refusal> {
-    plan.values
+fn rectangles(trace: &Trace, budget: &Budget) -> Result<Vec<Placement>, Error> {
+    trace.values
         .iter()
         .enumerate()
         .map(|(id, decl)| {
             let value = ValueId(id as u32);
             match &decl.def {
-                Def::Input(which) => Ok(Slot::Runtime(*which)),
-                Def::Weight(i) => Ok(Slot::Param(*i)),
-                Def::Cache(i) => Ok(Slot::Cache(*i)),
+                Def::Input(which) => Ok(Placement::Runtime(*which)),
+                Def::Weight(i) => Ok(Placement::Param(*i)),
+                Def::Cache(i) => Ok(Placement::Cache(*i)),
                 // A MERGE IS GIVEN THE COLUMN, and its arms are folded onto it
                 // below. That is the direction design §0 states: the arms
                 // write disjoint row windows of ONE buffer, so the buffer is
                 // the merge's and the arms are the writers.
                 //
                 // AND AN OP OUTPUT NO CLASS DEMANDS STILL GETS ONE.
-                // `Classes::dead` reports those and the compiler is free to
+                // `ClassTable::dead` reports those and the compiler is free to
                 // drop them; not dropping them is the conservative reading,
                 // and a shipped plan has none for it to cost anything on.
                 Def::Op(_) | Def::Merge(_) => match &decl.ty {
-                    Ty::Struct(kind) => Ok(Slot::Struct(*kind)),
+                    Ty::Struct(kind) => Ok(Placement::Struct(*kind)),
                     Ty::Tensor { shape, dtype } => {
                         let (rows, width) =
-                            rect(shape).map_err(|why| Refusal::Unrectangled { value, why })?;
-                        let elem = elem_bytes(*dtype).ok_or(Refusal::Unrectangled {
+                            rect(shape).map_err(|why| Error::Unrectangled { value, why })?;
+                        let elem = elem_bytes(*dtype).ok_or(Error::Unrectangled {
                             value,
                             why: Unrectangled::PackedElement,
                         })?;
-                        Ok(Slot::Arena {
+                        Ok(Placement::Arena {
                             offset: 0,
-                            bytes: rows.max(budgets).saturating_mul(width).saturating_mul(elem),
+                            bytes: rows.max(budget).saturating_mul(width).saturating_mul(elem),
                             rows,
                             width,
                             dtype: *dtype,
@@ -902,13 +902,13 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
 /// runtime binding and a host struct have no bytes here to fold, so the pair
 /// is left alone rather than refused: the driver owns that buffer and the
 /// in-place write lands in it.
-fn fold_in_place(plan: &Plan, slots: &mut [Slot]) -> Result<(), Refusal> {
+fn fold_in_place(trace: &Trace, placements: &mut [Placement]) -> Result<(), Error> {
     let mut pairs: Vec<(ValueId, ValueId)> = Vec::new();
-    for node in &plan.nodes {
+    for node in &trace.nodes {
         pairs.clear();
         node.op.aliases(&mut pairs);
         for (out, overwritten) in &pairs {
-            share(slots, Share::InPlace, *overwritten, *out)?;
+            share(placements, Share::InPlace, *overwritten, *out)?;
         }
     }
     Ok(())
@@ -925,14 +925,14 @@ fn fold_in_place(plan: &Plan, slots: &mut [Slot]) -> Result<(), Refusal> {
 /// Value order does the nesting for free: the recorder pushes a merge after
 /// its arms, so an inner merge has already claimed its arms by the time the
 /// outer one claims it, and [`share`] unions through the root.
-fn fold_merges(plan: &Plan, slots: &mut [Slot]) -> Result<(), Refusal> {
-    for (id, decl) in plan.values.iter().enumerate() {
+fn fold_merges(trace: &Trace, placements: &mut [Placement]) -> Result<(), Error> {
+    for (id, decl) in trace.values.iter().enumerate() {
         let Def::Merge(arms) = &decl.def else {
             continue;
         };
         let merge = ValueId(id as u32);
         for (arm, _) in arms {
-            share(slots, Share::MergeArm, merge, *arm)?;
+            share(placements, Share::MergeArm, merge, *arm)?;
         }
     }
     Ok(())
@@ -940,12 +940,12 @@ fn fold_merges(plan: &Plan, slots: &mut [Slot]) -> Result<(), Refusal> {
 
 /// Put `shares` into `holds`'s column, or refuse if the IR says they are one
 /// column and declares them at two sizes.
-fn share(slots: &mut [Slot], kind: Share, holds: ValueId, shares: ValueId) -> Result<(), Refusal> {
-    let (h, s) = (root(slots, holds), root(slots, shares));
+fn share(placements: &mut [Placement], kind: Share, holds: ValueId, shares: ValueId) -> Result<(), Error> {
+    let (h, s) = (root(placements, holds), root(placements, shares));
     if h == s {
         return Ok(());
     }
-    let (Some(a), Some(b)) = (slots.get(h.0 as usize), slots.get(s.0 as usize)) else {
+    let (Some(a), Some(b)) = (placements.get(h.0 as usize), placements.get(s.0 as usize)) else {
         // An id that indexes nothing is the validator's fault to name, not
         // this pass's to panic on.
         return Ok(());
@@ -955,14 +955,14 @@ fn share(slots: &mut [Slot], kind: Share, holds: ValueId, shares: ValueId) -> Re
     }
     let same = match (a, b) {
         (
-            Slot::Arena {
+            Placement::Arena {
                 bytes: ab,
                 rows: ar,
                 width: aw,
                 dtype: ad,
                 ..
             },
-            Slot::Arena {
+            Placement::Arena {
                 bytes: bb,
                 rows: br,
                 width: bw,
@@ -973,21 +973,21 @@ fn share(slots: &mut [Slot], kind: Share, holds: ValueId, shares: ValueId) -> Re
         _ => false,
     };
     if !same {
-        return Err(Refusal::Mismatch {
+        return Err(Error::Mismatch {
             kind,
             holds: h,
             shares: s,
         });
     }
-    slots[s.0 as usize] = Slot::Alias(h);
+    placements[s.0 as usize] = Placement::Alias(h);
     Ok(())
 }
 
 /// The rectangle an alias finally names.
-fn root(slots: &[Slot], mut value: ValueId) -> ValueId {
-    for _ in 0..=slots.len() {
-        match slots.get(value.0 as usize) {
-            Some(Slot::Alias(to)) => value = *to,
+fn root(placements: &[Placement], mut value: ValueId) -> ValueId {
+    for _ in 0..=placements.len() {
+        match placements.get(value.0 as usize) {
+            Some(Placement::Alias(to)) => value = *to,
             _ => return value,
         }
     }
@@ -996,10 +996,10 @@ fn root(slots: &[Slot], mut value: ValueId) -> ValueId {
 
 /// Collapse alias chains to one hop, so that every reader sees the rectangle
 /// and not another alias.
-fn flatten(slots: &mut [Slot]) {
-    for id in 0..slots.len() {
-        if let Slot::Alias(to) = slots[id] {
-            slots[id] = Slot::Alias(root(slots, to));
+fn flatten(placements: &mut [Placement]) {
+    for id in 0..placements.len() {
+        if let Placement::Alias(to) = placements[id] {
+            placements[id] = Placement::Alias(root(placements, to));
         }
     }
 }
@@ -1014,19 +1014,19 @@ fn flatten(slots: &mut [Slot]) {
 /// node that touched the value, and that is the tightening's whole input — not
 /// a shorter life, but the answer to "whose rows of this column are ever
 /// touched".
-fn lives(plan: &Plan, slots: &[Slot], classes: &Classes) -> (Vec<Option<Span>>, Vec<ClassSet>) {
-    let end = plan.nodes.len() as u32;
+fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<Option<Span>>, Vec<ClassSet>) {
+    let end = trace.nodes.len() as u32;
     // The reader with no class: the engine, past the last node, over every row
     // the fire carried. Both pins below widen to it.
     let everywhere = ClassSet::of(0..classes.classes.len());
     let nowhere = ClassSet::default();
-    let mut spans: Vec<Option<Span>> = vec![None; slots.len()];
-    let mut live_in: Vec<ClassSet> = vec![ClassSet::default(); slots.len()];
+    let mut spans: Vec<Option<Span>> = vec![None; placements.len()];
+    let mut live_in: Vec<ClassSet> = vec![ClassSet::default(); placements.len()];
     let mut touched: Vec<ValueId> = Vec::new();
 
-    for (at, node) in plan.nodes.iter().enumerate() {
+    for (at, node) in trace.nodes.iter().enumerate() {
         let at = at as u32;
-        // Parallel to `plan.nodes`, and a plan whose sweep and node list
+        // Parallel to `trace.nodes`, and a plan whose sweep and node list
         // disagree gets the empty mask — the same conservative reading
         // `region::coalesce` takes at the same index.
         let mask = classes.node_mask.get(at as usize).unwrap_or(&nowhere);
@@ -1034,7 +1034,7 @@ fn lives(plan: &Plan, slots: &[Slot], classes: &Classes) -> (Vec<Option<Span>>, 
         node.op.inputs(&mut touched);
         node.op.outputs(&mut touched);
         for value in &touched {
-            touch(slots, &mut spans, &mut live_in, *value, at, mask);
+            touch(placements, &mut spans, &mut live_in, *value, at, mask);
         }
     }
 
@@ -1056,10 +1056,10 @@ fn lives(plan: &Plan, slots: &[Slot], classes: &Classes) -> (Vec<Option<Span>>, 
     // per-layer capture column at the whole fire's height in every SKU that
     // declares one.
     for export in EXPORTS {
-        for seam in plan.seams.iter().filter(|s| s.seam == export.seam) {
+        for seam in trace.seams.iter().filter(|s| s.seam == export.seam) {
             for value in &seam.values {
-                let root = root(slots, *value);
-                if !slots.get(root.0 as usize).is_some_and(Slot::is_arena) {
+                let root = root(placements, *value);
+                if !placements.get(root.0 as usize).is_some_and(Placement::is_arena) {
                     continue;
                 }
                 spans[root.0 as usize]
@@ -1079,7 +1079,7 @@ fn lives(plan: &Plan, slots: &[Slot], classes: &Classes) -> (Vec<Option<Span>>, 
     // what an absent one means. One can only be absent for a value no node
     // names at all, and holding that open across the whole plan is the reading
     // that cannot be wrong.
-    for (id, slot) in slots.iter().enumerate() {
+    for (id, slot) in placements.iter().enumerate() {
         if slot.is_arena() {
             spans[id].get_or_insert(Span {
                 first: 0,
@@ -1096,7 +1096,7 @@ fn lives(plan: &Plan, slots: &[Slot], classes: &Classes) -> (Vec<Option<Span>>, 
 /// Extend a value's life to cover instant `at` in the classes `mask` runs,
 /// through any alias.
 fn touch(
-    slots: &[Slot],
+    placements: &[Placement],
     spans: &mut [Option<Span>],
     live_in: &mut [ClassSet],
     value: ValueId,
@@ -1109,8 +1109,8 @@ fn touch(
     // same way, and that is exactly why a merge column co-tenants with nobody:
     // it collects the union of its arms' masks, which is every class the
     // merge resolves in.
-    let root = root(slots, value);
-    if !slots.get(root.0 as usize).is_some_and(Slot::is_arena) {
+    let root = root(placements, value);
+    if !placements.get(root.0 as usize).is_some_and(Placement::is_arena) {
         return;
     }
     match &mut spans[root.0 as usize] {
@@ -1180,20 +1180,20 @@ fn align(bytes: u64) -> u64 {
 ///
 /// # Deterministic, and that is a requirement
 ///
-/// The same plan must lay out the same way on every host: a `Baked` is cached,
+/// The same plan must lay out the same way on every host: a `CompiledModel` is cached,
 /// compared and fired by offsets. So the order is a TOTAL one — bytes
 /// descending, then birth node, then value id — and never a hash's. The
 /// columns are gathered in that same order and a value joins the FIRST column
 /// that will have it, so which values end up sharing one is a function of the
 /// plan and of nothing else.
 fn place(
-    slots: &mut [Slot],
+    placements: &mut [Placement],
     spans: &[Option<Span>],
     live_in: &[ClassSet],
     conc: &Concurrency,
     mode: Columns,
 ) -> u64 {
-    let mut order: Vec<(u64, Span, usize)> = slots
+    let mut order: Vec<(u64, Span, usize)> = placements
         .iter()
         .enumerate()
         .filter(|(_, slot)| slot.is_arena())
@@ -1208,7 +1208,7 @@ fn place(
             .then(a.2.cmp(&b.2))
     });
 
-    let columns = gather(slots, live_in, &order, mode);
+    let columns = gather(placements, live_in, &order, mode);
 
     let mut placed: Vec<(u64, u64, Span)> = Vec::with_capacity(columns.len());
     let mut blockers: Vec<(u64, u64)> = Vec::new();
@@ -1233,8 +1233,8 @@ fn place(
             at = at.max(*to);
         }
         for id in &column.members {
-            let Slot::Arena { offset, .. } = &mut slots[*id] else {
-                unreachable!("only arena slots are gathered into columns")
+            let Placement::Arena { offset, .. } = &mut placements[*id] else {
+                unreachable!("only arena placements are gathered into columns")
             };
             *offset = at;
         }
@@ -1273,20 +1273,20 @@ struct Column {
     /// `(rows, width, dtype)` — what a member has to match — and `None` for a
     /// rectangle no window cuts, which admits no second member.
     pitch: Option<(RowExpr, u64, Dtype)>,
-    /// Slot indices, in the order they joined.
+    /// Placement indices, in the order they joined.
     members: Vec<usize>,
 }
 
 /// Gather the placement order into columns.
 fn gather(
-    slots: &[Slot],
+    placements: &[Placement],
     live_in: &[ClassSet],
     order: &[(u64, Span, usize)],
     mode: Columns,
 ) -> Vec<Column> {
     let mut columns: Vec<Column> = Vec::with_capacity(order.len());
     for (size, span, id) in order {
-        let pitch = pitch_of(&slots[*id]);
+        let pitch = pitch_of(&placements[*id]);
         let classes = &live_in[*id];
         // EVERY CLAUSE IS LOAD-BEARING. One pitch and one reservation, or the
         // rows do not line up; a cut, or the reader never sees a window at
@@ -1326,9 +1326,9 @@ fn gather(
 
 /// What a value has to agree about to share a column, or `None` for a
 /// rectangle a window hands over whole ([`RowExpr::cut_per_class`]).
-fn pitch_of(slot: &Slot) -> Option<(RowExpr, u64, Dtype)> {
+fn pitch_of(slot: &Placement) -> Option<(RowExpr, u64, Dtype)> {
     match slot {
-        Slot::Arena {
+        Placement::Arena {
             rows, width, dtype, ..
         } if rows.cut_per_class() => Some((*rows, *width, *dtype)),
         _ => None,
@@ -1351,14 +1351,14 @@ mod tests {
     use super::*;
     use crate::fixture::{Build, block, fact};
     use crate::region;
-    use model_ir::{Cond, resolve_classes};
+    use model_ir::{Guard, resolve_classes};
 
     /// Carve a fixture plan the way `compile` would.
-    fn carved(b: &Build, budgets: &Budgets) -> (ArenaMap, Concurrency) {
-        let classes = resolve_classes(&b.plan).expect("the fixture plans resolve");
-        let regions = region::coalesce(&b.plan, &classes);
-        let conc = Concurrency::sequential(&regions, b.plan.nodes.len());
-        let arena = carve(&b.plan, budgets, &classes, &conc).expect("the fixture plans carve");
+    fn carved(b: &Build, budget: &Budget) -> (ArenaMap, Concurrency) {
+        let classes = resolve_classes(&b.trace).expect("the fixture plans resolve");
+        let regions = region::coalesce(&b.trace, &classes);
+        let conc = Concurrency::sequential(&regions, b.trace.nodes.len());
+        let arena = carve(&b.trace, budget, &classes, &conc).expect("the fixture plans carve");
         (arena, conc)
     }
 
@@ -1369,22 +1369,22 @@ mod tests {
     /// implementation — everything up to [`place`] is shared, and the only
     /// thing that differs is the [`Columns`] mode, which is exactly the
     /// difference under test.
-    fn conservative(b: &Build, budgets: &Budgets) -> u64 {
-        let classes = resolve_classes(&b.plan).expect("the fixture plans resolve");
-        let regions = region::coalesce(&b.plan, &classes);
-        let conc = Concurrency::sequential(&regions, b.plan.nodes.len());
-        let mut slots = rectangles(&b.plan, budgets).expect("the fixture plans carve");
-        fold_in_place(&b.plan, &mut slots).expect("the fixture plans carve");
-        fold_merges(&b.plan, &mut slots).expect("the fixture plans carve");
-        flatten(&mut slots);
-        let (spans, live_in) = lives(&b.plan, &slots, &classes);
-        place(&mut slots, &spans, &live_in, &conc, Columns::PerValue)
+    fn conservative(b: &Build, budget: &Budget) -> u64 {
+        let classes = resolve_classes(&b.trace).expect("the fixture plans resolve");
+        let regions = region::coalesce(&b.trace, &classes);
+        let conc = Concurrency::sequential(&regions, b.trace.nodes.len());
+        let mut placements = rectangles(&b.trace, budget).expect("the fixture plans carve");
+        fold_in_place(&b.trace, &mut placements).expect("the fixture plans carve");
+        fold_merges(&b.trace, &mut placements).expect("the fixture plans carve");
+        flatten(&mut placements);
+        let (spans, live_in) = lives(&b.trace, &placements, &classes);
+        place(&mut placements, &spans, &live_in, &conc, Columns::PerValue)
     }
 
     /// A value's offset, or a panic naming the value that has none.
     fn at(arena: &ArenaMap, v: ValueId) -> u64 {
-        match arena.slots[v.0 as usize] {
-            Slot::Arena { offset, .. } => offset,
+        match arena.placements[v.0 as usize] {
+            Placement::Arena { offset, .. } => offset,
             _ => panic!("v{} is not a rectangle", v.0),
         }
     }
@@ -1396,24 +1396,24 @@ mod tests {
     fn interleaved(width: u64) -> (Build, ValueId, ValueId) {
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always); // node 0 — everywhere
+        let q = b.op(x, 8, Guard::Always); // node 0 — everywhere
         let d1 = b.op(q, 8, fact(0)); // node 1 — one class
-        let p1 = b.op(q, width, Cond::not(fact(0))); // node 2 — the other
+        let p1 = b.op(q, width, Guard::not(fact(0))); // node 2 — the other
         let d2 = b.op(d1, 8, fact(0)); // node 3 — d1 dies here
-        let p2 = b.op(p1, 8, Cond::not(fact(0))); // node 4 — p1 dies here
-        let o = b.merge(&[(d2, fact(0)), (p2, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always); // node 5
+        let p2 = b.op(p1, 8, Guard::not(fact(0))); // node 4 — p1 dies here
+        let o = b.merge(&[(d2, fact(0)), (p2, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always); // node 5
         b.out(y);
         (b, d1, p1)
     }
 
-    fn budgets() -> Budgets {
-        Budgets::new(4, 16)
+    fn budget() -> Budget {
+        Budget::new(4, 16)
     }
 
     #[test]
     fn the_row_algebra_sizes_every_dim_at_its_ceiling() {
-        let b = Budgets::new(4, 16);
+        let b = Budget::new(4, 16);
         assert_eq!(RowExpr::of(Dim::Tokens).max(&b), 16);
         assert_eq!(RowExpr::of(Dim::TokensTimes(3)).max(&b), 48);
         assert_eq!(RowExpr::of(Dim::Lanes).max(&b), 4);
@@ -1431,13 +1431,13 @@ mod tests {
         // gets. The sum of the four rectangles would be four.
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
-        let c = b.op(a, 8, Cond::Always);
-        let d = b.op(c, 8, Cond::Always);
-        let e = b.op(d, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
+        let c = b.op(a, 8, Guard::Always);
+        let d = b.op(c, 8, Guard::Always);
+        let e = b.op(d, 8, Guard::Always);
         b.out(e);
 
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
         // One rectangle is 16 rows x 8 bf16 = 256 bytes, which is exactly the
         // alignment, so the arithmetic here is unrounded.
         let one = 16 * 8 * 2;
@@ -1460,15 +1460,15 @@ mod tests {
         let layers = 24u64;
         let mut b = Build::new();
         let x = b.input(8);
-        let mut resid = b.op(x, 8, Cond::Always);
+        let mut resid = b.op(x, 8, Guard::Always);
         for _ in 0..layers {
-            let norm = b.op(resid, 8, Cond::Always);
-            let attn = b.op(norm, 8, Cond::Always);
-            resid = b.residual_add(attn, resid, 8, Cond::Always);
+            let norm = b.op(resid, 8, Guard::Always);
+            let attn = b.op(norm, 8, Guard::Always);
+            resid = b.residual_add(attn, resid, 8, Guard::Always);
         }
         b.out(resid);
 
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
         assert!(arena.clashes(&conc).is_empty());
         assert_eq!(arena.bytes, arena.live_bound(), "on the floor");
         let one = 16 * 8 * 2;
@@ -1479,7 +1479,7 @@ mod tests {
         );
         // …and the residual really is ONE column, however many times it is
         // added into.
-        let columns = arena.slots.iter().filter(|slot| slot.is_arena()).count();
+        let columns = arena.placements.iter().filter(|slot| slot.is_arena()).count();
         assert!(
             columns as u64 <= 2 * layers + 2,
             "{columns} rectangles for {layers} layers — the in-place folds did not fold",
@@ -1491,17 +1491,17 @@ mod tests {
         // phi costs nothing: the arms are windows of one buffer.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
-        let p = b.op(q, 8, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let p = b.op(q, 8, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
 
-        let (arena, conc) = carved(&b, &budgets());
-        assert_eq!(arena.slots[d.0 as usize], Slot::Alias(o));
-        assert_eq!(arena.slots[p.0 as usize], Slot::Alias(o));
-        assert!(matches!(arena.slots[o.0 as usize], Slot::Arena { .. }));
+        let (arena, conc) = carved(&b, &budget());
+        assert_eq!(arena.placements[d.0 as usize], Placement::Alias(o));
+        assert_eq!(arena.placements[p.0 as usize], Placement::Alias(o));
+        assert!(matches!(arena.placements[o.0 as usize], Placement::Arena { .. }));
         assert_eq!(arena.root(d), o);
         assert!(arena.clashes(&conc).is_empty());
         // The two arms are the same bytes ON PURPOSE — that is what makes
@@ -1513,12 +1513,12 @@ mod tests {
     fn an_in_place_op_writes_through_its_operand() {
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
-        let c = b.in_place(a, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
+        let c = b.in_place(a, 8, Guard::Always);
         b.out(c);
 
-        let (arena, _) = carved(&b, &budgets());
-        assert_eq!(arena.slots[c.0 as usize], Slot::Alias(a));
+        let (arena, _) = carved(&b, &budget());
+        assert_eq!(arena.placements[c.0 as usize], Placement::Alias(a));
         assert_eq!(arena.bytes, 16 * 8 * 2, "one column, written twice");
     }
 
@@ -1529,12 +1529,12 @@ mod tests {
         // the driver would read whatever the last launch left.
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
-        let c = b.op(a, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
+        let c = b.op(a, 8, Guard::Always);
         b.out(c);
 
-        let (arena, conc) = carved(&b, &budgets());
-        let end = b.plan.nodes.len() as u32;
+        let (arena, conc) = carved(&b, &budget());
+        let end = b.trace.nodes.len() as u32;
         assert_eq!(arena.spans[c.0 as usize].unwrap().last, end);
         assert!(arena.clashes(&conc).is_empty());
     }
@@ -1546,15 +1546,15 @@ mod tests {
         // 16 tokens over 4 lanes means the two reserve different amounts.
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
         let indptr = b.value(
-            Def::Op(b.plan.nodes.len() as u32),
+            Def::Op(b.trace.nodes.len() as u32),
             Ty::Tensor {
                 shape: vec![Dim::LanesPlus(1), Dim::Const(1)],
                 dtype: Dtype::I32,
             },
         );
-        b.plan.nodes.push(model_ir::Node {
+        b.trace.nodes.push(model_ir::Node {
             op: model_ir::ops::Elementwise::RmsnormNoScale {
                 x: a,
                 head_dim: 1,
@@ -1562,13 +1562,13 @@ mod tests {
                 y: indptr,
             }
             .into(),
-            cond: Cond::Always,
+            guard: Guard::Always,
             layer: None,
         });
         b.out(indptr);
 
-        let (arena, _) = carved(&b, &budgets());
-        let Slot::Arena { bytes, rows, .. } = arena.slots[indptr.0 as usize] else {
+        let (arena, _) = carved(&b, &budget());
+        let Placement::Arena { bytes, rows, .. } = arena.placements[indptr.0 as usize] else {
             panic!("the indptr is a rectangle")
         };
         assert_eq!(rows, RowExpr::LanesPlus(1));
@@ -1585,25 +1585,25 @@ mod tests {
         // regions they live in may run at once.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0)); // node 1, its own region
-        let p = b.op(q, 8, Cond::not(fact(0))); // node 2, its own region
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let p = b.op(q, 8, Guard::not(fact(0))); // node 2, its own region
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
 
-        let classes = resolve_classes(&b.plan).expect("resolves");
-        let regions = region::coalesce(&b.plan, &classes);
-        let nodes = b.plan.nodes.len();
+        let classes = resolve_classes(&b.trace).expect("resolves");
+        let regions = region::coalesce(&b.trace, &classes);
+        let nodes = b.trace.nodes.len();
         let sequential = Concurrency::sequential(&regions, nodes);
-        let shared = carve(&b.plan, &budgets(), &classes, &sequential).expect("carves");
+        let shared = carve(&b.trace, &budget(), &classes, &sequential).expect("carves");
         assert!(shared.clashes(&sequential).is_empty());
 
         // Now say regions 1 and 2 may be in flight together. The carve must
         // grow, and the sequential map must now REPORT a clash under the wider
         // relation — which is the whole reason the predicate takes it.
         let forked = Concurrency::with_pairs(&regions, nodes, [(1, 2)]);
-        let apart = carve(&b.plan, &budgets(), &classes, &forked).expect("carves");
+        let apart = carve(&b.trace, &budget(), &classes, &forked).expect("carves");
         assert!(apart.clashes(&forked).is_empty());
         assert!(
             apart.bytes >= shared.bytes,
@@ -1628,16 +1628,16 @@ mod tests {
         // about the answer may.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always); // r0
+        let q = b.op(x, 8, Guard::Always); // r0
         let d = b.op(q, 8, fact(0)); // r1
-        let p = b.op(q, 8, Cond::not(fact(0))); // r2
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always); // r3
+        let p = b.op(q, 8, Guard::not(fact(0))); // r2
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always); // r3
         b.out(y);
 
-        let classes = resolve_classes(&b.plan).expect("resolves");
-        let regions = region::coalesce(&b.plan, &classes);
-        let nodes = b.plan.nodes.len();
+        let classes = resolve_classes(&b.trace).expect("resolves");
+        let regions = region::coalesce(&b.trace, &classes);
+        let nodes = b.trace.nodes.len();
         let straight = Concurrency::with_pairs(&regions, nodes, [(1, 2)]);
 
         // The same table, rotated: r3 first, then r0, r1, r2. The pair now
@@ -1692,7 +1692,7 @@ mod tests {
         // ONE column: `Run::cut` hands each guarded node its own class's rows
         // and the two intervals never meet.
         let (b, d1, p1) = interleaved(8);
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
 
         assert_eq!(at(&arena, d1), at(&arena, p1), "one column, two windows");
         assert!(arena.co_tenants(d1, p1));
@@ -1708,7 +1708,7 @@ mod tests {
 
         // The saving is one whole column, and the carve lands on the floor.
         let one = 16 * 8 * 2;
-        assert_eq!(conservative(&b, &budgets()), 3 * one);
+        assert_eq!(conservative(&b, &budget()), 3 * one);
         assert_eq!(arena.bytes, 2 * one);
         assert_eq!(arena.bytes, arena.live_bound(), "on the floor");
     }
@@ -1719,7 +1719,7 @@ mod tests {
         // so it is live in EVERY class, and `d1` is live in one of them — the
         // masks meet, and a fire of that class has both resident at node 1.
         let (b, d1, _) = interleaved(8);
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
         let q = ValueId(1);
 
         assert!(!arena.co_tenants(q, d1));
@@ -1734,11 +1734,11 @@ mod tests {
         // land inside class 0's rows of the wide one — and the rounding hides
         // it, because 16x4 bf16 and 16x8 bf16 reserve the same 256 bytes.
         let (b, d1, p1) = interleaved(4);
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
 
         assert!(!arena.co_tenants(d1, p1));
         assert_ne!(at(&arena, d1), at(&arena, p1));
-        assert_eq!(arena.bytes, conservative(&b, &budgets()), "nothing shared");
+        assert_eq!(arena.bytes, conservative(&b, &budget()), "nothing shared");
         assert!(arena.clashes(&conc).is_empty());
     }
 
@@ -1750,16 +1750,16 @@ mod tests {
         // nothing here, and the rule has to know it.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always); // node 0
+        let q = b.op(x, 8, Guard::Always); // node 0
         let d1 = b.shaped(q, block(3, 8), fact(0)); // node 1
-        let p1 = b.shaped(q, block(3, 8), Cond::not(fact(0))); // node 2
+        let p1 = b.shaped(q, block(3, 8), Guard::not(fact(0))); // node 2
         let d2 = b.op(d1, 8, fact(0)); // node 3
-        let p2 = b.op(p1, 8, Cond::not(fact(0))); // node 4
-        let o = b.merge(&[(d2, fact(0)), (p2, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always); // node 5
+        let p2 = b.op(p1, 8, Guard::not(fact(0))); // node 4
+        let o = b.merge(&[(d2, fact(0)), (p2, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always); // node 5
         b.out(y);
 
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
         assert!(disjoint(
             &arena.live_in[d1.0 as usize],
             &arena.live_in[p1.0 as usize],
@@ -1773,19 +1773,19 @@ mod tests {
     fn a_merge_arm_is_not_a_co_tenant_because_it_is_not_a_second_rectangle() {
         // The mechanism this generalizes, kept distinct from it. An arm is
         // folded onto the merge by `fold_merges`, so there is one rectangle
-        // and the arms are `Slot::Alias` — which has no column to share and
+        // and the arms are `Placement::Alias` — which has no column to share and
         // therefore no co-tenancy to report.
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
-        let p = b.op(q, 8, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
+        let p = b.op(q, 8, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
         b.out(y);
 
-        let (arena, conc) = carved(&b, &budgets());
-        assert_eq!(arena.slots[d.0 as usize], Slot::Alias(o));
+        let (arena, conc) = carved(&b, &budget());
+        assert_eq!(arena.placements[d.0 as usize], Placement::Alias(o));
         assert!(!arena.co_tenants(d, p), "they are one rectangle already");
         assert_eq!(arena.window(d, 4, 2), arena.window(p, 4, 2));
         // The column collects both arms' classes, so IT co-tenants with
@@ -1804,11 +1804,11 @@ mod tests {
         // column and the delivery would hand back somebody else's rows.
         let mut b = Build::new();
         let x = b.input(8);
-        let s = b.op(x, 8, Cond::not(fact(0))); // node 0
+        let s = b.op(x, 8, Guard::not(fact(0))); // node 0
         let a = b.op(s, 8, fact(0)); // node 1 — the "out" seam
         b.out(a);
 
-        let (arena, conc) = carved(&b, &budgets());
+        let (arena, conc) = carved(&b, &budget());
         assert_eq!(arena.live_in[s.0 as usize].len(), 1, "one class writes it");
         assert_eq!(
             arena.live_in[a.0 as usize].len(),
@@ -1828,12 +1828,12 @@ mod tests {
         // concurrently they are written — which is why the join asks
         // `touching` and not `Concurrency::overlap`.
         let (b, d1, p1) = interleaved(8);
-        let classes = resolve_classes(&b.plan).expect("resolves");
-        let regions = region::coalesce(&b.plan, &classes);
-        let nodes = b.plan.nodes.len();
+        let classes = resolve_classes(&b.trace).expect("resolves");
+        let regions = region::coalesce(&b.trace, &classes);
+        let nodes = b.trace.nodes.len();
 
         let forked = Concurrency::with_pairs(&regions, nodes, [(1, 2), (3, 4)]);
-        let arena = carve(&b.plan, &budgets(), &classes, &forked).expect("carves");
+        let arena = carve(&b.trace, &budget(), &classes, &forked).expect("carves");
         assert_eq!(at(&arena, d1), at(&arena, p1), "still one column");
         assert!(arena.co_tenants(d1, p1));
         assert!(arena.clashes(&forked).is_empty());
@@ -1843,7 +1843,7 @@ mod tests {
     fn a_symbolic_width_is_refused_and_names_the_value() {
         let mut b = Build::new();
         let x = b.input(8);
-        let node = b.plan.nodes.len() as u32;
+        let node = b.trace.nodes.len() as u32;
         let y = b.value(
             Def::Op(node),
             Ty::Tensor {
@@ -1851,7 +1851,7 @@ mod tests {
                 dtype: Dtype::Bf16,
             },
         );
-        b.plan.nodes.push(model_ir::Node {
+        b.trace.nodes.push(model_ir::Node {
             op: model_ir::ops::Elementwise::RmsnormNoScale {
                 x,
                 head_dim: 1,
@@ -1859,17 +1859,17 @@ mod tests {
                 y,
             }
             .into(),
-            cond: Cond::Always,
+            guard: Guard::Always,
             layer: None,
         });
         b.out(y);
 
-        let classes = resolve_classes(&b.plan).expect("resolves");
-        let regions = region::coalesce(&b.plan, &classes);
-        let conc = Concurrency::sequential(&regions, b.plan.nodes.len());
+        let classes = resolve_classes(&b.trace).expect("resolves");
+        let regions = region::coalesce(&b.trace, &classes);
+        let conc = Concurrency::sequential(&regions, b.trace.nodes.len());
         assert_eq!(
-            carve(&b.plan, &budgets(), &classes, &conc),
-            Err(Refusal::Unrectangled {
+            carve(&b.trace, &budget(), &classes, &conc),
+            Err(Error::Unrectangled {
                 value: y,
                 why: Unrectangled::SymbolicWidth,
             }),
@@ -1883,16 +1883,16 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(8);
         let d = b.op(x, 8, fact(0));
-        let p = b.op(x, 4, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
+        let p = b.op(x, 4, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
         b.out(o);
 
-        let classes = resolve_classes(&b.plan).expect("resolves");
-        let regions = region::coalesce(&b.plan, &classes);
-        let conc = Concurrency::sequential(&regions, b.plan.nodes.len());
+        let classes = resolve_classes(&b.trace).expect("resolves");
+        let regions = region::coalesce(&b.trace, &classes);
+        let conc = Concurrency::sequential(&regions, b.trace.nodes.len());
         assert_eq!(
-            carve(&b.plan, &budgets(), &classes, &conc),
-            Err(Refusal::Mismatch {
+            carve(&b.trace, &budget(), &classes, &conc),
+            Err(Error::Mismatch {
                 kind: Share::MergeArm,
                 holds: o,
                 shares: p,
@@ -1906,13 +1906,13 @@ mod tests {
         // invariant notices. A reused slab does not fault when it is wrong.
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
-        let c = b.op(a, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
+        let c = b.op(a, 8, Guard::Always);
         b.out(c);
 
-        let (mut arena, conc) = carved(&b, &budgets());
+        let (mut arena, conc) = carved(&b, &budget());
         assert!(arena.clashes(&conc).is_empty());
-        if let Slot::Arena { offset, .. } = &mut arena.slots[c.0 as usize] {
+        if let Placement::Arena { offset, .. } = &mut arena.placements[c.0 as usize] {
             *offset = 0;
         }
         assert_eq!(arena.clashes(&conc), vec![(a, c)]);

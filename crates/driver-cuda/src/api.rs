@@ -8,7 +8,7 @@
 //! [`Driver`] is the other shape: a caller opens a driver first
 //! (`engine::driver::backend::open::cuda`, from a boot config that has no
 //! model in it), registers it, and only then calls
-//! [`Driver::load`] with a traced `Plan`. There is no `Shell` to have a
+//! [`Driver::load`] with a traced `Trace`. There is no `Shell` to have a
 //! `Driver` impl on until the verb that makes one has been called.
 //!
 //! So [`Cuda`] is a `Shell` that has not happened yet: the device knobs a
@@ -18,7 +18,7 @@
 //!
 //! # The contract the wrapper cannot state, and how it is supplied
 //!
-//! [`LoadRequest`] carries `{ plan, checkpoint, budgets, ordinal }` and NOT a
+//! [`LoadRequest`] carries `{ trace, checkpoint, budgets, ordinal }` and NOT a
 //! `ModelContract` — deliberately, because `driver-api`'s dependency floor is
 //! `model-ir`, `tensor-ir`, `serde`, `thiserror` (its own header), and a
 //! contract type in it would put `model-loader` in the graph of everyone who
@@ -32,8 +32,8 @@
 //! ```text
 //!   engine (links `model`)                     driver-cuda (links no family)
 //!   ----------------------                     -----------------------------
-//!   fn contract_for(plan, path) -> Contract ──▶ Cuda::new(boot, contract_for)
-//!     model::import_of(plan.name)                  … load(request) calls it
+//!   fn contract_for(trace, path) -> Contract ──▶ Cuda::new(boot, contract_for)
+//!     model::import_of(trace.name)                  … load(request) calls it
 //! ```
 //!
 //! One pointer, resolved by the party that already links the catalog, and no
@@ -64,8 +64,8 @@ use driver::driver_api::program::{
 };
 use driver::driver_api::transfer::MemoryDomain;
 use driver::driver_api::Driver;
-use model_compiler::{Budgets, DeviceProfile};
-use model_ir::Plan;
+use model_compiler::{Budget, DeviceProfile};
+use model_ir::Trace;
 use model_loader::contract::ModelContract;
 use driver::driver_api::tensor_ir::registry::{GeometryClass, ModelProfile, PortMask};
 use driver::driver_api::tensor_ir::types::DType;
@@ -81,7 +81,7 @@ use crate::serve::{Attached, Boot, Graphs, Lane, Seated, Shell};
 /// this crate must not know a model family, so the party that links the
 /// catalog supplies the lookup.
 pub type ContractFor =
-    fn(&Plan, &Path) -> std::result::Result<ModelContract, String>;
+    fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
 /// The device knobs a boot config states, before any model is loaded.
 ///
@@ -286,13 +286,13 @@ fn extents(stated: &BindExtents) -> driver::Extents {
 
 /// The ceilings the compiler bakes against, out of the ones the load states.
 ///
-/// The contract carries seven numbers and `model_compiler::Budgets` takes
+/// The contract carries seven numbers and `model_compiler::Budget` takes
 /// four; the other three (`page_size`, `max_context`, `slots`) are the POOLS'
 /// and go to `Boot` directly. Converted in one place, which is the whole
-/// reason `driver-api` states its own `Budgets` rather than depending on the
+/// reason `driver-api` states its own `Budget` rather than depending on the
 /// compiler (`load.rs`'s note).
-fn bake_budgets(budgets: &LoadBudgets) -> Budgets {
-    Budgets {
+fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+    Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
@@ -309,8 +309,8 @@ fn bake_budgets(budgets: &LoadBudgets) -> Budgets {
 /// the width of the `out` seam — so there is one copy and nothing to keep in
 /// step.
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> DriverResult<ModelProfile> {
-    let plan = shell.plan();
-    let layers = plan
+    let trace = shell.trace();
+    let layers = trace
         .nodes
         .iter()
         .filter_map(|node| node.layer)
@@ -393,7 +393,7 @@ impl Driver for Cuda {
             ));
         }
         let LoadRequest {
-            plan,
+            trace,
             checkpoint,
             budgets,
             ordinal,
@@ -412,13 +412,13 @@ impl Driver for Cuda {
             ));
         };
         let path = PathBuf::from(path);
-        let contract = (self.contract_for)(&plan, &path).map_err(DriverError::Load)?;
+        let contract = (self.contract_for)(&trace, &path).map_err(DriverError::Load)?;
 
         let shell = Shell::load(Boot {
-            plan,
+            trace,
             contract: &contract,
             checkpoint: &path,
-            budgets: bake_budgets(&budgets),
+            budget: bake_budgets(&budgets),
             // `None` takes this device's measured SM count. Costs are input,
             // not knowledge (design §6): a deployment that has measured its
             // own would state them, and one that has not still bakes
@@ -436,7 +436,7 @@ impl Driver for Cuda {
         })
         .map_err(fault)?;
 
-        let plan_name = shell.plan().name.clone();
+        let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let paging = shell.paging();
         let profile = profile(&shell, &budgets)?;
@@ -471,7 +471,7 @@ impl Driver for Cuda {
                 state_slots: paging.slots,
                 state_slot_bytes: 0,
                 // `palo C2`: what the LOAD actually seats, read off the plan
-                // rather than off the request. `Budgets::max_adapters` is what
+                // rather than off the request. `Budget::max_adapters` is what
                 // the deployment asked for and `compile` already refused a
                 // plan that could not seat it; this is the answer, which is
                 // the smallest capacity any one bank of this model declares —
@@ -529,7 +529,7 @@ impl Driver for Cuda {
         self.caps = Some(caps.clone());
         Ok(Loaded {
             facts: LoadFacts {
-                plan_name,
+                trace_name,
                 weight_bytes,
                 arena_bytes,
                 pool_bytes,
@@ -719,6 +719,35 @@ impl Driver for Cuda {
             });
         }
         Ok(FireTicket { id, readouts })
+    }
+
+    /// The contract's advisory, landed on [`Shell::expect`]: the fold's
+    /// prebind seam (`.wiki/palo/cuda-abi.md` §6d) applies the hinted
+    /// composition's cached binding to an exec that is not in flight, after
+    /// the next fire's launch and before its sync.
+    ///
+    /// Only the composition crosses — `Shell::expect` reads each lane's
+    /// `word` and `tokens.len()` and nothing else, so the borrow of the
+    /// token vectors here is a shape statement, not a content one. Nothing
+    /// of `fire`'s validation runs: a hint the artifact cannot compose is
+    /// dropped inside `expect` (the fire that actually submits it will say
+    /// why), and a hint before a load has no shell to warm and warms
+    /// nothing — both are the advisory contract's "a wrong hint costs only
+    /// the hidden work", not errors.
+    fn expect_fire(&mut self, submission: &FireSubmission) {
+        let Ok(shell) = self.loaded_mut() else {
+            return;
+        };
+        let lanes: Vec<Lane<'_>> = submission
+            .lanes
+            .iter()
+            .map(|lane| Lane {
+                slot: lane.slot,
+                word: lane.word,
+                tokens: &lane.tokens,
+            })
+            .collect();
+        shell.expect(&lanes);
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> DriverResult<ProgramId> {

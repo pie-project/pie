@@ -450,7 +450,7 @@ pub use driver_api::Capabilities as DriverCapabilities;
 ///
 /// **THIS IS WHERE `ModelLoadDesc` WENT.** Its four fields said nothing this
 /// does not: `snapshot_dir` is [`Checkpoint::Path`](driver_api::Checkpoint),
-/// `component` is which `Plan` you hand over, and `runtime_quant`/`mxfp4_moe`
+/// `component` is which `Trace` you hand over, and `runtime_quant`/`mxfp4_moe`
 /// were a quantization word and a MoE lowering name that a backend
 /// string-matched — the plan's params carry their own dtypes, and which
 /// kernel answers an op is the dispatch arm's decision (design §6). What is
@@ -1032,7 +1032,7 @@ mod tests {
     // on a load request, `MediaEncodePlan` with a completion to await, the
     // executor server it stood one up through, and `KvDtype` — and the thing
     // it was waiting for (component-scoped loading) is now a different
-    // question entirely: an encoder is a traced `Plan`, and the catalog ships
+    // question entirely: an encoder is a traced `Trace`, and the catalog ships
     // none. `embedded_driver::land` refuses a non-`Full` component by name,
     // which is the statement this test was keeping alive.
 

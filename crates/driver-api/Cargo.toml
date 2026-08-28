@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # optional surface is a contract that means the same thing to every reader.
 
 [dependencies]
-# Decision 18: the ENGINE traces, `Plan` crosses the boundary, `Baked` never
+# Decision 18: the ENGINE traces, `Plan` crosses the boundary, `CompiledModel` never
 # does. So the contract's load request carries a `model_ir::Plan` verbatim and
 # the shell does its own `compile`. The second reason this edge exists is
 # decision 1: `model_ir::Dtype` is THE dtype of a model-plane value, and the

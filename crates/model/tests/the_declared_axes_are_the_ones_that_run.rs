@@ -29,9 +29,9 @@
 
 use std::collections::BTreeSet;
 
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::{
-    Attention, Operands, Operation, Param, ParamSource, Plan, Platform, ValueId, resolve_classes,
+    Attention, Operands, Operation, Param, ParamSource, Trace, Platform, ValueId, resolve_classes,
 };
 
 /// Every platform a plan can be traced at: a model text may emit a different op
@@ -53,15 +53,15 @@ const CAPTURING: &str = "qwen35-d0.8b-bf16-kv-bf16";
 /// `drafts` and `captures_scores`, as bits of a lane's word.
 const NEW_BITS: u64 = (1 << 2) | (1 << 3);
 
-fn budgets_for(plan: &Plan) -> Budgets {
-    let seats = plan
+fn budgets_for(trace: &Trace) -> Budget {
+    let seats = trace
         .params
         .iter()
         .filter(|p: &&Param| p.source == ParamSource::Registered)
         .map(|p| p.shape.first().copied().unwrap_or(0))
         .min()
         .unwrap_or(0);
-    Budgets {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -71,7 +71,7 @@ fn budgets_for(plan: &Plan) -> Budgets {
     }
 }
 
-fn plan_of(sku: &str, platform: Platform) -> Plan {
+fn trace_of(sku: &str, platform: Platform) -> Trace {
     let trace = model::trace_of(sku).unwrap_or_else(|| panic!("this build ships `{sku}`"));
     trace(platform)
 }
@@ -80,8 +80,8 @@ fn plan_of(sku: &str, platform: Platform) -> Plan {
 /// `attn.qv` names two, and `attn.scores` names one PER LAYER — but the two
 /// whole-fire export seams name one each, and a second would mean the text
 /// changed under the test.
-fn exported(plan: &Plan, seam: &str) -> ValueId {
-    let mut found: Vec<ValueId> = plan
+fn exported(trace: &Trace, seam: &str) -> ValueId {
+    let mut found: Vec<ValueId> = trace
         .seams
         .iter()
         .filter(|s| s.seam == seam)
@@ -108,17 +108,17 @@ fn exported(plan: &Plan, seam: &str) -> ValueId {
 fn a_drafting_lane_lands_in_a_class_that_runs_the_draft_head() {
     let classify = model::classify_of(DRAFTING).expect("and its classifier");
     for platform in PLATFORMS {
-        let plan = plan_of(DRAFTING, platform);
-        let classes = resolve_classes(&plan).expect("the qwen36 plan resolves every merge");
+        let trace = trace_of(DRAFTING, platform);
+        let classes = resolve_classes(&trace).expect("the qwen36 plan resolves every merge");
 
         // Which cache index is the head's own row.
-        let head_cache = plan
+        let head_cache = trace
             .caches
             .iter()
             .position(|row| matches!(row, model_dsl::CacheRow::Kv { name, .. } if name == "kv.mtp"))
             .unwrap_or_else(|| panic!("{platform:?}: the draft head declares no kv row"))
             as u32;
-        let head_pages = plan
+        let head_pages = trace
             .values
             .iter()
             .position(|v| v.def == model_dsl::Def::Cache(head_cache))
@@ -126,7 +126,7 @@ fn a_drafting_lane_lands_in_a_class_that_runs_the_draft_head() {
             as u32;
 
         let runs_the_head = |class: usize| {
-            plan.nodes
+            trace.nodes
                 .iter()
                 .zip(&classes.node_mask)
                 .any(|(node, mask)| {
@@ -178,12 +178,12 @@ fn a_capturing_lane_lands_in_a_class_that_runs_the_lse_attention() {
     let classify = model::classify_of(CAPTURING).expect("this build ships the qwen row");
 
     for platform in PLATFORMS {
-        let plan = plan_of(CAPTURING, platform);
-        let classes = resolve_classes(&plan).expect("the qwen plan resolves every merge");
+        let trace = trace_of(CAPTURING, platform);
+        let classes = resolve_classes(&trace).expect("the qwen plan resolves every merge");
 
         let kernels = |class: usize| -> (bool, bool, bool) {
             let (mut lse, mut decode, mut prefill) = (false, false, false);
-            for (node, mask) in plan.nodes.iter().zip(&classes.node_mask) {
+            for (node, mask) in trace.nodes.iter().zip(&classes.node_mask) {
                 if !mask.contains(class) {
                     continue;
                 }
@@ -256,7 +256,7 @@ fn a_capturing_lane_lands_in_a_class_that_runs_the_lse_attention() {
 fn the_draft_readout_outlives_the_trunk_readout() {
     for sku in [DRAFTING, CAPTURING] {
         for platform in PLATFORMS {
-            let plan = plan_of(sku, platform);
+            let trace = trace_of(sku, platform);
             // Every value on every export seam, in the order the plan states
             // them — `EXPORT_SEAMS` is the compiler's own list, so a name that
             // stopped taking the tail stops being asked about here too, which
@@ -264,7 +264,7 @@ fn the_draft_readout_outlives_the_trunk_readout() {
             let exports: Vec<(&str, ValueId)> = model_compiler::EXPORT_SEAMS
                 .iter()
                 .flat_map(|name| {
-                    plan.seams
+                    trace.seams
                         .iter()
                         .filter(move |s| s.seam == *name)
                         .flat_map(move |s| s.values.iter().map(move |v| (*name, *v)))
@@ -278,18 +278,18 @@ fn the_draft_readout_outlives_the_trunk_readout() {
             // The two WHOLE-FIRE exports name one value each — one trunk
             // readout, one draft readout — and `exported` panics if either
             // ever names two.
-            let out = exported(&plan, "out");
+            let out = exported(&trace, "out");
             assert!(exports.contains(&("out", out)));
             if sku == DRAFTING {
-                let draft = exported(&plan, "mtp");
+                let draft = exported(&trace, "mtp");
                 assert!(
                     exports.contains(&("mtp", draft)),
                     "`{sku}` is the SKU whose checkpoint publishes a draft head"
                 );
             }
 
-            let baked = compile(&plan, &budgets_for(&plan), &DeviceProfile::default())
-                .unwrap_or_else(|why| panic!("`{sku}` as {platform:?}: {}", why.say(&plan)));
+            let compiled = compile(&trace, &budgets_for(&trace), &DeviceProfile::default())
+                .unwrap_or_else(|why| panic!("`{sku}` as {platform:?}: {}", why.say(&trace)));
 
             for (i, (a_name, a)) in exports.iter().enumerate() {
                 for (b_name, b) in &exports[i + 1..] {
@@ -299,7 +299,7 @@ fn the_draft_readout_outlives_the_trunk_readout() {
                          export and the `{b_name}` one"
                     );
                     assert!(
-                        !baked.arena.co_tenants(*a, *b),
+                        !compiled.arena.co_tenants(*a, *b),
                         "`{sku}` as {platform:?}: the `{a_name}` export (value {}) \
                          and the `{b_name}` export (value {}) share bytes, so \
                          whichever the graph writes second clobbers the other \
@@ -327,17 +327,17 @@ fn the_draft_readout_outlives_the_trunk_readout() {
 #[test]
 fn a_mid_plan_export_lives_to_the_end_of_the_fire() {
     for platform in PLATFORMS {
-        let plan = plan_of(CAPTURING, platform);
-        let end = plan.nodes.len() as u32;
-        let baked = compile(&plan, &budgets_for(&plan), &DeviceProfile::default())
-            .unwrap_or_else(|why| panic!("{platform:?}: {}", why.say(&plan)));
+        let trace = trace_of(CAPTURING, platform);
+        let end = trace.nodes.len() as u32;
+        let compiled = compile(&trace, &budgets_for(&trace), &DeviceProfile::default())
+            .unwrap_or_else(|why| panic!("{platform:?}: {}", why.say(&trace)));
 
         let mut seen = 0usize;
-        for seam in plan.seams.iter().filter(|s| s.seam == "attn.scores") {
+        for seam in trace.seams.iter().filter(|s| s.seam == "attn.scores") {
             for value in &seam.values {
                 seen += 1;
-                let root = baked.arena.root(*value);
-                let span = baked.arena.spans[root.0 as usize]
+                let root = compiled.arena.root(*value);
+                let span = compiled.arena.spans[root.0 as usize]
                     .unwrap_or_else(|| panic!("{platform:?}: export {} has no span", value.0));
                 assert!(
                     span.first < end,
@@ -404,7 +404,7 @@ fn a_mid_plan_export_lives_to_the_end_of_the_fire() {
 /// budget's ceiling by every load of a SKU whose text declares a capture arm,
 /// and it is 0.04–0.13% of these carves.
 ///
-/// **NODES RUN, NOT NODES DECLARED.** The capture schedule is a `Cond::Always`
+/// **NODES RUN, NOT NODES DECLARED.** The capture schedule is a `Guard::Always`
 /// prepare node, so it is LIVE in every class; demand narrows it to the
 /// classes that read its struct, and the old classes do not (build log 7).
 /// That is the difference between 486 and 485, and asking about `node_mask`
@@ -421,8 +421,8 @@ fn the_new_axes_cost_the_old_words_nothing() {
 
     for (sku, was_classes, was_nodes, was_arena) in BEFORE {
         for platform in PLATFORMS {
-            let plan = plan_of(sku, platform);
-            let classes = resolve_classes(&plan).expect("the plan resolves every merge");
+            let trace = trace_of(sku, platform);
+            let classes = resolve_classes(&trace).expect("the plan resolves every merge");
 
             // The classes a lane that set neither new fact can compose as.
             let old: Vec<usize> = (0..classes.classes.len())
@@ -442,7 +442,7 @@ fn the_new_axes_cost_the_old_words_nothing() {
                 old.len(),
             );
 
-            let run: BTreeSet<usize> = plan
+            let run: BTreeSet<usize> = trace
                 .nodes
                 .iter()
                 .enumerate()
@@ -457,14 +457,14 @@ fn the_new_axes_cost_the_old_words_nothing() {
                 run.len(),
             );
 
-            let baked = compile(&plan, &budgets_for(&plan), &DeviceProfile::default())
-                .unwrap_or_else(|why| panic!("`{sku}` as {platform:?}: {}", why.say(&plan)));
+            let compiled = compile(&trace, &budgets_for(&trace), &DeviceProfile::default())
+                .unwrap_or_else(|why| panic!("`{sku}` as {platform:?}: {}", why.say(&trace)));
             assert_eq!(
-                baked.arena.bytes, was_arena,
+                compiled.arena.bytes, was_arena,
                 "`{sku}` as {platform:?}: the carve is {} bytes and used to be \
                  {was_arena}; the capture columns' delivery tail is a known \
                  `layers × max_tokens × heads × 4` and nothing else may move",
-                baked.arena.bytes,
+                compiled.arena.bytes,
             );
         }
     }
@@ -484,14 +484,14 @@ fn the_new_axes_cost_the_old_words_nothing() {
 fn every_export_is_demanded_and_nothing_else_is_dead() {
     for sku in [DRAFTING, CAPTURING] {
         for platform in PLATFORMS {
-            let plan = plan_of(sku, platform);
-            let classes = resolve_classes(&plan).expect("the plan resolves every merge");
+            let trace = trace_of(sku, platform);
+            let classes = resolve_classes(&trace).expect("the plan resolves every merge");
             assert!(
                 classes.dead.is_empty(),
                 "`{sku}` as {platform:?}: {} node(s) are demanded in no class — \
                  first is `{}`",
                 classes.dead.len(),
-                plan.nodes[classes.dead[0] as usize].op.name(),
+                trace.nodes[classes.dead[0] as usize].op.name(),
             );
         }
     }

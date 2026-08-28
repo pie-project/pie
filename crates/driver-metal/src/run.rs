@@ -37,7 +37,7 @@ pub enum WeightRow {
     Planes { codes: Tensor, scales: Tensor },
 }
 
-/// Loader-resolved weights, one row per `Plan::params` entry —
+/// Loader-resolved weights, one row per `Trace::params` entry —
 /// `Def::Weight(i)` resolves to row `i`. `None` marks a param the shell has
 /// not bound; resolving such a row is a binding bug and panics.
 #[derive(Clone, Debug, Default)]
@@ -61,7 +61,7 @@ pub enum CachePool {
     Recurrent(RecurrentPool),
 }
 
-/// Cache-index-indexed pools, aligned with `Plan::caches`.
+/// Cache-index-indexed pools, aligned with `Trace::caches`.
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable(pub Vec<CachePool>);
 
@@ -147,7 +147,7 @@ pub struct FireBindings {
     /// token — also the plan builders' causal-bound table.
     pub positions: Tensor,
 
-    /// Per cache space, aligned with `Plan::caches`:
+    /// Per cache space, aligned with `Trace::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space.
     pub geometry: Vec<CacheGeometry>,
 
@@ -188,7 +188,7 @@ pub struct Run<'c> {
     /// buffer and an offset, so there is no address to add a row stride to.
     handles: &'c Handles,
 
-    /// The routing: `Plan::values`, read by [`Run::tensor`] to send each id
+    /// The routing: `Trace::values`, read by [`Run::tensor`] to send each id
     /// to its table.
     values: &'c [ValueDecl],
 
@@ -557,7 +557,7 @@ impl<'c> Run<'c> {
 
     /// The `StructKind` a plan op's output value declares — how the
     /// plan-building arms check the trace against what this plane can build:
-    /// the trace wrote the choice into `Plan::values`, the arm only follows
+    /// the trace wrote the choice into `Trace::values`, the arm only follows
     /// it.
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {

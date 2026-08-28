@@ -1,23 +1,23 @@
 //! `LoadRequest` in, `Loaded` out — the one door a model comes through.
 //!
-//! # The `Plan` crosses; `Baked` never does (decision 18)
+//! # The `Trace` crosses; `CompiledModel` never does (decision 18)
 //!
 //! The ENGINE traces the model. It links `model` anyway — `Classify::of` runs
 //! per lane on the fire path to compute [`Lane::word`](crate::fire::Lane::word)
 //! — so the supergraph is already in its address space, and handing it across
 //! costs a `serde` round trip a remote driver was going to need regardless.
 //!
-//! What does NOT cross is `model_compiler::Baked`: the region template, the
+//! What does NOT cross is `model_compiler::CompiledModel`: the region template, the
 //! class table, the arena carve. Those are the SHELL's, produced by
-//! `compile(plan, budgets, profile)` on the far side of this boundary, because
+//! `compile(trace, budgets, profile)` on the far side of this boundary, because
 //! they are answers about a device the engine does not have. The consequence
-//! is the one the design wants: a remote driver is a `serde`-able `Plan` on a
+//! is the one the design wants: a remote driver is a `serde`-able `Trace` on a
 //! socket and nothing else, and the compiler never has to be portable.
 //!
 //! ```text
 //!  engine                          |  shell
 //!  ------                          |  -----
-//!  model/ forward -> Plan  --------|--> compile(plan, budgets, profile) -> Baked
+//!  model/ forward -> Trace  --------|--> compile(trace, budgets, profile) -> CompiledModel
 //!  Classify::of(req) -> word       |    record one graph per bucket
 //!                                  |    land the checkpoint
 //!  FireSubmission{lanes} ----------|--> compose -> walk -> replay
@@ -38,7 +38,7 @@
 //!   name. Which kernel answers an op is the dispatch arm's decision (design
 //!   §6), and the axis it was really selecting is a model-declared one.
 //! * `component: ModelComponent{Full,Text,Encode}` — WHICH graph to load, by
-//!   enum. It is now which `Plan` you hand over: the encoder is a traced plan
+//!   enum. It is now which `Trace` you hand over: the encoder is a traced plan
 //!   like any other, and `Vec<ModelLoadDesc>` collapses to one request per
 //!   plan.
 
@@ -50,13 +50,13 @@ use crate::caps::Capabilities;
 
 /// The ceilings a load is baked against.
 ///
-/// The same four numbers `model_compiler::Budgets` states, carried across the
+/// The same four numbers `model_compiler::Budget` states, carried across the
 /// boundary because the compile happens on the far side of it and a shell that
 /// invented its own ceilings would bake a graph the engine cannot fill.
 ///
 /// A duplicate spelling is exactly what decision 1 kills, so this is written
 /// once here and converted by the shell in one place — the alternative,
-/// `driver-api` depending on `model-compiler`, would put `Baked` in the
+/// `driver-api` depending on `model-compiler`, would put `CompiledModel` in the
 /// dependency graph of `transport` and `controller-api`, which is the edge
 /// decision 18 exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +100,7 @@ pub enum Checkpoint {
     /// A snapshot directory, or one container file.
     Path(PathBuf),
     /// No weights: bind the device and bake the plan, but land nothing. What a
-    /// shape-only smoke test loads, and what makes a `Baked` inspectable
+    /// shape-only smoke test loads, and what makes a `CompiledModel` inspectable
     /// without a checkpoint on the machine.
     None,
 }
@@ -109,7 +109,7 @@ pub enum Checkpoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadRequest {
     /// The traced supergraph. The engine traces it (decision 18).
-    pub plan: model_ir::Plan,
+    pub trace: model_ir::Trace,
     /// Where the weights are.
     pub checkpoint: Checkpoint,
     /// The ceilings every fire is baked against.
@@ -131,8 +131,8 @@ pub struct Loaded {
 /// What came of a load, as numbers a caller can log and act on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadFacts {
-    /// The plan's own name, as the model text declared it.
-    pub plan_name: String,
+    /// The trace's own name, as the model text declared it.
+    pub trace_name: String,
     /// Bytes the weight tables occupy on the device.
     pub weight_bytes: u64,
     /// Bytes the activation arena occupies.

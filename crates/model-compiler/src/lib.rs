@@ -1,4 +1,4 @@
-//! Bakes a traced `Plan` once, into the artifact a driver records and replays
+//! Bakes a traced `Trace` once, into the artifact a driver records and replays
 //! forever (palo design §2).
 //!
 //! > model/ declares a supergraph, model-compiler bakes it once, the driver
@@ -28,11 +28,11 @@
 //!                prepare half hoisted in front of the capture half (§5)
 //! P6 streams     dep DAG over capture regions -> fork/join events
 //! P7 arena       liveness carve; offsets fully static
-//! P8 emit        Baked
+//! P8 emit        CompiledModel
 //! ```
 //!
 //! **Everything but P8 is here.** The seam P8 will fill is TYPED rather than
-//! stubbed; see the module docs on [`Baked`] for the four design §2 fields
+//! stubbed; see the module docs on [`CompiledModel`] for the four design §2 fields
 //! that belong to it and why an empty one would be a claim rather than a gap.
 //!
 //! P3 ships whole (see [`lowering`]) and chooses ONE region on today's whole
@@ -56,36 +56,37 @@
 //! P4 ships the C1P instance whole (see [`layout`]): a real PQ-tree over the
 //! plan's classes, the feasible SET rather than one witness ordering, so that
 //! the fire path's stability pick has something to ask. What it does not yet
-//! do is ask — [`LayoutOrder::class_order`] takes last fire's order and
+//! do is ask — [`ClassOrder::class_order`] takes last fire's order and
 //! ignores it — and it withdraws the last conflicting constraint rather than
 //! the cheapest one, which is where a Tucker certificate goes.
 //!
 
 pub mod arena;
-pub mod baked;
+pub mod compiled;
 pub mod budget;
 pub mod layout;
 pub mod lowering;
-pub mod refusal;
+pub mod error;
+mod pq;
 mod region;
 pub mod stream;
 
 #[cfg(test)]
 mod fixture;
 
-use model_ir::{Classes, Def, Operands, Operation, Plan, Ty, resolve_classes};
+use model_ir::{ClassTable, Def, Operands, Operation, Trace, Ty, resolve_classes};
 
-pub use arena::{ArenaMap, Concurrency, EXPORT_SEAMS, RowExpr, Slot, Span, Window};
-pub use baked::{
-    Baked, EventId, Fallback, FallbackRow, FallbackTable, LayoutOrder, Lowering, Phase, Region,
+pub use arena::{ArenaMap, Concurrency, EXPORT_SEAMS, RowExpr, Placement, Span, Extent};
+pub use compiled::{
+    CompiledModel, EventId, Fallback, FallbackRow, FallbackTable, ClassOrder, Lowering, Phase, Region,
 };
-pub use budget::{Budgets, DeviceProfile, FamilyCosts};
-pub use layout::PqTree;
-pub use stream::Forks;
-pub use refusal::{Refusal, Share, Unrectangled};
+pub use budget::{Budget, DeviceProfile, FamilyCosts};
+pub use pq::PqTree;
+pub use stream::StreamPlan;
+pub use error::{Error, Share, Unrectangled};
 
 /// The fact ceiling. The class sweep is `2^F`, and past 20 it stops being a
-/// sweep — the same number `Cond::simplified` and `resolve_classes` state.
+/// sweep — the same number `Guard::simplified` and `resolve_classes` state.
 ///
 /// `F` is what `model_ir::fact_width` reads off the plan's own guards, which
 /// is the number `resolve_classes` would then assert on. A plan that computes
@@ -98,21 +99,21 @@ const MAX_FACTS: usize = 20;
 ///
 /// # Errors
 ///
-/// [`Refusal`], which names the reason and refuses the load. That is the
+/// [`Error`], which names the reason and refuses the load. That is the
 /// rewrite's doctrine kept whole: **no silent fallback.** A plan whose merges
 /// do not cover their classes, whose budgets describe no fire, or whose values
 /// have no rectangle is a load that does not happen — not a graph that is
 /// quietly missing a window and computes anyway.
-pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<Baked, Refusal> {
+pub fn compile(trace: &Trace, budget: &Budget, profile: &DeviceProfile) -> Result<CompiledModel, Error> {
     // P0. The compiler is the front door, so every ceiling the utilities
     // downstream ASSERT is checked here first and answered as a refusal: a
     // panic in a load path takes the process with it.
-    accept(plan, budgets, profile)?;
+    accept(trace, budget, profile)?;
 
     // P0 + P1, one walk. The model test suite calls the same function at
     // authoring time for the author's sake; here it is the accept pass and the
     // class table at once, and neither side pays for the other (decision #7).
-    let classes = resolve_classes(plan).map_err(Refusal::Classes)?;
+    let classes = resolve_classes(trace).map_err(Error::Classes)?;
 
     // P1's acceptance half: a `Struct` value's readers must share the window
     // it was built in. It is asked off `node_mask` — the sweep's own answer,
@@ -122,10 +123,10 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // asks it in the same vocabulary against `resolve_classes` alone, which
     // is the earliest and cheapest instant a straddling model text can be
     // told; this is the front door's own restatement, on the load path.
-    struct_readers_share_one_window(plan, &classes)?;
+    struct_readers_share_one_window(trace, &classes)?;
 
     // P5 then P2: phase per node, then maximal runs of equal (mask, phase).
-    let mut regions = region::coalesce(plan, &classes);
+    let mut regions = region::coalesce(trace, &classes);
 
     // P5's second half: THE PREPARE HALF RUNS FIRST, WHOLE (design §5). A
     // model text may state its plan builds anywhere it likes — qwen3.6 states
@@ -134,7 +135,7 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // the artifact carries a host op standing after the graph reads its slot.
     // It runs HERE, before P3, so that every pass below reads one region table
     // and no pass has to know that a second order exists.
-    region::hoist(plan, &mut regions)?;
+    region::hoist(trace, &mut regions)?;
 
     // P3. Which regions enter the graph behind a conditional node — and P6
     // below reads the answer, because `stream::forkable` refuses to fork one
@@ -142,18 +143,18 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // rather than a preference: a conditional body is a child graph and a
     // fork's event pair is an edge inside one parent graph, so an arm that
     // was both is a dependency that cannot be expressed (see [`lowering`]).
-    lowering::lower(plan, &mut regions, &classes, budgets, profile);
+    lowering::lower(trace, &mut regions, &classes, budget, profile);
 
     // P6. The dep DAG over the capture regions, the cost gate, the streams
     // and the event points — stamped into `regions` in place, because a fork
     // is a property OF a region rather than a second schedule beside it. What
     // comes back is the relation the carve is widened by, and P7 below is the
     // pass that was written waiting for it.
-    let forks = stream::fork(plan, &mut regions, profile);
-    let concurrency = if forks.pairs.is_empty() {
-        Concurrency::sequential(&regions, plan.nodes.len())
+    let streams = stream::fork(trace, &mut regions, profile);
+    let concurrency = if streams.pairs.is_empty() {
+        Concurrency::sequential(&regions, trace.nodes.len())
     } else {
-        Concurrency::with_pairs(&regions, plan.nodes.len(), forks.pairs.iter().copied())
+        Concurrency::with_pairs(&regions, trace.nodes.len(), streams.pairs.iter().copied())
     };
 
     // P4. The C1P instance is read off the region table, so it runs after P2
@@ -161,20 +162,20 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // rather than the bytes, so it owes the carve nothing and the carve owes
     // it nothing. What it decides is the order a fire seriates its rows in,
     // which is arithmetic on the descriptor, not an offset.
-    let (order, fallback) = layout::seriate(plan, &regions, &classes, budgets, profile);
+    let (order, fallback) = layout::seriate(trace, &regions, &classes, budget, profile);
 
     // P7. The carve is the pass with something to get wrong, and
     // `ArenaMap::clashes` is what says it did not.
-    let arena = arena::carve(plan, budgets, &classes, &concurrency)?;
+    let arena = arena::carve(trace, budget, &classes, &concurrency)?;
 
-    Ok(Baked {
+    Ok(CompiledModel {
         classes,
         regions,
         order,
         fallback,
         arena,
         concurrency,
-        forks,
+        streams,
     })
 }
 
@@ -191,36 +192,36 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
 /// carried forward, [`Region::collective`], and the rule it enforces is P3's:
 /// a region carrying one stays always-launch. Stating it as a refusal instead
 /// would refuse plans that are perfectly legal today.
-fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(), Refusal> {
-    let facts = model_ir::fact_width(plan);
+fn accept(trace: &Trace, budget: &Budget, profile: &DeviceProfile) -> Result<(), Error> {
+    let facts = model_ir::fact_width(trace);
     if facts > MAX_FACTS {
-        return Err(Refusal::TooManyFacts { facts });
+        return Err(Error::TooManyFacts { facts });
     }
 
-    if budgets.max_lanes == 0 {
-        return Err(Refusal::Budget {
+    if budget.max_lanes == 0 {
+        return Err(Error::Budget {
             what: "admit no lanes, so no fire can be assembled",
         });
     }
-    if budgets.max_tokens == 0 {
-        return Err(Refusal::Budget {
+    if budget.max_tokens == 0 {
+        return Err(Error::Budget {
             what: "admit no token rows, so every rectangle is empty",
         });
     }
-    if budgets.max_lanes > budgets.max_tokens {
-        return Err(Refusal::Budget {
+    if budget.max_lanes > budget.max_tokens {
+        return Err(Error::Budget {
             what: "admit more lanes than token rows, and a lane carries at least one row",
         });
     }
     let mut previous = 0u32;
-    for &bucket in &budgets.buckets {
+    for &bucket in &budget.buckets {
         if bucket <= previous {
-            return Err(Refusal::Budget {
+            return Err(Error::Budget {
                 what: "list a bucket lattice that does not strictly ascend",
             });
         }
-        if bucket > budgets.max_tokens {
-            return Err(Refusal::Budget {
+        if bucket > budget.max_tokens {
+            return Err(Error::Budget {
                 what: "list a bucket past the token ceiling",
             });
         }
@@ -228,7 +229,7 @@ fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(),
     }
 
     if profile.sms == 0 {
-        return Err(Refusal::Profile {
+        return Err(Error::Profile {
             what: "describes a device with no streaming multiprocessors",
         });
     }
@@ -237,7 +238,7 @@ fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(),
     // (design §8, decision 17). Capacity is a SHAPE — the leading axis of
     // every bank the model text marked `ParamSource::Registered` — because a
     // shape is what a weight table reserves and what the routed op indexes.
-    // `Budgets::max_adapters` is what the deployment asked to be able to
+    // `Budget::max_adapters` is what the deployment asked to be able to
     // register, and asking for more than the text can seat is a load that
     // does not happen rather than a registration that is refused later:
     // decision 17's budget is not an admission cap, so it has to be true
@@ -246,8 +247,8 @@ fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(),
     // A plan with no bank is exempt at `max_adapters == 0` and refused above
     // it, which is the honest reading of "this deployment wants adapters and
     // this model text has no seat for them".
-    if budgets.max_adapters > 0 {
-        let seats = plan
+    if budget.max_adapters > 0 {
+        let seats = trace
             .params
             .iter()
             .filter(|param| param.source == model_ir::ParamSource::Registered)
@@ -255,14 +256,14 @@ fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(),
             .min();
         match seats {
             None => {
-                return Err(Refusal::AdapterCapacity {
-                    asked: budgets.max_adapters,
+                return Err(Error::AdapterCapacity {
+                    asked: budget.max_adapters,
                     seated: 0,
                 });
             }
-            Some(seated) if seated < u64::from(budgets.max_adapters) => {
-                return Err(Refusal::AdapterCapacity {
-                    asked: budgets.max_adapters,
+            Some(seated) if seated < u64::from(budget.max_adapters) => {
+                return Err(Error::AdapterCapacity {
+                    asked: budget.max_adapters,
                     seated,
                 });
             }
@@ -277,32 +278,32 @@ fn accept(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Result<(),
 /// was built in.
 ///
 /// `Ty::Struct` is exactly the attention SCHEDULES (`StructKind` is closed and
-/// every variant is one), and [`Refusal::Straddled`] argues why a schedule
+/// every variant is one), and [`Error::Straddled`] argues why a schedule
 /// cannot be sliced the way a tensor can. One pass over the nodes: the
 /// DEFINING node stands in the window its builder is dispatched in by
 /// construction, so what is compared is its class set against every reader's.
-fn struct_readers_share_one_window(plan: &Plan, classes: &Classes) -> Result<(), Refusal> {
-    let structs: Vec<bool> = plan
+fn struct_readers_share_one_window(trace: &Trace, classes: &ClassTable) -> Result<(), Error> {
+    let structs: Vec<bool> = trace
         .values
         .iter()
         .map(|value| matches!(value.ty, Ty::Struct(_)))
         .collect();
 
     let mut inputs = Vec::new();
-    for (at, node) in plan.nodes.iter().enumerate() {
+    for (at, node) in trace.nodes.iter().enumerate() {
         inputs.clear();
         node.op.inputs(&mut inputs);
         for &read in &inputs {
             if !structs.get(read.0 as usize).copied().unwrap_or(false) {
                 continue;
             }
-            let Some(Def::Op(built_by)) = plan.values.get(read.0 as usize).map(|v| &v.def) else {
+            let Some(Def::Op(built_by)) = trace.values.get(read.0 as usize).map(|v| &v.def) else {
                 continue;
             };
             let planned = &classes.node_mask[*built_by as usize];
             let reader = &classes.node_mask[at];
             if planned != reader {
-                return Err(Refusal::Straddled {
+                return Err(Error::Straddled {
                     value: read,
                     node: at as u32,
                     planned: planned.iter().collect(),
@@ -321,8 +322,8 @@ fn struct_readers_share_one_window(plan: &Plan, classes: &Classes) -> Result<(),
 /// this is the node-granular list, for a diagnostic that has to name which
 /// call it means.
 #[must_use]
-pub fn collectives(plan: &Plan) -> Vec<u32> {
-    plan.nodes
+pub fn collectives(trace: &Trace) -> Vec<u32> {
+    trace.nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| matches!(node.op, Operation::Collective(_)))
@@ -337,8 +338,8 @@ pub fn collectives(plan: &Plan) -> Vec<u32> {
 /// costs — and this is the same claim asked of the OUTPUT, which is where an
 /// assertion about a pass belongs.
 #[must_use]
-pub fn collectives_are_never_elided(baked: &Baked) -> bool {
-    baked
+pub fn collectives_are_never_elided(compiled: &CompiledModel) -> bool {
+    compiled
         .regions
         .iter()
         .all(|r| !r.collective || r.lowering == Lowering::AlwaysLaunch)
@@ -348,17 +349,17 @@ pub fn collectives_are_never_elided(baked: &Baked) -> bool {
 mod tests {
     use super::*;
     use crate::fixture::{Build, fact};
-    use model_ir::Cond;
+    use model_ir::Guard;
 
     fn plan() -> Build {
         let mut b = Build::new();
         let x = b.input(8);
-        let q = b.op(x, 8, Cond::Always);
+        let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
-        let p = b.op(q, 8, Cond::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Cond::not(fact(0)))], 8);
-        let y = b.op(o, 8, Cond::Always);
-        b.append(y, Cond::Always);
+        let p = b.op(q, 8, Guard::not(fact(0)));
+        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let y = b.op(o, 8, Guard::Always);
+        b.append(y, Guard::Always);
         b.out(y);
         b
     }
@@ -366,24 +367,24 @@ mod tests {
     #[test]
     fn a_plan_bakes_into_an_artifact_whose_arena_is_sound() {
         let b = plan();
-        let baked = compile(&b.plan, &Budgets::new(4, 16), &DeviceProfile::default())
+        let compiled = compile(&b.trace, &Budget::new(4, 16), &DeviceProfile::default())
             .expect("a covering plan bakes");
 
-        assert_eq!(baked.classes.classes.len(), 2);
-        assert!(!baked.regions.is_empty());
-        assert_eq!(baked.template().len(), baked.regions.len());
+        assert_eq!(compiled.classes.classes.len(), 2);
+        assert!(!compiled.regions.is_empty());
+        assert_eq!(compiled.template().len(), compiled.regions.len());
         // P4 seated both windows: the two classes are trivially an interval
         // of any order, so nothing is owed a fallback.
-        assert_eq!(baked.order.tree().expect("P4 seriated it").frontier(), [0, 1]);
-        assert!(baked.fallback.rows.is_empty());
-        assert!(baked.concurrency.pairs().is_empty());
-        assert!(baked.arena.bytes > 0);
-        assert!(baked.arena.clashes(&baked.concurrency).is_empty());
-        assert!(collectives_are_never_elided(&baked));
+        assert_eq!(compiled.order.tree().expect("P4 seriated it").frontier(), [0, 1]);
+        assert!(compiled.fallback.rows.is_empty());
+        assert!(compiled.concurrency.pairs().is_empty());
+        assert!(compiled.arena.bytes > 0);
+        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
+        assert!(collectives_are_never_elided(&compiled));
         // Two two-node arms: fat at no profile and profitable at none, so
         // the one lowering that is correctness and not optimization.
         assert!(
-            baked
+            compiled
                 .regions
                 .iter()
                 .all(|r| r.lowering == Lowering::AlwaysLaunch)
@@ -395,20 +396,20 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(8);
         let d = b.op(x, 8, fact(0));
-        let m = b.op(x, 8, Cond::and(Cond::not(fact(0)), fact(1)));
+        let m = b.op(x, 8, Guard::and(Guard::not(fact(0)), fact(1)));
         let o = b.merge(
-            &[(d, fact(0)), (m, Cond::and(Cond::not(fact(0)), fact(1)))],
+            &[(d, fact(0)), (m, Guard::and(Guard::not(fact(0)), fact(1)))],
             8,
         );
         b.out(o);
 
-        let refusal = compile(&b.plan, &Budgets::new(4, 16), &DeviceProfile::default())
+        let refusal = compile(&b.trace, &Budget::new(4, 16), &DeviceProfile::default())
             .expect_err("a hole is a refusal");
-        let Refusal::Classes(faults) = &refusal else {
+        let Error::Classes(faults) = &refusal else {
             panic!("the class sweep is what refused it: {refusal}")
         };
         assert_eq!(faults.len(), 1);
-        assert!(refusal.say(&b.plan).contains("no arm holds there"));
+        assert!(refusal.say(&b.trace).contains("no arm holds there"));
     }
 
     #[test]
@@ -416,27 +417,27 @@ mod tests {
         let b = plan();
         let profile = DeviceProfile::default();
         assert!(matches!(
-            compile(&b.plan, &Budgets::new(0, 16), &profile),
-            Err(Refusal::Budget { .. }),
+            compile(&b.trace, &Budget::new(0, 16), &profile),
+            Err(Error::Budget { .. }),
         ));
         assert!(matches!(
-            compile(&b.plan, &Budgets::new(4, 0), &profile),
-            Err(Refusal::Budget { .. }),
+            compile(&b.trace, &Budget::new(4, 0), &profile),
+            Err(Error::Budget { .. }),
         ));
         assert!(matches!(
-            compile(&b.plan, &Budgets::new(32, 16), &profile),
-            Err(Refusal::Budget { .. }),
+            compile(&b.trace, &Budget::new(32, 16), &profile),
+            Err(Error::Budget { .. }),
         ));
-        let mut lattice = Budgets::new(4, 16);
+        let mut lattice = Budget::new(4, 16);
         lattice.buckets = vec![1, 8, 8];
         assert!(matches!(
-            compile(&b.plan, &lattice, &profile),
-            Err(Refusal::Budget { .. }),
+            compile(&b.trace, &lattice, &profile),
+            Err(Error::Budget { .. }),
         ));
         lattice.buckets = vec![1, 8, 64];
         assert!(matches!(
-            compile(&b.plan, &lattice, &profile),
-            Err(Refusal::Budget { .. }),
+            compile(&b.trace, &lattice, &profile),
+            Err(Error::Budget { .. }),
         ));
     }
 
@@ -448,8 +449,8 @@ mod tests {
             ..DeviceProfile::default()
         };
         assert!(matches!(
-            compile(&b.plan, &Budgets::new(4, 16), &profile),
-            Err(Refusal::Profile { .. }),
+            compile(&b.trace, &Budget::new(4, 16), &profile),
+            Err(Error::Profile { .. }),
         ));
     }
 
@@ -464,8 +465,8 @@ mod tests {
         b.out(y);
 
         assert_eq!(
-            compile(&b.plan, &Budgets::new(4, 16), &DeviceProfile::default()),
-            Err(Refusal::TooManyFacts { facts: 21 }),
+            compile(&b.trace, &Budget::new(4, 16), &DeviceProfile::default()),
+            Err(Error::TooManyFacts { facts: 21 }),
         );
     }
 
@@ -473,15 +474,15 @@ mod tests {
     fn a_collective_is_listed_and_its_region_is_never_elidable() {
         let mut b = Build::new();
         let x = b.input(8);
-        let a = b.op(x, 8, Cond::Always);
+        let a = b.op(x, 8, Guard::Always);
         let g = b.all_gather(a, 8, fact(0));
-        let o = b.merge(&[(g, fact(0)), (a, Cond::not(fact(0)))], 8);
+        let o = b.merge(&[(g, fact(0)), (a, Guard::not(fact(0)))], 8);
         b.out(o);
 
-        assert_eq!(collectives(&b.plan), vec![1]);
-        let baked =
-            compile(&b.plan, &Budgets::new(4, 16), &DeviceProfile::default()).expect("bakes");
-        assert!(baked.regions.iter().any(|r| r.collective));
-        assert!(collectives_are_never_elided(&baked));
+        assert_eq!(collectives(&b.trace), vec![1]);
+        let compiled =
+            compile(&b.trace, &Budget::new(4, 16), &DeviceProfile::default()).expect("bakes");
+        assert!(compiled.regions.iter().any(|r| r.collective));
+        assert!(collectives_are_never_elided(&compiled));
     }
 }

@@ -15,7 +15,7 @@ pub enum Flavor {
     #[cfg(feature = "_driver-cuda")]
     Cuda,
     // BACK AT P5, and only this one. `driver-metal` walks a
-    // `model_compiler::program::Program` through a baker executor of its own,
+    // `model_compiler::CompiledModel` through a baker executor of its own,
     // which was the stated precondition for all three.
     #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
     Metal,

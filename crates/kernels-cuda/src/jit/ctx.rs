@@ -176,6 +176,25 @@ impl Slabs {
     }
 }
 
+/// **THIS FIRE'S ROW COUNT AND THE BUCKET IT ROUNDS UP TO** — the whole of
+/// what D4 (`.wiki/palo/cuda-abi.md` §3) sends down to the entries.
+///
+/// A `Pad` is not a permission to round; it is the pair of numbers that makes
+/// rounding CHECKABLE, and [`Ctx::opaque_rows`] is the only reader. `rows` is
+/// the fire's TOTAL row count — the extent an Always region's launch is handed
+/// — and `bucket` is what `driver::fire::compose` rounded it up to. A driver
+/// that arms neither leaves the default, which is `rows == bucket == 0`: no
+/// extent equals it, so nothing is ever padded and the plane is byte-for-byte
+/// the one that existed before this field did. That default is also what a
+/// WINDOWED region is armed with, which is where the boundary is enforced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pad {
+    /// The fire's total token rows.
+    pub rows: u32,
+    /// The smallest lattice point that holds them (`Composition::bucket`).
+    pub bucket: u32,
+}
+
 /// The stream and its companions. Long-lived state (jit cache, scratch
 /// slabs, device probes) is process-global behind it; the `Ctx` itself is
 /// what a driver `Run` builds per fire and lends to every entry.
@@ -184,6 +203,18 @@ pub struct Ctx {
     cublas: *mut c_void,
     comm: *mut c_void,
     slabs: Slabs,
+
+    /// D4's number, written per REGION by the driver's walk ([`Ctx::arm`]).
+    ///
+    /// **A `Cell` BECAUSE THE CONTEXT OUTLIVES THE FIRE AND THE NUMBER DOES
+    /// NOT.** One `Ctx` is minted per stream at LOAD (`device::Context::bind`,
+    /// `open_lanes`) and lent to every entry of every fire after it, so the
+    /// fire-lived half of what an entry needs cannot be a constructor
+    /// argument without re-minting a cuBLAS handle per fire. A `Cell<Pad>` is
+    /// eight bytes the shell stamps between two fires; it is never read across
+    /// threads, because a `Ctx` holds raw handles and is neither `Send` nor
+    /// `Sync` already.
+    pad: core::cell::Cell<Pad>,
 }
 
 impl Ctx {
@@ -197,6 +228,10 @@ impl Ctx {
             cublas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
             slabs: Slabs::PROCESS,
+            pad: core::cell::Cell::new(Pad {
+                rows: 0,
+                bucket: 0,
+            }),
         }
     }
 
@@ -291,6 +326,109 @@ impl Ctx {
     #[must_use]
     pub const fn slabs(&self) -> Slabs {
         self.slabs
+    }
+
+    /// **STAMP D4'S TWO NUMBERS ON THIS CONTEXT, FOR THE LAUNCH ABOUT TO RUN.**
+    ///
+    /// **PER REGION, NOT PER FIRE**, and that is the whole of why this is a
+    /// setter on a long-lived context rather than an argument to a
+    /// constructor. The driver calls it from `Run::ctx` — the lookup every
+    /// dispatch arm goes through to find its stream — with the walk's cursor
+    /// already on the node about to launch, so what it stamps is the pad THIS
+    /// REGION is allowed. A region whose window is not the whole fire is
+    /// stamped `Pad::default()`, because padding a window writes the next
+    /// class's rows of the same column.
+    ///
+    /// A `Pad` whose `bucket` is not above its `rows` arms nothing — which is
+    /// what a deployment with no lattice (`Composition::bucket == rows`), a
+    /// shell with `PIE_CUDA_PAD=off`, and a windowed region all hand over, so
+    /// none of the three needs an arm of its own here.
+    pub fn arm(&self, pad: Pad) {
+        self.pad.set(pad);
+    }
+
+    /// Put the pad back to "no fire is running". Every launch after it is
+    /// quantized by nothing, which is what a warm pass, a weight transform or
+    /// a bench firing on this stream between two fires must see.
+    pub fn disarm(&self) {
+        self.pad.set(Pad::default());
+    }
+
+    /// What this fire told the entries to round to, for a caller that wants
+    /// to report it.
+    #[must_use]
+    pub fn pad(&self) -> Pad {
+        self.pad.get()
+    }
+
+    /// **THE ROW COUNT AN OPAQUE CALLEE IS TOLD ABOUT** — D4, in one call.
+    ///
+    /// An entry that hands its shape to a library planner nobody publishes the
+    /// arm table of (cuBLASLt: `.wiki/palo/cuda-abi.md` §1 counted 151
+    /// arm-switching nodes and a non-monotone splitK band on the gemm's M
+    /// alone) asks for its `M` here instead of using the extent it was handed.
+    /// Every kernel this tree OWNS keeps the live extent and the zero-row
+    /// contract; this is not a general rounding service.
+    ///
+    /// **THE SAFETY ARGUMENT IS TWO GATES, AND ONLY THE SECOND ONE IS HERE.**
+    /// Padding is legal exactly when the rows `[rows, bucket)` a padded call
+    /// reads and writes belong to NOBODY:
+    ///
+    /// * **In bounds.** The arena reserves every `Dim::Tokens` column at
+    ///   `max_tokens` rows and hands out static offsets (`driver_cuda::arena`),
+    ///   and P0 refuses a lattice with a bucket past that ceiling
+    ///   (`model_compiler`'s `accept`: "list a bucket past the token ceiling").
+    ///   So a fire's tail rows are reserved bytes, not somebody's allocation.
+    /// * **Harmless.** A gemm is ROW-INDEPENDENT: output row `i` is a function
+    ///   of input row `i` and the weight. Garbage in the tail rows —
+    ///   uninitialized bytes included, since nothing stages them — contaminates
+    ///   tail rows and stops there. An entry that REDUCED over rows would fold
+    ///   that garbage into a real row and compute rather than fault, which is
+    ///   why the property is stated here, at the quantization, and not left to
+    ///   be rediscovered by whoever adds the next opaque entry.
+    /// * **Nobody's.** This is the clause the comparison enforces. A WINDOWED
+    ///   launch's tail is not the fire's tail — it is the NEXT class's rows of
+    ///   the same column, and under a merge or a co-tenant those are real
+    ///   bytes somebody reads. Padding one is a clobber that computes.
+    ///
+    /// **The first gate is the driver's, and it is the one that decides.**
+    /// `driver_cuda::run::Run::ctx` compares the region's WINDOW against the
+    /// composition — span at row zero, covering every row, not gathered, no
+    /// segment list — and arms this context with `Pad::default()` when any
+    /// clause fails. That is the question asked where the answer lives: an
+    /// entry sees extents, and an extent cannot tell the fire's rows from a
+    /// window that happens to hold as many.
+    ///
+    /// **The second gate is this comparison, and it is a belt.** Inside a
+    /// region that MAY pad, the pad still applies only to an extent that is the
+    /// fire's row count — so an entry that hands over something other than the
+    /// rows of the rectangle it was given (half of them, twice them, a
+    /// `Dim::Const` width) gets its own number back rather than a rounded one.
+    ///
+    /// **The residue, named.** The two gates together cannot separate a
+    /// token-shaped extent from a LANE-shaped one in a fire that carries one
+    /// row per lane, because both are then the same integer and a `Dim::Lanes`
+    /// column is reserved at `max_lanes` rather than at `max_tokens`. No opaque
+    /// callee on this plane is lane-shaped — the catalog's cuBLASLt entries all
+    /// take `Dim::Tokens` rectangles — and one added later must not read this
+    /// function without the driver first learning to say which axis it is
+    /// quantizing.
+    #[must_use]
+    pub fn opaque_rows(&self, rows: i32) -> i32 {
+        let pad = self.pad.get();
+        // Disarmed, or a deployment with no lattice: `bucket_of` answers
+        // `rows` itself and there is nothing above it to round to.
+        if pad.bucket <= pad.rows {
+            return rows;
+        }
+        // NOT THE FULL FIRE — a window, and windows are never padded.
+        if rows < 0 || rows.unsigned_abs() != pad.rows {
+            return rows;
+        }
+        // The `max` is the seatbelt, not the arithmetic: `bucket >= rows` is
+        // `bucket_of`'s post-condition and a bucket past `i32` is a lattice no
+        // `Dim::Tokens` column was ever cut for.
+        i32::try_from(pad.bucket).unwrap_or(rows).max(rows)
     }
 
     #[allow(clippy::unused_self)]
@@ -393,4 +531,107 @@ fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::
         );
     }
     why
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A context on no stream. Nothing below touches the device — the
+    /// quantization is arithmetic over two `u32`s, and a test that needed a
+    /// GPU to check it would not be run.
+    fn bare() -> Ctx {
+        // SAFETY: no method called here fires, so the null stream is never
+        // handed to the runtime.
+        unsafe { Ctx::on(core::ptr::null_mut()) }
+    }
+
+    #[test]
+    fn an_unarmed_context_quantizes_nothing() {
+        let ctx = bare();
+        for rows in [0, 1, 3, 9, 4096] {
+            assert_eq!(
+                ctx.opaque_rows(rows),
+                rows,
+                "a context no fire armed hands back the extent it was given"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployment_with_no_lattice_is_its_own_bucket_and_pads_by_zero() {
+        let ctx = bare();
+        // `compose::bucket_of` answers `rows` itself when `Budget::buckets`
+        // is empty, and the shell's `PIE_CUDA_PAD=off` arm says the same
+        // thing by choice. Both must be the identity.
+        ctx.arm(Pad { rows: 9, bucket: 9 });
+        assert_eq!(ctx.opaque_rows(9), 9);
+    }
+
+    #[test]
+    fn the_full_fires_extent_rounds_up_to_the_bucket() {
+        let ctx = bare();
+        ctx.arm(Pad {
+            rows: 9,
+            bucket: 16,
+        });
+        assert_eq!(
+            ctx.opaque_rows(9),
+            16,
+            "an Always launch is handed the fire's rows and computes the bucket's"
+        );
+    }
+
+    /// **THE BOUNDARY THE DESIGN NAMES** (`.wiki/palo/cuda-abi.md` §3): an
+    /// Always launch's tail is the fire's tail and belongs to nobody, but a
+    /// WINDOWED launch padded past its window writes the next class's rows of
+    /// the same column — a clobber that computes.
+    ///
+    /// The gate that decides it is the driver's (`Run::ctx` never arms a
+    /// windowed region at all); this is the belt under it, and what it holds
+    /// is that an extent which is not the fire's own row count is never
+    /// rounded even inside a region that may pad.
+    #[test]
+    fn a_windowed_extent_is_never_padded_however_close_it_comes() {
+        let ctx = bare();
+        ctx.arm(Pad {
+            rows: 9,
+            bucket: 16,
+        });
+        for windowed in [1, 3, 8, 10, 16] {
+            assert_eq!(
+                ctx.opaque_rows(windowed),
+                windowed,
+                "{windowed} is not this fire's row count, so it is somebody's window"
+            );
+        }
+    }
+
+    #[test]
+    fn disarming_puts_the_extent_back_the_way_the_fire_found_it() {
+        let ctx = bare();
+        ctx.arm(Pad {
+            rows: 9,
+            bucket: 16,
+        });
+        ctx.disarm();
+        assert_eq!(
+            ctx.opaque_rows(9),
+            9,
+            "the pad is the fire's, and the stream outlives the fire"
+        );
+    }
+
+    /// A bucket no `Dim::Tokens` column was ever cut for is not a licence to
+    /// launch: the seatbelt hands back the live extent rather than a negative
+    /// `M`.
+    #[test]
+    fn a_bucket_past_the_kernels_int_falls_back_on_the_live_extent() {
+        let ctx = bare();
+        ctx.arm(Pad {
+            rows: 9,
+            bucket: u32::MAX,
+        });
+        assert_eq!(ctx.opaque_rows(9), 9);
+    }
 }

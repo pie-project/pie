@@ -1,6 +1,6 @@
 //! The forward-pass authoring eDSL over the typed IR (design §4, §10). Model
 //! texts call the per-family wrappers in [`ops`], which compute shapes in
-//! plain Rust and push typed op variants onto a recorded [`Plan`]; `split`,
+//! plain Rust and push typed op variants onto a recorded [`Trace`]; `split`,
 //! `Value::merge` and the [`Predicate`] algebra carry the guard tracking over
 //! from the old surface unchanged. This crate names no backend and reaches no
 //! device.
@@ -36,7 +36,7 @@ pub use forward::*;
 /// stops being true. `GeomKind` was on it until M20 and is the proof: a
 /// forward pass used to name a geometry kind to ask the runtime for a vector,
 /// and now it names the kv row instead ([`Input::write_page`]), so the name
-/// left the door. `Attention`, `CacheRow`, `Def`, `Linear`, `Plan` and
+/// left the door. `Attention`, `CacheRow`, `Def`, `Linear`, `Trace` and
 /// `ValueId` are what `model::deployment` reads a traced plan with;
 /// `Dtype` is what a catalog row and a load contract
 /// are written in;
@@ -54,13 +54,13 @@ pub use forward::*;
 /// `model/tests/every_class_resolves_every_merge.rs` reads traced plans with
 /// these two, and reading a plan goes through this door.
 pub use model_ir::{
-    Attention, CacheRow, Def, Dtype, Linear, Operands, Operation, Param, ParamSource, Plan,
+    Attention, CacheRow, Def, Dtype, Linear, Operands, Operation, Param, ParamSource, Trace,
     Platform, Shard, ValueId, resolve_classes,
 };
 pub use record::{Recorder, Refine, SplitSpec, Value};
 
 /// What the catalog registers per model: trace me for this platform.
-pub type TraceFn = fn(Platform) -> Plan;
+pub type TraceFn = fn(Platform) -> Trace;
 
 /// What the catalog registers per model: sort this request into my facts and
 /// pack them into the one `u64` a lane carries.
@@ -68,7 +68,7 @@ pub type TraceFn = fn(Platform) -> Plan;
 /// MONOMORPHIC ON PURPOSE. `Classify` is a trait over a family's own `Facts`
 /// struct, and the party that needs a word — the engine's fire path — holds
 /// a SKU string and nothing else: it cannot name `qwen_3::forward::Facts`,
-/// and a plan cannot tell it either, because `Cond::Fact(bit)` numbers its
+/// and a plan cannot tell it either, because `Guard::Fact(bit)` numbers its
 /// bits and a bit is a position and nothing else (see [`Predicate`]). The
 /// column is what closes that: one pointer per row, wrapping the family's own
 /// `Classify::of(r).word()`, so which bit `qo_one` is stays the model's own

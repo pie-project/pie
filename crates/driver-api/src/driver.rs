@@ -2,7 +2,7 @@
 //!
 //! **THE VERBS SURVIVED THE REWRITE; THE ENCODING DID NOT.** Every method
 //! below was a method on the trait this replaces, and it means what it meant.
-//! What changed is what they take and what they answer: a `model_ir::Plan`
+//! What changed is what they take and what they answer: a `model_ir::Trace`
 //! instead of a `Vec<ModelLoadDesc>`, a `FireSubmission` of lanes instead of a
 //! 62-field `LaunchPlan` of parallel CSRs, `Result<_, DriverError>` instead of
 //! `Result<_, anyhow::Error>` with an `i32` status hiding inside it.
@@ -94,8 +94,8 @@ pub trait Driver: Send + Sync {
 
     /// Bake the plan, land the checkpoint, reserve the pools.
     ///
-    /// The one door a model comes through. The `Plan` crosses here and
-    /// `Baked` never does (decision 18): the compile happens on this side of
+    /// The one door a model comes through. The `Trace` crosses here and
+    /// `CompiledModel` never does (decision 18): the compile happens on this side of
     /// the boundary because it is an answer about a device.
     ///
     /// # Errors
@@ -276,6 +276,40 @@ pub trait Driver: Send + Sync {
     /// now, [`DriverError::Impossible`] for one past a baked ceiling,
     /// [`DriverError::Device`] for a launch the backend refused.
     fn fire(&mut self, submission: &FireSubmission) -> Result<FireTicket>;
+
+    /// State the fire the caller expects to submit NEXT. Advisory: a driver
+    /// MAY warm state for the stated composition — bind a cached CUDA-graph
+    /// binding to an exec that is not in flight, prime a descriptor table —
+    /// and a driver that does nothing is exactly as correct.
+    ///
+    /// **A HINT IS A COMPOSITION, NOT CONTENTS.** What a driver reads off
+    /// this submission is each lane's `word` and row count — the shape of
+    /// the next fire — because that is what warm state is a function of.
+    /// The token VALUES may be anything: the engine's frame scheduler holds
+    /// the next frame sealed before the tokens that will ride in it are
+    /// sampled, and this verb is shaped so that sealed-not-yet-sampled
+    /// frame can be stated as it stands. (`driver-cuda` says the same from
+    /// its side: `Shell::expect` reads `word` and `tokens.len()` and
+    /// nothing else.)
+    ///
+    /// **CORRECTNESS NEVER DEPENDS ON IT, AND THAT IS THE WHOLE CONTRACT.**
+    /// A wrong hint — a fire that never comes, a composition the next fire
+    /// does not have — costs the driver only the warm-up work it hid off
+    /// the critical path; the fire that actually arrives keys its own state
+    /// exactly as if nothing had been said (`driver-cuda`'s prebind
+    /// consumes a hint per fire and a mis-stated one leaves the next fire
+    /// on the rebind path it was already on). That is why this verb answers
+    /// `()` and not `Result`: there is no way to serve it wrongly, so there
+    /// is nothing to refuse. It is also why the default body is an explicit
+    /// nothing rather than [`DriverError::Unsupported`] — six of this
+    /// trait's verbs refuse by default because a caller must HEAR "I do not
+    /// serve this";
+    /// an advisory a driver ignores is indistinguishable from one it
+    /// honours, and a refusal would force every caller to branch on an
+    /// answer that cannot matter.
+    fn expect_fire(&mut self, submission: &FireSubmission) {
+        let _ = submission;
+    }
 
     // ── state movement ──────────────────────────────────────────────────
 

@@ -87,8 +87,8 @@ use std::cell::Cell;
 
 use driver::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use kernels_metal::Tensor;
-use model_compiler::{Baked, Lowering, Region};
-use model_ir::{Attention, Def, Dtype, Operation, Plan};
+use model_compiler::{CompiledModel, Lowering, Region};
+use model_ir::{Attention, Def, Dtype, Operation, Trace};
 
 use crate::device::handles::NIL;
 use crate::device::Handles;
@@ -158,13 +158,13 @@ impl Windows {
     /// slab; `kernels-metal` publishes neither, so this shell's
     /// `driver::fire::Serve` impl is the default and every fragmented window
     /// here splits.
-    pub fn of(baked: &Baked, classes: &WindowTable, indptr_host: &[i32]) -> Result<Windows> {
+    pub fn of(compiled: &CompiledModel, classes: &WindowTable, indptr_host: &[i32]) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
-        let mut runs: Vec<u32> = Vec::with_capacity(baked.template().len());
-        let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(baked.template().len());
+        let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
+        let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(compiled.template().len());
         let mut spans: Vec<MaskSpan> = Vec::new();
 
-        for (at, region) in baked.template().iter().enumerate() {
+        for (at, region) in compiled.template().iter().enumerate() {
             classes.spans_into(&region.mask, &mut spans);
             if spans.len() > 1 {
                 // The two integrity questions, asked of the artifact
@@ -174,13 +174,13 @@ impl Windows {
                 // one the shipped order breaks the mask into? A fire's order
                 // is that order with the absent classes dropped, and dropping
                 // a class can only close a gap, so neither can happen to a
-                // `Baked` and a `WindowTable` built from each other.
-                let bound = fallback::bound(baked, &region.mask);
-                if fallback::promised(baked, region) || spans.len() > bound as usize {
+                // `CompiledModel` and a `WindowTable` built from each other.
+                let bound = fallback::bound(compiled, &region.mask);
+                if fallback::promised(compiled, region) || spans.len() > bound as usize {
                     return Err(Fault::Fragmented {
                         region: at as u32,
                         runs: spans.len(),
-                        promised: fallback::promised(baked, region).then_some(bound),
+                        promised: fallback::promised(compiled, region).then_some(bound),
                     });
                 }
                 // **THIS PLANE SERVES `Fallback::Split` AND NOT
@@ -362,19 +362,19 @@ impl Windows {
 ///
 /// [`Fault::Straddled`], naming the value, the consuming node, and the two
 /// class sets.
-pub fn no_schedule_straddles_its_readers(plan: &Plan, baked: &Baked) -> Result<()> {
+pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel) -> Result<()> {
     // Which region each node stands in, and therefore which classes it runs.
-    let mut region_of: Vec<usize> = vec![0; plan.nodes.len()];
-    for (at, region) in baked.template().iter().enumerate() {
+    let mut region_of: Vec<usize> = vec![0; trace.nodes.len()];
+    for (at, region) in compiled.template().iter().enumerate() {
         for node in region.nodes.clone() {
             if let Some(slot) = region_of.get_mut(node as usize) {
                 *slot = at;
             }
         }
     }
-    let mask_of = |node: usize| &baked.template()[region_of[node]].mask;
+    let mask_of = |node: usize| &compiled.template()[region_of[node]].mask;
 
-    for (at, node) in plan.nodes.iter().enumerate() {
+    for (at, node) in trace.nodes.iter().enumerate() {
         let Operation::Attention(op) = &node.op else {
             continue;
         };
@@ -389,7 +389,7 @@ pub fn no_schedule_straddles_its_readers(plan: &Plan, baked: &Baked) -> Result<(
             | Attention::Masked { plan, .. } => *plan,
             _ => continue,
         };
-        let Some(Def::Op(built_by)) = plan.values.get(consumed.0 as usize).map(|v| &v.def) else {
+        let Some(Def::Op(built_by)) = trace.values.get(consumed.0 as usize).map(|v| &v.def) else {
             continue;
         };
         let planned = mask_of(*built_by as usize);
@@ -430,7 +430,7 @@ fn rebase(indptr: &[i32], span: MaskSpan) -> Vec<i32> {
 /// the dispatch as two separate borrows.
 #[derive(Debug, Default)]
 pub struct At {
-    /// The region index, in `Baked::template` order.
+    /// The region index, in `CompiledModel::template` order.
     pub region: Cell<u32>,
     /// Which run of that region's window: `0` always, and `0..r` for a region
     /// P4 could not seat.

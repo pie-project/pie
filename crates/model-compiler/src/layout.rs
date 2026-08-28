@@ -33,7 +33,7 @@
 //! # Which consumers are rows of the matrix
 //!
 //! A capture-phase region whose mask is neither empty nor every class. Empty
-//! is a region no class runs (`Classes::dead`); every class is a region that
+//! is a region no class runs (`ClassTable::dead`); every class is a region that
 //! runs over all rows, and "all rows" is an interval of every ordering, so
 //! neither constrains anything. Prepare-phase regions are host work outside
 //! the graph and read no rows.
@@ -77,24 +77,22 @@
 //! the cheap one to withdraw: the score window keeps its interval, the
 //! correction takes a segment list, and neither pays a split.
 
-mod pq;
-
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use model_ir::{Classes, Plan};
+use model_ir::{ClassTable, Trace};
 
-use crate::baked::{Fallback, FallbackRow, FallbackTable, LayoutOrder, Phase, Region};
-use crate::budget::{Budgets, DeviceProfile};
+use crate::compiled::{Fallback, FallbackRow, FallbackTable, ClassOrder, Phase, Region};
+use crate::budget::{Budget, DeviceProfile};
 
-pub use pq::{Leaf, PqTree};
+use crate::pq::{Leaf, PqTree};
 
 /// The most classes this pass will seriate.
 ///
 /// THE FIRE PATH'S CEILING, NOT THIS PASS'S. `class_order` hands the driver a
 /// `Vec<u8>` per fire, so a class index is a byte everywhere downstream. A
 /// plan with more behaviours than that is not refused HERE —
-/// [`LayoutOrder::Identity`] is what it gets, and P4 is an optimization pass
+/// [`ClassOrder::Identity`] is what it gets, and P4 is an optimization pass
 /// with no business turning a load away — but nor can such a plan be fired:
 /// the descriptor cannot name its classes either. **The refusal belongs to
 /// P8**, beside the `DescriptorAbi` whose byte layout states the ceiling; this
@@ -145,22 +143,22 @@ const CROSSOVER_SMS: f32 = 82.0;
 
 /// P4. The class order, and the answers for the consumers it could not seat.
 pub(crate) fn seriate(
-    plan: &Plan,
+    trace: &Trace,
     regions: &[Region],
-    classes: &Classes,
-    budgets: &Budgets,
+    classes: &ClassTable,
+    budget: &Budget,
     profile: &DeviceProfile,
-) -> (LayoutOrder, FallbackTable) {
+) -> (ClassOrder, FallbackTable) {
     let count = classes.classes.len();
     if count == 0 || count > MAX_CLASSES {
-        return (LayoutOrder::Identity, FallbackTable::default());
+        return (ClassOrder::Identity, FallbackTable::default());
     }
 
     // The matrix: one row per DISTINCT mask, remembering every region that
     // stated it, since the fallback is owed to all of them.
     let mut matrix: BTreeMap<Vec<Leaf>, Vec<usize>> = BTreeMap::new();
     for (r, region) in regions.iter().enumerate() {
-        if !constrains(plan, region, count) {
+        if !constrains(trace, region, count) {
             continue;
         }
         let mask: Vec<Leaf> = region.mask.iter().map(|c| c as Leaf).collect();
@@ -172,10 +170,10 @@ pub(crate) fn seriate(
     // serve this consumer GROUPED?
     let groupable: BTreeMap<&Vec<Leaf>, bool> = matrix
         .iter()
-        .map(|(mask, stated_by)| (mask, composed_of(plan, regions, stated_by, &profile.grouped)))
+        .map(|(mask, stated_by)| (mask, composed_of(trace, regions, stated_by, &profile.grouped)))
         .collect();
 
-    let (tree, withdrawn) = choose(plan, regions, &matrix, &groupable, count, profile);
+    let (tree, withdrawn) = choose(trace, regions, &matrix, &groupable, count, profile);
 
     let mut rows: Vec<FallbackRow> = Vec::new();
     for mask in &withdrawn {
@@ -189,7 +187,7 @@ pub(crate) fn seriate(
         let answer = menu(
             PqTree::runs(tree.frontier(), mask),
             groupable[mask],
-            budgets,
+            budget,
             profile,
         );
         for &r in &matrix[mask] {
@@ -206,15 +204,15 @@ pub(crate) fn seriate(
     // the withdrawal order is about the tree rather than about the plan.
     rows.sort_by_key(|row| (row.node, row.buckets.start));
 
-    (LayoutOrder::Seriated(tree), FallbackTable { rows })
+    (ClassOrder::Seriated(tree), FallbackTable { rows })
 }
 
 /// Is this region a row of the C1P matrix?
-fn constrains(plan: &Plan, region: &Region, classes: usize) -> bool {
+fn constrains(trace: &Trace, region: &Region, classes: usize) -> bool {
     region.phase == Phase::Capture
         && !region.mask.is_empty()
         && region.mask.len() < classes
-        && !gather_absorbs(plan, region)
+        && !gather_absorbs(trace, region)
 }
 
 /// Decision #9's seat: does this region's work reach its rows through a
@@ -259,7 +257,7 @@ fn constrains(plan: &Plan, region: &Region, classes: usize) -> bool {
 ///
 /// The arguments stay as they are — the region names the nodes, the plan names
 /// their ops — so the day such an op lands, this is a function body.
-fn gather_absorbs(_plan: &Plan, _region: &Region) -> bool {
+fn gather_absorbs(_trace: &Trace, _region: &Region) -> bool {
     false
 }
 
@@ -288,13 +286,13 @@ fn gather_absorbs(_plan: &Plan, _region: &Region) -> bool {
 ///
 /// An empty list answers `false` for everything, which is the status quo and
 /// the default for both.
-fn composed_of(plan: &Plan, regions: &[Region], stated_by: &[usize], names: &[String]) -> bool {
+fn composed_of(trace: &Trace, regions: &[Region], stated_by: &[usize], names: &[String]) -> bool {
     if names.is_empty() {
         return false;
     }
     stated_by.iter().all(|&r| {
         regions[r].nodes.clone().all(|node| {
-            plan.nodes.get(node as usize).is_some_and(|node| {
+            trace.nodes.get(node as usize).is_some_and(|node| {
                 names
                     .iter()
                     .any(|named| named == model_ir::Operands::name(&node.op))
@@ -337,7 +335,7 @@ fn composed_of(plan: &Plan, regions: &[Region], stated_by: &[usize], names: &[St
 /// launch against `r` is not literally free — held above zero so that a
 /// groupable mask still loses to withdrawing nothing at all.
 fn withdrawal_cost(
-    plan: &Plan,
+    trace: &Trace,
     regions: &[Region],
     rows: &[usize],
     groupable: bool,
@@ -346,7 +344,7 @@ fn withdrawal_cost(
     let discount = if groupable { GROUPED_DISCOUNT } else { 1.0 };
     discount * rows.iter()
         .flat_map(|&r| regions[r].nodes.clone())
-        .filter_map(|node| plan.nodes.get(node as usize))
+        .filter_map(|node| trace.nodes.get(node as usize))
         .map(|node| profile.family_us.of(&node.op))
         .sum::<f32>()
 }
@@ -389,7 +387,7 @@ const GROUPED_DISCOUNT: f32 = 0.05;
 /// Ties keep the lowest candidate word, so a bake is still a function of its
 /// inputs (`tests/every_sku_seriates_its_classes.rs` pins that).
 fn choose(
-    plan: &Plan,
+    trace: &Trace,
     regions: &[Region],
     matrix: &BTreeMap<Vec<Leaf>, Vec<usize>>,
     groupable: &BTreeMap<&Vec<Leaf>, bool>,
@@ -399,7 +397,7 @@ fn choose(
     let masks: Vec<&Vec<Leaf>> = matrix.keys().collect();
     let costs: Vec<f32> = masks
         .iter()
-        .map(|mask| withdrawal_cost(plan, regions, &matrix[*mask], groupable[*mask], profile))
+        .map(|mask| withdrawal_cost(trace, regions, &matrix[*mask], groupable[*mask], profile))
         .collect();
 
     if masks.len() > MAX_SEARCH_MASKS {
@@ -481,9 +479,9 @@ fn concede(masks: &[&Vec<Leaf>], costs: &[f32], count: usize) -> (PqTree, Vec<Ve
 ///
 /// **SPLIT AT PREFILL SCALE, COPY AT DECODE SCALE** — see [`CROSSOVER_ROWS`]
 /// for the measurement and [`CROSSOVER_SMS`] for how it is carried to a device
-/// nobody re-measured. The ranges index [`Budgets::buckets`]; a deployment
+/// nobody re-measured. The ranges index [`Budget::buckets`]; a deployment
 /// that declared no bucket lattice has one implicit bucket at
-/// [`Budgets::max_tokens`], and gets one row covering it.
+/// [`Budget::max_tokens`], and gets one row covering it.
 ///
 /// **[`Fallback::Grouped`] IS CHOSEN WHEN, AND ONLY WHEN, THE CALLER SAID ITS
 /// KERNEL EXISTS** ([`groupable`], [`DeviceProfile::grouped`]). The standing
@@ -509,13 +507,13 @@ fn concede(masks: &[&Vec<Leaf>], costs: &[f32], count: usize) -> (PqTree, Vec<Ve
 fn menu(
     runs: u32,
     groupable: bool,
-    budgets: &Budgets,
+    budget: &Budget,
     profile: &DeviceProfile,
 ) -> Vec<(Range<u32>, Fallback)> {
-    let lattice: &[u32] = if budgets.buckets.is_empty() {
-        std::slice::from_ref(&budgets.max_tokens)
+    let lattice: &[u32] = if budget.buckets.is_empty() {
+        std::slice::from_ref(&budget.max_tokens)
     } else {
-        &budgets.buckets
+        &budget.buckets
     };
     if groupable {
         return vec![(0..lattice.len() as u32, Fallback::Grouped)];
@@ -541,15 +539,15 @@ fn menu(
 mod tests {
     use super::*;
     use crate::fixture::{Build, fact};
-    use crate::{Baked, LayoutOrder, compile};
-    use model_ir::Cond;
+    use crate::{CompiledModel, ClassOrder, compile};
+    use model_ir::Guard;
 
-    fn bake(b: &Build) -> Baked {
-        compile(&b.plan, &Budgets::new(4, 16), &DeviceProfile::default()).expect("the fixtures bake")
+    fn bake(b: &Build) -> CompiledModel {
+        compile(&b.trace, &Budget::new(4, 16), &DeviceProfile::default()).expect("the fixtures bake")
     }
 
-    fn frontier(baked: &Baked) -> Vec<Leaf> {
-        baked
+    fn frontier(compiled: &CompiledModel) -> Vec<Leaf> {
+        compiled
             .order
             .tree()
             .expect("P4 seriated it")
@@ -559,10 +557,10 @@ mod tests {
 
     /// `f0 XOR f1` — the guard whose class set is the diagonal, and the one
     /// that cannot be an interval alongside both axes.
-    fn either_but_not_both() -> Cond {
-        Cond::or(
-            Cond::and(fact(0), Cond::not(fact(1))),
-            Cond::and(Cond::not(fact(0)), fact(1)),
+    fn either_but_not_both() -> Guard {
+        Guard::or(
+            Guard::and(fact(0), Guard::not(fact(1))),
+            Guard::and(Guard::not(fact(0)), fact(1)),
         )
     }
 
@@ -574,35 +572,35 @@ mod tests {
         // the qo_one classes; the Gray-coded order does not.
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
+        let y = b.op(x, 8, Guard::Always);
         b.append(y, fact(0));
         b.append(y, fact(1));
         b.out(y);
 
-        let baked = bake(&b);
-        assert_eq!(baked.classes.classes.len(), 4);
-        assert_eq!(frontier(&baked), [0, 1, 3, 2]);
+        let compiled = bake(&b);
+        assert_eq!(compiled.classes.classes.len(), 4);
+        assert_eq!(frontier(&compiled), [0, 1, 3, 2]);
         assert!(
-            baked.fallback.rows.is_empty(),
+            compiled.fallback.rows.is_empty(),
             "both windows are intervals of that order, so nobody pays",
         );
 
         // Every windowed consumer, read back off the region table.
-        for region in &baked.regions {
-            if !constrains(&b.plan, region, 4) {
+        for region in &compiled.regions {
+            if !constrains(&b.trace, region, 4) {
                 continue;
             }
             let mask: Vec<Leaf> = region.mask.iter().map(|c| c as Leaf).collect();
             assert!(
-                PqTree::is_interval(&frontier(&baked), &mask),
+                PqTree::is_interval(&frontier(&compiled), &mask),
                 "{mask:?} is not an interval of the baked order",
             );
         }
 
         // The window the ascending order splits in two.
-        let qo_one = &baked.regions[1].mask;
+        let qo_one = &compiled.regions[1].mask;
         assert_eq!(qo_one.iter().collect::<Vec<_>>(), [1, 3]);
-        assert_eq!(LayoutOrder::Identity.class_order(qo_one, None), [1, 3]);
+        assert_eq!(ClassOrder::Identity.class_order(qo_one, None), [1, 3]);
         assert!(!PqTree::is_interval(&[0, 1, 2, 3], &[1, 3]));
     }
 
@@ -610,23 +608,23 @@ mod tests {
     fn a_fire_gets_the_present_classes_in_the_baked_order() {
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
+        let y = b.op(x, 8, Guard::Always);
         b.append(y, fact(0));
         b.append(y, fact(1));
         b.out(y);
-        let baked = bake(&b);
+        let compiled = bake(&b);
 
         // A fire carrying every class gets the whole frontier; one carrying
         // the masked classes gets the sub-order, which is still an interval.
-        let everything = &baked.regions[0].mask;
-        assert_eq!(baked.order.class_order(everything, None), [0, 1, 3, 2]);
-        let masked = &baked.regions[2].mask;
-        assert_eq!(baked.order.class_order(masked, None), [3, 2]);
+        let everything = &compiled.regions[0].mask;
+        assert_eq!(compiled.order.class_order(everything, None), [0, 1, 3, 2]);
+        let masked = &compiled.regions[2].mask;
+        assert_eq!(compiled.order.class_order(masked, None), [3, 2]);
 
         // v1 ignores last fire's order, and says so by answering the same.
         assert_eq!(
-            baked.order.class_order(everything, Some(&[2, 3, 1, 0])),
-            baked.order.class_order(everything, None),
+            compiled.order.class_order(everything, Some(&[2, 3, 1, 0])),
+            compiled.order.class_order(everything, None),
         );
     }
 
@@ -640,29 +638,29 @@ mod tests {
         // rather than for the order it arrived in.
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
-        b.append(y, Cond::not(fact(1))); // node 1: classes {0, 1}
-        b.append(y, Cond::not(fact(1))); // node 2: the same window, again
+        let y = b.op(x, 8, Guard::Always);
+        b.append(y, Guard::not(fact(1))); // node 1: classes {0, 1}
+        b.append(y, Guard::not(fact(1))); // node 2: the same window, again
         b.append(y, either_but_not_both()); // node 3: classes {1, 2}
-        b.append(y, Cond::not(fact(0))); // node 4: classes {0, 2}
-        b.append(y, Cond::not(fact(0))); // node 5: the same window, again
+        b.append(y, Guard::not(fact(0))); // node 4: classes {0, 2}
+        b.append(y, Guard::not(fact(0))); // node 5: the same window, again
         b.out(y);
 
-        let baked = bake(&b);
-        assert_eq!(baked.classes.classes.len(), 4);
-        assert_eq!(frontier(&baked), [1, 0, 2, 3]);
+        let compiled = bake(&b);
+        assert_eq!(compiled.classes.classes.len(), 4);
+        assert_eq!(frontier(&compiled), [1, 0, 2, 3]);
 
         // Exactly one consumer fell back, and it is the diagonal one.
-        let nodes: Vec<u32> = baked.fallback.rows.iter().map(|row| row.node).collect();
+        let nodes: Vec<u32> = compiled.fallback.rows.iter().map(|row| row.node).collect();
         assert_eq!(nodes, [3]);
-        assert!(PqTree::is_interval(&frontier(&baked), &[0, 1]));
-        assert!(PqTree::is_interval(&frontier(&baked), &[0, 2]));
-        assert!(!PqTree::is_interval(&frontier(&baked), &[1, 2]));
+        assert!(PqTree::is_interval(&frontier(&compiled), &[0, 1]));
+        assert!(PqTree::is_interval(&frontier(&compiled), &[0, 2]));
+        assert!(!PqTree::is_interval(&frontier(&compiled), &[1, 2]));
 
         // No bucket lattice means one implicit bucket at the token ceiling,
         // and 16 rows is decode scale, where a copy beats a split.
-        assert_eq!(baked.fallback.rows[0].buckets, 0..1);
-        assert_eq!(baked.fallback.rows[0].fallback, Fallback::Copy);
+        assert_eq!(compiled.fallback.rows[0].buckets, 0..1);
+        assert_eq!(compiled.fallback.rows[0].fallback, Fallback::Copy);
     }
 
     #[test]
@@ -670,13 +668,13 @@ mod tests {
         // Nothing constrains: one class, and the tree is the free one.
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
-        b.append(y, Cond::Always);
+        let y = b.op(x, 8, Guard::Always);
+        b.append(y, Guard::Always);
         b.out(y);
 
-        let baked = bake(&b);
-        assert_eq!(frontier(&baked), [0]);
-        assert!(baked.fallback.rows.is_empty());
+        let compiled = bake(&b);
+        assert_eq!(frontier(&compiled), [0]);
+        assert!(compiled.fallback.rows.is_empty());
     }
 
     #[test]
@@ -687,24 +685,24 @@ mod tests {
         // stated by the capture region.
         let mut b = Build::new();
         let x = b.input(4);
-        let q = b.op(x, 4, Cond::Always);
+        let q = b.op(x, 4, Guard::Always);
         let plan = b.prepare(fact(0));
         let o = b.decode(q, plan, fact(0));
-        let merged = b.merge(&[(o, fact(0)), (q, Cond::not(fact(0)))], 4);
+        let merged = b.merge(&[(o, fact(0)), (q, Guard::not(fact(0)))], 4);
         b.out(merged);
 
-        let baked = bake(&b);
-        let rows: Vec<Vec<Leaf>> = baked
+        let compiled = bake(&b);
+        let rows: Vec<Vec<Leaf>> = compiled
             .regions
             .iter()
-            .filter(|region| constrains(&b.plan, region, baked.classes.classes.len()))
+            .filter(|region| constrains(&b.trace, region, compiled.classes.classes.len()))
             .map(|region| region.mask.iter().map(|c| c as Leaf).collect())
             .collect();
         assert!(
             rows.iter().all(|mask| mask.len() == 1),
             "only the decode window constrains: {rows:?}",
         );
-        assert!(baked.fallback.rows.is_empty());
+        assert!(compiled.fallback.rows.is_empty());
     }
 
     #[test]
@@ -715,27 +713,27 @@ mod tests {
         // exactly what a windowed consumer got before P4 existed.
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
+        let y = b.op(x, 8, Guard::Always);
         for bit in 0..9 {
             b.append(y, fact(bit));
         }
         b.out(y);
 
-        let baked = bake(&b);
-        assert_eq!(baked.classes.classes.len(), 512);
-        assert_eq!(baked.order, LayoutOrder::Identity);
-        assert!(baked.order.tree().is_none());
-        assert!(baked.fallback.rows.is_empty());
+        let compiled = bake(&b);
+        assert_eq!(compiled.classes.classes.len(), 512);
+        assert_eq!(compiled.order, ClassOrder::Identity);
+        assert!(compiled.order.tree().is_none());
+        assert!(compiled.fallback.rows.is_empty());
     }
 
     #[test]
     fn the_bake_is_a_function_of_the_plan() {
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
-        b.append(y, Cond::not(fact(1)));
+        let y = b.op(x, 8, Guard::Always);
+        b.append(y, Guard::not(fact(1)));
         b.append(y, either_but_not_both());
-        b.append(y, Cond::not(fact(0)));
+        b.append(y, Guard::not(fact(0)));
         b.out(y);
 
         let once = bake(&b);
@@ -752,36 +750,36 @@ mod tests {
             sms: CROSSOVER_SMS as u32,
             ..DeviceProfile::default()
         };
-        let budgets = Budgets {
+        let budget = Budget {
             buckets: vec![1, 64, 512, 1024, 8192],
-            ..Budgets::default()
+            ..Budget::default()
         };
         assert_eq!(
-            menu(3, false, &budgets, &reference),
+            menu(3, false, &budget, &reference),
             vec![(0..2, Fallback::Copy), (2..5, Fallback::Split { r: 3 })],
         );
 
         // A wider device needs more rows before a split has tiles to fill it.
         let wider = DeviceProfile::default();
         assert_eq!(
-            menu(2, false, &budgets, &wider),
+            menu(2, false, &budget, &wider),
             vec![(0..3, Fallback::Copy), (3..5, Fallback::Split { r: 2 })],
         );
 
         // An all-prefill lattice never copies, and an all-decode one never
         // splits: the table is bucket-keyed because one answer would be wrong
         // at one end of it.
-        let prefill = Budgets {
+        let prefill = Budget {
             buckets: vec![4096, 8192],
-            ..Budgets::default()
+            ..Budget::default()
         };
         assert_eq!(
             menu(2, false, &prefill, &wider),
             vec![(0..2, Fallback::Split { r: 2 })],
         );
-        let decode = Budgets {
+        let decode = Budget {
             buckets: vec![1, 2, 4],
-            ..Budgets::default()
+            ..Budget::default()
         };
         assert_eq!(menu(2, false, &decode, &wider), vec![(0..3, Fallback::Copy)]);
     }
@@ -798,22 +796,22 @@ mod tests {
         // reads a class index, so the answer here is the other one.
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
-        b.append(y, Cond::not(fact(1))); // node 1: classes {0, 1}, stated once
+        let y = b.op(x, 8, Guard::Always);
+        b.append(y, Guard::not(fact(1))); // node 1: classes {0, 1}, stated once
         b.append(y, either_but_not_both()); // node 2: classes {1, 2}
         b.append(y, either_but_not_both()); // node 3: the same window, again
-        b.append(y, Cond::not(fact(0))); // node 4: classes {0, 2}
-        b.append(y, Cond::not(fact(0))); // node 5: the same window, again
+        b.append(y, Guard::not(fact(0))); // node 4: classes {0, 2}
+        b.append(y, Guard::not(fact(0))); // node 5: the same window, again
         b.out(y);
 
-        let baked = bake(&b);
-        assert_eq!(baked.classes.classes.len(), 4);
+        let compiled = bake(&b);
+        assert_eq!(compiled.classes.classes.len(), 4);
 
-        let nodes: Vec<u32> = baked.fallback.rows.iter().map(|row| row.node).collect();
+        let nodes: Vec<u32> = compiled.fallback.rows.iter().map(|row| row.node).collect();
         assert_eq!(nodes, [1], "the one node that is cheaper to lose than two");
-        assert!(PqTree::is_interval(&frontier(&baked), &[1, 2]));
-        assert!(PqTree::is_interval(&frontier(&baked), &[0, 2]));
-        assert!(!PqTree::is_interval(&frontier(&baked), &[0, 1]));
+        assert!(PqTree::is_interval(&frontier(&compiled), &[1, 2]));
+        assert!(PqTree::is_interval(&frontier(&compiled), &[0, 2]));
+        assert!(!PqTree::is_interval(&frontier(&compiled), &[0, 1]));
     }
 
     #[test]
@@ -823,20 +821,20 @@ mod tests {
         // running it beside the search on an instance small enough for both.
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
-        b.append(y, Cond::not(fact(1)));
+        let y = b.op(x, 8, Guard::Always);
+        b.append(y, Guard::not(fact(1)));
         b.append(y, either_but_not_both());
         b.append(y, either_but_not_both());
-        b.append(y, Cond::not(fact(0)));
-        b.append(y, Cond::not(fact(0)));
+        b.append(y, Guard::not(fact(0)));
+        b.append(y, Guard::not(fact(0)));
         b.out(y);
 
-        let baked = bake(&b);
+        let compiled = bake(&b);
         let profile = DeviceProfile::default();
-        let count = baked.classes.classes.len();
+        let count = compiled.classes.classes.len();
         let mut matrix: BTreeMap<Vec<Leaf>, Vec<usize>> = BTreeMap::new();
-        for (r, region) in baked.regions.iter().enumerate() {
-            if constrains(&b.plan, region, count) {
+        for (r, region) in compiled.regions.iter().enumerate() {
+            if constrains(&b.trace, region, count) {
                 matrix
                     .entry(region.mask.iter().map(|c| c as Leaf).collect())
                     .or_default()
@@ -846,13 +844,13 @@ mod tests {
         let masks: Vec<&Vec<Leaf>> = matrix.keys().collect();
         let costs: Vec<f32> = masks
             .iter()
-            .map(|mask| withdrawal_cost(&b.plan, &baked.regions, &matrix[*mask], false, &profile))
+            .map(|mask| withdrawal_cost(&b.trace, &compiled.regions, &matrix[*mask], false, &profile))
             .collect();
 
         let groupable: BTreeMap<&Vec<Leaf>, bool> =
             matrix.keys().map(|mask| (mask, false)).collect();
         let (_, greedy) = concede(&masks, &costs, count);
-        let (_, searched) = choose(&b.plan, &baked.regions, &matrix, &groupable, count, &profile);
+        let (_, searched) = choose(&b.trace, &compiled.regions, &matrix, &groupable, count, &profile);
         assert_eq!(greedy, searched, "costs {costs:?} over masks {masks:?}");
         assert_eq!(searched.len(), 1, "the family is a three-cycle; one pays");
     }
@@ -865,19 +863,19 @@ mod tests {
     /// a number nobody measured.
     #[test]
     fn a_groupable_consumer_is_answered_grouped_at_every_bucket() {
-        let budgets = Budgets {
+        let budget = Budget {
             buckets: vec![1, 64, 512, 1024, 8192],
-            ..Budgets::default()
+            ..Budget::default()
         };
         let profile = DeviceProfile::default();
         assert_eq!(
-            menu(3, true, &budgets, &profile),
+            menu(3, true, &budget, &profile),
             vec![(0..5, Fallback::Grouped)],
         );
         // The same lattice, the same runs, the same device — and without the
         // word, the two entries the menu has always written.
         assert_eq!(
-            menu(3, false, &budgets, &profile),
+            menu(3, false, &budget, &profile),
             vec![(0..3, Fallback::Copy), (3..5, Fallback::Split { r: 3 })],
         );
     }
@@ -890,13 +888,13 @@ mod tests {
     fn one_ungroupable_node_disqualifies_the_region_that_holds_it() {
         let mut b = Build::new();
         let x = b.input(8);
-        let y = b.op(x, 8, Cond::Always);
+        let y = b.op(x, 8, Guard::Always);
         let guarded = b.op(y, 8, fact(0));
         b.out(guarded);
 
-        assert_eq!(b.plan.nodes.len(), 2, "one shared op and one guarded one");
+        assert_eq!(b.trace.nodes.len(), 2, "one shared op and one guarded one");
         // The op the fixture's `Build::op` emits, and a name no plan states.
-        let named = model_ir::Operands::name(&b.plan.nodes[0].op).to_string();
+        let named = model_ir::Operands::name(&b.trace.nodes[0].op).to_string();
         let region = Region {
             nodes: 0..2,
             mask: model_ir::ClassSet::of([0]),
@@ -912,17 +910,17 @@ mod tests {
         let regions = [region];
 
         assert!(
-            composed_of(&b.plan, &regions, &[0], std::slice::from_ref(&named)),
+            composed_of(&b.trace, &regions, &[0], std::slice::from_ref(&named)),
             "both nodes are the same op and it is named",
         );
         assert!(!composed_of(
-            &b.plan,
+            &b.trace,
             &regions,
             &[0],
             &["linear.matmul".to_string()]
         ));
         assert!(
-            !composed_of(&b.plan, &regions, &[0], &[]),
+            !composed_of(&b.trace, &regions, &[0], &[]),
             "the empty list is the status quo and groups nothing",
         );
     }

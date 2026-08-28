@@ -108,7 +108,7 @@
 //! is what that sentence means in bytes.
 
 use kernels_metal::Tensor;
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_ir::Dtype;
 
 use crate::device::{Buffer, Context};
@@ -279,14 +279,14 @@ impl Inputs {
     /// [`Fault::Deviceless`](crate::Fault::Deviceless) off Apple.
     pub fn reserve(
         device: &Context,
-        budgets: &Budgets,
+        budget: &Budget,
         paging: Paging,
         spaces: usize,
         classes: usize,
     ) -> Result<Inputs> {
-        let rows = u64::from(budgets.max_tokens);
-        let lanes = u64::from(budgets.max_lanes);
-        let pages = u64::from(budgets.max_lanes) * u64::from(paging.pages_per_slot);
+        let rows = u64::from(budget.max_tokens);
+        let lanes = u64::from(budget.max_lanes);
+        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
         // A window is one contiguous run of the fire's class order, so a plan
         // of `k` classes has at most `k(k+1)/2` of them — plus one for the
         // zero window every empty region shares. Reserved rather than

@@ -113,7 +113,7 @@ pub fn elaborate(src: &ztensor::Source, claims: Vec<Claim>) -> Result<ModelContr
             // codes cannot be read without, under `<w>.scales` — the one name
             // this tree binds an mxfp4 second plane by, the one
             // `model_dsl::scales_name` writes and `Weight::planes` interns
-            // into `Plan::params`. That accord is settled in the loader
+            // into `Trace::params`. That accord is settled in the loader
             // (`plan::build::ScaleLayout::for_encode`'s MXFP4 arm carries the
             // ruling and `executor::walk`'s
             // `an_expert_bank_encodes_to_the_same_bytes_as_the_rows_it_stacks`

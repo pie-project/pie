@@ -1210,7 +1210,24 @@ impl DriverLane {
         {
             tracing::error!(driver_idx, %error, "driver lane could not bind its thread");
         }
-        while let Ok(request) = Self::next_request(&launch_rx, &control_rx) {
+        // A launch this loop has already RECEIVED but not yet served: the
+        // next-fire lookahead inside `fire_frame` takes a queued launch out
+        // of `launch_rx` early so the driver can be told its composition
+        // (`Driver::expect_fire`) before the fire ahead of it runs. FIFO is
+        // kept by construction — the stash is always the oldest launch not
+        // yet served, and the loop serves it before it receives anything
+        // else — and the panic arm below answers its owed frame like any
+        // other, because a stashed launch nobody answers is the same
+        // forever-in-flight frame the `owed` machinery exists for.
+        let mut stash: Option<LaneRequest> = None;
+        loop {
+            let request = match stash.take() {
+                Some(stashed) => stashed,
+                None => match Self::next_request(&launch_rx, &control_rx) {
+                    Ok(request) => request,
+                    Err(()) => break,
+                },
+            };
             let lane_began = Instant::now();
             let lane_was_control = matches!(request, LaneRequest::Control { .. });
             let lane_was_prefill = matches!(request, LaneRequest::Launch { prefill: true, .. });
@@ -1278,6 +1295,8 @@ impl DriverLane {
                                             &frame,
                                             EXHAUSTED_RETRY_SLEEP,
                                             EXHAUSTED_RETRY_MAX,
+                                            &launch_rx,
+                                            &mut stash,
                                         )
                                     })
                                 }
@@ -1326,6 +1345,13 @@ impl DriverLane {
                          behind it rather than leaving them in flight"
                     );
                     owed.answer(&reply_tx, "the driver lane panicked serving this request");
+                    // A launch the lookahead stashed is queued work the
+                    // channels no longer hold — fail it with the queue, or
+                    // its frame is the in-flight-forever stall the `owed`
+                    // machinery answers everywhere else.
+                    if let Some(stashed) = stash.take() {
+                        Owed::of(&stashed).answer(&reply_tx, "the driver lane is down after a panic");
+                    }
                     Self::drain_poisoned(&launch_rx, &control_rx, &reply_tx, driver, channels);
                     return;
                 }
@@ -1379,10 +1405,44 @@ impl DriverLane {
         frame: &crate::driver::FrameFire,
         retry_sleep: Duration,
         retry_max: u32,
+        launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
+        stash: &mut Option<LaneRequest>,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::driver::completion;
 
-        for step in &frame.steps {
+        for (index, step) in frame.steps.iter().enumerate() {
+            // ── THE NEXT FIRE, STATED (`Driver::expect_fire`, advisory).
+            //    The CUDA fold's prebind wants the SUCCESSOR's composition
+            //    on the table before this step fires, because the hidden
+            //    window it uses is inside the fire itself — after this
+            //    step's launch, before its sync. Two places know a
+            //    successor on this thread, and both are used:
+            //
+            //    * the frame's own next step — exact, the frame is a closed
+            //      system fired in slot order;
+            //    * on the LAST step, a whole launch already queued behind
+            //      this one (the run-ahead's depth-2 shape). `launch_rx`
+            //      has no peek, so the lookahead RECEIVES it into `stash` —
+            //      the run loop serves it next, ahead of everything, which
+            //      is the order the channel held.
+            //
+            //    Stated before the retry loop, once per step: an admission
+            //    retry re-fires the same step, and the hint a folded fire
+            //    consumes is restated per fire anyway — a hint consumed by
+            //    a retried launch costs one wasted prebind, which is the
+            //    advisory contract's price for being wrong.
+            if let Some(next) = frame.steps.get(index + 1) {
+                driver.expect_fire(&next.submission);
+            } else if stash.is_none()
+                && let Ok(queued) = launch_rx.try_recv()
+            {
+                if let LaneRequest::Launch { submission, .. } = &queued
+                    && let Some(first) = submission.0.steps.first()
+                {
+                    driver.expect_fire(&first.submission);
+                }
+                *stash = Some(queued);
+            }
             let mut attempts = 0u32;
             loop {
                 // ── THE CHANNEL JOIN, IN (`palo B2`). Every cell the guest
@@ -5163,5 +5223,146 @@ mod tests {
         let (driver, channels) = lane.shutdown();
         assert!(driver.is_none(), "a poisoned lane hands back no driver");
         assert!(channels.is_empty());
+    }
+
+    /// A driver that records, in order, every composition it is TOLD ABOUT
+    /// (`expect_fire`) and every one it RUNS (`fire`), each identified by
+    /// its first lane's `word` — the field a hint is actually about.
+    ///
+    /// `fire` dawdles on purpose: the lookahead's whole subject is a launch
+    /// that is queued while another executes, and a fire that returns
+    /// instantly would race the test's own posts.
+    struct RecordingDriver {
+        heard: Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
+    }
+
+    impl RecordingDriver {
+        fn hear(&self, verb: &'static str, submission: &driver_api::FireSubmission) {
+            let word = submission.lanes.first().map_or(u64::MAX, |lane| lane.word);
+            self.heard.lock().unwrap().push((verb, word));
+        }
+    }
+
+    impl driver_api::Driver for RecordingDriver {
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
+
+        fn load(
+            &mut self,
+            _request: driver_api::LoadRequest,
+        ) -> driver_api::Result<driver_api::Loaded> {
+            Err(driver_api::DriverError::Load("no model".into()))
+        }
+
+        fn expect_fire(&mut self, submission: &driver_api::FireSubmission) {
+            self.hear("expect", submission);
+        }
+
+        fn fire(
+            &mut self,
+            submission: &driver_api::FireSubmission,
+        ) -> driver_api::Result<driver_api::FireTicket> {
+            self.hear("fire", submission);
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(driver_api::FireTicket::default())
+        }
+    }
+
+    /// One launch of `word`-stamped frames, single-step unless `steps` says
+    /// otherwise.
+    fn launch_of(token: u64, words: &[u64]) -> LaneRequest {
+        LaneRequest::Launch {
+            token,
+            submission: LaneLaunch(crate::driver::FrameFire {
+                steps: words
+                    .iter()
+                    .map(|&word| crate::driver::StepFire {
+                        submission: crate::driver::FireSubmission {
+                            lanes: vec![crate::driver::Lane::decode(0, word, 1, 0)],
+                            attachments: Vec::new(),
+                        },
+                        terminal_cells: Vec::new(),
+                        instances: vec![0],
+                        logical_fire_ids: vec![token],
+                    })
+                    .collect(),
+            }),
+            prefill: false,
+        }
+    }
+
+    /// **THE HINT SEAM'S CONFORMANCE TEST** (palo cuda-abi step 6): before a
+    /// step fires, the lane states the NEXT fire to the driver — the frame's
+    /// own next step exactly, and at a frame boundary whatever launch is
+    /// already queued behind the executing one. The GPU gate
+    /// (`tests/gpu/tests/cuda_fold_hint_e2e.rs`) shows the serving-loop
+    /// motion; THIS test is the one that pins the ordering, because on
+    /// hardware the ordering is what a prebind cashes and a wrong order is
+    /// silently just a wasted hint.
+    ///
+    /// Determinism: the driver's `fire` sleeps 20 ms, so by the time frame
+    /// 1's fire returns, frames 2 and 3 — posted before any fire began —
+    /// have long been queued. Whether frame 1's own lookahead caught frame 2
+    /// is a race this test does NOT pin (either side is correct); what it
+    /// pins is that frame 3 was stated before frame 2's LAST step fired,
+    /// and that a frame's second step was stated before its first fired.
+    #[test]
+    fn the_lane_states_the_next_fire_before_the_one_ahead_of_it_runs() {
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
+        let mut lane = DriverLane::spawn(
+            0,
+            Some(Box::new(RecordingDriver {
+                heard: Arc::clone(&heard),
+            })),
+            reply_tx,
+            Arc::new(SchedulerStats::default()),
+        );
+
+        // Frame 1 carries TWO steps (words 10 and 11) — the intra-frame
+        // half of the seam. Frames 2 and 3 (words 20, 30) are single-step —
+        // the queued-behind half.
+        lane.post(launch_of(1, &[10, 11]));
+        lane.post(launch_of(2, &[20]));
+        lane.post(launch_of(3, &[30]));
+
+        for want in [1_u64, 2, 3] {
+            let reply = reply_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("token {want} was never answered"));
+            let SchedulerItem::Lane(LaneReply::LaunchDone { token, result }) = reply else {
+                panic!("a launch must be answered with a launch reply");
+            };
+            assert_eq!(token, want, "answered in the order posted");
+            result.unwrap_or_else(|err| panic!("frame {want} failed: {err}"));
+        }
+        let (_driver, _channels) = lane.shutdown();
+
+        let heard = heard.lock().unwrap();
+        let at = |verb: &str, word: u64| {
+            heard
+                .iter()
+                .position(|&(v, w)| v == verb && w == word)
+                .unwrap_or_else(|| panic!("({verb}, {word}) never happened in {heard:?}"))
+        };
+        // Every step fired, in frame order and slot order.
+        assert!(at("fire", 10) < at("fire", 11), "{heard:?}");
+        assert!(at("fire", 11) < at("fire", 20), "{heard:?}");
+        assert!(at("fire", 20) < at("fire", 30), "{heard:?}");
+        // The intra-frame hint: step 2 stated before step 1 fired.
+        assert!(
+            at("expect", 11) < at("fire", 10),
+            "the frame's own next step must be stated before the step ahead \
+             of it fires: {heard:?}"
+        );
+        // The queued-behind hint: frame 3 was in the channel throughout
+        // frame 2's service (posted before fire 1 finished sleeping), so the
+        // boundary lookahead must state it before frame 2 fires.
+        assert!(
+            at("expect", 30) < at("fire", 20),
+            "a launch queued behind the executing one must be stated before \
+             the executing one's last step fires: {heard:?}"
+        );
     }
 }

@@ -28,9 +28,9 @@ kernels-metal = { path = "../kernels-metal" }
 # (palo design §6). The shell supplies the two traits and calls the walk; it
 # never re-implements one.
 driver = { path = "../driver" }
-# `Baked` — the artifact this shell walks: the region template, the class
+# `CompiledModel` — the artifact this shell walks: the region template, the class
 # table a descriptor's counts index, and the arena's static offsets. Metal
-# records nothing (design §6: "no record.rs"), so `Baked` is read as a
+# records nothing (design §6: "no record.rs"), so `CompiledModel` is read as a
 # template and never as a capture script.
 model-compiler = { path = "../model-compiler" }
 # The residency half: `ModelContract` (the caller's, per decision #18),

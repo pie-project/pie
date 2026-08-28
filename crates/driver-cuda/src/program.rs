@@ -82,7 +82,7 @@ pub struct Program {
 /// programs, and the bound instances.
 ///
 /// **IT NEEDS A DEVICE, NOT A MODEL.** Everything here works against a bound
-/// [`Context`] and nothing else — no weights, no arena, no `Baked`. That is
+/// [`Context`] and nothing else — no weights, no arena, no `CompiledModel`. That is
 /// what lets the parity test drive it with a context and a golden trace, and
 /// it is also the honest shape: a guest program's channels are its own, and
 /// the model fire meets it only at the two attachment points design §9 names.

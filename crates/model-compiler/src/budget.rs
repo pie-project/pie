@@ -1,5 +1,5 @@
 //! The two inputs beside the plan: what a fire is allowed to be
-//! ([`Budgets`]), and what the device charges for the shapes it can be
+//! ([`Budget`]), and what the device charges for the shapes it can be
 //! ([`DeviceProfile`]). Both are PLAIN DATA and both are the caller's — the
 //! shell measures a device once and hands the numbers in, because a compiler
 //! that probed hardware would be a compiler that cannot be run on a laptop
@@ -8,8 +8,8 @@
 /// The ceilings a fire is baked against.
 ///
 /// EVERY SYMBOLIC DIM IS SIZED HERE AND NOWHERE ELSE. `Dim::Tokens` becomes
-/// [`max_tokens`](Budgets::max_tokens), `Dim::Lanes` becomes
-/// [`max_lanes`](Budgets::max_lanes), and the arena's rectangles are cut at
+/// [`max_tokens`](Budget::max_tokens), `Dim::Lanes` becomes
+/// [`max_lanes`](Budget::max_lanes), and the arena's rectangles are cut at
 /// those maxima (`arena::RowExpr`). That is what makes an offset static: a
 /// value's column is as wide as the largest fire the deployment admits, and a
 /// smaller fire uses its first rows and leaves the tail alone.
@@ -17,7 +17,7 @@
 /// A BUDGET IS NOT AN ADMISSION CAP (decision #17). Exceeding one is a load
 /// that is refused at compile time, not a request that is queued at run time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Budgets {
+pub struct Budget {
     /// The most requests one fire may carry. `Dim::Lanes` is this number.
     pub max_lanes: u32,
     /// The most token rows one fire may carry, across every lane in it.
@@ -25,11 +25,11 @@ pub struct Budgets {
     pub max_tokens: u32,
     /// The shape lattice a fire's row count is rounded up to before it is
     /// launched — one immutable graph per entry (design §5). Ascending, each
-    /// entry at most [`max_tokens`](Budgets::max_tokens).
+    /// entry at most [`max_tokens`](Budget::max_tokens).
     ///
     /// v1 READS THE LENGTH AND NOTHING ELSE. The arena is cut once at the
     /// ceiling and every bucket addresses the same static offsets, so bucket
-    /// membership does not change a byte of `Baked` yet; it is here because
+    /// membership does not change a byte of `CompiledModel` yet; it is here because
     /// P4's fallback menu is bucket-dependent (measured: copy 1.07x beats
     /// split 1.82x at M=64, and they converge at prefill scale) and that table
     /// cannot be keyed by something the compiler was never told.
@@ -40,12 +40,12 @@ pub struct Budgets {
     pub max_adapters: u32,
 }
 
-impl Budgets {
+impl Budget {
     /// The ceilings, with no bucket lattice and no adapter pool — what a test
     /// or a golden-path walk wants.
     #[must_use]
-    pub fn new(max_lanes: u32, max_tokens: u32) -> Budgets {
-        Budgets {
+    pub fn new(max_lanes: u32, max_tokens: u32) -> Budget {
+        Budget {
             max_lanes,
             max_tokens,
             buckets: Vec::new(),
@@ -54,13 +54,13 @@ impl Budgets {
     }
 }
 
-impl Default for Budgets {
+impl Default for Budget {
     /// A single-page decode-and-prefill deployment: 256 lanes, 8192 rows.
     /// Round numbers, chosen so that a caller who has not measured anything
     /// still bakes something that runs rather than something that divides by
     /// zero.
-    fn default() -> Budgets {
-        Budgets::new(256, 8192)
+    fn default() -> Budget {
+        Budget::new(256, 8192)
     }
 }
 

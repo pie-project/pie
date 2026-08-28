@@ -52,11 +52,11 @@ use kernels::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear,
 };
-use model_compiler::{Baked, Budgets, DeviceProfile, Fallback, Lowering, Region, compile};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, Fallback, Lowering, Region, compile};
 use model_dsl::Platform;
 use model_ir::{
     Attention, ClassSet, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
-    Plan,
+    Trace,
 };
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -69,8 +69,8 @@ const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 /// buckets are load-bearing too, and differently — they are what make the
 /// menu write a `Copy` row and a `Split` row rather than one entry covering
 /// everything, which is the thing this file is about.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -97,9 +97,9 @@ struct MockDispatch {
 }
 
 impl MockDispatch {
-    fn new(plan: &Plan, copies: bool) -> MockDispatch {
+    fn new(trace: &Trace, copies: bool) -> MockDispatch {
         MockDispatch {
-            at: plan
+            at: trace
                 .nodes
                 .iter()
                 .enumerate()
@@ -221,57 +221,57 @@ impl Sink for Runs {
     fn join(&mut self, _event: EventId) {}
 }
 
-fn sku() -> (Plan, Baked) {
+fn sku() -> (Trace, CompiledModel) {
     let trace = model::trace_of(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
-    let plan = trace(Platform::Cuda);
-    let baked = compile(&plan, &budgets(), &DeviceProfile::default())
+    let trace = trace(Platform::Cuda);
+    let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
-    (plan, baked)
+    (trace, compiled)
 }
 
 /// The smallest composition that leaves a window in pieces: a plain prefill
 /// lane, a capturing prefill lane and a capturing decode lane, with the plain
 /// one's rows standing between the other two.
-fn fragmenting(baked: &Baked) -> Vec<Lane> {
+fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
     [0usize, 4, 5]
         .iter()
-        .map(|&class| Lane::new(baked.classes.classes[class].word(), 1))
+        .map(|&class| Lane::new(compiled.classes.classes[class].word(), 1))
         .collect()
 }
 
 /// Walk one fire and hand back `(the sink's run counts, the dispatch)`.
-fn fire(plan: &Plan, baked: &Baked, lanes: &[Lane], copies: bool) -> (Runs, MockDispatch) {
-    let composition = compose(baked, &budgets(), lanes).expect("the fire composes");
+fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -> (Runs, MockDispatch) {
+    let composition = compose(compiled, &budget(), lanes).expect("the fire composes");
     let descriptor = FireDescriptor::of(&composition);
-    let mut dispatch = MockDispatch::new(plan, copies);
+    let mut dispatch = MockDispatch::new(trace, copies);
     let mut runs = Runs::default();
-    walk(plan, baked, &descriptor, &mut dispatch, &mut runs).expect("the fire walks");
+    walk(trace, compiled, &descriptor, &mut dispatch, &mut runs).expect("the fire walks");
     (runs, dispatch)
 }
 
 #[test]
 fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
-    let (plan, baked) = sku();
-    let lanes = fragmenting(&baked);
+    let (trace, compiled) = sku();
+    let lanes = fragmenting(&compiled);
 
     // NOT VACUOUS, AND CHECKED AGAINST THE ARTIFACT. The whole file is about
     // a table entry that used to be ignored, so the entry has to be there:
     // the bucket a three-row fire lands in must be one the menu wrote a
     // `Copy` row for, and some region must actually come back in pieces.
-    let composition = compose(&baked, &budgets(), &lanes).expect("three lanes compose");
+    let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     assert_eq!(
         composition.present(),
         [4, 0, 5],
         "class 0 stands between 4 and 5"
     );
-    let bucket = budgets()
+    let bucket = budget()
         .buckets
         .iter()
         .position(|&rows| rows == composition.bucket())
         .expect("the fire lands in the lattice") as u32;
     let descriptor = FireDescriptor::of(&composition);
 
-    let fragmented: Vec<usize> = baked
+    let fragmented: Vec<usize> = compiled
         .template()
         .iter()
         .enumerate()
@@ -285,7 +285,7 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let copied: Vec<usize> = fragmented
         .iter()
         .copied()
-        .filter(|&at| fallback::copies(&baked, &baked.template()[at].mask, bucket))
+        .filter(|&at| fallback::copies(&compiled, &compiled.template()[at].mask, bucket))
         .collect();
     assert_eq!(
         copied, fragmented,
@@ -293,12 +293,12 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
          not others, and this file's premise is that it asks for one on all of them",
     );
 
-    let (split, split_dispatch) = fire(&plan, &baked, &lanes, false);
-    let (copy, copy_dispatch) = fire(&plan, &baked, &lanes, true);
+    let (split, split_dispatch) = fire(&trace, &compiled, &lanes, false);
+    let (copy, copy_dispatch) = fire(&trace, &compiled, &lanes, true);
 
     // THE PERFORMANCE CLAIM, COUNTED. Every fragmented region falls from its
     // run count to one; every other region is untouched.
-    for (at, region) in baked.template().iter().enumerate() {
+    for (at, region) in compiled.template().iter().enumerate() {
         let runs = descriptor.spans(&region.mask).len().max(1) as u32;
         assert_eq!(
             split.per_region[at], runs,
@@ -331,7 +331,7 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     // that order, and nothing at all for a region P4 seated.
     let mut want: Vec<(u32, &str)> = Vec::new();
     for &at in &fragmented {
-        let node = baked.template()[at].nodes.start;
+        let node = compiled.template()[at].nodes.start;
         want.push((node, "gather"));
         want.push((node, "scatter"));
     }
@@ -351,7 +351,7 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
         "the two walks dispatched different node SETS",
     );
     for (node, ran) in &copy_counts {
-        let region = baked
+        let region = compiled
             .template()
             .iter()
             .position(|region| region.nodes.contains(node))
@@ -367,18 +367,18 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
 
 #[test]
 fn a_backend_that_says_nothing_about_serve_still_gets_every_split_it_had() {
-    let (plan, baked) = sku();
-    let lanes = fragmenting(&baked);
-    let composition = compose(&baked, &budgets(), &lanes).expect("three lanes compose");
+    let (trace, compiled) = sku();
+    let lanes = fragmenting(&compiled);
+    let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     let descriptor = FireDescriptor::of(&composition);
 
-    // `MockDispatch::new(plan, false)` IS the default `Serve` impl's answer,
+    // `MockDispatch::new(trace, false)` IS the default `Serve` impl's answer,
     // and the assertion is that the walk's launch counts are then exactly the
     // ones `WindowTable::spans` states — which is what rule 4 said before the
     // branch existed and what every other gate in this repo is written to.
-    let (runs, dispatch) = fire(&plan, &baked, &lanes, false);
+    let (runs, dispatch) = fire(&trace, &compiled, &lanes, false);
     let mut fragmented = 0usize;
-    for (at, region) in baked.template().iter().enumerate() {
+    for (at, region) in compiled.template().iter().enumerate() {
         let spans = descriptor.spans(&region.mask).len();
         fragmented += usize::from(spans > 1);
         assert_eq!(runs.per_region[at], spans.max(1) as u32, "region {at}");
@@ -389,10 +389,10 @@ fn a_backend_that_says_nothing_about_serve_still_gets_every_split_it_had() {
 
 #[test]
 fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
-    let (_, baked) = sku();
-    let lanes = fragmenting(&baked);
-    let composition = compose(&baked, &budgets(), &lanes).expect("three lanes compose");
-    let bucket = budgets()
+    let (_, compiled) = sku();
+    let lanes = fragmenting(&compiled);
+    let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
+    let bucket = budget()
         .buckets
         .iter()
         .position(|&rows| rows == composition.bucket())
@@ -407,12 +407,12 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
     // single gathered launch would read the first one.
     let mut prepare = 0usize;
     let mut capture = 0usize;
-    for region in baked.template() {
+    for region in compiled.template() {
         if descriptor.spans(&region.mask).len() < 2 {
             continue;
         }
         assert!(
-            fallback::copies(&baked, &region.mask, bucket),
+            fallback::copies(&compiled, &region.mask, bucket),
             "region {:?} is in pieces and takes a different answer from its own mask",
             region.nodes,
         );
@@ -429,7 +429,7 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
 
     // And the prepare region is owed no row of its OWN — which is exactly why
     // `fallback::copies` asks the mask rather than the nodes.
-    for region in baked.template() {
+    for region in compiled.template() {
         if region.phase != model_compiler::Phase::Prepare {
             continue;
         }
@@ -437,7 +437,7 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
             continue;
         }
         assert!(
-            fallback::answers(&baked, region.nodes.clone()).is_empty(),
+            fallback::answers(&compiled, region.nodes.clone()).is_empty(),
             "P4 wrote a row for a prepare region, and this test's reason to exist \
              was that it does not",
         );
@@ -446,16 +446,16 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
 
 #[test]
 fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
-    let (_, baked) = sku();
-    let lattice = budgets().buckets;
+    let (_, compiled) = sku();
+    let lattice = budget().buckets;
 
     // The table itself, read at every bucket — the claim the walk's branch is
     // built on, and the one that says the ten small buckets were the ones
     // paying for a split they did not ask for.
-    let withdrawn: Vec<&Region> = baked
+    let withdrawn: Vec<&Region> = compiled
         .template()
         .iter()
-        .filter(|region| !fallback::answers(&baked, region.nodes.clone()).is_empty())
+        .filter(|region| !fallback::answers(&compiled, region.nodes.clone()).is_empty())
         .collect();
     assert!(
         !withdrawn.is_empty(),
@@ -466,7 +466,7 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
     let mut splits = 0usize;
     for bucket in 0..lattice.len() as u32 {
         let mask = &withdrawn[0].mask;
-        if fallback::copies(&baked, mask, bucket) {
+        if fallback::copies(&compiled, mask, bucket) {
             copies += 1;
         } else {
             splits += 1;
@@ -481,7 +481,7 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
 
     // And the split rows say how many launches they would have cost, which is
     // the number the copy replaces with one.
-    let r = baked
+    let r = compiled
         .fallback
         .rows
         .iter()
@@ -492,7 +492,7 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
         .expect("the lattice reaches past the crossover");
     assert_eq!(r, 3, "the withdrawn mask breaks into three runs");
     assert_eq!(
-        fallback::bound(&baked, &withdrawn[0].mask),
+        fallback::bound(&compiled, &withdrawn[0].mask),
         3,
         "and the bound derived from the shipped order agrees",
     );
@@ -504,9 +504,9 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
         [4, 5, 6, 7],
         "the withdrawn window is `captures_scores`",
     );
-    let order = baked
+    let order = compiled
         .order
-        .class_order(&ClassSet::of(0..baked.classes.classes.len()), None);
+        .class_order(&ClassSet::of(0..compiled.classes.classes.len()), None);
     assert_eq!(
         order,
         [4, 0, 2, 6, 7, 3, 1, 5],

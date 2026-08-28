@@ -45,7 +45,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use driver_cuda::{AdapterPlane, Boot, Graphs, Lane, Seated, Shell};
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -302,7 +302,7 @@ fn a_fire_no_lane_routed_costs_the_axis_nothing() {
     // this composition, so no `linear.lora_correct` was dispatched at all.
     // Read off the bake, because "a launch that did not happen" has no output.
     let corrections = shell
-        .plan()
+        .trace()
         .nodes
         .iter()
         .filter(|node| {
@@ -887,8 +887,8 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-    let seats = plan
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let seats = trace
         .params
         .iter()
         .filter(|param| param.source == model_ir::ParamSource::Registered)
@@ -901,12 +901,12 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     drop(source);
 
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: Budgets {
+        budget: Budget {
             max_adapters: u32::try_from(seats).expect("a capacity fits a u32"),
-            ..Budgets::new(4, 256)
+            ..Budget::new(4, 256)
         },
         profile: None,
         page_size: 16,

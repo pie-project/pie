@@ -6,7 +6,7 @@ use model_ir::{Dtype, ParamSource, Shard};
 
 /// One logical weight: name, logical shape, on-device representation, how it
 /// is laid out across ranks, and where its bytes come from. The recorder
-/// interns it into `Plan::params` — one param per stored plane — the first
+/// interns it into `Trace::params` — one param per stored plane — the first
 /// time a wrapper touches it.
 #[derive(Clone, Debug)]
 pub struct Weight {
@@ -46,7 +46,7 @@ impl Weight {
     ///
     /// Capacity is stated here rather than passed in at load because it is a
     /// SHAPE, and shapes are the model text's. `model_compiler::compile`
-    /// refuses a `Budgets::max_adapters` this bank cannot seat, which is the
+    /// refuses a `Budget::max_adapters` this bank cannot seat, which is the
     /// one place the deployment's number and the model's meet.
     #[must_use]
     pub fn registered(mut self) -> Weight {
@@ -188,7 +188,7 @@ impl Weight {
     }
 }
 
-/// One stored plane of a weight: what actually lands in `Plan::params`.
+/// One stored plane of a weight: what actually lands in `Trace::params`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BankPlane {
     pub suffix: &'static str,

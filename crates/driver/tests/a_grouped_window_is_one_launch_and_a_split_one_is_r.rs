@@ -52,11 +52,11 @@ use kernels::{
     DispatchLinear,
 };
 use model_compiler::{
-    Baked, Budgets, DeviceProfile, Fallback, FamilyCosts, Lowering, Region, compile,
+    CompiledModel, Budget, DeviceProfile, Fallback, FamilyCosts, Lowering, Region, compile,
 };
 use model_dsl::Platform;
 use model_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Plan,
+    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Trace,
 };
 
 /// The SKU the recon measured, and the one whose adapter window fragments into
@@ -72,8 +72,8 @@ const CORRECTION: &str = "linear.lora_correct";
 /// compile nothing — no text seats more than eight — and every loop body in
 /// them is skipped. This file would have the same disease, so it names a
 /// number the text can seat and asserts non-vacuity besides.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -83,7 +83,7 @@ fn budgets() -> Budgets {
     }
 }
 
-fn plan() -> Plan {
+fn trace() -> Trace {
     let (_, _, trace, _) = model::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
@@ -91,8 +91,8 @@ fn plan() -> Plan {
     trace(Platform::Cuda)
 }
 
-fn bake(plan: &Plan, profile: &DeviceProfile) -> Baked {
-    compile(plan, &budgets(), profile).unwrap_or_else(|why| panic!("`{SKU}` bakes: {why:?}"))
+fn bake(trace: &Trace, profile: &DeviceProfile) -> CompiledModel {
+    compile(trace, &budget(), profile).unwrap_or_else(|why| panic!("`{SKU}` bakes: {why:?}"))
 }
 
 /// The three profiles this file compares: the artifact as it ships, and the
@@ -130,8 +130,8 @@ fn grouped_arm() -> DeviceProfile {
 }
 
 /// Which nodes of the plan are corrections.
-fn corrections(plan: &Plan) -> Vec<u32> {
-    plan.nodes
+fn corrections(trace: &Trace) -> Vec<u32> {
+    trace.nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| node.op.name() == CORRECTION)
@@ -140,12 +140,12 @@ fn corrections(plan: &Plan) -> Vec<u32> {
 }
 
 /// The class order the artifact ships, over every class.
-fn frontier(baked: &Baked) -> Vec<u8> {
+fn frontier(compiled: &CompiledModel) -> Vec<u8> {
     let mut every = model_ir::ClassSet::default();
-    for class in 0..baked.classes.classes.len() {
+    for class in 0..compiled.classes.classes.len() {
         every.insert(class);
     }
-    baked.order.class_order(&every, None)
+    compiled.order.class_order(&every, None)
 }
 
 /// One lane per class of the artifact — the composition that presents every
@@ -155,8 +155,8 @@ fn frontier(baked: &Baked) -> Vec<u8> {
 /// own `qo_one` bit, because a class whose lanes are single-row IS the decode
 /// class and a fire that gave it three would be composing a lane the word does
 /// not describe.
-fn one_lane_per_class(baked: &Baked) -> Vec<Lane> {
-    baked
+fn one_lane_per_class(compiled: &CompiledModel) -> Vec<Lane> {
+    compiled
         .classes
         .classes
         .iter()
@@ -167,8 +167,8 @@ fn one_lane_per_class(baked: &Baked) -> Vec<Lane> {
         .collect()
 }
 
-fn fire(baked: &Baked, lanes: &[Lane]) -> FireDescriptor {
-    FireDescriptor::of(&compose(baked, &budgets(), lanes).expect("the lanes compose"))
+fn fire(compiled: &CompiledModel, lanes: &[Lane]) -> FireDescriptor {
+    FireDescriptor::of(&compose(compiled, &budget(), lanes).expect("the lanes compose"))
 }
 
 // ── the mock backend ─────────────────────────────────────────────────────
@@ -183,9 +183,9 @@ struct MockDispatch {
 }
 
 impl MockDispatch {
-    fn new(plan: &Plan) -> MockDispatch {
+    fn new(trace: &Trace) -> MockDispatch {
         MockDispatch {
-            at: plan
+            at: trace
                 .nodes
                 .iter()
                 .enumerate()
@@ -295,11 +295,11 @@ impl Sink for Runs {
 
 /// One walk of one bake over one composition: what each node cost, and what
 /// each region announced.
-fn walked(plan: &Plan, baked: &Baked, lanes: &[Lane]) -> (HashMap<u32, usize>, Vec<u32>) {
-    let descriptor = fire(baked, lanes);
-    let mut dispatch = MockDispatch::new(plan);
+fn walked(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane]) -> (HashMap<u32, usize>, Vec<u32>) {
+    let descriptor = fire(compiled, lanes);
+    let mut dispatch = MockDispatch::new(trace);
     let mut runs = Runs::default();
-    walk(plan, baked, &descriptor, &mut dispatch, &mut runs).expect("a fragmented fire walks");
+    walk(trace, compiled, &descriptor, &mut dispatch, &mut runs).expect("a fragmented fire walks");
     (dispatch.counts(), runs.per_region)
 }
 
@@ -311,14 +311,14 @@ fn walked(plan: &Plan, baked: &Baked, lanes: &[Lane]) -> (HashMap<u32, usize>, V
 /// be compared at all.
 #[test]
 fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together() {
-    let plan = plan();
-    let corrections = corrections(&plan);
+    let trace = trace();
+    let corrections = corrections(&trace);
     assert!(
         !corrections.is_empty(),
         "`{SKU}` states no correction, and then every gate in this file is vacuous",
     );
 
-    let shipped = bake(&plan, &shipped());
+    let shipped = bake(&trace, &shipped());
     for &node in &corrections {
         assert!(
             fallback::answers(&shipped, node..node + 1).is_empty(),
@@ -334,8 +334,8 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
     );
 
     // The two arms, and the one thing they must agree on.
-    let split = bake(&plan, &split_arm());
-    let grouped = bake(&plan, &grouped_arm());
+    let split = bake(&trace, &split_arm());
+    let grouped = bake(&trace, &grouped_arm());
     assert_eq!(
         frontier(&split),
         [0, 2, 4, 6, 5, 7, 1, 3],
@@ -366,8 +366,8 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
     // Nobody else changed hands. The score-capture window the shipped bake
     // withdrew is seated in both arms, which is the other half of "the
     // scaffold moved one constraint".
-    let owed = |baked: &Baked| -> Vec<u32> {
-        baked
+    let owed = |compiled: &CompiledModel| -> Vec<u32> {
+        compiled
             .fallback
             .rows
             .iter()
@@ -385,12 +385,12 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
 /// other node in the plan is dispatched exactly as often in both.
 #[test]
 fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
-    let plan = plan();
-    let corrections = corrections(&plan);
+    let trace = trace();
+    let corrections = corrections(&trace);
     assert!(!corrections.is_empty(), "the SKU states corrections");
 
-    let split = bake(&plan, &split_arm());
-    let grouped = bake(&plan, &grouped_arm());
+    let split = bake(&trace, &split_arm());
+    let grouped = bake(&trace, &grouped_arm());
     let lanes = one_lane_per_class(&split);
     assert_eq!(lanes.len(), 8, "`{SKU}` resolves eight classes");
 
@@ -412,8 +412,8 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
          nothing for `Grouped` to do and nothing for this test to compare",
     );
 
-    let (split_counts, split_runs) = walked(&plan, &split, &lanes);
-    let (grouped_counts, grouped_runs) = walked(&plan, &grouped, &lanes);
+    let (split_counts, split_runs) = walked(&trace, &split, &lanes);
+    let (grouped_counts, grouped_runs) = walked(&trace, &grouped, &lanes);
 
     // The correction nodes: `r` launches against one.
     for &node in &corrections {
@@ -432,8 +432,8 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
 
     // And the regions announced what they cost, which is what a shell's
     // cursor reads to know how many windows to resolve.
-    let region_of = |baked: &Baked| {
-        baked
+    let region_of = |compiled: &CompiledModel| {
+        compiled
             .template()
             .iter()
             .position(|region| region.nodes.clone().any(|node| corrections.contains(&node)))
@@ -474,10 +474,10 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
 /// fire it always was, grouped answer or not.
 #[test]
 fn a_fire_that_fragments_nothing_is_unchanged_by_the_grouped_answer() {
-    let plan = plan();
-    let corrections = corrections(&plan);
-    let split = bake(&plan, &split_arm());
-    let grouped = bake(&plan, &grouped_arm());
+    let trace = trace();
+    let corrections = corrections(&trace);
+    let split = bake(&trace, &split_arm());
+    let grouped = bake(&trace, &grouped_arm());
 
     // Two adapted lanes and nothing else: the adapter classes are the only
     // ones present, so their window is one interval however the order runs.
@@ -503,8 +503,8 @@ fn a_fire_that_fragments_nothing_is_unchanged_by_the_grouped_answer() {
         "the premise: this composition does not fragment the adapter window",
     );
 
-    let (split_counts, split_runs) = walked(&plan, &split, &adapted);
-    let (grouped_counts, grouped_runs) = walked(&plan, &grouped, &adapted);
+    let (split_counts, split_runs) = walked(&trace, &split, &adapted);
+    let (grouped_counts, grouped_runs) = walked(&trace, &grouped, &adapted);
     assert_eq!(split_counts, grouped_counts);
     assert_eq!(split_runs, grouped_runs);
     for &node in &corrections {

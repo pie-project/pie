@@ -1,4 +1,4 @@
-//! The trace machinery: a `Recorder` accumulating a `Plan`, and the `Value`
+//! The trace machinery: a `Recorder` accumulating a `Trace`, and the `Value`
 //! handles a forward pass passes around. Re-imagined from the old `record.rs`
 //! for the `Def` × `Ty` world — the string `Stmt` builder is gone; wrappers
 //! build typed op variants, declare their outputs with `fresh`, and `push`
@@ -9,7 +9,7 @@ use std::ops::Mul;
 use std::rc::Rc;
 
 use model_ir::{
-    CacheRow, Cond, Def, Dim, Dtype, Node, Operands, Operation, Param, ParamSource, Plan, Platform,
+    CacheRow, Guard, Def, Dim, Dtype, Node, Operands, Operation, Param, ParamSource, Trace, Platform,
     RuntimeInput, Seam, Shard, Ty, ValueDecl, ValueId,
 };
 
@@ -25,7 +25,7 @@ const UNCLAIMED: u32 = u32::MAX;
 /// `finish` insists the trace let go of all of them.
 #[derive(Clone)]
 pub struct Recorder {
-    inner: Rc<RefCell<Plan>>,
+    inner: Rc<RefCell<Trace>>,
 
     /// The layer the trace is inside, driven by `enter`/`leave` (the
     /// `Layers` iterator in `forward.rs` is the usual driver).
@@ -35,7 +35,7 @@ pub struct Recorder {
 impl Recorder {
     pub(crate) fn new(name: &str, platform: Platform, caches: Vec<CacheRow>) -> Recorder {
         Recorder {
-            inner: Rc::new(RefCell::new(Plan {
+            inner: Rc::new(RefCell::new(Trace {
                 name: name.to_string(),
                 platform,
                 params: Vec::new(),
@@ -74,7 +74,7 @@ impl Recorder {
     /// derive wires the recorder rather than the wrapper doing it by hand.
     pub fn push(&self, op: impl Into<Operation>, ins: &[&Value]) {
         let op = op.into();
-        let mut cond = Cond::Always;
+        let mut cond = Guard::Always;
         for v in ins {
             let c = v.cond();
             assert!(
@@ -100,7 +100,7 @@ impl Recorder {
         }
         p.nodes.push(Node {
             op,
-            cond,
+            guard: cond,
             layer: self.at.get(),
         });
     }
@@ -208,7 +208,7 @@ impl Recorder {
     /// Unwrap the plan and run the validator — the trace's first error
     /// surface. A bad trace panics with every fault sentence at once, so one
     /// forgotten `#[out]` reads as itself and not as ten downstream mysteries.
-    pub fn finish(self) -> Plan {
+    pub fn finish(self) -> Trace {
         let plan = Rc::try_unwrap(self.inner)
             .unwrap_or_else(|_| panic!("a Value outlived its trace"))
             .into_inner();
@@ -223,26 +223,26 @@ impl Recorder {
         plan
     }
 
-    /// The guard a value settled under. Op outputs read their node's cond off
+    /// The guard a value settled under. Op outputs read their node's guard off
     /// the plan itself — which is why `fresh` needs no cond up front and
     /// `push` never has to reach into handles already given out.
-    fn guard(&self, id: ValueId) -> Cond {
+    fn guard(&self, id: ValueId) -> Guard {
         let p = self.inner.borrow();
         match &p.values[id.0 as usize].def {
             Def::Op(i) => p
                 .nodes
                 .get(*i as usize)
-                .map(|n| n.cond.clone())
-                .unwrap_or(Cond::Always),
+                .map(|n| n.guard.clone())
+                .unwrap_or(Guard::Always),
             // Merges carry their or-cond in the handle; inputs, weights and
             // caches are bound before the first node and guard nothing.
-            _ => Cond::Always,
+            _ => Guard::Always,
         }
     }
 }
 
 fn intern(
-    p: &mut Plan,
+    p: &mut Trace,
     name: String,
     shape: Vec<u64>,
     shard: Shard,
@@ -290,7 +290,7 @@ pub struct Value {
     id: ValueId,
     /// `None` reads the producing node's guard off the plan; a split arm
     /// carries its refinement here.
-    over: Option<Cond>,
+    over: Option<Guard>,
     ty: Ty,
 }
 
@@ -343,7 +343,7 @@ impl Value {
         *dtype
     }
 
-    pub(crate) fn cond(&self) -> Cond {
+    pub(crate) fn cond(&self) -> Guard {
         match &self.over {
             Some(c) => c.clone(),
             None => self.rec.guard(self.id),
@@ -367,7 +367,7 @@ impl Value {
         let cond = joined
             .iter()
             .skip(1)
-            .fold(joined[0].1.clone(), |c, (_, a)| Cond::or(c, a.clone()))
+            .fold(joined[0].1.clone(), |c, (_, a)| Guard::or(c, a.clone()))
             .simplified();
         let mut p = rec.inner.borrow_mut();
         p.values.push(ValueDecl {
@@ -410,18 +410,18 @@ impl Value {
         Value {
             rec: self.rec.clone(),
             id: self.id,
-            over: Some(Cond::Always),
+            over: Some(Guard::Always),
             ty: self.ty.clone(),
         }
     }
 }
 
 impl Refine for Value {
-    fn refined(&self, cond: Cond) -> Value {
+    fn refined(&self, cond: Guard) -> Value {
         Value {
             rec: self.rec.clone(),
             id: self.id,
-            over: Some(Cond::and(self.cond(), cond)),
+            over: Some(Guard::and(self.cond(), cond)),
             ty: self.ty.clone(),
         }
     }
@@ -452,7 +452,7 @@ impl Mul<f32> for Value {
 /// so a schedule built off one class's arm and a query read off another's is
 /// refused at the line that mixed them.
 pub trait Refine: Sized {
-    fn refined(&self, cond: Cond) -> Self;
+    fn refined(&self, cond: Guard) -> Self;
 }
 
 /// How a spec cuts a carrier into arms: `&Predicate` gives the two-way
@@ -468,7 +468,7 @@ impl SplitSpec for &Predicate {
 
     fn arms<T: Refine>(self, of: &T) -> (T, T) {
         let c = cond_of(self);
-        (of.refined(c.clone()), of.refined(Cond::not(c)))
+        (of.refined(c.clone()), of.refined(Guard::not(c)))
     }
 }
 
@@ -476,14 +476,14 @@ impl<const N: usize> SplitSpec for [Predicate; N] {
     type Arms<T> = [T; N];
 
     fn arms<T: Refine>(self, of: &T) -> [T; N] {
-        let mut not_prior = Cond::Always;
+        let mut not_prior = Guard::Always;
         self.each_ref().map(|p| {
             let mine = match p {
                 Predicate::Rest => not_prior.clone(),
                 p => {
                     let c = cond_of(p);
-                    let mine = Cond::and(not_prior.clone(), c.clone());
-                    not_prior = Cond::and(not_prior.clone(), Cond::not(c));
+                    let mine = Guard::and(not_prior.clone(), c.clone());
+                    not_prior = Guard::and(not_prior.clone(), Guard::not(c));
                     mine
                 }
             };
@@ -529,22 +529,22 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
     }
 }
 
-fn cond_of(p: &Predicate) -> Cond {
+fn cond_of(p: &Predicate) -> Guard {
     match p {
-        Predicate::Fact { bit } => Cond::Fact(*bit),
-        Predicate::Not(a) => Cond::not(cond_of(a)),
-        Predicate::And(a, b) => Cond::and(cond_of(a), cond_of(b)),
+        Predicate::Fact { bit } => Guard::Fact(*bit),
+        Predicate::Not(a) => Guard::not(cond_of(a)),
+        Predicate::And(a, b) => Guard::and(cond_of(a), cond_of(b)),
         Predicate::Rest => panic!("Predicate::rest() belongs only in an n-way split"),
     }
 }
 
-fn compatible(a: &Cond, b: &Cond) -> bool {
-    matches!(a, Cond::Always) || matches!(b, Cond::Always) || a == b
+fn compatible(a: &Guard, b: &Guard) -> bool {
+    matches!(a, Guard::Always) || matches!(b, Guard::Always) || a == b
 }
 
-fn meet(a: Cond, b: Cond) -> Cond {
+fn meet(a: Guard, b: Guard) -> Guard {
     match (a, b) {
-        (Cond::Always, x) | (x, Cond::Always) => x,
+        (Guard::Always, x) | (x, Guard::Always) => x,
         (a, _) => a,
     }
 }

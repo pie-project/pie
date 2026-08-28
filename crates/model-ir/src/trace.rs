@@ -1,8 +1,8 @@
-//! The plan container: what one trace of a forward pass serializes to.
+//! The trace container: what one trace of a forward pass serializes to.
 
 use serde::{Deserialize, Serialize};
 
-use crate::cond::Cond;
+use crate::guard::Guard;
 use crate::ops::Operation;
 use crate::value::{Dtype, ValueDecl, ValueId};
 
@@ -16,7 +16,7 @@ pub enum Platform {
     Vulkan,
 }
 
-/// How a param is laid out across ranks. Plans are SPMD; `Cut` carries the
+/// How a param is laid out across ranks. Traces are SPMD; `Cut` carries the
 /// per-rank segment lengths along the cut axis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Shard {
@@ -27,7 +27,7 @@ pub enum Shard {
 /// Where one param's bytes come from.
 ///
 /// **THE ONE THING `Def::Weight` COULD NOT SAY** (design §8's open IR item).
-/// A weight is a static index into `Plan::params` and that is the whole of its
+/// A weight is a static index into `Trace::params` and that is the whole of its
 /// runtime story: the loader lands it once and the address never moves again.
 /// An adapter bank is the same STORAGE with a different provenance — reserved
 /// at load from its own declared shape, written between fires by
@@ -96,12 +96,12 @@ pub struct Seam {
     pub layer: Option<u32>,
 }
 
-/// One executable step. `cond` and `layer` wrap the op because they are
+/// One executable step. `guard` and `layer` wrap the op because they are
 /// orthogonal to every family.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub op: Operation,
-    pub cond: Cond,
+    pub guard: Guard,
     pub layer: Option<u32>,
 }
 
@@ -109,7 +109,7 @@ pub struct Node {
 /// fresh rewrite with no migration path — a stale plan is re-traced, not
 /// converted (decision #19).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Plan {
+pub struct Trace {
     pub name: String,
     pub platform: Platform,
     pub params: Vec<Param>,

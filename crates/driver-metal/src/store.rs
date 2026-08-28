@@ -68,7 +68,7 @@
 pub mod kv;
 
 use kernels_metal::{KvPool, RecurrentPool, Tensor};
-use model_ir::{CacheRow, Dtype, Plan};
+use model_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
@@ -204,14 +204,14 @@ impl Pools {
     /// [`Fault::Deviceless`] for a non-Apple build.
     pub fn reserve(
         device: &Context,
-        plan: &Plan,
+        trace: &Trace,
         paging: Paging,
         facts: &Facts,
     ) -> Result<Pools> {
-        let mut slabs = Vec::with_capacity(plan.caches.len());
-        let mut shapes = Vec::with_capacity(plan.caches.len());
+        let mut slabs = Vec::with_capacity(trace.caches.len());
+        let mut shapes = Vec::with_capacity(trace.caches.len());
 
-        for (index, row) in plan.caches.iter().enumerate() {
+        for (index, row) in trace.caches.iter().enumerate() {
             match row {
                 CacheRow::Kv {
                     name,

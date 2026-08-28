@@ -138,8 +138,8 @@ use std::cell::Cell;
 use crate::device::graph::Event;
 use driver::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use kernels_cuda::Tensor;
-use model_compiler::{Baked, Lowering, Phase, Region};
-use model_ir::{Attention, Def, Dim, Dtype, GeomKind, Operands, Operation, Plan, RuntimeInput, Ty};
+use model_compiler::{CompiledModel, Lowering, Phase, Region};
+use model_ir::{Attention, Def, Dim, Dtype, GeomKind, Operands, Operation, Trace, RuntimeInput, Ty};
 
 use crate::error::{Fault, Result};
 use crate::store::kv::Geometry;
@@ -280,13 +280,13 @@ pub struct GatheredSpace {
 /// **THE BUCKET AND THE TOGGLE ARE BOTH THE DEPLOYMENT'S, NOT THE
 /// ARTIFACT'S.** P4's menu is keyed by bucket range because the cost model
 /// is, and turning `Composition::bucket` — a row COUNT — into the index that
-/// range is over needs the `Budgets` only the shell holds. `enabled` is the
+/// range is over needs the `Budget` only the shell holds. `enabled` is the
 /// A/B switch: `Fallback::Split` is green on device and is the oracle a copy
 /// is diffed against, so the shell ships with copies OFF and a caller turns
 /// them on.
 #[derive(Debug, Clone, Copy)]
 pub struct Copies<'a> {
-    /// Which position of `Budgets::buckets` this fire's rows land in; `0` for
+    /// Which position of `Budget::buckets` this fire's rows land in; `0` for
     /// a deployment that declared no lattice and therefore has one bucket.
     pub bucket: u32,
     /// Does this shell serve `Fallback::Copy` at all?
@@ -363,10 +363,10 @@ pub struct Windows {
 /// resolved through `Run::slot`, and its own window is the region that BUILT
 /// it — which is copied whenever this one is, for the reason
 /// `driver::fire::fallback::copies` states.
-fn copyable(plan: &Plan, region: &Region) -> bool {
+fn copyable(trace: &Trace, region: &Region) -> bool {
     let mut operands: Vec<model_ir::ValueId> = Vec::new();
     for node in region.nodes.clone() {
-        let Some(node) = plan.nodes.get(node as usize) else {
+        let Some(node) = trace.nodes.get(node as usize) else {
             return false;
         };
         macro_rules! collect {
@@ -385,7 +385,7 @@ fn copyable(plan: &Plan, region: &Region) -> bool {
         }
     }
     operands.iter().all(|id| {
-        let Some(decl) = plan.values.get(id.0 as usize) else {
+        let Some(decl) = trace.values.get(id.0 as usize) else {
             return false;
         };
         match &decl.def {
@@ -399,7 +399,7 @@ fn copyable(plan: &Plan, region: &Region) -> bool {
             // again, in a table `GatheredSpace` does not re-cut. Wrong state,
             // no fault; so a region that scans one does not copy.
             Def::Cache(c) => matches!(
-                plan.caches.get(*c as usize),
+                trace.caches.get(*c as usize),
                 Some(model_ir::CacheRow::Kv { .. })
             ),
             // The four geometry vectors that re-cut goes through. `Indices`
@@ -454,22 +454,22 @@ impl Windows {
     /// `copies` says this fire's bucket asks for a copy and the region's
     /// operands admit one, as a single [`Gathered`] window.
     pub fn of(
-        plan: &Plan,
-        baked: &Baked,
+        trace: &Trace,
+        compiled: &CompiledModel,
         classes: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
     ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
-        let mut runs: Vec<u32> = Vec::with_capacity(baked.template().len());
-        let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(baked.template().len());
+        let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
+        let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(compiled.template().len());
         let mut spans: Vec<MaskSpan> = Vec::new();
         // The grid's segment axis, once per fire rather than once per window:
         // it is a property of the ARTIFACT (how many intervals the shipped
         // order breaks any mask into) and a fire may not move it.
-        let segment_cap = fallback::max_runs(baked);
+        let segment_cap = fallback::max_runs(compiled);
 
-        for (at, region) in baked.template().iter().enumerate() {
+        for (at, region) in compiled.template().iter().enumerate() {
             classes.spans_into(&region.mask, &mut spans);
             let mut segments_host: Vec<i32> = Vec::new();
             if spans.len() > 1 {
@@ -480,13 +480,13 @@ impl Windows {
                 // one the shipped order breaks the mask into? A fire's order
                 // is that order with the absent classes dropped, and dropping
                 // a class can only close a gap, so neither can happen to a
-                // `Baked` and a `WindowTable` built from each other.
-                let bound = fallback::bound(baked, &region.mask);
-                if fallback::promised(baked, region) || spans.len() > bound as usize {
+                // `CompiledModel` and a `WindowTable` built from each other.
+                let bound = fallback::bound(compiled, &region.mask);
+                if fallback::promised(compiled, region) || spans.len() > bound as usize {
                     return Err(Fault::Fragmented {
                         region: at as u32,
                         runs: spans.len(),
-                        promised: fallback::promised(baked, region).then_some(bound),
+                        promised: fallback::promised(compiled, region).then_some(bound),
                     });
                 }
                 // **P4'S OTHER ANSWER, AND THE ONE THAT CHANGES THE LAUNCH
@@ -499,7 +499,7 @@ impl Windows {
                 // loop once, so the two cannot disagree about how many runs
                 // this region has — which is what `at`'s panic would
                 // otherwise be for.
-                if fallback::grouped(baked, region.nodes.clone()) {
+                if fallback::grouped(compiled, region.nodes.clone()) {
                     let union = union_of(&spans);
                     segments_host = spans
                         .iter()
@@ -524,8 +524,8 @@ impl Windows {
             // launch, which is the whole point.
             if spans.len() > 1
                 && copies.enabled
-                && fallback::copies(baked, &region.mask, copies.bucket)
-                && copyable(plan, region)
+                && fallback::copies(compiled, &region.mask, copies.bucket)
+                && copyable(trace, region)
             {
                 let gathered = gather_of(&spans, indptr_host, copies.spaces);
                 of_region.push((runs.len() as u32, 1));
@@ -738,19 +738,19 @@ impl Windows {
 ///
 /// [`Fault::Straddled`], naming the value, the consuming node, and the two
 /// class sets.
-pub fn no_schedule_straddles_its_readers(plan: &Plan, baked: &Baked) -> Result<()> {
+pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel) -> Result<()> {
     // Which region each node stands in, and therefore which classes it runs.
-    let mut region_of: Vec<usize> = vec![0; plan.nodes.len()];
-    for (at, region) in baked.template().iter().enumerate() {
+    let mut region_of: Vec<usize> = vec![0; trace.nodes.len()];
+    for (at, region) in compiled.template().iter().enumerate() {
         for node in region.nodes.clone() {
             if let Some(slot) = region_of.get_mut(node as usize) {
                 *slot = at;
             }
         }
     }
-    let mask_of = |node: usize| &baked.template()[region_of[node]].mask;
+    let mask_of = |node: usize| &compiled.template()[region_of[node]].mask;
 
-    for (at, node) in plan.nodes.iter().enumerate() {
+    for (at, node) in trace.nodes.iter().enumerate() {
         let Operation::Attention(op) = &node.op else {
             continue;
         };
@@ -765,7 +765,7 @@ pub fn no_schedule_straddles_its_readers(plan: &Plan, baked: &Baked) -> Result<(
             | Attention::Masked { plan, .. } => *plan,
             _ => continue,
         };
-        let Some(Def::Op(built_by)) = plan.values.get(consumed.0 as usize).map(|v| &v.def) else {
+        let Some(Def::Op(built_by)) = trace.values.get(consumed.0 as usize).map(|v| &v.def) else {
             continue;
         };
         let planned = mask_of(*built_by as usize);
@@ -805,12 +805,12 @@ pub fn no_schedule_straddles_its_readers(plan: &Plan, baked: &Baked) -> Result<(
 ///
 /// [`Fault::Straddled`], naming the grouped region's first node and the two
 /// class sets.
-pub fn no_grouped_window_is_also_a_prepare_window(baked: &Baked) -> Result<()> {
-    for region in baked.template() {
-        if !fallback::grouped(baked, region.nodes.clone()) {
+pub fn no_grouped_window_is_also_a_prepare_window(compiled: &CompiledModel) -> Result<()> {
+    for region in compiled.template() {
+        if !fallback::grouped(compiled, region.nodes.clone()) {
             continue;
         }
-        let Some(builder) = baked
+        let Some(builder) = compiled
             .template()
             .iter()
             .find(|other| other.phase == Phase::Prepare && other.mask == region.mask)
@@ -984,7 +984,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
 /// the dispatch as two separate borrows.
 #[derive(Debug, Default)]
 pub struct At {
-    /// The region index, in `Baked::template` order.
+    /// The region index, in `CompiledModel::template` order.
     pub region: Cell<u32>,
     /// Which run of that region's window: `0` always, and `0..r` for a region
     /// P4 could not seat.
@@ -1115,7 +1115,7 @@ impl<'a> Cursor<'a> {
     ///
     /// [`Fault::Device`] from a `cudaEventRecord` or a `cudaStreamWaitEvent`,
     /// or [`Fault::Unbound`] for a template naming a stream or an event this
-    /// load never opened — which is a `Baked` and a `Context` that were not
+    /// load never opened — which is a `CompiledModel` and a `Context` that were not
     /// set up from each other.
     pub fn settle(self) -> Result<()> {
         match self.fault {

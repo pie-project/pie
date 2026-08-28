@@ -42,8 +42,8 @@ fn a_one_token_lane_lands_in_the_decode_class() {
     let classify = model::classify_of(QWEN).expect("and its classifier");
 
     for platform in PLATFORMS {
-        let plan = trace(platform);
-        let classes = resolve_classes(&plan).expect("the qwen plan resolves every merge");
+        let trace = trace(platform);
+        let classes = resolve_classes(&trace).expect("the qwen plan resolves every merge");
 
         // The sweep enumerates only the bits some GUARD reads; the word packs
         // every fact the model computes. Masking is what keeps a fact the plan
@@ -73,7 +73,7 @@ fn a_one_token_lane_lands_in_the_decode_class() {
         // would widen `model_dsl`'s re-export door for one assertion.
         let kernels = |class: usize| -> (bool, bool) {
             let (mut decode, mut prefill) = (false, false);
-            for (node, mask) in plan.nodes.iter().zip(&classes.node_mask) {
+            for (node, mask) in trace.nodes.iter().zip(&classes.node_mask) {
                 if !mask.contains(class) {
                     continue;
                 }
@@ -114,8 +114,8 @@ fn every_sku_classifies_into_its_own_plan() {
 
     for (sku, _, trace, classify) in model::catalog() {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(classes) = resolve_classes(&plan) else {
+            let trace = trace(platform);
+            let Ok(classes) = resolve_classes(&trace) else {
                 continue; // `every_class_resolves_every_merge` is what says so.
             };
             // The two shapes every fire is made of, and every axis fact

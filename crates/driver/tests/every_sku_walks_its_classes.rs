@@ -37,11 +37,11 @@ use kernels::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear,
 };
-use model_compiler::{Budgets, DeviceProfile, Lowering, Phase, Region, compile};
+use model_compiler::{Budget, DeviceProfile, Lowering, Phase, Region, compile};
 use model_dsl::Platform;
 use model_ir::{
-    Attention, Classes, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
-    Plan,
+    Attention, ClassTable, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
+    Trace,
 };
 
 /// Every platform a plan can be traced at. A model text may emit a different op
@@ -72,8 +72,8 @@ const PLATFORMS: [Platform; 4] = [
 /// bank is exempt at zero and refused above it. The adapter axis has its own
 /// files (`driver-cuda/tests/adapter_banks.rs`), which ask each plan for what
 /// it seats; what this one is about is the walk, on every text there is.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -104,10 +104,10 @@ fn no_pair_was_skipped(walked: usize, of: usize) {
 ///
 /// **HOW IT KNOWS THE NODE INDEX**, since the contract does not tell it. A
 /// `Dispatch*` method is handed the OP and not the node — deliberately, since
-/// "`cond` and `layer` are the driver walk's business" — so the mock builds
+/// "`guard` and `layer` are the driver walk's business" — so the mock builds
 /// one map at construction from each node's op-payload ADDRESS to its index
 /// and looks the incoming reference up in it. The payload lives inside the
-/// `Plan`'s node vector, which outlives the walk and is never moved during
+/// `Trace`'s node vector, which outlives the walk and is never moved during
 /// one, so the address is a stable identity. No `unsafe`: a reference cast to
 /// `usize` is a comparison of two things the borrow checker already proved are
 /// alive.
@@ -121,9 +121,9 @@ struct MockDispatch {
 }
 
 impl MockDispatch {
-    fn new(plan: &Plan) -> MockDispatch {
+    fn new(trace: &Trace) -> MockDispatch {
         MockDispatch {
-            at: plan
+            at: trace
                 .nodes
                 .iter()
                 .enumerate()
@@ -252,7 +252,7 @@ const DECODE: u64 = 1;
 /// On gemma — the only catalog text whose guards reach a second bit — that is
 /// where the nested split over two facts gets its three classes fired
 /// together.
-fn mixes(classes: &Classes) -> Vec<(String, Vec<Lane>)> {
+fn mixes(classes: &ClassTable) -> Vec<(String, Vec<Lane>)> {
     let decode = DECODE & classes.mask;
     let mut mixes = vec![
         (
@@ -324,14 +324,14 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
 
     for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
                 continue; // `model-compiler`'s own catalog test is what says so.
             };
             walked += 1;
 
-            for (name, lanes) in mixes(&baked.classes) {
-                let fire = match compose(&baked, &budgets(), &lanes) {
+            for (name, lanes) in mixes(&compiled.classes) {
+                let fire = match compose(&compiled, &budget(), &lanes) {
                     Ok(fire) => fire,
                     Err(refusal) => {
                         wrong.push(format!("`{sku}` as {platform:?} [{name}]: {refusal}"));
@@ -341,9 +341,9 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 let present: BTreeSet<usize> = fire.present().iter().map(|&c| c as usize).collect();
                 let descriptor = FireDescriptor::of(&fire);
 
-                let mut dispatch = MockDispatch::new(&plan);
+                let mut dispatch = MockDispatch::new(&trace);
                 if let Err(refusal) =
-                    walk(&plan, &baked, &descriptor, &mut dispatch, &mut EagerSink)
+                    walk(&trace, &compiled, &descriptor, &mut dispatch, &mut EagerSink)
                 {
                     wrong.push(format!("`{sku}` as {platform:?} [{name}]: {refusal}"));
                     continue;
@@ -363,7 +363,7 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 // dispatch belongs to never goes backwards.
                 let ran = dispatch.nodes();
                 let region_of = |node: u32| {
-                    baked
+                    compiled
                         .template()
                         .iter()
                         .position(|region| region.nodes.contains(&node))
@@ -379,14 +379,14 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
 
                 // What the artifact says should run: every node some present
                 // class demands, plus every collective, always (decision #5).
-                let mut demanded: BTreeSet<u32> = (0..plan.nodes.len() as u32)
+                let mut demanded: BTreeSet<u32> = (0..trace.nodes.len() as u32)
                     .filter(|&node| {
                         present
                             .iter()
-                            .any(|&class| baked.classes.node_mask[node as usize].contains(class))
+                            .any(|&class| compiled.classes.node_mask[node as usize].contains(class))
                     })
                     .collect();
-                let collectives: BTreeSet<u32> = plan
+                let collectives: BTreeSet<u32> = trace
                     .nodes
                     .iter()
                     .enumerate()
@@ -408,9 +408,9 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
 
                 // THE SAME SET SAID THE DESIGN'S WAY, AND WHERE THE TWO PART
                 // COMPANY. `Class::live` is what a class's fact word ADMITS —
-                // every node whose `cond` holds — and the walk runs what the
+                // every node whose `guard` holds — and the walk runs what the
                 // classes DEMAND, which is `live` narrowed by the backward
-                // demand walk (`Classes::node_mask`). The two differ on real
+                // demand walk (`ClassTable::node_mask`). The two differ on real
                 // plans and gemma is where it shows: an attention plan build
                 // is guarded `Always`, so it is live in every class, but the
                 // only node that reads its struct is the decode attention —
@@ -423,7 +423,7 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 // anything else.
                 let mut live: BTreeSet<u32> = present
                     .iter()
-                    .flat_map(|&class| baked.classes.classes[class].live.iter().copied())
+                    .flat_map(|&class| compiled.classes.classes[class].live.iter().copied())
                     .collect();
                 live.extend(&collectives);
                 let unadmitted: Vec<u32> = ran.difference(&live).copied().take(8).collect();
@@ -450,23 +450,23 @@ fn every_sku_shows_the_sink_its_whole_template_every_fire() {
 
     for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
                 continue;
             };
             walked += 1;
-            let template: Vec<u32> = baked.template().iter().map(|r| r.nodes.start).collect();
+            let template: Vec<u32> = compiled.template().iter().map(|r| r.nodes.start).collect();
             // Set by the first mix, compared by the rest.
             let mut shape: Option<(usize, usize)> = None;
 
-            for (name, lanes) in mixes(&baked.classes) {
-                let Ok(fire) = compose(&baked, &budgets(), &lanes) else {
+            for (name, lanes) in mixes(&compiled.classes) {
+                let Ok(fire) = compose(&compiled, &budget(), &lanes) else {
                     continue; // the test above is the one that says so.
                 };
                 let descriptor = FireDescriptor::of(&fire);
-                let mut dispatch = MockDispatch::new(&plan);
+                let mut dispatch = MockDispatch::new(&trace);
                 let mut structure = Structure::default();
-                if walk(&plan, &baked, &descriptor, &mut dispatch, &mut structure).is_err() {
+                if walk(&trace, &compiled, &descriptor, &mut dispatch, &mut structure).is_err() {
                     continue;
                 }
 
@@ -538,14 +538,14 @@ fn no_sku_bakes_a_prepare_region_behind_the_graph_that_reads_its_slots() {
 
     for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
-            let plan = trace(platform);
-            let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+            let trace = trace(platform);
+            let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
                 continue;
             };
             walked += 1;
 
             let mut captured = false;
-            for (at, region) in baked.template().iter().enumerate() {
+            for (at, region) in compiled.template().iter().enumerate() {
                 match region.phase {
                     Phase::Capture => captured = true,
                     Phase::Prepare if captured => wrong.push(format!(
@@ -557,14 +557,14 @@ fn no_sku_bakes_a_prepare_region_behind_the_graph_that_reads_its_slots() {
                 }
             }
 
-            for (name, lanes) in mixes(&baked.classes) {
-                let Ok(fire) = compose(&baked, &budgets(), &lanes) else {
+            for (name, lanes) in mixes(&compiled.classes) {
+                let Ok(fire) = compose(&compiled, &budget(), &lanes) else {
                     continue;
                 };
                 let descriptor = FireDescriptor::of(&fire);
-                let mut dispatch = MockDispatch::new(&plan);
+                let mut dispatch = MockDispatch::new(&trace);
                 if let Err(refusal) =
-                    walk(&plan, &baked, &descriptor, &mut dispatch, &mut EagerSink)
+                    walk(&trace, &compiled, &descriptor, &mut dispatch, &mut EagerSink)
                 {
                     wrong.push(format!("`{sku}` as {platform:?} [{name}]: {refusal}"));
                 }
@@ -579,7 +579,7 @@ fn no_sku_bakes_a_prepare_region_behind_the_graph_that_reads_its_slots() {
 #[test]
 fn a_composition_is_the_only_thing_that_changes_between_fires() {
     // The claim the whole design rests on: the artifact is baked once and the
-    // fire path only writes a descriptor. So walking the same `Baked` with
+    // fire path only writes a descriptor. So walking the same `CompiledModel` with
     // wildly different batches must never need a second `compile` — and the
     // windows those batches produce must tile their rows exactly, every time.
     let mut wrong: Vec<String> = Vec::new();
@@ -588,14 +588,14 @@ fn a_composition_is_the_only_thing_that_changes_between_fires() {
     let mut walked = 0usize;
 
     for (sku, _, trace, _) in catalog {
-        let plan = trace(Platform::Cuda);
-        let Ok(baked) = compile(&plan, &budgets(), &DeviceProfile::default()) else {
+        let trace = trace(Platform::Cuda);
+        let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
             continue;
         };
         walked += 1;
 
-        for (name, lanes) in mixes(&baked.classes) {
-            let Ok(fire) = compose(&baked, &budgets(), &lanes) else {
+        for (name, lanes) in mixes(&compiled.classes) {
+            let Ok(fire) = compose(&compiled, &budget(), &lanes) else {
                 continue;
             };
             let rows: u32 = lanes.iter().map(|lane| lane.rows).sum();

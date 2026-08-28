@@ -40,7 +40,7 @@ pub enum Fault {
     },
 
     /// The compiler refused to bake this plan against these budgets.
-    Bake(model_compiler::Refusal),
+    Bake(model_compiler::Error),
 
     /// The loader refused to land this checkpoint.
     Load(model_loader::error::Error),
@@ -69,11 +69,11 @@ pub enum Fault {
     /// pieces, or one whose pieces outnumber the `Fallback::Split { r }` P4
     /// counted on the order it shipped. A fire's class order is that order
     /// with the absent classes dropped and dropping a class can only close a
-    /// gap, so neither can happen to a `Baked` and a `WindowTable` built from
+    /// gap, so neither can happen to a `CompiledModel` and a `WindowTable` built from
     /// each other. Both are refused by name rather than run over the classes
     /// in between.
     Fragmented {
-        /// Which region of `Baked::template`.
+        /// Which region of `CompiledModel::template`.
         region: u32,
         /// How many runs its mask covers in this fire.
         runs: usize,
@@ -320,9 +320,9 @@ pub enum Fault {
     /// plan per arm in the model text, not a fold here — so this is refused
     /// by name.
     Straddled {
-        /// The plan value, as `Plan::values` numbers it.
+        /// The plan value, as `Trace::values` numbers it.
         value: u32,
-        /// The node consuming it, as `Plan::nodes` numbers it.
+        /// The node consuming it, as `Trace::nodes` numbers it.
         node: u32,
         /// The classes its defining region runs in.
         planned: String,
@@ -618,8 +618,8 @@ impl fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
-impl From<model_compiler::Refusal> for Fault {
-    fn from(refusal: model_compiler::Refusal) -> Fault {
+impl From<model_compiler::Error> for Fault {
+    fn from(refusal: model_compiler::Error) -> Fault {
         Fault::Bake(refusal)
     }
 }

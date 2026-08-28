@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use driver_metal::{Boot, Lane, Shell};
-use model_compiler::Budgets;
+use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -83,7 +83,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Platform::Metal);
+    let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
@@ -92,7 +92,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         plan,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: Budgets::new(8, 256),
+        budget: Budget::new(8, 256),
         profile: None,
         page_size: 16,
         context: 512,

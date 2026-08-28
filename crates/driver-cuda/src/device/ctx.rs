@@ -235,7 +235,7 @@ impl Context {
     }
 
     /// **OPEN P6'S SIDE STREAMS AND ITS EVENTS**, once, at load, for the
-    /// counts the artifact asked for (`Baked::forks`).
+    /// counts the artifact asked for (`CompiledModel::streams`).
     ///
     /// Called after `compile`, because how many streams a plan wants is
     /// something the plan decides — and called at LOAD rather than per fire,

@@ -1,5 +1,5 @@
 //! The model-facing entry: classify a request into facts, declare cache
-//! spaces, trace the forward pass, and hand back a checked `Plan`.
+//! spaces, trace the forward pass, and hand back a checked `Trace`.
 //! Re-imagined from the old `forward.rs`: the inputs handle is typed now —
 //! tokens and positions arrive as `[Tokens] i32` values, cache geometry as
 //! declared `RuntimeInput::Geometry` inputs (§7) — and `qo_indptr` is gone
@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-use model_ir::{CacheRow, Cond, Dim, Dtype, GeomKind, Plan, Platform, RuntimeInput, Ty, ValueId};
+use model_ir::{CacheRow, Guard, Dim, Dtype, GeomKind, Trace, Platform, RuntimeInput, Ty, ValueId};
 
 use crate::record::{Recorder, Refine, SplitSpec, Value};
 use crate::seam;
@@ -146,7 +146,7 @@ pub fn word_of<M: ForwardHybrid>(_model: impl FnOnce() -> M, r: &Request) -> u64
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvSpace(pub u32);
 
-/// The caches a model declares, in the order `Plan::caches` will carry them —
+/// The caches a model declares, in the order `Trace::caches` will carry them —
 /// kv rows and recurrent state slabs collect straight into `CacheRow`. A kv
 /// row is declared as a plane list — the pieces one token's entry is written
 /// as, each by its per-token width in elements, so a k|v pair is `[w, w]`, a
@@ -242,7 +242,7 @@ pub fn platform() -> Platform {
 /// forward, and `finish` through the validator. The platform is ambient for
 /// the length of `forward` and nowhere else — a nested trace on one thread
 /// would have two answers to [`platform`], so it is refused here.
-pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Plan {
+pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
     let caches = m.caches();
     let rec = Recorder::new(name, platform, caches.rows.clone());
     rec.seam(seam::IN.name, &[]);
@@ -256,7 +256,7 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> 
     let logits = m.forward(Input {
         rec: rec.clone(),
         caches,
-        over: Cond::Always,
+        over: Guard::Always,
         _facts: PhantomData,
     });
     TRACING.with(|tracing| tracing.set(None));
@@ -296,7 +296,7 @@ impl<T> Drop for Layers<'_, T> {
 /// fact vocabulary to its trace and is otherwise phantom.
 ///
 /// **AN INPUT HANDLE IS SPLITTABLE, EXACTLY AS A [`Value`] IS.** `over` is
-/// `Cond::Always` for the whole fire; [`split`](Input::split) hands back arms
+/// `Guard::Always` for the whole fire; [`split`](Input::split) hands back arms
 /// that carry a class in it, and every value read off an arm carries that
 /// class too. That is what lets a schedule say which class it was carved for
 /// — it is built off that class's arm — instead of leaving the answer to be
@@ -306,7 +306,7 @@ pub struct Input<F> {
     caches: HybridSpec,
     /// `Always` for the whole fire; a split arm carries its class here, and
     /// every value read off the arm carries it too.
-    over: Cond,
+    over: Guard,
     _facts: PhantomData<F>,
 }
 
@@ -325,11 +325,11 @@ impl<F> Clone for Input<F> {
 }
 
 impl<F> Refine for Input<F> {
-    fn refined(&self, cond: Cond) -> Input<F> {
+    fn refined(&self, cond: Guard) -> Input<F> {
         Input {
             rec: self.rec.clone(),
             caches: self.caches.clone(),
-            over: Cond::and(self.over.clone(), cond),
+            over: Guard::and(self.over.clone(), cond),
             _facts: PhantomData,
         }
     }

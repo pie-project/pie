@@ -45,8 +45,8 @@
 //! The verb set survived; the encoding did not. The five decisions the rewrite
 //! executed (palo design §7, decisions 18–20):
 //!
-//! 1. **`model-ir` is a dependency.** The engine traces, `Plan` crosses at
-//!    load, `Baked` never crosses, and `model_ir::Dtype` is *the* dtype — the
+//! 1. **`model-ir` is a dependency.** The engine traces, `Trace` crosses at
+//!    load, `CompiledModel` never crosses, and `model_ir::Dtype` is *the* dtype — the
 //!    `KvDtype` that spelled five of its variants a second time is gone.
 //! 2. **The completion broker went to the engine.** Run-ahead is a scheduling
 //!    policy, and this crate keeps only the receipt

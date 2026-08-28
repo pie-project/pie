@@ -61,7 +61,7 @@
 //!
 //! R1 deleted it, because the fourth fact is the one that settles it: the walk
 //! read the LEGACY traced form. `model_ir::trace::ForwardPlan` is what
-//! `model-dsl-legacy` produces; the baker path produces `model_ir::plan::Plan`,
+//! `model-dsl-legacy` produces; the baker path produces `model_ir::trace::Trace`,
 //! a different type with a different op vocabulary. A walk over a form the
 //! serving path is being moved off, with no producer, no carrier and no
 //! consumer, is not a reference implementation — it is the only reason this

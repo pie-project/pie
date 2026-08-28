@@ -19,7 +19,7 @@
 //! format, and therefore a knob nobody can A/B.
 //!
 //! WHAT THIS ASSERTS. Permute the fact bits of a traced plan — every
-//! `Cond::Fact` on every node and every merge arm — and bake it again. The
+//! `Guard::Fact` on every node and every merge arm — and bake it again. The
 //! plan is the same forward pass said in a different numbering, so the SET OF
 //! NODES owed a fallback must not move. Node indices are untouched by the
 //! permutation, which is what makes the comparison exact rather than
@@ -27,9 +27,9 @@
 
 use std::collections::BTreeSet;
 
-use model_compiler::{Budgets, DeviceProfile, compile};
+use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::Platform;
-use model_ir::{Cond, Def, Plan, fact_width};
+use model_ir::{Guard, Def, Trace, fact_width};
 
 /// A budget the catalog can actually seat.
 ///
@@ -38,8 +38,8 @@ use model_ir::{Cond, Def, Plan, fact_width};
 /// than eight, so `compile` refuses every SKU and every body is skipped. The
 /// non-vacuity assert at the end of each test here is the other half of not
 /// repeating that.
-fn budgets() -> Budgets {
-    Budgets {
+fn budget() -> Budget {
+    Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
@@ -51,25 +51,25 @@ fn budgets() -> Budgets {
 
 /// The same guard, said with the bits renamed.
 ///
-/// The smart constructors fold — `Cond::and(Always, x)` is `x` — which is
+/// The smart constructors fold — `Guard::and(Always, x)` is `x` — which is
 /// semantics-preserving and is what a trace would have produced had the text
 /// numbered its facts this way in the first place.
-fn renumber(cond: &Cond, perm: &[u8]) -> Cond {
+fn renumber(cond: &Guard, perm: &[u8]) -> Guard {
     match cond {
-        Cond::Always => Cond::Always,
-        Cond::Fact(bit) => Cond::Fact(perm[*bit as usize]),
-        Cond::Not(a) => Cond::not(renumber(a, perm)),
-        Cond::And(a, b) => Cond::and(renumber(a, perm), renumber(b, perm)),
-        Cond::Or(a, b) => Cond::or(renumber(a, perm), renumber(b, perm)),
+        Guard::Always => Guard::Always,
+        Guard::Fact(bit) => Guard::Fact(perm[*bit as usize]),
+        Guard::Not(a) => Guard::not(renumber(a, perm)),
+        Guard::And(a, b) => Guard::and(renumber(a, perm), renumber(b, perm)),
+        Guard::Or(a, b) => Guard::or(renumber(a, perm), renumber(b, perm)),
     }
 }
 
-/// Every `Cond` in the plan lives in one of two places: a node's guard and a
+/// Every `Guard` in the plan lives in one of two places: a node's guard and a
 /// merge arm's. Miss either and the permuted plan is a different forward pass.
-fn renumbered(plan: &Plan, perm: &[u8]) -> Plan {
-    let mut out = plan.clone();
+fn renumbered(trace: &Trace, perm: &[u8]) -> Trace {
+    let mut out = trace.clone();
     for node in &mut out.nodes {
-        node.cond = renumber(&node.cond, perm);
+        node.guard = renumber(&node.guard, perm);
     }
     for value in &mut out.values {
         if let Def::Merge(arms) = &mut value.def {
@@ -101,26 +101,26 @@ fn permutations(n: usize) -> Vec<Vec<u8>> {
     out
 }
 
-fn owes(plan: &Plan) -> Option<BTreeSet<u32>> {
-    let baked = compile(plan, &budgets(), &DeviceProfile::default()).ok()?;
-    Some(baked.fallback.rows.iter().map(|row| row.node).collect())
+fn owes(trace: &Trace) -> Option<BTreeSet<u32>> {
+    let compiled = compile(trace, &budget(), &DeviceProfile::default()).ok()?;
+    Some(compiled.fallback.rows.iter().map(|row| row.node).collect())
 }
 
 #[test]
 fn no_catalog_text_changes_what_it_owes_when_its_facts_are_renumbered() {
     let mut moved: Vec<String> = Vec::new();
-    let (mut baked, mut with_rows) = (0usize, 0usize);
+    let (mut compiled, mut with_rows) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
-        let plan = trace(Platform::Cuda);
-        let Some(before) = owes(&plan) else { continue };
-        baked += 1;
+        let trace = trace(Platform::Cuda);
+        let Some(before) = owes(&trace) else { continue };
+        compiled += 1;
         if !before.is_empty() {
             with_rows += 1;
         }
 
-        for perm in permutations(fact_width(&plan)) {
-            let Some(after) = owes(&renumbered(&plan, &perm)) else {
+        for perm in permutations(fact_width(&trace)) {
+            let Some(after) = owes(&renumbered(&trace, &perm)) else {
                 moved.push(format!("`{sku}` under {perm:?}: refused after renumbering"));
                 continue;
             };
@@ -135,7 +135,7 @@ fn no_catalog_text_changes_what_it_owes_when_its_facts_are_renumbered() {
     // NOT VACUOUS, TWICE OVER: the catalog bakes, and some of it actually has
     // a withdrawal to get wrong. A green run over an empty fallback table
     // would prove only that zero equals zero.
-    assert!(baked >= 16, "only {baked} SKUs baked");
+    assert!(compiled >= 16, "only {compiled} SKUs compiled");
     assert!(
         with_rows >= 4,
         "only {with_rows} SKUs owe a fallback at all, so nothing was at stake",

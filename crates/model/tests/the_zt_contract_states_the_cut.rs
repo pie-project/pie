@@ -205,9 +205,9 @@ fn state_every_sku() -> Vec<Stated> {
             .iter()
             .find(|(name, ..)| *name == sku.name)
             .unwrap_or_else(|| panic!("`{}` names no catalog row", sku.name));
-        let plan = trace(Platform::Cuda);
+        let trace = trace(Platform::Cuda);
         let path = dir.join(format!("{}.zt", sku.name));
-        write_checkpoint(&path, &plan.params);
+        write_checkpoint(&path, &trace.params);
 
         let src = ztensor::Source::open(&path).unwrap_or_else(|why| {
             panic!(
@@ -226,7 +226,7 @@ fn state_every_sku() -> Vec<Stated> {
         out.push(Stated {
             name: sku.name,
             tp,
-            params: plan.params,
+            params: trace.params,
             contract,
         });
     }
@@ -477,9 +477,9 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
             .iter()
             .find(|(name, ..)| *name == sku.name)
             .unwrap_or_else(|| panic!("`{}` names no catalog row", sku.name));
-        let plan = trace(Platform::Cuda);
+        let trace = trace(Platform::Cuda);
         let path = dir.join(format!("{}-unquantized.zt", sku.name));
-        write_unquantized_checkpoint(&path, &plan.params);
+        write_unquantized_checkpoint(&path, &trace.params);
 
         let src = ztensor::Source::open(&path).unwrap_or_else(|why| {
             panic!("`{}`: {} does not open: {why}", sku.name, path.display())
@@ -494,7 +494,7 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
         drop(src);
 
         let supply = published(&contract);
-        for param in &plan.params {
+        for param in &trace.params {
             let Some(stem) = param.name.strip_suffix(".scales") else {
                 // Every other plane is declared under its own name.
                 if !supply.contains_key(param.name.as_str()) {

@@ -417,7 +417,7 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
     };
     let request = engine::driver::load::request(&checkpoint, Platform::Cuda, budgets.clone(), 0)
         .expect("the checkpoint identifies and its SKU traces");
-    assert_eq!(request.plan.name, SKU);
+    assert_eq!(request.trace.name, SKU);
     let loaded = driver.load(request).expect("the checkpoint lands");
     let vocab = loaded.caps.profile.vocab;
     let classify = engine::driver::load::classify(SKU).expect("this build ships the gate's SKU");

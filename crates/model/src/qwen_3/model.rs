@@ -116,7 +116,7 @@ pub enum Head {
 ///
 /// How many adapters a load can hold and how wide each one's waist is are
 /// declared HERE, in the model text, because they are the leading axes of two
-/// weights and shapes are the text's. `Budgets::max_adapters` is what a
+/// weights and shapes are the text's. `Budget::max_adapters` is what a
 /// deployment asks to be able to register, and `model_compiler::compile`
 /// refuses a load whose ask is bigger than what these numbers seat — one
 /// refusal, at the door, instead of a capacity discovered at a registration.

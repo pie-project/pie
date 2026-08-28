@@ -9,7 +9,7 @@
 //! re-recording the graph costs everything, so pointer churn is the thing
 //! worth minimising and a single witness ordering cannot be asked about it
 //! (`tart/evidence/layout_planning.md`, the tile-alignment section). So the
-//! tree ships whole inside [`LayoutOrder`](crate::LayoutOrder), and
+//! tree ships whole inside [`ClassOrder`](crate::ClassOrder), and
 //! [`admits`](PqTree::admits) is the question the stability pick will ask it.
 //!
 //! # The shape

@@ -23,7 +23,7 @@ impl Facts {
     /// uses it: a fire no lane routed has zero rows in this class,
     /// `driver::fire::walk` skips a zero-row region before it dispatches
     /// anything, and the correction costs that fire no launch, no empty grid
-    /// and no instruction. A `Cond::Always` correction would instead launch
+    /// and no instruction. A `Guard::Always` correction would instead launch
     /// two kernels per layer over every row of every fire to add zero to them,
     /// which is 1.0x nothing.
     ///
@@ -161,7 +161,7 @@ impl ForwardHybrid for Model {
         // share `plan_p`: a `Struct` value's readers must share one
         // class-mask, and a schedule carved over the union of two classes
         // hands each arm its own rebased boundaries, which end before its work
-        // items do — `Refusal::Straddled` at the load. Reading `plan_p` from
+        // items do — `model_compiler::Error::Straddled` at the load. Reading `plan_p` from
         // the capture arm is now refused by `Recorder::push` at the line that
         // mixed the two arms.
         let classes = [Facts::captures_scores(), Facts::qo_one(), Predicate::rest()];
@@ -475,7 +475,7 @@ fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn)
     let pages = inputs.kv(&a.kv);
     // Taken unrefined, as the trunk's own mixer takes them. `x` already
     // carries the draft window, and `Recorder::push` meets its inputs' guards:
-    // a `Cond::Always` runtime input narrows to the window of whatever it is
+    // a `Guard::Always` runtime input narrows to the window of whatever it is
     // read beside, so splitting these would state the window twice.
     let positions = inputs.positions();
     let write_page = inputs.write_page(&a.kv);

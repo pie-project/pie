@@ -16,9 +16,9 @@
 //!
 //! So it is a property of the MODEL TEXT, and the cheapest instant to say so
 //! is the sweep the author already runs. `resolve_classes` gives the per-node
-//! class set outright (`Classes::node_mask`); regions are maximal runs of
+//! class set outright (`ClassTable::node_mask`); regions are maximal runs of
 //! EQUAL masks, so this predicate and `model_compiler`'s
-//! `Refusal::Straddled` — which the shell's load path asks — are literally
+//! `model_compiler::Error::Straddled` — which the shell's load path asks — are literally
 //! the same comparison, asked one pass earlier and with no compiler in the
 //! room.
 //!
@@ -29,7 +29,7 @@
 //! a reader standing in another arm. Gemma builds six, one per
 //! (reading × class), and gpt-oss four.
 
-use model_dsl::{Attention, Def, Operands, Operation, Plan, Platform, resolve_classes};
+use model_dsl::{Attention, Def, Operands, Operation, Trace, Platform, resolve_classes};
 
 /// Every platform a plan can be traced at: a model text may emit a different op
 /// per platform, so one platform passing says nothing about the others.
@@ -52,8 +52,8 @@ fn schedule(op: &Operation) -> bool {
 }
 
 /// Every `(schedule, reader)` pair whose class sets differ, as sentences.
-fn straddles(plan: &Plan) -> Vec<String> {
-    let Ok(classes) = resolve_classes(plan) else {
+fn straddles(trace: &Trace) -> Vec<String> {
+    let Ok(classes) = resolve_classes(trace) else {
         // A plan whose merges do not resolve is somebody else's test
         // (`every_class_resolves_every_merge`); saying it twice here would
         // only make one authoring mistake two failures.
@@ -61,14 +61,14 @@ fn straddles(plan: &Plan) -> Vec<String> {
     };
     let mut found = Vec::new();
     let mut inputs = Vec::new();
-    for (at, node) in plan.nodes.iter().enumerate() {
+    for (at, node) in trace.nodes.iter().enumerate() {
         inputs.clear();
         node.op.inputs(&mut inputs);
         for &read in &inputs {
-            let Some(Def::Op(built_by)) = plan.values.get(read.0 as usize).map(|v| &v.def) else {
+            let Some(Def::Op(built_by)) = trace.values.get(read.0 as usize).map(|v| &v.def) else {
                 continue;
             };
-            if !schedule(&plan.nodes[*built_by as usize].op) {
+            if !schedule(&trace.nodes[*built_by as usize].op) {
                 continue;
             }
             let planned = &classes.node_mask[*built_by as usize];
@@ -78,7 +78,7 @@ fn straddles(plan: &Plan) -> Vec<String> {
                     "v{} is built by `{}` over classes {:?} and read by `{}` (node {at}) \
                      in classes {:?}",
                     read.0,
-                    plan.nodes[*built_by as usize].op.name(),
+                    trace.nodes[*built_by as usize].op.name(),
                     planned.iter().collect::<Vec<_>>(),
                     node.op.name(),
                     reader.iter().collect::<Vec<_>>(),
@@ -121,10 +121,10 @@ fn no_shipped_schedule_is_read_outside_the_window_it_was_built_in() {
 /// says so.
 #[test]
 fn a_schedule_shared_by_two_classes_is_caught() {
-    let mut plan = model::trace_of("gemma4-e4b-bf16-kv-bf16")
+    let mut trace = model::trace_of("gemma4-e4b-bf16-kv-bf16")
         .expect("the catalog ships gemma")(Platform::Cuda);
     assert!(
-        straddles(&plan).is_empty(),
+        straddles(&trace).is_empty(),
         "gemma ships straddle-free, which is what makes the rewrite below a defect"
     );
 
@@ -132,7 +132,7 @@ fn a_schedule_shared_by_two_classes_is_caught() {
     // themselves — the plan value ids are the trace's business, not this
     // test's.
     let mut prefill_plan_of_width = std::collections::HashMap::new();
-    for node in &plan.nodes {
+    for node in &trace.nodes {
         if let Operation::Attention(Attention::Prefill { plan, head_dim, .. }) = &node.op {
             prefill_plan_of_width.insert(*head_dim, *plan);
         }
@@ -144,7 +144,7 @@ fn a_schedule_shared_by_two_classes_is_caught() {
     );
 
     let mut rewritten = 0usize;
-    for node in &mut plan.nodes {
+    for node in &mut trace.nodes {
         if let Operation::Attention(Attention::Masked {
             plan: at, head_dim, ..
         }) = &mut node.op
@@ -158,7 +158,7 @@ fn a_schedule_shared_by_two_classes_is_caught() {
     // Both readers of each now-shared schedule are named, which is the point:
     // demand widened the prepare node to the union {prefill, masked}, so the
     // prefill arm is straddling its own schedule too.
-    let caught = straddles(&plan);
+    let caught = straddles(&trace);
     assert_eq!(
         caught.len(),
         2 * rewritten,

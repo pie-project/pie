@@ -38,7 +38,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use driver_cuda::{Boot, Graphs, Lane, Shell};
-use model_compiler::{Baked, Budgets, DeviceProfile, Lowering, Phase, compile};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, Lowering, Phase, compile};
 use model_dsl::{Classify, Platform, Request};
 
 /// The catalog row this suite serves, as `graph_replay` serves it.
@@ -94,8 +94,8 @@ fn word(query_len: u32) -> u64 {
     model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
-fn budgets() -> Budgets {
-    Budgets::new(4, 256)
+fn budget() -> Budget {
+    Budget::new(4, 256)
 }
 
 /// A shell loaded with a profile of the caller's choosing.
@@ -119,17 +119,17 @@ fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer
         .expect("the checkpoint's tokenizer loads");
 
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Platform::Cuda);
+    let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
         .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: budgets(),
+        budget: budget(),
         profile,
         page_size: 16,
         context: 512,
@@ -148,10 +148,10 @@ fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer
 /// A pure function of the artifact and the set of classes present, which is
 /// why it needs no device: a region's window is its mask's rows, and a mask
 /// disjoint from the fire's classes has none.
-fn empty_launches(baked: &Baked, present: &[usize]) -> (usize, usize) {
+fn empty_launches(compiled: &CompiledModel, present: &[usize]) -> (usize, usize) {
     let mut empty = 0;
     let mut live = 0;
-    for region in &baked.regions {
+    for region in &compiled.regions {
         if region.phase != Phase::Capture {
             continue;
         }
@@ -166,10 +166,10 @@ fn empty_launches(baked: &Baked, present: &[usize]) -> (usize, usize) {
 }
 
 /// Which class a lane of this word lands in.
-fn class_of(baked: &Baked, word: u64) -> usize {
-    baked
+fn class_of(compiled: &CompiledModel, word: u64) -> usize {
+    compiled
         .classes
-        .class_of(word & baked.classes.mask)
+        .class_of(word & compiled.classes.mask)
         .expect("the sweep names this word's class")
 }
 
@@ -179,7 +179,7 @@ fn class_of(baked: &Baked, word: u64) -> usize {
 #[test]
 fn the_shells_own_artifact_holds_no_conditional_region() {
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Platform::Cuda);
+    let trace = trace(Platform::Cuda);
     // The profile `serve.rs` builds when a caller states none, with an L40S's
     // SM count in it — the one number the shell measures.
     let profile = DeviceProfile {
@@ -187,8 +187,8 @@ fn the_shells_own_artifact_holds_no_conditional_region() {
         exclusive: driver_cuda::EXCLUSIVE.iter().map(|op| (*op).to_string()).collect(),
         ..DeviceProfile::default()
     };
-    let baked = compile(&plan, &budgets(), &profile).expect("the SKU bakes");
-    let conditional: Vec<usize> = baked
+    let compiled = compile(&trace, &budget(), &profile).expect("the SKU bakes");
+    let conditional: Vec<usize> = compiled
         .regions
         .iter()
         .enumerate()
@@ -215,10 +215,10 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
 
     // The host half: what the composition says, off the artifact alone.
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
-    let plan = trace(Platform::Cuda);
-    let baked = compile(
-        &plan,
-        &budgets(),
+    let trace = trace(Platform::Cuda);
+    let compiled = compile(
+        &trace,
+        &budget(),
         &DeviceProfile {
             sms: 142,
             exclusive: driver_cuda::EXCLUSIVE
@@ -229,10 +229,10 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
         },
     )
     .expect("the SKU bakes");
-    let decode = class_of(&baked, word(1));
-    let prefill = class_of(&baked, word(prompt.len() as u32));
-    let (empty_alone, live_alone) = empty_launches(&baked, &[decode]);
-    let (empty_mixed, live_mixed) = empty_launches(&baked, &[decode, prefill]);
+    let decode = class_of(&compiled, word(1));
+    let prefill = class_of(&compiled, word(prompt.len() as u32));
+    let (empty_alone, live_alone) = empty_launches(&compiled, &[decode]);
+    let (empty_mixed, live_mixed) = empty_launches(&compiled, &[decode, prefill]);
     eprintln!(
         "composition census on `{SKU}`:\n  \
          all-decode   {live_alone} live launches, {empty_alone} empty\n  \

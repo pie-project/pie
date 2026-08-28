@@ -1478,10 +1478,10 @@ impl ScaleLayout {
             // It was `_scale`, which is a name nothing in this tree looks for.
             // An mxfp4 bank's second plane has exactly one spelling here:
             // `model_dsl`'s `SCALES`, interned by `Weight::planes` into
-            // `Plan::params` as `<w>.scales`, written by every family import
+            // `Trace::params` as `<w>.scales`, written by every family import
             // that names a stored scales tensor, and looked up by name in the
             // driver's residency sink (`driver-cuda/src/weights.rs` indexes
-            // `plan.params` by name and refuses a param the load never
+            // `trace.params` by name and refuses a param the load never
             // published). A weight this loader ENCODES lands beside a weight
             // the checkpoint shipped, in the same table, under the same rule —
             // so publishing the encoder's plane under a fourth spelling

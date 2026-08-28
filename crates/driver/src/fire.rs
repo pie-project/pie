@@ -21,7 +21,7 @@
 //! eager by construction** — the same loop, the same order, the same skip
 //! decisions — which is the verification strategy built into the shape rather
 //! than asserted by a test (decision #11). It also fixes the dependency
-//! direction the menlo stack had backwards: the walk needs `Baked`, so it
+//! direction the menlo stack had backwards: the walk needs `CompiledModel`, so it
 //! cannot live in `kernels`, which must not know what a compiler is
 //! (decision #12).
 //!
@@ -77,7 +77,7 @@ pub use walk::{Phases, walk, walk_phases};
 /// — and never about the plan. Everything here is the other kind: a fire the
 /// artifact cannot describe, or a template the walk cannot execute. A lane
 /// whose word matches no class is not a kernel that is missing; it is an
-/// engine and a `Baked` that disagree about what model is loaded, and saying
+/// engine and a `CompiledModel` that disagree about what model is loaded, and saying
 /// so in the backend's error type would send the operator hunting for a
 /// kernel that was never the problem.
 ///
@@ -89,8 +89,8 @@ pub enum Fault {
     ///
     /// The class sweep is total over the `2^F` words its own guards reach, and
     /// `compose` masks every lane's word down to those bits first — so a bit
-    /// the plan never splits on is not this, and a well-formed `Baked` cannot
-    /// reach here at all. What can is a `Classes` whose class list does not
+    /// the plan never splits on is not this, and a well-formed `CompiledModel` cannot
+    /// reach here at all. What can is a `ClassTable` whose class list does not
     /// cover its own mask: an artifact that was not baked by the compiler this
     /// walk was written against.
     UnknownWord {
@@ -113,7 +113,7 @@ pub enum Fault {
     TooManyLanes {
         /// How many were submitted.
         lanes: usize,
-        /// `Budgets::max_lanes`, the number every `Dim::Lanes` column was cut
+        /// `Budget::max_lanes`, the number every `Dim::Lanes` column was cut
         /// at.
         max: u32,
     },
@@ -125,7 +125,7 @@ pub enum Fault {
     TooManyRows {
         /// The rows the submitted lanes add up to.
         rows: u64,
-        /// `Budgets::max_tokens`.
+        /// `Budget::max_tokens`.
         max: u32,
     },
     /// The fire's rows are above every bucket in the lattice.
@@ -148,7 +148,7 @@ pub enum Fault {
         /// Classes the descriptor carries.
         descriptor: usize,
         /// Classes the artifact has.
-        baked: usize,
+        compiled: usize,
     },
     /// A prepare region stands after a capture region in the template.
     ///
@@ -158,12 +158,12 @@ pub enum Fault {
     /// order is P2's output and a walk that quietly repaired it would hide a
     /// compiler bug behind a fire that mostly works.
     PrepareAfterCapture {
-        /// The offending region's index in `Baked::template`.
+        /// The offending region's index in `CompiledModel::template`.
         region: u32,
     },
     /// The template names a node the plan does not have.
     ///
-    /// `Baked` carries regions as ranges of `Plan::nodes`, so the two are
+    /// `CompiledModel` carries regions as ranges of `Trace::nodes`, so the two are
     /// only meaningful together — this is a plan and an artifact that were
     /// not baked from each other.
     NoSuchNode {
@@ -207,10 +207,10 @@ impl fmt::Display for Fault {
                 "this fire carries {rows} token rows and the largest bucket is \
                  {top} — there is no graph to launch it in"
             ),
-            Self::ClassTable { descriptor, baked } => write!(
+            Self::ClassTable { descriptor, compiled } => write!(
                 f,
                 "the descriptor carries {descriptor} classes and the artifact \
-                 has {baked} — a region's mask would index the wrong window"
+                 has {compiled} — a region's mask would index the wrong window"
             ),
             Self::PrepareAfterCapture { region } => write!(
                 f,
@@ -221,7 +221,7 @@ impl fmt::Display for Fault {
             Self::NoSuchNode { node, nodes } => write!(
                 f,
                 "the template runs node {node} of a plan that has {nodes} — \
-                 this artifact was baked from another plan"
+                 this artifact was compiled from another plan"
             ),
             Self::Descriptor { what } => {
                 write!(f, "these bytes are not a fire descriptor: {what}")

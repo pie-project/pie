@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
 use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear};
-use crate::{Def, Dim, Dtype, Operands, Operation, Plan, StructKind, Ty, ValueId};
+use crate::{Def, Dim, Dtype, Operands, Operation, Trace, StructKind, Ty, ValueId};
 
 /// Where an out-of-range `ValueId` was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub enum Expect {
 /// One broken validator rule, with enough context to act on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fault {
-    /// A referenced id does not index `plan.values`.
+    /// A referenced id does not index `trace.values`.
     OutOfRange { site: Site, id: ValueId, len: usize },
     /// A node produces an id whose decl does not say `Def::Op(that node)`.
     ForeignOutput { node: usize, op: &'static str, id: ValueId, declared: DefKind },
@@ -77,14 +77,14 @@ pub enum Fault {
     DoubleOutput { id: ValueId, first: usize, first_op: &'static str, second: usize, second_op: &'static str },
     /// `Def::Op(i)` names a node that does not output this id.
     PhantomDef { id: ValueId, node: usize, op: &'static str },
-    /// `Def::Op(i)` names a node index past the end of `plan.nodes`.
+    /// `Def::Op(i)` names a node index past the end of `trace.nodes`.
     DefNodeOutOfRange { id: ValueId, node: usize, len: usize },
     /// An input (directly, or through a merge arm) is defined at or after its
     /// consumer in program order.
     UseBeforeDef { node: usize, op: &'static str, input: ValueId, arm: Option<ValueId>, def_node: usize },
-    /// `Def::Weight(k)` with `k` past the end of `plan.params`.
+    /// `Def::Weight(k)` with `k` past the end of `trace.params`.
     WeightOutOfRange { id: ValueId, index: u32, len: usize },
-    /// `Def::Cache(k)` with `k` past the end of `plan.caches`.
+    /// `Def::Cache(k)` with `k` past the end of `trace.caches`.
     CacheOutOfRange { id: ValueId, index: u32, len: usize },
     /// A weight's shape must be all-`Const`; this axis is symbolic.
     SymbolicWeight { id: ValueId, axis: usize, dim: Dim },
@@ -116,9 +116,9 @@ pub enum Fault {
 }
 
 /// Validate a traced plan against the §3 rules, collecting every fault.
-pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
+pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     let mut faults = Vec::new();
-    let len = plan.values.len();
+    let len = trace.values.len();
     let in_range = |id: ValueId| (id.0 as usize) < len;
 
     // Program order: each node's ports, gathered once through `Operands`.
@@ -130,7 +130,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
     let (mut ins, mut outs, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut seen = HashSet::new();
 
-    for (j, node) in plan.nodes.iter().enumerate() {
+    for (j, node) in trace.nodes.iter().enumerate() {
         let op = node.op.name();
         ins.clear();
         outs.clear();
@@ -146,11 +146,11 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
             }
             match owner[id.0 as usize] {
                 Some(first) => faults.push(Fault::DoubleOutput {
-                    id, first, first_op: plan.nodes[first].op.name(), second: j, second_op: op,
+                    id, first, first_op: trace.nodes[first].op.name(), second: j, second_op: op,
                 }),
                 None => owner[id.0 as usize] = Some(j),
             }
-            match &plan.values[id.0 as usize].def {
+            match &trace.values[id.0 as usize].def {
                 Def::Op(i) if *i as usize == j => matched[id.0 as usize] = true,
                 other => faults.push(Fault::ForeignOutput { node: j, op, id, declared: DefKind::of(other) }),
             }
@@ -164,7 +164,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
             // Use-after-def, chasing merge arms (a merge is data, so each arm
             // must itself be settled before the consumer fires).
             seen.clear();
-            available(plan, id, id, j, op, &mut seen, &mut faults);
+            available(trace, id, id, j, op, &mut seen, &mut faults);
         }
 
         for &(out, input) in &pairs {
@@ -180,7 +180,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
                 faults.push(Fault::AliasInUnknown { node: j, op, input });
             }
             if in_range(out) && in_range(input) {
-                let (out_ty, in_ty) = (&plan.values[out.0 as usize].ty, &plan.values[input.0 as usize].ty);
+                let (out_ty, in_ty) = (&trace.values[out.0 as usize].ty, &trace.values[input.0 as usize].ty);
                 if out_ty != in_ty {
                     faults.push(Fault::AliasTyMismatch {
                         node: j, op, out, input, out_ty: out_ty.clone(), in_ty: in_ty.clone(),
@@ -206,7 +206,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
             if !in_range(id) {
                 continue; // already an OutOfRange fault above
             }
-            let decl = &plan.values[id.0 as usize];
+            let decl = &trace.values[id.0 as usize];
             let wrong_kind = match want {
                 Expect::Struct(kinds) => !matches!(&decl.ty, Ty::Struct(k) if kinds.contains(k)),
                 Expect::Cache => !matches!(decl.def, Def::Cache(_)),
@@ -228,7 +228,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
         }
     }
 
-    for (idx, decl) in plan.values.iter().enumerate() {
+    for (idx, decl) in trace.values.iter().enumerate() {
         let id = ValueId(idx as u32);
         let struct_kind = match &decl.ty {
             Ty::Struct(kind) => Some(*kind),
@@ -241,8 +241,8 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
         match &decl.def {
             Def::Input(_) => {}
             Def::Weight(k) => {
-                if *k as usize >= plan.params.len() {
-                    faults.push(Fault::WeightOutOfRange { id, index: *k, len: plan.params.len() });
+                if *k as usize >= trace.params.len() {
+                    faults.push(Fault::WeightOutOfRange { id, index: *k, len: trace.params.len() });
                 }
                 if let Ty::Tensor { shape, .. } = &decl.ty {
                     for (axis, &dim) in shape.iter().enumerate() {
@@ -253,15 +253,15 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
                 }
             }
             Def::Cache(k) => {
-                if *k as usize >= plan.caches.len() {
-                    faults.push(Fault::CacheOutOfRange { id, index: *k, len: plan.caches.len() });
+                if *k as usize >= trace.caches.len() {
+                    faults.push(Fault::CacheOutOfRange { id, index: *k, len: trace.caches.len() });
                 }
             }
             Def::Op(i) => {
-                if *i as usize >= plan.nodes.len() {
-                    faults.push(Fault::DefNodeOutOfRange { id, node: *i as usize, len: plan.nodes.len() });
+                if *i as usize >= trace.nodes.len() {
+                    faults.push(Fault::DefNodeOutOfRange { id, node: *i as usize, len: trace.nodes.len() });
                 } else if !matched[idx] {
-                    faults.push(Fault::PhantomDef { id, node: *i as usize, op: plan.nodes[*i as usize].op.name() });
+                    faults.push(Fault::PhantomDef { id, node: *i as usize, op: trace.nodes[*i as usize].op.name() });
                 }
             }
             Def::Merge(arms) => {
@@ -273,7 +273,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
                         faults.push(Fault::OutOfRange { site: Site::MergeArm { merge: id }, id: arm, len });
                         continue;
                     }
-                    let arm_ty = &plan.values[arm.0 as usize].ty;
+                    let arm_ty = &trace.values[arm.0 as usize].ty;
                     if struct_kind.is_none() && matches!(arm_ty, Ty::Struct(_)) {
                         faults.push(Fault::StructArm { merge: id, arm });
                     }
@@ -298,7 +298,7 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
         }
     }
 
-    for seam in &plan.seams {
+    for seam in &trace.seams {
         for &id in &seam.values {
             if !in_range(id) {
                 faults.push(Fault::OutOfRange { site: Site::Seam { seam: seam.seam.clone() }, id, len });
@@ -310,28 +310,28 @@ pub fn check(plan: &Plan) -> Result<(), Vec<Fault>> {
 }
 
 /// `check`, keeping the plan on success — for the tail of a trace pipeline.
-pub fn checked(plan: Plan) -> Result<Plan, Vec<Fault>> {
-    check(&plan)?;
-    Ok(plan)
+pub fn checked(trace: Trace) -> Result<Trace, Vec<Fault>> {
+    check(&trace)?;
+    Ok(trace)
 }
 
-/// Is `id` settled before `plan.nodes[node]` fires? Direct op outputs must
+/// Is `id` settled before `trace.nodes[node]` fires? Direct op outputs must
 /// come from an earlier node; merges are chased arm by arm (`root` keeps the
 /// operand actually consumed for the message; `seen` breaks merge cycles).
 fn available(
-    plan: &Plan, root: ValueId, id: ValueId, node: usize, op: &'static str,
+    trace: &Trace, root: ValueId, id: ValueId, node: usize, op: &'static str,
     seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
 ) {
-    match &plan.values[id.0 as usize].def {
-        Def::Op(i) if (*i as usize) < plan.nodes.len() && *i as usize >= node => {
+    match &trace.values[id.0 as usize].def {
+        Def::Op(i) if (*i as usize) < trace.nodes.len() && *i as usize >= node => {
             faults.push(Fault::UseBeforeDef {
                 node, op, input: root, arm: (id != root).then_some(id), def_node: *i as usize,
             });
         }
         Def::Merge(arms) => {
             for &(arm, _) in arms {
-                if (arm.0 as usize) < plan.values.len() && seen.insert(arm.0) {
-                    available(plan, root, arm, node, op, seen, faults);
+                if (arm.0 as usize) < trace.values.len() && seen.insert(arm.0) {
+                    available(trace, root, arm, node, op, seen, faults);
                 }
             }
         }
