@@ -58,19 +58,57 @@ pub trait Sink {
     /// That region is done.
     fn region_end(&mut self, region: &Region);
 
-    /// A conditional region is being entered — `Lowering::Switch` over a
-    /// merge's arms, or `Lowering::If` over a device mask bit (design §4).
+    /// One RUN of the region's window is about to be dispatched: `run` of
+    /// `runs`, ascending in row order.
     ///
-    /// NOT CALLED IN v1: P3 constructs `AlwaysLaunch` for every region,
-    /// because conditionals are an optimization and zero-row always-launch is
-    /// the correctness mechanism (decision #3).
+    /// **P4'S FALLBACK, AT THE SEAM WHERE IT IS PAID** (design §3). A region
+    /// whose class set P4 could not make an interval of the row order covers
+    /// several row intervals rather than one, and `Fallback::Split { r }` is
+    /// the compiler saying so: the nodes run `r` times, once per interval,
+    /// each over its own pointer and extent. The walk announces which one it
+    /// is about to dispatch, and the shell's window table answers the
+    /// resolution against THAT interval rather than against the union — which
+    /// is the whole of what a sink has to carry for the slow path to be
+    /// correct rather than merely not to fault.
+    ///
+    /// **CALLED FOR EVERY REGION, ALWAYS**, exactly as `region_begin` is: the
+    /// consecutive case that P4 exists to produce is `run = 0` of `runs = 1`,
+    /// and an empty window is `run = 0` of `runs = 1` as well, because a
+    /// region with no rows still announces itself and still dispatches its
+    /// collectives. So a sink never has to ask whether the fallback is in
+    /// play; it reads one number either way.
+    fn run(&mut self, run: u32, runs: u32);
+
+    /// A conditional region is being entered — `Lowering::Switch` over a
+    /// merge's arms, or `Lowering::If` over one independently-present body
+    /// (design §4).
+    ///
+    /// **A RECORDING SINK MUST HONOUR IT; AN EAGER ONE MUST NOT HAVE TO.** The
+    /// walk's zero-row rule decides exactly what a conditional decides — is
+    /// this behavior in this composition — so an eager sink that no-ops this
+    /// runs the same nodes over the same rows. A recorded graph outlives the
+    /// fire that recorded it, so there the decision has to become a node.
+    ///
+    /// Rare, and deliberately so: on today's whole catalog one region of one
+    /// SKU is called with this (qwen36-27b's MTP head), because a conditional
+    /// is only worth its evaluation point around a body of layer granularity
+    /// or coarser.
     fn cond_begin(&mut self, lowering: &Lowering);
 
-    /// One arm of the conditional. Arms are exclusive by construction — they
-    /// ARE a `Def::Merge`'s arms (decision #4) — so exactly one runs.
+    /// One arm of a SWITCH, between [`cond_begin`](Sink::cond_begin) and
+    /// [`cond_end`](Sink::cond_end), in `Def::Merge` arm order.
+    ///
+    /// **NOT CALLED FOR AN `If`**, which has one body and no arm to name. And
+    /// the exclusivity here is stronger than decision #4's: `resolve_classes`
+    /// proves no LANE demands two arms, and a switch node needs no FIRE to
+    /// have rows for two — `model_compiler::lowering` is where that second
+    /// proof is discharged, and it is why a batching deployment gets `If` per
+    /// arm instead.
     fn cond_arm(&mut self, arm: u8);
 
-    /// The conditional region is closed.
+    /// The conditional region is closed. For a SWITCH group this arrives after
+    /// the LAST arm's region, not after each one: the group is a run of
+    /// consecutive regions and the bracket is around the run.
     fn cond_end(&mut self);
 
     /// **RECORD `event` ON THE STREAM THIS REGION IS ON, HERE.** Anything
@@ -101,10 +139,14 @@ pub trait Sink {
 ///
 /// EVERY METHOD IS A NO-OP AND THAT IS THE CORRECT IMPLEMENTATION, not a stub.
 /// In an eager fire the walk's own control flow IS the structure — a region
-/// begins when the loop reaches it, a conditional arm is taken by the `if`
-/// that decides whether to dispatch — so there is nothing left for a sink to
-/// carry. What the type buys is that the walk which produced a graph and the
-/// walk which produced the golden numbers are the same function, called twice.
+/// begins when the loop reaches it, and a conditional's body is taken or
+/// skipped by the zero-row rule that would have decided it anyway — so there
+/// is nothing left for a sink to carry. That equivalence is design §4's whole
+/// claim: conditionals are an optimization and zero-row always-launch is the
+/// correctness mechanism, which is only true if ignoring one is correct.
+///
+/// What the type buys is that the walk which produced a graph and the walk
+/// which produced the golden numbers are the same function, called twice.
 ///
 /// # Eager IS the serialization of the DAG, and that is why the tokens cannot
 /// move
@@ -131,6 +173,17 @@ pub struct EagerSink;
 impl Sink for EagerSink {
     fn region_begin(&mut self, _region: &Region) {}
     fn region_end(&mut self, _region: &Region) {}
+    /// Nothing, and correctly so — but for a different reason from the
+    /// conditional below, and the difference matters. A no-op `cond_begin` is
+    /// correct because an eager walk decides the same thing the conditional
+    /// would; a no-op `run` is correct only because THIS sink resolves no
+    /// operands. The walk still dispatches the region's nodes once per run
+    /// and still hands each launch its own row count, so a golden path
+    /// carried by an eager sink runs a fragmented window as several launches
+    /// exactly as a shell does. A sink that DOES resolve operands
+    /// (`driver_cuda::window::Cursor`) must record this number, or every run
+    /// after the first reads the first one's rows.
+    fn run(&mut self, _run: u32, _runs: u32) {}
     fn cond_begin(&mut self, _lowering: &Lowering) {}
     fn cond_arm(&mut self, _arm: u8) {}
     fn cond_end(&mut self) {}

@@ -24,6 +24,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use super::kv::KvStore;
 use super::rs::RsStore;
+use super::seat::SeatBook;
 
 /// parking_lot mutexes do not poison: a panic unwinding mid-mutation would
 /// leave a half-updated `KvStore` silently live (std's poisoning made the
@@ -74,6 +75,12 @@ pub struct Stores {
     // measured wake-herd lock storm cost ~2 ms per wave — §15).
     pub kv: Arc<parking_lot::Mutex<KvStore>>,
     pub rs: Arc<Mutex<RsStore>>,
+    /// Which pool slot each working set's sequences sit in — the seat
+    /// `Lane::slot` states to the shell. Sized by the same `num_slots` the
+    /// `RsStore` is, because it is the same number: the driver advertises it
+    /// as `PoolFacts::state_slots` and the contract calls it
+    /// `Budgets::slots`, "how many sequences the pools seat at once".
+    pub seats: Arc<Mutex<SeatBook>>,
     /// Tokens per KV page for this model/driver.
     pub kv_page_size: u32,
 }
@@ -84,22 +91,28 @@ static REGISTRY: LazyLock<boxcar::Vec<RwLock<Vec<Option<Stores>>>>> =
 /// Test convenience: register a model with no host swap pages. Production
 /// bootstrap always sizes swap explicitly via [`register_model_with_swap`].
 #[cfg(test)]
-pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_rs_slots: &[usize]) -> usize {
+pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[usize]) -> usize {
     register_model_with_swap(
         kv_page_size,
         num_kv_pages,
         &vec![0; num_kv_pages.len()],
-        num_rs_slots,
+        num_slots,
     )
 }
 
 /// Register a model's per-driver stores at bootstrap. Capacities come from
 /// the driver-preallocated static pools. Returns the assigned model index.
+///
+/// `num_slots` is the driver's advertised `PoolFacts::state_slots` — the
+/// contract's `Budgets::slots`, "how many sequences the pools seat at once".
+/// It sizes both the recurrent-state pool and the [`SeatBook`], because a
+/// sequence's recurrent bank row and its seat are the same seat
+/// (`driver::fire`'s header: `Lane::slot` is the seat in BOTH pools).
 pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],
     num_host_pages: &[usize],
-    num_rs_slots: &[usize],
+    num_slots: &[usize],
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
         .map(|d| {
@@ -108,11 +121,11 @@ pub fn register_model_with_swap(
                 num_host_pages.get(d).copied().unwrap_or(0) as u32,
                 rand::random::<[u8; 32]>(),
             )));
+            let slots = num_slots.get(d).copied().unwrap_or(0) as u32;
             Some(Stores {
                 kv,
-                rs: Arc::new(Mutex::new(RsStore::new(
-                    num_rs_slots.get(d).copied().unwrap_or(0) as u32,
-                ))),
+                rs: Arc::new(Mutex::new(RsStore::new(slots))),
+                seats: Arc::new(Mutex::new(SeatBook::new(slots))),
                 kv_page_size,
             })
         })
@@ -127,7 +140,7 @@ pub fn register_driver_with_swap(
     base_page: u32,
     num_kv_pages: usize,
     num_host_pages: usize,
-    num_rs_slots: usize,
+    num_slots: usize,
 ) -> anyhow::Result<()> {
     let model = REGISTRY
         .get(model_idx)
@@ -155,7 +168,8 @@ pub fn register_driver_with_swap(
     )));
     stores[driver_idx] = Some(Stores {
         kv,
-        rs: Arc::new(Mutex::new(RsStore::new(num_rs_slots as u32))),
+        rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32))),
+        seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
         kv_page_size,
     });
     Ok(())

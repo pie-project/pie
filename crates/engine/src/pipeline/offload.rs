@@ -529,7 +529,12 @@ pub(crate) async fn try_encode(request: &mut crate::driver::FireRequest) -> bool
     false
 }
 
-/// Forget every peer. Test support, and the shutdown path.
+/// Forget every peer.
+///
+/// The shutdown path's door, and the only way a test can start from a known
+/// registry — which is why it stays `pub` rather than `#[cfg(test)]`: the
+/// crate's public facade re-exports it (`crate::offload`), so a `cfg` would
+/// break the export rather than document the intent.
 pub fn clear_partners() {
     let partners: Vec<Arc<Partner>> = PARTNERS.write().unwrap().drain().map(|(_, p)| p).collect();
     for partner in partners {
@@ -539,11 +544,44 @@ pub fn clear_partners() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
     use super::*;
+
+    /// Serializes every test that reads or writes [`PARTNERS`].
+    ///
+    /// The registry is process-global and reachable only as a global: nothing
+    /// in [`register_partner`], [`select_partner`] or [`remove_partner`] takes
+    /// a registry to act on, because a node has exactly one set of peers and
+    /// the engine's public facade publishes those free functions as its whole
+    /// interface to it. Threading a registry handle through them would be a
+    /// production shape invented for the tests, so the honest fix is here: the
+    /// tests take turns.
+    ///
+    /// Without a turn they wipe each other. Both start by calling
+    /// [`clear_partners`], and `cargo test` runs them on separate threads by
+    /// default, so under parallelism one test's `clear_partners` drains the
+    /// peer the other just registered and its `select_partner` answers `None`
+    /// — a flake that reported three times before it was read as a shared-state
+    /// problem rather than a scheduling one.
+    static REGISTRY: Mutex<()> = Mutex::new(());
+
+    /// Take the registry for the duration of a test, empty.
+    ///
+    /// A test that fails while holding the lock poisons it, and a poisoned
+    /// lock would turn one real failure into a cascade of unrelated ones. The
+    /// state the poison warns about is exactly the state this drains on the
+    /// way in, so [`PoisonError::into_inner`] is the correct reading and not a
+    /// suppressed one.
+    fn exclusive_registry() -> MutexGuard<'static, ()> {
+        let guard = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+        clear_partners();
+        guard
+    }
 
     #[test]
     fn a_claim_is_released_when_its_guard_drops() {
-        clear_partners();
+        let _registry = exclusive_registry();
         let partner = register_partner(1, 2, 7usize, PartnerRole::Prefill, 2, TransferKind::Inline);
         let first = select_partner(PartnerRole::Prefill).expect("a peer is available");
         assert_eq!(partner.outstanding(), 1);
@@ -559,9 +597,12 @@ mod tests {
         clear_partners();
     }
 
+    /// Holds the registry across `await` points, which is sound here because
+    /// `#[tokio::test]` drives the future to completion on this one thread: no
+    /// other task can be scheduled onto the lock while it is parked.
     #[tokio::test]
     async fn every_transfer_verb_refuses_by_name_rather_than_answering_ok() {
-        clear_partners();
+        let _registry = exclusive_registry();
         let partner = register_partner(3, 4, 0usize, PartnerRole::Prefill, 1, TransferKind::Inline);
         let error = partner
             .pull_kv(vec![0], vec![1])

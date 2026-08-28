@@ -37,7 +37,7 @@ use objc2::rc::Retained;
 #[cfg(target_vendor = "apple")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_vendor = "apple")]
-use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
+use objc2_metal::{MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLLibrary};
 
 #[cfg(target_vendor = "apple")]
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
@@ -132,8 +132,25 @@ impl Pipelines {
             entrypoint: fire.entrypoint,
             why: "the compiled library holds no such entrypoint".to_string(),
         })?;
+        // **EVERY PIPELINE IS BUILT FOR AN INDIRECT COMMAND BUFFER, AND ONE
+        // PATH SERVES BOTH CONSUMERS.** `supportIndirectCommandBuffers` is
+        // false by default and cannot be turned on afterwards, and a pipeline
+        // without it cannot be set into an `MTLIndirectComputeCommand` — so a
+        // cache that built the plain form would have to build every point
+        // twice the day `crate::icb` wants one. The flag costs a compute pass
+        // nothing measurable here (`serve_smoke`'s ms/fire is unmoved), and
+        // asking for it needs the DESCRIPTOR form of the constructor, which
+        // is the only reason this is not one line.
+        let descriptor = MTLComputePipelineDescriptor::new();
+        descriptor.setComputeFunction(Some(&function));
+        descriptor.setSupportIndirectCommandBuffers(true);
+        descriptor.setLabel(Some(&super::ctx::nsstring(fire.entrypoint)));
         let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &descriptor,
+                objc2_metal::MTLPipelineOption::None,
+                None,
+            )
             .map_err(|error| Fault::Shader {
                 file: fire.file,
                 entrypoint: fire.entrypoint,

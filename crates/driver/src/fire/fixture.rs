@@ -312,6 +312,9 @@ pub(crate) enum Event {
     /// their first node is what a failing assert should print anyway.
     Begin(u32),
     End(u32),
+    /// Run `run` of `runs` over the region's window — one for a window P4
+    /// seated, several for one it could not.
+    Run(u32, u32),
     CondBegin,
     CondArm(u8),
     CondEnd,
@@ -332,6 +335,16 @@ impl Sink for Recorder {
     }
     fn region_end(&mut self, region: &Region) {
         self.events.push(Event::End(region.nodes.start));
+    }
+    /// **RECORDED ONLY WHEN THE WINDOW SPLIT.** Every region announces a run,
+    /// so writing all of them down would bury every structural expectation in
+    /// this file under a `Run(0, 1)` per region and say nothing: one launch is
+    /// what P4 produces for the whole catalog. What a test wants to see is the
+    /// case P4 could not seat, and that is the case this records.
+    fn run(&mut self, run: u32, runs: u32) {
+        if runs > 1 {
+            self.events.push(Event::Run(run, runs));
+        }
     }
     fn cond_begin(&mut self, _lowering: &Lowering) {
         self.events.push(Event::CondBegin);

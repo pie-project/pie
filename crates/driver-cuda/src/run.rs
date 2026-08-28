@@ -23,7 +23,7 @@ use kernels_cuda::attn::plan::{
 use kernels_cuda::{Ctx, KvPool, RaggedTensor, RecurrentPool, Tensor};
 use model_ir::{Def, Dim, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
-use crate::window::{Window, Windows};
+use crate::window::{At, Window, Windows};
 
 /// One loader-resolved weight. Most rows are one dense handle; an mxfp4 bank
 /// is two device planes under one `Def::Weight` id. Both shells seat the form
@@ -300,10 +300,21 @@ pub struct FireBindings {
     /// the plan-building arms route to row `cache`'s planning twin.
     pub geometry: Vec<CacheGeometry>,
 
-    /// Per PLAN VALUE, by `Plan::values` id: the reading that schedule is
-    /// carved for and the grant it stages into. `None` for every value that
-    /// is not a plan struct some launch consumes.
+    /// Per (RUN, PLAN VALUE), flat at `run * plan_values + value`: the reading
+    /// that schedule is carved for and the grant it stages into. `None` for
+    /// every value that is not a plan struct some launch consumes.
+    ///
+    /// **THE RUN IS P4'S FALLBACK REACHING THE GRANT** (design §3). A region
+    /// the layout could not seat carves one schedule per interval of its class
+    /// set, every one of them built in the prepare pass and read in the
+    /// capture pass, so every one of them needs its own staged image — see
+    /// [`Inputs::plans`](crate::inputs) for which half of a grant is
+    /// per-run and which is shared. For an artifact P4 seated whole this is
+    /// one run wide and is the table it always was.
     pub schedules: Vec<Option<ScheduleSeat>>,
+    /// How many plan values one run's slice of
+    /// [`schedules`](FireBindings::schedules) holds.
+    pub plan_values: usize,
 
     /// The seam extras the arms bind beside the ops' named operands.
     pub tables: FireTables,
@@ -374,9 +385,27 @@ pub struct Run<'c> {
     /// [`Run::recurrent`], never through [`Run::tensor`].
     caches: &'c CacheTable,
 
-    /// `ValueId`-indexed plan payloads: filled by the plan-building arms in
-    /// the prepare phase, read by the consuming arms afterwards.
+    /// Plan payloads: filled by the plan-building arms in the prepare phase,
+    /// read by the consuming arms afterwards.
+    ///
+    /// **KEYED BY `(RUN, VALUE)`, NOT BY VALUE**, and the extra key is the
+    /// split's other half. A schedule is carved for ONE window — how many
+    /// requests it batches, where each one's query rows start, how its work
+    /// items divide the kv — so a region P4 could not seat carves one per
+    /// interval, and the prepare phase builds all of them before the capture
+    /// phase reads any of them. One slot per value would let run 1's builder
+    /// overwrite run 0's, and run 0's launch would then read a schedule
+    /// describing run 1's requests: not a fault, just wrong logits for the
+    /// lanes in the first interval.
+    ///
+    /// Flat rather than nested, at `run * values + value`: a plan has
+    /// thousands of values and a `Vec` per value would be thousands of
+    /// allocations per fire, where this is one. The width is
+    /// [`Windows::max_runs`] — `1` for every artifact P4 seated whole, which
+    /// is the layout this table had before the split existed.
     structs: Vec<Option<StructSlot>>,
+    /// How many values one run's slice of [`structs`](Run::structs) holds.
+    values_wide: usize,
 
     /// This fire's bindings.
     fire: FireBindings,
@@ -385,12 +414,12 @@ pub struct Run<'c> {
     /// class table.
     windows: &'c Windows,
 
-    /// Which region the walk is inside, written by
-    /// [`Cursor`](crate::window::Cursor) — the shell's `Sink` — before the
-    /// region's nodes are dispatched. **THIS IS THE WHOLE MIXED-FIRE
-    /// MECHANISM**: it turns every resolution below from "the fire's
-    /// rectangle" into "this node's window of it".
-    region: &'c Cell<u32>,
+    /// Which region the walk is inside and which run of its window, written
+    /// by [`Cursor`](crate::window::Cursor) — the shell's `Sink` — before the
+    /// region's nodes are dispatched and before each launch of them. **THIS
+    /// IS THE WHOLE MIXED-FIRE MECHANISM**: it turns every resolution below
+    /// from "the fire's rectangle" into "this node's window of it".
+    place: &'c At,
 
     /// P6's side-stream contexts, in stream order: `side[0]` is stream 1.
     ///
@@ -401,7 +430,7 @@ pub struct Run<'c> {
     side: &'c [&'c Ctx],
 
     /// Which stream the walk is on, written by the same `Cursor` that writes
-    /// [`region`](Run::region), at the same instant and for the same reason.
+    /// [`place`](Run::place), at the same instant and for the same reason.
     stream: &'c Cell<u32>,
 }
 
@@ -416,7 +445,7 @@ impl<'c> Run<'c> {
         caches: &'c CacheTable,
         fire: FireBindings,
         windows: &'c Windows,
-        region: &'c Cell<u32>,
+        place: &'c At,
     ) -> Self {
         Self {
             ctx,
@@ -424,12 +453,13 @@ impl<'c> Run<'c> {
             weights,
             arena,
             caches,
-            structs: vec![None; values.len()],
+            structs: vec![None; values.len() * windows.max_runs() as usize],
+            values_wide: values.len(),
             fire,
             windows,
-            region,
+            place,
             side: &[],
-            stream: region,
+            stream: &place.region,
         }
     }
 
@@ -476,9 +506,19 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
-    /// The window the node being dispatched runs over.
+    /// The window the node being dispatched runs over — this region's, cut at
+    /// the run the walk is on.
     pub(crate) fn window(&self) -> &'c Window {
-        self.windows.at(self.region.get())
+        self.windows.at(self.place.region.get(), self.place.run.get())
+    }
+
+    /// Where this run's payload for `id` sits in [`structs`](Run::structs).
+    ///
+    /// The run comes off the same cell the window does, so a schedule is
+    /// stored and read at the same key by construction — a builder cannot
+    /// carve for one interval and a launch read another.
+    fn struct_at(&self, id: ValueId) -> usize {
+        self.place.run.get() as usize * self.values_wide + id.0 as usize
     }
 
     /// This window's qo boundaries, staged — what a ragged view is cut by.
@@ -822,17 +862,20 @@ impl<'c> Run<'c> {
                  geometry twins before a plan op can fire"
             )
         });
+        let run = self.place.run.get() as usize;
         let schedule = self
             .fire
             .schedules
-            .get(plan.0 as usize)
+            .get(run * self.fire.plan_values + plan.0 as usize)
             .copied()
             .flatten()
             .unwrap_or_else(|| {
                 panic!(
-                    "plan value {} carries no schedule seat; the shell reads every \
-                     schedule's reading off the plan op that defines it, so a plan op \
-                     firing without one is a value `store::kv::probe` never walked",
+                    "plan value {} carries no schedule seat for run {run} of its \
+                     window; the shell reads every schedule's reading off the plan op \
+                     that defines it and carves one grant per run of the region that \
+                     builds it, so a plan op firing without one is a value \
+                     `store::kv::probe` never walked",
                     plan.0
                 )
             });
@@ -956,18 +999,21 @@ impl<'c> Run<'c> {
 
     /// Store a plan payload a prepare-phase arm just built.
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
-        self.structs[id.0 as usize] = Some(built);
+        let at = self.struct_at(id);
+        self.structs[at] = Some(built);
     }
 
     /// One built slot, whichever kind it holds — for the arm that routes on
     /// the kind (prefill's fa2/sm90 fork); the typed accessors below are the
     /// single-kind reads.
     pub(crate) fn slot(&self, id: ValueId) -> &StructSlot {
-        self.structs[id.0 as usize].as_ref().unwrap_or_else(|| {
+        let at = self.struct_at(id);
+        self.structs[at].as_ref().unwrap_or_else(|| {
             panic!(
-                "value {} holds no plan payload; its plan op has not fired, and the \
-                 prepare phase runs first",
-                id.0
+                "value {} holds no plan payload for run {} of its window; its plan \
+                 op has not fired, and the prepare phase runs first",
+                id.0,
+                self.place.run.get(),
             )
         })
     }

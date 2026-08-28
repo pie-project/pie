@@ -56,6 +56,7 @@ pub(crate) mod fixture;
 
 pub mod compose;
 pub mod descriptor;
+pub mod fallback;
 pub mod sink;
 pub mod walk;
 
@@ -63,6 +64,7 @@ pub use compose::{
     ClassWindow, Composition, Lane, LaneRow, MaskSpan, RowSpan, WindowTable, compose,
 };
 pub use descriptor::{ABI_VERSION, CLASS_BYTES, FireDescriptor, HEADER_BYTES, LANE_BYTES, MAGIC};
+pub use fallback::{answers as fallback_answers, max_runs};
 pub use sink::{EagerSink, EventId, Sink};
 pub use walk::{Phases, walk, walk_phases};
 

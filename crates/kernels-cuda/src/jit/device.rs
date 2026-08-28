@@ -1,8 +1,45 @@
-//! The device probe and the process-global scratch slabs. Every probe runs
-//! once and is cached; the slabs grow and never shrink, because an entry may
-//! not allocate per fire (graph capture forbids it). A slab that would have
-//! to grow under a capturing stream is refused, not grown — the contract
-//! lives on [`Ctx::scratch`](crate::jit::Ctx::scratch).
+//! The device probe and the scratch slabs. Every probe runs once and is
+//! cached; the slabs grow and never shrink, because an entry may not
+//! allocate per fire (graph capture forbids it). A slab that would have to
+//! grow under a capturing stream is refused, not grown — the contract lives
+//! on [`Ctx::scratch`](crate::jit::Ctx::scratch).
+//!
+//! # A slab is per `(arena, name, stream)`, and each of the three is a bug
+//! that was measured
+//!
+//! It was keyed by NAME alone, process-wide, and that key was wrong twice.
+//!
+//! **The ARENA is the shell.** Two `Shell`s in one process fired into one
+//! another's staging planes and both computed: build log 18 measured a
+//! continuation of `"PPP is目前是. \{ a a \)"` where the same load alone says
+//! `" Paris"`, and the whole tree worked around it by admitting one shell per
+//! process. An arena is minted by [`Slabs::open`](crate::Slabs::open), one per
+//! CUDA context, and [`released`](crate::Slabs::release) with it, so two
+//! shells now share nothing and neither leaks the other's slabs at teardown.
+//!
+//! **The STREAM is P6.** Two arms of one fork group run at the same instant
+//! by construction, so two regions staging through one slab stage over each
+//! other — which is why `driver_cuda::EXCLUSIVE` named eleven entries and
+//! ordered every linear-attention split in qwen and kimi back into a line
+//! (build log 24). Per stream, they are disjoint by the same argument that
+//! makes two streams worth having.
+//!
+//! # Growth is BROADCAST across the arena's streams, and that is the warming
+//! contract
+//!
+//! The shell warms a load by firing it EAGERLY — one stream, program order —
+//! and only then records the same regions across the side streams. A slab
+//! sized on the eager pass's stream would therefore be missing on every
+//! stream the capture actually uses, and [`take`] would answer
+//! [`Fault::Unwarmed`] for a load that did exactly what the contract asked.
+//!
+//! So a name that grows on one of an arena's streams grows on all of them, at
+//! the same instant and to the same size. The eager warm pass is then the
+//! warm pass for the capture too, unchanged, and the cost is the honest one:
+//! an arena holds `streams × bytes` of a name it uses on one stream. Side
+//! streams are counted in ones and twos (`DeviceProfile::side_streams`), and
+//! the alternative — allocating on the stream that asks — is a load that
+//! refuses.
 
 use core::ffi::c_void;
 use std::collections::HashMap;
@@ -17,11 +54,73 @@ struct Slab {
     bytes: usize,
 }
 
-unsafe impl Send for Slab {}
+/// One arena: the streams a context fires on, and one slab per
+/// `(name, stream)`.
+///
+/// The streams are addresses rather than pointers because that is all a key
+/// needs, and because a `usize` is `Send` without an unsafe promise about a
+/// handle this map never dereferences.
+#[derive(Default)]
+struct Arena {
+    /// Every stream this arena's growth must cover. Registered at
+    /// [`attach`], which the shell calls when it opens a stream — before its
+    /// first fire, which is what makes the broadcast above complete.
+    streams: Vec<usize>,
+    slabs: HashMap<(&'static str, usize), Slab>,
+}
 
-fn slabs() -> &'static Mutex<HashMap<&'static str, Slab>> {
-    static SLABS: OnceLock<Mutex<HashMap<&'static str, Slab>>> = OnceLock::new();
-    SLABS.get_or_init(|| Mutex::new(HashMap::new()))
+// SAFETY: the only pointers here are device allocations this map owns
+// outright. `cudaMalloc`/`cudaFree` are thread-safe and the map is behind a
+// mutex; nothing else holds a slab except a launch that has already been
+// enqueued.
+unsafe impl Send for Arena {}
+
+fn arenas() -> &'static Mutex<HashMap<u32, Arena>> {
+    static ARENAS: OnceLock<Mutex<HashMap<u32, Arena>>> = OnceLock::new();
+    ARENAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
+    arenas()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Tell `arena` that it fires on `stream` too, so a slab grown anywhere in it
+/// is grown here as well.
+///
+/// Idempotent, and deliberately not retroactive: a stream attached AFTER a
+/// name has already grown gets its slab on that name's next growth, which for
+/// the shell is never a question because [`Context::open_lanes`] runs at load
+/// and every fire is after it.
+pub(crate) fn attach(arena: u32, stream: *mut c_void) {
+    let mut arenas = locked();
+    let held = arenas.entry(arena).or_default();
+    let at = stream.addr();
+    if !held.streams.contains(&at) {
+        held.streams.push(at);
+    }
+}
+
+/// Free every slab this arena holds and forget its streams.
+///
+/// **THE SHELL'S TEARDOWN IS THE ONLY CALLER**, and it is what makes a second
+/// shell in one process cost what the first one did rather than twice it. A
+/// slab is only ever read by a launch that was enqueued on one of this
+/// arena's streams, so a context that has synchronized and is dropping them
+/// has nothing left in flight.
+pub(crate) fn release(arena: u32) {
+    let mut arenas = locked();
+    let Some(held) = arenas.remove(&arena) else {
+        return;
+    };
+    for (_, slab) in held.slabs {
+        if !slab.ptr.is_null() {
+            // SAFETY: an address this map allocated with `cudaMalloc` and
+            // handed to nobody who outlives the arena.
+            let _ = unsafe { rt::cudaFree(slab.ptr) };
+        }
+    }
 }
 
 /// Whether `stream` is mid-capture; `None` when the runtime will not say
@@ -40,6 +139,7 @@ pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptur
 }
 
 pub(crate) fn take(
+    arena: u32,
     stream: *mut c_void,
     name: &'static str,
     bytes: usize,
@@ -47,14 +147,12 @@ pub(crate) fn take(
     if bytes == 0 {
         return Ok(core::ptr::null_mut());
     }
-    let mut slabs = slabs()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let slab = slabs.entry(name).or_insert(Slab {
-        ptr: core::ptr::null_mut(),
-        bytes: 0,
-    });
-    if slab.bytes >= bytes {
+    let mut arenas = locked();
+    let held = arenas.entry(arena).or_default();
+    let here = stream.addr();
+    if let Some(slab) = held.slabs.get(&(name, here))
+        && slab.bytes >= bytes
+    {
         return Ok(slab.ptr);
     }
     // Growth is `cudaFree` + `cudaMalloc`; under capture that poisons the
@@ -64,17 +162,43 @@ pub(crate) fn take(
     {
         return Err(Fault::Unwarmed {
             name,
-            have: slab.bytes,
+            have: held.slabs.get(&(name, here)).map_or(0, |slab| slab.bytes),
             need: bytes,
         });
     }
+    // Every stream at once, so that the eager pass that warms this name warms
+    // it for the capture pass that will run the same region elsewhere.
+    let mut on = held.streams.clone();
+    if !on.contains(&here) {
+        on.push(here);
+    }
+    for at in on {
+        grow(held, name, at, bytes)?;
+    }
+    Ok(held.slabs[&(name, here)].ptr)
+}
+
+/// Size one `(name, stream)` slab to at least `bytes`, reallocating when it
+/// is short. Never called under capture — [`take`] refuses there first.
+fn grow(arena: &mut Arena, name: &'static str, stream: usize, bytes: usize) -> Result<(), Fault> {
+    let slab = arena.slabs.entry((name, stream)).or_insert(Slab {
+        ptr: core::ptr::null_mut(),
+        bytes: 0,
+    });
+    if slab.bytes >= bytes {
+        return Ok(());
+    }
     if !slab.ptr.is_null() {
+        // SAFETY: an address this map allocated and no captured graph holds,
+        // by the warm-before-capture contract on `Ctx::scratch`.
         let _ = unsafe { rt::cudaFree(slab.ptr) };
         slab.ptr = core::ptr::null_mut();
         slab.bytes = 0;
     }
     let mut fresh: *mut c_void = core::ptr::null_mut();
 
+    // SAFETY: a live local out-parameter and a byte count this caller checked
+    // is non-zero.
     let code = unsafe { rt::cudaMalloc(&raw mut fresh, bytes) };
     if code != rt::cudaError::cudaSuccess || fresh.is_null() {
         return Err(Fault::Device {
@@ -84,7 +208,7 @@ pub(crate) fn take(
     }
     slab.ptr = fresh;
     slab.bytes = bytes;
-    Ok(fresh)
+    Ok(())
 }
 
 #[must_use]

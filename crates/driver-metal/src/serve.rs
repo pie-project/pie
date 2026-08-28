@@ -62,7 +62,6 @@
 //! axes have no arm to run on this plane, so a submission field for them
 //! would be a promise the dispatch layer breaks one launch later.
 
-use std::cell::Cell;
 use std::path::Path;
 
 use driver::fire::{FireDescriptor, Lane as FireLane, compose, walk};
@@ -75,11 +74,12 @@ use crate::device::{Context, Handles, Pipelines};
 use crate::encode::Sink;
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
+use crate::record::{Recording, Tape};
 use crate::run::{CacheGeometry, FireBindings, FireTables, Run};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
 use crate::weights::Weights;
-use crate::window::{Cursor, Windows};
+use crate::window::{At, Cursor, Windows};
 
 use driver::driver_api::fire::Mask;
 
@@ -219,6 +219,22 @@ pub struct Shell {
     /// a program, and never touched by [`Shell::fire_seated`] — a guest pass
     /// runs BESIDE a fire, at its boundaries, never inside it.
     programs: crate::program::Plane,
+    /// The artifact's dispatches, encoded once (`crate::icb`).
+    ///
+    /// `None` until [`Shell::build_icb`] is called, and this shell fires
+    /// through the ordinary encode path meanwhile — which is what keeps the
+    /// indirect plane an ADDITION rather than a fork: `serve_smoke`'s goldens
+    /// run against a `Shell` that never builds one, and the A/B gate is the
+    /// same shell answering twice.
+    #[cfg(target_vendor = "apple")]
+    icb: Option<crate::icb::Icb>,
+    /// What the last indirect fire rewrote — the observable behind "the
+    /// descriptor is the one mutable channel into a recorded graph". A steady
+    /// stream of fires over one composition moves the offsets and the grids
+    /// and turns nothing on or off, and an absence has no output unless
+    /// something counts it.
+    #[cfg(target_vendor = "apple")]
+    rebound: crate::icb::Rebound,
 }
 
 impl Shell {
@@ -336,6 +352,10 @@ impl Shell {
             held: vec![0; boot.slots as usize],
             out,
             programs: crate::program::Plane::new(),
+            #[cfg(target_vendor = "apple")]
+            icb: None,
+            #[cfg(target_vendor = "apple")]
+            rebound: crate::icb::Rebound::default(),
         })
     }
 
@@ -576,8 +596,118 @@ impl Shell {
     /// for a lane whose mask and word disagree, [`Fault::Ceiling`] for a
     /// count past a reservation, [`Fault::Device`] for a command buffer the
     /// GPU refused.
-    #[allow(clippy::too_many_lines)]
     pub fn fire_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.drive(lanes, Mode::Encode)?.logits)
+    }
+
+    /// One walk of this batch, written down — [`Shell::record_seated`] for a
+    /// caller that seats nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::record_seated`].
+    pub fn record(&mut self, lanes: &[Lane<'_>]) -> Result<Recording> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        self.record_seated(&seated)
+    }
+
+    /// Encode this artifact's dispatches ONCE, into an indirect command
+    /// buffer, at the composition `lanes` produces.
+    ///
+    /// **THE COMPOSITION CHOSEN HERE DECIDES WHICH SLOTS EXIST.** The walk
+    /// skips a zero-row region's nodes, so a buffer built at an all-decode
+    /// batch holds no prefill launch and cannot serve a mixed one — design
+    /// §5's "all compositions live inside it" says to build at a batch that
+    /// holds every class, and that is the caller's statement rather than a
+    /// guess this function makes. What a fire whose window is empty does with
+    /// a slot it does not want is [`Shell::fire_indirect`]'s business.
+    ///
+    /// Two walks happen: one recording, to count the slots and the scalar
+    /// cells (`maxCommandCount` is fixed at creation), and one encoding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::fire_seated`], plus [`Fault::Device`] when the device
+    /// would not reserve the buffer.
+    #[cfg(target_vendor = "apple")]
+    pub fn build_icb(&mut self, lanes: &[Lane<'_>]) -> Result<()> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        let taped = self.drive(&seated, Mode::Record)?.tape.ok_or_else(|| {
+            Fault::Unbound {
+                what: "a recording, from a walk that was asked for one".to_string(),
+            }
+        })?;
+        let mode = Mode::Build {
+            slots: taped.slots.len(),
+            constants: crate::icb::constants_for(&taped),
+        };
+        self.drive(&seated, mode).map(|_| ())
+    }
+
+    /// What was encoded, for a caller that wants the census.
+    #[cfg(target_vendor = "apple")]
+    #[must_use]
+    pub fn icb(&self) -> Option<&crate::icb::Icb> {
+        self.icb.as_ref()
+    }
+
+    /// What the last indirect fire rewrote.
+    #[cfg(target_vendor = "apple")]
+    #[must_use]
+    pub fn rebound(&self) -> crate::icb::Rebound {
+        self.rebound
+    }
+
+    /// One fire, through the indirect command buffer.
+    ///
+    /// The walk runs — over a `Tape`, which encodes nothing — the components
+    /// this composition moves are written into the buffer, and one
+    /// `executeCommandsInBuffer:` runs all of it. **No compute pass is
+    /// encoded**, which is the ~319 µs per fire this plane exists to remove.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::fire_seated`], plus [`Fault::Unbound`] when no buffer was
+    /// built and [`Fault::Unstructured`] when this composition does not walk
+    /// the buffer's own slots.
+    #[cfg(target_vendor = "apple")]
+    pub fn fire_indirect(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        Ok(self.drive(&seated, Mode::Replay)?.logits)
+    }
+
+    /// One walk of this batch, **written down instead of encoded**.
+    ///
+    /// The differential recorder's door (`.wiki/palo/icb.md` §7 step 1, and
+    /// `crate::record`). Everything a fire does before the walk happens here
+    /// too — the composition, the windows, the staged vectors, the arena's
+    /// carve, the pools' views — because the recording has to be of the walk
+    /// this batch WOULD have run, argument for argument. What does not happen
+    /// is the dispatch, the commit and the readback: nothing is submitted to
+    /// the device, and the sequence lengths this shell counts are left where
+    /// they were, so recording a synthetic batch does not move a real slot's
+    /// history.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::fire_seated`], less the device's own refusals.
+    pub fn record_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Recording> {
+        self.drive(lanes, Mode::Record)?
+            .tape
+            .ok_or_else(|| Fault::Unbound {
+                what: "a recording, from a walk that was asked for one".to_string(),
+            })
+    }
+
+    /// The fire path, once, under either sink.
+    ///
+    /// **THE TWO MODES ARE ONE WALK AND THAT IS THE WHOLE POINT** — decision
+    /// #11's "captured is eager by construction", one mode further. Splitting
+    /// this into two functions would put a second reading of the composition,
+    /// the windows and the carve beside the first, and the recording's value
+    /// is precisely that it is not a second reading.
+    #[allow(clippy::too_many_lines)]
+    fn drive(&mut self, lanes: &[Seated<'_>], mode: Mode) -> Result<Outcome> {
         let Shell {
             device,
             pipelines,
@@ -600,7 +730,19 @@ impl Shell {
             // omission — a `..` would absorb the next field somebody adds
             // without anyone deciding it belongs here.
             programs: _,
+            // The indirect plane's one field, and it is NAMED for the same
+            // reason `programs` is: an artifact encoded once is state a fire
+            // reads, and a `..` would let the next one in without a decision.
+            #[cfg(target_vendor = "apple")]
+            icb,
+            #[cfg(target_vendor = "apple")]
+            rebound,
         } = self;
+        // Off Apple there is no indirect plane to hold: the two modes that
+        // would read it refuse before the walk (`Fault::Deviceless`), and the
+        // binding exists so the code below reads the same on both targets.
+        #[cfg(not(target_vendor = "apple"))]
+        let _icb: Option<()> = None;
 
         // 1. Lane words in. `compose` is arithmetic over a `Vec` of them:
         //    words to classes, classes to an order, counts to prefix sums.
@@ -796,13 +938,35 @@ impl Shell {
             },
         };
         // The one piece of state between the two halves of the walk: the
-        // sink writes which region is running, the `Run` reads it to know
-        // which window to resolve in. They cannot be one object — `walk`
-        // takes two `&mut` — and this is the smallest thing between them.
-        let region = Cell::new(0u32);
-        let frame = device.frame()?;
+        // sink writes which region is running and which run of its window,
+        // the `Run` reads both to know which window to resolve in. They
+        // cannot be one object — `walk` takes two `&mut` — and this is the
+        // smallest thing between them.
+        let place = At::new();
+        // **ONLY THE ENCODING MODE OPENS A FRAME.** A `Tape` and a `Builder`
+        // touch no compute pass, and a frame opened and dropped without a
+        // commit is an encoder Metal expects to be ended — so the modes differ
+        // here, in the one place they can, and nowhere above it.
+        let frame = match mode {
+            Mode::Encode => Some(device.frame()?),
+            Mode::Record | Mode::Build { .. } | Mode::Replay => None,
+        };
+        let sink = match mode {
+            Mode::Encode => Encoded::Live(Sink::new(
+                device,
+                frame.as_ref().expect("the encoding mode opened a frame"),
+                pipelines,
+                handles,
+            )),
+            Mode::Record | Mode::Replay => Encoded::Taped(Tape::new(handles, &place)),
+            #[cfg(target_vendor = "apple")]
+            Mode::Build { slots, constants } => Encoded::Built(crate::icb::Builder::new(
+                device, pipelines, handles, &place, slots, constants,
+            )?),
+            #[cfg(not(target_vendor = "apple"))]
+            Mode::Build { .. } => return Err(Fault::Deviceless),
+        };
         {
-            let sink = Sink::new(device, &frame, pipelines, handles);
             let mut run = Run::new(
                 &sink,
                 handles,
@@ -812,15 +976,80 @@ impl Shell {
                 &caches,
                 bindings,
                 &windows,
-                &region,
+                &place,
             );
-            walk(plan, baked, &descriptor, &mut run, &mut Cursor::new(&region))?;
+            walk(plan, baked, &descriptor, &mut run, &mut Cursor::new(&place))?;
         }
 
-        // 9. The one synchronization a fire has, and it is here because a
-        //    caller asked for numbers — every encode above is enqueue-only by
-        //    design (decision #15).
-        frame.commit()?;
+        let classes: Vec<(u32, u32)> = composition
+            .classes()
+            .as_slice()
+            .iter()
+            .map(|class| (class.rows, class.lanes))
+            .collect();
+        let taped = match sink {
+            // The `Sink` is dropped here and the frame's borrow ends with it.
+            Encoded::Live(_) => None,
+            Encoded::Taped(tape) => Some(tape.finish(classes)),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => {
+                *icb = Some(builder.finish()?);
+                None
+            }
+        };
+
+        match mode {
+            // The recorder's fire ends here: nothing was submitted, so there
+            // is nothing to wait for and no logits to read. The handle table
+            // is still rewound — the carve this walk minted is this walk's —
+            // and the sequence lengths are left alone, which is what makes a
+            // synthetic probe free of side effects.
+            Mode::Record => {
+                handles.rewind();
+                return Ok(Outcome {
+                    logits: Vec::new(),
+                    tape: taped,
+                });
+            }
+            // The build's fire ends the same way, one artifact heavier.
+            Mode::Build { .. } => {
+                handles.rewind();
+                return Ok(Outcome {
+                    logits: Vec::new(),
+                    tape: None,
+                });
+            }
+            // **THE REPLAY: NO PASS IS ENCODED AT ALL.** The walk wrote the
+            // dispatches down; what reaches the device is the rewrite of the
+            // components this composition moved, and one
+            // `executeCommandsInBuffer:` over the buffer that was encoded
+            // once. This is where the exec key would have been consulted on
+            // the other plane, and there is no key to consult.
+            Mode::Replay => {
+                #[cfg(target_vendor = "apple")]
+                {
+                    let taped = taped.expect("the replay mode records");
+                    let icb = icb.as_mut().ok_or_else(|| Fault::Unbound {
+                        what: "an indirect command buffer, which this load never built"
+                            .to_string(),
+                    })?;
+                    *rebound = icb.rebind(device, pipelines, &taped)?;
+                    icb.execute(device)?;
+                }
+                #[cfg(not(target_vendor = "apple"))]
+                {
+                    let _ = taped;
+                    return Err(Fault::Deviceless);
+                }
+            }
+            Mode::Encode => {
+                let frame = frame.expect("the encoding mode opened a frame");
+                // 9. The one synchronization a fire has, and it is here
+                //    because a caller asked for numbers — every encode above
+                //    is enqueue-only by design (decision #15).
+                frame.commit()?;
+            }
+        }
 
         let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!(
@@ -872,7 +1101,83 @@ impl Shell {
         //     retained buffers and a live handle resolvable against the
         //     wrong offset.
         handles.rewind();
-        Ok(taken)
+        Ok(Outcome {
+            logits: taken,
+            tape: None,
+        })
+    }
+}
+
+/// Which sink the walk runs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_vendor = "apple"),
+    allow(dead_code, reason = "the indirect plane is Apple's; the modes are named on both")
+)]
+enum Mode {
+    /// The fire: dispatches into a command buffer, committed and read back.
+    Encode,
+    /// The recorder: the same walk, written down (`crate::record`).
+    Record,
+    /// The builder: the same walk, encoded ONCE into an indirect command
+    /// buffer (`crate::icb`). The two sizes are counted from a prior
+    /// recording, because `maxCommandCount` is fixed at creation.
+    Build {
+        /// How many dispatches the walk produces at this composition.
+        slots: usize,
+        /// How many bytes of scalar arena its scalars need.
+        constants: u64,
+    },
+    /// The replay: the same walk, recorded, used to rewrite the indirect
+    /// command buffer, and executed. No compute pass is encoded.
+    Replay,
+}
+
+/// What one drive of the fire path produced.
+struct Outcome {
+    /// One row of logits per submitted lane, under [`Mode::Encode`].
+    logits: Vec<Vec<f32>>,
+    /// The walk, written down, under [`Mode::Record`].
+    tape: Option<Recording>,
+}
+
+/// The two sinks a walk can run over, under one `Encode`.
+///
+/// An enum rather than a `dyn` at the call site because `Run::new` already
+/// takes `&dyn Encode`: what varies is which concrete sink stands behind that
+/// reference, and a two-armed enum says so at the seam instead of hiding it
+/// in a box.
+enum Encoded<'a> {
+    /// The real one: `Sink` encoding into this fire's compute pass.
+    Live(Sink<'a>),
+    /// The recorder: `Tape`, writing the dispatch down.
+    Taped(Tape<'a>),
+    /// The builder: `icb::Builder`, encoding one indirect command buffer.
+    #[cfg(target_vendor = "apple")]
+    Built(crate::icb::Builder<'a>),
+}
+
+impl kernels_metal::Encode for Encoded<'_> {
+    fn fire(
+        &self,
+        fire: kernels_metal::Fire,
+        args: &[kernels_metal::ArgValue],
+    ) -> std::result::Result<(), kernels::KernelError> {
+        match self {
+            Encoded::Live(sink) => sink.fire(fire, args),
+            Encoded::Taped(tape) => tape.fire(fire, args),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.fire(fire, args),
+        }
+    }
+
+    fn absent(&self) -> std::result::Result<kernels_metal::ArgValue, kernels::KernelError> {
+        match self {
+            Encoded::Live(sink) => sink.absent(),
+            Encoded::Taped(tape) => tape.absent(),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.absent(),
+        }
     }
 }
 

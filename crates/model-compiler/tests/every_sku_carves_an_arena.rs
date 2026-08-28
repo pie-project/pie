@@ -334,8 +334,18 @@ fn the_regions_tile_every_plan_in_program_order() {
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
+/// The one lowering rule that is not an optimization, and the one region in
+/// the catalog that is one.
+///
+/// **P3 HAS LANDED, SO "EVERY REGION IS ALWAYS-LAUNCH" IS NO LONGER THE
+/// CLAIM.** What survives it is decision #5 — a collective is never elided —
+/// and the fact that a conditional is a rare, deliberate, structural thing:
+/// exactly one region of one catalog SKU at the default profile.
+/// `tests/which_skus_get_a_conditional.rs` is where the gates that decided it
+/// are asked; this is the arena file's own restatement, so that a change to
+/// the lowering has to break something here too.
 #[test]
-fn v1_lowers_every_region_the_one_way_that_is_correctness() {
+fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
@@ -350,14 +360,17 @@ fn v1_lowers_every_region_the_one_way_that_is_correctness() {
                      always-launch",
                 ));
             }
-            if baked
+            let conditional = baked
                 .regions
                 .iter()
-                .any(|r| r.lowering != Lowering::AlwaysLaunch)
-            {
+                .filter(|r| r.lowering != Lowering::AlwaysLaunch)
+                .count();
+            let expected = usize::from(sku.starts_with("qwen36-27b"));
+            if conditional != expected {
                 wrong.push(format!(
-                    "`{sku}` as {platform:?}: a region lowers as something P3 has \
-                     not been written to choose yet",
+                    "`{sku}` as {platform:?}: {conditional} conditional regions, and \
+                     the catalog's answer at this profile is {expected} — the MTP \
+                     head and nothing else",
                 ));
             }
             // **P6 LANDED, SO "EVERY REGION IS ON STREAM 0" IS NO LONGER THE

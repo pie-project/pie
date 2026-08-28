@@ -561,8 +561,14 @@ impl ReqGeometry {
                 crate::driver::Lane {
                     // The engine keeps the page table, so a lane's SLOT is
                     // its working set — see `crate::driver::fire`. A PTIR
-                    // fire's geometry ports carry no slot of their own, and
-                    // the caller stamps it.
+                    // fire's geometry ports carry no slot of their own, so
+                    // it is stamped by `crate::pipeline::fire::
+                    // stamp_lane_slots`, from the book the working set owns
+                    // its seats in — which is the caller this line named
+                    // before there was one (`palo` build log 29). Zero is
+                    // the placeholder and it does not survive submission:
+                    // every fire through either path is seated before it
+                    // reaches the scheduler.
                     slot: 0,
                     // `Lane::word` is stamped by
                     // `crate::pipeline::fire::stamp_lane_words`, not here.
@@ -1678,7 +1684,9 @@ mod tests {
             lanes: vec![crate::driver::Lane::default()],
             ..Default::default()
         };
-        FireAttnMask::Device.apply_to(&mut plan);
+        FireAttnMask::Device
+            .apply_to(&mut plan)
+            .expect("the dense device path stamps every lane");
         assert!(plan.has_user_mask);
         assert!(
             plan.lanes.iter().all(|lane| lane.mask.is_none()),

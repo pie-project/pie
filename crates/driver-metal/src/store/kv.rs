@@ -70,9 +70,9 @@ use crate::error::{Fault, Result};
 /// wide the row it addresses is. The dev lineage says the same in its own
 /// vocabulary — one `KvCache` with `per_layer_head_dim_`,
 /// `per_layer_num_kv_heads_` and a `per_layer_window_left` on the weights —
-/// and the IR already agrees, because `CacheRow::Kv { row }` is declared per
-/// ROW and this shell's pool reservation already allocates one slab per row
-/// at that row's own width.
+/// and the IR already agrees, because `CacheRow::Kv { planes }` is declared
+/// per ROW and this shell's pool reservation already allocates one slab per
+/// row at that row's own planes.
 ///
 /// So the facts are keyed by the thing that actually holds them:
 ///

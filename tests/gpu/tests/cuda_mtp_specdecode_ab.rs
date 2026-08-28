@@ -1,5 +1,5 @@
 //! **Two independent `forward-hybrid` spec-decoders, run back to back** on the
-//! REAL 4090 + Qwen3.5-0.8B:
+//! a real CUDA device + Qwen3.5-0.8B:
 //!
 //!   A = `mtp-specdecode`     B = `mtp-native-verify` (host mode)
 //!
@@ -116,18 +116,25 @@ fn parse_metrics(json: &str) -> (f64, usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "(b) device-resident MTP spec-decode A/B: needs the 4090 + cuda + Qwen3.5-0.8B (MTP head). \
-            Run: PIE_MTP_DRAFT_TOKENS=4 PIE_COMPILER_LAUNCHER=env"]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog row \
+            whose checkpoint publishes fifteen `mtp.*` planes -- and that load \
+            refuses on the reference L40S with `Fault::OutOfMemory` at 51.05 GiB \
+            against 43.87 free (palo build log 25f). Qwen3.5-0.8B loads as the \
+            plain `qwen35-d0.8b` dense row, so a drafting lane gets \
+            `Fault::Draftless`. The `mtp-specdecode` and `mtp-native-verify` \
+            guests are gone with the workspace move to `tests/inferlets` \
+            besides"]
 async fn mtp_specdecode_device_ab() -> Result<()> {
     common::init_trace();
     let k = draft_k();
     eprintln!("[specdecode-ab] k = {k}");
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     build_wasm(&ws, "mtp-specdecode")?;
     build_wasm(&ws, "mtp-native-verify")?;
 
-    let pie = common::boot_4090_mtp(k).await?;
+    let pie = common::boot_cuda_mtp(k).await?;
     eprintln!(
         "[specdecode-ab] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr
@@ -173,7 +180,7 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
 
     let (a_mean, a_commit) = parse_metrics(&a_json);
     let (b_mean, b_commit) = parse_metrics(&b_json);
-    eprintln!("═══════════════════ MTP spec-decode A/B — 4090 / Qwen3.5-0.8B ═══════════════════");
+    eprintln!("═══════════════════ MTP spec-decode A/B — Qwen3.5-0.8B ═══════════════════");
     eprintln!(
         "  A mtp-specdecode    : mean_accept={a_mean:.2}  committed={a_commit}  decode={a_dt:?}"
     );

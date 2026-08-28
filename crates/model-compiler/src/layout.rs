@@ -210,9 +210,13 @@ fn constrains(plan: &Plan, region: &Region, classes: usize) -> bool {
 /// the exact seriation `0 2 3 1` — every one of the three consecutive, no
 /// fallback row emitted. Withdrawing it leaves the frontier `[[0 2] [1 3]]`,
 /// whose canonical order puts classes 2 and 3 at positions 1 and 3, and a fire
-/// carrying an adapted prefill lane beside an adapted decode lane is then
-/// `driver_cuda::Fault::Fragmented` — a bake-integrity refusal, not a slow
-/// path, because P4's promise is what `Windows::of` reads.
+/// carrying an adapted prefill lane beside an adapted decode lane then covers
+/// two row intervals rather than one — `Fallback::Split { r: 2 }`, which the
+/// shells now serve as two launches (`driver::fire::fallback`). Offering the
+/// constraint is still the better answer, because a split costs a launch and
+/// a tile that the seated order does not; what it no longer costs is the fire.
+/// (It did: `driver_cuda::Fault::Fragmented` used to refuse every such batch,
+/// on the premise — false since C4 — that this table is always empty.)
 /// `crates/model-compiler/tests/every_sku_carves_an_arena.rs` pins both halves.
 ///
 /// So decision #9's exclusion belongs to the FALLBACK menu — what a withdrawn

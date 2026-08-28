@@ -445,6 +445,61 @@ mod tests {
         assert_eq!(step.lanes[1].mask, None, "an unmasked peer stays unmasked");
     }
 
+    /// **A BATCHED FIRE'S LANES CARRY DISTINCT SLOTS** — the property
+    /// `palo` build log 28 found the tree had never checked, and build log
+    /// 29 gave an owner.
+    ///
+    /// A step is a CONCATENATION of its members' lanes, so the seat each
+    /// member states is the only thing keeping two concurrent guests out of
+    /// one another's pool slot. Both engine fire paths used to state zero —
+    /// fine for a solo fire, and `FireSubmission::validate` refuses the
+    /// second lane of any batch built out of them by name ("slot 0 appears
+    /// twice in one fire, at lane 1"), which is what took half the lanes off
+    /// an eight-guest fleet.
+    ///
+    /// So this drives the production stamp — `pipeline::fire::
+    /// stamp_lane_slots`, against the book two real working sets own their
+    /// seats in — and asserts the thing the shell asserts: the assembled
+    /// submission is one the contract accepts. It is RED against the
+    /// `slot: 0` this replaced, on the recorded message.
+    #[test]
+    fn two_seated_members_batch_into_a_fire_the_contract_accepts() {
+        let model = crate::store::registry::register_model(16, &[8], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let (first_ws, second_ws) =
+            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+                (kv.create_working_set(), kv.create_working_set())
+            });
+
+        let mut first = decode(11, 3);
+        let mut second = decode(22, 4);
+        assert_eq!(
+            (first.lanes[0].slot, second.lanes[0].slot),
+            (0, 0),
+            "both fires arrive at the seat stamp unseated — this is the defect's shape"
+        );
+        crate::pipeline::fire::stamp_lane_slots(&mut first, &stores, first_ws)
+            .expect("a two-slot pool seats one sequence");
+        crate::pipeline::fire::stamp_lane_slots(&mut second, &stores, second_ws)
+            .expect("and its peer");
+
+        let (frame, _) = build_frame_submission(
+            vec![vec![pending(first, 41, false), pending(second, 42, false)]],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        let step = &frame.steps[0];
+        assert_eq!(step.submission.lanes.len(), 2, "both members co-batch");
+        assert_ne!(
+            step.submission.lanes[0].slot, step.submission.lanes[1].slot,
+            "two concurrent sequences, two pool slots"
+        );
+        step.submission
+            .validate()
+            .expect("the contract accepts a fire whose lanes are seated apart");
+    }
+
     /// A pooled device-geometry member seriates into the step's SUFFIX.
     ///
     /// This is `a_pooled_device_geometry_member_is_stamped_its_own_class`

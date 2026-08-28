@@ -12,8 +12,8 @@
 
 use core::ffi::c_void;
 
-use kernels_cuda::Ctx;
 use kernels_cuda::attn::plan::{Device, Toggles};
+use kernels_cuda::{Ctx, Slabs};
 
 use crate::error::{Fault, Result};
 
@@ -94,6 +94,16 @@ pub struct Context {
     side: Vec<Side>,
     /// One `cudaEvent_t` per `model_compiler::EventId`, created once at load.
     events: Vec<crate::device::graph::Event>,
+    /// **THIS SHELL'S SCRATCH SLABS, AND NOBODY ELSE'S.**
+    ///
+    /// `kernels_cuda::Ctx::scratch` used to hand back a slab keyed by a
+    /// static name alone, which made every workspace in the process one
+    /// buffer: two shells staged into each other and both computed (build log
+    /// 18), and two arms of a P6 fork group did the same, which is the whole
+    /// reason [`crate::EXCLUSIVE`] existed (build log 24). An arena is one
+    /// context's, every stream in it gets its own slab, and [`Drop`] gives
+    /// the bytes back.
+    slabs: Slabs,
     device: Device,
     toggles: Toggles,
     capability: (i32, i32),
@@ -147,7 +157,13 @@ impl Context {
 
                 let stream: *mut c_void = stream.cast();
                 let cublas: *mut c_void = handle.cast();
-                let ctx = Ctx::on(stream).with_cublas(cublas);
+                let slabs = Slabs::open();
+                // The main stream is attached before anything fires on it,
+                // which is what `Slabs::attach` asks for: growth broadcasts
+                // across an arena's attached streams, and a stream that
+                // arrives after a name has grown misses that name's slab.
+                slabs.attach(stream);
+                let ctx = Ctx::on(stream).with_cublas(cublas).with_slabs(slabs);
                 // A probe that fails is not a load that fails: the facts have
                 // a stated fallback, and the builders take them as data.
                 let device = Device::probe(&ctx).unwrap_or(Device::L40S);
@@ -156,6 +172,7 @@ impl Context {
                     stream,
                     cublas,
                     ctx,
+                    slabs,
                     side: Vec::new(),
                     events: Vec::new(),
                     device,
@@ -269,10 +286,14 @@ impl Context {
                     }
                     let stream: *mut c_void = stream.cast();
                     let cublas: *mut c_void = handle.cast();
+                    // Attached at LOAD, before the first fire, because the
+                    // warm pass runs eagerly on the main stream and its
+                    // growth has to reach this one — see `Slabs::attach`.
+                    self.slabs.attach(stream);
                     Side {
                         stream,
                         cublas,
-                        ctx: Ctx::on(stream).with_cublas(cublas),
+                        ctx: Ctx::on(stream).with_cublas(cublas).with_slabs(self.slabs),
                     }
                 };
                 self.side.push(opened);
@@ -386,6 +407,10 @@ impl Drop for Context {
             unsafe {
                 // The events first: they name points on the streams below.
                 self.events.clear();
+                // Then the slabs, before the streams they were sized for:
+                // freeing is what makes a SECOND shell in this process cost
+                // what the first one did.
+                self.slabs.release();
                 for side in self.side.drain(..) {
                     if !side.cublas.is_null() {
                         let _ = cudarc::cublas::sys::cublasDestroy_v2(side.cublas.cast());

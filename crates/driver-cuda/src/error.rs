@@ -49,21 +49,37 @@ pub enum Fault {
     /// dispatch inside it.
     Fire(driver::Error),
 
-    /// A region whose classes this fire's order does not make consecutive.
+    /// A region whose classes this fire's order does not make consecutive, and
+    /// which the artifact owes no answer for.
     ///
-    /// **P4's PROMISE, FOUND BROKEN.** The layout pass solves one global C1P
-    /// instance so that every windowed consumer's class set is an interval of
-    /// the class order (design §3), which is what lets a windowed kernel take
-    /// a pointer and an extent. A region that comes back as more than one run
-    /// would need more than one launch — a `Fallback` row — and the catalog
-    /// bakes an empty [`FallbackTable`](model_compiler::FallbackTable) today,
-    /// so there is nothing to fall back to. It is a bake-integrity failure,
-    /// refused by name rather than run over the classes in between.
+    /// **P4's PROMISE, FOUND BROKEN — AND NOT MERELY UNKEPT.** The layout pass
+    /// solves one global C1P instance so that every windowed consumer's class
+    /// set is an interval of the class order (design §3), which is what lets a
+    /// windowed kernel take a pointer and an extent. When it cannot seat a
+    /// consumer it says so, in
+    /// [`FallbackTable`](model_compiler::FallbackTable) — and THAT is a slow
+    /// path, not this: `driver::fire::walk` dispatches such a region once per
+    /// interval and `crate::window::Windows` cuts it a window per launch. The
+    /// catalog does bake rows (the four qwen texts owe 12–84 apiece, all of
+    /// them the `captures_scores` window), so an empty table is not the
+    /// premise here and never was.
+    ///
+    /// What is left for this variant is the case where the two halves
+    /// disagree: a mask P4 PROMISED consecutive that this fire found in
+    /// pieces, or one whose pieces outnumber the `Fallback::Split { r }` P4
+    /// counted on the order it shipped. A fire's class order is that order
+    /// with the absent classes dropped and dropping a class can only close a
+    /// gap, so neither can happen to a `Baked` and a `WindowTable` built from
+    /// each other. Both are refused by name rather than run over the classes
+    /// in between.
     Fragmented {
         /// Which region of `Baked::template`.
         region: u32,
-        /// How many runs its mask covers.
+        /// How many runs its mask covers in this fire.
         runs: usize,
+        /// How many P4 wrote down, or `None` when it wrote nothing at all —
+        /// which is the promise being broken rather than exceeded.
+        promised: Option<u32>,
     },
 
     /// A tensor the checkpoint published that this plan does not name, or a
@@ -349,6 +365,47 @@ pub enum Fault {
         /// The seat, named as the IR names it.
         what: String,
     },
+
+    /// A region the compiler put behind a conditional node, reaching a
+    /// RECORDING walk this shell has no conditional-node mechanism for.
+    ///
+    /// **REFUSED BY NAME RATHER THAN RECORDED UNCONDITIONALLY**, and the
+    /// distinction is the whole reason this variant exists. An EAGER walk may
+    /// ignore a conditional and be right — the zero-row rule decides the same
+    /// thing at the same instant (design §4), which is why
+    /// `driver::fire::EagerSink` no-ops the bracket and why the eager cursor
+    /// beside it does too. A CAPTURE may not: a graph outlives the fire that
+    /// recorded it, so a body recorded outside its conditional node is a body
+    /// that runs in every composition, over rows some later fire does not
+    /// have. It would compute, and that is the failure mode that has no
+    /// observable.
+    ///
+    /// **WHAT IS MISSING IS NOT THE API.** `cudarc` 0.19.8 binds the whole
+    /// host half — `cudaGraphConditionalHandleCreate`, `cudaGraphAddNode` with
+    /// `cudaGraphNodeTypeConditional`, `cudaStreamGetCaptureInfo`,
+    /// `cudaStreamUpdateCaptureDependencies`, `cudaStreamBeginCaptureToGraph`
+    /// — and CUDA 13 on this tree's L40S has all of them. Two things are
+    /// missing and both are named in build log 27:
+    ///
+    /// 1. `cudaGraphSetConditional` is DEVICE-side only, so the predicate is a
+    ///    kernel compiled with relocatable device code and linked against
+    ///    `libcudadevrt.a`. This shell's JIT (`program::compile`) is a
+    ///    whole-program NVRTC→cubin path with no `cuLink` stage and no
+    ///    cudadevrt discovery.
+    /// 2. **The deeper one**: a captured launch's EXTENT is frozen in its node
+    ///    parameters (build log 10 — rebinding needs a node→argument map the
+    ///    shell never sees), so an exec already serves exactly one composition
+    ///    and one size, and the walk skips an empty window at RECORD time. A
+    ///    conditional body would guard a launch whose extents belong to the
+    ///    fire that recorded it. Conditionals become worth building the day a
+    ///    kernel reads its extent from the descriptor, which is design §5's
+    ///    "the kernel reads `desc.count[region]`" and is unbuilt.
+    Unlowered {
+        /// Which region of the template.
+        region: u32,
+        /// The lowering, as the compiler spells it.
+        lowering: String,
+    },
 }
 
 impl fmt::Display for Fault {
@@ -365,12 +422,26 @@ impl fmt::Display for Fault {
             Self::Bake(refusal) => write!(f, "this plan does not bake: {refusal:?}"),
             Self::Load(error) => write!(f, "this checkpoint does not land: {error}"),
             Self::Fire(error) => write!(f, "{error}"),
-            Self::Fragmented { region, runs } => write!(
-                f,
-                "region {region} covers {runs} runs of this fire's rows, and a \
-                 windowed launch takes one pointer and one extent — P4 seriates \
-                 so that it takes exactly one"
-            ),
+            Self::Fragmented {
+                region,
+                runs,
+                promised,
+            } => match promised {
+                None => write!(
+                    f,
+                    "region {region} covers {runs} runs of this fire's rows and P4 \
+                     wrote it no fallback row — it seriated so that this mask takes \
+                     exactly one launch, and this fire's class order did not come \
+                     from that seriation"
+                ),
+                Some(promised) => write!(
+                    f,
+                    "region {region} covers {runs} runs of this fire's rows where P4 \
+                     counted {promised} on the order it shipped — a fire's order is \
+                     that order with the absent classes dropped, and dropping a class \
+                     cannot open a gap"
+                ),
+            },
             Self::Param { name, why } => write!(f, "`{name}` {why}"),
             Self::Ceiling { what, need, have } => write!(
                 f,
@@ -527,6 +598,16 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "{at}: {why}"),
+            Self::Unlowered { region, lowering } => write!(
+                f,
+                "region {region} is baked as {lowering} and this shell records no \
+                 conditional nodes: the host half of the CUDA API is reachable, the \
+                 device-side `cudaGraphSetConditional` needs an rdc + cudadevrt link \
+                 stage this crate has no seat for, and a captured launch's extent is \
+                 frozen anyway (build log 10), so a body behind a conditional would \
+                 hold the recording fire's rows. Bake with `fat_region_us: INFINITY` \
+                 — every region always-launch, which is the correctness mechanism"
+            ),
             Self::Unbound { what } => write!(
                 f,
                 "this plan names {what}, which this shell does not bind"

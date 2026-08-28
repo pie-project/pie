@@ -29,7 +29,8 @@
 //!
 //! # Sizes come off the plan, not off a config
 //!
-//! `CacheRow::Kv { row, dtype }` states a per-token row and its element, and
+//! `CacheRow::Kv { planes, dtype }` names the planes one entry is written as,
+//! at their own widths, and its element, and
 //! `CacheRow::State { slab }` states a per-lane bank — so a pool's bytes are
 //! the plan's declaration times the deployment's budget, and there is no
 //! second place where a head count could disagree with the model text. The
@@ -214,12 +215,12 @@ impl Pools {
             match row {
                 CacheRow::Kv {
                     name,
-                    row,
+                    planes,
                     dtype,
                     space,
                 } => {
                     let seat = facts.row(index, name)?;
-                    let (planes, width) = split(name, row)?;
+                    let (planes, width) = split(name, planes)?;
                     let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
                     if heads != width {
                         return Err(Fault::Unbound {
@@ -403,19 +404,27 @@ impl Pools {
 
 /// A kv row's `(planes, width)`: the leading dim is the k|v plane count and
 /// the rest is one plane's row.
-fn split(name: &str, row: &[u64]) -> Result<(u64, u64)> {
-    let (planes, rest) = row.split_first().ok_or_else(|| Fault::Unbound {
-        what: format!("cache `{name}`, which declares a row of no dims at all"),
-    })?;
-    if *planes != 2 {
-        return Err(Fault::Unbound {
+fn split(name: &str, planes: &[u64]) -> Result<(u64, u64)> {
+    // M22 turned the row's leading plane count into `CacheRow::Kv { planes }`
+    // — the per-plane widths themselves. This shell cuts a kv page into an
+    // equal key half and value half, so it serves exactly the two-plane form
+    // at one width and refuses the rest by name, as the old dims reading did.
+    match planes {
+        [keys, values] if keys == values => Ok((2, *keys)),
+        [keys, values] => Err(Fault::Unbound {
             what: format!(
-                "cache `{name}`, whose row leads with {planes} planes — this shell \
-                 cuts kv pages into a key half and a value half, and knows no third"
+                "cache `{name}`, whose planes are {keys} and {values} wide — this \
+                 shell cuts kv pages into equal key and value halves"
             ),
-        });
+        }),
+        other => Err(Fault::Unbound {
+            what: format!(
+                "cache `{name}`, which declares {} plane(s) — this shell cuts kv \
+                 pages into a key half and a value half, and knows no other form",
+                other.len()
+            ),
+        }),
     }
-    Ok((*planes, rest.iter().product()))
 }
 
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {

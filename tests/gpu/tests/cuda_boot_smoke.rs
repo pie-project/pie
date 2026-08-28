@@ -1,30 +1,42 @@
-//! cuda_native standalone boot smoke (lane L4 / echo, Phase-2 WS7).
+//! **THE STANDALONE BOOT SMOKE**: all three planes co-reside and the HTTP
+//! ingress streams a turn.
 //!
-//! The cuda_native analogue of the deleted driverless boot_smoke.rs: boots the
-//! embedded controller +
-//! gateway + worker in one process over loopback with the **real CUDA driver**
-//! (`type = "cuda_native"`) against **qwen-3-0.6b** on the 4090, then pings the
-//! full client path. This is the engine-boot half of the programmable-sampler
-//! 4090 real-driver pass (echo's piece); the capability tests in
-//! `programmable_sampler_4090.rs` reuse the same `common::boot_4090()`.
+//! Boots the embedded controller + gateway + worker in one process over
+//! loopback with the real CUDA driver (`type = "cuda_native"`) against the
+//! shipping dense SKU, then drives one turn through `POST /v1/generate` — the
+//! axum ingress, which is the ONE client surface no other gate in this tree
+//! touches. `cuda_serve_round_trip` boots the same standalone and goes further
+//! through the websocket at `/v1/ws`; `gateway/tests/gateway_smoke` drives the
+//! session pipe with no ingress under it. The HTTP edge is the seam between
+//! them and this is what holds it.
 //!
-//! `#[ignore]` (needs the 4090 + a HF-cached qwen-3-0.6b + a `driver-cuda`
-//! build). Run with:
-//!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
-//!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_boot_smoke -- --ignored --nocapture
+//! # The SKU, because this file is where the census started
+//!
+//! It booted `Qwen/Qwen3-0.6B` and named it in three doc lines and an
+//! `#[ignore]` reason. This build ships no SKU that checkpoint can be: every
+//! row of `::model::qwen_3::IMPORTS` claims an artifact by NAME at a qwen3.5
+//! geometry, and `engine::model::ROWS` has no id for it, so
+//! `engine::driver::load` refuses before a fire and the gate would have failed
+//! for a reason that is not about booting. It comes up on
+//! `qwen35-d0.8b-bf16-kv-bf16` now, through `common::boot_cuda`, which is the
+//! checkpoint every other gate in this directory already pins against.
+//!
+//! Run:
+//! ```text
+//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   --test cuda_boot_smoke -- --ignored --nocapture
+//! ```
 
 mod common;
 
 use anyhow::Result;
 
-/// Boots once on the 4090 with the real CUDA driver + qwen-3-0.6b and proves
-/// all three planes co-reside + the client path round-trips a ping — the
-/// engine-boot gate for the programmable-sampler 4090 e2e.
+/// Boots once with the real CUDA driver and proves all three planes co-reside
+/// and that a turn posted at the HTTP ingress streams back to `[DONE]`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the 4090 + HF-cached qwen-3-0.6b + a driver-cuda build"]
-async fn cuda_native_boots_qwen3_and_pings() -> Result<()> {
-    let pie = common::boot_4090().await?;
+#[ignore = "the boot gate: needs a CUDA device and the Qwen3.5-0.8B snapshot"]
+async fn the_standalone_boots_and_the_ingress_streams_a_turn() -> Result<()> {
+    let pie = common::boot_cuda().await?;
 
     assert_ne!(
         pie.listen_addr.port(),

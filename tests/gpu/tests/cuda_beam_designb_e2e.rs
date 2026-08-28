@@ -1,4 +1,4 @@
-//! §6.2 beam DESIGN B DEVICE e2e — real driver (4090). First real end-to-end
+//! §6.2 beam DESIGN B DEVICE e2e — real driver. First real end-to-end
 //! exercise of the Design B steady-state (no-compaction) path: logical mask-out
 //! + flat tail-append, NO heir election / freeze arithmetic / fresh-page
 //! handshake / page reorder. The `beam-designb` inferlet drives a beam search
@@ -36,15 +36,20 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "§6.2 beam Design B device e2e: needs the 4090 + cuda + qwen-3-0.6b + the ptir feature"]
+#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+            `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
+            Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
+            denotes, so the mask this guest puts on every fire is a port no \
+            shell in this tree resolves. The `beam-designb` guest is gone with \
+            the workspace move to `tests/inferlets` besides"]
 async fn beam_designb_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!("[beam-designb-e2e] booted, listen_addr={}", pie.listen_addr);
 
     // Build the `beam-designb` inferlet to wasm (member of the runtime
     // test-inferlets ws). The crate name normalizes to `beam_designb.wasm`.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "beam-designb"])
         .current_dir(&ws)

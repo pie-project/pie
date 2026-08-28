@@ -130,6 +130,20 @@ impl FireDescriptor {
         self.classes.span(mask)
     }
 
+    /// Every interval a node with this class mask runs over, ascending — the
+    /// slow path's launches, asked against the table that crossed to the
+    /// device. [`WindowTable::spans`] states what the list means.
+    #[must_use]
+    pub fn spans(&self, mask: &ClassSet) -> Vec<MaskSpan> {
+        self.classes.spans(mask)
+    }
+
+    /// The same, into a buffer the caller keeps — what the walk asks once per
+    /// region ([`WindowTable::spans_into`] says why it is not a `Vec`).
+    pub fn spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
+        self.classes.spans_into(mask, out);
+    }
+
     /// How many bytes [`pack`](FireDescriptor::pack) will write.
     #[must_use]
     pub fn bytes(&self) -> u64 {

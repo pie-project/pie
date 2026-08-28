@@ -411,6 +411,7 @@ pub fn register(
         rs_caps: rs,
         ptir_caps: ptir,
         tokenizer,
+        vocab: OnceLock::new(),
         vocab_size,
         num_layers,
     });
@@ -455,6 +456,20 @@ pub struct Model {
     rs_caps: RsCaps,
     ptir_caps: PtirCaps,
     tokenizer: Arc<Tokenizer>,
+    /// **THE TOKEN TABLE, BUILT ONCE PER ENGINE.**
+    ///
+    /// [`Model::get_vocabs`] walks `id_to_token` over the whole vocabulary and
+    /// mints one `Vec<u8>` per token — 248 070 of them on qwen3.6, ~16 ms —
+    /// and it used to do that on every guest call, which is once per LAUNCH
+    /// for any inferlet that asks. An engine serves exactly one model and a
+    /// model's tokenizer never changes, so the table is a constant and is
+    /// treated as one; it is also what
+    /// [`tokens_with_prefix`](Model::tokens_with_prefix) scans instead of
+    /// shipping.
+    ///
+    /// Built lazily rather than at registration: a deployment whose guests
+    /// never ask should not pay 16 ms and ~20 MiB for a table nobody reads.
+    vocab: OnceLock<(Vec<u32>, Vec<Vec<u8>>)>,
     /// Logits/output vocab dimension (= hf_config.vocab_size from the model's
     /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
     /// THIS for sampler lowering / logits-shaped ops, NOT the tokenizer vocab.
@@ -539,18 +554,71 @@ impl Model {
         self.tokenizer.decode(tokens, false)
     }
 
-    /// Gets the vocabulary as parallel vectors of (token IDs, token bytes).
+    /// The whole vocabulary as parallel vectors of (token IDs, token bytes) —
+    /// a COPY of the table built once by [`Model::vocab`].
+    ///
+    /// The copy is unavoidable: the WIT surface hands the guest an owned list.
+    /// What is avoidable, and now avoided, is rebuilding the table from
+    /// `id_to_token` on every call. Callers that want a few tokens' bytes or a
+    /// prefix match should take [`token_bytes`](Model::token_bytes) or
+    /// [`tokens_with_prefix`](Model::tokens_with_prefix) instead and copy
+    /// nothing.
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        let size = self.tokenizer.vocab_size();
-        let mut ids = Vec::with_capacity(size);
-        let mut bytes = Vec::with_capacity(size);
-        for id in 0..size as u32 {
-            if let Some(tok_bytes) = self.tokenizer.id_to_token(id) {
-                ids.push(id);
-                bytes.push(tok_bytes);
+        self.vocab().clone()
+    }
+
+    /// The token table, built on first ask and kept.
+    fn vocab(&self) -> &(Vec<u32>, Vec<Vec<u8>>) {
+        self.vocab.get_or_init(|| {
+            let size = self.tokenizer.vocab_size();
+            let mut ids = Vec::with_capacity(size);
+            let mut bytes = Vec::with_capacity(size);
+            for id in 0..size as u32 {
+                if let Some(tok_bytes) = self.tokenizer.id_to_token(id) {
+                    ids.push(id);
+                    bytes.push(tok_bytes);
+                }
             }
-        }
-        (ids, bytes)
+            (ids, bytes)
+        })
+    }
+
+    /// The raw bytes each of `tokens` stands for, in order; an empty vector
+    /// for an id the vocabulary does not hold.
+    ///
+    /// The same answer indexing a table built from [`get_vocabs`] gives, at
+    /// the size of the QUESTION rather than the size of the vocabulary —
+    /// which is the whole point (see [`tokens_with_prefix`]).
+    ///
+    /// [`get_vocabs`]: Model::get_vocabs
+    /// [`tokens_with_prefix`]: Model::tokens_with_prefix
+    pub fn token_bytes(&self, tokens: &[u32]) -> Vec<Vec<u8>> {
+        tokens
+            .iter()
+            .map(|id| self.tokenizer.id_to_token(*id).unwrap_or_default())
+            .collect()
+    }
+
+    /// Every token id whose bytes begin with `prefix`, ascending.
+    ///
+    /// **THIS IS THE QUERY THE GUESTS WERE SHIPPING A VOCABULARY TO ASK.**
+    /// Token healing rolls a prompt back by a token or two and re-expands it
+    /// under the mask of every token that reproduces the rolled-back BYTES as
+    /// a prefix. It was building that mask guest-side, which meant lowering
+    /// 248 070 records across the component boundary and looping over them
+    /// twice — ~115 ms of a 158 ms per-launch constant (palo build log 23) to
+    /// compute a set the host can name from a table it already holds.
+    ///
+    /// The set is exactly the one that loop produced: the ids the token table
+    /// holds whose bytes start with `prefix`, and no others. An empty prefix
+    /// matches the whole vocabulary, because every byte string starts with
+    /// nothing — the caller that cares (a rollback that carried no bytes) has
+    /// to say so itself, as it did before.
+    /// It is the tokenizer's own table that is scanned, borrowed rather than
+    /// copied — so this asks nothing of [`Model::vocab`]'s cache and a
+    /// deployment whose guests only ever heal never builds one.
+    pub fn tokens_with_prefix(&self, prefix: &[u8]) -> Vec<u32> {
+        self.tokenizer.ids_with_prefix(prefix)
     }
 
     /// Gets the split regex pattern.

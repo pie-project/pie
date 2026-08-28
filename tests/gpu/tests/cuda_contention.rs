@@ -17,9 +17,13 @@
 //! order → a flipped argmax), so a lane can diverge from its batch-of-1 solo
 //! reference with NO KV corruption (verified: tp=16 engaged, suspends=101, still
 //! ~9 near-tie flips). The composite (charlie's Phase-2 finding):
-//!   (a) the surviving `cuda_concurrent` single-lane reference — SEAL + carrier transparency with the
-//!       co-batch confound REMOVED (a single long-decode lane forced to preempt
-//!       via `[batching].total_pages`, byte-identical to its sync reference);
+//!   (a) the single-lane reference this file takes for itself — SEAL + carrier
+//!       transparency with the co-batch confound REMOVED (a single long-decode
+//!       lane forced to preempt via `[batching].total_pages`, byte-identical to
+//!       its sync reference). It used to be `cuda_concurrent`'s, deleted in the
+//!       census wave because the batched-vs-solo identity it asked is
+//!       `driver-cuda/tests/serve_smoke`'s
+//!       `three_lanes_two_decoding_and_one_prefilling_agree_with_their_solo_runs`;
 //!   (b) engaged multi-lane `restore_attributable == 0` HERE — a divergence first
 //!       appearing at KV position >= page_size (a SEALED + restored page) is real
 //!       suspend/restore corruption, hard-gated (assertion 3);
@@ -53,7 +57,7 @@
 //! WorkingSetError, the orchestrator MUST have engaged (an unmanaged pool would
 //! have errored the over-capacity lanes).
 //!
-//! `#[ignore]` (needs the 4090 + cuda + qwen3-0.6b). Run:
+//! `#[ignore]` (needs a CUDA device and the Qwen3.5-0.8B snapshot). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
 //!     cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_contention -- --ignored --nocapture
@@ -70,13 +74,55 @@
 //!     cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
 //!
-//! COORDINATION (charlie owns the harness + boot config + GPU): the small-pool
-//! boot knob below (`SMALL_POOL_GPU_MEM_UTIL`) is a first-cut forcing mechanism —
-//! a low `gpu_mem_utilization` shrinks the KV pool so a modest fleet over-fills
-//! it. charlie: tune the util (or add an explicit `total_pages`/`max_num_kv_pages`
-//! cap to the driver options — the dummy driver currently floors at 256 pages, so
-//! a host-runnable variant needs that cap) so the fleet reliably contends without
-//! OOM-killing the box. alpha owns the FLEET shape + the two assertions.
+//! # BLOCKED: this build has no KV-page cap, so the fleet cannot be made to
+//! over-fill the pool
+//!
+//! Everything this file asserts is downstream of ONE forcing mechanism —
+//! shrink the KV pool until a modest fleet exceeds it — and on the palo shell
+//! there is no longer a knob that does it. Measured, at
+//! `max_total_pages = 8`, `PIE_CONTENTION_FLEET=48`, `PIE_CONTENTION_BUDGET=64`:
+//!
+//! ```text
+//! [contention] boot_cuda_kv_cap util=0.3 total_pages=8
+//! [contention-trace] t=1000ms parked=0 woken=0 suspends=0 restores=0 free=250/256
+//! ```
+//!
+//! **256 pages, with the cap asking for 8.** `max_total_pages` sizes SLOTS now
+//! (`worker::embedded_driver`: `slots: pages / pages_per_slot`), and the
+//! `[batching].total_pages` key it also writes is one the palo shell does not
+//! read — the page pool follows `gpu_mem_utilization` and the context ceiling
+//! through `Budgets`. The util cannot take its place: below ~0.3 the driver
+//! answers "no viable forward/KV layout" and the boot is fatal. So the cap
+//! makes the deployment ONE slot and leaves the pool whole, the fleet queues at
+//! the scheduler instead of at the pool, and `waiters_parked` is 0 by
+//! construction — which is exactly what assertion 4 refuses, correctly.
+//!
+//! It is `#[ignore]`d on that fact and not on hardware. What unblocks it is a
+//! driver option that caps the KV PAGE pool, which is the thing the paragraph
+//! this replaced was already asking for.
+//!
+//! **A SECOND BLOCKER STOOD BEHIND IT AND IS GONE** (`palo` build log 29).
+//! Found while measuring the first: run this uncapped, where the deployment
+//! has many slots and the fleet really co-batches
+//! (`PIE_CONTENTION_PROFILE_MODE=baseline PIE_CONTENTION_FLEET=8`), and four
+//! of eight lanes used to come back with `invalid submission: slot 0 appears
+//! twice in one fire, at lane 1` — a multi-lane fire stated slot 0 for every
+//! lane, because `Lane::slot` had no owner. It has one now (the KV working
+//! set, through `engine::store::seat`), and the same command answers `8/8
+//! lanes: zero WorkingSetError` with the divergences it classifies all in the
+//! non-gating `[1, page_size)` band. So what is left blocking this file is
+//! the KV-page cap above and nothing else; `cuda_sweep_e2e` is the gate that
+//! keeps the slot half fixed.
+//!
+//! The FLEET shape and the assertions are unchanged and still say what they
+//! said; two things about the harness were repaired en route and are worth
+//! keeping whichever way the cap lands. The lane guard now prints
+//! `FleetRun::failures` instead of guessing "the pool is too small" for a lane
+//! that never reached the pool — which is how the second repair was found:
+//! `text-completion` returned prose and no token array, so `fleet::run`'s
+//! `parse_tokens` read a working guest as a broken one (that guest returns its
+//! token ids now, which is also what `pie sweep` and `pie config tune` need
+//! from it).
 
 mod common;
 
@@ -86,10 +132,15 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use pie::sweep::fleet::{self, FleetRun};
 
-/// The inferlet every lane runs. Named here rather than inside the fleet
-/// helper because the sweep and this test drive different programs through
-/// the same load generator.
-const GENERATE: &str = "generate@0.1.0";
+/// The inferlet every lane runs, and why it is this one: it is greedy, so a
+/// lane's continuation is a function of its prompt alone and the solo
+/// reference is EXACT — which is what assertion 3 is a diff against.
+///
+/// It was `generate@0.1.0`, a package deleted with the guest workspace's move
+/// from `crates/engine/tests/inferlets` to `tests/inferlets`. `text-completion`
+/// is its replacement and takes the same `{"prompt": ...}` document, which is
+/// what let the repoint be a rename.
+const GENERATE: &str = "text-completion@0.1.0";
 use client::client::Client;
 
 /// A fleet large enough that its combined KV demand exceeds the shrunk pool
@@ -111,17 +162,20 @@ fn fleet_size() -> usize {
 /// fleet's aggregate demand exceeds the small pool. Greedy decode ⇒ deterministic
 /// per prompt, so the solo reference is exact.
 fn prompt(k: usize) -> String {
-    // `PIE_CONTENTION_BUDGET=N`: emit a bare-int budget so the generate
-    // inferlet decodes N tokens — LONGER-lived lanes sustain KV pool
-    // pressure long enough for the suspend/restore cycle to reliably
-    // engage (5-token lanes finish before contention forms → flaky parked=0).
-    // Unset → the original JSON prompt (default 5-token lanes preserved).
+    // `PIE_CONTENTION_BUDGET=N`: raise the per-lane token budget so lanes live
+    // LONGER and sustain KV pool pressure through a whole suspend/restore cycle
+    // (5-token lanes finish before contention forms → flaky parked=0). It is a
+    // `max_tokens` field rather than the bare integer the deleted `generate`
+    // guest parsed, because `text-completion` reads a JSON document.
     if let Ok(b) = std::env::var("PIE_CONTENTION_BUDGET") {
-        if b.trim().parse::<usize>().is_ok() {
-            return b.trim().to_string();
+        if let Ok(budget) = b.trim().parse::<usize>() {
+            return format!(
+                "{{\"prompt\": \"Lane {k}: the quick brown fox jumps over the lazy dog, \
+                 and then the clever cat considers the consequences carefully before it\", \
+                 \"max_tokens\": {budget}}}"
+            );
         }
     }
-    let _ = k;
     format!(
         "{{\"prompt\": \"Lane {k}: the quick brown fox jumps over the lazy dog, \
          and then the clever cat considers the consequences carefully before it\"}}"
@@ -251,7 +305,12 @@ fn write_profile_record(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "contention over-capacity e2e: needs the 4090 + cuda + qwen3-0.6b"]
+#[ignore = "BLOCKED, and not on hardware: this build has no KV-page cap. \
+            `max_total_pages` sizes slots (worker::embedded_driver) and the \
+            `[batching].total_pages` key it writes is one the palo shell does \
+            not read, so at a cap of 8 the pool measures 256/256 free and the \
+            fleet queues at the scheduler instead of over-filling the pool — \
+            waiters_parked is 0 by construction. See the module header."]
 async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()> {
     common::init_trace();
 
@@ -274,21 +333,21 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
             .unwrap_or(8)
     };
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     anyhow::ensure!(
         Command::new("cargo")
-            .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
+            .args(["build", "--target", "wasm32-wasip2", "-p", "text-completion"])
             .current_dir(&ws)
             .status()?
             .success(),
-        "generate wasm build failed"
+        "text-completion wasm build failed"
     );
-    let wasm = ws.join("target/wasm32-wasip2/debug/generate.wasm");
-    let manifest = ws.join("generate/Pie.toml");
+    let wasm = ws.join("target/wasm32-wasip2/debug/text_completion.wasm");
+    let manifest = ws.join("text-completion/Pie.toml");
 
     // Boot with a SMALL KV pool so a modest fleet over-fills it (charlie tunes the
     // exact knob — see the module COORDINATION note).
-    let pie = common::boot_4090_kv_cap(total_pages).await?;
+    let pie = common::boot_cuda_kv_cap(total_pages).await?;
     let addr = pie.listen_addr.to_string();
     let fleet = fleet_size();
     eprintln!("[contention] booted small-pool, addr={addr}, fleet={fleet}");
@@ -306,15 +365,19 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // the deterministic greedy ground truth for that prompt.
     let mut reference = Vec::new();
     for (k, input) in inputs.iter().enumerate() {
-        let r = fleet::run(&addr, GENERATE, std::slice::from_ref(input))
-            .await
-            .outputs
-            .pop()
-            .flatten();
+        // `FleetRun::failures` carries WHY a lane produced nothing, and this
+        // guard used to throw it away and guess: it reported "the pool is too
+        // small" for a lane that never reached the pool. `failures`' own doc
+        // names that mistake; this is the same fix on this side of it.
+        let run = fleet::run(&addr, GENERATE, std::slice::from_ref(input)).await;
+        let why = run.failures.join("; ");
+        let r = run.outputs.into_iter().next().flatten();
         anyhow::ensure!(
             r.is_some(),
-            "solo lane {k} produced no tokens — the pool is too small even for ONE lane; \
-             raise the small-pool util so a single lane fits (contention must come from the FLEET, not a solo lane)"
+            "solo lane {k} produced no tokens, and the lane said: {why:?}. If it \
+             said nothing, the pool is too small even for ONE lane — raise \
+             PIE_CONTENTION_TOTAL_PAGES so a single lane fits (contention must \
+             come from the FLEET, not a solo lane)"
         );
         reference.push(r);
     }

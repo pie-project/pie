@@ -40,6 +40,24 @@
 //! union — which is the whole fire. That is design §0's zero-instruction φ,
 //! and it falls out rather than being arranged.
 //!
+//! # When a region's window is NOT one interval
+//!
+//! P4 makes as many windowed consumers consecutive as one row order can, and
+//! writes a `Fallback` row for each one it could not (design §3). A region
+//! with such a row covers SEVERAL row intervals in a fire that carries the
+//! classes between its own, and the answer this shell serves is
+//! `Fallback::Split { r }`: the region holds `r` windows rather than one, the
+//! walk encodes its nodes once per window, and each encode takes its own
+//! offset, its own extent and — the part that is easy to get silently wrong —
+//! its own rebased qo boundaries. A ragged view's `indptr` is offsets INTO
+//! the rectangle it cuts, so the second run's must start at 0 again over the
+//! second run's lanes; sharing the first run's would hand the encode a vector
+//! that describes somebody else's requests.
+//!
+//! [`Fault::Fragmented`] survives, narrowed to what it always meant: a
+//! fragmented window the artifact owes NO fallback row for, which is P4
+//! having promised this mask consecutive and the fire finding it broken.
+//!
 //! # A cut is a HANDLE here, not an address
 //!
 //! The one place this file's arithmetic meets the plane it runs on. A
@@ -59,15 +77,15 @@
 //! (decision #11: one walk, generic over `Dispatch` × `Sink`). But the walk
 //! announces every region to the SINK, in order, before dispatching its nodes
 //! — and the sink is the shell's. So [`Cursor`] is this shell's `Sink`: it
-//! counts regions into a `Cell` the `Run` also holds a shared reference to.
-//! No signature moves, and the one piece of state involved is a `u32` written
-//! once per region.
+//! counts regions into an [`At`] the `Run` also holds a shared reference to,
+//! and writes the run index beside it for the same reason and at the same
+//! instant. No signature moves, and the state involved is two `u32`s.
 //!
 //! [`Run`]: crate::run::Run
 
 use std::cell::Cell;
 
-use driver::fire::{EventId, MaskSpan, Sink, WindowTable};
+use driver::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use kernels_metal::Tensor;
 use model_compiler::{Baked, Lowering, Region};
 use model_ir::{Attention, Def, Dtype, Operation, Plan};
@@ -99,61 +117,98 @@ pub struct Window {
     pub indptr: Tensor,
 }
 
-/// Every region's window, deduplicated.
+/// Every region's windows, deduplicated.
 ///
 /// Deduplicated because a plan has hundreds of regions and at most a handful
 /// of distinct windows — one per contiguous run of the class order — and the
 /// rebased boundary vectors are staged one per DISTINCT window, in a single
 /// copy, rather than one per region.
+///
+/// **A REGION HAS A LIST AND NOT A WINDOW**, because P4's fallback is a list:
+/// a consumer it could not seat runs once per maximal interval of its class
+/// set, and the interval is what an encode is cut at. One entry is the case P4
+/// exists to produce and is what every region of every SKU the catalog seats
+/// has; the empty window is one entry too, so that a region with no rows is
+/// resolvable rather than special.
 #[derive(Debug, Clone, Default)]
 pub struct Windows {
     windows: Vec<Window>,
-    /// Region index → position in [`windows`](Windows::windows).
-    of_region: Vec<u32>,
+    /// Every region's runs end to end, as positions in
+    /// [`windows`](Windows::windows) — region `r`'s are
+    /// `runs[of_region[r].0 .. of_region[r].0 + of_region[r].1]`.
+    runs: Vec<u32>,
+    /// Region index → `(where its runs start, how many)`.
+    of_region: Vec<(u32, u32)>,
 }
 
 impl Windows {
     /// The windows of one fire: every region of the template resolved against
-    /// this composition's class table.
+    /// this composition's class table, one per interval its mask covers.
     ///
     /// # Errors
     ///
     /// [`Fault::Fragmented`] for a region whose classes are not consecutive in
-    /// the fire's class order — a promise P4 made and this fire found broken,
-    /// which is a bake-integrity failure rather than a slow path (the catalog
-    /// bakes an empty `FallbackTable` today).
+    /// the fire's class order AND which the artifact owes no `Fallback` row —
+    /// a promise P4 made and this fire found broken, which is a bake-integrity
+    /// failure rather than a slow path. A region P4 DID write a row for is the
+    /// slow path, and is served here as `Fallback::Split { r }` at every
+    /// bucket; `driver::fire::fallback` states what that costs against the
+    /// `Fallback::Copy` the table asks for below the crossover, and why this
+    /// shell cannot yet serve it.
     pub fn of(baked: &Baked, classes: &WindowTable, indptr_host: &[i32]) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
-        let mut of_region: Vec<u32> = Vec::with_capacity(baked.template().len());
+        let mut runs: Vec<u32> = Vec::with_capacity(baked.template().len());
+        let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(baked.template().len());
+        let mut spans: Vec<MaskSpan> = Vec::new();
 
         for (at, region) in baked.template().iter().enumerate() {
+            classes.spans_into(&region.mask, &mut spans);
+            if spans.len() > 1 {
+                // The two integrity questions, asked of the artifact
+                // rather than of the fire. Did P4 PROMISE this window
+                // consecutive — a capture region it seated and wrote no
+                // fallback row for? And is this fire's run count within the
+                // one the shipped order breaks the mask into? A fire's order
+                // is that order with the absent classes dropped, and dropping
+                // a class can only close a gap, so neither can happen to a
+                // `Baked` and a `WindowTable` built from each other.
+                let bound = fallback::bound(baked, &region.mask);
+                if fallback::promised(baked, region) || spans.len() > bound as usize {
+                    return Err(Fault::Fragmented {
+                        region: at as u32,
+                        runs: spans.len(),
+                        promised: fallback::promised(baked, region).then_some(bound),
+                    });
+                }
+            }
             // An empty mask (a region no class demands) answers the zero
             // window, which is the same answer a composition without this
             // behavior gives — and the walk skips both for the same reason.
-            let span = classes
-                .span(&region.mask)
-                .map_err(|runs| Fault::Fragmented {
-                    region: at as u32,
-                    runs,
-                })?
-                .unwrap_or_default();
-            let found = windows.iter().position(|held| held.span == span);
-            let index = match found {
-                Some(index) => index,
-                None => {
-                    windows.push(Window {
-                        span,
-                        indptr_host: rebase(indptr_host, span),
-                        indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
-                    });
-                    windows.len() - 1
-                }
-            };
-            of_region.push(index as u32);
+            if spans.is_empty() {
+                spans.push(MaskSpan::default());
+            }
+
+            of_region.push((runs.len() as u32, spans.len() as u32));
+            for &span in &spans {
+                let found = windows.iter().position(|held| held.span == span);
+                let index = match found {
+                    Some(index) => index,
+                    None => {
+                        windows.push(Window {
+                            span,
+                            indptr_host: rebase(indptr_host, span),
+                            indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
+                        });
+                        windows.len() - 1
+                    }
+                };
+                runs.push(index as u32);
+            }
         }
 
         Ok(Windows {
             windows,
+            runs,
             of_region,
         })
     }
@@ -207,21 +262,50 @@ impl Windows {
         Ok(())
     }
 
-    /// One region's window.
+    /// How many encodes a region costs in this fire — `1` for a window P4
+    /// seated, `r` for one it could not, and `1` for an empty window.
     ///
-    /// A region index this table does not hold is an integrity failure of the
-    /// shell — the cursor counts the same template the table was built from —
-    /// so it panics with a sentence rather than dressing up as a window.
+    /// THE SAME NUMBER `driver::fire::walk` LOOPS ON, and it is the same
+    /// number because both read it off the same class table: the walk asks
+    /// `WindowTable::spans_into` and this asked it once per region when the
+    /// table was built. A disagreement would show up as
+    /// [`at`](Windows::at)'s panic rather than as a wrong window.
     #[must_use]
-    pub fn at(&self, region: u32) -> &Window {
+    pub fn runs(&self, region: u32) -> u32 {
+        self.of_region.get(region as usize).map_or(0, |held| held.1)
+    }
+
+    /// The most encodes any region of this fire costs — what a per-run table
+    /// is sized at.
+    #[must_use]
+    pub fn max_runs(&self) -> u32 {
+        self.of_region
+            .iter()
+            .map(|&(_, runs)| runs)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// One region's window, for one run of it.
+    ///
+    /// A region index this table does not hold, or a run past the ones it cut
+    /// for that region, is an integrity failure of the shell — the cursor
+    /// counts the same template the table was built from, and the walk loops
+    /// over the same span list — so it panics with a sentence rather than
+    /// dressing up as a window.
+    #[must_use]
+    pub fn at(&self, region: u32, run: u32) -> &Window {
         self.of_region
             .get(region as usize)
+            .filter(|&&(_, runs)| run < runs)
+            .and_then(|&(start, _)| self.runs.get((start + run) as usize))
             .and_then(|index| self.windows.get(*index as usize))
             .unwrap_or_else(|| {
                 panic!(
-                    "region {region} has no window, and this fire resolved {} of them \
+                    "region {region} has no run {run}; this fire cut it into {} \
                      over a template of {}",
-                    self.windows.len(),
+                    self.runs(region),
                     self.of_region.len()
                 )
             })
@@ -318,6 +402,34 @@ fn rebase(indptr: &[i32], span: MaskSpan) -> Vec<i32> {
     cut.iter().map(|bound| bound - base).collect()
 }
 
+/// Where the walk is: which region of the template, and which run of that
+/// region's window.
+///
+/// **TWO NUMBERS, ONE OBJECT, BECAUSE THEY ARE READ TOGETHER.** A `Run`
+/// resolves every operand at `windows.at(region, run)`, and a pair that could
+/// be handed in separately is a pair that could be handed in from two
+/// different walks. The [`Cursor`] writes both — the region before the
+/// region's first node, the run before each encode of it — and the `Run`
+/// holds a shared reference to the same object; that is the whole mechanism,
+/// and it is a `Cell` rather than a `&mut` because `walk` takes the sink and
+/// the dispatch as two separate borrows.
+#[derive(Debug, Default)]
+pub struct At {
+    /// The region index, in `Baked::template` order.
+    pub region: Cell<u32>,
+    /// Which run of that region's window: `0` always, and `0..r` for a region
+    /// P4 could not seat.
+    pub run: Cell<u32>,
+}
+
+impl At {
+    /// A cursor position at the top of the template.
+    #[must_use]
+    pub fn new() -> At {
+        At::default()
+    }
+}
+
 /// This shell's [`Sink`]: the region counter a [`Run`](crate::run::Run) reads
 /// its window out of.
 ///
@@ -350,15 +462,16 @@ fn rebase(indptr: &[i32], span: MaskSpan) -> Vec<i32> {
 #[derive(Debug)]
 pub struct Cursor<'a> {
     at: u32,
-    region: &'a Cell<u32>,
+    place: &'a At,
 }
 
 impl<'a> Cursor<'a> {
-    /// A cursor writing into `region`, counting from the template's first.
+    /// A cursor writing into `place`, counting from the template's first.
     #[must_use]
-    pub fn new(region: &'a Cell<u32>) -> Cursor<'a> {
-        region.set(0);
-        Cursor { at: 0, region }
+    pub fn new(place: &'a At) -> Cursor<'a> {
+        place.region.set(0);
+        place.run.set(0);
+        Cursor { at: 0, place }
     }
 
     /// What the device refused during the walk, if anything.
@@ -385,10 +498,21 @@ impl<'a> Cursor<'a> {
 
 impl Sink for Cursor<'_> {
     fn region_begin(&mut self, _region: &Region) {
-        self.region.set(self.at);
+        self.place.region.set(self.at);
+        self.place.run.set(0);
         self.at += 1;
     }
     fn region_end(&mut self, _region: &Region) {}
+
+    /// **THE SPLIT'S ONE PIECE OF STATE.** A region P4 could not seat runs
+    /// once per interval of its class set, and every operand the `Run`
+    /// resolves after this call is cut at THAT interval — its rows, its lanes,
+    /// its rebased qo boundaries. A cursor that ignored this would hand every
+    /// run the first one's window, which is not a fault: it is the first
+    /// interval's rows encoded `r` times and the rest never encoded at all.
+    fn run(&mut self, run: u32, _runs: u32) {
+        self.place.run.set(run);
+    }
     fn cond_begin(&mut self, _lowering: &Lowering) {}
     fn cond_arm(&mut self, _arm: u8) {}
     fn cond_end(&mut self) {}
@@ -464,12 +588,17 @@ mod tests {
     }
 
     /// The cursor is a counter and nothing else: every region the walk
-    /// announces lands in the cell the `Run` reads, in template order.
+    /// announces lands in the cell the `Run` reads, in template order — and
+    /// every run of that region's window lands in the cell beside it.
     #[test]
-    fn the_cursor_counts_regions_into_the_cell() {
-        let cell = Cell::new(7);
-        let mut cursor = Cursor::new(&cell);
+    fn the_cursor_counts_regions_and_their_runs_into_the_cells() {
+        let place = At::new();
+        place.region.set(7);
+        place.run.set(3);
+        let cell = &place.region;
+        let mut cursor = Cursor::new(&place);
         assert_eq!(cell.get(), 0, "a fresh cursor rebases the cell");
+        assert_eq!(place.run.get(), 0, "and the run beside it");
         let region = Region {
             nodes: 0..0,
             mask: ClassSet::of([0]),
@@ -492,6 +621,16 @@ mod tests {
         cursor.fork(EventId(0));
         cursor.join(EventId(0));
         assert_eq!(cell.get(), 1, "an event point is not a region");
+
+        // A region P4 could not seat announces one run per interval, and the
+        // next region rebases the count — a run index that leaked across a
+        // region boundary would resolve the next region's nodes at a window
+        // it does not have.
+        cursor.run(1, 2);
+        assert_eq!(place.run.get(), 1);
+        cursor.region_end(&region);
+        cursor.region_begin(&region);
+        assert_eq!(place.run.get(), 0, "a new region starts at its first run");
         cursor.settle().expect("an eager cursor never holds a fault");
     }
 }

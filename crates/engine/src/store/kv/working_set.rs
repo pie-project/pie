@@ -94,6 +94,15 @@ impl KvLifecycle {
             kv.release_working_set(self.id, epoch);
             kv.retire_idle();
         }); // store lock released before the planner's drain re-locks pools.
+        // The sequence's SEAT goes back with its pages. A working set is one
+        // sequence's page table and `Lane::slot` is that sequence's seat in
+        // the shell's pools (`store::seat`), so the two have exactly one
+        // lifetime between them: a seat kept past the release would shrink
+        // the deployment's concurrency by one for every guest that ever ran.
+        // No epoch delay — unlike a page, a seat carries no bytes an
+        // in-flight fire could still be reading, and the fire that named it
+        // held a lease this release waited out.
+        stores.seats.lock().unwrap().release(self.id);
         // Freed pool space may unblock a parked ask.
         if let Some(planner) = crate::planner::planner() {
             planner.pages_freed();

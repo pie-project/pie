@@ -114,7 +114,7 @@ use crate::run::{CacheGeometry, CachePlanning, FireBindings, FireTables, Run, Sc
 use crate::store::kv::{self, Paging, Seat};
 use crate::store::Pools;
 use crate::weights::{AdapterPlane, Weights};
-use crate::window::{Cursor, Lanes, Windows};
+use crate::window::{At, Cursor, Lanes, Windows};
 
 /// The names `model_dsl::seam` states for the values a reader touches after
 /// the graph has run — `out`, `mtp`, `attn.scores`, in that order.
@@ -665,6 +665,7 @@ impl Shell {
             spaces,
             &facts,
             baked.classes.classes.len(),
+            driver::fire::max_runs(&baked),
             device.device().num_sm,
         )?;
 
@@ -1506,28 +1507,36 @@ impl Shell {
         //    beside its global). The FIRE's lanes go in; `Run::planning`
         //    narrows `num_requests` to the asking node's window, which is the
         //    count a schedule is actually built at.
-        let schedules: Vec<Option<ScheduleSeat>> = facts
-            .plans
-            .iter()
-            .enumerate()
-            .map(|(at, seat)| {
-                let seat = (*seat)?;
-                Some(ScheduleSeat {
-                    shape: Shape {
-                        num_requests: lane_count,
-                        num_q_heads: seat.reading.q_heads,
-                        num_kv_heads: seat.reading.kv_heads,
-                        head_dim: seat.reading.head_dim,
-                        page_size: paging.page_size,
-                        hnd_layout: false,
-                    },
-                    window: seat.reading.window,
-                    workspace: inputs.grant(at as u32).unwrap_or_else(|| {
-                        panic!(
-                            "plan value {at} carries a reading but no grant; \
-                             `Inputs::reserve` carves one per probed plan"
-                        )
-                    }),
+        //
+        //    ONE SEAT PER (RUN, PLAN VALUE), because a region P4 could not
+        //    seat builds one schedule per interval of its window and all of
+        //    them are alive between the prepare pass and the capture pass.
+        //    `windows.max_runs()` is 1 for every artifact P4 seated whole, and
+        //    this is then the flat table it always was.
+        let runs = windows.max_runs();
+        let inputs = &inputs;
+        let schedules: Vec<Option<ScheduleSeat>> = (0..runs)
+            .flat_map(|run| {
+                facts.plans.iter().enumerate().map(move |(at, seat)| {
+                    let seat = (*seat)?;
+                    Some(ScheduleSeat {
+                        shape: Shape {
+                            num_requests: lane_count,
+                            num_q_heads: seat.reading.q_heads,
+                            num_kv_heads: seat.reading.kv_heads,
+                            head_dim: seat.reading.head_dim,
+                            page_size: paging.page_size,
+                            hnd_layout: false,
+                        },
+                        window: seat.reading.window,
+                        workspace: inputs.grant(at as u32, run).unwrap_or_else(|| {
+                            panic!(
+                                "plan value {at} carries a reading but no grant for \
+                                 run {run}; `Inputs::reserve` carves one per probed \
+                                 plan per run the artifact can split into"
+                            )
+                        }),
+                    })
                 })
             })
             .collect();
@@ -1544,6 +1553,7 @@ impl Shell {
             adapter_routes: handles.adapter_routes,
             geometry,
             schedules,
+            plan_values: facts.plans.len(),
             tables: FireTables {
                 // Fire-wide going in and window-sliced coming out
                 // (`Run::mask_indptr`): the plan-building arm takes its own
@@ -1561,10 +1571,11 @@ impl Shell {
             capture: graphs.shaped(),
         };
         // The one piece of state between the two halves of the walk: the sink
-        // writes which region is running, the `Run` reads it to know which
-        // window to resolve in. They cannot be one object — `walk` takes two
-        // `&mut` — and this is the smallest thing that stands between them.
-        let region = Cell::new(0u32);
+        // writes which region is running and which run of its window, the
+        // `Run` reads both to know which window to resolve in. They cannot be
+        // one object — `walk` takes two `&mut` — and this is the smallest
+        // thing that stands between them.
+        let place = At::new();
         // P6's twin of it: which STREAM the walk is on. Written by the same
         // cursor at the same instant, read by the same `Run` — one more `u32`
         // between the sink and the dispatch, and nothing else changes about
@@ -1586,7 +1597,7 @@ impl Shell {
             &caches,
             bindings,
             &windows,
-            &region,
+            &place,
         )
         .across(&side_ctx, &stream);
         // TWO MODES, ONE WALK (design §6, decision #11). Off and Shaped run
@@ -1606,7 +1617,7 @@ impl Shell {
                     key: record::Key::of(composition.classes()),
                 },
                 &mut run,
-                &region,
+                &place,
             )?;
         } else {
             walk(
@@ -1614,7 +1625,7 @@ impl Shell {
                 baked,
                 &descriptor,
                 &mut run,
-                &mut Cursor::new(&region),
+                &mut Cursor::new(&place),
             )?;
         }
         drop(run);

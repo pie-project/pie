@@ -1,5 +1,5 @@
-//! **Low-level chat-EOS pipelined inferlet — 4090 value-verify** (foxtrot ∥ bravo).
-//! Boots the 4090 + real driver and launches the `lowlevel-chat` inferlet, which
+//! **Low-level chat-EOS pipelined inferlet — device value-verify** (foxtrot ∥ bravo).
+//! Boots the standalone over the real CUDA shell and launches the `lowlevel-chat` inferlet, which
 //! hand-writes the whole decode loop on the RAW WIT API (no helper SDK) — explicit
 //! run-ahead + EOS-rollback — and self-asserts:
 //!
@@ -31,14 +31,18 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "low-level chat run-ahead + EOS-rollback verify: needs the 4090 + cuda + qwen-3-0.6b + delta's carrier"]
+#[ignore = "BLOCKED, and not on hardware: the `lowlevel-chat` guest that drove \
+            `decode_pipelined_deep_eos` is gone with the workspace move to \
+            `tests/inferlets`, and the EOS-rollback surface it exercised \
+            belonged to the deleted C++ shell's carrier. The run-ahead half is \
+            `cuda_device_carried_round_trip` and `cuda_runahead_depth1`"]
 async fn lowlevel_chat_runahead_rollback_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!("[lowlevel-chat] booted, listen_addr={}", pie.listen_addr);
 
     // Build the low-level chat inferlet (raw-WIT explicit run-ahead + rollback).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "lowlevel-chat"])
         .current_dir(&ws)

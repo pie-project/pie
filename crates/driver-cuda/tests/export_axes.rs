@@ -17,7 +17,23 @@
 //! (e) the refusals: a capture and a word that disagree, both ways;
 //!     a draft against a text that declares no head
 //! (f) the drafting SKU does not fit this device, and the refusal says by how much
+//! (g) a capturing PREFILL beside a capturing DECODE is the fire P4 cannot
+//!     seat: it runs as two launches, says what each lane says alone, and
+//!     replays out of a recorded graph identically
 //! ```
+//!
+//! **AND WHY (g) IS THIS FILE'S BUSINESS.** The capture axis is the one that
+//! CROSSES `qo_one`. Every earlier axis nested inside it — `masked` splits
+//! decode from prefill inside itself, and a nested family is laminar and
+//! therefore always consecutive-ones — so P4 seated every window the catalog
+//! stated and its `FallbackTable` really was empty. `captures_scores` is not
+//! nested: it cuts across, and the row order P4 finds puts the plain classes
+//! between the capturing prefill class and the capturing decode class. A fire
+//! holding both is then a window in two pieces, which is the case design §3's
+//! fallback exists for and the case every driver used to refuse by name. It is
+//! not exotic — two capturing requests at different stages of their lives is
+//! an ordinary serving mix — so it is gated here beside the axis that produces
+//! it.
 //!
 //! **WHY THE SCORE AXIS CARRIES THE WEIGHT AND THE DRAFT AXIS DOES NOT.** The
 //! one shipping SKU whose checkpoint publishes a draft head is
@@ -38,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use driver_cuda::{Boot, Graphs, Lane, LayerScores, Seated, Shell};
-use model_compiler::Budgets;
+use model_compiler::{Budgets, DeviceProfile, compile};
 use model_dsl::{Classify, Platform, Request};
 
 /// The workhorse: small, dense, and the SKU whose model text declares the
@@ -57,6 +73,16 @@ const EXPECTED: &str = " Paris";
 
 /// How many greedy decode fires follow a prefill.
 const STEPS: usize = 8;
+
+/// The ceilings every shell in this file loads at — named because gate (g)
+/// bakes the same plan a second time to check its own premise, and two
+/// budgets would be two artifacts.
+const BUDGETS: Budgets = Budgets {
+    max_lanes: 4,
+    max_tokens: 256,
+    buckets: Vec::new(),
+    max_adapters: 0,
+};
 
 /// One shell at a time per process — `kernels-cuda`'s scratch slabs are
 /// process-global and keyed by name (`serve_smoke.rs` argues it whole).
@@ -558,6 +584,261 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
 
 // ── (e) the refusals ─────────────────────────────────────────────────────
 
+// ── (g) the fire P4 cannot seat ──────────────────────────────────────────
+
+/// **THE COMPOSITION THAT BREAKS THE ROW ORDER, FIRED.**
+///
+/// Four of this SKU's eight classes run the capture arm — the ones whose word
+/// sets the `captures_scores` bit — and P4's seriation cannot make that set an
+/// interval of the same order that keeps `qo_one`, `masked` and the adapter
+/// window consecutive. So it withdraws the constraint and writes a `Fallback`
+/// row for each of the six `attention.prefill_lse` nodes that state it. A fire
+/// holding a capturing PREFILL lane and a capturing DECODE lane at once puts a
+/// plain lane's rows between them, and the capture window is then two row
+/// intervals rather than one — as is the `attention.plan_prefill` region that
+/// carves their schedule, which P4 offers no constraint for and therefore owes
+/// no row (`driver::fire::fallback::promised`) but which splits all the same.
+///
+/// Until this was fixed that fire was `Fault::Fragmented` and the batch died.
+/// What it is now is `Fallback::Split { r }`: the walk dispatches the region
+/// once per interval, each launch over its own pointer, its own extent and its
+/// own rebased qo boundaries, and each interval's plan builder carves its own
+/// schedule into its own grant. The claim is the same one every mixed-fire
+/// gate in this crate makes — **every lane says what it says alone** — and it
+/// is the claim that catches the split's own failure modes: a run that read
+/// the other run's window computes the first interval twice, and a run that
+/// read the other run's SCHEDULE indexes a boundary vector describing other
+/// lanes. Both come back as tokens that moved.
+///
+/// The lanes are admitted one step apart, which is the whole setup: lane 0
+/// prefills capturing and lane 2 prefills plain, and only then does lane 1
+/// arrive to prefill capturing while lane 0 has moved on to decoding. That one
+/// fire is the fragmented one, and the assert below says so rather than hoping.
+#[test]
+fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_tokens() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the split-window fire") else {
+        return;
+    };
+    let first = tok.encode(PROMPT);
+    let late = tok.encode("The largest planet is");
+    let plain = tok.encode("Water boils at");
+
+    // NOT VACUOUS, AND CHECKED AGAINST THE ARTIFACT RATHER THAN ASSERTED. The
+    // whole claim is that step 1 below is a composition P4 could not seat, and
+    // a model text or a seriation that stopped producing one would otherwise
+    // turn this into a green test of an ordinary fire. So: bake the same plan
+    // at the same budgets, compose the same three words, and count the windows
+    // that come back in pieces.
+    let split_windows = {
+        let plan = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let baked = compile(&plan, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
+        let words = [
+            driver::fire::Lane::new(word(1, true), 1),
+            driver::fire::Lane::new(word(late.len() as u32, true), late.len() as u32),
+            driver::fire::Lane::new(word(1, false), 1),
+        ];
+        let fire = driver::fire::compose(&baked, &BUDGETS, &words).expect("the fire composes");
+        baked
+            .template()
+            .iter()
+            .filter(|region| fire.classes().spans(&region.mask).len() > 1)
+            .count()
+    };
+    assert!(
+        split_windows > 0,
+        "a capturing decode beside a capturing prefill no longer breaks a window, \
+         so this gate is firing an ordinary composition",
+    );
+    eprintln!("the step-1 composition leaves {split_windows} windows in pieces");
+
+    // The solo references, warmed. Lane 1 arrives a step late, so it takes one
+    // fewer.
+    let (solo_first, _) = solo(&mut shell, 0, &first, true, STEPS + 1);
+    let (solo_late, _) = solo(&mut shell, 1, &late, true, STEPS);
+    let (solo_plain, _) = solo(&mut shell, 2, &plain, false, STEPS + 1);
+
+    for slot in 0..3 {
+        shell.open(slot).expect("the slot opens");
+    }
+    let mut said: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut fed: Vec<Vec<u32>> = vec![first.clone(), late.clone(), plain.clone()];
+    let mut split_fires = 0usize;
+
+    for step in 0..=STEPS {
+        // Step 0 carries two lanes; from step 1 the late one is in, and at
+        // that instant it is PREFILLING while lane 0 is DECODING and both are
+        // capturing. That is the composition the row order cannot seat.
+        // `(slot, captures)` beside the seats, because `Seated` does not read
+        // back out and the two assertions below are about which lane is which.
+        let held: &[(usize, bool)] = if step == 0 {
+            &[(0, true), (2, false)]
+        } else {
+            &[(0, true), (1, true), (2, false)]
+        };
+        let seated: Vec<Seated<'_>> = held
+            .iter()
+            .map(|&(slot, captures)| seat(slot as u32, &fed[slot], captures))
+            .collect();
+        let fragmented = step == 1;
+        if fragmented {
+            split_fires += 1;
+        }
+
+        let mut mass: Vec<Vec<LayerScores>> = Vec::new();
+        let out = shell
+            .fire_captured(&seated, &[], &mut mass)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "the {} fire at step {step}: {why}",
+                    if fragmented { "split" } else { "ordinary" },
+                )
+            });
+
+        // Both capturing lanes are handed their own mass in the fragmented
+        // fire — one per interval, and neither of them empty. A run that
+        // resolved the other run's window would leave one of them with none.
+        for (at, &(slot, captures)) in held.iter().enumerate() {
+            assert_eq!(
+                !mass[at].is_empty(),
+                captures,
+                "step {step} slot {slot}: capture and mass disagree",
+            );
+            let token = argmax(&out[at]);
+            said[slot].push(token);
+            fed[slot] = vec![token];
+        }
+    }
+
+    eprintln!(
+        "split: capturing {:?} / late capturing {:?} / plain {:?}",
+        tok.decode(&said[0], false),
+        tok.decode(&said[1], false),
+        tok.decode(&said[2], false),
+    );
+    assert_eq!(split_fires, 1, "exactly one fire of this run is the split one");
+    assert_eq!(
+        said[0], solo_first,
+        "the capturing lane's continuation moved when its window was split",
+    );
+    assert_eq!(
+        said[1], solo_late,
+        "the late capturing lane's continuation moved when its window was split",
+    );
+    assert_eq!(
+        said[2], solo_plain,
+        "the plain lane's continuation moved when a split fire carried it",
+    );
+}
+
+/// **AND THE RECORDED GRAPH CARRIES THE SPLIT TOO.**
+///
+/// A split's launch count is a function of the fire's WINDOW TABLE — where
+/// each class's rows stand, which classes have any — and `record::Key` IS that
+/// table (see `driver_cuda::record`). So every fire that replays a captured
+/// exec has the same table the capture was walked at, and therefore the same
+/// number of runs over the same intervals; the graph can hold the split the
+/// way it holds everything else about a composition. That is an argument, and
+/// this is the gate for it.
+///
+/// The fragmented composition is repeated rather than passed through once:
+/// lane 1's slot is RE-OPENED every step, so it prefills the same rows every
+/// step while lane 0 decodes and lane 2 decodes, which presents one key over
+/// and over — the only way a key reaches its capture fire and then a replay.
+/// Eager first, then the same sequence under `Graphs::On`, and the tokens and
+/// the captured mass both have to be identical.
+#[test]
+fn a_split_composition_captures_once_and_replays_identically() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the split replay") else {
+        return;
+    };
+    let first = tok.encode(PROMPT);
+    let late = tok.encode("The largest planet is");
+    let plain = tok.encode("Water boils at");
+
+    /// One run of the repeated fragmented composition: prefill the two
+    /// long-lived lanes, then fire the split key `steps` times, re-prefilling
+    /// the late lane each time so the key never moves.
+    fn repeat(
+        shell: &mut Shell,
+        first: &[u32],
+        late: &[u32],
+        plain: &[u32],
+        steps: usize,
+    ) -> (Vec<u32>, Vec<LayerScores>) {
+        for slot in 0..3 {
+            shell.open(slot).expect("the slot opens");
+        }
+        // The two long-lived lanes prefill together; from here on they decode.
+        let mut none = Vec::new();
+        let out = shell
+            .fire_captured(
+                &[seat(0, first, true), seat(2, plain, false)],
+                &[],
+                &mut none,
+            )
+            .expect("the two-lane prefill");
+        let mut fed0 = vec![argmax(&out[0])];
+        let mut fed2 = vec![argmax(&out[1])];
+
+        let mut said = Vec::new();
+        let mut captured = Vec::new();
+        for step in 0..steps {
+            // The late lane starts over every step, so it prefills the same
+            // rows every step and the window table — which IS the graph key —
+            // never moves.
+            shell.open(1).expect("slot 1 re-opens");
+            let mut mass: Vec<Vec<LayerScores>> = Vec::new();
+            let out = shell
+                .fire_captured(
+                    &[
+                        seat(0, &fed0, true),
+                        seat(1, late, true),
+                        seat(2, &fed2, false),
+                    ],
+                    &[],
+                    &mut mass,
+                )
+                .unwrap_or_else(|why| panic!("the split fire at step {step}: {why}"));
+            said.extend([argmax(&out[0]), argmax(&out[1]), argmax(&out[2])]);
+            captured = mass[1].clone();
+            fed0 = vec![argmax(&out[0])];
+            fed2 = vec![argmax(&out[2])];
+        }
+        (said, captured)
+    }
+
+    // Enough repetitions that the key warms, captures, and then replays.
+    const FIRES: usize = 6;
+
+    shell.set_mode(Graphs::Off);
+    let (eager, eager_mass) = repeat(&mut shell, &first, &late, &plain, FIRES);
+
+    shell.set_mode(Graphs::On);
+    let (replayed, replay_mass) = repeat(&mut shell, &first, &late, &plain, FIRES);
+
+    let stats = shell.graph_stats();
+    eprintln!(
+        "split replay: {} captured ({} nodes), {} replayed",
+        stats.captures, stats.nodes, stats.replays,
+    );
+    assert!(
+        stats.captures >= 1 && stats.replays >= 1,
+        "the graph mode neither captured nor replayed a split key, so this \
+         compared eager against eager"
+    );
+    assert_eq!(
+        eager, replayed,
+        "the recorded graph of a split composition disagrees with the eager walk"
+    );
+    let moved = drift(&eager_mass, &replay_mass);
+    assert_eq!(
+        moved, 0.0,
+        "the replayed split captured a mass {moved} away from the eager walk's",
+    );
+}
+
 /// **A CAPTURE AND A WORD THAT DISAGREE, BOTH WAYS.**
 ///
 /// `Fault::MaskWord`'s and `Fault::AdapterWord`'s third, and the argument
@@ -855,7 +1136,7 @@ fn the_drafting_sku_does_not_fit_this_device() {
         plan,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: Budgets::new(4, 256),
+        budgets: BUDGETS,
         profile: None,
         page_size: 16,
         context: 512,
@@ -1001,7 +1282,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         plan,
         contract: &contract,
         checkpoint: &checkpoint,
-        budgets: Budgets::new(4, 256),
+        budgets: BUDGETS,
         profile: None,
         page_size: 16,
         context: 512,

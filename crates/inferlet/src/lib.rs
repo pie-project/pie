@@ -98,7 +98,8 @@ pub mod model {
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
     // here so `model::encode`/`model::decode`/… keep working for inferlet source.
     pub use crate::pie::inferlet::tokenizer::{
-        Token, decode, encode, special_tokens, split_regex, vocabs,
+        Token, decode, encode, special_tokens, split_regex, token_bytes, tokens_with_prefix,
+        vocabs,
     };
 }
 

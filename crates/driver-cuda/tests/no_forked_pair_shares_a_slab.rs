@@ -5,38 +5,67 @@
 //! `Shell::load` builds, which is a pure function — the point is precisely
 //! that a machine with no GPU can say what a machine with one will do.
 //!
-//! # What the rule is
+//! # What the rule is, and why it now names nobody
 //!
-//! `kernels_cuda::Ctx::scratch` hands back a slab keyed by a static NAME:
-//! process-global, grown but never shrunk, and deliberately not per stream,
-//! because an entry that allocated per fire could not be captured. Two
-//! launches inside one slab at the same instant stage over each other, and
-//! the fire computes anyway — nothing faults, a logit moves.
+//! `kernels_cuda::Ctx::scratch` used to hand back a slab keyed by a static
+//! NAME: process-global, grown but never shrunk, and deliberately not per
+//! stream, because an entry that allocated per fire could not be captured.
+//! Two launches inside one slab at the same instant stage over each other,
+//! and the fire computes anyway — nothing faults, a logit moves. The compiler
+//! cannot know that: no `Operands` method says which entries reach a slab,
+//! and a backend-neutral pass that did would be a compiler that knows a
+//! backend's allocator. So the shell said it, as [`driver_cuda::EXCLUSIVE`] —
+//! eleven op names, read off the four `kernels-cuda` modules that call
+//! `Ctx::scratch` — and P6 turned it into a dependency edge.
 //!
-//! The compiler cannot know this: no `Operands` method says which entries
-//! reach a slab, and a backend-neutral pass that did would be a compiler that
-//! knows a backend's allocator. So the shell says it, as
-//! [`driver_cuda::EXCLUSIVE`], and P6 turns it into a dependency edge.
+//! It cost every LINEAR-ATTENTION layer of qwen and kimi. Their two arms —
+//! `ssm_gated_delta` beside `ssm_gated_delta_chunked`, over disjoint classes,
+//! writing disjoint values — are otherwise a textbook concurrency candidate,
+//! and both stage through `attn.ssm_gdn_chunk_qk`.
 //!
-//! # What it costs, said plainly
+//! **The key is `(arena, name, stream)` now**, so two arms of a fork group
+//! take two slabs and there is nothing to order apart: `EXCLUSIVE` is empty
+//! and those layers fork. [`WAS`] below is the list it used to hold, kept so
+//! the gate can price the change instead of asserting the absence of one.
 //!
-//! It takes every LINEAR-ATTENTION layer of qwen and kimi off the table. Their
-//! two arms — `ssm_gated_delta` beside `ssm_gated_delta_chunked`, over
-//! disjoint classes, writing disjoint values — are otherwise a textbook
-//! concurrency candidate, and both stage through `attn.ssm_gdn_chunk_qk`. The
-//! overlap is real and unavailable; what makes it available is a slab keyed by
-//! `(name, stream)` in the kernels plane, which is a change to the frozen side
-//! of the seam and is not this wave's. Their full-attention layers still fork,
-//! and so do glm-5's and gpt-oss's: those arms are flashinfer entries whose
-//! workspace is a `ScheduleSeat` per plan value (build log 21), already
-//! disjoint by construction.
+//! # What the tests pin
 //!
-//! Gemma is the SKU that forks most, and it is the one the axis campaign
-//! built: three attention arms and a qkv pair, in every one of its layers.
+//! The PREDICATE, not the count. How many regions a SKU forks follows from
+//! how many layers its model text declares, and those move when somebody
+//! edits a family. What must not move without something being wrong is the
+//! RELATION between two bakes of the same plan — so every assertion here is a
+//! comparison between profiles, and the numbers ride in the message.
 
 use model_compiler::{Budgets, DeviceProfile, compile};
 use model_dsl::Platform;
 use model_ir::{Operands, Plan};
+
+/// **THE ELEVEN NAMES THE SHELL USED TO PUBLISH**, kept as the BEFORE of a
+/// measurement rather than as a rule.
+///
+/// Every one of them is an op whose `kernels-cuda` entry reaches
+/// `Ctx::scratch` — `attn/ssm.rs` (the staging planes), `attn/pool.rs` (the
+/// boundary rope side channel), `attn/index.rs` (the top-k score plane) and
+/// `linear/lora.rs` (the correction's waist). Under the old name-keyed slab
+/// each was a device-wide workspace and P6 had to serialize them; under the
+/// per-stream slab each is a workspace per stream and none of them is.
+///
+/// A test that only asserted "the empty list costs nothing" would be true of
+/// any empty list. Baking against this one is what says the arms it silenced
+/// are the arms that came back.
+const WAS: [&str; 11] = [
+    "attention.ssm_causal_conv1d",
+    "attention.ssm_causal_conv1d_chunked",
+    "attention.ssm_gdn_prep",
+    "attention.ssm_gated_delta",
+    "attention.ssm_gated_delta_chunked",
+    "attention.ssm_kda_step",
+    "attention.ssm_kda_chunked",
+    "attention.index_topk",
+    "attention.pool_boundary_decode",
+    "attention.pool_boundary_prefill",
+    "linear.lora_correct",
+];
 
 /// The profile `Shell::load` builds, minus the device probe: the compiler's
 /// defaults, this shell's exclusive list, and the L40S SM count the gates run
@@ -49,6 +78,14 @@ fn profile() -> DeviceProfile {
             .map(|op| (*op).to_string())
             .collect(),
         ..DeviceProfile::default()
+    }
+}
+
+/// The same profile as it was before the slab was keyed per stream.
+fn as_it_was() -> DeviceProfile {
+    DeviceProfile {
+        exclusive: WAS.iter().map(|op| (*op).to_string()).collect(),
+        ..profile()
     }
 }
 
@@ -70,16 +107,25 @@ fn budgets_for(plan: &Plan) -> Budgets {
     }
 }
 
-fn claims_a_slab(plan: &Plan, region: &model_compiler::Region) -> Vec<&'static str> {
+fn claims(list: &[&str], plan: &Plan, region: &model_compiler::Region) -> Vec<&'static str> {
     region
         .nodes
         .clone()
         .filter_map(|node| plan.nodes.get(node as usize))
         .map(|node| node.op.name())
-        .filter(|name| driver_cuda::EXCLUSIVE.contains(name))
+        .filter(|name| list.contains(name))
         .collect()
 }
 
+fn forked(baked: &model_compiler::Baked) -> usize {
+    baked.regions.iter().filter(|r| r.stream != 0).count()
+}
+
+/// **THE INVARIANT, WHICHEVER NAMES THE LIST HOLDS.** Two regions that both
+/// claim an entry the shell called exclusive are never scheduled beside each
+/// other. It is vacuous today because the list is empty, and it is the test
+/// that stops being vacuous the moment somebody puts a name back on it —
+/// which is exactly when the property matters.
 #[test]
 fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
     let profile = profile();
@@ -92,13 +138,13 @@ fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
         };
         for &(a, b) in &baked.forks.pairs {
             let (x, y) = (
-                claims_a_slab(&plan, &baked.regions[a as usize]),
-                claims_a_slab(&plan, &baked.regions[b as usize]),
+                claims(&driver_cuda::EXCLUSIVE, &plan, &baked.regions[a as usize]),
+                claims(&driver_cuda::EXCLUSIVE, &plan, &baked.regions[b as usize]),
             );
             if !x.is_empty() && !y.is_empty() {
                 wrong.push(format!(
                     "`{sku}`: regions {a} and {b} run beside each other and both \
-                     claim a process-global slab — {x:?} against {y:?}",
+                     claim a device-wide workspace — {x:?} against {y:?}",
                 ));
             }
         }
@@ -107,20 +153,25 @@ fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
-/// **WHAT THE SLAB RULE COSTS, SAID IN THE ONE PLACE IT IS VISIBLE.** The
-/// compiler's own catalog test asks the same question at the backend-neutral
-/// default, where `exclusive` is empty; this is it with the CUDA answer in,
-/// and the rows that MOVE between the two are the rule's whole price.
+/// **WHAT THE PER-STREAM SLAB BOUGHT, PRICED IN THE ONE PLACE IT IS
+/// VISIBLE.** Bake every SKU twice — once against the eleven names the shell
+/// used to publish, once against the empty list it publishes now — and the
+/// difference is the whole of what the old key cost.
 ///
-/// **THE PREDICATE IS PINNED, NOT THE COUNT.** How many regions a SKU forks
-/// follows from how many layers its model text declares, and those move when
-/// somebody edits a family. What must not move without something being wrong
-/// is which SKUs the slab rule silences, and by how much RELATIVE to the
-/// neutral bake — so the assertion is a comparison between the two profiles
-/// rather than a table of numbers, and the numbers ride in the message.
+/// Two claims, and the second is the one that could fail:
+///
+/// 1. **The new bake is the NEUTRAL bake.** With nothing exclusive, the CUDA
+///    profile and the backend-neutral default agree region for region, which
+///    is the statement that this shell no longer asks the compiler for a
+///    dependency edge it cannot derive.
+/// 2. **Every SKU the old list silenced now forks**, and it is exactly the
+///    SKUs whose plans name one of the eleven. A SKU that names none of them
+///    must be unmoved — if one moved, the two profiles differ for a reason
+///    that has nothing to do with slabs and the reading below is wrong.
 #[test]
-fn the_slab_rule_silences_the_arms_that_share_a_staging_plane() {
-    let cuda = profile();
+fn the_per_stream_slab_gives_back_the_arms_the_name_key_silenced() {
+    let now = profile();
+    let was = as_it_was();
     let neutral = DeviceProfile {
         exclusive: Vec::new(),
         ..profile()
@@ -128,59 +179,74 @@ fn the_slab_rule_silences_the_arms_that_share_a_staging_plane() {
 
     let mut table: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
+    let mut recovered = 0usize;
+
     for (sku, _, trace, _) in model::catalog() {
         let plan = trace(Platform::Cuda);
+        let before = compile(&plan, &budgets_for(&plan), &was).expect("bakes");
+        let after = compile(&plan, &budgets_for(&plan), &now).expect("bakes");
         let free = compile(&plan, &budgets_for(&plan), &neutral).expect("bakes");
-        let bound = compile(&plan, &budgets_for(&plan), &cuda).expect("bakes");
-        let forked = |baked: &model_compiler::Baked| {
-            baked.regions.iter().filter(|r| r.stream != 0).count()
-        };
+        let named = plan
+            .nodes
+            .iter()
+            .any(|node| WAS.contains(&node.op.name()));
+
         table.push(format!(
-            "  {sku}: neutral {} forked, this shell {} forked",
-            forked(&free),
-            forked(&bound),
+            "  {sku}: was {}/{}/{}, is {}/{}/{}  (streams/events/forked){}",
+            before.forks.streams,
+            before.forks.events,
+            forked(&before),
+            after.forks.streams,
+            after.forks.events,
+            forked(&after),
+            if named { "  ← names one of the eleven" } else { "" },
         ));
 
-        // The rule only ever takes forks away: it adds edges to the DAG and
-        // an edge cannot create a candidate.
-        if forked(&bound) > forked(&free) {
+        // 1. The empty list IS the neutral profile, so the two bakes agree.
+        if forked(&after) != forked(&free) || after.forks.events != free.forks.events {
             wrong.push(format!(
-                "`{sku}`: the slab rule ADDED forks — {} against the neutral bake's \
-                 {}, and an extra dependency edge cannot make a candidate",
-                forked(&bound),
+                "`{sku}`: this shell's profile bakes {} forked regions and {} events \
+                 where the backend-neutral one bakes {} and {}, and the shell's \
+                 exclusive list is empty",
+                forked(&after),
+                after.forks.events,
                 forked(&free),
+                free.forks.events,
             ));
         }
 
-        // And where it takes them, it is because two regions really do both
-        // claim a slab. Nothing else may lose a fork.
-        let claims = bound
-            .regions
-            .iter()
-            .filter(|region| !claims_a_slab(&plan, region).is_empty())
-            .count();
-        if forked(&bound) < forked(&free) && claims < 2 {
+        // 2. A plan that names none of the eleven cannot have moved.
+        if !named && forked(&after) != forked(&before) {
             wrong.push(format!(
-                "`{sku}` lost forks to a rule that names {claims} slab-claiming \
-                 regions in the whole plan",
+                "`{sku}` names none of the eleven and still moved, {} forked against \
+                 {} — the two profiles differ for a reason that is not the slab",
+                forked(&after),
+                forked(&before),
             ));
+        }
+        // The rule only ever took forks away, so the new bake can only add.
+        if forked(&after) < forked(&before) {
+            wrong.push(format!(
+                "`{sku}` LOST forks when the edges were removed: {} against {}",
+                forked(&after),
+                forked(&before),
+            ));
+        }
+        if forked(&after) > forked(&before) {
+            recovered += 1;
         }
     }
 
-    // **GEMMA IS THE SKU THE RULE COSTS NOTHING**, and it is the subject: its
-    // three attention arms are flashinfer entries whose workspace is a
-    // `ScheduleSeat` per plan value (build log 21), so none of them is on the
-    // list at all.
-    let plan = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
-        Platform::Cuda,
-    );
-    let bound = compile(&plan, &budgets_for(&plan), &cuda).expect("bakes");
-    if bound.forks.streams < 3 {
-        wrong.push(format!(
-            "gemma asked for {} streams under this shell's profile, and its three \
-             attention arms take no slab",
-            bound.forks.streams,
-        ));
+    // **AND SOMETHING HAS TO HAVE MOVED.** The whole wave is the claim that
+    // the eleven names cost real overlap; a table where nothing changed would
+    // mean they cost nothing and this test proves nothing.
+    if recovered == 0 {
+        wrong.push(
+            "no SKU forks more than it did under the eleven names — either the \
+             catalog stopped declaring linear attention or the profile is not \
+             reaching the compiler"
+                .to_string(),
+        );
     }
 
     assert!(
@@ -189,6 +255,7 @@ fn the_slab_rule_silences_the_arms_that_share_a_staging_plane() {
         wrong.join("\n"),
         table.join("\n"),
     );
+    eprintln!("{}", table.join("\n"));
 }
 
 /// The off arm, through the shell's own door: `PIE_CUDA_STREAMS=off` is the

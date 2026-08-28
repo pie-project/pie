@@ -170,6 +170,10 @@ impl DispatchCustomCuda for MockDispatch {
 #[derive(Default)]
 struct Structure {
     regions: Vec<u32>,
+    /// How many launches the walk cut the regions into, summed — one per
+    /// region for a plan every window of which P4 seated, more where a
+    /// fragmented window pays `Fallback::Split`.
+    runs: usize,
     conds: usize,
     events: usize,
 }
@@ -179,6 +183,9 @@ impl Sink for Structure {
         self.regions.push(region.nodes.start);
     }
     fn region_end(&mut self, _region: &Region) {}
+    fn run(&mut self, _run: u32, _runs: u32) {
+        self.runs += 1;
+    }
     fn cond_begin(&mut self, _lowering: &Lowering) {
         self.conds += 1;
     }

@@ -1,20 +1,28 @@
-//! Shared boot helper for the `bin/pie` cuda_native integration tests
-//! (Phase-2 WS7 — the programmable-sampler 4090 real-driver pass).
+//! The shared boots every gate in this directory comes up on, and the one
+//! checkpoint they all come up on.
 //!
-//! `boot_4090()` owns ALL cuda_native boot details (TOML + Mode + addresses)
-//! so the capability test bodies (golf's Client-submit + hotel's
-//! `sampler_assert`) stay pure submit+assert and can't drift from the boot.
-//! Imported via `mod common;` in each integration-test file.
+//! There are two families here and the split is the wave they were written in.
+//! `boot_cuda*` is the LEGACY family: the standalone with the driver's own
+//! `gpu_mem_utilization` deriving every ceiling, which is what the pre-palo
+//! harnesses were written against. `boot_serving*` is the palo B3 family: the
+//! same standalone with the ceilings STATED, because the arena reserves
+//! `max_tokens` rows of a vocabulary-wide logit column and an 8192-row default
+//! is 8 GiB of arena for a gate that fires eight tokens.
+//!
+//! Both resolve the SAME checkpoint. There is exactly one dense SKU the
+//! catalog, `engine::model::ROWS` and the reference device all agree about —
+//! `qwen35-d0.8b-bf16-kv-bf16` — and a gate that booted anything else in this
+//! tree would be measuring a load refusal.
 //!
 //! ONE boot per process (the runtime owns process-global singletons — `auth`
 //! panics on a 2nd boot; the driver grabs a fixed POSIX shmem), so every test
-//! that calls `boot_4090()` must live in its own `#[ignore]` test process.
+//! that boots must live in its own `#[ignore]` test process.
 
 // Not every integration-test file uses every helper (each `mod common;` is a
 // separate compilation), so silence unused-helper warnings per test binary.
 #![allow(dead_code)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pie::derive::derive_standalone;
 use pie::run_standalone;
 
@@ -30,36 +38,21 @@ pub fn init_trace() {
         .try_init();
 }
 
-/// Default model for the 4090 pass — HF-cached, resolved to a local snapshot
-/// path (the cuda_native worker never downloads, per the R3 policy).
-pub const QWEN3_0_6B_REPO: &str = "Qwen/Qwen3-0.6B";
-
-/// Resolve `Qwen/Qwen3-0.6B` to its **local HF cache snapshot dir** (the dir
-/// holding `config.json` + `model.safetensors` + `tokenizer.json`). The
-/// cuda_native worker enforces R3 (never downloads), so `hf_repo` must be a
-/// local path, and the snapshot hash is machine-specific — resolve it at
-/// runtime from `$HF_HOME`/`~/.cache/huggingface/hub`.
-pub fn resolve_qwen3_snapshot() -> Result<String> {
-    let hub = std::env::var("HF_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            std::path::PathBuf::from(home).join(".cache/huggingface")
-        })
-        .join("hub/models--Qwen--Qwen3-0.6B/snapshots");
-    let snap = std::fs::read_dir(&hub)
-        .with_context(|| {
-            format!(
-                "qwen-3-0.6b not in HF cache at {} — run `huggingface-cli download Qwen/Qwen3-0.6B`",
-                hub.display()
-            )
-        })?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.join("config.json").exists() && p.join("model.safetensors").exists())
-        .with_context(|| format!("no complete qwen-3-0.6b snapshot under {}", hub.display()))?;
-    Ok(snap.to_string_lossy().into_owned())
-}
+// ── The qwen-3-0.6b default STOOD HERE ──────────────────────────────────
+//
+// `QWEN3_0_6B_REPO` and `resolve_qwen3_snapshot` named `Qwen/Qwen3-0.6B` and
+// every `boot_4090*` below resolved through them. This build ships no SKU that
+// checkpoint can be: `::model::qwen_3::IMPORTS` claims an artifact by NAME, and
+// all five of its rows ask for `model.language_model.layers.*` at a qwen3.5
+// geometry, which a Qwen3-0.6B file does not hold. `engine::model::ROWS` has no
+// id for it either. So `engine::driver::load` cannot identify it and the boot
+// dies before a fire, for a reason that has nothing to do with what any gate
+// here measures.
+//
+// The boots now resolve the one dense SKU the catalog, the serving table and
+// the L40S all agree about -- `qwen35-d0.8b-bf16-kv-bf16`, out of the stock
+// `Qwen/Qwen3.5-0.8B` snapshot -- which is the checkpoint every palo-era gate
+// in this directory already pins its continuation against.
 
 /// The cuda_native standalone TOML (`[controller]/[gateway]/[worker]`).
 ///
@@ -104,7 +97,7 @@ pub fn cuda_standalone_toml_capped(
          port = 0\n\
          \n\
          [model]\n\
-         name = \"qwen3\"\n\
+         name = \"qwen35\"\n\
          model = \"{hf_repo}\"\n\
          \n\
          [driver]\n\
@@ -126,71 +119,54 @@ pub fn cuda_standalone_toml_capped(
 }
 
 /// Boot the embedded standalone (controller + gateway + worker) with the real
-/// CUDA driver + qwen-3-0.6b on the 4090. The client edge is at
+/// CUDA driver against the shipping dense SKU. The client edge is at
 /// `handle.listen_addr` (`ws://{listen_addr}` for the `pie-client`).
-pub async fn boot_4090() -> Result<pie::StandaloneHandle> {
-    let snapshot = resolve_qwen3_snapshot()?;
+///
+/// The LEGACY boot: every ceiling is derived from `gpu_mem_utilization`, which
+/// is what the pre-palo harnesses in this directory were written against. A
+/// gate that wants the ceilings stated wants [`boot_serving`].
+pub async fn boot_cuda() -> Result<pie::StandaloneHandle> {
+    let snapshot = resolve_qwen35_snapshot()?;
     let (controller, gateway, worker) = derive_standalone(&cuda_standalone_toml(&snapshot))?;
     run_standalone(controller, gateway, worker).await
 }
 
-/// [`boot_4090`] at an explicit `[runtime] frame_dispatch_depth` — the
-/// engine's enqueue horizon in frames. `cuda_deep_coverify` needs the engine's
-/// depth to MATCH the chain depth its carrier submits, and config is the only
-/// way to say so: the depth used to be an env var the engine silently clamped,
-/// so a test asking for 4 quietly ran the engine at 3.
-pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie::StandaloneHandle> {
-    let snapshot = resolve_qwen3_snapshot()?;
-    let toml = format!(
-        "{}\n[runtime]\nframe_dispatch_depth = {depth}\n",
-        cuda_standalone_toml(&snapshot)
-    );
-    let (controller, gateway, worker) = derive_standalone(&toml)?;
-    run_standalone(controller, gateway, worker).await
-}
-
-/// [`boot_4090`] with a SMALL KV pool (low `gpu_mem_utilization`) so a modest
-/// fleet over-fills it — the Task-B preempt/restore over-capacity e2e
-/// (`cuda_contention`). Contention is now forced by the explicit KV-page cap
-/// (`PIE_CONTENTION_TOTAL_PAGES`, charlie — `[batching].total_pages`, mirrors
-/// metal), NOT by util: util only needs to clear the ~0.3 forward-layout floor
-/// so the driver boots (util < ~0.3 → fatal "no viable forward/KV layout"). The
-/// cap then shrinks the KV pool to exactly N pages (`min(kv_pages, cap)`), so a
-/// modest fleet genuinely over-fills it deterministically (CI-friendly).
+/// [`boot_cuda`] with a SMALL KV pool (low `gpu_mem_utilization`) so a modest
+/// fleet over-fills it — the preempt/restore over-capacity e2e
+/// (`cuda_contention`). Contention is forced by the explicit KV-page cap
+/// (`PIE_CONTENTION_TOTAL_PAGES` → `[batching].total_pages`), NOT by util: util
+/// only needs to clear the ~0.3 forward-layout floor so the driver boots
+/// (util < ~0.3 → fatal "no viable forward/KV layout"). The cap then shrinks
+/// the KV pool to exactly N pages (`min(kv_pages, cap)`), so a modest fleet
+/// genuinely over-fills it deterministically.
 pub const SMALL_POOL_GPU_MEM_UTIL: f64 = 0.3;
 
-pub async fn boot_4090_kv_cap(total_pages: u32) -> Result<pie::StandaloneHandle> {
+pub async fn boot_cuda_kv_cap(total_pages: u32) -> Result<pie::StandaloneHandle> {
     let util = std::env::var("PIE_CONTENTION_UTIL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(SMALL_POOL_GPU_MEM_UTIL);
-    eprintln!("[contention] boot_4090_kv_cap util={util} total_pages={total_pages}");
-    let snapshot = resolve_qwen3_snapshot()?;
+    eprintln!("[contention] boot_cuda_kv_cap util={util} total_pages={total_pages}");
+    let snapshot = resolve_qwen35_snapshot()?;
     let (controller, gateway, worker) =
         derive_standalone(&cuda_standalone_toml_capped(&snapshot, util, total_pages))?;
     run_standalone(controller, gateway, worker).await
 }
 
-pub async fn boot_4090_small_kv() -> Result<pie::StandaloneHandle> {
-    // charlie: explicit KV-page cap (deterministic tiny pool, independent of the
-    // forward-layout budget floor). Default 8 forces genuine contention out-of-the
-    // -box; `PIE_CONTENTION_TOTAL_PAGES=0` restores the derive-from-util path.
-    let total_pages: u32 = std::env::var("PIE_CONTENTION_TOTAL_PAGES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    boot_4090_kv_cap(total_pages).await
-}
-
-/// Default MTP model for the native-drafter de-risk (Qwen3.5-0.8B GDN backbone +
-/// a 1-layer MTP head). HF-cached, resolved to a local snapshot path (R3: never
-/// downloads). The MTP head auto-activates in the driver on MTP-weight presence
-/// (entry.cpp `wire_system_drafter`); `[model.driver.options].mtp_num_drafts`
-/// sets the draft count K (0 disables → the non-spec baseline).
+/// The checkpoint the MTP harnesses were written against (a Qwen3.5-0.8B GDN
+/// backbone with a 1-layer MTP head bolted on).
+///
+/// **THIS BUILD DECLARES NO DRAFT ARM ON IT.** `::model::qwen_3::CATALOG` puts
+/// the `mtp` export on exactly one row — `qwen36-27b-bf16-kv-bf16`, the only
+/// checkpoint in the catalog that publishes fifteen `mtp.*` planes — so a
+/// Qwen3.5-0.8B snapshot loads here as the plain `qwen35-d0.8b` dense row and
+/// `Fault::Draftless` is what a drafting lane gets. Every harness that boots
+/// through here is `#[ignore]`d on that fact and says so in its reason.
 pub const QWEN35_0_8B_REPO: &str = "Qwen/Qwen3.5-0.8B";
 
-/// Resolve `Qwen/Qwen3.5-0.8B` to its local HF cache snapshot dir (mirrors
-/// [`resolve_qwen3_snapshot`]; the snapshot hash is machine-specific).
+/// Resolve `Qwen/Qwen3.5-0.8B` to its local HF cache snapshot dir (R3: the
+/// worker never downloads, and the snapshot hash is machine-specific, so the
+/// path is resolved at runtime out of `$HF_HOME`/`~/.cache/huggingface/hub`).
 pub fn resolve_qwen35_snapshot() -> Result<String> {
     let hub = std::env::var("HF_HOME")
         .map(std::path::PathBuf::from)
@@ -239,12 +215,12 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
     )
 }
 
-/// Boot the embedded standalone with the real CUDA driver + Qwen3.5-0.8B (the
-/// MTP model) on the 4090. K (native draft tokens) is `mtp_num_drafts`, passed
+/// Boot the embedded standalone with the real CUDA driver against
+/// [`QWEN35_0_8B_REPO`]. K (native draft tokens) is `mtp_num_drafts`, passed
 /// through `[model.driver.options]` like any other driver setting -- 0 disables
 /// speculation and gives the non-spec baseline. Client edge at
 /// `handle.listen_addr`.
-pub async fn boot_4090_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle> {
+pub async fn boot_cuda_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle> {
     let snapshot = resolve_qwen35_snapshot()?;
     let (controller, gateway, worker) =
         derive_standalone(&cuda_mtp_standalone_toml(&snapshot, mtp_num_drafts))?;
@@ -323,7 +299,7 @@ pub async fn boot_serving() -> Result<pie::StandaloneHandle> {
 /// [`boot_serving`]'s callers are unchanged.
 ///
 /// It rides `[runtime]`, which `worker::config_layout::reshape` moves to
-/// `model.scheduler` — the same door `boot_4090_dispatch_depth` uses.
+/// `model.scheduler`, which is where the engine reads its frame knobs from.
 pub async fn boot_serving_frame(frame_size: Option<u32>) -> Result<pie::StandaloneHandle> {
     let checkpoint = resolve_qwen35_snapshot()?;
     let mut toml = serving_standalone_toml(&checkpoint);
@@ -362,122 +338,31 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 // a build with neither feature reaches no device."* These helpers were what
 // that sentence had not finished removing.
 //
-// THREE gates rested on them, and they went three different ways, which is
-// worth writing down because "the dummy driver is gone" is not by itself an
-// answer to what a gate was measuring.
+// What is genuinely lost is that the two root-package boot gates ran in a
+// plain `cargo test` with no GPU and no env var, and the gates that took over
+// do not: they are `#[ignore]`d and want a device. That is a real reduction in
+// what CI notices on a machine with no device, and it is stated here rather
+// than discovered later. It is the cost of the dummy driver's deletion, not of
+// this edit. The end-to-end half -- boot from a snapshot and round-trip a turn
+// through the real client edge -- is `cuda_serve_round_trip` in this
+// directory, against a real model on a real device.
+
+// ── `build_inferlet` and `run_inferlet` STOOD HERE ──────────────────────
 //
-// * `dummy_add_program` -- the chunked-`add_program` session-bridge deadlock
-//   repro -- became a Vulkan gate, and went with the Vulkan gates at R3. What
-//   it measures is the gateway/worker turn model under a ~12 MB upload, which
-//   is driver-agnostic; it wanted the CHEAPEST boot, and the cheapest boot in
-//   this tree is a CUDA one again.
+// They built `-p generate -p mirostat -p grammar` out of
+// `crates/engine/tests/inferlets` and submitted the result over the client
+// websocket. BOTH halves of that are gone: the guest workspace moved to
+// `tests/inferlets`, and none of those three packages is in it -- the sampler
+// capability suite they served (`programmable_sampler_4090`, `cuda_mirostat19`,
+// `cuda_grammar_op`, `cuda_grammar_late`) went with the driver-baked sampler
+// plane it was written for, and what asks that question now is
+// `driver-cuda/tests/program_parity` (the emitted guest kernels diffed against
+// the host interpreter, ring for ring) and `engine/tests/cuda_program_epilogue`.
 //
-// * tests/boot_smoke.rs and tests/boot_artifact.rs, in the root `pie` package,
-//   are DELETED -- named without backticks because they are not there to be
-//   opened, which is the rule `model-loader`'s citation gate enforces. Both
-//   booted the standalone against a synthetic snapshot -- a 256-token
-//   byte-level BPE and a four-byte `embed_tokens` tensor --
-//   which only the dummy load planner ever accepted. A real driver cannot
-//   serve four bytes, so there was no config to repoint them at: their subject
-//   was the fabricating driver itself.
-//
-//   They are not replaced so much as already covered from both sides. The
-//   end-to-end half -- boot from a snapshot and round-trip a turn through the
-//   real client edge -- is what `cuda_chat_completion_e2e` in this directory
-//   does, against a real model on a real device.
-//
-//   What is genuinely lost is that those two ran in a plain `cargo test` with
-//   no GPU and no env var, and the gates that took over do not: they are
-//   `#[ignore]`d and want a device. That is a real reduction in what CI
-//   notices on a machine with no device, and it is stated here rather than
-//   discovered later. It is the cost of the dummy driver's deletion, not of
-//   this edit.
+// The gates that still submit a guest build it themselves against
+// `tests/inferlets`, one package each, which is what lets a harness name the
+// fixture it actually drives instead of paying for three.
 
-// ── Client submit (golf) ────────────────────────────────────────────────────
-//
-// The capability-test half: build a capability inferlet to wasm, submit it to
-// the engine `boot_4090()` brought up, and return its structured-JSON result
-// for hotel's `sampler_assert`. Pure client-side (no GPU), so it compiles +
-// type-checks Rust-only (without `--features driver-cuda-13`).
-
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use anyhow::Context;
-use client::client::Client;
-
-/// Build the capability inferlets to `wasm32-wasip2` and return
-/// `(wasm, manifest)` for `name` ∈ {"generate", "mirostat", "grammar"}. Paths resolve from
-/// the `bin/pie` crate dir to the runtime test-inferlets workspace. Builds both
-/// (one cargo invocation) so a multi-capability harness pays the build once.
-pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
-    let workspace =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
-    let ok = Command::new("cargo")
-        .args([
-            "build",
-            "--target",
-            "wasm32-wasip2",
-            "-p",
-            "generate",
-            "-p",
-            "mirostat",
-            "-p",
-            "grammar",
-        ])
-        .current_dir(&workspace)
-        .status()
-        .expect("spawn cargo build for capability inferlets")
-        .success();
-    assert!(ok, "capability inferlet wasm build failed");
-    let wasm = workspace.join(format!("target/wasm32-wasip2/debug/{name}.wasm"));
-    let manifest = workspace.join(format!("{name}/Pie.toml"));
-    assert!(wasm.exists(), "missing inferlet wasm: {}", wasm.display());
-    assert!(
-        manifest.exists(),
-        "missing manifest: {}",
-        manifest.display()
-    );
-    (wasm, manifest)
-}
-
-/// Submit a capability inferlet to the running engine at `listen_addr` and
-/// return its structured-JSON result. Builds `name` (`mirostat`/`grammar`),
-/// then runs the canonical submit flow (connect → authenticate → add_program →
-/// launch_process → `wait_for_return`). `program_name` is `{name}@{version}`
-/// (e.g. `mirostat@0.1.0`); `input` is the inferlet's JSON run-params (e.g.
-/// `{"max_tokens":48}`, or `{}` for defaults).
-pub async fn run_inferlet(
-    listen_addr: &std::net::SocketAddr,
-    name: &str,
-    program_name: &str,
-    input: &str,
-) -> Result<String> {
-    let (wasm, manifest) = build_inferlet(name);
-
-    // The gateway serves the multi-turn client WebSocket at `/v1/ws`
-    // (`gateway/src/ingress.rs`), gated on the `x-pie-identity` trust-edge
-    // header (else 401). Standalone has no edge proxy, so inject it here.
-    let client = Client::connect_with_identity(&format!("ws://{listen_addr}/v1/ws"), "test-user")
-        .await
-        .with_context(|| format!("connect to engine at ws://{listen_addr}/v1/ws"))?;
-    // The bench/test engine disables public-key auth, so this returns early.
-    client
-        .authenticate("test-user", &None)
-        .await
-        .context("authenticate")?;
-    client
-        .add_program(&wasm, &manifest, true)
-        .await
-        .with_context(|| format!("add_program {program_name}"))?;
-
-    let mut proc = client
-        .launch_process(program_name.to_string(), input.to_string(), true)
-        .await
-        .with_context(|| format!("launch_process {program_name}"))?;
-
-    proc.wait_for_return().await
-}
 // ── The shader-plane boots STOOD HERE ───────────────────────────────────
 //
 // `vulkan_standalone_toml*`, `wgpu_standalone_toml*`, `boot_vulkan*` and

@@ -41,7 +41,9 @@ tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
-# `cuda_boot_smoke` scrapes `/metrics` off a booted engine over HTTP.
+# `cuda_boot_smoke` drives one turn through the booted engine's HTTP ingress
+# (`POST /v1/generate`), which is the one client surface no other gate here
+# touches.
 #
 # `rustls-no-provider` rather than `rustls` for the same reason the rest of the
 # tree uses it: reqwest's `rustls` feature hard-selects the aws-lc backend, and
@@ -52,8 +54,10 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# `cuda_declared_family_parity` captures fd 2 to assert on what the driver
-# printed during a fire (no `declined:`, a first-fire line), which is a libc
-# call. Upstream dropped this dependency when it deleted the three tests that
-# were its only users there; here the parity gate still needs it.
-libc = "0.2"
+# `libc` STOOD HERE. Its one user was `cuda_declared_family_parity`, which
+# captured fd 2 to assert on what the driver printed during a fire. That gate
+# went in the census wave: its OFF/ON polarity was `PIE_DECLARED_FORWARD`, an
+# environment switch no crate in this tree reads any more, because the declared
+# model text is the only forward this build has. What asks the per-family
+# question now is `driver/tests/every_sku_walks_its_classes` over the whole
+# catalog and `driver-cuda/tests/masked_axis::every_sku_probes_its_caches`.

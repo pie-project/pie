@@ -75,13 +75,26 @@ pub enum Fault {
         why: &'static str,
     },
 
-    /// A region's classes are not one run — P4's promise broke, and a
-    /// windowed launch would read somebody else's rows.
+    /// A region's classes are not one run AND the artifact owes it no answer —
+    /// P4's promise broke, and a windowed encode would read somebody else's
+    /// rows.
+    ///
+    /// **NOT THE SLOW PATH, WHICH IS SERVED.** P4 writes a `Fallback` row for
+    /// every consumer it could not seat, and such a region is encoded once per
+    /// interval of its window (`crate::window::Windows`,
+    /// `driver::fire::fallback`). What is left here is the case where the bake
+    /// and the fire disagree: a mask P4 promised consecutive that came back in
+    /// pieces, or one whose pieces outnumber the `Fallback::Split { r }` P4
+    /// counted on the order it shipped. Neither can happen to a `Baked` and a
+    /// `WindowTable` built from each other.
     Fragmented {
         /// The template region.
         region: u32,
-        /// How many runs its class mask fell into.
+        /// How many runs its class mask fell into in this fire.
         runs: usize,
+        /// How many P4 wrote down, or `None` when it wrote nothing at all —
+        /// which is the promise being broken rather than exceeded.
+        promised: Option<u32>,
     },
 
     /// A schedule value built over one class mask and read under another.
@@ -156,6 +169,42 @@ pub enum Fault {
         why: String,
     },
 
+    /// A quantity the ICB would have to rewrite per fire, and no affine law
+    /// over the descriptor's own numbers predicts it.
+    ///
+    /// **THE CONSTRUCTIVE FORM OF A REFUSAL** (`.wiki/palo/icb.md` §3): the
+    /// binding recipe is derived by walking one template against several
+    /// synthetic descriptors and fitting each moving component to
+    /// `v = base + Σ slope·axis`. A component that moves and does not fit is
+    /// named here rather than guessed at, because a wrong slope is a grid
+    /// that reads past a rectangle and no test between here and the tokens
+    /// would say so.
+    Unaffine {
+        /// The slot, in walk order — which is dispatch order and ICB index.
+        slot: u32,
+        /// The shader point standing in that slot.
+        point: String,
+        /// Which component of it: a grid axis, a threadgroup axis, or an
+        /// argument index.
+        at: String,
+        /// What the fit saw.
+        why: String,
+    },
+
+    /// Two synthetic descriptors did not walk the same template.
+    ///
+    /// The claim design §5 makes — one artifact, all compositions inside it —
+    /// stated as a check: the slots have to be the same slots in the same
+    /// order, binding the same reservations at the same argument indices, or
+    /// no single indirect command buffer serves both compositions and the
+    /// exec key has not collapsed.
+    Unstructured {
+        /// Where the two recordings first disagree.
+        slot: u32,
+        /// How.
+        why: String,
+    },
+
     /// The plan names something this shell bound no seat for.
     Unbound {
         /// What went unbound.
@@ -199,11 +248,26 @@ impl fmt::Display for Fault {
             Self::Load(error) => write!(f, "the checkpoint does not land: {error}"),
             Self::Fire(error) => write!(f, "the fire is refused: {error}"),
             Self::Param { name, why } => write!(f, "param `{name}`: {why}"),
-            Self::Fragmented { region, runs } => write!(
-                f,
-                "region {region} covers {runs} runs of the fire's rows, and a windowed \
-                 launch reads one"
-            ),
+            Self::Fragmented {
+                region,
+                runs,
+                promised,
+            } => match promised {
+                None => write!(
+                    f,
+                    "region {region} covers {runs} runs of the fire's rows and P4 wrote \
+                     it no fallback row — it seriated so that this mask takes exactly \
+                     one encode, and this fire's class order did not come from that \
+                     seriation"
+                ),
+                Some(promised) => write!(
+                    f,
+                    "region {region} covers {runs} runs of the fire's rows where P4 \
+                     counted {promised} on the order it shipped — a fire's order is \
+                     that order with the absent classes dropped, and dropping a class \
+                     cannot open a gap"
+                ),
+            },
             Self::Straddled {
                 value,
                 node,
@@ -243,6 +307,19 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
+            Self::Unaffine {
+                slot,
+                point,
+                at,
+                why,
+            } => write!(
+                f,
+                "slot {slot} ({point}): {at} is not affine in the descriptor — {why}"
+            ),
+            Self::Unstructured { slot, why } => write!(
+                f,
+                "two compositions do not walk the same template at slot {slot}: {why}"
+            ),
             Self::Unbound { what } => write!(
                 f,
                 "the plan names {what}, which this shell binds no seat for"

@@ -30,11 +30,19 @@
 //! P8 emit        Baked
 //! ```
 //!
-//! **P0, P1, P2, P4, P5, P6 and P7 are here.** P3 and P8 are not, and the
-//! seams they will fill are TYPED rather than stubbed: `Lowering` has all
-//! three variants and only `AlwaysLaunch` is ever constructed. That is a true
-//! statement about a v1 artifact, not a placeholder — a plan baked today runs
-//! correctly, just not as fast as it will.
+//! **Everything but P8 is here.** The seam P8 will fill is TYPED rather than
+//! stubbed; see the module docs on [`Baked`] for the four design §2 fields
+//! that belong to it and why an empty one would be a claim rather than a gap.
+//!
+//! P3 ships whole (see [`lowering`]) and chooses ONE region on today's whole
+//! catalog: qwen36-27b's MTP head, 26 launches and 576 µs behind the
+//! multi-token-prediction fact. Zero-row always-launch is the correctness
+//! mechanism (decision #3), so a conditional is worth its evaluation point
+//! only where the body is fat AND the launches it skips outweigh the point
+//! that skips them — and every other guarded region in every other text is one
+//! to seven operators, which is the shape design §4 says never to wrap.
+//! `tests/which_skus_get_a_conditional.rs` pins the predicate and prints the
+//! margin per SKU.
 //!
 //! P6 ships whole (see [`stream`]): a dependency DAG over the capture
 //! regions, a cost gate against the profile, streams handed out greedily, and
@@ -51,14 +59,12 @@
 //! ignores it — and it withdraws the last conflicting constraint rather than
 //! the cheapest one, which is where a Tucker certificate goes.
 //!
-//! What is genuinely absent is absent: see the module docs on [`Baked`] for
-//! the four design §2 fields that belong to P8 and why an empty one would be a
-//! claim rather than a gap.
 
 pub mod arena;
 pub mod baked;
 pub mod budget;
 pub mod layout;
+pub mod lowering;
 pub mod refusal;
 mod region;
 pub mod stream;
@@ -120,12 +126,20 @@ pub fn compile(plan: &Plan, budgets: &Budgets, profile: &DeviceProfile) -> Resul
     // P5 then P2: phase per node, then maximal runs of equal (mask, phase).
     let regions = region::coalesce(plan, &classes);
 
+    // P3. Which regions enter the graph behind a conditional node — and P6
+    // below reads the answer, because `stream::forkable` refuses to fork one
+    // that does. The order is the composition rule and it is a mechanism
+    // rather than a preference: a conditional body is a child graph and a
+    // fork's event pair is an edge inside one parent graph, so an arm that
+    // was both is a dependency that cannot be expressed (see [`lowering`]).
+    let mut regions = regions;
+    lowering::lower(plan, &mut regions, &classes, budgets, profile);
+
     // P6. The dep DAG over the capture regions, the cost gate, the streams
     // and the event points — stamped into `regions` in place, because a fork
     // is a property OF a region rather than a second schedule beside it. What
     // comes back is the relation the carve is widened by, and P7 below is the
     // pass that was written waiting for it.
-    let mut regions = regions;
     let forks = stream::fork(plan, &mut regions, profile);
     let concurrency = if forks.pairs.is_empty() {
         Concurrency::sequential(&regions, plan.nodes.len())
@@ -309,11 +323,10 @@ pub fn collectives(plan: &Plan) -> Vec<u32> {
 
 /// Does this artifact keep the one lowering rule that is not an optimization?
 ///
-/// **A COLLECTIVE IS NEVER ELIDED** (decision #5). Trivially true in v1, where
-/// every region is [`Lowering::AlwaysLaunch`] — which is exactly why it is
-/// written now: the day P3 starts choosing, this is the assertion that has
-/// been standing there all along, rather than one somebody has to think to
-/// add.
+/// **A COLLECTIVE IS NEVER ELIDED** (decision #5). P3 enforces it at the gate
+/// — `lowering::windowed` refuses a region carrying one before it asks what it
+/// costs — and this is the same claim asked of the OUTPUT, which is where an
+/// assertion about a pass belongs.
 #[must_use]
 pub fn collectives_are_never_elided(baked: &Baked) -> bool {
     baked
@@ -358,8 +371,8 @@ mod tests {
         assert!(baked.arena.bytes > 0);
         assert!(baked.arena.clashes(&baked.concurrency).is_empty());
         assert!(collectives_are_never_elided(&baked));
-        // v1 lowers everything the one way that is correctness and not
-        // optimization.
+        // Two two-node arms: fat at no profile and profitable at none, so
+        // the one lowering that is correctness and not optimization.
         assert!(
             baked
                 .regions

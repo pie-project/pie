@@ -1,7 +1,7 @@
 //! §6.1 north-star e2e — composed MTP spec-verify ⟂ PER-POSITION grammar mask on
-//! the REAL 4090 + Qwen3-0.6B (bravo). The north-star assembly nucleus, on real HW.
+//! a real CUDA device (bravo). The north-star assembly nucleus, on real HW.
 //!
-//! Boots the 4090 + real CUDA driver and launches the `mtpverify` inferlet — the
+//! Boots the standalone over the real CUDA shell and launches the `mtpverify` inferlet — the
 //! §6.1 composition: draft `k` tokens, read the target's `[k, vocab]` logits, apply
 //! a grammar mask PER speculative position (a `[k, vocab]` bool matrix via `select`,
 //! NOT the packed single-mask `mask_apply` — echo's design constraint that per-row
@@ -46,14 +46,21 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "§6.1 composed MTP+grammar e2e: needs the 4090 + cuda + qwen-3-0.6b + the matrix select-mask ∘ spec-verify DAG lowering"]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog row \
+            whose checkpoint publishes fifteen `mtp.*` planes -- and that load \
+            refuses on the reference L40S with `Fault::OutOfMemory` at 51.05 GiB \
+            against 43.87 free (palo build log 25f). Qwen3.5-0.8B loads as the \
+            plain `qwen35-d0.8b` dense row, so a drafting lane gets \
+            `Fault::Draftless`, and the `mtpverify` guest that composed it with \
+            a grammar mask is gone with the workspace move to `tests/inferlets`"]
 async fn mtp_grammar_composition_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!("[mtp-verify] booted, listen_addr={}", pie.listen_addr);
 
     // Build the §6.1 composed spec-verify ⟂ per-position grammar inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "mtpverify"])
         .current_dir(&ws)

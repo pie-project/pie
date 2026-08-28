@@ -20,7 +20,25 @@ interface tokenizer {
     }
 
     // Returns the model's vocabulary
+    //
+    // IT IS THE EXPENSIVE DOOR, AND MOST CALLERS WANT ONE OF THE TWO BELOW.
+    // A vocabulary is a quarter of a million records; lowering that list
+    // across this boundary and looping over it guest-side cost token healing
+    // ~115 ms on every launch (palo build log 23), to answer a byte-prefix
+    // question the host can answer by scanning a table it already holds.
     vocabs: func() -> list<token>;
+
+    // The raw bytes each of `tokens` stands for, in order. An id the
+    // vocabulary does not hold answers an empty list, which is what indexing
+    // a table built from `vocabs` gave for the same id.
+    token-bytes: func(tokens: list<u32>) -> list<list<u8>>;
+
+    // Every token id whose bytes begin with `prefix`, ascending.
+    //
+    // The host-side spelling of the loop a caller would otherwise write over
+    // `vocabs`, and the answer is the same set. An empty prefix matches every
+    // token in the vocabulary, because every byte string starts with nothing.
+    tokens-with-prefix: func(prefix: list<u8>) -> list<u32>;
 
     // Returns the split regular expression used by the tokenizer
     split-regex: func() -> string;

@@ -114,42 +114,32 @@ pub mod store;
 pub mod weights;
 pub mod window;
 
-/// **THE ENTRIES THAT CLAIM A PROCESS-GLOBAL WORKSPACE**, by
+/// **THE ENTRIES THAT CLAIM A WORKSPACE TWO STREAMS WOULD SHARE**, by
 /// `model_ir::Operands::name` — what this shell hands `model_compiler`'s P6 as
 /// `DeviceProfile::exclusive`, so that two of them are never scheduled onto
 /// two streams at once.
 ///
-/// `kernels_cuda::Ctx::scratch` returns a slab keyed by a static NAME:
-/// process-global, grown but never shrunk, and deliberately not per stream —
-/// an entry that allocated per fire could not be captured, which is the
-/// contract that doc states from the other side. Two launches inside one slab
-/// at the same instant stage over each other and the fire computes anyway, so
-/// the compiler is told, and it orders them.
+/// **IT IS EMPTY, AND THAT IS THE POINT.** It held eleven names, and every
+/// one of them was on it for one reason: `kernels_cuda::Ctx::scratch` handed
+/// back a slab keyed by a static NAME, so two launches inside one slab at the
+/// same instant staged over each other and the fire computed anyway. A slab
+/// is keyed by `(arena, name, stream)` now — one arena per CUDA context, one
+/// slab per stream inside it, growth broadcast across the arena's streams so
+/// the eager warm pass still warms what the capture reads
+/// (`kernels_cuda::Slabs`, and `kernels_cuda::jit::device`'s header for the
+/// argument). Two arms of a fork group take two slabs, so there is nothing
+/// left for the compiler to order apart, and the linear-attention layers of
+/// qwen and kimi — the eleven names' whole cost, build log 24 — fork.
 ///
-/// The list is every op whose `kernels-cuda` entry can reach `Ctx::scratch`,
-/// read off the four modules that call it — `attn/ssm.rs` (the staging
-/// planes), `attn/pool.rs` (the boundary rope side channel), `attn/index.rs`
-/// (the top-k score plane) and `linear/lora.rs` (the correction's waist).
-/// Everything else — the flashinfer arms included — takes its workspace from
-/// its own `ScheduleSeat`, which is per plan value and therefore already
-/// disjoint between two arms (build log 21).
-///
-/// **A NAME THAT DROPS OFF THIS LIST WHEN A KERNEL GAINS A SLAB IS A RACE**,
-/// which is why `tests/no_forked_pair_shares_a_slab.rs` re-derives the
+/// **THE SEAT STAYS, BECAUSE THE NEXT SUCH ENTRY WILL NEED IT.** The list is
+/// the shell's answer to a question the compiler cannot ask: no `Operands`
+/// method says which entries reach a device-wide workspace, and a
+/// backend-neutral pass that knew would be a compiler that knows an
+/// allocator. An entry that acquires a workspace this shell cannot key per
+/// stream — a device-wide semaphore, a library handle with hidden state —
+/// belongs here, and `tests/no_forked_pair_shares_a_slab.rs` re-derives the
 /// question from the other end.
-pub const EXCLUSIVE: [&str; 11] = [
-    "attention.ssm_causal_conv1d",
-    "attention.ssm_causal_conv1d_chunked",
-    "attention.ssm_gdn_prep",
-    "attention.ssm_gated_delta",
-    "attention.ssm_gated_delta_chunked",
-    "attention.ssm_kda_step",
-    "attention.ssm_kda_chunked",
-    "attention.index_topk",
-    "attention.pool_boundary_decode",
-    "attention.pool_boundary_prefill",
-    "linear.lora_correct",
-];
+pub const EXCLUSIVE: [&str; 0] = [];
 
 
 pub use error::{Fault, Result};

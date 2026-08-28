@@ -38,7 +38,7 @@
 
 use std::ops::Range;
 
-use model_ir::{ClassSet, Classes, Cond, ValueId};
+use model_ir::{ClassSet, Classes, ValueId};
 
 use crate::arena::{ArenaMap, Concurrency};
 use crate::layout::PqTree;
@@ -115,9 +115,14 @@ impl Baked {
     /// still be a `Vec<Region>` copied beside a `Vec<Region>` with nothing to
     /// keep the two in step.
     ///
-    /// P3 is the pass that can still change this: a SWITCH has arms, and arms
-    /// nest. The signature is what changes then; the callers are already
-    /// asking the right question.
+    /// **P3 DID NOT CHANGE IT EITHER, AND THAT WAS THE DESIGN QUESTION.** A
+    /// SWITCH has arms and arms could have nested, which would have made the
+    /// script a tree. It does not: a group's arms are CONSECUTIVE regions and
+    /// each one says which arm of which merge it is
+    /// ([`Lowering::Switch`]), so a recorder brackets a group by reading the
+    /// members it is already walking past. Nesting is v1's flat one level
+    /// (design's open items), and a nested conditional is what would need the
+    /// second table.
     #[must_use]
     pub fn template(&self) -> &[Region] {
         &self.regions
@@ -146,35 +151,63 @@ pub enum Phase {
 /// **CONDITIONALS ARE AN OPTIMIZATION, NOT THE SEMANTICS.** Every windowed
 /// kernel is always in the graph and reads its row count from the descriptor;
 /// an empty window returns immediately, at about a microsecond. That is what
-/// makes composition runtime data instead of a recapture, and it is why v1
-/// constructs [`AlwaysLaunch`](Lowering::AlwaysLaunch) for every region and
-/// nothing else.
+/// makes composition runtime data instead of a recapture, and it is why
+/// [`AlwaysLaunch`](Lowering::AlwaysLaunch) is the default and the fallback
+/// and the answer on every region of every catalog plan today.
 ///
-/// P3 will read [`DeviceProfile`](crate::DeviceProfile) and choose one of the
+/// P3 reads [`DeviceProfile`](crate::DeviceProfile) and chooses one of the
 /// other two for a region fat enough to amortize its evaluation point — layer
 /// granularity or coarser — subject to the one rule that is not an
 /// optimization: **a region whose [`Region::collective`] is set must stay
 /// always-launch** (decision #5). A collective inside a skipped body
 /// deadlocks the ranks that did not skip, or — worse — silently mispairs with
-/// a later collective, because NCCL matches by call order.
-#[derive(Debug, Clone, PartialEq)]
+/// a later collective, because NCCL matches by call order. On today's catalog
+/// it chooses `AlwaysLaunch` everywhere and [`crate::lowering`] says with what
+/// arithmetic.
+///
+/// **AN EAGER SINK MAY IGNORE ALL OF THIS AND STILL BE CORRECT**, and a
+/// RECORDING one may not. The walk's zero-row rule already decides what a
+/// conditional decides — the composition simply does not include the behavior
+/// — so `EagerSink`'s no-op `cond_begin` is the right implementation and not a
+/// stub. A sink that RECORDS has to bracket the body, because a graph outlives
+/// the fire that recorded it and the count it was recorded against is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lowering {
     /// In the graph unconditionally; the kernel reads `desc.count[region]` and
     /// returns on zero.
     AlwaysLaunch,
-    /// One body per arm of a merge, exactly one taken. The arms ARE the
-    /// exclusive variant set — that exclusivity is already in the IR, which is
-    /// what makes `Def::Merge` the SWITCH group for free (decision #4).
+    /// One arm of a `cudaGraphCondTypeSwitch` over a merge's arms, exactly one
+    /// taken.
+    ///
+    /// **THE GROUP IS FREE AND THE ACTIVATION IS NOT** (see
+    /// [`crate::lowering`]). Decision #4's exclusivity is a fact about a LANE
+    /// — `resolve_classes` proves no lane demands two arms — and a switch
+    /// node's predicate is a fact about a FIRE, which is a batch of lanes of
+    /// different classes. P3 constructs this only where at most one arm can be
+    /// live in any composition the budgets admit.
     Switch {
         /// The merged value whose arms are the bodies.
         merge: ValueId,
+        /// Which arm this region is, in `Def::Merge` order — the value the
+        /// dispatch kernel writes when this region's class is the live one.
+        arm: u8,
+        /// How many arms the group has. `arm + 1 == arms` is the last one,
+        /// which is where a recorder closes the switch: the region table is
+        /// FLAT, so each member says where it stands in its group rather than
+        /// a second table saying it for them.
+        arms: u8,
     },
-    /// One body behind a device-side mask bit — an independent-presence axis
+    /// One body behind a device-side predicate — an independent-presence axis
     /// with no exclusive sibling to switch against.
-    If {
-        /// The predicate the dispatch kernel evaluates against the descriptor.
-        cond: Cond,
-    },
+    ///
+    /// **IT CARRIES NOTHING, AND THE PREDICATE IS [`Region::mask`].** Design
+    /// §4 spells this `If { cond }`; a `Cond` here would be the authoring-level
+    /// guard, and what the device evaluates is
+    /// `descriptor.rows_of(region.mask) > 0` — the same number always-launch
+    /// reads, asked one node earlier. Carrying the guard beside the mask would
+    /// be two spellings of one window, free to disagree, which is the collapse
+    /// build log 8 deleted `FireBindings::facts` over.
+    If,
 }
 
 /// A maximal run of adjacent nodes that run in the same classes, in the same
@@ -200,7 +233,9 @@ pub struct Region {
     pub mask: ClassSet,
     /// Host prepare work, or graph body.
     pub phase: Phase,
-    /// How it enters the graph. Always [`Lowering::AlwaysLaunch`] today.
+    /// How it enters the graph (P3). [`Lowering::AlwaysLaunch`] on every
+    /// region of every catalog plan at today's profile — see
+    /// [`crate::lowering`] for the two gates that say so.
     pub lowering: Lowering,
     /// Which stream it is recorded into (P6). `0` is the main stream, which
     /// is where a region stays unless [`crate::stream`] found it a partner
@@ -334,10 +369,20 @@ impl LayoutOrder {
 /// and a split 1.82x, and the two converge at prefill scale. One answer per
 /// node would be the wrong answer at one end of the lattice.
 ///
-/// EMPTY IS THE GOOD CASE, and it is what the whole catalog bakes to today:
-/// every consumer's class set is an interval of the order P4 found, so nobody
-/// is owed anything. A row here names a consumer the C1P instance could not
-/// seat — see [`crate::layout`] for which one gets withdrawn and why.
+/// EMPTY IS THE GOOD CASE, AND THE CATALOG STOPPED BEING IT. It was true while
+/// every window a model text stated nested inside another — `masked` inside
+/// everything, `qo_one` inside `masked` — because a laminar family is always
+/// C1P. `captures_scores` (palo C4) does not nest: it CROSSES `qo_one`, and
+/// over the fourteen-point bucket lattice the four qwen3.5 texts each owe 12
+/// or 20 rows for it — two per `Attention::PrefillLse` node, a
+/// [`Fallback::Copy`] below the crossover and a [`Fallback::Split`] above —
+/// while qwen3.6-27b owes 84 over the 42 nodes of its MTP head.
+///
+/// A row here names a consumer the C1P instance could not seat — see
+/// [`crate::layout`] for which one gets withdrawn and why — and
+/// `driver::fire::fallback` is what reads it: [`Fallback::Split`] is served at
+/// every bucket, and the [`Fallback::Copy`] this table asks for below the
+/// crossover is a performance debt rather than an unimplemented one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FallbackTable {
     /// One row per (node, bucket range) that needs one.

@@ -132,7 +132,6 @@
 //! `page_size` steps, which is the point at which padding stops being
 //! optional.
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -143,7 +142,7 @@ use model_ir::Plan;
 use crate::device::graph::{Graph, GraphExec};
 use crate::error::{Fault, Result};
 use crate::run::Run;
-use crate::window::{Cursor, Lanes};
+use crate::window::{At, Cursor, Lanes};
 
 /// Which fire of a key captures it: the fires before it are eager, and so is
 /// this one's own first pass.
@@ -339,11 +338,11 @@ impl Graphs {
     /// [`Fault::Fire`] for a walk the artifact refused, [`Fault::Schedule`]
     /// for a fire whose schedules are not the shape its exec was captured
     /// against, [`Fault::Device`] for a capture, an instantiation or a launch.
-    pub fn fire(&mut self, at: &Fire<'_>, run: &mut Run<'_>, region: &Cell<u32>) -> Result<Mode> {
+    pub fn fire(&mut self, at: &Fire<'_>, run: &mut Run<'_>, place: &At) -> Result<Mode> {
         // 1. Prepare: the host half. Plan builders, their staging, and
         //    nothing that could be recorded — this is exactly the work dev's
         //    second constraint says must not be inside a capture.
-        let mut prepare = at.serial(region);
+        let mut prepare = at.serial(place);
         walk_phases(
             at.plan,
             at.baked,
@@ -371,7 +370,7 @@ impl Graphs {
         // 3. A miss runs for real, which is where this fire's numbers come
         //    from and where every lazily-warmed thing the capture must not do
         //    gets done.
-        walk_capture(at, run, region, Streams::Serial)?;
+        walk_capture(at, run, place, Streams::Serial)?;
 
         // The sighting counts are bounded too, and for the same reason the
         // execs are: a load whose shapes wander would otherwise keep a
@@ -411,7 +410,7 @@ impl Graphs {
         //    which is a second schedule beside the template; a failed capture
         //    is a failed load either way.
         let began = Instant::now();
-        let graph = Graph::capture(at.stream, || walk_capture(at, run, region, Streams::Forked))?;
+        let graph = Graph::capture(at.stream, || walk_capture(at, run, place, Streams::Forked))?;
         let exec = graph.instantiate(at.stream)?;
         self.stats.nodes = exec.nodes();
         self.stats.edges = graph.edges();
@@ -460,11 +459,11 @@ enum Streams {
 impl<'a> Fire<'a> {
     /// A cursor that stays on the main stream, and puts the stream cell back
     /// there if a capture pass left it somewhere else.
-    fn serial(&self, region: &'a Cell<u32>) -> Cursor<'a> {
+    fn serial(&self, place: &'a At) -> Cursor<'a> {
         if let Some(lanes) = self.lanes {
             lanes.at.set(0);
         }
-        Cursor::new(region)
+        Cursor::new(place)
     }
 }
 
@@ -474,13 +473,21 @@ impl<'a> Fire<'a> {
 fn walk_capture(
     at: &Fire<'_>,
     run: &mut Run<'_>,
-    region: &Cell<u32>,
+    place: &At,
     streams: Streams,
 ) -> Result<()> {
     let mut cursor = match (streams, at.lanes) {
-        (Streams::Forked, Some(lanes)) => Cursor::across(region, lanes),
-        _ => at.serial(region),
+        (Streams::Forked, Some(lanes)) => Cursor::across(place, lanes),
+        _ => at.serial(place),
     };
+    // **AND WHETHER THIS WALK IS BEING WRITTEN DOWN**, which is a different
+    // question from whether it has side streams: a plan P6 found nothing in
+    // captures through the serial cursor and is still a capture. The one thing
+    // that reads it is the conditional bracket, where ignoring is correct in
+    // an eager pass and silently wrong in a recorded one.
+    if streams == Streams::Forked {
+        cursor = cursor.writing();
+    }
     walk_phases(
         at.plan,
         at.baked,

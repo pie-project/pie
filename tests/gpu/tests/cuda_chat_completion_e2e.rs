@@ -1,13 +1,28 @@
-//! chat-completion PTIR migration — DEVICE e2e on the 4090.
+//! **THE CHAT TURN, END TO END ON THE DEVICE.**
 //!
-//! Proves the `chat-completion` inferlet (migrated off the classic
-//! `forward-pass` onto `inferlet::ptir`: prompt prefill + device-carried decode
-//! loop + in-graph top-p/temperature sampler) generates a COHERENT continuation
-//! on the real cuda driver. This is the go-green for the classic-forward-pass
-//! removal endgame (step 2/3): the default chat-generation path now rides PTIR.
+//! The `chat-completion` inferlet is the default chat-generation path — prompt
+//! prefill, then a device-carried decode loop with an in-graph top-p sampler,
+//! all of it authored in `inferlet::ptir` — and this boots the standalone over
+//! the real CUDA shell and asserts the continuation is coherent.
 //!
-//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda-13 \
-//!     --test cuda_chat_completion_e2e -j6 -- --ignored --nocapture
+//! It runs against `DECODE_ENVELOPE` and nothing wider, which is why it is a
+//! gate rather than a blocked one: the only port the guest DECIDES is
+//! `EmbedTokens` (the sampled token, fed back through the channel the `embed`
+//! port reads), and the `w_slot` / `w_off` / `page_indptr` the epilogue also
+//! carries are pure arithmetic over the KV length that `pareval` folds
+//! host-side on every fire (palo build log 18). Its neighbours in this
+//! directory that put an `attn_mask` on the device are refused for exactly the
+//! port this one does not need.
+//!
+//! Booted through `common::boot_cuda`, which resolves the shipping
+//! `qwen35-d0.8b-bf16-kv-bf16` snapshot; the `Qwen/Qwen3-0.6B` this file used
+//! to name is a checkpoint no `::model::qwen_3::IMPORTS` row can claim.
+//!
+//! Run:
+//! ```text
+//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   --test cuda_chat_completion_e2e -- --ignored --nocapture
+//! ```
 
 mod common;
 
@@ -18,17 +33,17 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "chat-completion ptir device e2e: needs the 4090 + cuda + qwen-3-0.6b"]
+#[ignore = "the chat-turn gate: needs a CUDA device and the Qwen3.5-0.8B snapshot"]
 async fn chat_completion_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!(
         "[chat-completion-e2e] booted, listen_addr={}",
         pie.listen_addr
     );
 
     // chat-completion is part of the curated inferlet test workspace.
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let dir = workspace.join("chat-completion");
     let ok = Command::new("cargo")
         .args([

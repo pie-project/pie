@@ -1,6 +1,6 @@
 //! **Stage-2 driver `mtp_logits` value-verify** (charlie) — drives the
 //! `mtp-native-verify` inferlet (bravo's PTIR-native draft→verify→accept) on the
-//! REAL 4090 + Qwen3.5-0.8B, exercising the driver's `mtp_logits` plumbing (the
+//! a real CUDA device + Qwen3.5-0.8B, exercising the driver's `mtp_logits` plumbing (the
 //! MTP head produces K draft rows in `ws.logits`; `ctx.mtp_draft_row` points the
 //! `Intrinsic::MtpLogits [K,vocab]` binding at them).
 //!
@@ -38,7 +38,7 @@ mod common;
 /// is a trap -- a guest wanting 4 drafts against a driver built for some other
 /// count fails deep in frame prepare with "MtpLogits draft-row requirement
 /// exceeds the production layout" -- so this ONE value feeds both: pass it to
-/// `boot_4090_mtp` and to the guest. `PIE_MTP_DRAFT_TOKENS` overrides it.
+/// `boot_cuda_mtp` and to the guest. `PIE_MTP_DRAFT_TOKENS` overrides it.
 fn draft_k() -> u32 {
     std::env::var("PIE_MTP_DRAFT_TOKENS")
         .ok()
@@ -48,15 +48,22 @@ fn draft_k() -> u32 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "Stage-2 mtp_logits value-verify: needs the 4090 + cuda + Qwen3.5-0.8B (MTP head). \
-            Run: PIE_MTP_DRAFT_TOKENS=4 PIE_MTP_LOGITS_TRACE=1"]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog \
+            row whose checkpoint publishes fifteen `mtp.*` planes -- and that \
+            load refuses on the reference L40S with `Fault::OutOfMemory` at \
+            51.05 GiB against 43.87 free (palo build log 25f). Qwen3.5-0.8B \
+            loads as the plain `qwen35-d0.8b` dense row, so a drafting lane \
+            gets `Fault::Draftless`. The \
+            `mtp-native-verify` guest is gone with the workspace move to \
+            `tests/inferlets` besides"]
 async fn mtp_logits_value_verify() -> Result<()> {
     common::init_trace();
     let k = draft_k();
     eprintln!("[mtp-native-verify] k = {k}");
 
     // Build the mtp-native-verify inferlet (wasm).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -70,7 +77,7 @@ async fn mtp_logits_value_verify() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
 
-    let pie = common::boot_4090_mtp(k).await?;
+    let pie = common::boot_cuda_mtp(k).await?;
     eprintln!(
         "[mtp-native-verify] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr
@@ -170,13 +177,20 @@ async fn mtp_logits_value_verify() -> Result<()> {
 /// different token streams (`committed=23/25/26`, `steps=12/13/9`). Any
 /// equality assertion over that output is reading noise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the GPU + Qwen3.5-0.8B (MTP head). Run: \
-            PIE_MTP_DRAFT_TOKENS=4"]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog \
+            row whose checkpoint publishes fifteen `mtp.*` planes -- and that \
+            load refuses on the reference L40S with `Fault::OutOfMemory` at \
+            51.05 GiB against 43.87 free (palo build log 25f). Qwen3.5-0.8B \
+            loads as the plain `qwen35-d0.8b` dense row, so a drafting lane \
+            gets `Fault::Draftless`, and `PortMask::RS_BUFFER` -- \
+            which is where a device-resident fold length would be read -- is \
+            RESERVED and served by no driver here"]
 async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
     common::init_trace();
     let k = draft_k();
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -190,7 +204,7 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
 
-    let pie = common::boot_4090_mtp(k).await?;
+    let pie = common::boot_cuda_mtp(k).await?;
     let url = format!("ws://{}/v1/ws", pie.listen_addr);
 
     let setup = Client::connect_with_identity(&url, "test-user")
@@ -261,11 +275,19 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the RTX 4090; boots the MTP model with drafting disabled and \
-            checks that the mtp_logits intrinsic is then refused"]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog \
+            row whose checkpoint publishes fifteen `mtp.*` planes -- and that \
+            load refuses on the reference L40S with `Fault::OutOfMemory` at \
+            51.05 GiB against 43.87 free (palo build log 25f). Qwen3.5-0.8B \
+            loads as the plain `qwen35-d0.8b` dense row, so a drafting lane \
+            gets `Fault::Draftless` -- which is what this negative arm asserts, so it is blocked \
+            on the same fact its positive twin is. The `mtp-native-verify` \
+            guest is gone with the workspace move to `tests/inferlets` \
+            besides"]
 async fn mtp_logits_capability_false() -> Result<()> {
     common::init_trace();
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -288,7 +310,7 @@ async fn mtp_logits_capability_false() -> Result<()> {
     // hybrid model gates the SAME intrinsic through the SAME validator path, so
     // nothing is lost by pinning this test to the reachable configuration.
     //
-    let pie = common::boot_4090_mtp(0).await?;
+    let pie = common::boot_cuda_mtp(0).await?;
     let endpoint = format!("ws://{}/v1/ws", pie.listen_addr);
     let setup = Client::connect_with_identity(&endpoint, "test-user")
         .await

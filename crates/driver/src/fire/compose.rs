@@ -29,7 +29,9 @@
 //! classes this fire has no lanes in, and adds up counts. A mask that still
 //! straddles a gap — because the class between its members is present too, and
 //! the consumer was one P4 could not seat — simply becomes more than one
-//! launch, and [`WindowTable::segments`] is what says how many.
+//! launch, and [`WindowTable::spans`] is the list of them: one interval per
+//! launch, which is what `Fallback::Split { r }` asks for and what
+//! `driver::fire::walk` loops over.
 //!
 //! # What this is NOT allowed to be
 //!
@@ -205,53 +207,106 @@ impl WindowTable {
     /// — which is exactly what a windowed kernel takes: a pointer and an
     /// extent. `Ok(None)` is the empty window (a composition without this
     /// behavior in it), and `Err(runs)` is the mask P4 could not seat, naming
-    /// how many launches it would take instead. A caller that gets `Err` from
-    /// a plan whose [`FallbackTable`](model_compiler::FallbackTable) is empty
-    /// has a bake-integrity failure, not a slow path.
+    /// how many launches it would take instead.
     ///
-    /// Contiguity is checked against the classes NOT in the mask: a mask is
-    /// one run iff no absent class's rows stand inside the span its own
-    /// classes bound. Zero-row classes are invisible to that test, because a
-    /// class no lane is in occupies no rows to straddle — which is what makes
-    /// an all-decode fire's prefill mask an empty window rather than a
-    /// fragmented one.
+    /// **`Err` IS NOT THE END OF THE FIRE ANY MORE.** It is the question "can
+    /// this consumer be ONE launch", which is what a caller that has nowhere
+    /// to put a second one still needs to ask; the caller that can put one
+    /// there asks [`spans`](WindowTable::spans) instead and gets every run.
+    /// What an `Err` means about the ARTIFACT is read off
+    /// [`FallbackTable`](model_compiler::FallbackTable): a fragmented mask
+    /// with a row there is P4 saying "I could not seat this one, here is what
+    /// to do instead", and a fragmented mask with no row is a bake-integrity
+    /// failure, because P4 promised this mask consecutive and the fire found
+    /// it broken.
     ///
     /// # Errors
     ///
     /// The number of runs the mask covers, when that is more than one.
     pub fn span(&self, mask: &ClassSet) -> core::result::Result<Option<MaskSpan>, usize> {
-        let mut span = MaskSpan {
-            row_offset: u32::MAX,
-            rows: 0,
-            lane_offset: u32::MAX,
-            lanes: 0,
-        };
+        let runs = self.spans(mask);
+        match runs.len() {
+            0 => Ok(None),
+            1 => Ok(Some(runs[0])),
+            more => Err(more),
+        }
+    }
+
+    /// **EVERY interval this mask covers**, ascending — one per launch.
+    ///
+    /// THE SLOW PATH'S WHOLE ARITHMETIC. `Fallback::Split { r }` says a
+    /// consumer P4 could not seat runs `r` times, once per maximal interval of
+    /// its class set, and this is that list: the empty vector for a window no
+    /// lane is in, one entry for the consecutive case P4 exists to produce,
+    /// and `r` entries for the one it could not. A caller that walks it
+    /// dispatches the region's nodes once per entry, each over its own
+    /// pointer and extent, and the union of the entries is exactly the rows
+    /// [`rows_of`](WindowTable::rows_of) counts — which is the invariant that
+    /// makes the split a slow path rather than a different answer.
+    ///
+    /// Contiguity is decided by the offsets themselves: two of the mask's
+    /// classes are one run iff the second's rows begin where the first's end,
+    /// so a class the mask does NOT contain standing between them breaks the
+    /// run and a zero-row class does not. Zero-row classes are invisible
+    /// throughout — a class no lane is in occupies no rows to straddle, which
+    /// is what makes an all-decode fire's prefill mask an empty window rather
+    /// than a fragmented one, and what makes a fire that happens to carry no
+    /// lane in the class between two runs get ONE launch where the baked
+    /// order promises none.
+    ///
+    /// Rows and lanes break at the same places and are therefore merged
+    /// together rather than by two passes that could disagree: a class with
+    /// rows has lanes (a lane contributes at least one row) and a class with
+    /// lanes has rows, so the two prefix sums have their gaps at exactly the
+    /// same classes.
+    #[must_use]
+    pub fn spans(&self, mask: &ClassSet) -> Vec<MaskSpan> {
+        let mut out = Vec::new();
+        self.spans_into(mask, &mut out);
+        out
+    }
+
+    /// [`spans`](WindowTable::spans), into a buffer the caller keeps.
+    ///
+    /// THE FIRE PATH'S FORM OF IT. `walk` asks this question once per region
+    /// of the template — hundreds of times per fire, twice for a shell that
+    /// captures — and a `Vec` per region is hundreds of allocations in front
+    /// of a launch that costs tens of microseconds. One buffer, reused down
+    /// the template, is the same answer with none of them.
+    pub fn spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
+        out.clear();
         for class in mask.iter() {
             let window = self.class(class);
             if window.rows == 0 {
                 continue;
             }
-            span.row_offset = span.row_offset.min(window.row_offset);
-            span.rows += window.rows;
-            span.lane_offset = span.lane_offset.min(window.lane_offset);
-            span.lanes += window.lanes;
-        }
-        if span.rows == 0 {
-            return Ok(None);
-        }
-        let straddles = self
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(class, window)| window.rows > 0 && !mask.contains(*class))
-            .any(|(_, window)| {
-                window.row_offset >= span.row_offset
-                    && window.row_offset < span.row_offset + span.rows
+            out.push(MaskSpan {
+                row_offset: window.row_offset,
+                rows: window.rows,
+                lane_offset: window.lane_offset,
+                lanes: window.lanes,
             });
-        if straddles {
-            return Err(self.segments(mask).len());
         }
-        Ok(Some(span))
+        out.sort_unstable_by_key(|span| span.row_offset);
+
+        // Merge in place: `open` is how many runs are settled, and the entry
+        // under it is the one still growing.
+        let mut open = 0usize;
+        for read in 0..out.len() {
+            let span = out[read];
+            let grows = open > 0 && {
+                let last = out[open - 1];
+                last.row_offset + last.rows == span.row_offset
+            };
+            if grows {
+                out[open - 1].rows += span.rows;
+                out[open - 1].lanes += span.lanes;
+            } else {
+                out[open] = span;
+                open += 1;
+            }
+        }
+        out.truncate(open);
     }
 
     /// The maximal contiguous row runs this mask covers, ascending.
@@ -260,30 +315,21 @@ impl WindowTable {
     /// of the fire's class order comes back as a single [`RowSpan`] and its
     /// consumer is one launch over pointer+extent; a mask that straddles a
     /// class it does not contain comes back as two, and the consumer is two
-    /// launches — or a `Fallback` row, once P4 starts making promises and
-    /// owing them. Empty classes are dropped rather than splitting a run,
-    /// since a zero-row class occupies no rows to straddle.
+    /// launches — `Fallback::Split { r }`, which is the row P4 wrote for it.
+    ///
+    /// The row half of [`spans`](WindowTable::spans), and derived from it
+    /// rather than computed again: a second implementation of "where does
+    /// this window break" is a second answer waiting to disagree with the one
+    /// the launches are cut at.
     #[must_use]
     pub fn segments(&self, mask: &ClassSet) -> Vec<RowSpan> {
-        let mut spans: Vec<RowSpan> = mask
-            .iter()
-            .map(|c| self.class(c))
-            .filter(|w| w.rows > 0)
-            .map(|w| RowSpan {
-                offset: w.row_offset,
-                rows: w.rows,
+        self.spans(mask)
+            .into_iter()
+            .map(|span| RowSpan {
+                offset: span.row_offset,
+                rows: span.rows,
             })
-            .collect();
-        spans.sort_unstable_by_key(|s| s.offset);
-
-        let mut merged: Vec<RowSpan> = Vec::with_capacity(spans.len());
-        for span in spans {
-            match merged.last_mut() {
-                Some(open) if open.offset + open.rows == span.offset => open.rows += span.rows,
-                _ => merged.push(span),
-            }
-        }
-        merged
+            .collect()
     }
 }
 

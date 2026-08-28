@@ -53,6 +53,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSString",
     "NSError",
+    "NSRange",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
@@ -67,6 +68,13 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLLibrary",
     "MTLBlitCommandEncoder",
     "MTLTypes",
+    # The indirect command buffer plane (`crate::icb`): the buffer, the
+    # per-slot compute command, and the `MTLAllocation` supertrait a resource
+    # is declared resident through.
+    "MTLIndirectCommandBuffer",
+    "MTLIndirectCommandEncoder",
+    "MTLAllocation",
+    "MTLPipeline",
 ] }
 
 [dev-dependencies]

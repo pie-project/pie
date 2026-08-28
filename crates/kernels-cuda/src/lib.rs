@@ -24,6 +24,6 @@ pub mod linear;
 pub mod source;
 pub mod tensor;
 
-pub use jit::{Arg, ArgValue, Ctx, Fire, Launch};
+pub use jit::{Arg, ArgValue, Ctx, Fire, Launch, Slabs};
 pub use kernels::KernelError;
 pub use tensor::{KvPool, RaggedTensor, RecurrentPool, Tensor};

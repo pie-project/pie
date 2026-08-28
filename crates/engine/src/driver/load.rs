@@ -117,26 +117,82 @@ fn no_such_sku(sku: &str) -> String {
 /// (`ztensor_compat::index`), not a canonical `.zt`; `ztensor::Source::open`
 /// is the other door and refuses one. Both are tried, in that order, because
 /// the deployments this engine serves have both.
+///
+/// # ALL OF THE SHARDS, NOT THE FIRST ONE
+///
+/// `index` and `Source::open` each take ONE file, which is the whole of a
+/// single-container SKU and a silent lie about a sharded one: a fifteen-shard
+/// 27B publishes its embedding in `model-00001-of-00015.safetensors` and its
+/// final norm in the last, so an import contract built over the first shard
+/// alone refuses for a missing tensor that is on disk two files away — a
+/// sentence naming a param, when the fault is that this door never looked.
+/// So a directory of containers goes through `index_all`/`open_all`, which
+/// merge the set into one name space and refuse a name that is in two files.
+///
+/// A LONE CONTAINER STILL GOES THROUGH THE SINGLE-FILE DOOR, and not as a
+/// one-element set: `Source::merge` rebuilds the catalog and drops what a root
+/// says about itself, so the manifest a `.zt` root carries — its shard table,
+/// which `verify_shards` is the only reader of — would be traded for a merged
+/// projection that claims nothing. Every SKU in this build's catalog is one
+/// container, so that is the path essentially every load takes.
 fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
-    let container = if checkpoint.is_dir() {
-        let mut found: Vec<PathBuf> = std::fs::read_dir(checkpoint)
-            .with_context(|| format!("read the checkpoint directory {checkpoint:?}"))?
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                let name = path.file_name()?.to_str()?;
-                (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
-            })
-            .collect();
-        found.sort();
-        found.into_iter().next().ok_or_else(|| {
-            anyhow!("{checkpoint:?} holds no `.safetensors` and no `.zt` container")
-        })?
-    } else {
-        checkpoint.to_path_buf()
-    };
-    ztensor_compat::index(&container)
-        .or_else(|_| ztensor::Source::open(&container))
-        .with_context(|| format!("open {container:?} as a tensor container"))
+    let containers = containers(checkpoint)?;
+    if let [container] = containers.as_slice() {
+        return ztensor_compat::index(container)
+            .or_else(|_| ztensor::Source::open(container))
+            .with_context(|| format!("open {container:?} as a tensor container"));
+    }
+    ztensor_compat::index_all(&containers)
+        .or_else(|_| ztensor::Source::open_all(&containers))
+        .with_context(|| {
+            format!(
+                "open the {} containers under {checkpoint:?} as one tensor name space",
+                containers.len()
+            )
+        })
+}
+
+/// Which files on disk make up this checkpoint, in the order that fixes the
+/// merged name space.
+///
+/// Sorted, because a shard set has to open the same way twice: `index_all`
+/// numbers its stores by position, and a `read_dir` order is the filesystem's
+/// and not the checkpoint's.
+///
+/// A directory holding `model.zt` is ONE container and not a set, which is
+/// `model_loader::checkpoint::read::discover`'s own rule and is followed here
+/// so that the source this module opens and the metadata
+/// [`checkpoint_metadata`] parses never disagree about what the checkpoint is:
+/// a `.zt` root resolves its own data shards positionally, and handing those
+/// shards to `index_all` beside the root would offer the same tensor twice and
+/// be refused for a collision the checkpoint does not have.
+///
+/// # Errors
+///
+/// A directory that cannot be read, or one that holds no container at all.
+fn containers(checkpoint: &Path) -> Result<Vec<PathBuf>> {
+    if !checkpoint.is_dir() {
+        return Ok(vec![checkpoint.to_path_buf()]);
+    }
+    let root = checkpoint.join("model.zt");
+    if root.is_file() {
+        return Ok(vec![root]);
+    }
+    let mut found: Vec<PathBuf> = std::fs::read_dir(checkpoint)
+        .with_context(|| format!("read the checkpoint directory {checkpoint:?}"))?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
+        })
+        .collect();
+    found.sort();
+    if found.is_empty() {
+        return Err(anyhow!(
+            "{checkpoint:?} holds no `.safetensors` and no `.zt` container"
+        ));
+    }
+    Ok(found)
 }
 
 /// Which SKU a checkpoint is, by asking every import in the catalog **and
@@ -293,4 +349,95 @@ pub fn request_for(
         budgets,
         ordinal,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-tensor safetensors container, written by hand.
+    ///
+    /// The format is `[header_len: u64 LE][JSON header][data]`, and the
+    /// projection is strict about the tail — the tensor ranges must tile the
+    /// data section exactly and end at EOF — so the payload is sized from the
+    /// header and nothing is padded after it. Written rather than fetched
+    /// because the shard question is about NAMES, and a name space needs no
+    /// weights: this fixture is what lets the gate below run on a machine with
+    /// no GPU and no 27B snapshot in its cache.
+    fn shard(dir: &Path, file: &str, tensor: &str) -> PathBuf {
+        let header = format!(
+            "{{{tensor:?}:{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}}}"
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        let path = dir.join(file);
+        std::fs::write(&path, bytes).expect("the fixture container writes");
+        path
+    }
+
+    /// **THE REGRESSION THIS MODULE EXISTS TO HOLD** (build log 25): a sharded
+    /// checkpoint is every shard, and `open_source` took the first one.
+    ///
+    /// The second shard here is the final norm, which is exactly where a
+    /// fifteen-shard 27B keeps it — under the old door the contract algebra
+    /// was told the tensor does not exist, and refused naming a param instead
+    /// of naming the file that was never opened.
+    #[test]
+    fn a_sharded_checkpoint_opens_as_the_union_of_its_shards() {
+        let snapshot = tempfile::tempdir().expect("a temp dir");
+        shard(
+            snapshot.path(),
+            "model-00001-of-00002.safetensors",
+            "model.embed_tokens.weight",
+        );
+        shard(
+            snapshot.path(),
+            "model-00002-of-00002.safetensors",
+            "model.norm.weight",
+        );
+
+        let source = open_source(snapshot.path()).expect("both shards open as one name space");
+        let names: Vec<&str> = source.names().collect();
+        assert_eq!(
+            names,
+            vec!["model.embed_tokens.weight", "model.norm.weight"],
+            "the source is not the union of the shards, so an import contract \
+             would refuse for a tensor that is on disk"
+        );
+    }
+
+    /// The single-container SKU — every row this build's catalog ships — reads
+    /// the way it always did, one file through the one-file door.
+    #[test]
+    fn a_lone_container_is_still_read_whole() {
+        let snapshot = tempfile::tempdir().expect("a temp dir");
+        let only = shard(snapshot.path(), "model.safetensors", "model.norm.weight");
+
+        for checkpoint in [snapshot.path(), only.as_path()] {
+            let source = open_source(checkpoint).expect("the container opens");
+            let names: Vec<&str> = source.names().collect();
+            assert_eq!(
+                names,
+                vec!["model.norm.weight"],
+                "a one-file checkpoint answers differently through {checkpoint:?}"
+            );
+        }
+    }
+
+    /// A directory with nothing to open still says so in the checkpoint's own
+    /// terms: the shard path must not turn "no container here" into a merge
+    /// refusal about an empty set.
+    #[test]
+    fn a_directory_holding_no_container_is_refused_by_name() {
+        let snapshot = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(snapshot.path().join("config.json"), b"{}").expect("the fixture writes");
+
+        let refused = open_source(snapshot.path()).expect_err("there is nothing to open");
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains("holds no `.safetensors` and no `.zt` container"),
+            "the refusal does not name what is missing: {said}"
+        );
+    }
 }

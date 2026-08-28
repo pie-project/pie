@@ -167,18 +167,26 @@ fn finite(logits: &[f32], what: &str) {
     );
 }
 
-/// ONE SHELL AT A TIME, PER PROCESS.
+/// ONE TEST AT A TIME, PER PROCESS — AND IT IS ABOUT VRAM NOW, NOT ABOUT
+/// CORRECTNESS.
 ///
-/// `kernels-cuda`'s scratch slabs are process-global and keyed by name
-/// (`Ctx::scratch`), and the dense autotuner keeps one device state beside
-/// them — so two shells firing at once on two streams stage into the same
-/// bytes and both produce fluent garbage. Measured, not assumed: run these
-/// three tests in parallel and the continuation comes back
-/// `"PPP is目前是. \{ a a \)"`; serialize them and it is ` Paris`.
+/// It used to be about correctness. `kernels-cuda`'s scratch slabs were
+/// process-global and keyed by NAME (`Ctx::scratch`), and the dense
+/// autotuner's cuBLASLt workspace was one buffer per device beside them — so
+/// two shells firing at once on two streams staged into the same bytes and
+/// both produced fluent garbage. Measured, not assumed: run these tests in
+/// parallel and the continuation came back `"PPP is目前是. \{ a a \)"`;
+/// serialize them and it was ` Paris`.
 ///
-/// It is a real constraint of the plane and not of this test, which is why
-/// the engine's own GPU suite is thirty binaries rather than one. Held here
-/// so that a plain `cargo test` is green without an operator remembering
+/// A slab is keyed by `(arena, name, stream)` now — one arena per CUDA
+/// context, one slab per stream inside it — and the Lt workspace is one of
+/// them, so two shells share nothing. [`two_shells_firing_at_once_say_what_each_says_alone`]
+/// is that claim as a test rather than as a comment, and it deliberately does
+/// NOT serialize its two shells.
+///
+/// What is left is arithmetic: every test here loads its own 1.7 GB of
+/// weights, and four of them at once is four copies on one card. Held so that
+/// a plain `cargo test` is green without an operator remembering
 /// `--test-threads 1`.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -598,5 +606,93 @@ fn three_lanes_two_decoding_and_one_prefilling_agree_with_their_solo_runs() {
         "decode lane 1 said {:?} alone and {:?} in a mixed fire",
         tokenizer.decode(&alone.1, false),
         tokenizer.decode(&together.1, false),
+    );
+}
+
+/// **TWO SHELLS IN ONE PROCESS, FIRING AT THE SAME INSTANT, AND NEITHER SAYS
+/// THE OTHER'S WORDS.**
+///
+/// This test could not be written before. Build log 18 recorded "one shell
+/// per process (kernels-cuda scratch slabs are process-global — measured,
+/// documented in `serve.rs`)" as a standing property of the plane, and
+/// [`ONE_AT_A_TIME`] above is the workaround it forced on every suite in the
+/// tree. The slabs are per `(arena, name, stream)` now and the arena is the
+/// CUDA context, so the property is supposed to be gone — and the only way to
+/// say that is to break the rule on purpose.
+///
+/// **TWO THREADS, NOT TWO INTERLEAVED CALLS.** A shell synchronizes its
+/// stream at the end of every fire, so two shells driven in turn from one
+/// thread would never have two launches in flight and a shared slab would
+/// never be observed. The garbling needs real overlap, which needs two
+/// threads — and a `Context` binds the thread that will fire it
+/// (`cudaSetDevice` is per-thread), so each thread loads its own.
+///
+/// **THE GOLDEN IS THE SAME PROCESS, NOT A PINNED STRING.** Both prompts are
+/// run first on one shell, alone, and the two concurrent continuations are
+/// diffed against those — so a machine, a driver version or a checkpoint that
+/// answers something else still tests the property this is for. The two
+/// prompts DIFFER, because two shells computing the same continuation would
+/// agree whether or not they were staging over each other.
+#[test]
+fn two_shells_firing_at_once_say_what_each_says_alone() {
+    // Held against the OTHER tests in this file — four shells at once is four
+    // copies of the weights — and released inside for the two of its own.
+    let _serial = serialized();
+    let Some((mut shell, tokenizer)) = ready("the two-shell gate") else {
+        return;
+    };
+    const STEPS: usize = 12;
+    let first = tokenizer.encode(PROMPT);
+    let second = tokenizer.encode("The largest planet in the solar system is");
+    assert_ne!(first, second, "two shells saying one thing prove nothing");
+
+    let alone = (
+        solo(&mut shell, 0, &first, STEPS),
+        solo(&mut shell, 1, &second, STEPS),
+    );
+    // The golden's shell goes away before the two under test load, so the
+    // card holds two sets of weights rather than three.
+    drop(shell);
+
+    let gate = std::sync::Barrier::new(2);
+    let arm = |what: &'static str, prompt: &[u32]| {
+        let Some((mut shell, _)) = ready(what) else {
+            return None;
+        };
+        // Both shells are loaded and warm before either fires, so the
+        // overlap is the fires and not the loads.
+        gate.wait();
+        Some(solo(&mut shell, 0, prompt, STEPS))
+    };
+
+    let (left, right) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| arm("the two-shell gate's first shell", &first));
+        let b = scope.spawn(|| arm("the two-shell gate's second shell", &second));
+        (
+            a.join().expect("the first shell's thread finishes"),
+            b.join().expect("the second shell's thread finishes"),
+        )
+    });
+    let (Some(left), Some(right)) = (left, right) else {
+        eprintln!("skipping the two-shell gate: a second shell would not load");
+        return;
+    };
+
+    eprintln!(
+        "concurrent: {:?} / {:?}",
+        tokenizer.decode(&left, false),
+        tokenizer.decode(&right, false),
+    );
+    assert_eq!(
+        alone.0, left,
+        "the first shell said {:?} alone and {:?} beside a second shell",
+        tokenizer.decode(&alone.0, false),
+        tokenizer.decode(&left, false),
+    );
+    assert_eq!(
+        alone.1, right,
+        "the second shell said {:?} alone and {:?} beside a first shell",
+        tokenizer.decode(&alone.1, false),
+        tokenizer.decode(&right, false),
     );
 }

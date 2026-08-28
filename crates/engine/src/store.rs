@@ -6,6 +6,8 @@
 //!   abort protocol over the physical KV page pool.
 //! - `rs`: `RsStore` — the recurrent-state slot store (GDN/Mamba2 folded
 //!   state) with the same prepare/commit/abort protocol.
+//! - [`seat`]: `SeatBook` — which pool slot each working set's sequences sit
+//!   in, which is what `Lane::slot` states to a shell.
 //! - `pool`/`genmap`: the physical-id free list and generational key map the
 //!   typed stores are built on.
 //! - `registry`: per-(model, driver) lookup of the owning `KvStore`/`RsStore`.
@@ -18,6 +20,7 @@ pub(crate) mod kv;
 pub(crate) mod pool;
 pub(crate) mod registry;
 pub(crate) mod rs;
+pub(crate) mod seat;
 
 /// Stable identity for one pipeline ownership scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -106,6 +106,76 @@ impl Fire {
     }
 }
 
+/// **ONE CONTEXT'S SCRATCH SLABS**, minted by [`Slabs::open`] and freed by
+/// [`Slabs::release`].
+///
+/// A scratch slab is the workspace an entry may not allocate per fire, and
+/// the question this handle answers is WHOSE. It used to be nobody's: the
+/// slabs were keyed by a static name and shared by every `Ctx` in the
+/// process, so two shells staged into one another's planes and both computed
+/// (build log 18 measured the garbage; the tree's workaround was one shell
+/// per process). An arena makes the sharing explicit — one per CUDA context,
+/// and within it one slab per `(name, stream)`, which is the other half of
+/// the same key (build log 24's `EXCLUSIVE` list existed only because two
+/// forked arms shared a name).
+///
+/// Handles are `Copy` and mean nothing but an identity; the storage is
+/// process-global behind them, like the jit cache beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Slabs(u32);
+
+impl Slabs {
+    /// **THE ARENA A BARE [`Ctx::on`] FIRES AGAINST.** Shared by everything
+    /// that never asked for one of its own — the model-loader's transform
+    /// executor, benches, a test that wants a stream and nothing else — and
+    /// still per stream inside, so sharing it is not sharing a slab.
+    pub const PROCESS: Slabs = Slabs(0);
+
+    /// A fresh arena, disjoint from every other. One per `Context`.
+    #[must_use]
+    pub fn open() -> Slabs {
+        static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+        Slabs(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Tell this arena it fires on `stream` too.
+    ///
+    /// **CALL IT BEFORE THE FIRST FIRE ON THAT STREAM.** Growth is broadcast
+    /// across an arena's attached streams — that is what lets the shell's
+    /// EAGER warm pass, which runs on one stream, size the slabs the CAPTURE
+    /// pass will read on the others (`jit::device`'s header argues it). A
+    /// stream attached late gets its slab on the name's next growth, and a
+    /// capture is where there is no next growth.
+    ///
+    /// # Safety
+    ///
+    /// `stream` must be a live `cudaStream_t`, and must not outlive this
+    /// arena's [`release`](Slabs::release).
+    pub unsafe fn attach(self, stream: *mut c_void) {
+        #[cfg(feature = "_cuda")]
+        {
+            crate::jit::device::attach(self.0, stream);
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            let _ = stream;
+        }
+    }
+
+    /// Free every slab in this arena.
+    ///
+    /// The context's teardown, and nothing else: a slab is read only by a
+    /// launch enqueued on one of the arena's own streams, so a context that
+    /// has synchronized has nothing left pointing at one. Freeing is what
+    /// makes a second shell in one process cost what the first did.
+    pub fn release(self) {
+        #[cfg(feature = "_cuda")]
+        {
+            crate::jit::device::release(self.0);
+        }
+    }
+}
+
 /// The stream and its companions. Long-lived state (jit cache, scratch
 /// slabs, device probes) is process-global behind it; the `Ctx` itself is
 /// what a driver `Run` builds per fire and lends to every entry.
@@ -113,6 +183,7 @@ pub struct Ctx {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: *mut c_void,
+    slabs: Slabs,
 }
 
 impl Ctx {
@@ -125,7 +196,16 @@ impl Ctx {
             stream,
             cublas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
+            slabs: Slabs::PROCESS,
         }
+    }
+
+    /// The same context, firing against `slabs` rather than the process
+    /// arena — what a shell that opened its own [`Slabs`] hands every entry.
+    #[must_use]
+    pub const fn with_slabs(mut self, slabs: Slabs) -> Self {
+        self.slabs = slabs;
+        self
     }
 
     /// # Safety
@@ -168,20 +248,27 @@ impl Ctx {
         Ok(self.comm)
     }
 
-    /// A named process-global scratch slab, grown but never shrunk — the
-    /// workspace an entry may not allocate per fire (graph capture forbids
-    /// it).
+    /// A named scratch slab, grown but never shrunk — the workspace an entry
+    /// may not allocate per fire (graph capture forbids it).
+    ///
+    /// **THE KEY IS `(arena, name, stream)`, AND NONE OF THE THREE IS
+    /// DECORATION.** The arena is this context's [`Slabs`], so two shells in
+    /// one process no longer stage into one another's planes; the stream is
+    /// the one this `Ctx` fires on, so two arms of a P6 fork group get two
+    /// slabs and the compiler no longer has to order them apart. `jit::device`
+    /// carries the measurements both halves come from.
     ///
     /// **The contract, both ways.** Growth is `cudaFree` + `cudaMalloc`,
     /// which would poison a capture in progress. The driver's side: warm
     /// every scratch-consuming entry with an eager fire at full fire shape
     /// before capturing, so a captured fire only ever re-reads a slab that
-    /// is already big enough. This plane's side: the cheap runtime guard in
+    /// is already big enough — and the warm pass may fire on ONE stream,
+    /// because growth is broadcast across every stream the arena has been
+    /// told about. This plane's side: the cheap runtime guard in
     /// `device::take` — if this context's stream is mid-capture
     /// (`cudaStreamIsCapturing`) and the slab would have to grow, the fire
     /// comes back as a [`KernelError::Backend`] refusal naming the
     /// un-warmed slab instead of corrupting the capture.
-    #[allow(clippy::unused_self)]
     pub fn scratch(
         &self,
         op: &'static str,
@@ -190,13 +277,20 @@ impl Ctx {
     ) -> Result<*mut c_void, KernelError> {
         #[cfg(feature = "_cuda")]
         {
-            crate::jit::device::take(self.stream, name, bytes).map_err(|fault| fault.at(op))
+            crate::jit::device::take(self.slabs.0, self.stream, name, bytes)
+                .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "_cuda"))]
         {
             let _ = (name, bytes);
             Err(crate::jit::runtimeless(op))
         }
+    }
+
+    /// Which arena this context's slabs come from.
+    #[must_use]
+    pub const fn slabs(&self) -> Slabs {
+        self.slabs
     }
 
     #[allow(clippy::unused_self)]

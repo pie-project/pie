@@ -23,9 +23,33 @@
 //! a property of the machine, and a test that pins it would fail on the next
 //! one.
 //!
-//! `#[ignore]` (needs cuda + a resident qwen3). Run:
+//! # AND IT IS THE TREE'S ONE COVER FOR CONCURRENT MULTI-LANE SERVING
+//!
+//! A fourth thing it catches, which is not about sweeping at all and is why
+//! the census wave left it RED rather than `#[ignore]`d: eight guests
+//! arriving at once co-batch, so this is the only gate in the tree that fires
+//! a submission carrying more than one member's lanes through the serving
+//! door. It found that such a fire was refused outright —
+//!
+//! ```text
+//! 4 of 8 lanes failed during warmup; the fleet cannot run here at all.
+//!   4x text-completion@0.1.0 returned an error: ... direct launch rejected:
+//!   invalid submission: slot 0 appears twice in one fire, at lane 1
+//! ```
+//!
+//! — because `Lane::slot`, the sequence's seat in the shell's pools, had no
+//! owner: both engine fire paths stated zero and the caller their comments
+//! said would stamp it did not exist. `palo` build log 29 gave the seat to
+//! the KV working set (`engine::store::seat`), which is the engine's
+//! per-sequence identity, and this gate is GREEN on it: four rounds, eight
+//! lanes each, `failed 0`. Keep it that way — a regression here is the
+//! defect coming back, and the host-side half of the same claim is
+//! `engine::scheduler::batch`'s
+//! `two_seated_members_batch_into_a_fire_the_contract_accepts`.
+//!
+//! `#[ignore]` (needs a CUDA device and the Qwen3.5-0.8B snapshot). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
-//!     cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!     cargo test -p pie-gpu-tests --features driver-cuda-13 --release \
 //!     --test cuda_sweep_e2e -- --ignored --nocapture
 
 mod common;
@@ -37,7 +61,12 @@ use anyhow::{Context, Result};
 use client::client::Client;
 use pie::sweep::{self, Knobs};
 
-const GENERATE: &str = "generate@0.1.0";
+/// The program every lane runs. It was `generate@0.1.0`, a package deleted
+/// with the guest workspace's move from `crates/engine/tests/inferlets` to
+/// `tests/inferlets`; `text-completion` replaces it. Nothing here reads the
+/// guest's answer — the assertions are all `sweep::Round` — so the repoint is
+/// a package name and the shape of the budget it is handed.
+const GENERATE: &str = "text-completion@0.1.0";
 
 /// Lanes per round. Small enough that a round is seconds, large enough that
 /// lanes co-batch — a single lane never exercises the frame knobs at all,
@@ -81,25 +110,26 @@ fn probe_candidates() -> Vec<Knobs> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "needs a GPU, a built model in PIE_HOME and a wasm guest built on the spot"]
+#[ignore = "the sweep gate: needs a CUDA device, the Qwen3.5-0.8B snapshot and a \
+            wasm guest built on the spot"]
 async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result<()> {
     common::init_trace();
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     anyhow::ensure!(
         Command::new("cargo")
-            .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
+            .args(["build", "--target", "wasm32-wasip2", "-p", "text-completion"])
             .current_dir(&ws)
             .status()?
             .success(),
-        "generate wasm build failed"
+        "text-completion wasm build failed"
     );
-    let wasm = ws.join("target/wasm32-wasip2/debug/generate.wasm");
-    let manifest = ws.join("generate/Pie.toml");
+    let wasm = ws.join("target/wasm32-wasip2/debug/text_completion.wasm");
+    let manifest = ws.join("text-completion/Pie.toml");
 
     // ONE boot. Everything after this is the claim under test: the expensive
     // thing happens once and the cheap thing repeats.
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     let addr = pie.listen_addr.to_string();
 
     let setup = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "sweep-e2e").await?;
@@ -110,9 +140,14 @@ async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result
         .context("add_program")?;
     drop(setup);
 
-    // A bare integer budget makes the generate inferlet decode that many
-    // tokens, so a lane lives long enough to co-batch with its neighbours.
-    let inputs: Vec<String> = (0..FLEET).map(|_| "48".to_string()).collect();
+    // Forty-eight tokens a lane, so a lane lives long enough to co-batch with
+    // its neighbours — a lane that finishes before the fleet forms measures the
+    // knobs against nothing. It is a `max_tokens` field rather than the bare
+    // integer the deleted `generate` guest parsed, because `text-completion`
+    // reads a JSON document.
+    let inputs: Vec<String> = (0..FLEET)
+        .map(|_| serde_json::json!({ "max_tokens": 48 }).to_string())
+        .collect();
 
     // Discarded. Without it the first round measured 844 tok/s and the same
     // configuration measured 1228 at the end of the sweep — see `sweep::warmup`.

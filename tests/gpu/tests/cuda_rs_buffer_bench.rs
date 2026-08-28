@@ -23,7 +23,7 @@ use client::client::Client;
 mod common;
 
 fn build_inferlet() -> Result<std::path::PathBuf> {
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -46,7 +46,7 @@ async fn run_arms(inputs: &[&str]) -> Result<Vec<std::result::Result<String, Str
     common::init_trace();
     let ws = build_inferlet()?;
 
-    let pie = common::boot_4090_mtp(common::mtp_draft_tokens(3)).await?;
+    let pie = common::boot_cuda_mtp(common::mtp_draft_tokens(3)).await?;
     eprintln!(
         "[rs-buffer-bench] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr
@@ -111,7 +111,13 @@ fn head(result: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a GPU + Qwen3.5-0.8B (GDN backbone) in the HF cache"]
+#[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
+            `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
+            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and no driver in \
+            this tree serves a bit of it, so a recurrent fold that reads its \
+            length off a buffered slot has no port to read. The \
+            `rs-buffer-bench` guest is gone with the workspace move to \
+            `tests/inferlets` besides"]
 async fn buffering_a_token_costs_what_it_costs() -> Result<()> {
     // A warm arm first: the very first arm on a fresh engine pays for lazy
     // graph capture and first-touch allocation, and charging that to whichever

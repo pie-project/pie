@@ -1,6 +1,6 @@
 //! #31 greedy-v0 self-spec verify e2e — DEVICE-ALIAS draft source, GPU (delta).
 //!
-//! Boots the 4090 + real driver and launches the `selfspec` inferlet, which drives
+//! Boots the standalone over the real CUDA shell and launches the `selfspec` inferlet, which drives
 //! `mtp_self_spec_greedy_observable` (foxtrot's A2 keystone) through echo's
 //! `SelfSpecDraftInput` resolver — the verify's `[k]` drafts are DEVICE-RESIDENT off
 //! `pi.tokens + sample_row + 1` (the input tokens after the anchor), source-selected
@@ -35,13 +35,21 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "#31 greedy-v0 self-spec verify: needs the 4090 + cuda + qwen-3-0.6b + the SelfSpecDraftInput device-alias resolver"]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog row \
+            whose checkpoint publishes fifteen `mtp.*` planes -- and that load \
+            refuses on the reference L40S with `Fault::OutOfMemory` at 51.05 GiB \
+            against 43.87 free (palo build log 25f). Qwen3.5-0.8B loads as the \
+            plain `qwen35-d0.8b` dense row, so a drafting lane gets \
+            `Fault::Draftless`, and the `SelfSpecDraftInput` resolver that \
+            aliased the drafts off `pi.tokens` went with the C++ shell -- as did \
+            the `selfspec` guest"]
 async fn self_spec_device_alias_verify_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!("[self-spec] booted, listen_addr={}", pie.listen_addr);
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "selfspec"])
         .current_dir(&ws)

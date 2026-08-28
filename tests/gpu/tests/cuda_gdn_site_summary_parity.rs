@@ -78,7 +78,11 @@ fn parse_generated_tokens(result: &str) -> Option<Vec<u32>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a CUDA GPU + qwen3.5-0.8b-base; run gate-OFF then gate-ON"]
+#[ignore = "BLOCKED, and not on hardware: the OFF/ON polarity is \
+            `PIE_DECLARED_FORWARD`, an environment switch no crate in this tree \
+            reads any more -- the declared model text is the only forward there \
+            is -- and the `generate-gdn` guest both arms drove is gone with the \
+            workspace move to `tests/inferlets`"]
 async fn gdn_site_summary_parity() -> Result<()> {
     common::init_trace();
     // `unwrap_or(false)` is CORRECT HERE and must not be "fixed" to match
@@ -103,7 +107,7 @@ async fn gdn_site_summary_parity() -> Result<()> {
     // generate-gdn: the greedy decode that binds BOTH working sets (KV +
     // recurrent state) — the hybrid's linear-attention layers need
     // runtime-assigned rs_cache slots (see cuda_mtp_stage1).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "generate-gdn"])
         .current_dir(&ws)

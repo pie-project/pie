@@ -35,6 +35,28 @@ pub(crate) type Slab = Retained<ProtocolObject<dyn MTLBuffer>>;
 #[cfg(not(target_vendor = "apple"))]
 pub(crate) type Slab = ();
 
+/// The identity of one reservation, as a number two recordings can compare.
+///
+/// A [`Recording`](crate::record::Recording) has to say whether two walks
+/// bound the SAME reservation at two offsets or two different reservations,
+/// and the only thing that answers that off the retained object is its
+/// address. It is never dereferenced and never used as an offset — equality
+/// is the whole contract, and the retain a `Slab` carries is what makes the
+/// address stable for the life of the load.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn slab_id(slab: &Slab) -> u64 {
+    let object: &objc2::runtime::ProtocolObject<dyn MTLBuffer> = slab;
+    std::ptr::from_ref(object).cast::<u8>() as u64
+}
+
+/// The identity of one reservation — off Apple there are no reservations, so
+/// every one of them is the same one.
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn slab_id(slab: &Slab) -> u64 {
+    let _ = slab;
+    0
+}
+
 /// One device reservation: a buffer and its length.
 ///
 /// Cloning is a RETAIN, not a copy — the same bytes under a second owner,

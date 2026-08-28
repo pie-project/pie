@@ -46,8 +46,36 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
         Ok(Ok(model::model().detokenize(&tokens)))
     }
 
+    /// **THE WHOLE TABLE, AND IT IS THE EXPENSIVE DOOR.** A quarter of a
+    /// million records is ~20 ms of engine time before wasmtime has lowered
+    /// anything, so it goes to the blocking pool unconditionally — the
+    /// threshold above exists to decide when a call is worth a `spawn_blocking`
+    /// and this one always is. The table itself is built once per engine
+    /// ([`crate::model::Model::get_vocabs`]); what is left is the copy the WIT
+    /// surface's owned list requires.
     async fn vocabs(&mut self) -> Result<Vec<pie::inferlet::tokenizer::Token>> {
-        Ok(token_table(model::model().get_vocabs()))
+        Ok(tokio::task::spawn_blocking(|| token_table(model::model().get_vocabs())).await?)
+    }
+
+    /// The bytes of the tokens a caller names, at the size of the question.
+    ///
+    /// Inline, and not for a threshold's sake: a caller asks for the tokens it
+    /// rolled back, which is one or two.
+    async fn token_bytes(&mut self, tokens: Vec<u32>) -> Result<Vec<Vec<u8>>> {
+        Ok(model::model().token_bytes(&tokens))
+    }
+
+    /// The byte-prefix query token healing was shipping a vocabulary to ask
+    /// ([`crate::model::Model::tokens_with_prefix`] argues it).
+    ///
+    /// One pass over the cached table — the same order of work as a long
+    /// detokenize and, like it, on the blocking pool rather than holding an
+    /// async worker for its duration.
+    async fn tokens_with_prefix(&mut self, prefix: Vec<u8>) -> Result<Vec<u32>> {
+        Ok(
+            tokio::task::spawn_blocking(move || model::model().tokens_with_prefix(&prefix))
+                .await?,
+        )
     }
 
     async fn split_regex(&mut self) -> Result<String> {

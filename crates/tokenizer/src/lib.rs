@@ -560,6 +560,33 @@ impl Tokenizer {
         self.bpe.id_to_bytes(id).map(|s| s.to_vec())
     }
 
+    /// Every token id whose bytes begin with `prefix`, ascending.
+    ///
+    /// **THE QUERY A CALLER WOULD OTHERWISE SHIP A VOCABULARY TO ASK.** Token
+    /// healing rolls a prompt back by a token or two and re-expands it under
+    /// the mask of every token that reproduces the rolled-back BYTES as a
+    /// prefix. That guest was building the mask from a copy of the whole
+    /// table — a quarter of a million records lowered across a component
+    /// boundary and looped over twice, ~115 ms of a 158 ms per-launch
+    /// constant (pie's palo build log 23) — where this is one pass over the
+    /// table that already exists, and borrows every token rather than
+    /// copying it.
+    ///
+    /// The answer is the same SET that loop produced: the ids this table
+    /// holds whose bytes start with `prefix`, and no others. An empty prefix
+    /// therefore matches the whole vocabulary, because every byte string
+    /// starts with nothing — a caller whose prefix may be empty has to say
+    /// what it wants, and cannot get it by accident.
+    pub fn ids_with_prefix(&self, prefix: &[u8]) -> Vec<u32> {
+        (0..self.bpe.vocab_size() as u32)
+            .filter(|id| {
+                self.bpe
+                    .id_to_bytes(*id)
+                    .is_some_and(|bytes| bytes.starts_with(prefix))
+            })
+            .collect()
+    }
+
     /// Look up an ID → token string (lossy UTF-8 conversion).
     pub fn id_to_token_str(&self, id: u32) -> Option<String> {
         self.bpe
@@ -894,6 +921,64 @@ fn drain_utf8(pending: &mut Vec<u8>, output: &mut Vec<u8>, finish: bool) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **THE PREFIX QUERY IS THE LOOP IT REPLACES**, asked of the same table.
+    ///
+    /// [`Tokenizer::ids_with_prefix`] exists so a guest need not copy a
+    /// quarter of a million records to compute a set; the only thing that
+    /// makes that a saving rather than a change is that the set is identical.
+    /// So the oracle here is written the way the caller used to write it —
+    /// walk `0..vocab_size`, take `id_to_token`, test `starts_with` — and the
+    /// two are diffed over every prefix a fixture vocabulary can pose,
+    /// including the empty one (which matches everything) and one no token
+    /// carries (which matches nothing).
+    #[test]
+    fn the_prefix_query_answers_what_a_walk_of_the_whole_table_answers() {
+        let vocab: Vec<String> = ["he", "hell", "hello", "help", "world", "", "h"]
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect();
+        let tokenizer = Tokenizer::from_vocab(&vocab);
+
+        let walked = |prefix: &[u8]| -> Vec<u32> {
+            (0..tokenizer.vocab_size() as u32)
+                .filter(|id| {
+                    tokenizer
+                        .id_to_token(*id)
+                        .is_some_and(|bytes| bytes.starts_with(prefix))
+                })
+                .collect()
+        };
+
+        for prefix in [
+            &b""[..],
+            b"h",
+            b"he",
+            b"hel",
+            b"hell",
+            b"hello",
+            b"help",
+            b"w",
+            b"zzz",
+            &[0xffu8][..],
+        ] {
+            assert_eq!(
+                tokenizer.ids_with_prefix(prefix),
+                walked(prefix),
+                "the prefix query and the whole-table walk disagree on {prefix:?}"
+            );
+        }
+
+        // And it is not vacuous in either direction: `h` names more than one
+        // token and `zzz` names none.
+        assert!(tokenizer.ids_with_prefix(b"hel").len() >= 3);
+        assert!(tokenizer.ids_with_prefix(b"zzz").is_empty());
+        assert_eq!(
+            tokenizer.ids_with_prefix(b"").len(),
+            walked(b"").len(),
+            "an empty prefix is every token the table holds"
+        );
+    }
 
     fn make_byte_tokenizer(
         vocab: &[(&str, u32)],

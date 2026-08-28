@@ -1,4 +1,4 @@
-//! A4 mask-migration DEVICE e2e — real driver (4090). Second exercise of the
+//! A4 mask-migration DEVICE e2e — real driver. Second exercise of the
 //! token-at-a-time, B=1 explicit-write PTIR geometry the A4 mask inferlets
 //! migrated onto (superseding the classic `forward-pass` +
 //! `attention_mask(list<brle>)` surface). The `attention-sink` inferlet drives a
@@ -34,16 +34,20 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "A4 mask-migration device e2e: needs the 4090 + cuda + qwen-3-0.6b"]
+#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+            `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
+            Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
+            denotes, so the mask this guest puts on every fire is a port no \
+            shell in this tree resolves"]
 async fn attention_sink_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!(
         "[attention-sink-e2e] booted, listen_addr={}",
         pie.listen_addr
     );
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let dir = workspace.join("attention-sink");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "attention-sink"])

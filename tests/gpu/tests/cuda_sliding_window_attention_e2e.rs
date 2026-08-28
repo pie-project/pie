@@ -1,4 +1,4 @@
-//! A4 mask-migration DEVICE e2e — real driver (4090). First end-to-end exercise
+//! A4 mask-migration DEVICE e2e — real driver. First end-to-end exercise
 //! of the token-at-a-time, B=1 explicit-write PTIR geometry that the A4 mask
 //! inferlets migrated onto (superseding the classic `forward-pass` +
 //! `attention_mask(list<brle>)` surface). The `sliding-window-attention` inferlet
@@ -28,7 +28,7 @@
 //!
 //! # What it does on a box that HAS all of that, which is refuse
 //!
-//! Run on the reference 4090 with CUDA 13 and the qwen-3-0.6b snapshot -- so
+//! Run on the reference device with CUDA 13 and the shipping snapshot -- so
 //! with every precondition the `#[ignore]` reason used to name -- this gate
 //! boots, loads, spawns, and then dies inside the first fire:
 //!
@@ -38,27 +38,32 @@
 //! value
 //! ```
 //!
-//! That sentence is about the symptom. The claim behind it lived beside the
-//! old shell's `device_geometry_port_mask` and survives as
-//! `PortMask::DEVICE_GEOMETRY` in `crates/tensor-ir/src/registry.rs`:
+//! That sentence is about the symptom, and it names the wrong port because
+//! `EmbedTokens` is the first one the fire path reaches. The claim behind it
+//! is `crates/tensor-ir/src/registry.rs`, where a driver's served set is one
+//! of two constants and neither holds the port this file is about:
 //!
-//! > Exactly the three ports `fire::envelope::compose` reads -- `EmbedTokens |
-//! > Positions | KvLen`; the rest a decode derives from the positions.
-//! > `DEVICE_GEOMETRY_PORTS` is deliberately absent: it wins the pool-owned
-//! > class this driver does not build.
+//! > `DECODE_ENVELOPE`: the three ports a decode envelope resolves -- the
+//! > token ids, their positions, and each request's readable KV extent.
+//! >
+//! > `DEVICE_GEOMETRY`: the decode envelope plus the page table, the row
+//! > split, and the adapter routing.
 //!
-//! A program whose geometry evolves in-graph -- which is the entire subject of
-//! this file -- is exactly that class. Without the bit the engine classifies
-//! it as a host-evaluated decode, and a host cannot know what token the
-//! epilogue is about to sample. engine's vulkan seam (deleted at R3; back at P5) and
-//! `.../wgpu.rs` each carry a long note about paying for this twice and then
-//! building the machinery; `.../cuda.rs` has neither the note nor the bit.
+//! `Port::AttnMask` is in NEITHER. `driver-cuda::api` answers
+//! `GeometryClass::DecodeEnvelope` (palo build log 18: a decode-envelope
+//! lane's page table is the ENGINE's, so `bind_instance` refuses the wider
+//! class by name through `Capabilities::admits`), and a mask this guest
+//! re-derives in its epilogue and `put`s every fire is therefore a value the
+//! host is asked to know and cannot. The engine classifies the program as a
+//! host-evaluated decode and refuses at the first fire rather than running on
+//! a guess.
 //!
-//! So this is not a test waiting for a GPU. It is a test waiting for
-//! `driver-cuda` to build the pool-owned device-geometry class, and it will
-//! start passing the day the mask above grows `PIE_DEVICE_GEOMETRY_PORTS` and
-//! `PIE_DEVICE_PORT_ATTN_MASK`. Until then `crates/worker/tests/cuda_forward`
-//! carries an epitaph pointing here rather than a second copy of the failure.
+//! So this is not a test waiting for a GPU. It is a test waiting for a shell
+//! that resolves `Port::AttnMask` on the device, which is a `driver-cuda`
+//! `program/ports.rs` wave: build log 18 built that read for `EmbedTokens`
+//! alone and said which four of `DEVICE_GEOMETRY` it deliberately did not
+//! claim. `cuda_attention_sink_e2e` in this directory is blocked on the same
+//! port with a sink+window mask instead of a sliding one.
 
 mod common;
 
@@ -69,18 +74,21 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BLOCKED, and not on hardware: `driver-cuda` does not claim the \
-            pool-owned device-geometry class this program needs. See the \
-            section at the end of this file's header before running it"]
+#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+            `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
+            Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
+            denotes, so the window this guest puts on every fire is a port no \
+            shell in this tree resolves. See the section at the end of this \
+            file's header before running it"]
 async fn sliding_window_attention_on_real_driver() -> Result<()> {
     common::init_trace();
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_cuda().await?;
     eprintln!(
         "[sliding-window-attn-e2e] booted, listen_addr={}",
         pie.listen_addr
     );
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let dir = workspace.join("sliding-window-attention");
     let ok = Command::new("cargo")
         .args([

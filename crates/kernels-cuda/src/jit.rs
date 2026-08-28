@@ -26,7 +26,7 @@ pub mod nvrtc;
 mod root;
 
 pub use abi::{Arg, ArgValue};
-pub use ctx::{Ctx, Fire, Launch};
+pub use ctx::{Ctx, Fire, Launch, Slabs};
 pub use root::{Headers, Root, Toolchain};
 
 use kernels::KernelError;

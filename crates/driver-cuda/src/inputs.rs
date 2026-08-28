@@ -156,9 +156,11 @@ const ALIGN: u64 = 256;
 
 /// One plan value's grant, as offsets — turned into a [`Workspace`] once the
 /// store is allocated and its base address is known.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Grant {
-    int_at: u64,
+    /// One int carving per run of the region that builds this schedule, in
+    /// run order.
+    int_at: Vec<u64>,
     float_at: u64,
     float_bytes: u64,
 }
@@ -262,14 +264,33 @@ pub struct Inputs {
     mask_bytes: u64,
     mask_indptr: u64,
     spaces: Vec<SpaceAt>,
-    /// One grant per PLAN VALUE, by value id. Grants are disjoint carvings of
-    /// the shell's bounded pool because every schedule a fire builds is
-    /// staged at once and read at once; what changed in C1b is the KEY — a
-    /// family that carves two readings out of one page-id space (gemma's
-    /// sliding beside its global, gpt-oss's windowed beside its full) mints
-    /// two plan values, and two schedules sharing one grant would overwrite
-    /// each other's staged image between the prepare pass and the launch.
+    /// One grant per (RUN, PLAN VALUE), flat at `run * plan_values + value`.
+    /// Grants are disjoint carvings of the shell's bounded pool because every
+    /// schedule a fire builds is staged at once and read at once; what changed
+    /// in C1b is the KEY — a family that carves two readings out of one
+    /// page-id space (gemma's sliding beside its global, gpt-oss's windowed
+    /// beside its full) mints two plan values, and two schedules sharing one
+    /// grant would overwrite each other's staged image between the prepare
+    /// pass and the launch.
+    ///
+    /// **THE RUN IS THE SAME ARGUMENT ONE STEP FURTHER IN** (P4's fallback,
+    /// design §3). A region whose class set P4 could not seat carves one
+    /// schedule per interval of it, all of them staged in the prepare pass and
+    /// all of them read in the capture pass, so they are as simultaneous as
+    /// two readings of one space are — and they need disjoint INT grants for
+    /// exactly the same reason.
+    ///
+    /// The FLOAT side is shared across the runs of one plan value, and that is
+    /// not an oversight. The int side holds the schedule's staged image, which
+    /// must survive from the build to the launch; the float side is the
+    /// split-kv partials, which a launch writes and reads inside itself. The
+    /// runs of one region are sequential on that region's stream — the same
+    /// sequencing that already lets sixty layers share one plan value's
+    /// partials — so sharing costs nothing and multiplying it would cost the
+    /// 149 MiB a wide reading asks for, per interval.
     plans: Vec<Option<Workspace>>,
+    /// How many plan values one run's slice of [`plans`](Inputs::plans) holds.
+    plan_values: usize,
 }
 
 impl Inputs {
@@ -284,6 +305,7 @@ impl Inputs {
         spaces: usize,
         facts: &Facts,
         classes: usize,
+        runs: u32,
         sms: u32,
     ) -> Result<Inputs> {
         let rows = u64::from(budgets.max_tokens);
@@ -338,6 +360,14 @@ impl Inputs {
         // to the SM count and stage a partial per (query head, padded item,
         // tile row), the latent one stages a partial per cluster row and knows
         // nothing about query heads at all.
+        //
+        // ONE INT GRANT PER RUN, ONE FLOAT GRANT PER VALUE — see
+        // [`Inputs::plans`] for which half of a schedule needs which, and why
+        // multiplying the float side would be the expensive way to be wrong
+        // about it. `runs` is `driver::fire::max_runs`, which is `1` for every
+        // artifact P4 seated whole, and the carve below is then byte-for-byte
+        // the one this shell has always made.
+        let runs = runs.max(1);
         let grants: Vec<Option<Grant>> = facts
             .plans
             .iter()
@@ -356,7 +386,7 @@ impl Inputs {
                     }
                     .max(GRANT_FLOAT_BYTES);
                     Grant {
-                        int_at: take(GRANT_INT_BYTES),
+                        int_at: (0..runs).map(|_| take(GRANT_INT_BYTES)).collect(),
                         float_at: take(floats),
                         float_bytes: floats,
                     }
@@ -379,14 +409,16 @@ impl Inputs {
             mask_bytes,
             mask_indptr,
             spaces,
-            plans: grants
-                .into_iter()
-                .map(|grant| {
-                    grant.map(|grant| Workspace {
-                        int_ptr: base + grant.int_at,
-                        int_bytes: GRANT_INT_BYTES as usize,
-                        float_ptr: base + grant.float_at,
-                        float_bytes: usize::try_from(grant.float_bytes).unwrap_or(usize::MAX),
+            plan_values: grants.len(),
+            plans: (0..runs as usize)
+                .flat_map(|run| {
+                    grants.iter().map(move |grant| {
+                        grant.as_ref().map(|grant| Workspace {
+                            int_ptr: base + grant.int_at[run],
+                            int_bytes: GRANT_INT_BYTES as usize,
+                            float_ptr: base + grant.float_at,
+                            float_bytes: usize::try_from(grant.float_bytes).unwrap_or(usize::MAX),
+                        })
                     })
                 })
                 .collect(),
@@ -394,10 +426,18 @@ impl Inputs {
         })
     }
 
-    /// One plan value's builder grant, by value id.
+    /// One plan value's builder grant, by value id, for one run of the region
+    /// that builds it.
+    ///
+    /// A run past the ones this load reserved answers `None`, which the caller
+    /// reads as "no grant" and refuses on — the same answer a value that is
+    /// not a plan struct gives. It cannot happen to a load and a fire built
+    /// from one artifact: `driver::fire::max_runs` bounds every fire's split
+    /// and is what `reserve` was handed.
     #[must_use]
-    pub fn grant(&self, plan: u32) -> Option<Workspace> {
-        self.plans.get(plan as usize).copied().flatten()
+    pub fn grant(&self, plan: u32, run: u32) -> Option<Workspace> {
+        let at = run as usize * self.plan_values + plan as usize;
+        self.plans.get(at).copied().flatten()
     }
 
     /// Every byte the inputs hold.

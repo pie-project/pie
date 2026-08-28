@@ -106,19 +106,17 @@ async fn main(input: Input) -> Result<Output> {
     // The fragment is the *bytes* the rolled-back tokens covered, not their
     // text: a prefix test on decoded strings would break on tokens whose bytes
     // are not valid UTF-8 on their own, which is most multi-byte tokens.
-    let vocabs = model::vocabs();
-    let mut token_bytes: Vec<&[u8]> = vec![&[]; vocab as usize];
-    for token in &vocabs {
-        if (token.id as usize) < token_bytes.len() {
-            token_bytes[token.id as usize] = token.bytes.as_slice();
-        }
-    }
-
+    //
+    // BOTH HALVES ARE HOST QUERIES, AND THEY USED TO BE ONE `model::vocabs()`.
+    // This asked for the whole table — 248 070 records — to read the bytes of
+    // the two tokens it rolled back and then to loop over the table once more
+    // looking for a byte prefix. That is ~115 ms of a 158 ms per-launch
+    // constant (palo build log 23), paid before a single token is generated,
+    // to compute something the host can name from a table it already holds.
+    // `token_bytes` is the size of the question and `tokens_with_prefix`
+    // returns the same set the loop below produced.
     let split = full.len() - input.backoff;
-    let mut fragment: Vec<u8> = Vec::new();
-    for &token in &full[split..] {
-        fragment.extend_from_slice(token_bytes[token as usize]);
-    }
+    let fragment: Vec<u8> = model::token_bytes(&full[split..]).concat();
     if fragment.is_empty() {
         return Err("the rolled-back tokens carry no bytes to heal".into());
     }
@@ -126,11 +124,15 @@ async fn main(input: Input) -> Result<Output> {
     // The healing mask: every token that reproduces the fragment as a prefix.
     // A token equal to the fragment is included, so healing can always fall
     // back to the tokenizer's own choice and never removes a legal completion.
+    //
+    // The `< vocab` filter is not defensive: the mask is LOGITS-shaped and a
+    // tokenizer may hold ids past the logit width, which the table-indexing
+    // version dropped by construction.
     let mut prefix_mask = vec![false; vocab as usize];
     let mut prefix_candidates = 0usize;
-    for (token, bytes) in token_bytes.iter().enumerate() {
-        if bytes.starts_with(&fragment) {
-            prefix_mask[token] = true;
+    for token in model::tokens_with_prefix(&fragment) {
+        if (token as usize) < prefix_mask.len() {
+            prefix_mask[token as usize] = true;
             prefix_candidates += 1;
         }
     }
@@ -249,7 +251,11 @@ async fn main(input: Input) -> Result<Output> {
     }
     pipeline.close();
 
-    let healed_bytes = token_bytes[first as usize];
+    // One more host query at the size of the question: the bytes of the one
+    // token the model chose, to check the prompt survived the healing.
+    let healed_bytes = model::token_bytes(&[first])
+        .pop()
+        .unwrap_or_default();
     // The whole point of the mask: whatever the model chose, the caller's
     // prompt must still be reproduced byte for byte.
     let prompt_preserved = !input.heal || healed_bytes.starts_with(&fragment);

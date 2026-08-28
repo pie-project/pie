@@ -32,28 +32,45 @@
 //!   seat, but the causal launches still read it plan-carried, beside the
 //!   `mask_enabled`/`mask_stride` no op names.
 
+pub mod abi;
 pub mod api;
 pub mod arena;
 pub mod device;
 mod dispatch;
 pub mod encode;
 mod error;
+/// The indirect command buffer — Metal-only, and the one module of this
+/// crate that is.
+///
+/// Everything else here compiles on any target (the standing doctrine: the
+/// shell type-checks without an Apple SDK), and the recorder and the derived
+/// `DescriptorAbi` above are portable BECAUSE they are about the walk rather
+/// than about the device. An `MTLIndirectCommandBuffer` is not: there is no
+/// portable half of it worth writing, and a refusing twin would be a type
+/// with no callers off Apple.
+#[cfg(target_vendor = "apple")]
+pub mod icb;
 pub mod inputs;
 pub mod mask;
 pub mod program;
+pub mod record;
 pub mod run;
 pub mod serve;
 pub mod store;
 pub mod weights;
 pub mod window;
 
+pub use abi::{Armed, At as AbiAt, Axis, DescriptorAbi, Law, SlotAbi, Survey};
 pub use api::{ContractFor, DeviceBoot, Metal};
 pub use arena::Arena;
 pub use device::{Buffer, Context, Handles, Pipelines};
 pub use encode::Sink;
 pub use error::{Fault, Result};
+#[cfg(target_vendor = "apple")]
+pub use icb::{Icb, Rebound};
 pub use inputs::Inputs;
 pub use program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
+pub use record::{Arg, Point, Recording, Slot, Tape};
 pub use run::{
     CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, Run, SlotTable, StructSlot,
     WeightRow, WeightTable,

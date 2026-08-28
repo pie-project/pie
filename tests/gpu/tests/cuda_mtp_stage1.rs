@@ -1,4 +1,4 @@
-//! **MTP Stage 1 — native-drafter de-risk** (bravo), on the REAL 4090 +
+//! **MTP Stage 1 — native-drafter de-risk** (bravo), on the a real CUDA device +
 //! Qwen3.5-0.8B (GDN backbone + a 1-layer MTP head). Validates that the
 //! driver's NATIVE system drafter (`qwen3_5_mtp_forward` + `wire_system_drafter`,
 //! auto-active on MTP-weight presence) produces GENUINE, LOSSLESS t+2 drafts.
@@ -221,8 +221,14 @@ async fn run_generate(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "MTP Stage 1 native-drafter de-risk: needs the 4090 + cuda + Qwen3.5-0.8B (MTP head). \
-            Run twice: PIE_MTP_DRAFT_TOKENS=0 then =2."]
+#[ignore = "BLOCKED, and not on hardware: this build declares an `mtp` arm on \
+            exactly one SKU -- `qwen36-27b-bf16-kv-bf16`, the only catalog row \
+            whose checkpoint publishes fifteen `mtp.*` planes -- and that load \
+            refuses on the reference L40S with `Fault::OutOfMemory` at 51.05 GiB \
+            against 43.87 free (palo build log 25f). Qwen3.5-0.8B loads as the \
+            plain `qwen35-d0.8b` dense row, so a drafting lane gets \
+            `Fault::Draftless`. The `generate-gdn` guest is gone with the \
+            workspace move to `tests/inferlets` besides"]
 async fn mtp_native_drafter_de_risk() -> Result<()> {
     common::init_trace();
 
@@ -234,7 +240,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
     // slots — so we use `generate-gdn` (binds BOTH the KvWorkingSet and an
     // RsWorkingSet), NOT the dense `generate` (KV-only, which the GDN forward
     // rejects with "rs_cache forward missing runtime-assigned slot ids").
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlets");
     let gdn_pkg = std::env::var("PIE_GDN_INFERLET").unwrap_or_else(|_| "generate-gdn".to_string());
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", &gdn_pkg])
@@ -243,7 +249,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for {gdn_pkg}");
 
-    let pie = common::boot_4090_mtp(k).await?;
+    let pie = common::boot_cuda_mtp(k).await?;
     eprintln!(
         "[mtp-stage1] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr
@@ -293,7 +299,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
     //  (a) NON-DEGENERACY (hard, always): the sequence must be varied — a fixed
     //      argmax from a stuck state is degenerate;
     //  (b) GOLDEN (hard when set): the decode must match the known-correct prefix
-    //      captured on the 4090 (the definitive correctness check).
+    //      captured on the device (the definitive correctness check).
     if let Some(reason) = degenerate_reason(&tokens) {
         anyhow::bail!(
             "T0 VALUE FAILED — GDN output is degenerate: {reason}. A correct GDN decode \

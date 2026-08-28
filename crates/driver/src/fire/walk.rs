@@ -7,7 +7,7 @@
 //! `model_compiler::compile`. What is left is the part that has to be right
 //! 5000 times a second.
 //!
-//! # The three rules it enforces, and none of them is an optimization
+//! # The four rules it enforces, and none of them is an optimization
 //!
 //! **1. Zero rows means the node does not run** (decision #3). A region's
 //! window is its mask's rows in this fire's descriptor; when that is zero, the
@@ -33,6 +33,19 @@
 //! quietly repairing it here would hide a P2/P5 bug behind a fire that mostly
 //! works.
 //!
+//! **4. A window that is not one interval is not one launch** (design §3).
+//! P4 chooses one row order for the whole plan and makes as many windowed
+//! consumers consecutive under it as a PQ-tree can; the ones it cannot seat
+//! get a `Fallback` row instead, and `Fallback::Split { r }` says what this
+//! loop does about them — dispatch the region's nodes once per maximal
+//! interval, each over its own pointer and extent. The consecutive case is
+//! that loop turning once, so there is no branch on the fallback anywhere
+//! here: the number of launches is `WindowTable::spans(mask).len()`, which is
+//! `1` for a window P4 seated, `0` for a window this composition has no rows
+//! for, and `r` for the one it withdrew. THE UNION OF THE RUNS IS THE WINDOW
+//! — the intervals partition the mask's rows — which is what makes the split
+//! a slow path and not a different answer.
+//!
 //! # The phase filter, and why it is not a second walk
 //!
 //! [`walk()`] runs every region of the template. A shell that CAPTURES has to
@@ -48,6 +61,19 @@
 //! (`driver_cuda::window::Cursor`), and a filter that skipped the announcement
 //! would renumber every region after the first prepare one and hand the whole
 //! capture somebody else's rows.
+//!
+//! # The conditional bracket, and why an eager sink may ignore it
+//!
+//! A region P3 put behind a conditional node is announced with
+//! [`Sink::cond_begin`] before its first node and [`Sink::cond_end`] after its
+//! last, and a SWITCH group's arms are announced with [`Sink::cond_arm`] in
+//! between. **The zero-row rule below is unchanged by all of it.** A
+//! conditional decides exactly what the row count already decides — whether
+//! this composition includes the behavior — so an eager sink that no-ops all
+//! three runs the same nodes over the same rows and gets the same numbers.
+//! What a RECORDING sink must do with them is not optional: a graph outlives
+//! the fire that recorded it, so the decision has to be a node in the graph
+//! rather than a branch the recorder took.
 //!
 //! # The event points, and what they do NOT do
 //!
@@ -76,6 +102,7 @@ use model_ir::{Operation, Plan};
 
 use crate::Result;
 use crate::fire::Fault;
+use crate::fire::compose::MaskSpan;
 use crate::fire::descriptor::FireDescriptor;
 use crate::fire::sink::Sink;
 
@@ -167,6 +194,10 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
     }
 
     let mut captured = false;
+    // One buffer for the whole walk, refilled per region. `spans_into` is what
+    // keeps the split from costing an allocation per region in front of a
+    // launch that costs tens of microseconds.
+    let mut runs: Vec<MaskSpan> = Vec::new();
     for (index, region) in baked.template().iter().enumerate() {
         match region.phase {
             Phase::Prepare if captured => {
@@ -179,21 +210,41 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
             Phase::Capture => captured = true,
         }
 
-        // One number for the whole region: every node in it has the same mask
-        // — that equality is what defines the run (P2) — so they share a
-        // window and read one count.
-        let rows = descriptor.rows_of(&region.mask);
+        // The region's window, cut into the intervals it actually covers.
+        //
+        // ONE ENTRY IS THE CASE P4 EXISTS TO PRODUCE, and it is the case
+        // everything below reads as if it were the only one: every node in a
+        // region has the same mask — that equality is what defines the run
+        // (P2) — so they share a window and read one count. What P4 could not
+        // seat covers SEVERAL intervals, and `Fallback::Split { r }` is the
+        // compiler's answer for it: the nodes run once per interval, each over
+        // its own pointer and extent, and the intervals' rows add up to
+        // `rows_of(mask)` by construction (`WindowTable::spans`). An empty
+        // window is no intervals at all, and the loop below still turns once —
+        // a zero-row pass, which is what dispatches a collective in a
+        // composition that has no rows for it.
+        descriptor.spans_into(&region.mask, &mut runs);
 
-        // v1 never takes this branch: P3 constructs `AlwaysLaunch` for every
-        // region. It is written now because the day P3 starts choosing, a
-        // conditional region has to be BRACKETED for a recording sink or the
-        // body lands outside the conditional node — and the arms themselves
-        // (`Sink::cond_arm`) arrive with the template structure that names
-        // them, which is the same pass. Semantically this changes nothing:
-        // an eager walk of a conditional region still decides by the same
-        // zero-row rule, which is what "conditionals are an optimization, not
-        // the semantics" means.
-        let conditional = !matches!(region.lowering, Lowering::AlwaysLaunch);
+        // P3's answer, and the two instants a recording sink needs it at.
+        //
+        // **SEMANTICALLY THIS CHANGES NOTHING**, which is what "conditionals
+        // are an optimization, not the semantics" means: an eager walk of a
+        // conditional region decides by the same zero-row rule below, so
+        // `EagerSink`'s no-op `cond_begin` is the correct implementation and
+        // not a stub. A RECORDING sink is the one that must bracket, because
+        // the graph it writes outlives the fire that wrote it.
+        //
+        // A SWITCH GROUP IS A RUN OF REGIONS AND THE TABLE IS FLAT. Each arm
+        // carries which arm it is and how many the group has
+        // (`Lowering::Switch`), so the group opens at arm 0 and closes at the
+        // last one and the walk needs no second table and no state between
+        // regions — which is the same reason `Region::open` is a field rather
+        // than a group object (build log 24 (c)).
+        let (open, arm, close) = match region.lowering {
+            Lowering::AlwaysLaunch => (false, None, false),
+            Lowering::If => (true, None, true),
+            Lowering::Switch { arm, arms, .. } => (arm == 0, Some(arm), arm + 1 == arms),
+        };
 
         // P6's event points, in the one order that means what they say
         // (`model_compiler::stream`): the region's stream waits for whatever
@@ -207,33 +258,54 @@ pub fn walk_phases<D: Dispatch, S: Sink>(
         if let Some(event) = region.open {
             sink.fork(event);
         }
-        if conditional {
+        if open {
             sink.cond_begin(&region.lowering);
         }
-
-        for node in region.nodes.clone() {
-            // Resolved before the filter, so that a template naming a node
-            // the plan lacks is the same refusal in a prepare pass, a capture
-            // pass and a whole walk. A filter that changed which templates
-            // are legal would be a second walk wearing this one's name.
-            let Some(node) = plan.nodes.get(node as usize) else {
-                return Err(Fault::NoSuchNode {
-                    node,
-                    nodes: plan.nodes.len(),
-                }
-                .into());
-            };
-            if !phases.admits(region.phase) {
-                continue;
-            }
-            let collective = matches!(node.op, Operation::Collective(_));
-            if rows == 0 && !collective {
-                continue;
-            }
-            dispatch.exec(node)?;
+        if let Some(arm) = arm {
+            sink.cond_arm(arm);
         }
 
-        if conditional {
+        // The launches. `max(1)` is the empty window: it turns once, at zero
+        // rows, so the collective rule below still sees every node of every
+        // region exactly as it did when a window was one span or none.
+        //
+        // A COLLECTIVE IN A SPLIT REGION JOINS THE RENDEZVOUS ONCE PER RUN,
+        // and that is the rule holding rather than bending. Decision #5 is
+        // about call ORDER matching across ranks, and the run count is a
+        // function of the class table — which the engine replicates
+        // identically across ranks — so every rank issues the same number of
+        // them in the same order. What would break the rendezvous is a rank
+        // deciding the count from something local, and nothing here does.
+        let launches = runs.len().max(1);
+        for launch in 0..launches {
+            sink.run(launch as u32, launches as u32);
+            let rows = runs.get(launch).map_or(0, |span| span.rows);
+
+            for node in region.nodes.clone() {
+                // Resolved before the filter, so that a template naming a node
+                // the plan lacks is the same refusal in a prepare pass, a
+                // capture pass and a whole walk. A filter that changed which
+                // templates are legal would be a second walk wearing this
+                // one's name.
+                let Some(node) = plan.nodes.get(node as usize) else {
+                    return Err(Fault::NoSuchNode {
+                        node,
+                        nodes: plan.nodes.len(),
+                    }
+                    .into());
+                };
+                if !phases.admits(region.phase) {
+                    continue;
+                }
+                let collective = matches!(node.op, Operation::Collective(_));
+                if rows == 0 && !collective {
+                    continue;
+                }
+                dispatch.exec(node)?;
+            }
+        }
+
+        if close {
             sink.cond_end();
         }
         // The join half: the arm records its exit on its own stream, after its
@@ -533,6 +605,110 @@ mod tests {
         // And the nodes are the same nodes, in the same order: a fork says
         // where the next launch lands, never when.
         assert_eq!(dispatch.nodes(), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// A profile that takes any windowed region: what it is for is exercising
+    /// the bracket, since P3 at the default profile chooses one region in the
+    /// whole catalog and none at all in a five-node fixture.
+    fn conditionalizing() -> DeviceProfile {
+        DeviceProfile {
+            fat_region_us: 0.0,
+            cond_fixed_us: 0.5,
+            cond_per_arm_us: 0.0,
+            side_streams: 0,
+            ..DeviceProfile::default()
+        }
+    }
+
+    #[test]
+    fn a_conditional_region_is_bracketed_and_runs_the_same_nodes_it_always_did() {
+        let b = diagram();
+        let baked = compile(&b.plan, &budgets(), &conditionalizing()).expect("bakes");
+        // The two windows took an `If` each; the shared trunk did not, because
+        // its mask holds every class and a guard around it is never false.
+        assert_eq!(baked.template()[2].lowering, Lowering::If);
+        assert_eq!(baked.template()[3].lowering, Lowering::If);
+        assert_eq!(baked.template()[4].lowering, Lowering::AlwaysLaunch);
+
+        let descriptor = fire(&baked, &[Lane::new(0, 7), Lane::new(1, 1)]);
+        let mut dispatch = MockDispatch::new(&b.plan);
+        let mut sink = Recorder::default();
+        walk(&b.plan, &baked, &descriptor, &mut dispatch, &mut sink).expect("walks");
+
+        assert_eq!(
+            sink.events,
+            vec![
+                Event::Begin(0),
+                Event::End(0),
+                Event::Begin(1),
+                Event::End(1),
+                Event::Begin(2),
+                Event::CondBegin,
+                Event::CondEnd,
+                Event::End(2),
+                Event::Begin(3),
+                Event::CondBegin,
+                Event::CondEnd,
+                Event::End(3),
+                Event::Begin(4),
+                Event::End(4),
+            ],
+        );
+        // **AND THE DISPATCH IS UNMOVED**, which is design §4's whole claim:
+        // the same five nodes in the same order as the always-launch walk
+        // above, because the zero-row rule already decided what the bracket
+        // announces.
+        assert_eq!(dispatch.nodes(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_switch_group_opens_once_names_every_arm_and_closes_once() {
+        // A one-lane deployment: the only shape in which a merge's arms are
+        // exclusive at FIRE granularity, which is what a switch node needs
+        // (`model_compiler::lowering`).
+        let b = diagram();
+        let budgets = Budgets::new(1, 64);
+        let baked = compile(&b.plan, &budgets, &conditionalizing()).expect("bakes");
+        assert!(matches!(
+            baked.template()[2].lowering,
+            Lowering::Switch { arm: 0, arms: 2, .. }
+        ));
+        assert!(matches!(
+            baked.template()[3].lowering,
+            Lowering::Switch { arm: 1, arms: 2, .. }
+        ));
+
+        let descriptor =
+            FireDescriptor::of(&compose(&baked, &budgets, &[Lane::new(0, 7)]).expect("composes"));
+        let mut dispatch = MockDispatch::new(&b.plan);
+        let mut sink = Recorder::default();
+        walk(&b.plan, &baked, &descriptor, &mut dispatch, &mut sink).expect("walks");
+
+        assert_eq!(
+            sink.events,
+            vec![
+                Event::Begin(0),
+                Event::End(0),
+                Event::Begin(1),
+                Event::End(1),
+                // One bracket around the RUN, not one per arm.
+                Event::Begin(2),
+                Event::CondBegin,
+                Event::CondArm(0),
+                Event::End(2),
+                Event::Begin(3),
+                Event::CondArm(1),
+                Event::CondEnd,
+                Event::End(3),
+                Event::Begin(4),
+                Event::End(4),
+            ],
+        );
+        // This fire is prefill-only, so the decode arm has no rows and the
+        // eager walk skips its node — the same answer the switch would give.
+        // Node 0 goes with it: the decode plan build is narrowed by demand to
+        // the classes that read its struct (build log 7).
+        assert_eq!(dispatch.nodes(), vec![1, 3, 4]);
     }
 
     #[test]

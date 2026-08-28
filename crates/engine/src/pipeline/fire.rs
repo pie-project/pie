@@ -1106,6 +1106,59 @@ fn stamp_lane_words(req: &mut crate::driver::FireRequest, fire_wide_mask: bool) 
     }
 }
 
+/// Seat this fire's lanes: `Lane::slot`, from the working set that owns it.
+///
+/// **THE SLOT HAD NO OWNER, AND THAT IS WHAT A MULTI-LANE FIRE FOUND OUT**
+/// (`palo` build log 28's headline). Both paths built their lanes with the
+/// field at zero — `ReqGeometry::lanes` under a comment saying "the caller
+/// stamps it", `fire_device_geometry` through `Lane::default()` — and the
+/// caller it named did not exist. A solo fire is one lane and zero is a
+/// perfectly good seat for it, so every gate in the tree passed; the batcher
+/// concatenates the lanes of every member of a step (`scheduler::batch`), so
+/// the second concurrent guest in one wave made the fire two lanes both
+/// seated at zero and `FireSubmission::validate` refused the batch by name.
+/// Concurrent multi-lane serving was broken for exactly as long as nothing
+/// covered it.
+///
+/// **WHO OWNS A SLOT.** It is the sequence's seat in the shell's pools — the
+/// kv block a shell-owned page table hands it, the recurrent bank row
+/// `Pools::clear` zeroes on the fire where `held == 0`, the id
+/// `slot_ids[lane]` a linear-attention scan indexes with. The engine's
+/// per-sequence identity is the KV WORKING SET: it is one sequence's page
+/// table, minted at create/fork/slice and released with its last handle. So
+/// the working set owns the seat, [`crate::store::seat`] is the book it owns
+/// it in, and this is where the book's answer meets the lanes.
+///
+/// One seat per LANE, because a request is lanes plural: a beam fires B row
+/// groups against one page table and each of those rows is a sequence as far
+/// as the pools are concerned. The book keeps the run, so lane `i` of every
+/// fire of a working set sits in the same seat — which is what a recurrent
+/// bank row depends on, and why a seat cannot be handed out per fire.
+///
+/// # Errors
+///
+/// The refusal, ready to return, when this fire would seat more sequences
+/// than the deployment's pools hold (`Budgets::slots`, which the driver
+/// advertises as `PoolFacts::state_slots`). Named here, with both numbers,
+/// rather than reaching the shell and coming back as a `Fault::Ceiling`
+/// naming a lane index.
+pub(crate) fn stamp_lane_slots(
+    req: &mut crate::driver::FireRequest,
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) -> Result<(), String> {
+    let seats = stores
+        .seats
+        .lock()
+        .unwrap()
+        .seats(ws, req.lanes.len())
+        .map_err(|error| format!("pipeline: seating this fire's lanes: {error}"))?;
+    for (lane, &seat) in req.lanes.iter_mut().zip(&seats) {
+        lane.slot = seat;
+    }
+    Ok(())
+}
+
 /// Poison every host-reader cell of a pass with the failed fire's error —
 /// under run-ahead this IS the error channel (`take`/`read` surface it).
 fn poison_readers(cells: &BoundCells, reason: &str) {
@@ -1440,6 +1493,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver);
+        // THE LANES' SEATS, and they stand here rather than beside the word
+        // stamp for one reason: the seat is the WORKING SET's, and the
+        // working set is resolved on the line above. Nothing between the two
+        // points touches `Lane::slot`, and everything after this reads a
+        // seated fire.
+        if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
+            return Ok(Err(refusal));
+        }
         let (readable_pages, writable_pages) =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
                 let page_len = kv_store.page_len(ws.id)?;
@@ -2965,7 +3026,10 @@ async fn fire_device_geometry<C: FireContext>(
         boundary_program: true,
         // `Lane::word` is left at its default here and stamped below, once
         // the mask has lowered — see `stamp_lane_words`, which is the one
-        // place either path states a word.
+        // place either path states a word. `Lane::slot` is defaulted for the
+        // same shape of reason and stamped at the same place by
+        // `stamp_lane_slots`: a seat belongs to the working set, and B lanes
+        // of one beam are B sequences that each need one.
         lanes: resolved_qo_indptr
             .windows(2)
             .map(|span| crate::driver::Lane {
@@ -2999,6 +3063,15 @@ async fn fire_device_geometry<C: FireContext>(
     // The same stamp as the wire path, for the same reason and at the same
     // point: rows from the lanes above, mask from the lowering just now.
     stamp_lane_words(&mut req, fire_wide_mask);
+    // And the same seating, from the same owner: this pass's working set.
+    // A device-geometry fire resolves its ROW SPLIT on the device and its
+    // seats here, because a seat is not geometry — it is which sequence each
+    // row group IS, which only the host knows (`stamp_lane_slots`).
+    if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
+        reclaim_pending_device_grant(ctx, &fwd);
+        record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
+        return Ok(Err(refusal));
+    }
     // Same carry as the wire path: the AttnMask channel binding is the
     // program's, so a device-geometry fire of a mask-binding pass must be
     // scheduled SOLO too. Omitting it here is what let the run-ahead

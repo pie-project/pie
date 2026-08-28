@@ -54,6 +54,15 @@ struct Output {
     text: String,
     /// How many tokens it is.
     count: usize,
+    /// The continuation's token ids.
+    ///
+    /// **LAST, AND THAT IS LOAD-BEARING.** `pie::sweep::fleet` — the fleet
+    /// runner behind `pie sweep`, `pie config tune` and the contention gate —
+    /// reads a lane's answer with `parse_tokens`, which takes the LAST `[` in
+    /// the document. A guest that returned only prose came back as "returned
+    /// no tokens", which reads as a broken program and is a program that
+    /// worked; the field the runner has always looked for is this one.
+    tokens: Vec<u32>,
 }
 
 /// The greedy pick over a logits row, as a one-lane `[1]` i32 cell.
@@ -71,6 +80,7 @@ async fn main(input: Input) -> Result<Output> {
         return Ok(Output {
             text: String::new(),
             count: 0,
+            tokens: Vec::new(),
         });
     }
 
@@ -212,5 +222,6 @@ async fn main(input: Input) -> Result<Output> {
     Ok(Output {
         count: generated.len(),
         text: model::decode(&generated)?,
+        tokens: generated,
     })
 }

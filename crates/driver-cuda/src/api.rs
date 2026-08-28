@@ -205,9 +205,14 @@ fn fault(fault: Fault) -> DriverError {
         Fault::Runtimeless | Fault::Device { .. } | Fault::Schedule { .. } => {
             DriverError::Device(fault.to_string())
         }
-        Fault::Bake(_) | Fault::Load(_) | Fault::Param { .. } | Fault::Unbound { .. } => {
-            DriverError::Load(fault.to_string())
-        }
+        // `Unlowered` joins them: a region baked behind a conditional node is
+        // an ARTIFACT this shell cannot record, so the recovery is a different
+        // profile at load time and not a different fire.
+        Fault::Bake(_)
+        | Fault::Load(_)
+        | Fault::Param { .. }
+        | Fault::Unbound { .. }
+        | Fault::Unlowered { .. } => DriverError::Load(fault.to_string()),
         // AN EXHAUSTION, AND THE CONTRACT HAS THE SHAPE FOR IT. `Exhausted`
         // carries the two numbers structurally rather than only in a sentence,
         // which is what a control plane deciding where to place a model wants.

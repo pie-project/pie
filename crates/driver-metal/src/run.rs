@@ -15,14 +15,12 @@
 //!
 //! [`KernelError`]: kernels::KernelError
 
-use std::cell::Cell;
-
 use kernels_metal::attn::mla::MlaPlan;
 use kernels_metal::{Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor};
 use model_ir::{Def, Dim, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::device::Handles;
-use crate::window::{Window, Windows};
+use crate::window::{At, Window, Windows};
 
 /// One loader-resolved weight. Most rows are one dense handle; an mxfp4 bank
 /// is two device planes under one `Def::Weight` id — the form this shell's
@@ -204,23 +202,39 @@ pub struct Run<'c> {
     /// [`Run::recurrent`], never through [`Run::tensor`].
     caches: &'c CacheTable,
 
-    /// `ValueId`-indexed plan payloads: filled by the plan-building arms in
-    /// the prepare phase, read by the consuming arms afterwards.
+    /// Plan payloads: filled by the plan-building arms in the prepare phase,
+    /// read by the consuming arms afterwards.
+    ///
+    /// **KEYED BY `(RUN, VALUE)`, NOT BY VALUE**, and the extra key is P4's
+    /// split (design §3). A schedule is carved for ONE window, so a region the
+    /// layout could not seat carves one per interval of it — all built in the
+    /// prepare phase, all read in the capture phase. One slot per value would
+    /// let run 1's builder overwrite run 0's, and run 0's encode would then
+    /// read a schedule describing run 1's requests: not a fault, just wrong
+    /// logits for the lanes in the first interval.
+    ///
+    /// Flat rather than nested, at `run * values + value`: a plan has
+    /// thousands of values and a `Vec` per value would be thousands of
+    /// allocations per fire, where this is one. The width is
+    /// [`Windows::max_runs`] — `1` for every artifact P4 seated whole.
     structs: Vec<Option<StructSlot>>,
+    /// How many values one run's slice of [`structs`](Run::structs) holds.
+    values_wide: usize,
 
     /// This fire's bindings.
     fire: FireBindings,
 
-    /// Every region's window, resolved once per fire from the composition's
-    /// class table. Indexed by [`region`](Run::region).
+    /// Every region's windows, resolved once per fire from the composition's
+    /// class table. Indexed by [`place`](Run::place).
     windows: &'c Windows,
 
-    /// Which region the walk is inside, written by
-    /// [`Cursor`](crate::window::Cursor) on `region_begin` — before that
-    /// region's nodes are dispatched. **THIS IS THE WHOLE MIXED-FIRE
-    /// MECHANISM**: the walk's `Dispatch` signature is fixed and carries no
-    /// region, so the sink and the resolver share one cell instead.
-    region: &'c Cell<u32>,
+    /// Which region the walk is inside and which run of its window, written
+    /// by [`Cursor`](crate::window::Cursor) on `region_begin` and on `run` —
+    /// before that region's nodes are dispatched, and before each encode of
+    /// them. **THIS IS THE WHOLE MIXED-FIRE MECHANISM**: the walk's `Dispatch`
+    /// signature is fixed and carries no region, so the sink and the resolver
+    /// share one cell instead.
+    place: &'c At,
 }
 
 impl<'c> Run<'c> {
@@ -235,7 +249,7 @@ impl<'c> Run<'c> {
         caches: &'c CacheTable,
         fire: FireBindings,
         windows: &'c Windows,
-        region: &'c Cell<u32>,
+        place: &'c At,
     ) -> Self {
         Self {
             ctx,
@@ -244,16 +258,26 @@ impl<'c> Run<'c> {
             weights,
             arena,
             caches,
-            structs: vec![None; values.len()],
+            structs: vec![None; values.len() * windows.max_runs() as usize],
+            values_wide: values.len(),
             fire,
             windows,
-            region,
+            place,
         }
     }
 
-    /// The window of the region the walk is inside.
+    /// The window of the region the walk is inside, cut at the run it is on.
     pub(crate) fn window(&self) -> &'c Window {
-        self.windows.at(self.region.get())
+        self.windows.at(self.place.region.get(), self.place.run.get())
+    }
+
+    /// Where this run's payload for `id` sits in [`structs`](Run::structs).
+    ///
+    /// The run comes off the same cell the window does, so a schedule is
+    /// stored and read at the same key by construction — a builder cannot
+    /// carve for one interval and an encode read another.
+    fn struct_at(&self, id: ValueId) -> usize {
+        self.place.run.get() as usize * self.values_wide + id.0 as usize
     }
 
     /// This window's own qo boundaries, rebased to start at zero.
@@ -604,12 +628,13 @@ impl<'c> Run<'c> {
 
     /// Store a plan payload a prepare-phase arm just built.
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
-        self.structs[id.0 as usize] = Some(built);
+        let at = self.struct_at(id);
+        self.structs[at] = Some(built);
     }
 
     /// The decode plan a consuming arm names.
     pub(crate) fn decode_plan(&self, id: ValueId) -> &DecodePlan {
-        match &self.structs[id.0 as usize] {
+        match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Decode(plan)) => plan,
             Some(_) => panic!(
                 "value {} holds another plan kind, and this op consumes a decode plan",
@@ -625,7 +650,7 @@ impl<'c> Run<'c> {
 
     /// The prefill plan a consuming arm names.
     pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
-        match &self.structs[id.0 as usize] {
+        match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Prefill(plan)) => plan,
             Some(_) => panic!(
                 "value {} holds another plan kind, and this op consumes a prefill plan",

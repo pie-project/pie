@@ -279,6 +279,15 @@ fn fault(fault: Fault) -> DriverError {
         // is a BAKE-integrity break, not a submission the caller can fix; so
         // is a schedule built over more classes than its reader runs.
         Fault::Fragmented { .. } => DriverError::Device(fault.to_string()),
+        // The two derivation refusals (`crate::abi`) are LOAD answers, and
+        // deliberately: the binding recipe is derived once, from synthetic
+        // descriptors, before a `FireId` is ever spent — so a quantity that
+        // is not affine in the descriptor, or two compositions that do not
+        // walk the same template, is a fact about this artifact on this
+        // plane, discovered at load and unchanged by any retry.
+        Fault::Unaffine { .. } | Fault::Unstructured { .. } => {
+            DriverError::Load(fault.to_string())
+        }
         Fault::Straddled { .. } => DriverError::Load(fault.to_string()),
         // A mask that does not describe its lane, one against a plan with no
         // masked arm, or one whose word says the other thing, is the

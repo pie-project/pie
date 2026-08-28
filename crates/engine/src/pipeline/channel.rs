@@ -523,6 +523,14 @@ impl ChannelCell {
     /// occupancy are unchanged, so a later queued put cannot move forward
     /// between a take and put. A front already claimed by a fire is immutable
     /// until that fire advances the device head.
+    ///
+    /// A front that has already been DELIVERED — a seed, which crossed at bind
+    /// and left this ring empty — is replaced in the engine's record of it
+    /// rather than in the ring, because a delivered cell is not this ring's to
+    /// rewrite and re-producing it is refused by the far side. [`set_ref`]
+    /// argues that case where it is decided.
+    ///
+    /// [`set_ref`]: Self::set_ref
     pub fn set(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         self.set_ref(&native)
     }
@@ -565,6 +573,71 @@ impl ChannelCell {
                 tail
             };
             if committed_tail <= head {
+                // A DELIVERED SEED IS STILL THE STANDING CELL.
+                // [`commit_seed`](Self::commit_seed) states, in this ring's own
+                // control words, that sequence 0 was produced AND delivered —
+                // the seed rode `InstanceBinding::seeds` into the SHELL's ring
+                // and never travelled through this one — and `committed_tail`
+                // counts exactly the cells this ring still holds that have not
+                // crossed. A seeded channel has none, which is how the honest
+                // arithmetic above turns the one channel class that exists to
+                // be `set` into [`Empty`](ChannelError::Empty): a latest-value
+                // control word is bound to a port that does not `consumes()`
+                // (`KvLen`, `PageIndptr`, `AttnMask`), so NOTHING ever advances
+                // its head, its seed is its front for the whole run, and `set`
+                // is the only verb that can move it. A guest that seeds `klen`
+                // and then `set`s it once per step — the decode loop
+                // `tests/inferlets/tart-masked` spells out in its own comment —
+                // was told `no cell available` on its very first step.
+                //
+                // AND THE REPLACEMENT CANNOT BE PRODUCED AS A FRESH CELL. The
+                // tempting fall-through — write it into the ring and let the
+                // newer cell win — is refused twice over by the far side.
+                // [`ChannelJoin::pump_in`](crate::driver::ChannelJoin::pump_in)
+                // is the engine's only door into a device ring and it APPENDS:
+                // the shell answers `false` once that ring's `tail - head`
+                // reaches the declared capacity, which a capacity-1
+                // latest-value ring reached the moment the seed landed. The
+                // cell never crosses, `pump_in` never advances this ring's
+                // head, and the guest's next `put` then reads
+                // `writer_tail - head >= capacity` and answers
+                // [`Full`](ChannelError::Full) for ever — the very parked lane
+                // `commit_seed` exists to prevent. Give the device ring room
+                // and it is still refused, silently: the shell resolves a port
+                // by reading the cell at `head` (`driver_cuda::program::ports`,
+                // whose header says so), and `head` moves only for ports that
+                // consume, so the second cell would sit at a sequence nothing
+                // ever reads.
+                //
+                // What replaces a DELIVERED front is therefore the engine's own
+                // record of it, which is what `front_override` is for: the host
+                // shadow reads it as the value this channel presents to the
+                // next fire (`pipeline::fire::shadow::HostShadow::fire_value`),
+                // and the geometry the engine composes out of that shadow is
+                // how a latest-value cell reaches the device on every path that
+                // does not resolve its ports off a device ring. It does not
+                // correct the shell's own copy of a cell that already crossed —
+                // nothing the engine holds can — so a device-resolved `KvLen`
+                // goes on reading the seed and refuses the fire it disagrees
+                // with by name (`Envelope::check_extent`). That is a named
+                // failure at the one place able to see the disagreement,
+                // instead of a guest that cannot advance at all.
+                if self.role == Some(HostRole::Writer)
+                    && self.seeded
+                    && self.seed_taken
+                    && head == tail
+                    && self.ring_host_copies.is_empty()
+                {
+                    // A submitted fire that already claimed the seed owns it:
+                    // the consume ticket is immutable and names the cell that
+                    // fire will read, which is what the `device_reserved_head >
+                    // head` rule below says for a front still in the ring.
+                    if self.device_reserved_head >= self.writer_tail {
+                        return Err(ChannelError::InFlight);
+                    }
+                    self.front_override = Some(native.to_vec());
+                    return Ok(());
+                }
                 return Err(ChannelError::Empty);
             }
             if self.device_reserved_head > head {
@@ -1589,6 +1662,66 @@ mod tests {
         writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 -> 5
         assert_eq!(words[1].load(Ordering::Acquire), 2);
         assert_eq!(mirror[1], 5, "sequence 1 lands at slot 1 of cap1=2");
+    }
+
+    /// A SEEDED latest-value writer's `set` has to REPLACE the seed.
+    ///
+    /// The other half of the same seed. `commit_seed` reconciles the ring by
+    /// recording the seed as produced AND delivered, which is true and which
+    /// leaves this ring holding nothing — so `set`'s `committed_tail <= head`
+    /// answered [`Empty`](ChannelError::Empty) on the one channel class that
+    /// exists to be `set`. A latest-value control word is bound to a
+    /// non-consuming port, so nothing anywhere ever advances its head: its seed
+    /// is its front for the whole run, and a `set` that is refused leaves the
+    /// guest with no verb at all for advancing it. Re-producing the value
+    /// through the ring is not the alternative — the device ring a seed landed
+    /// in is full at capacity 1 and a port reads the cell at its own head — so
+    /// the replacement lands in the engine's record of the front, and nothing
+    /// is written to the ring or published to the tail word.
+    #[test]
+    fn a_seeded_latest_value_writers_set_replaces_the_delivered_seed() {
+        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
+        declaration.capacity = 1;
+        let (mut writer, mirror, words, registered) = writer_ring(1, 1);
+        // The seed, as the guest staged it before the bind.
+        writer.bind(&declaration);
+        writer.staged.push_back(vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        attach_writer(&mut writer, registered);
+        writer.commit_seed();
+
+        let first = vec![1, 0, 1, 0, 0, 0, 0, 0];
+        writer.set(first.clone()).unwrap();
+        assert_eq!(
+            writer.front_override(),
+            Some(first),
+            "the replacement is the front the next fire reads"
+        );
+        assert_eq!(
+            (
+                words[0].load(Ordering::Acquire),
+                words[1].load(Ordering::Acquire)
+            ),
+            (1, 1),
+            "no cell was produced: a second one could not cross and would be read by nothing"
+        );
+        assert_eq!(
+            mirror[0], 0,
+            "the seed never travelled through this ring, so there is no slot to rewrite"
+        );
+
+        // Repeat `set` is what a decode loop does: one per step, for ever.
+        let second = vec![0, 1, 0, 0, 0, 0, 0, 0];
+        writer.set(second.clone()).unwrap();
+        assert_eq!(writer.front_override(), Some(second));
+        assert!(
+            writer.has_committed_front(),
+            "frame validation's latest-value class must still see a committed cell"
+        );
+
+        // A submitted fire that claimed the seed owns it, exactly as it owns a
+        // front still sitting in the ring.
+        assert_eq!(writer.reserve_device_ticket(true, false), (0, TICKET_NONE));
+        assert_eq!(writer.set(vec![1; 8]).unwrap_err(), ChannelError::InFlight);
     }
 
     #[test]

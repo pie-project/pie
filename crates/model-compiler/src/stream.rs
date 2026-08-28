@@ -210,16 +210,12 @@ pub(crate) fn fork(plan: &Plan, regions: &mut [Region], profile: &DeviceProfile)
 
     let touches = Touches::of(plan, regions, profile);
     let ordered = closure(regions, &touches);
+    // The same estimator P3 gates a conditional with — one spelling of "what
+    // does this region cost", so the two passes cannot disagree about the same
+    // region on the same profile.
     let costs: Vec<f32> = regions
         .iter()
-        .map(|region| {
-            region
-                .nodes
-                .clone()
-                .filter_map(|node| plan.nodes.get(node as usize))
-                .map(|node| profile.family_us.of(&node.op))
-                .sum()
-        })
+        .map(|region| crate::lowering::region_us(plan, region, profile))
         .collect();
 
     let mut forks = Forks {
@@ -385,12 +381,14 @@ fn group_at(
 /// empty mask is disjoint from everything, which would make it a candidate
 /// with every region in the plan for no reason at all.
 ///
-/// **AND A CONDITIONAL BODY IS SINGLE-STREAM** (design §4, v1). P3 has not
-/// landed, so every region is `AlwaysLaunch` and this clause is vacuous
-/// today — it is written now because the day a region becomes a SWITCH arm,
-/// forking it would mean a `cudaGraphSetConditional` body whose work is on a
-/// stream the body does not own, and the rule that forbids it should already
-/// be standing rather than be one somebody has to think to add.
+/// **AND A CONDITIONAL BODY IS SINGLE-STREAM** (design §4, v1). P3 has landed
+/// and runs BEFORE this pass, so the clause is live rather than vacuous — and
+/// it is a mechanism and not a policy: a conditional body is a child graph
+/// filled by `cudaStreamBeginCaptureToGraph`, while a fork's event pair is an
+/// edge between two nodes of one parent graph, so an arm that was both would
+/// be a dependency CUDA has no way to express. On today's catalog P3 chooses
+/// nothing and every region here is still `AlwaysLaunch`, which is why build
+/// log 24's assignment table is unmoved.
 fn forkable(region: &Region) -> bool {
     region.phase == Phase::Capture
         && !region.collective

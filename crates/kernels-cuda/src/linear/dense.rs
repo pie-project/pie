@@ -111,18 +111,23 @@ pub(crate) fn act_x_wt(
     let call = Call { act, w, y, m, n, k };
     let capturing = capture_status(stream);
 
-    let (plan, tactic, lt_handle, ws, ws_bytes) = with_device(|device| {
+    let (plan, tactic, lt_handle, want) = with_device(|device| {
         let plan = device.plan_for(m, n, k);
         let tactic = capturing
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
-        (
-            plan,
-            tactic,
-            device.lt.handle,
-            device.lt.workspace,
-            device.lt.workspace_bytes,
-        )
+        (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
+    // **THE Lt WORKSPACE IS A SLAB, FOR THE REASON EVERY SLAB IS ONE.** It
+    // was one 64 MiB buffer per DEVICE, which two shells firing at once — and
+    // two arms of a P6 fork group — scribble over together while cuBLASLt
+    // reports success on both. `Ctx::scratch` keys it by `(arena, name,
+    // stream)` like the staging planes, so the sharing ends where the streams
+    // do. Absent is not fatal: Lt takes a null workspace at zero bytes, and
+    // the tactic ladder below has three rungs that need none at all.
+    let (ws, ws_bytes) = match ctx.scratch(op, LT_WORKSPACE, want) {
+        Ok(ws) if !ws.is_null() => (ws, want),
+        _ => (std::ptr::null_mut(), 0),
+    };
     if let Some(tactic) = tactic
         && run_tactic(handle, stream, lt_handle, plan.as_deref(), tactic, call, ws, ws_bytes)
     {
@@ -233,12 +238,20 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
 
 // ─── the cuBLASLt plumbing ──────────────────────────────────────────────────
 
-/// The Lt handle and its workspace, created on first use. The byte count is
-/// the single source both the heuristic preference and the tuner's bench
-/// read.
+/// The name the Lt workspace slab is keyed by, in the same namespace every
+/// other scratch entry uses.
+const LT_WORKSPACE: &str = "linear.lt_workspace";
+
+/// The Lt handle, created on first use, and the workspace byte count — the
+/// single source the heuristic preference, the tuner's bench and the fire
+/// path's slab all read.
+///
+/// **THE BUFFER ITSELF IS NOT HERE ANY MORE.** It was a `cudaMalloc` per
+/// device, shared by every stream in the process; it is a per-`(arena,
+/// stream)` slab now (`act_x_wt` takes it), because a workspace two
+/// concurrent matmuls write is a wrong answer neither of them reports.
 struct LtCtx {
     handle: lt::cublasLtHandle_t,
-    workspace: *mut c_void,
     workspace_bytes: usize,
 }
 
@@ -252,14 +265,7 @@ impl LtCtx {
         {
             return false;
         }
-        if self.workspace.is_null()
-            && unsafe { cudaMalloc(&raw mut self.workspace, self.workspace_bytes) }
-                != cudaError::cudaSuccess
-        {
-            clear_error();
-            self.workspace = std::ptr::null_mut();
-        }
-        !self.handle.is_null() && !self.workspace.is_null()
+        !self.handle.is_null()
     }
 }
 
@@ -482,7 +488,6 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
     let device = map.entry(current_device()).or_insert_with(|| Device {
         lt: LtCtx {
             handle: std::ptr::null_mut(),
-            workspace: std::ptr::null_mut(),
             workspace_bytes: 64 * 1024 * 1024,
         },
         plans: HashMap::new(),
