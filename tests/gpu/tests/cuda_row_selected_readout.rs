@@ -233,6 +233,11 @@ fn attached_prefill(
             kv: KvDelta {
                 held: 0,
                 pages: PAGES.to_vec(),
+                // Spread, not spelled: this gate is about the READOUT, and
+                // every other axis of the delta is whatever the contract's
+                // default is — `translation` empty, which is this lane saying
+                // it resolves its own pages on the host.
+                ..KvDelta::default()
             },
             mask: None,
             adapter: None,

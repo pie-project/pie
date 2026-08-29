@@ -208,7 +208,22 @@ impl Plane {
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let endpoints = endpoints_for(&program.plan, adopted)?;
-        let session = Session::bind(&program.compiled, &program.plan, seeds, extents, endpoints)?;
+        let held = endpoints.clone();
+        let session = match Session::bind(
+            &program.compiled,
+            &program.plan,
+            seeds,
+            extents,
+            endpoints,
+        ) {
+            Ok(session) => session,
+            Err(why) => {
+                // Same rule as a refused `endpoints_for`: an instance that did
+                // not bind holds no seat.
+                release_seats(&held);
+                return Err(why);
+            }
+        };
         let id = self.next_instance;
         self.next_instance += 1;
         self.instances.insert(
@@ -216,6 +231,7 @@ impl Plane {
             Bound {
                 program_id,
                 session,
+                endpoints: held,
                 geometry,
                 ids: ids.to_vec(),
             },
@@ -427,10 +443,17 @@ impl Plane {
     /// [`Fault::Program`] when there is no such instance — closing twice is a
     /// caller's bug, not a no-op.
     pub fn close_instance(&mut self, id: u64) -> Result<()> {
-        self.instances
+        let bound = self
+            .instances
             .remove(&id)
-            .map(|_| ())
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        // The seats go back; the RINGS do not necessarily go with them. A
+        // shared ring is an `Arc` the engine's channel table also holds, so it
+        // survives this drop and stays addressable by the attachments that are
+        // still open — which is the whole point of a ring that belongs to the
+        // channel (`release_seats`' own note).
+        release_seats(&bound.endpoints);
+        Ok(())
     }
 
     /// Drop program `id`, unloading this plane's share of its modules.
@@ -476,6 +499,12 @@ impl Plane {
 struct Bound {
     program_id: u64,
     session: Session,
+    /// **This instance's share of every ring it bound**, kept so that closing
+    /// it gives back the seats its shared rings hold — see
+    /// [`release_seats`]. Cloned `Arc`s, so holding them here is also what
+    /// keeps a shared ring alive for exactly as long as some attachment can
+    /// still address it.
+    endpoints: Vec<Option<std::sync::Arc<Endpoint>>>,
     /// How much of the fire geometry this instance's descriptor resolves on
     /// the device — the caller's claim at bind, kept because it is what
     /// [`Plane::envelope`] gates on. A class the load does not serve never
@@ -515,11 +544,49 @@ fn endpoints_for(
     plan: &ExecPlan,
     adopted: &[Option<std::sync::Arc<Endpoint>>],
 ) -> Result<Vec<Option<std::sync::Arc<Endpoint>>>> {
+    let mut seated: Vec<std::sync::Arc<Endpoint>> = Vec::new();
+    match gather_endpoints(plan, adopted, &mut seated) {
+        Ok(endpoints) => Ok(endpoints),
+        Err(why) => {
+            // A bind that does not happen holds no seat. The seats taken
+            // before the refusal are given back here rather than left for the
+            // eight-seat bound to trip over on the caller's next attempt.
+            for endpoint in &seated {
+                endpoint.detach();
+            }
+            Err(why)
+        }
+    }
+}
+
+fn gather_endpoints(
+    plan: &ExecPlan,
+    adopted: &[Option<std::sync::Arc<Endpoint>>],
+    seated: &mut Vec<std::sync::Arc<Endpoint>>,
+) -> Result<Vec<Option<std::sync::Arc<Endpoint>>>> {
     use engine::tensor_ir::container::HostRole;
 
     let mut endpoints = Vec::with_capacity(plan.package.channels.len());
     for (dense, declared) in plan.package.channels.iter().enumerate() {
-        if declared.host_role == HostRole::None {
+        // **A `None` ROLE NO LONGER MEANS "NO ENDPOINT"** (design §5). It used
+        // to: a channel whose cells never leave the device had its ring cut
+        // inside this session, which is right for a ring one pass owns and
+        // silently wrong for the one design §5 names — a device-only ring
+        // shared by up to eight attachments, one putting and another taking.
+        // Two sessions cut two slabs and the handoff crossed nothing.
+        //
+        // So the ring belongs to the channel now, for every role, and the
+        // adoption below is the whole of it: a `None` channel this engine
+        // registered offers a shared endpoint and every attachment takes the
+        // same one. What stays session-local is the STAGING a host-visible
+        // channel crosses through, which is `Rings::allocate`'s to cut.
+        //
+        // A `None` channel this engine never registered still gets `None` —
+        // the caller driving `bind_instance` directly, whose ring nobody else
+        // can name.
+        if declared.host_role == HostRole::None
+            && adopted.get(dense).and_then(Option::as_ref).is_none()
+        {
             endpoints.push(None);
             continue;
         }
@@ -529,7 +596,21 @@ fn endpoints_for(
             .map(|&dim| dim as usize)
             .product::<usize>()
             .max(1);
-        let wire = engine::wire_cell_bytes(engine::concrete_dtype(declared.dtype), numel);
+        // **A SHARED RING IS CUT AT ITS NATIVE WIDTH, NOT ITS WIRE WIDTH.**
+        // `wire_bytes` sizes the pinned MIRROR, which is the width a guest
+        // reads a cell at — bit-packed for a bool channel. A device-only ring
+        // has no guest and no mirror; what its endpoint owns is the DEVICE
+        // slab, which the emitted kernels index one byte per bool lane. Cut at
+        // the wire width, a shared bool ring would be an eighth of the slab
+        // every reader addresses.
+        let wire = if declared.host_role == HostRole::None {
+            super::program::launch::native_cell_bytes(
+                engine::concrete_dtype(declared.dtype),
+                numel,
+            )
+        } else {
+            engine::wire_cell_bytes(engine::concrete_dtype(declared.dtype), numel)
+        };
         let wire_bytes = u32::try_from(wire).map_err(|_| {
             Fault::program(
                 "program::plane",
@@ -559,6 +640,14 @@ fn endpoints_for(
                         ),
                     ));
                 }
+                // **ONE OF THE RING'S EIGHT SEATS** (design §5's bound). Only
+                // a shared ring counts them: a host-visible endpoint is
+                // adopted by one instance at a time by construction, and it is
+                // the device-only ring that two passes deliberately share.
+                if endpoint.role() == HostRole::None {
+                    seated.push(endpoint.clone());
+                    endpoint.attach()?;
+                }
                 endpoints.push(Some(endpoint.clone()));
             }
             None => endpoints.push(Some(std::sync::Arc::new(Endpoint::open(
@@ -569,4 +658,31 @@ fn endpoints_for(
         }
     }
     Ok(endpoints)
+}
+
+/// **Give back every seat this instance's channels hold** — the inverse of the
+/// `attach` in [`endpoints_for`].
+///
+/// # Who owns a shared ring's lifetime (design §5)
+///
+/// The ring itself is an `Arc<Endpoint>` held by the engine's channel table
+/// (`Cuda::channels`, keyed by the id its registration minted) and by every
+/// session bound to it, so it is freed when the LAST holder drops — which is
+/// after `close_channel` has removed the engine's entry AND every attachment
+/// has been closed, in either order. That is the property a shared ring needs
+/// and a per-session ring never had: it outlives any one instance's close, so
+/// a pipeline may close its prefill pass while its decode passes are still
+/// reading the ring the prefill filled.
+///
+/// The SEAT is separate bookkeeping and is given back here, so that a pipeline
+/// which closes and rebuilds passes does not walk its ring up to the eight-seat
+/// bound one rebuild at a time.
+fn release_seats(endpoints: &[Option<std::sync::Arc<Endpoint>>]) {
+    use engine::tensor_ir::container::HostRole;
+
+    for endpoint in endpoints.iter().flatten() {
+        if endpoint.role() == HostRole::None {
+            endpoint.detach();
+        }
+    }
 }

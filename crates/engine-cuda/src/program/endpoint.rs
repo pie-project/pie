@@ -30,9 +30,35 @@
 //! ```text
 //! HostRole::Writer   the guest owns TAIL (it publishes), the engine owns HEAD
 //! HostRole::Reader   the guest owns HEAD (it consumes),  the engine owns TAIL
-//! HostRole::None     there is no endpoint at all — the cells never leave the
-//!                    device and no counter is pinned
+//! HostRole::None     NO guest owns either counter — the cells never leave the
+//!                    device, and both counters are the engine's
 //! ```
+//!
+//! # The third role, and why it has an endpoint at all (design §5)
+//!
+//! [`HostRole::None`] used to mean "there is no endpoint": a channel whose
+//! cells never leave the device had its ring cut inside one `Session`, out of
+//! that session's own slab, with its counters kept only in that session's
+//! prediction. That is right for a ring ONE pass owns and wrong for the shape
+//! design §5 names by hand — *"draft→verify chaining is free: a device-only
+//! private ring shared by ≤8 attachments, ordered by the pipeline FIFO"* — a
+//! ring two passes share, one putting and the other taking. Two sessions each
+//! cut their own slab and their own counters, so the put landed in one copy
+//! and the take read the other, forever empty. The failure was legible and
+//! wrong: the taker's fire refused with "blocked AFTER the gate admitted it",
+//! because the gate and the fire were both reading a ring nobody had written.
+//!
+//! So the ring belongs to the CHANNEL and not to the instance, for all three
+//! roles. A `None` endpoint carries the same two pinned counters the other two
+//! do — read by `pull_validate` on the device and by [`Session::depth`] on the
+//! host, which is what makes the gate and the fire read one number — plus the
+//! DEVICE SLAB itself ([`Endpoint::device_cells`]), because that is the one
+//! piece of a shared ring that a per-session allocation cannot stand in for.
+//! What it does not carry is a guest: its mirror is never pulled from or
+//! published to, because neither `TICKET_HOST_WRITER` nor `TICKET_HOST_READER`
+//! is ever set on its tickets.
+//!
+//! [`Session::depth`]: super::session::Session::depth
 //!
 //! The engine's own counter is kept TWICE, and the difference is alto's
 //! central mechanism: the PREDICTION ([`Cursor`](super::launch::Cursor), which
@@ -51,11 +77,11 @@
 //! kernel-launch boundary and takes it for free (`channels.cuh`'s ordering
 //! note, and the 13.8× that forbids per-store release there).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use engine::tensor_ir::container::HostRole;
 
-use crate::device::Pinned;
+use crate::device::{Buffer, Pinned};
 use crate::error::{Fault, Result};
 
 /// Where each counter lives in [`Endpoint::words`] — the runtime's
@@ -65,11 +91,23 @@ const TAIL_WORD: usize = 1;
 /// How many words one endpoint carries: `[head, tail, poison, closed]`.
 pub const WORDS: usize = 4;
 
+/// **How many instances may share one ring** — design §5's number, verbatim
+/// ("a device-only private ring shared by ≤8 attachments").
+///
+/// A bound rather than a budget: the ordering argument for a shared ring is
+/// that the attachments fire in pipeline order on one stream, and a ring with
+/// an unbounded number of attachments is a ring whose order nobody has stated.
+/// Eight is what the design says, so eight is what [`Endpoint::attach`]
+/// refuses past — by name, because silently serving a ninth would be serving a
+/// shape the design has no ordering argument for.
+pub const MAX_ATTACHMENTS: u32 = 8;
+
 /// One host-visible channel endpoint's pinned mirror and pinned counters.
 #[derive(Debug)]
 pub struct Endpoint {
-    /// Which end the host holds. Never [`HostRole::None`] — a channel with no
-    /// host end has no endpoint at all.
+    /// Which end the host holds. [`HostRole::None`] is a channel with no guest
+    /// end at all — a ring two passes share, whose counters are both the
+    /// engine's (see the module header's third role).
     role: HostRole,
     /// `[head, tail, poison, closed]`, mapped.
     words: Pinned,
@@ -80,6 +118,31 @@ pub struct Endpoint {
     wire_bytes: u32,
     /// `capacity + 1`: the spare cell that makes `tail == head` mean empty.
     cap1: u32,
+    /// **THE SHARED DEVICE SLAB, for a ring that belongs to the channel.**
+    ///
+    /// `Some` for [`HostRole::None`] and `None` for the other two, and the
+    /// asymmetry is the point. A host-visible channel's device cells are one
+    /// END of a crossing — the pull copies the guest's mirror INTO them and
+    /// the publish copies them back OUT — so they are staging that belongs to
+    /// whichever pass is doing the crossing, and a second attachment would
+    /// want its own. A device-only channel's cells are the ring ITSELF: the
+    /// putting pass writes a cell and the taking pass reads that same cell,
+    /// with no crossing anywhere, so there is exactly one slab and every
+    /// attachment addresses it.
+    device_cells: Option<Buffer>,
+    /// How many instances have bound this channel — [`MAX_ATTACHMENTS`] at
+    /// most.
+    attachments: AtomicU32,
+    /// **Has a bind already planted this ring's seeds?**
+    ///
+    /// A seed is a cell the ring starts life holding, and a shared ring starts
+    /// life once. Two instances binding a seeded shared channel each arrive
+    /// carrying the same seed bytes — the runtime hands every attachment the
+    /// declaration — and planting them twice would leave the ring holding the
+    /// seed twice and its tail two on. So the first bind claims the right to
+    /// seed and the rest are told they lost the race
+    /// ([`Endpoint::claim_seeding`]).
+    seeded: AtomicU32,
 }
 
 impl Endpoint {
@@ -121,13 +184,79 @@ impl Endpoint {
             ));
         }
         let cells = (wire_bytes as usize).saturating_mul(cap1 as usize);
+        // **THE SLAB IS THE ROLE'S OWN DECISION** (see `device_cells`). A
+        // device-only ring is shared, so its cells are cut here, once, and
+        // every session that binds the channel addresses them; the other two
+        // roles keep the per-session staging `Rings::allocate` cuts.
+        //
+        // `native_bytes` is what a device cell holds and `wire_bytes` what a
+        // mirror cell does; they differ only for a bool channel, which packs
+        // on the wire. Cutting the shared slab at the WIDER of the two is what
+        // makes one allocation serve either — a bool ring then holds a byte
+        // per lane, which is what the emitted kernels read.
+        let device_cells = match role {
+            HostRole::None => Some(Buffer::zeroed(cells.max(1))?),
+            _ => None,
+        };
         Ok(Endpoint {
             role,
             words: Pinned::mapped(WORDS * size_of::<u64>())?,
             mirror: Pinned::mapped(cells.max(1))?,
             wire_bytes,
             cap1,
+            device_cells,
+            attachments: AtomicU32::new(0),
+            seeded: AtomicU32::new(0),
         })
+    }
+
+    /// **The shared device slab's base**, or `None` for a role whose device
+    /// cells are per-session staging.
+    #[must_use]
+    pub fn device_cells(&self) -> Option<u64> {
+        self.device_cells.as_ref().map(Buffer::ptr)
+    }
+
+    /// **Take one of this ring's [`MAX_ATTACHMENTS`] seats**, or say who is
+    /// already in them.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] past the design's bound. A refusal here is a bind
+    /// that does not happen, so nothing has to be undone.
+    pub fn attach(&self) -> Result<u32> {
+        let taken = self.attachments.fetch_add(1, Ordering::AcqRel) + 1;
+        if taken > MAX_ATTACHMENTS {
+            self.attachments.fetch_sub(1, Ordering::AcqRel);
+            return Err(Fault::program(
+                "program::endpoint",
+                format!(
+                    "this channel already has {MAX_ATTACHMENTS} instances bound to it and                      a {taken}th asked to bind: a shared ring is ordered by the pipeline                      FIFO its attachments fire in, and design §5 states that bound at                      {MAX_ATTACHMENTS} — past it there is no ordering argument, so there                      is no ring"
+                ),
+            ));
+        }
+        Ok(taken)
+    }
+
+    /// Give one seat back, when an instance that held one is closed.
+    pub fn detach(&self) {
+        let _ = self
+            .attachments
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(1))
+            });
+    }
+
+    /// **Claim the right to plant this ring's seeds**, `true` for the first
+    /// caller and `false` for every one after it.
+    ///
+    /// See [`Endpoint::seeded`](Endpoint#structfield.seeded): a shared ring
+    /// starts life once, and every attachment arrives carrying the same
+    /// declaration.
+    pub fn claim_seeding(&self) -> bool {
+        self.seeded
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Which end the host holds.
@@ -278,6 +407,9 @@ mod tests {
             mirror: Pinned::mapped(0).expect("a null allocation needs no runtime"),
             wire_bytes: 4,
             cap1: 2,
+            device_cells: None,
+            attachments: AtomicU32::new(0),
+            seeded: AtomicU32::new(0),
         };
         let writer = of(HostRole::Writer);
         assert!(writer.engine_owns_head(), "the pass consumes what the guest published");
@@ -285,5 +417,60 @@ mod tests {
         let reader = of(HostRole::Reader);
         assert!(!reader.engine_owns_head(), "the guest alone consumes");
         assert!(reader.engine_owns_tail(), "and the pass alone publishes");
+        // **AND THE THIRD ROLE ANSWERS BOTH** (design §5). A device-only ring
+        // has no guest at either end, so neither counter is the guest's — and
+        // that is exactly why `Session::merge` reads such a ring's words
+        // instead of a prediction: "the engine owns it" resolves to a
+        // different session for one of the two ends.
+        let shared = of(HostRole::None);
+        assert!(shared.engine_owns_head() && shared.engine_owns_tail());
+    }
+
+    /// **THE EIGHT SEATS ARE A BOUND AND THE NINTH IS A REFUSAL** (design §5:
+    /// "a device-only private ring shared by <=8 attachments").
+    #[test]
+    fn a_shared_ring_seats_eight_attachments_and_refuses_the_ninth() {
+        let ring = Endpoint {
+            role: HostRole::None,
+            words: Pinned::mapped(0).expect("a null allocation needs no runtime"),
+            mirror: Pinned::mapped(0).expect("a null allocation needs no runtime"),
+            wire_bytes: 4,
+            cap1: 2,
+            device_cells: None,
+            attachments: AtomicU32::new(0),
+            seeded: AtomicU32::new(0),
+        };
+        for seat in 1..=MAX_ATTACHMENTS {
+            assert_eq!(ring.attach().expect("a seat inside the bound"), seat);
+        }
+        let ninth = ring.attach();
+        assert!(ninth.is_err(), "the ninth attachment is refused: {ninth:?}");
+        // **AND THE REFUSAL LEAVES THE COUNT WHERE IT WAS**, so a caller that
+        // is refused and retries after closing something is not permanently
+        // one seat over.
+        ring.detach();
+        assert_eq!(
+            ring.attach().expect("the seat that was just given back"),
+            MAX_ATTACHMENTS
+        );
+    }
+
+    /// A shared ring is seeded ONCE, however many attachments carry the same
+    /// declaration to it.
+    #[test]
+    fn only_the_first_attachment_plants_a_shared_rings_seeds() {
+        let ring = Endpoint {
+            role: HostRole::None,
+            words: Pinned::mapped(0).expect("a null allocation needs no runtime"),
+            mirror: Pinned::mapped(0).expect("a null allocation needs no runtime"),
+            wire_bytes: 4,
+            cap1: 2,
+            device_cells: None,
+            attachments: AtomicU32::new(0),
+            seeded: AtomicU32::new(0),
+        };
+        assert!(ring.claim_seeding(), "the first bind plants the seed");
+        assert!(!ring.claim_seeding(), "and the second finds it already there");
+        assert!(!ring.claim_seeding());
     }
 }

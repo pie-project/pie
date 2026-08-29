@@ -1086,39 +1086,52 @@ impl Engine for Cuda {
                 registration.id
             )));
         }
-        let mirror = if registration.host_role == engine::tensor_ir::container::HostRole::None {
-            None
+        // **EVERY ROLE GETS AN ENDPOINT NOW, AND ONLY TWO OF THEM GET A
+        // MIRROR** (design §5). A `HostRole::None` channel used to allocate
+        // nothing here and register nothing, so its ring was cut inside
+        // whichever session bound it — and a ring two passes SHARE was then
+        // two rings that never met, which is the whole of the
+        // "device-only private ring shared by <=8 attachments" gap. The ring
+        // belongs to the channel now: this is where it is cut, once, and
+        // `endpoints_for` hands the same one to every attachment.
+        //
+        // What a `None` channel still has no part of is the CROSSING. It
+        // publishes no `HostMirror`, because there is no guest end to point at
+        // it, and `mint` sets neither `HOST_WRITER` nor `HOST_READER` on its
+        // tickets — so the pull and the publish kernels skip it and its cells
+        // never leave the device, which is exactly what its role says.
+        let numel = registration
+            .shape
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>()
+            .max(1);
+        let device_only = registration.host_role == engine::tensor_ir::container::HostRole::None;
+        let cell_bytes = u32::try_from(if device_only {
+            // The slab the emitted kernels index, not the wire the mirror
+            // holds — see `endpoints_for`.
+            crate::program::launch::native_cell_bytes(registration.dtype.program_dtype(), numel)
         } else {
-            let numel = registration
-                .shape
-                .iter()
-                .map(|&dim| dim as usize)
-                .product::<usize>()
-                .max(1);
-            let cell_bytes = u32::try_from(engine::wire_cell_bytes(
-                registration.dtype.program_dtype(),
-                numel,
+            engine::wire_cell_bytes(registration.dtype.program_dtype(), numel)
+        })
+        .map_err(|_| {
+            Error::Program(format!(
+                "channel {}'s cell is wider than a u32 counts",
+                registration.id
             ))
-            .map_err(|_| {
-                Error::Program(format!(
-                    "channel {}'s wire cell is wider than a u32 counts",
-                    registration.id
-                ))
-            })?;
-            let capacity = registration.capacity.max(1);
-            let endpoint = Arc::new(
-                crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity)
-                    .map_err(fault)?,
-            );
-            let published = HostMirror {
-                mirror: endpoint.mirror_host(),
-                words: endpoint.words_host(),
-                cell_bytes,
-                capacity,
-            };
-            self.channels.insert(registration.id, endpoint);
-            Some(published)
-        };
+        })?;
+        let capacity = registration.capacity.max(1);
+        let endpoint = Arc::new(
+            crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity)
+                .map_err(fault)?,
+        );
+        let mirror = (!device_only).then(|| HostMirror {
+            mirror: endpoint.mirror_host(),
+            words: endpoint.words_host(),
+            cell_bytes,
+            capacity,
+        });
+        self.channels.insert(registration.id, endpoint);
         Ok(RegisteredChannel {
             id: registration.id,
             // ZERO, AND THE CONTRACT SAYS WHAT ZERO MEANS: this shell keeps no

@@ -113,6 +113,10 @@ fn lane(slot: u32, pages: &[u32], held: u32, tokens: Vec<u32>, readout: Readout)
         kv: KvDelta {
             held,
             pages: pages.to_vec(),
+            // Spread, for the reason the row-readout gate gives: this gate is
+            // about the PAGES, and every other axis takes the contract's own
+            // default.
+            ..KvDelta::default()
         },
         mask: None,
         adapter: None,

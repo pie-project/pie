@@ -152,6 +152,20 @@ pub struct Session {
     /// the guest's own counter is its pinned word, and
     /// [`Session::cursors_now`] is where the two are read as one.
     cursors: Vec<Cursor>,
+    /// **What THIS session has minted and not yet settled**, per channel, for
+    /// the SHARED rings alone (design §5).
+    ///
+    /// A device-only ring's counters live in its endpoint and are advanced at
+    /// settle by whichever attachment committed; between a fire's mint and its
+    /// settle the ring stands one further on than its words say, for the
+    /// channels that fire moves. [`Session::merge`] adds this back so the
+    /// answer is the ring's, not a stale read of it.
+    ///
+    /// Zero for every channel that is not a shared ring, and — while
+    /// [`Session::fire`] synchronizes before it settles — zero everywhere
+    /// outside one `fire` call. Kept as arithmetic rather than as an
+    /// assumption about that synchronize.
+    inflight: Vec<Cursor>,
     /// One per stage plan, `None` for a stage with nothing to launch — the
     /// adapter prologue is exactly that, its one region being a sink the model
     /// fire reads out of the plan rather than a body anyone compiled.
@@ -273,6 +287,7 @@ impl Session {
 
         let mut session = Session {
             rings,
+            inflight: vec![Cursor::default(); shapes.len()],
             shapes,
             cursors,
             prepared,
@@ -288,6 +303,24 @@ impl Session {
             put: Buffer::zeroed(slots * size_of::<u32>())?,
         };
         for (channel, wire) in seeds {
+            // **A SHARED RING IS SEEDED ONCE, BY WHICHEVER ATTACHMENT BINDS
+            //    FIRST** (design §5). Every attachment arrives carrying the
+            //    same declaration, so every attachment arrives carrying the
+            //    same seed; planting it per session was right while the ring
+            //    was per session, and would now leave a two-attachment ring
+            //    holding the seed twice with its tail two on. The endpoint
+            //    hands out the right to plant exactly once, and the losers
+            //    skip — which is not a silent fallback but the same cell,
+            //    already there, put there by the same bytes.
+            let shared = session
+                .rings
+                .endpoint(*channel as usize)
+                .filter(|endpoint| endpoint.role() == HostRole::None);
+            if let Some(endpoint) = shared
+                && !endpoint.claim_seeding()
+            {
+                continue;
+            }
             if !session.publish(*channel, wire)? {
                 return Err(Fault::program(
                     "program::session",
@@ -349,6 +382,37 @@ impl Session {
 
     fn merge(&self, channel: usize, prediction: Cursor) -> Cursor {
         match self.rings.endpoint(channel) {
+            // **A SHARED RING IS READ FROM THE RING, BOTH ENDS** (design §5).
+            // The two-owner rule above resolves "who moves this counter" to
+            // the guest or to THIS engine; on a device-only ring the answer is
+            // neither — it is whichever ATTACHMENT last committed, and that is
+            // another session with a prediction of its own. So the pinned
+            // words are the truth for both ends, and the prediction is not
+            // consulted at all.
+            //
+            // This is the line the "blocked AFTER the gate admitted it" fault
+            // came from. `blocked_channel` and `Session::fire` both ask
+            // `depth`, which asks here; while this returned a per-session
+            // prediction, the taker's gate and the taker's fire agreed
+            // perfectly with each other and both disagreed with the ring the
+            // putter had actually filled.
+            //
+            // **AND THIS SESSION'S OWN IN-FLIGHT FIRE IS ADDED BACK ON.** A
+            // fire advances its prediction at mint and the pinned word only at
+            // settle, so between the two the ring stands one further on than
+            // its words say for the fires THIS session has minted. Today that
+            // window is closed before it can be observed — `Session::fire`
+            // synchronizes before it settles, so a session never has two of
+            // its own fires outstanding — and `inflight` is therefore always
+            // zero here. It is added anyway because the arithmetic, not the
+            // synchronize, is what makes the answer right.
+            Some(endpoint) if endpoint.role() == HostRole::None => {
+                let inflight = self.inflight.get(channel).copied().unwrap_or_default();
+                Cursor {
+                    head: endpoint.head() + inflight.head,
+                    tail: endpoint.tail() + inflight.tail,
+                }
+            }
             Some(endpoint) => Cursor {
                 head: if endpoint.engine_owns_head() {
                     prediction.head
@@ -765,11 +829,34 @@ impl Session {
             // would read a cell nobody copied in.
             let addresses_head = takes || plan.reads_channel(slot);
 
+            // **A SHARED RING'S DURABLE STATE IS ITS ENDPOINT'S, NOT THIS
+            //    SESSION'S REGISTRY** (design §5). `commit_bump` moves the
+            //    registry arrays, which are cut per session and indexed by
+            //    DENSE slot — and one shared channel sits at a different dense
+            //    slot in every instance that binds it, so no session's
+            //    registry can be the ring's. Its counters are the pinned words
+            //    both attachments read, advanced at settle by whichever fire
+            //    committed. So the slot stays OUT of the bump's lists and the
+            //    kernel is left with exactly the channels it can speak for.
+            //
+            //    Nothing is lost by leaving: the registry's ring positions are
+            //    read by `commit_bump` alone, and its full/empty bytes by
+            //    nothing at all outside a host-writer pull — which a ring with
+            //    no host end never takes.
+            let shared = self
+                .rings
+                .endpoint(channel)
+                .is_some_and(|endpoint| endpoint.role() == HostRole::None);
+
             let mut used = cursor.tail - cursor.head;
             if takes && used != 0 {
                 next[channel].head = cursor.head + 1;
                 used -= 1;
-                taken.push(slot);
+                if shared {
+                    self.inflight[channel].head += 1;
+                } else {
+                    taken.push(slot);
+                }
             }
             if puts {
                 if used >= u64::from(shape.capacity) {
@@ -779,7 +866,11 @@ impl Session {
                     ));
                 }
                 next[channel].tail = cursor.tail + 1;
-                put.push(slot);
+                if shared {
+                    self.inflight[channel].tail += 1;
+                } else {
+                    put.push(slot);
+                }
             }
 
             let Some(endpoint) = self.rings.endpoint(channel) else {
@@ -914,6 +1005,35 @@ impl Session {
     fn settle(&mut self, minted: &Minted) -> Result<Fired> {
         let word = self.commit.read(0, size_of::<u32>());
         let committed = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) != 0;
+        // **THE SHARED RINGS ADVANCE HERE AND ONLY HERE** (design §5). Their
+        // slots are not in `minted.taken`/`minted.put` — `mint` says why — so
+        // they are walked off this session's own in-flight count instead, and
+        // the pinned words the OTHER attachments read move exactly when this
+        // fire committed.
+        //
+        // **AND THE PIPELINE FIFO IS WHAT ORDERS THEM.** Two attachments of
+        // one ring are two passes of one guest pipeline, submitted in order
+        // and fired in order; each pass's `Session::fire` synchronizes before
+        // it reaches this line, so the putter's word has moved before the
+        // taker is minted at all. The ordering is not an assumption about
+        // kernel completion — it is the same host-side happens-before every
+        // other counter on this plane rests on.
+        for (channel, flight) in self.inflight.iter_mut().enumerate() {
+            let (head, tail) = (flight.head, flight.tail);
+            *flight = Cursor::default();
+            let Some(endpoint) = self.rings.endpoint(channel) else {
+                continue;
+            };
+            if !committed {
+                continue;
+            }
+            for _ in 0..head {
+                endpoint.bump_head();
+            }
+            for _ in 0..tail {
+                endpoint.bump_tail();
+            }
+        }
         if committed {
             for slot in &minted.taken {
                 if let Some(endpoint) = self.rings.endpoint(*slot as usize)

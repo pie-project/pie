@@ -415,7 +415,21 @@ impl Rings {
                     format!("channel {index}'s cell is zero bytes, so it can never be ready"),
                 ));
             }
-            cells.push(Buffer::zeroed(bytes * shape.ring() as usize)?);
+            // **A SHARED RING IS NOT CUT HERE, AND THAT IS THE WHOLE FIX**
+            // (design §5). A channel whose endpoint carries its own device
+            // slab is one the CHANNEL owns rather than this instance: the
+            // pass that puts and the pass that takes are two sessions, and a
+            // slab cut per session is two slabs that never meet. The
+            // placeholder keeps `cells` indexed by dense channel like every
+            // other array here; `Rings::slab` is what reads through it.
+            let shared = endpoints
+                .get(index)
+                .and_then(Option::as_ref)
+                .and_then(|endpoint| endpoint.device_cells());
+            cells.push(match shared {
+                Some(_) => Buffer::zeroed(0)?,
+                None => Buffer::zeroed(bytes * shape.ring() as usize)?,
+            });
         }
 
         // ── The registry, in one allocation. The u32 arrays go first so that
@@ -532,7 +546,27 @@ impl Rings {
     pub fn cell_address(&self, channel: usize, sequence: u64) -> Result<u64> {
         let shape = self.shape_of(channel)?;
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
-        self.cells[channel].at(at)
+        match self.shared_slab(channel) {
+            // The shared slab's bound is the endpoint's own: `cap1` cells of
+            // this width, which is the same ring `shape.ring()` counts.
+            Some(base) => Ok(base + at),
+            None => self.cells[channel].at(at),
+        }
+    }
+
+    /// **Channel `channel`'s SHARED device slab**, or `None` for one whose
+    /// cells this session cut for itself.
+    ///
+    /// See [`Endpoint::device_cells`](super::Endpoint::device_cells): a
+    /// device-only ring belongs to the channel and every attachment addresses
+    /// one slab; a host-visible one's device cells are this pass's staging for
+    /// a crossing and belong to the session.
+    #[must_use]
+    pub fn shared_slab(&self, channel: usize) -> Option<u64> {
+        self.endpoints
+            .get(channel)
+            .and_then(Option::as_ref)
+            .and_then(|endpoint| endpoint.device_cells())
     }
 
     /// Write one native cell into channel `channel` at `sequence`.
@@ -561,6 +595,14 @@ impl Rings {
         //    commit time. Writing the slab here instead would put the bytes
         //    where the guest cannot see them and where the next pull will
         //    overwrite them.
+        // ── A SHARED RING'S SEED GOES TO THE SLAB ITSELF. It has no guest
+        //    at either end, so there is no mirror for a cell to cross through
+        //    and nothing will ever pull it in: the passes that take from this
+        //    ring read the device cells directly, so the seed has to BE one.
+        if let Some(base) = self.shared_slab(channel) {
+            let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
+            return crate::device::write_raw(base + at, native);
+        }
         if let Some(endpoint) = self.endpoint(channel) {
             let wire = native_to_wire(shape.dtype, shape.numel, native)?;
             if !endpoint.write_cell(sequence, &wire) {
@@ -590,6 +632,19 @@ impl Rings {
         // are, in both directions. A descriptor port resolved off this call
         // therefore reads the cell the GUEST published this fire, before
         // anything has launched and without a device read.
+        // ── A SHARED RING HAS NO MIRROR TO READ. Its endpoint carries the
+        //    counters and the SLAB and nothing else: there is no guest at
+        //    either end, so no cell ever crosses into pinned memory and the
+        //    mirror stays as `Endpoint::open` left it. The cell a descriptor
+        //    port wants is the device one, which is where both attachments
+        //    write it — the same read the per-session branch below took while
+        //    the ring was per session.
+        if let Some(base) = self.shared_slab(channel) {
+            let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
+            let mut out = vec![0u8; shape.cell_bytes()];
+            crate::device::copy_d2h(base + at, &mut out)?;
+            return Ok(out);
+        }
         if let Some(endpoint) = self.endpoint(channel) {
             return wire_to_native(shape.dtype, shape.numel, &endpoint.read_cell(sequence));
         }
@@ -618,7 +673,7 @@ impl Rings {
 /// A `take`/`read` reads `committed`; a `put` writes `pending`. Both are
 /// resolved on the host out of the ring cursors, because the kernel does no
 /// ring arithmetic at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     /// The sequence a consumer reads.
     pub head: u64,

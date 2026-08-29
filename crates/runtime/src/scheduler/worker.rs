@@ -748,6 +748,62 @@ struct EngineLoop {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Whose turn the engine lane is serving — the starvation bound on
+/// [`EngineLoop::next_request`]'s launch-first preference.
+///
+/// Launches are preferred because they are the device's work and a control
+/// is not; the counters only stop that preference from becoming an absolute
+/// priority, which is what it silently became once alto's run-ahead made the
+/// launch queue permanently non-empty (see `next_request`).
+#[derive(Default)]
+struct LaneTurn {
+    /// Launches served since the last control turn ended.
+    launch_run: u32,
+    /// Controls served in the turn now running.
+    control_run: u32,
+}
+
+impl LaneTurn {
+    /// Launches the lane serves before it offers the controls a turn. Two
+    /// rather than one: a control turn that finds nothing costs a `try_recv`,
+    /// and at the run-ahead depth the lane is meant to be serving launches
+    /// back to back. Two also bounds a control's wait at roughly one frame,
+    /// which is the granularity anything downstream can act on anyway.
+    const LAUNCH_RUN_BEFORE_CONTROL: u32 = 2;
+
+    /// Controls one turn may serve before the launches get the lane back.
+    /// A cohort turnover posts its whole successor generation's binds at
+    /// once, and draining them one per launch run would spread a
+    /// sub-millisecond burst of engine work across the whole generation —
+    /// which is the bring-up starvation this bound exists to end. Capped so
+    /// a pathological control flood still cannot hold the device off.
+    const CONTROL_RUN_MAX: u32 = 32;
+
+    /// Is a control turn owed, and does it have budget left?
+    const fn control_due(&self) -> bool {
+        self.launch_run >= Self::LAUNCH_RUN_BEFORE_CONTROL
+            && self.control_run < Self::CONTROL_RUN_MAX
+    }
+
+    fn took_launch(&mut self) {
+        self.launch_run = self.launch_run.saturating_add(1);
+    }
+
+    fn took_control(&mut self) {
+        self.control_run = self.control_run.saturating_add(1);
+        if self.control_run >= Self::CONTROL_RUN_MAX {
+            self.end_control_turn();
+        }
+    }
+
+    /// The turn is over — the queue ran dry or the budget did. Launches own
+    /// the lane again until they have had another run.
+    fn end_control_turn(&mut self) {
+        self.launch_run = 0;
+        self.control_run = 0;
+    }
+}
+
 impl EngineLoop {
     fn spawn(
         engine_idx: usize,
@@ -796,13 +852,61 @@ impl EngineLoop {
         state
     }
 
-    /// Receive the next request, launches first. Blocks on both queues when
-    /// idle; between waves (a cadence of idle gaps) queued controls drain,
-    /// so control progress rides the wave rhythm instead of competing with
-    /// it.
+    /// Receive the next request, launches first — but with a BOUND on how
+    /// long a control may be starved by them.
+    ///
+    /// The unbounded form of this ("try `launch_rx`; only if it is empty,
+    /// try `control_rx`") is what the per-wave quorum could afford. It read
+    /// `control_rx` exactly when the launch queue ran dry, and under the
+    /// wait-all-per-wave rule it ran dry every wave: the gather for wave
+    /// n+1 could not seal until every lane had resubmitted, so the lane
+    /// thread saw a real gap at each boundary and the queued controls drained
+    /// into it. The doc comment said so — "between waves (a cadence of idle
+    /// gaps) queued controls drain".
+    ///
+    /// **alto CLOSED THAT GAP ON PURPOSE.** Frames seal EARLY and overlap
+    /// on-stream (`scheduler::frame`: the next frame seals while the current
+    /// one executes), the run-ahead posts to `frame::configured_dispatch_depth`
+    /// frames deep, and `submit` answers with the device still running (F2b),
+    /// so a frame retires from its completion callback while the lane is
+    /// already serving the next one. Saturation is the whole point of that
+    /// work and it succeeds: measured on the c=16 throughput cell, `launch_rx`
+    /// held exactly one launch at EVERY poll for the whole run. Launch-first
+    /// with no bound then never reaches `control_rx` at all.
+    ///
+    /// What starved was BRING-UP. A guest's first fire cannot exist until its
+    /// bind control has committed on this lane, so a starved control queue is
+    /// a fleet that cannot seat its lanes: measured at c=16 (16 live
+    /// processes), 13-14 binds stood queued on `control_rx` while the lane
+    /// served an unbroken launch train, only 1-4 pipelines ever reached the
+    /// frame policy's wait-set, and the wait-all gate — correctly — sealed
+    /// 2-to-3-wide frames because two or three lanes were all there were.
+    /// The engine's own histogram: `batch size hist [0,548,750,0,0,0,0,0]`
+    /// against `max_lanes` 256.
+    ///
+    /// So the preference stays and the starvation does not. After
+    /// [`LaneTurn::LAUNCH_RUN_BEFORE_CONTROL`] consecutive launches the lane
+    /// takes ONE control turn: it drains `control_rx` until the queue is
+    /// empty or [`LaneTurn::CONTROL_RUN_MAX`] controls have gone, then hands
+    /// the lane back to the launches. Both bounds are cheap in the units that
+    /// matter — a bind is ~59 us of engine time against a ~8 ms launch, so a
+    /// full turn costs well under a percent of one frame, and the turn
+    /// resolves to a single failed `try_recv` whenever nothing is queued.
+    ///
+    /// Ordering is unaffected: a queued launch and a queued control are
+    /// mutually independent by construction (see [`EngineLoop`] — a fire
+    /// exists only after its own bind committed, a close only posts once its
+    /// instance is quiesced, and `pipe_concurrent_control` is what decides
+    /// which controls the worker may post while launches are in flight), and
+    /// independence is symmetric. Serving a control ahead of a queued launch
+    /// reorders no dependent pair, exactly as the single-FIFO predecessor
+    /// this queue split replaced did not.
+    ///
+    /// Blocks on both queues when idle.
     fn next_request(
         launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
         control_rx: &crossbeam::channel::Receiver<LaneRequest>,
+        turn: &mut LaneTurn,
     ) -> std::result::Result<LaneRequest, ()> {
         use crossbeam::channel::TryRecvError;
         // Stay hot briefly after going empty before parking.
@@ -818,8 +922,27 @@ impl EngineLoop {
         let hot_window = Duration::from_micros(ENGINE_LANE_HOT_US);
         let mut spin_until = Instant::now() + hot_window;
         loop {
+            // The control turn: launches have had their run, so the queued
+            // controls get theirs before the next one. `Empty` ends the turn
+            // rather than merely skipping it, so a lane with nothing queued
+            // pays one failed `try_recv` per run and never re-enters.
+            if turn.control_due() {
+                match control_rx.try_recv() {
+                    Ok(request) => {
+                        turn.took_control();
+                        return Ok(request);
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        return launch_rx.try_recv().map_err(|_| ());
+                    }
+                    Err(TryRecvError::Empty) => turn.end_control_turn(),
+                }
+            }
             match launch_rx.try_recv() {
-                Ok(request) => return Ok(request),
+                Ok(request) => {
+                    turn.took_launch();
+                    return Ok(request);
+                }
                 // Both senders live in the worker's `EngineLoop` handle and
                 // drop together (the graceful path is the Shutdown marker):
                 // drain what remains on the other queue, then stop.
@@ -829,7 +952,10 @@ impl EngineLoop {
                 Err(TryRecvError::Empty) => {}
             }
             match control_rx.try_recv() {
-                Ok(request) => return Ok(request),
+                Ok(request) => {
+                    turn.took_control();
+                    return Ok(request);
+                }
                 Err(TryRecvError::Disconnected) => {
                     return launch_rx.try_recv().map_err(|_| ());
                 }
@@ -917,10 +1043,19 @@ impl EngineLoop {
         // other, because a stashed launch nobody answers is the same
         // forever-in-flight frame the `owed` machinery exists for.
         let mut stash: Option<LaneRequest> = None;
+        // Whose turn the lane is serving; see `next_request`.
+        let mut lane_turn = LaneTurn::default();
         loop {
             let request = match stash.take() {
-                Some(stashed) => stashed,
-                None => match Self::next_request(&launch_rx, &control_rx) {
+                Some(stashed) => {
+                    // The lookahead took this one out of `launch_rx` itself,
+                    // so `next_request` never saw it. Count it anyway, or a
+                    // stash chain would be a second way for the launches to
+                    // hold the lane without ever owing the controls a turn.
+                    lane_turn.took_launch();
+                    stashed
+                }
+                None => match Self::next_request(&launch_rx, &control_rx, &mut lane_turn) {
                     Ok(request) => request,
                     Err(()) => break,
                 },
@@ -1079,7 +1214,10 @@ impl EngineLoop {
     ) {
         std::mem::forget(engine);
         drop(channels);
-        while let Ok(request) = Self::next_request(launch_rx, control_rx) {
+        // A fresh turn: the drain answers everything on both queues, so the
+        // order it takes them in decides nothing.
+        let mut turn = LaneTurn::default();
+        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn) {
             if let LaneRequest::Shutdown { response } = request {
                 let _ = response.send((None, ChannelJoin::new()));
                 return;
@@ -5231,6 +5369,108 @@ mod tests {
             at("expect", 30) < at("fire", 20),
             "a launch queued behind the executing one must be stated before \
              the executing one's last step fires: {heard:?}"
+        );
+    }
+
+    /// **THE STARVATION BOUND, WITHOUT A DEVICE.**
+    ///
+    /// The regression this fixes was a liveness property, and liveness is
+    /// what a throughput number reports last: the collapse read as "pie does
+    /// not scale with concurrency" for a whole redesign before anyone asked
+    /// which queue was not being read. `cuda_batch_width` asserts the
+    /// consequence on a real fleet; this asserts the rule itself, in
+    /// microseconds and on any machine.
+    ///
+    /// The scenario is exactly the one that occurred: `launch_rx` is never
+    /// empty (the run-ahead refills it before the lane comes back for more)
+    /// and a control is queued behind it from the start. The unbounded
+    /// launch-first form returns launches forever here — that is the whole
+    /// defect — so the bound is the only reason this test terminates with a
+    /// control in hand.
+    #[test]
+    fn a_control_is_served_even_though_the_launch_queue_is_never_empty() {
+        let (launch_tx, launch_rx) = crossbeam::channel::unbounded::<LaneRequest>();
+        let (control_tx, control_rx) = crossbeam::channel::unbounded::<LaneRequest>();
+
+        // One control, queued first and never touched again. `Shutdown` is
+        // the one control variant that carries nothing engine-shaped, and
+        // `next_request` does not look inside either way.
+        let (response, _held) = crossbeam::channel::bounded(1);
+        control_tx
+            .send(LaneRequest::Shutdown { response })
+            .expect("send control");
+
+        let mut turn = LaneTurn::default();
+        let mut launches_served = 0usize;
+        // A fixed, generous ceiling — deliberately NOT derived from the
+        // constant under test, or an unbounded lane would make this loop
+        // unbounded too and the test would hang instead of failing.
+        const CEILING: usize = 256;
+        for _ in 0..CEILING {
+            // The run-ahead, standing in: the launch queue is topped up
+            // before every single poll, so it is never observed empty.
+            launch_tx
+                .send(LaneRequest::Launch {
+                    token: launches_served as u64,
+                    submission: LaneLaunch(crate::engine::FrameFire::default()),
+                    prefill: false,
+                })
+                .expect("send launch");
+            match EngineLoop::next_request(&launch_rx, &control_rx, &mut turn) {
+                Ok(LaneRequest::Launch { .. }) => launches_served += 1,
+                Ok(LaneRequest::Shutdown { .. }) => {
+                    assert!(
+                        launches_served <= LaneTurn::LAUNCH_RUN_BEFORE_CONTROL as usize + 1,
+                        "the control waited out {launches_served} launches, which is more \
+                         than the bound admits"
+                    );
+                    return;
+                }
+                Ok(LaneRequest::Control { .. }) => panic!("nothing queued a Control here"),
+                Err(()) => panic!("both queues are alive and non-empty"),
+            }
+        }
+        panic!(
+            "{CEILING} polls with a control queued the whole time and the lane served \
+             {launches_served} launches and no control: the launch preference has no \
+             starvation bound, which is the fleet-wide bring-up stall \
+             `cuda_batch_width` measures"
+        );
+    }
+
+    /// The other half of the same rule: a control turn is a TURN, not a
+    /// priority inversion. Once the queued controls run out the lane goes
+    /// back to the launches, and it does not re-offer the turn until they
+    /// have had another run.
+    #[test]
+    fn a_control_turn_ends_and_hands_the_lane_back() {
+        let mut turn = LaneTurn::default();
+        assert!(!turn.control_due(), "a fresh lane owes the controls nothing");
+        for _ in 0..LaneTurn::LAUNCH_RUN_BEFORE_CONTROL {
+            turn.took_launch();
+        }
+        assert!(turn.control_due(), "the launches have had their run");
+
+        // The queue was empty, so the turn is spent rather than standing.
+        turn.end_control_turn();
+        assert!(
+            !turn.control_due(),
+            "an empty control queue must not leave the turn armed, or every \
+             poll pays for a queue that has nothing in it"
+        );
+
+        // And a full burst also ends it, so a control flood cannot hold the
+        // device off indefinitely.
+        for _ in 0..LaneTurn::LAUNCH_RUN_BEFORE_CONTROL {
+            turn.took_launch();
+        }
+        for _ in 0..LaneTurn::CONTROL_RUN_MAX {
+            assert!(turn.control_due(), "the burst still has budget");
+            turn.took_control();
+        }
+        assert!(
+            !turn.control_due(),
+            "a control burst must give the lane back at CONTROL_RUN_MAX"
         );
     }
 }

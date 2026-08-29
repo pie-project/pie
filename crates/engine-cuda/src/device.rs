@@ -37,7 +37,10 @@ pub mod map;
 /// write-side probes that are still only probes.
 pub mod nodes;
 
-pub use alloc::{Buffer, Pinned, copy_any, copy_d2d, copy_d2h, free_bytes, zero_span, zero_span_on};
+pub use alloc::{
+    Buffer, Pinned, copy_any, copy_d2d, copy_d2h, free_bytes, write_raw, zero_span,
+    zero_span_on,
+};
 pub use elastic::{Arena, PhysicalPool};
 pub use ctx::{Context, present};
 pub use graph::{Graph, GraphExec};

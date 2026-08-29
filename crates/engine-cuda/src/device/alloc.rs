@@ -625,6 +625,52 @@ impl Drop for Pinned {
     }
 }
 
+/// **Copy `bytes` to a device address the caller resolved, and wait.**
+///
+/// [`Buffer::write`]'s free-function twin, for the one owner that cannot hand
+/// out a `&mut Buffer`: a channel's SHARED device ring lives behind an
+/// `Arc<Endpoint>` (`program::endpoint`), so every holder has `&self` and the
+/// seeds a bind plants have to reach it anyway. The bounds check is the
+/// caller's for the same reason — the address is already resolved when it
+/// arrives here.
+///
+/// Synchronous, like [`Buffer::write`], and for its reason: the only caller is
+/// bind-time seeding, which is control plane and orders against nothing.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime
+/// selected.
+pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: `at` is an address the caller resolved against an allocation
+        // it owns, and `bytes` is a live host slice for the duration of a
+        // synchronous copy.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpy",
+                rt::cudaMemcpy(
+                    at as *mut core::ffi::c_void,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                ),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = at;
+        Err(Fault::Runtimeless)
+    }
+}
+
 /// **One device-to-device copy, on `stream`** (alto F3).
 ///
 /// A free function rather than a [`Buffer`] method because the two callers do
